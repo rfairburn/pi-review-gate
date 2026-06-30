@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "mode": "single-decider",
+  "maxCorrectionCycles": 1,
+  "reviewWhen": "changed-files",
+  "maxPatchBytes": 200000,
+  "maxFileBytes": 1048576,
+  "maxSnapshotBytes": 52428800,
+  "retainBundles": "on-failure",
+  "decider": {
+    "id": "codex",
+    "adapter": "generic-cli",
+    "command": "codex",
+    "args": [],
+    "timeoutMs": 120000
+  }
+}

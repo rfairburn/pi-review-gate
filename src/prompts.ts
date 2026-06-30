@@ -1,0 +1,75 @@
+import type { ChangedFile } from "./capture";
+import type { ReviewFinding, ReviewResult } from "./schema";
+
+export function buildReviewerPrompt(input: {
+  request: string;
+  changes: ChangedFile[];
+  patch: string;
+  cwd: string;
+}): string {
+  const changedFiles = input.changes.map((change) => ({
+    path: change.path,
+    status: change.status,
+    binary: change.binary,
+    oversized: change.oversized,
+    diffOmittedReason: change.diffOmittedReason,
+  }));
+
+  return `You are reviewing code changes made by another coding agent.
+
+Review only the supplied request and patch. Do not ask for more context unless the patch is impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
+
+Workspace:
+${input.cwd}
+
+Original request:
+<request>
+${input.request}
+</request>
+
+Changed files:
+<changed_files_json>
+${JSON.stringify(changedFiles, null, 2)}
+</changed_files_json>
+
+Patch:
+<patch_diff>
+${input.patch}
+</patch_diff>
+
+Return JSON:
+{
+  "verdict": "pass" | "needs_changes",
+  "summary": string,
+  "findings": [
+    {
+      "severity": "blocking" | "non_blocking",
+      "file": string,
+      "line": number | null,
+      "issue": string,
+      "recommendation": string
+    }
+  ]
+}
+`;
+}
+
+export function buildFollowUpMessage(result: ReviewResult): string {
+  const blocking = result.findings.filter((finding) => finding.severity === "blocking");
+  const findings = blocking.length > 0 ? blocking : result.findings;
+  const lines = findings.map((finding, index) => `${index + 1}. ${formatFinding(finding)}`);
+
+  return [
+    "Review found blocking issues in your last changes.",
+    "",
+    "Fix only these items:",
+    ...lines,
+    "",
+    "After fixing, run the relevant tests and report the result.",
+  ].join("\n");
+}
+
+function formatFinding(finding: ReviewFinding): string {
+  const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
+  return `${location} - ${finding.issue} ${finding.recommendation}`;
+}

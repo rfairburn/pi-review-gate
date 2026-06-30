@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "mode": "single-decider",
+  "maxCorrectionCycles": 1,
+  "reviewWhen": "changed-files",
+  "maxPatchBytes": 200000,
+  "maxFileBytes": 1048576,
+  "maxSnapshotBytes": 52428800,
+  "retainBundles": "on-failure",
+  "decider": {
+    "id": "glm-5.2",
+    "adapter": "little-coder-model",
+    "model": "llamacpp/glm-5.2",
+    "timeoutMs": 180000
+  }
+}

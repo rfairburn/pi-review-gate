@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "mode": "quorum",
+  "maxCorrectionCycles": 1,
+  "reviewWhen": "changed-files",
+  "maxPatchBytes": 200000,
+  "maxFileBytes": 1048576,
+  "maxSnapshotBytes": 52428800,
+  "retainBundles": "on-failure",
+  "reviewers": [
+    {
+      "id": "claude",
+      "adapter": "generic-cli",
+      "command": "claude",
+      "args": ["--print"],
+      "timeoutMs": 120000
+    }
+  ],
+  "decider": {
+    "id": "claude-decider",
+    "adapter": "generic-cli",
+    "command": "claude",
+    "args": ["--print"],
+    "timeoutMs": 120000
+  }
+}

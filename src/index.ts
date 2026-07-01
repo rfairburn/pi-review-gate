@@ -121,7 +121,10 @@ export async function activate(pi: unknown): Promise<void> {
 
     if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
       if (state.correctionCycles >= config.maxCorrectionCycles) {
-        await sendNotice(noticeTarget, `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`);
+        await sendNotice(
+          noticeTarget,
+          `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})\n\n${output.followUpMessage}`,
+        );
         state.runActive = false;
         return;
       }

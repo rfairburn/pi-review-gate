@@ -49,6 +49,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendNotice(ctx, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
       } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
         await sendNotice(ctx, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
+        input.state.correctionCycles = 0;
         await sendFollowUp(input.pi, output.followUpMessage);
       } else {
         const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;

@@ -9,9 +9,7 @@
   "retainBundles": "on-failure",
   "decider": {
     "id": "codex",
-    "adapter": "generic-cli",
-    "command": "codex",
-    "args": [],
+    "adapter": "codex-cli",
     "timeoutMs": 120000
   }
 }

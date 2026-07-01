@@ -6,6 +6,7 @@ export function buildReviewerPrompt(input: {
   changes: ChangedFile[];
   patch: string;
   cwd: string;
+  evidenceMarkdown?: string;
 }): string {
   const changedFiles = input.changes.map((change) => ({
     path: change.path,
@@ -36,6 +37,11 @@ Patch:
 <patch_diff>
 ${input.patch}
 </patch_diff>
+
+Session evidence:
+<session_evidence>
+${input.evidenceMarkdown || "(no session evidence captured)"}
+</session_evidence>
 
 Return JSON:
 {

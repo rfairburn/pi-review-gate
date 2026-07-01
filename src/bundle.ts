@@ -2,13 +2,17 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChangedFile } from "./capture";
+import type { EvidenceBundle } from "./evidence";
 import { buildReviewerPrompt } from "./prompts";
+import type { TokenUsage } from "./usage";
 
 export interface ReviewBundleInput {
   cwd: string;
   request: string;
   changes: ChangedFile[];
   patch: string;
+  evidence?: EvidenceBundle;
+  actingUsage?: TokenUsage;
   metadata?: Record<string, unknown>;
 }
 
@@ -29,6 +33,7 @@ export async function createReviewBundle(input: ReviewBundleInput): Promise<Revi
     changes: input.changes,
     patch: input.patch,
     cwd: input.cwd,
+    evidenceMarkdown: input.evidence?.markdown,
   });
 
   const requestPath = join(dir, "request.md");
@@ -36,6 +41,9 @@ export async function createReviewBundle(input: ReviewBundleInput): Promise<Revi
   const patchPath = join(dir, "patch.diff");
   const metadataPath = join(dir, "metadata.json");
   const promptPath = join(dir, "reviewer-prompt.md");
+  const evidenceJsonPath = join(dir, "evidence.json");
+  const evidenceMarkdownPath = join(dir, "evidence.md");
+  const actingUsagePath = join(dir, "acting-model-usage.json");
 
   const changedFiles = input.changes.map((change) => ({
     path: change.path,
@@ -51,6 +59,9 @@ export async function createReviewBundle(input: ReviewBundleInput): Promise<Revi
     writeFile(patchPath, input.patch, "utf8"),
     writeFile(metadataPath, JSON.stringify({ cwd: input.cwd, createdAt: new Date().toISOString(), ...input.metadata }, null, 2), "utf8"),
     writeFile(promptPath, prompt, "utf8"),
+    writeFile(evidenceJsonPath, JSON.stringify(input.evidence ?? null, null, 2), "utf8"),
+    writeFile(evidenceMarkdownPath, input.evidence?.markdown ?? "", "utf8"),
+    writeFile(actingUsagePath, JSON.stringify(input.actingUsage ?? null, null, 2), "utf8"),
   ]);
 
   return {

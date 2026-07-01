@@ -10,17 +10,13 @@
   "reviewers": [
     {
       "id": "claude",
-      "adapter": "generic-cli",
-      "command": "claude",
-      "args": ["--print"],
+      "adapter": "claude-cli",
       "timeoutMs": 120000
     }
   ],
   "decider": {
     "id": "claude-decider",
-    "adapter": "generic-cli",
-    "command": "claude",
-    "args": ["--print"],
+    "adapter": "claude-cli",
     "timeoutMs": 120000
   }
 }

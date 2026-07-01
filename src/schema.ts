@@ -1,3 +1,5 @@
+import type { TokenUsage } from "./usage";
+
 export type ReviewVerdict = "pass" | "needs_changes" | "error";
 
 export type FindingSeverity = "blocking" | "non_blocking";
@@ -16,6 +18,7 @@ export interface ReviewResult {
   summary: string;
   findings: ReviewFinding[];
   rawOutputPath?: string;
+  usage?: TokenUsage;
   error?: string;
 }
 

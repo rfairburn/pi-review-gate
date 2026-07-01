@@ -2,6 +2,7 @@ import type { ReviewGateConfig } from "./config";
 import type { ReviewGateState } from "./state";
 import { runReview } from "./review";
 import { sendNotice, sendFollowUp } from "./pi";
+import { formatTokenUsage } from "./usage";
 
 export interface RegisterCommandsInput {
   pi: unknown;
@@ -26,30 +27,32 @@ export function registerCommands(input: RegisterCommandsInput): void {
   registerCommand("review-now", {
     description: "Run pi-review-gate against the current turn baseline.",
     handler: async (_args: string, ctx: unknown) => {
-    if (!input.state.baseline) {
-      await sendNotice(ctx, "review gate: no baseline available");
-      return;
-    }
-    const output = await runReview({
-      cwd: input.cwd(),
-      request: input.state.latestRequest || "Manual /review-now request",
-      before: input.state.baseline,
-      config: input.config,
-      notify: (message) => sendNotice(ctx, message),
-    });
+      if (!input.state.baseline) {
+        await sendNotice(ctx, "review gate: no baseline available");
+        return;
+      }
+      const output = await runReview({
+        cwd: input.cwd(),
+        request: input.state.latestRequest || "Manual /review-now request",
+        before: input.state.baseline,
+        config: input.config,
+        evidence: input.state.evidence,
+        notify: (message) => sendNotice(ctx, message),
+      });
 
-    if (!output.changed) {
-      await sendNotice(ctx, "review gate: no changes detected");
-      return;
-    }
-    if (output.result?.verdict === "pass") {
-      await sendNotice(ctx, "review gate: passed");
-    } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
-      await sendNotice(ctx, "review gate: changes requested");
-      await sendFollowUp(input.pi, output.followUpMessage);
-    } else {
-      await sendNotice(ctx, output.bundleRetained ? `review gate: reviewer failed, bundle retained at ${output.bundleDir}` : "review gate: reviewer failed");
-    }
+      if (!output.changed) {
+        await sendNotice(ctx, "review gate: no changes detected");
+        return;
+      }
+      if (output.result?.verdict === "pass") {
+        await sendNotice(ctx, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
+      } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
+        await sendNotice(ctx, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
+        await sendFollowUp(input.pi, output.followUpMessage);
+      } else {
+        const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
+        await sendNotice(ctx, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
+      }
     },
   });
 }

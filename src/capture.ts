@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -112,6 +112,51 @@ export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOpti
   };
 }
 
+export async function createPathSnapshot(cwd: string, pathLike: string, options: SnapshotOptions): Promise<FileSnapshot> {
+  const root = resolve(cwd);
+  const absolutePath = isAbsolute(pathLike) ? resolve(pathLike) : resolve(root, pathLike);
+  const relativePath = pathLabel(root, absolutePath);
+  const fileStat = await stat(absolutePath).catch(() => undefined);
+  if (!fileStat?.isFile()) {
+    return {
+      relativePath,
+      absolutePath,
+      exists: false,
+      size: 0,
+      mtimeMs: 0,
+      sha256: null,
+      isBinary: false,
+      omittedReason: "missing",
+    };
+  }
+
+  const sha256 = await hashFile(absolutePath);
+  const base: FileSnapshot = {
+    relativePath,
+    absolutePath,
+    exists: true,
+    size: fileStat.size,
+    mtimeMs: fileStat.mtimeMs,
+    sha256,
+    isBinary: false,
+  };
+
+  if (fileStat.size > options.maxFileBytes) {
+    return { ...base, omittedReason: "oversized" };
+  }
+
+  const buffer = await readFile(absolutePath);
+  const isBinary = looksBinary(buffer);
+  if (isBinary) {
+    return { ...base, isBinary: true, omittedReason: "binary" };
+  }
+
+  return {
+    ...base,
+    content: buffer.toString("utf8"),
+  };
+}
+
 export function compareSnapshots(before: WorkspaceSnapshot, after: WorkspaceSnapshot): ChangedFile[] {
   const paths = new Set([...before.files.keys(), ...after.files.keys()]);
   const changed: ChangedFile[] = [];
@@ -130,6 +175,19 @@ export function compareSnapshots(before: WorkspaceSnapshot, after: WorkspaceSnap
   }
 
   return changed;
+}
+
+export function compareFileSnapshots(before: FileSnapshot, after: FileSnapshot): ChangedFile | null {
+  if (!before.exists && after.exists) {
+    return fileChange(after.relativePath, "added", undefined, after);
+  }
+  if (before.exists && !after.exists) {
+    return fileChange(before.relativePath, "deleted", before, undefined);
+  }
+  if (before.exists && after.exists && before.sha256 !== after.sha256) {
+    return fileChange(after.relativePath, "modified", before, after);
+  }
+  return null;
 }
 
 export async function discoverFiles(cwd: string): Promise<string[]> {
@@ -224,4 +282,12 @@ function looksBinary(buffer: Buffer): boolean {
 
 function normalizeRelativePath(path: string): string {
   return path.split(sep).join("/");
+}
+
+function pathLabel(cwd: string, absolutePath: string): string {
+  const rel = relative(cwd, absolutePath);
+  if (!rel.startsWith("..") && !isAbsolute(rel)) {
+    return normalizeRelativePath(rel);
+  }
+  return normalizeRelativePath(absolutePath);
 }

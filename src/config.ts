@@ -13,15 +13,34 @@ export interface GenericCliDeciderConfig {
   timeoutMs?: number;
 }
 
+export interface CodexCliDeciderConfig {
+  id: string;
+  adapter: "codex-cli";
+  command?: string;
+  args?: string[];
+  model?: string;
+  timeoutMs?: number;
+}
+
+export interface ClaudeCliDeciderConfig {
+  id: string;
+  adapter: "claude-cli";
+  command?: string;
+  args?: string[];
+  model?: string;
+  timeoutMs?: number;
+}
+
 export interface LittleCoderDeciderConfig {
   id: string;
   adapter: "little-coder-model";
   model: string;
   command?: string;
+  args?: string[];
   timeoutMs?: number;
 }
 
-export type DeciderConfig = GenericCliDeciderConfig | LittleCoderDeciderConfig;
+export type DeciderConfig = GenericCliDeciderConfig | CodexCliDeciderConfig | ClaudeCliDeciderConfig | LittleCoderDeciderConfig;
 
 export interface ReviewGateConfig {
   enabled: boolean;
@@ -140,6 +159,26 @@ function normalizeDecider(value: unknown): DeciderConfig {
       timeoutMs: numberOrDefault(value.timeoutMs, 120_000),
     };
   }
+  if (value.adapter === "codex-cli") {
+    return {
+      id: value.id,
+      adapter: "codex-cli",
+      command: typeof value.command === "string" ? value.command : "codex",
+      args: Array.isArray(value.args) ? value.args.map(String) : [],
+      model: typeof value.model === "string" ? value.model : undefined,
+      timeoutMs: numberOrDefault(value.timeoutMs, 120_000),
+    };
+  }
+  if (value.adapter === "claude-cli") {
+    return {
+      id: value.id,
+      adapter: "claude-cli",
+      command: typeof value.command === "string" ? value.command : "claude",
+      args: Array.isArray(value.args) ? value.args.map(String) : [],
+      model: typeof value.model === "string" ? value.model : undefined,
+      timeoutMs: numberOrDefault(value.timeoutMs, 120_000),
+    };
+  }
   if (value.adapter === "little-coder-model") {
     if (typeof value.model !== "string" || !value.model.trim()) {
       throw new Error("little-coder-model decider requires model");
@@ -149,6 +188,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       adapter: "little-coder-model",
       model: value.model,
       command: typeof value.command === "string" ? value.command : "little-coder",
+      args: Array.isArray(value.args) ? value.args.map(String) : [],
       timeoutMs: numberOrDefault(value.timeoutMs, 180_000),
     };
   }

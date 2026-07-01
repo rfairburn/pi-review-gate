@@ -28,7 +28,7 @@ The older `LITTLE_CODER_REVIEW_CONFIG` and
 `LITTLE_CODER_REVIEW_GATE_DISABLED` names are still accepted as compatibility
 aliases.
 
-Example config:
+Example config using Codex as the reviewer:
 
 ```json
 {
@@ -41,10 +41,8 @@ Example config:
   "maxSnapshotBytes": 52428800,
   "retainBundles": "on-failure",
   "decider": {
-    "id": "claude",
-    "adapter": "generic-cli",
-    "command": "claude",
-    "args": ["--print"],
+    "id": "codex",
+    "adapter": "codex-cli",
     "timeoutMs": 120000
   }
 }
@@ -62,6 +60,44 @@ For little-coder specifically, the same built extension can be loaded with:
 ```bash
 PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json \
 little-coder -e /path/to/pi-review-gate/dist/src/index.js
+```
+
+A Codex-oriented starter config is available at:
+
+```bash
+examples/single-codex.json
+```
+
+Claude and little-coder model examples are available at:
+
+```bash
+examples/single-claude.json
+examples/single-little-coder-model.json
+```
+
+The little-coder model adapter is generic. The example currently uses
+`ollama/glm-5.2`, matching a provider/model entry from
+`~/.config/little-coder/models.json`.
+
+For little-coder plus Codex review, use:
+
+```bash
+./scripts/little-coder-codex-review.sh
+```
+
+The development wrappers pass all ordinary arguments through to `little-coder`.
+By default they do not retain review temp bundles. To keep review bundles, pass:
+
+```bash
+./scripts/little-coder-codex-review.sh --retain-review-bundles
+```
+
+The wrapper flag also accepts explicit modes:
+
+```bash
+--retain-review-bundles=never
+--retain-review-bundles=on-failure
+--retain-review-bundles=always
 ```
 
 ## Temporary fake reviewer
@@ -86,3 +122,16 @@ PI_REVIEW_GATE_FAKE_RECOMMENDATION="Make any tiny follow-up edit." \
 PI_REVIEW_GATE_FAKE_VERDICT=retry \
 ./scripts/little-coder-fake-review.sh
 ```
+
+The review bundle includes a compact evidence ledger built from tool calls,
+tool results, high-confidence file path arguments, shell redirection targets,
+and the agent's final assistant summary. Exact `write` / `edit` paths and easy
+shell targets are pre-captured before execution, including absolute paths
+outside the current worktree.
+
+Retained review bundles include `request.md`, `changed-files.json`,
+`patch.diff`, `reviewer-prompt.md`, `evidence.json`, `evidence.md`,
+`acting-model-usage.json`, `reviewer-usage.json`, `raw-output.txt`, and
+`stderr.txt`. When supported by the reviewer CLI, user-facing notices include a
+compact reviewer token summary, for example `review gate: passed (review tokens:
+in 1.2k, out 340, total 1.6k)`.

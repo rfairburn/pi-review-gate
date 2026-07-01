@@ -9,9 +9,7 @@
   "retainBundles": "on-failure",
   "decider": {
     "id": "claude",
-    "adapter": "generic-cli",
-    "command": "claude",
-    "args": ["--print"],
+    "adapter": "claude-cli",
     "timeoutMs": 120000
   }
 }

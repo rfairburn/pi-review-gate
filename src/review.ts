@@ -4,16 +4,23 @@ import type { ReviewGateConfig } from "./config";
 import { createReviewBundle, removeReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
+import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
 import { buildFollowUpMessage } from "./prompts";
 import type { ReviewResult } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
+import { CodexCliAdapter } from "./adapters/codex-cli";
+import { ClaudeCliAdapter } from "./adapters/claude-cli";
+import { LittleCoderAdapter } from "./adapters/little-coder";
 import type { ModelAdapter } from "./adapters/types";
+import type { TokenUsage } from "./usage";
 
 export interface ReviewRunInput {
   cwd: string;
   request: string;
   before: WorkspaceSnapshot;
   config: ReviewGateConfig;
+  evidence?: EvidenceState;
+  actingUsage?: TokenUsage;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
 }
@@ -33,7 +40,14 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     maxFileBytes: input.config.maxFileBytes,
     maxSnapshotBytes: input.config.maxSnapshotBytes,
   });
-  const changes = compareSnapshots(input.before, after);
+  const workspaceChanges = compareSnapshots(input.before, after);
+  const evidenceChanges = input.evidence
+    ? await collectEvidenceChanges(input.evidence, input.cwd, {
+      maxFileBytes: input.config.maxFileBytes,
+      maxSnapshotBytes: input.config.maxSnapshotBytes,
+    })
+    : [];
+  const changes = mergeChanges(workspaceChanges, evidenceChanges);
   if (changes.length === 0) {
     return { changed: false, changes };
   }
@@ -53,6 +67,10 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     request: input.request,
     changes,
     patch: patchResult.patch,
+    evidence: input.evidence
+      ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
+      : undefined,
+    actingUsage: input.actingUsage,
     metadata: {
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
@@ -71,7 +89,10 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       timeoutMs: decider.timeoutMs ?? 120_000,
       signal: input.signal,
     });
-    await writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8");
+    await Promise.all([
+      writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
+      writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    ]);
   } catch (error) {
     result = {
       reviewerId: decider.id,
@@ -80,7 +101,10 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       findings: [],
       error: error instanceof Error ? error.message : "review_failed",
     };
-    await writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8").catch(() => undefined);
+    await Promise.all([
+      writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
+      writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    ]).catch(() => undefined);
   }
 
   const shouldRetain = input.config.retainBundles === "always" || (input.config.retainBundles === "on-failure" && result.verdict === "error");
@@ -102,6 +126,28 @@ function createAdapter(decider: NonNullable<ReviewGateConfig["decider"]>): Model
   if (decider.adapter === "generic-cli") {
     return new GenericCliAdapter(decider);
   }
+  if (decider.adapter === "codex-cli") {
+    return new CodexCliAdapter(decider);
+  }
+  if (decider.adapter === "claude-cli") {
+    return new ClaudeCliAdapter(decider);
+  }
+  if (decider.adapter === "little-coder-model") {
+    return new LittleCoderAdapter(decider);
+  }
 
-  throw new Error("little-coder-model adapter is not implemented yet");
+  throw new Error("unsupported reviewer adapter");
+}
+
+function mergeChanges<T extends { path: string }>(workspaceChanges: T[], evidenceChanges: T[]): T[] {
+  const byPath = new Map<string, T>();
+  for (const change of workspaceChanges) {
+    byPath.set(change.path, change);
+  }
+  for (const change of evidenceChanges) {
+    if (!byPath.has(change.path)) {
+      byPath.set(change.path, change);
+    }
+  }
+  return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
 }

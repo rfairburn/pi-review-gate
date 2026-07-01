@@ -4,7 +4,7 @@ import { registerCommands } from "./commands";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendFollowUp, sendNotice } from "./pi";
 import { runReview } from "./review";
-import { createState, recordTouchedPath, rememberUserRequest, resetRunEvidence } from "./state";
+import { beginAgentRun, buildRequestContext, createState, recordTouchedPath, rememberUserRequest } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
 
 declare const module: {
@@ -45,7 +45,10 @@ export async function activate(pi: unknown): Promise<void> {
 
   registerHook(pi, "before_agent_start", async (...args) => {
     currentCwd = extractCwd(args, currentCwd);
-    resetRunEvidence(state);
+    const runKind = beginAgentRun(state);
+    if (runKind === "continuation") {
+      return;
+    }
     state.baseline = await createWorkspaceSnapshot(currentCwd, {
       maxFileBytes: config.maxFileBytes,
       maxSnapshotBytes: config.maxSnapshotBytes,
@@ -91,12 +94,13 @@ export async function activate(pi: unknown): Promise<void> {
     rememberFinalAssistantSummary(state.evidence, args);
     const actingUsage = extractPiUsageFromMessages(args);
     if (!state.baseline) {
+      state.runActive = false;
       return;
     }
 
     const output = await runReview({
       cwd: currentCwd,
-      request: state.latestRequest || "No original request captured.",
+      request: buildRequestContext(state),
       before: state.baseline,
       config,
       evidence: state.evidence,
@@ -105,27 +109,32 @@ export async function activate(pi: unknown): Promise<void> {
     });
 
     if (!output.changed) {
+      state.runActive = false;
       return;
     }
 
     if (output.result?.verdict === "pass") {
       await sendNotice(noticeTarget, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
+      state.runActive = false;
       return;
     }
 
     if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
       if (state.correctionCycles >= config.maxCorrectionCycles) {
         await sendNotice(noticeTarget, `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`);
+        state.runActive = false;
         return;
       }
       state.correctionCycles += 1;
       await sendNotice(noticeTarget, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
+      state.runActive = false;
       await sendFollowUp(pi, output.followUpMessage);
       return;
     }
 
     const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
     await sendNotice(noticeTarget, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
+    state.runActive = false;
   });
 
   registerCommands({

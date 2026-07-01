@@ -1,5 +1,5 @@
 import type { ReviewGateConfig } from "./config";
-import type { ReviewGateState } from "./state";
+import { buildRequestContext, type ReviewGateState } from "./state";
 import { runReview } from "./review";
 import { sendNotice, sendFollowUp } from "./pi";
 import { formatTokenUsage } from "./usage";
@@ -33,7 +33,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const output = await runReview({
         cwd: input.cwd(),
-        request: input.state.latestRequest || "Manual /review-now request",
+        request: buildRequestContext(input.state) || "Manual /review-now request",
         before: input.state.baseline,
         config: input.config,
         evidence: input.state.evidence,

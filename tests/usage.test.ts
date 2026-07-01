@@ -36,6 +36,28 @@ test("parseCodexUsageFromJsonl reads token_count events", () => {
   assert.equal(usage?.totalTokens, 1450);
 });
 
+test("parseCodexUsageFromJsonl reads turn.completed usage events", () => {
+  const usage = parseCodexUsageFromJsonl([
+    JSON.stringify({ type: "thread.started", thread_id: "abc" }),
+    JSON.stringify({ type: "turn.started" }),
+    JSON.stringify({
+      type: "turn.completed",
+      usage: {
+        input_tokens: 19030,
+        cached_input_tokens: 4992,
+        output_tokens: 556,
+        reasoning_output_tokens: 516,
+      },
+    }),
+  ].join("\n"));
+
+  assert.equal(usage?.inputTokens, 19030);
+  assert.equal(usage?.cachedInputTokens, 4992);
+  assert.equal(usage?.outputTokens, 556);
+  assert.equal(usage?.reasoningOutputTokens, 516);
+  assert.equal(usage?.totalTokens, 19586);
+});
+
 test("parseClaudeUsage reads json output usage and review text", () => {
   const output = {
     result: "{\"verdict\":\"pass\",\"summary\":\"ok\",\"findings\":[]}",
@@ -57,6 +79,24 @@ test("parseClaudeUsage reads json output usage and review text", () => {
   assert.equal(usage?.outputTokens, 150);
   assert.equal(usage?.totalTokens, 1500);
   assert.equal(usage?.costTotal, 0.0123);
+});
+
+test("parseClaudeUsage ignores zero usage on Claude error envelopes", () => {
+  const usage = parseClaudeUsage({
+    type: "result",
+    is_error: true,
+    api_error_status: 401,
+    result: "Failed to authenticate.",
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      output_tokens: 0,
+    },
+  });
+
+  assert.equal(usage, undefined);
 });
 
 test("extractReviewTextFromPiJsonl reads assistant text and little-coder usage", () => {
@@ -114,4 +154,5 @@ test("formatTokenUsage returns compact user-facing summary", () => {
     "review tokens: in 1.2k, out 345, total 1.5k",
   );
   assert.equal(formatTokenUsage(undefined), "review tokens: unavailable");
+  assert.equal(formatTokenUsage({ inputTokens: 0, outputTokens: 0, totalTokens: 0 }), "review tokens: unavailable");
 });

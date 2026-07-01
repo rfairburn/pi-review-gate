@@ -50,7 +50,11 @@ export class ClaudeCliAdapter implements ModelAdapter {
       return errorResult(req.id, `Reviewer timed out after ${req.timeoutMs}ms.`, rawOutputPath, "timeout", usage);
     }
     if (output.code !== 0) {
-      return errorResult(req.id, `Reviewer exited with status ${output.code}.`, rawOutputPath, `exit_${output.code}`, usage);
+      return errorResult(req.id, claudeErrorSummary(parsed) ?? `Reviewer exited with status ${output.code}.`, rawOutputPath, `exit_${output.code}`, usage);
+    }
+    const claudeError = claudeErrorSummary(parsed);
+    if (claudeError) {
+      return errorResult(req.id, claudeError, rawOutputPath, "claude_error", usage);
     }
 
     const finalText = extractReviewTextFromClaudeJson(parsed) || output.stdout;
@@ -62,4 +66,17 @@ export class ClaudeCliAdapter implements ModelAdapter {
 
 function errorResult(reviewerId: string, summary: string, rawOutputPath: string, error: string, usage: ReviewResult["usage"]): ReviewResult {
   return { reviewerId, verdict: "error", summary, findings: [], rawOutputPath, error, usage };
+}
+
+function claudeErrorSummary(value: unknown): string | undefined {
+  if (!isRecord(value) || value.is_error !== true) {
+    return undefined;
+  }
+  const status = typeof value.api_error_status === "number" ? `Claude API ${value.api_error_status}` : "Claude API error";
+  const result = typeof value.result === "string" && value.result.trim() ? value.result.trim() : undefined;
+  return result ? `${status}: ${result}` : status;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

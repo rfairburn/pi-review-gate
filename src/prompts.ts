@@ -18,12 +18,12 @@ export function buildReviewerPrompt(input: {
 
   return `You are reviewing code changes made by another coding agent.
 
-Review only the supplied request and patch. Do not ask for more context unless the patch is impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
+Review only the supplied user request context, patch, and session evidence. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the patch is impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
 
 Workspace:
 ${input.cwd}
 
-Original request:
+User request context:
 <request>
 ${input.request}
 </request>

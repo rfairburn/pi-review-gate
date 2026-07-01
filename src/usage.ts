@@ -10,7 +10,7 @@ export interface TokenUsage {
 }
 
 export function formatTokenUsage(usage: TokenUsage | undefined): string {
-  if (!usage) {
+  if (!usage || isZeroUsage(usage)) {
     return "review tokens: unavailable";
   }
   const parts: string[] = [];
@@ -50,7 +50,12 @@ export function parseCodexUsageFromJsonl(stdout: string): TokenUsage | undefined
     } catch {
       continue;
     }
-    if (isRecord(parsed) && isRecord(parsed.payload) && parsed.payload.type === "token_count") {
+    if (!isRecord(parsed)) {
+      continue;
+    }
+    if (parsed.type === "turn.completed" && isRecord(parsed.usage)) {
+      lastUsage = parsed.usage;
+    } else if (isRecord(parsed.payload) && parsed.payload.type === "token_count") {
       lastUsage = parsed.payload.info;
     }
   }
@@ -61,7 +66,7 @@ export function parseCodexUsageFromJsonl(stdout: string): TokenUsage | undefined
   const totalTokenUsage = isRecord(lastUsage.total_token_usage) ? lastUsage.total_token_usage : undefined;
   const raw = lastTokenUsage ?? totalTokenUsage;
   if (!raw) {
-    return { raw: lastUsage };
+    return normalizeOpenAiStyleUsage(lastUsage, lastUsage);
   }
   return normalizeOpenAiStyleUsage(raw, lastUsage);
 }
@@ -78,7 +83,7 @@ export function parseClaudeUsage(value: unknown): TokenUsage | undefined {
   if (!usage) {
     return undefined;
   }
-  return {
+  const result = {
     inputTokens: numberValue(usage.input_tokens),
     cachedInputTokens: numberValue(usage.cache_read_input_tokens),
     cacheWriteTokens: numberValue(usage.cache_creation_input_tokens),
@@ -92,6 +97,7 @@ export function parseClaudeUsage(value: unknown): TokenUsage | undefined {
     costTotal: numberValue(value.total_cost_usd),
     raw: usage,
   };
+  return isZeroUsage(result) && isRecord(value) && value.is_error === true ? undefined : result;
 }
 
 export function parsePiUsage(value: unknown): TokenUsage | undefined {
@@ -202,12 +208,16 @@ export function extractReviewTextFromPiJsonl(stdout: string): { text: string; us
 }
 
 function normalizeOpenAiStyleUsage(value: Record<string, unknown>, raw: unknown): TokenUsage {
+  const inputTokens = numberValue(value.input_tokens);
+  const cachedInputTokens = numberValue(value.cached_input_tokens);
+  const outputTokens = numberValue(value.output_tokens);
+  const reasoningOutputTokens = numberValue(value.reasoning_output_tokens);
   return {
-    inputTokens: numberValue(value.input_tokens),
-    cachedInputTokens: numberValue(value.cached_input_tokens),
-    outputTokens: numberValue(value.output_tokens),
-    reasoningOutputTokens: numberValue(value.reasoning_output_tokens),
-    totalTokens: numberValue(value.total_tokens),
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens: numberValue(value.total_tokens) ?? sumDefined([inputTokens, outputTokens]),
     raw,
   };
 }
@@ -242,6 +252,19 @@ function formatCount(value: number): string {
     return `${(value / 1_000).toFixed(1)}k`;
   }
   return String(value);
+}
+
+function isZeroUsage(usage: TokenUsage): boolean {
+  const values = [
+    usage.inputTokens,
+    usage.cachedInputTokens,
+    usage.outputTokens,
+    usage.reasoningOutputTokens,
+    usage.cacheWriteTokens,
+    usage.totalTokens,
+    usage.costTotal,
+  ].filter((value): value is number => value !== undefined);
+  return values.length > 0 && values.every((value) => value === 0);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

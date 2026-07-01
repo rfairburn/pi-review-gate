@@ -76,3 +76,63 @@ test("runReview skips reviewer when no files changed", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("runReview prompt preserves request context and original baseline across continued work", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-continued-"));
+  try {
+    await writeFile(join(dir, "main.tf"), "fleet_image = \"before\"\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "main.tf"), "fleet_image = \"during\"\n", "utf8");
+    await writeFile(join(dir, "main.tf"), "fleet_image = \"after-geolite2\"\n", "utf8");
+
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      decider: {
+        id: "prompt-checker",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "process.stdin.resume();",
+            "let s='';",
+            "process.stdin.on('data',c=>s+=c);",
+            "process.stdin.on('end',()=>{",
+            "const ok=s.includes('Initial user request:')",
+            "&& s.includes('update Fleet release bits')",
+            "&& s.includes('Additional user guidance during the same agent run:')",
+            "&& s.includes('the -geolite2 needs to go back for pinterest')",
+            "&& s.includes('-fleet_image = \"before\"')",
+            "&& s.includes('+fleet_image = \"after-geolite2\"');",
+            "process.stdout.write(JSON.stringify(ok",
+            "?{verdict:'pass',summary:'ok',findings:[]}",
+            ":{verdict:'needs_changes',summary:'missing context',findings:[{severity:'blocking',file:'main.tf',line:null,issue:'prompt lacked continued context',recommendation:'include original and mid-run request context'}]}));",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    };
+
+    const output = await runReview({
+      cwd: dir,
+      request: [
+        "Initial user request:",
+        "update Fleet release bits",
+        "",
+        "Additional user guidance during the same agent run:",
+        "2. the -geolite2 needs to go back for pinterest",
+      ].join("\n"),
+      before,
+      config,
+    });
+
+    assert.equal(output.changed, true);
+    assert.equal(output.result?.verdict, "pass");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

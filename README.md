@@ -129,6 +129,22 @@ and the agent's final assistant summary. Exact `write` / `edit` paths and easy
 shell targets are pre-captured before execution, including absolute paths
 outside the current worktree.
 
+## Commands
+
+`/review-now` reruns the configured reviewer against the current captured
+baseline and evidence.
+
+`/ask-reviewer [--private|--public] <question>` asks the configured reviewer an
+ad hoc question about the current work. It includes the current request context,
+changed files and patch when available, and the session evidence digest,
+including read-only/tool-call activity and the primary agent's final summary.
+This makes it useful after planning-only turns as well as after edits.
+
+`--private` is the default. The answer is shown to you but is not sent to the
+primary model. With `--public`, the answer is also queued as `nextTurn` context,
+so the primary model sees it on your next real message without triggering a new
+turn immediately.
+
 Retained review bundles include `request.md`, `changed-files.json`,
 `patch.diff`, `reviewer-prompt.md`, `evidence.json`, `evidence.md`,
 `acting-model-usage.json`, `reviewer-usage.json`, `raw-output.txt`, and

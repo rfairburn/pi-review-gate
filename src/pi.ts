@@ -49,6 +49,19 @@ export async function sendFollowUp(pi: unknown, message: string): Promise<void> 
   }
 }
 
+export async function sendNextTurnMessage(pi: unknown, content: string, details?: unknown): Promise<boolean> {
+  if (!isRecord(pi) || typeof pi.sendMessage !== "function") {
+    return false;
+  }
+  await pi.sendMessage({
+    customType: "pi-review-gate/reviewer-note",
+    content,
+    display: true,
+    details,
+  }, { deliverAs: "nextTurn" });
+  return true;
+}
+
 export function extractCwd(args: unknown[], fallback: string = process.cwd()): string {
   for (const arg of args) {
     if (isRecord(arg) && typeof arg.cwd === "string") {

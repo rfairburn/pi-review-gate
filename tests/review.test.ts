@@ -5,7 +5,8 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ReviewGateConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
-import { runReview } from "../src/review";
+import { createEvidenceState } from "../src/evidence";
+import { runAskReviewer, runReview } from "../src/review";
 
 const baseConfig: ReviewGateConfig = {
   enabled: true,
@@ -132,6 +133,63 @@ test("runReview prompt preserves request context and original baseline across co
 
     assert.equal(output.changed, true);
     assert.equal(output.result?.verdict, "pass");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runAskReviewer answers with request and evidence even when there is no patch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-reviewer-"));
+  try {
+    const evidence = createEvidenceState();
+    evidence.events.push({
+      sequence: 1,
+      phase: "tool_call",
+      toolName: "read",
+      summary: "planning-session-tool read terraform files before proposing a plan",
+      candidatePaths: ["main.tf"],
+      riskSignals: [],
+    });
+    evidence.finalAssistantSummary = "Plan: update shared docker locals after confirming release branch naming.";
+
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      decider: {
+        id: "prompt-checker",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "process.stdin.resume();",
+            "let s='';",
+            "process.stdin.on('data',c=>s+=c);",
+            "process.stdin.on('end',()=>{",
+            "const ok=s.includes('Reviewer question:')",
+            "&& s.includes('does this plan look legit?')",
+            "&& s.includes('Plan the Fleet release update')",
+            "&& s.includes('planning-session-tool')",
+            "&& s.includes('no baseline available');",
+            "process.stdout.write(JSON.stringify(ok",
+            "?{verdict:'pass',summary:'The plan is reviewable from evidence even without a patch.',findings:[]}",
+            ":{verdict:'needs_changes',summary:'missing planning context',findings:[{severity:'blocking',file:'session',line:null,issue:'prompt lacked planning evidence',recommendation:'include evidence for no-patch reviewer questions'}]}));",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    };
+
+    const output = await runAskReviewer({
+      cwd: dir,
+      question: "does this plan look legit?",
+      request: "Plan the Fleet release update",
+      config,
+      evidence,
+    });
+
+    assert.equal(output.result?.verdict, "pass");
+    assert.match(output.result?.summary ?? "", /reviewable from evidence/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

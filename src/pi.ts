@@ -28,13 +28,19 @@ export async function sendNotice(pi: unknown, message: string): Promise<void> {
   if (!isRecord(pi)) {
     return;
   }
-  if (typeof pi.notify === "function") {
+  if (isRecord(pi.ui) && typeof pi.ui.notify === "function") {
+    await pi.ui.notify(message, "info");
+  } else if (typeof pi.notify === "function") {
     await pi.notify(message);
   } else if (typeof pi.sendSystemMessage === "function") {
     await pi.sendSystemMessage(message);
   } else if (typeof pi.log === "function") {
     pi.log(message);
   }
+}
+
+export function extractContext(args: unknown[]): unknown {
+  return args.find((arg) => isRecord(arg) && isRecord(arg.ui)) ?? undefined;
 }
 
 export async function sendFollowUp(pi: unknown, message: string): Promise<void> {
@@ -63,7 +69,7 @@ export function extractInputText(args: unknown[]): string {
     if (!isRecord(arg)) {
       continue;
     }
-    for (const key of ["text", "input", "content", "message", "prompt"]) {
+    for (const key of ["text", "prompt", "input", "content", "message"]) {
       if (typeof arg[key] === "string") {
         return arg[key] as string;
       }
@@ -72,10 +78,19 @@ export function extractInputText(args: unknown[]): string {
   return "";
 }
 
+export function extractInputSource(args: unknown[]): string | undefined {
+  for (const arg of args) {
+    if (isRecord(arg) && typeof arg.source === "string") {
+      return arg.source;
+    }
+  }
+  return undefined;
+}
+
 export function extractToolName(args: unknown[]): string {
   for (const arg of args) {
     if (isRecord(arg)) {
-      for (const key of ["name", "tool", "toolName"]) {
+      for (const key of ["toolName", "name", "tool"]) {
         if (typeof arg[key] === "string") {
           return arg[key] as string;
         }
@@ -87,14 +102,14 @@ export function extractToolName(args: unknown[]): string {
 
 export function extractToolArgs(args: unknown[]): Record<string, unknown> | undefined {
   for (const arg of args) {
+    if (isRecord(arg) && isRecord(arg.input)) {
+      return arg.input;
+    }
     if (isRecord(arg) && isRecord(arg.args)) {
       return arg.args;
     }
     if (isRecord(arg) && isRecord(arg.arguments)) {
       return arg.arguments;
-    }
-    if (isRecord(arg) && isRecord(arg.input)) {
-      return arg.input;
     }
   }
   return undefined;

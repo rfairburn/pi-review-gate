@@ -63,3 +63,26 @@ For little-coder specifically, the same built extension can be loaded with:
 PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json \
 little-coder -e /path/to/pi-review-gate/dist/src/index.js
 ```
+
+## Temporary fake reviewer
+
+For local wiring tests, use the fake reviewer wrapper:
+
+```bash
+./scripts/little-coder-fake-review.sh
+```
+
+By default it approves changed files. To force the retry/follow-up path:
+
+```bash
+PI_REVIEW_GATE_FAKE_VERDICT=retry ./scripts/little-coder-fake-review.sh
+```
+
+Optional retry message controls:
+
+```bash
+PI_REVIEW_GATE_FAKE_ISSUE="Controlled fake issue." \
+PI_REVIEW_GATE_FAKE_RECOMMENDATION="Make any tiny follow-up edit." \
+PI_REVIEW_GATE_FAKE_VERDICT=retry \
+./scripts/little-coder-fake-review.sh
+```

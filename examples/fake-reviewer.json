@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "mode": "single-decider",
+  "maxCorrectionCycles": 1,
+  "reviewWhen": "changed-files",
+  "maxPatchBytes": 200000,
+  "maxFileBytes": 1048576,
+  "maxSnapshotBytes": 52428800,
+  "retainBundles": "on-failure",
+  "decider": {
+    "id": "fake-reviewer",
+    "adapter": "generic-cli",
+    "command": "node",
+    "args": ["scripts/fake-reviewer.cjs"],
+    "timeoutMs": 5000
+  }
+}

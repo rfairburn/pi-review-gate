@@ -1,7 +1,7 @@
 import { loadConfig } from "./config";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
-import { registerHook, extractCwd, extractInputText, extractToolArgs, extractToolName, sendFollowUp, sendNotice } from "./pi";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendFollowUp, sendNotice } from "./pi";
 import { runReview } from "./review";
 import { createState, recordTouchedPath, rememberUserRequest } from "./state";
 
@@ -29,8 +29,15 @@ export async function activate(pi: unknown): Promise<void> {
   const state = createState();
   let currentCwd = process.cwd();
 
+  registerHook(pi, "session_start", async (...args) => {
+    await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
+  });
+
   registerHook(pi, "input", (...args) => {
     currentCwd = extractCwd(args, currentCwd);
+    if (extractInputSource(args) === "extension") {
+      return;
+    }
     rememberUserRequest(state, extractInputText(args));
   });
 
@@ -62,6 +69,7 @@ export async function activate(pi: unknown): Promise<void> {
 
   registerHook(pi, "agent_end", async (...args) => {
     currentCwd = extractCwd(args, currentCwd);
+    const noticeTarget = extractContext(args) ?? pi;
     if (!state.baseline) {
       return;
     }
@@ -71,7 +79,7 @@ export async function activate(pi: unknown): Promise<void> {
       request: state.latestRequest || "No original request captured.",
       before: state.baseline,
       config,
-      notify: (message) => sendNotice(pi, message),
+      notify: (message) => sendNotice(noticeTarget, message),
     });
 
     if (!output.changed) {
@@ -79,22 +87,22 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     if (output.result?.verdict === "pass") {
-      await sendNotice(pi, "review gate: passed");
+      await sendNotice(noticeTarget, "review gate: passed");
       return;
     }
 
     if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
       if (state.correctionCycles >= config.maxCorrectionCycles) {
-        await sendNotice(pi, "review gate: changes requested, automatic correction cap reached");
+        await sendNotice(noticeTarget, "review gate: changes requested, automatic correction cap reached");
         return;
       }
       state.correctionCycles += 1;
-      await sendNotice(pi, "review gate: changes requested");
+      await sendNotice(noticeTarget, "review gate: changes requested");
       await sendFollowUp(pi, output.followUpMessage);
       return;
     }
 
-    await sendNotice(pi, output.bundleRetained ? `review gate: reviewer failed, bundle retained at ${output.bundleDir}` : "review gate: reviewer failed");
+    await sendNotice(noticeTarget, output.bundleRetained ? `review gate: reviewer failed, bundle retained at ${output.bundleDir}` : "review gate: reviewer failed");
   });
 
   registerCommands({

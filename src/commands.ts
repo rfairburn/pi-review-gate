@@ -1,7 +1,7 @@
 import type { ReviewGateConfig } from "./config";
 import { buildRequestContext, type ReviewGateState } from "./state";
 import { runAskReviewer, runReview } from "./review";
-import { sendNotice, sendFollowUp, sendNextTurnMessage } from "./pi";
+import { sendNotice, sendFollowUp, sendUserPrompt } from "./pi";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 
@@ -61,20 +61,16 @@ export function registerCommands(input: RegisterCommandsInput): void {
   registerCommand("ask-reviewer", {
     description: "Ask the configured reviewer a question about the current work.",
     handler: async (args: string, ctx: unknown) => {
-      const parsed = parseAskReviewerArgs(args);
-      if (parsed.error) {
-        await sendNotice(ctx, `review gate: ${parsed.error}`);
-        return;
-      }
-      if (!parsed.question) {
-        await sendNotice(ctx, "review gate: usage: /ask-reviewer [--private|--public] <question>");
+      const question = args.trim();
+      if (!question) {
+        await sendNotice(ctx, "review gate: usage: /ask-reviewer <question>");
         return;
       }
 
-      await sendNotice(ctx, `review gate: asking reviewer\n\nQuestion: ${parsed.question}`);
+      await sendNotice(ctx, `review gate: asking reviewer\n\nQuestion: ${question}`);
       const output = await runAskReviewer({
         cwd: input.cwd(),
-        question: parsed.question,
+        question,
         request: buildRequestContext(input.state),
         before: input.state.baseline,
         config: input.config,
@@ -93,20 +89,13 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
 
-      const answer = formatReviewerAnswer(parsed.question, output.result);
-      await sendNotice(ctx, `${answer}\n\n${formatTokenUsage(output.result.usage)}`);
-
-      if (parsed.visibility === "public") {
-        const queued = await sendNextTurnMessage(input.pi, formatPublicReviewerNote(parsed.question, output.result), {
-          command: "ask-reviewer",
-          question: parsed.question,
-          reviewerId: output.result.reviewerId,
-          verdict: output.result.verdict,
-        });
-        await sendNotice(ctx, queued
-          ? "review gate: reviewer answer queued for the next primary-model turn"
-          : "review gate: could not queue reviewer answer for next turn; host does not expose sendMessage");
+      const payload = formatReviewerAnswer(question, output.result);
+      const submittedPayload = await showPrivateReviewerAnswer(ctx, payload);
+      if (typeof submittedPayload === "string" && submittedPayload.trim()) {
+        await sendUserPrompt(input.pi, submittedPayload.trim());
+        return;
       }
+      await sendNotice(ctx, `${formatTokenUsage(output.result.usage)}\nreview gate: reviewer answer cleared`);
     },
   });
 }
@@ -126,54 +115,7 @@ function getRegisterCommand(pi: unknown): RegisterCommand | undefined {
   return undefined;
 }
 
-type AskReviewerVisibility = "private" | "public";
-
-function parseAskReviewerArgs(args: string): { visibility: AskReviewerVisibility; question: string; error?: string } {
-  const parts = args.trim().split(/\s+/).filter(Boolean);
-  let visibility: AskReviewerVisibility = "private";
-  const questionParts: string[] = [];
-  let passthrough = false;
-
-  for (const part of parts) {
-    if (passthrough) {
-      questionParts.push(part);
-      continue;
-    }
-    if (part === "--") {
-      passthrough = true;
-    } else if (part === "--private") {
-      visibility = "private";
-    } else if (part === "--public") {
-      visibility = "public";
-    } else if (part.startsWith("--")) {
-      return { visibility, question: "", error: `unsupported /ask-reviewer flag: ${part}` };
-    } else {
-      questionParts.push(part);
-    }
-  }
-
-  return {
-    visibility,
-    question: questionParts.join(" ").trim(),
-  };
-}
-
 function formatReviewerAnswer(question: string, result: ReviewResult): string {
-  const lines = [
-    "review gate: reviewer answer",
-    "",
-    `Question: ${question}`,
-    "",
-    result.summary,
-  ];
-  const findings = formatFindings(result.findings);
-  if (findings.length > 0) {
-    lines.push("", "Findings:", ...findings);
-  }
-  return lines.join("\n");
-}
-
-function formatPublicReviewerNote(question: string, result: ReviewResult): string {
   const lines = [
     "Reviewer note from /ask-reviewer:",
     "",
@@ -193,6 +135,15 @@ function formatFindings(findings: ReviewFinding[]): string[] {
     const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
     return `${index + 1}. ${location} - ${finding.issue} ${finding.recommendation}`;
   });
+}
+
+async function showPrivateReviewerAnswer(ctx: unknown, message: string): Promise<string | undefined> {
+  if (isRecord(ctx) && isRecord(ctx.ui) && typeof ctx.ui.editor === "function") {
+    const result = await ctx.ui.editor("review gate: reviewer answer", message);
+    return typeof result === "string" ? result : undefined;
+  }
+  await sendNotice(ctx, message);
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

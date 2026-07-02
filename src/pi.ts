@@ -49,17 +49,10 @@ export async function sendFollowUp(pi: unknown, message: string): Promise<void> 
   }
 }
 
-export async function sendNextTurnMessage(pi: unknown, content: string, details?: unknown): Promise<boolean> {
-  if (!isRecord(pi) || typeof pi.sendMessage !== "function") {
-    return false;
+export async function sendUserPrompt(pi: unknown, message: string): Promise<void> {
+  if (isRecord(pi) && typeof pi.sendUserMessage === "function") {
+    await pi.sendUserMessage(message);
   }
-  await pi.sendMessage({
-    customType: "pi-review-gate/reviewer-note",
-    content,
-    display: true,
-    details,
-  }, { deliverAs: "nextTurn" });
-  return true;
 }
 
 export function extractCwd(args: unknown[], fallback: string = process.cwd()): string {

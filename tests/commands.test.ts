@@ -56,6 +56,92 @@ test("/review-now requested changes reset the automatic correction budget", asyn
   }
 });
 
+test("/ask-reviewer opens the reviewer answer in the editor when canceled", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-command-"));
+  try {
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const userMessages: string[] = [];
+    const notices: string[] = [];
+    const editorViews: Array<{ title: string; prefill: string }> = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        userMessages.push(message);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        async editor(title: string, prefill: string) {
+          editorViews.push({ title, prefill });
+          return undefined;
+        },
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: askReviewerConfig(),
+      state: createState(),
+    });
+
+    await commands.get("ask-reviewer")?.("does this plan look right?", ctx);
+    assert.equal(userMessages.length, 0);
+    assert.equal(editorViews.length, 1);
+    assert.equal(editorViews[0]?.title, "review gate: reviewer answer");
+    assert.match(editorViews[0]?.prefill ?? "", /Question: does this plan look right\?/);
+    assert.match(editorViews[0]?.prefill ?? "", /Answer: reviewer answer ready/);
+    assert.match(notices.join("\n"), /reviewer answer cleared/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/ask-reviewer submits edited reviewer text when the editor is submitted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-submit-"));
+  try {
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const userMessages: string[] = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        userMessages.push(message);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify() {},
+        async editor(_title: string, prefill: string) {
+          return `${prefill}\n\nPlease act on this.`;
+        },
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: askReviewerConfig(),
+      state: createState(),
+    });
+
+    await commands.get("ask-reviewer")?.("should this be shared?", ctx);
+
+    assert.equal(userMessages.length, 1);
+    assert.match(userMessages[0] ?? "", /Reviewer note from \/ask-reviewer:/);
+    assert.match(userMessages[0] ?? "", /Question: should this be shared\?/);
+    assert.match(userMessages[0] ?? "", /Please act on this\./);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function reviewConfig(): ReviewGateConfig {
   return {
     enabled: true,
@@ -73,6 +159,39 @@ function reviewConfig(): ReviewGateConfig {
       args: [
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
+      ],
+      timeoutMs: 5000,
+    },
+  };
+}
+
+function askReviewerConfig(): ReviewGateConfig {
+  return {
+    enabled: true,
+    mode: "single-decider",
+    maxCorrectionCycles: 3,
+    reviewWhen: "changed-files",
+    maxPatchBytes: 200_000,
+    maxFileBytes: 1_048_576,
+    maxSnapshotBytes: 52_428_800,
+    retainBundles: "never",
+    decider: {
+      id: "fake",
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const ok=s.includes('Reviewer question:')&&(s.includes('does this plan look right?')||s.includes('should this be shared?'));",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'reviewer answer ready',findings:[]}",
+          ":{verdict:'needs_changes',summary:'question text was not passed through',findings:[]}));",
+          "});",
+        ].join(""),
       ],
       timeoutMs: 5000,
     },

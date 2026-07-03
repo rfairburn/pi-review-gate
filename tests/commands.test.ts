@@ -56,6 +56,46 @@ test("/review-now requested changes reset the automatic correction budget", asyn
   }
 });
 
+test("/review-continue sends capped feedback and resets the correction budget", async () => {
+  const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+  const followUps: string[] = [];
+  const notices: string[] = [];
+  const state = createState();
+  state.correctionCycles = 3;
+  state.lastCappedFollowUp = "Review found blocking issues.\n\n1. index.ts - missing guard add it";
+  const pi = {
+    registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+      commands.set(name, options.handler);
+    },
+    sendUserMessage(message: string) {
+      followUps.push(message);
+    },
+  };
+  const ctx = {
+    notify(message: string) {
+      notices.push(message);
+    },
+  };
+
+  registerCommands({
+    pi,
+    cwd: () => process.cwd(),
+    config: reviewConfig(),
+    state,
+  });
+
+  await commands.get("review-continue")?.("", ctx);
+
+  assert.equal(state.correctionCycles, 0);
+  assert.equal(state.lastCappedFollowUp, undefined);
+  assert.deepEqual(followUps, ["Review found blocking issues.\n\n1. index.ts - missing guard add it"]);
+  assert.match(notices.join("\n"), /correction budget reset to 3/);
+
+  await commands.get("review-continue")?.("", ctx);
+  assert.equal(followUps.length, 1);
+  assert.match(notices.join("\n"), /no capped reviewer feedback available/);
+});
+
 test("/ask-reviewer opens the reviewer answer in the editor when canceled", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-command-"));
   try {

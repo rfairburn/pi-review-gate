@@ -121,13 +121,21 @@ export async function activate(pi: unknown): Promise<void> {
 
     if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
       if (state.correctionCycles >= config.maxCorrectionCycles) {
+        state.lastCappedFollowUp = output.followUpMessage;
         await sendNotice(
           noticeTarget,
-          `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})\n\n${output.followUpMessage}`,
+          [
+            `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`,
+            "Reviewer feedback was not sent to the primary model.",
+            `Use /review-continue to send this feedback and allow another ${config.maxCorrectionCycles} automatic correction cycle(s).`,
+            "",
+            output.followUpMessage,
+          ].join("\n"),
         );
         state.runActive = false;
         return;
       }
+      state.lastCappedFollowUp = undefined;
       state.correctionCycles += 1;
       await sendNotice(noticeTarget, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
       state.runActive = false;

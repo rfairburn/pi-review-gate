@@ -56,6 +56,8 @@ test("cap notice includes reviewer requested changes", async () => {
 
     const noticeText = notices.join("\n\n");
     assert.match(noticeText, /automatic correction cap reached/);
+    assert.match(noticeText, /Reviewer feedback was not sent to the primary model/);
+    assert.match(noticeText, /Use \/review-continue to send this feedback/);
     assert.match(noticeText, /Review found blocking issues/);
     assert.match(noticeText, /missing guard/);
     assert.match(noticeText, /add the guard/);

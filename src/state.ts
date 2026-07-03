@@ -5,6 +5,7 @@ export interface ReviewGateState {
   latestRequest: string;
   requestHistory: UserRequestContext[];
   correctionCycles: number;
+  lastCappedFollowUp?: string;
   baseline?: WorkspaceSnapshot;
   runActive: boolean;
   touchedPaths: Set<string>;
@@ -22,6 +23,7 @@ export function createState(): ReviewGateState {
     latestRequest: "",
     requestHistory: [],
     correctionCycles: 0,
+    lastCappedFollowUp: undefined,
     runActive: false,
     touchedPaths: new Set<string>(),
     evidence: createEvidenceState(),
@@ -51,6 +53,7 @@ export function rememberUserRequest(state: ReviewGateState, request: string): vo
     text,
   }];
   state.correctionCycles = 0;
+  state.lastCappedFollowUp = undefined;
   state.touchedPaths.clear();
   state.evidence = createEvidenceState();
 }

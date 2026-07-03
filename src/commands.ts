@@ -58,6 +58,21 @@ export function registerCommands(input: RegisterCommandsInput): void {
     },
   });
 
+  registerCommand("review-continue", {
+    description: "Send the last capped reviewer feedback and reset the correction budget.",
+    handler: async (_args: string, ctx: unknown) => {
+      if (!input.state.lastCappedFollowUp) {
+        await sendNotice(ctx, "review gate: no capped reviewer feedback available");
+        return;
+      }
+      const followUp = input.state.lastCappedFollowUp;
+      input.state.lastCappedFollowUp = undefined;
+      input.state.correctionCycles = 0;
+      await sendNotice(ctx, `review gate: continuing review; correction budget reset to ${input.config.maxCorrectionCycles}`);
+      await sendFollowUp(input.pi, followUp);
+    },
+  });
+
   registerCommand("ask-reviewer", {
     description: "Ask the configured reviewer a question about the current work.",
     handler: async (args: string, ctx: unknown) => {

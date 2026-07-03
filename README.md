@@ -134,6 +134,10 @@ outside the current worktree.
 `/review-now` reruns the configured reviewer against the current captured
 baseline and evidence.
 
+`/review-continue` sends the last reviewer feedback that was held back because
+the automatic correction cap was reached. It resets the correction counter, so
+the configured correction budget is available again for the continued fix.
+
 `/ask-reviewer <question>` asks the configured reviewer an ad hoc question about
 the current work. It includes the current request context, changed files and
 patch when available, and the session evidence digest, including

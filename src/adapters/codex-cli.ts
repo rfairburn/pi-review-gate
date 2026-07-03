@@ -46,6 +46,9 @@ export class CodexCliAdapter implements ModelAdapter {
     const usage = parseCodexUsageFromJsonl(output.stdout);
     await writeFile(usagePath, JSON.stringify(usage ?? null, null, 2), "utf8").catch(() => undefined);
 
+    if (output.aborted) {
+      return errorResult(req.id, "Reviewer was aborted.", rawOutputPath, "aborted", usage);
+    }
     if (output.timedOut) {
       return errorResult(req.id, `Reviewer timed out after ${req.timeoutMs}ms.`, rawOutputPath, "timeout", usage);
     }

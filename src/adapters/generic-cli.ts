@@ -3,6 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { GenericCliDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
+import { terminateProcessTree } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 
 const MAX_OUTPUT_BYTES = 1_000_000;
@@ -18,9 +19,15 @@ export class GenericCliAdapter implements ModelAdapter {
     const args = this.config.args ?? [];
     const timeoutMs = req.timeoutMs || this.config.timeoutMs || 300_000;
 
+    if (req.signal?.aborted) {
+      await writeEmptyResultFiles(rawOutputPath, stderrPath);
+      return abortedResult(req.id, rawOutputPath);
+    }
+
     return await new Promise<ReviewResult>((resolve) => {
       const proc = spawn(this.config.command, args, {
         cwd: req.cwd,
+        detached: process.platform !== "win32",
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
         env: sanitizedEnv(process.env),
@@ -29,6 +36,9 @@ export class GenericCliAdapter implements ModelAdapter {
       let stdout = "";
       let stderr = "";
       let settled = false;
+      let timedOut = false;
+      let aborted = false;
+      let forceKillTimer: NodeJS.Timeout | undefined;
 
       const finish = async (result: ReviewResult) => {
         if (settled) {
@@ -36,6 +46,10 @@ export class GenericCliAdapter implements ModelAdapter {
         }
         settled = true;
         clearTimeout(timer);
+        req.signal?.removeEventListener("abort", onAbort);
+        if (forceKillTimer) {
+          clearTimeout(forceKillTimer);
+        }
         await Promise.all([
           writeFile(rawOutputPath, stdout, "utf8").catch(() => undefined),
           writeFile(stderrPath, stderr, "utf8").catch(() => undefined),
@@ -43,29 +57,29 @@ export class GenericCliAdapter implements ModelAdapter {
         resolve(result);
       };
 
+      const terminate = () => {
+        if (forceKillTimer) {
+          return;
+        }
+        terminateProcessTree(proc, "SIGTERM");
+        forceKillTimer = setTimeout(() => {
+          if (!settled) {
+            terminateProcessTree(proc, "SIGKILL");
+          }
+        }, 2_000);
+        forceKillTimer.unref?.();
+      };
+
       const timer = setTimeout(() => {
-        proc.kill("SIGTERM");
-        void finish({
-          reviewerId: req.id,
-          verdict: "error",
-          summary: `Reviewer timed out after ${timeoutMs}ms.`,
-          findings: [],
-          rawOutputPath,
-          error: "timeout",
-        });
+        timedOut = true;
+        terminate();
       }, timeoutMs);
 
-      req.signal?.addEventListener("abort", () => {
-        proc.kill("SIGTERM");
-        void finish({
-          reviewerId: req.id,
-          verdict: "error",
-          summary: "Reviewer was aborted.",
-          findings: [],
-          rawOutputPath,
-          error: "aborted",
-        });
-      });
+      const onAbort = () => {
+        aborted = true;
+        terminate();
+      };
+      req.signal?.addEventListener("abort", onAbort, { once: true });
 
       proc.on("error", (error) => {
         void finish({
@@ -93,6 +107,21 @@ export class GenericCliAdapter implements ModelAdapter {
       });
 
       proc.on("close", (code) => {
+        if (aborted) {
+          void finish(abortedResult(req.id, rawOutputPath));
+          return;
+        }
+        if (timedOut) {
+          void finish({
+            reviewerId: req.id,
+            verdict: "error",
+            summary: `Reviewer timed out after ${timeoutMs}ms.`,
+            findings: [],
+            rawOutputPath,
+            error: "timeout",
+          });
+          return;
+        }
         if (code !== 0) {
           void finish({
             reviewerId: req.id,
@@ -108,8 +137,29 @@ export class GenericCliAdapter implements ModelAdapter {
       });
 
       proc.stdin.end(req.prompt);
+      if (req.signal?.aborted) {
+        onAbort();
+      }
     });
   }
+}
+
+function abortedResult(reviewerId: string, rawOutputPath: string): ReviewResult {
+  return {
+    reviewerId,
+    verdict: "error",
+    summary: "Reviewer was aborted.",
+    findings: [],
+    rawOutputPath,
+    error: "aborted",
+  };
+}
+
+async function writeEmptyResultFiles(rawOutputPath: string, stderrPath: string): Promise<void> {
+  await Promise.all([
+    writeFile(rawOutputPath, "", "utf8").catch(() => undefined),
+    writeFile(stderrPath, "", "utf8").catch(() => undefined),
+  ]);
 }
 
 function sanitizedEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

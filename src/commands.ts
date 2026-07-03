@@ -1,7 +1,7 @@
 import type { ReviewGateConfig } from "./config";
 import { buildRequestContext, type ReviewGateState } from "./state";
 import { runAskReviewer, runReview } from "./review";
-import { sendNotice, sendFollowUp, sendUserPrompt } from "./pi";
+import { extractSignal, sendNotice, sendFollowUp, sendUserPrompt } from "./pi";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 
@@ -38,6 +38,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         before: input.state.baseline,
         config: input.config,
         evidence: input.state.evidence,
+        signal: extractSignal([ctx]),
         notify: (message) => sendNotice(ctx, message),
       });
 
@@ -90,6 +91,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         before: input.state.baseline,
         config: input.config,
         evidence: input.state.evidence,
+        signal: extractSignal([ctx]),
         notify: (message) => sendNotice(ctx, message),
       });
 

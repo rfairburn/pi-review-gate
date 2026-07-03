@@ -1,10 +1,11 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 
 export interface ProcessRunResult {
   stdout: string;
   stderr: string;
   code: number | null;
   timedOut: boolean;
+  aborted: boolean;
 }
 
 const MAX_OUTPUT_BYTES = 1_000_000;
@@ -18,9 +19,14 @@ export async function runPromptProcess(input: {
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
 }): Promise<ProcessRunResult> {
+  if (input.signal?.aborted) {
+    return { stdout: "", stderr: "", code: null, timedOut: false, aborted: true };
+  }
+
   return await new Promise((resolve, reject) => {
     const proc = spawn(input.command, input.args, {
       cwd: input.cwd,
+      detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
       env: input.env ?? process.env,
@@ -30,6 +36,8 @@ export async function runPromptProcess(input: {
     let stderr = "";
     let settled = false;
     let timedOut = false;
+    let aborted = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
 
     const finish = (result: ProcessRunResult) => {
       if (settled) {
@@ -37,21 +45,43 @@ export async function runPromptProcess(input: {
       }
       settled = true;
       clearTimeout(timer);
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
       resolve(result);
+    };
+
+    const terminate = () => {
+      if (forceKillTimer) {
+        return;
+      }
+      terminateProcessTree(proc, "SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        if (!settled) {
+          terminateProcessTree(proc, "SIGKILL");
+        }
+      }, 2_000);
+      forceKillTimer.unref?.();
     };
 
     const timer = setTimeout(() => {
       timedOut = true;
-      proc.kill("SIGTERM");
-      finish({ stdout, stderr, code: null, timedOut });
+      terminate();
     }, input.timeoutMs);
 
-    input.signal?.addEventListener("abort", () => {
-      proc.kill("SIGTERM");
-      finish({ stdout, stderr, code: null, timedOut: false });
-    });
+    const onAbort = () => {
+      aborted = true;
+      terminate();
+    };
+    input.signal?.addEventListener("abort", onAbort, { once: true });
 
-    proc.on("error", reject);
+    proc.on("error", (error) => {
+      input.signal?.removeEventListener("abort", onAbort);
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
+      reject(error);
+    });
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => {
       if (Buffer.byteLength(stdout) < MAX_OUTPUT_BYTES) {
@@ -65,10 +95,27 @@ export async function runPromptProcess(input: {
       }
     });
     proc.on("close", (code) => {
-      finish({ stdout, stderr, code, timedOut });
+      input.signal?.removeEventListener("abort", onAbort);
+      finish({ stdout, stderr, code, timedOut, aborted });
     });
     proc.stdin.end(input.prompt);
+
+    if (input.signal?.aborted) {
+      onAbort();
+    }
   });
+}
+
+export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+  if (proc.pid && process.platform !== "win32") {
+    try {
+      process.kill(-proc.pid, signal);
+      return;
+    } catch {
+      // Fall back to killing the direct child below.
+    }
+  }
+  proc.kill(signal);
 }
 
 export function reviewerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

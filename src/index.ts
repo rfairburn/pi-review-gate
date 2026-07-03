@@ -2,7 +2,7 @@ import { loadConfig } from "./config";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendFollowUp, sendNotice } from "./pi";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, sendFollowUp, sendNotice } from "./pi";
 import { runReview, type ReviewRunOutput } from "./review";
 import { beginAgentRun, buildRequestContext, createState, recordTouchedPath, rememberUserRequest, type ReviewGateState } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
@@ -96,6 +96,7 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "agent_end", async (...args) => {
     currentCwd = extractCwd(args, currentCwd);
     const noticeTarget = extractContext(args) ?? pi;
+    const signal = extractSignal(args);
     rememberFinalAssistantSummary(state.evidence, args);
     const actingUsage = extractPiUsageFromMessages(args);
     if (!state.baseline) {
@@ -113,6 +114,7 @@ export async function activate(pi: unknown): Promise<void> {
         config,
         evidence: state.evidence,
         actingUsage,
+        signal,
         notify: (message) => sendNotice(noticeTarget, message),
       });
     } catch (error) {

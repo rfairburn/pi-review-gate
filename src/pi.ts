@@ -93,6 +93,18 @@ export function extractInputSource(args: unknown[]): string | undefined {
   return undefined;
 }
 
+export function extractSignal(args: unknown[]): AbortSignal | undefined {
+  for (const arg of args) {
+    if (isRecord(arg) && isAbortSignal(arg.signal)) {
+      return arg.signal;
+    }
+    if (isRecord(arg) && isRecord(arg.ctx) && isAbortSignal(arg.ctx.signal)) {
+      return arg.ctx.signal;
+    }
+  }
+  return undefined;
+}
+
 export function extractToolName(args: unknown[]): string {
   for (const arg of args) {
     if (isRecord(arg)) {
@@ -123,4 +135,8 @@ export function extractToolArgs(args: unknown[]): Record<string, unknown> | unde
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return isRecord(value) && typeof value.aborted === "boolean" && typeof value.addEventListener === "function";
 }

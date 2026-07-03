@@ -45,6 +45,9 @@ export class LittleCoderAdapter implements ModelAdapter {
     const extracted = extractReviewTextFromPiJsonl(output.stdout);
     await writeFile(usagePath, JSON.stringify(extracted.usage ?? null, null, 2), "utf8").catch(() => undefined);
 
+    if (output.aborted) {
+      return errorResult(req.id, "Reviewer was aborted.", rawOutputPath, "aborted", extracted.usage);
+    }
     if (output.timedOut) {
       return errorResult(req.id, `Reviewer timed out after ${req.timeoutMs}ms.`, rawOutputPath, "timeout", extracted.usage);
     }

@@ -16,7 +16,7 @@ export class GenericCliAdapter implements ModelAdapter {
     const rawOutputPath = join(req.bundleDir, "raw-output.txt");
     const stderrPath = join(req.bundleDir, "stderr.txt");
     const args = this.config.args ?? [];
-    const timeoutMs = req.timeoutMs || this.config.timeoutMs || 120_000;
+    const timeoutMs = req.timeoutMs || this.config.timeoutMs || 300_000;
 
     return await new Promise<ReviewResult>((resolve) => {
       const proc = spawn(this.config.command, args, {

@@ -105,7 +105,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       cwd: input.cwd,
       prompt: bundle.prompt,
       bundleDir: bundle.dir,
-      timeoutMs: decider.timeoutMs ?? 120_000,
+      timeoutMs: decider.timeoutMs ?? 300_000,
       signal: input.signal,
     });
     await Promise.all([
@@ -183,7 +183,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       cwd: input.cwd,
       prompt: bundle.prompt,
       bundleDir: bundle.dir,
-      timeoutMs: decider.timeoutMs ?? 120_000,
+      timeoutMs: decider.timeoutMs ?? 300_000,
       signal: input.signal,
     });
     await Promise.all([

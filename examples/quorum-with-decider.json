@@ -11,12 +11,12 @@
     {
       "id": "claude",
       "adapter": "claude-cli",
-      "timeoutMs": 120000
+      "timeoutMs": 300000
     }
   ],
   "decider": {
     "id": "claude-decider",
     "adapter": "claude-cli",
-    "timeoutMs": 120000
+    "timeoutMs": 300000
   }
 }

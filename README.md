@@ -43,7 +43,7 @@ Example config using Codex as the reviewer:
   "decider": {
     "id": "codex",
     "adapter": "codex-cli",
-    "timeoutMs": 120000
+    "timeoutMs": 300000
   }
 }
 ```

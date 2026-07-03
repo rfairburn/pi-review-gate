@@ -90,7 +90,7 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
     command: "codex",
     args: [],
     model: undefined,
-    timeoutMs: 120000,
+    timeoutMs: 300000,
   });
 
   const claude = normalizeConfig({
@@ -108,7 +108,7 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
     command: "claude",
     args: [],
     model: undefined,
-    timeoutMs: 120000,
+    timeoutMs: 300000,
   });
 });
 
@@ -129,6 +129,6 @@ test("normalizeConfig keeps little-coder model selection generic", () => {
     command: "little-coder",
     args: [],
     model: "ollama/glm-5.2",
-    timeoutMs: 180000,
+    timeoutMs: 300000,
   });
 });

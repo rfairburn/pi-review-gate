@@ -72,6 +72,8 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   retainBundles: "on-failure",
 };
 
+const DEFAULT_REVIEWER_TIMEOUT_MS = 300_000;
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
   const disabledVar = firstTruthyEnv(env, ["PI_REVIEW_GATE_DISABLED", "LITTLE_CODER_REVIEW_GATE_DISABLED"]);
   if (disabledVar) {
@@ -156,7 +158,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       adapter: "generic-cli",
       command: value.command,
       args: Array.isArray(value.args) ? value.args.map(String) : [],
-      timeoutMs: numberOrDefault(value.timeoutMs, 120_000),
+      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
     };
   }
   if (value.adapter === "codex-cli") {
@@ -166,7 +168,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       command: typeof value.command === "string" ? value.command : "codex",
       args: Array.isArray(value.args) ? value.args.map(String) : [],
       model: typeof value.model === "string" ? value.model : undefined,
-      timeoutMs: numberOrDefault(value.timeoutMs, 120_000),
+      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
     };
   }
   if (value.adapter === "claude-cli") {
@@ -176,7 +178,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       command: typeof value.command === "string" ? value.command : "claude",
       args: Array.isArray(value.args) ? value.args.map(String) : [],
       model: typeof value.model === "string" ? value.model : undefined,
-      timeoutMs: numberOrDefault(value.timeoutMs, 120_000),
+      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
     };
   }
   if (value.adapter === "little-coder-model") {
@@ -189,7 +191,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       model: value.model,
       command: typeof value.command === "string" ? value.command : "little-coder",
       args: Array.isArray(value.args) ? value.args.map(String) : [],
-      timeoutMs: numberOrDefault(value.timeoutMs, 180_000),
+      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
     };
   }
   throw new Error("unsupported decider adapter");

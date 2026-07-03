@@ -3,8 +3,8 @@ import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendFollowUp, sendNotice } from "./pi";
-import { runReview } from "./review";
-import { beginAgentRun, buildRequestContext, createState, recordTouchedPath, rememberUserRequest } from "./state";
+import { runReview, type ReviewRunOutput } from "./review";
+import { beginAgentRun, buildRequestContext, createState, recordTouchedPath, rememberUserRequest, type ReviewGateState } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
 
 declare const module: {
@@ -40,7 +40,12 @@ export async function activate(pi: unknown): Promise<void> {
     if (extractInputSource(args) === "extension") {
       return;
     }
-    rememberUserRequest(state, extractInputText(args));
+    const text = extractInputText(args);
+    rememberUserRequest(state, text);
+    if (state.reviewInProgress && text.trim()) {
+      state.queuedUserInputsDuringReview.push(text.trim());
+      return { action: "handled" };
+    }
   });
 
   registerHook(pi, "before_agent_start", async (...args) => {
@@ -98,24 +103,34 @@ export async function activate(pi: unknown): Promise<void> {
       return;
     }
 
-    const output = await runReview({
-      cwd: currentCwd,
-      request: buildRequestContext(state),
-      before: state.baseline,
-      config,
-      evidence: state.evidence,
-      actingUsage,
-      notify: (message) => sendNotice(noticeTarget, message),
-    });
+    state.reviewInProgress = true;
+    let output: ReviewRunOutput;
+    try {
+      output = await runReview({
+        cwd: currentCwd,
+        request: buildRequestContext(state),
+        before: state.baseline,
+        config,
+        evidence: state.evidence,
+        actingUsage,
+        notify: (message) => sendNotice(noticeTarget, message),
+      });
+    } catch (error) {
+      state.runActive = false;
+      await releaseQueuedUserInputs(pi, state);
+      throw error;
+    }
 
     if (!output.changed) {
       state.runActive = false;
+      await releaseQueuedUserInputs(pi, state);
       return;
     }
 
     if (output.result?.verdict === "pass") {
       await sendNotice(noticeTarget, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
       state.runActive = false;
+      await releaseQueuedUserInputs(pi, state);
       return;
     }
 
@@ -133,6 +148,7 @@ export async function activate(pi: unknown): Promise<void> {
           ].join("\n"),
         );
         state.runActive = false;
+        await releaseQueuedUserInputs(pi, state);
         return;
       }
       state.lastCappedFollowUp = undefined;
@@ -140,12 +156,14 @@ export async function activate(pi: unknown): Promise<void> {
       await sendNotice(noticeTarget, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
       state.runActive = false;
       await sendFollowUp(pi, output.followUpMessage);
+      await releaseQueuedUserInputs(pi, state);
       return;
     }
 
     const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
     await sendNotice(noticeTarget, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
     state.runActive = false;
+    await releaseQueuedUserInputs(pi, state);
   });
 
   registerCommands({
@@ -163,4 +181,12 @@ Object.assign(module.exports as Record<string, unknown>, { activate });
 
 function isToolError(value: unknown): boolean {
   return typeof value === "object" && value !== null && "isError" in value && Boolean((value as { isError?: unknown }).isError);
+}
+
+async function releaseQueuedUserInputs(pi: unknown, state: ReviewGateState): Promise<void> {
+  state.reviewInProgress = false;
+  const queuedInputs = state.queuedUserInputsDuringReview.splice(0);
+  for (const input of queuedInputs) {
+    await sendFollowUp(pi, input);
+  }
 }

@@ -138,6 +138,11 @@ baseline and evidence.
 the automatic correction cap was reached. It resets the correction counter, so
 the configured correction budget is available again for the continued fix.
 
+If you send normal guidance while the reviewer is still running, the plugin
+holds that input locally until the review finishes. When the reviewer requests
+changes, reviewer feedback is queued first, then your held guidance is queued
+after it in the same order you typed it.
+
 `/ask-reviewer <question>` asks the configured reviewer an ad hoc question about
 the current work. It includes the current request context, changed files and
 patch when available, and the session evidence digest, including

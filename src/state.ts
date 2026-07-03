@@ -6,6 +6,8 @@ export interface ReviewGateState {
   requestHistory: UserRequestContext[];
   correctionCycles: number;
   lastCappedFollowUp?: string;
+  reviewInProgress: boolean;
+  queuedUserInputsDuringReview: string[];
   baseline?: WorkspaceSnapshot;
   runActive: boolean;
   touchedPaths: Set<string>;
@@ -24,6 +26,8 @@ export function createState(): ReviewGateState {
     requestHistory: [],
     correctionCycles: 0,
     lastCappedFollowUp: undefined,
+    reviewInProgress: false,
+    queuedUserInputsDuringReview: [],
     runActive: false,
     touchedPaths: new Set<string>(),
     evidence: createEvidenceState(),
@@ -54,6 +58,7 @@ export function rememberUserRequest(state: ReviewGateState, request: string): vo
   }];
   state.correctionCycles = 0;
   state.lastCappedFollowUp = undefined;
+  state.queuedUserInputsDuringReview = [];
   state.touchedPaths.clear();
   state.evidence = createEvidenceState();
 }

@@ -1,4 +1,5 @@
 export type HookHandler = (...args: unknown[]) => unknown;
+export type TerminalInputHandler = (input: unknown) => unknown;
 
 export function registerHook(pi: unknown, name: string, handler: HookHandler): boolean {
   if (!isRecord(pi)) {
@@ -53,6 +54,32 @@ export async function sendUserPrompt(pi: unknown, message: string): Promise<void
   if (isRecord(pi) && typeof pi.sendUserMessage === "function") {
     await pi.sendUserMessage(message);
   }
+}
+
+export function onTerminalInput(pi: unknown, handler: TerminalInputHandler): (() => void) | undefined {
+  for (const target of terminalInputTargets(pi)) {
+    if (!isRecord(target) || typeof target.onTerminalInput !== "function") {
+      continue;
+    }
+    const subscription = target.onTerminalInput(handler);
+    if (typeof subscription === "function") {
+      return subscription as () => void;
+    }
+    if (isRecord(subscription) && typeof subscription.dispose === "function") {
+      const dispose = subscription.dispose;
+      return () => {
+        dispose();
+      };
+    }
+    if (isRecord(subscription) && typeof subscription.unsubscribe === "function") {
+      const unsubscribe = subscription.unsubscribe;
+      return () => {
+        unsubscribe();
+      };
+    }
+    return undefined;
+  }
+  return undefined;
 }
 
 export function extractCwd(args: unknown[], fallback: string = process.cwd()): string {
@@ -139,4 +166,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isAbortSignal(value: unknown): value is AbortSignal {
   return isRecord(value) && typeof value.aborted === "boolean" && typeof value.addEventListener === "function";
+}
+
+function terminalInputTargets(pi: unknown): unknown[] {
+  if (isRecord(pi) && isRecord(pi.ui)) {
+    return [pi.ui, pi];
+  }
+  return [pi];
 }

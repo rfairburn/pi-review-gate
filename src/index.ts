@@ -2,7 +2,7 @@ import { loadConfig } from "./config";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, sendFollowUp, sendNotice } from "./pi";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
 import { runReview, type ReviewRunOutput } from "./review";
 import { beginAgentRun, buildRequestContext, createState, recordTouchedPath, rememberUserRequest, type ReviewGateState } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
@@ -103,8 +103,18 @@ export async function activate(pi: unknown): Promise<void> {
       state.runActive = false;
       return;
     }
+    if (signal?.aborted) {
+      state.reviewInProgress = false;
+      state.queuedUserInputsDuringReview = [];
+      return;
+    }
 
     state.reviewInProgress = true;
+    const reviewAbort = createReviewAbortController({
+      signal,
+      noticeTarget,
+      state,
+    });
     let output: ReviewRunOutput;
     try {
       output = await runReview({
@@ -114,18 +124,27 @@ export async function activate(pi: unknown): Promise<void> {
         config,
         evidence: state.evidence,
         actingUsage,
-        signal,
+        signal: reviewAbort.signal,
         notify: (message) => sendNotice(noticeTarget, message),
       });
     } catch (error) {
       state.runActive = false;
       await releaseQueuedUserInputs(pi, state);
       throw error;
+    } finally {
+      reviewAbort.cleanup();
     }
 
     if (!output.changed) {
       state.runActive = false;
       await releaseQueuedUserInputs(pi, state);
+      return;
+    }
+
+    if (output.result?.error === "aborted") {
+      reviewAbort.notifyCancellation();
+      state.reviewInProgress = false;
+      state.queuedUserInputsDuringReview.splice(0);
       return;
     }
 
@@ -191,4 +210,69 @@ async function releaseQueuedUserInputs(pi: unknown, state: ReviewGateState): Pro
   for (const input of queuedInputs) {
     await sendFollowUp(pi, input);
   }
+}
+
+function createReviewAbortController(input: {
+  signal: AbortSignal | undefined;
+  noticeTarget: unknown;
+  state: ReviewGateState;
+}): { signal: AbortSignal; cleanup: () => void; notifyCancellation: () => void } {
+  const controller = new AbortController();
+  let cancellationNoticeSent = false;
+
+  const abortReview = () => {
+    if (!controller.signal.aborted) {
+      controller.abort();
+    }
+  };
+  const notifyCancellation = () => {
+    if (cancellationNoticeSent) {
+      return;
+    }
+    cancellationNoticeSent = true;
+    void sendNotice(input.noticeTarget, "review gate: review cancelled");
+  };
+
+  if (input.signal?.aborted) {
+    abortReview();
+  }
+  input.signal?.addEventListener("abort", abortReview, { once: true });
+
+  const unsubscribeTerminalInput = onTerminalInput(input.noticeTarget, (terminalInput) => {
+    if (!input.state.reviewInProgress || !isEscapeTerminalInput(terminalInput)) {
+      return undefined;
+    }
+    abortReview();
+    notifyCancellation();
+    return { action: "handled", consume: true };
+  });
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      input.signal?.removeEventListener("abort", abortReview);
+      unsubscribeTerminalInput?.();
+    },
+    notifyCancellation,
+  };
+}
+
+function isEscapeTerminalInput(input: unknown): boolean {
+  if (input === "\x1b" || input === "Escape" || input === "escape") {
+    return true;
+  }
+  if (!isRecord(input)) {
+    return false;
+  }
+  if (input.name === "escape" || input.key === "Escape" || input.key === "escape") {
+    return true;
+  }
+  if (isRecord(input.key) && input.key.name === "escape") {
+    return true;
+  }
+  return input.sequence === "\x1b";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

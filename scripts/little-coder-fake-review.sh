@@ -10,7 +10,7 @@ cat >"$CONFIG" <<JSON
 {
   "enabled": true,
   "mode": "single-decider",
-  "maxCorrectionCycles": 1,
+  "maxCorrectionCycles": 30,
   "reviewWhen": "changed-files",
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,

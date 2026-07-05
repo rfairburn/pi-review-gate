@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${TMPDIR:-/tmp}/pi-review-gate-claude-review.json"
-RETAIN_BUNDLES="${PI_REVIEW_GATE_RETAIN_BUNDLES:-never}"
+RETAIN_BUNDLES="${PI_REVIEW_GATE_RETAIN_BUNDLES:-on-failure}"
 LITTLE_CODER_ARGS=()
 
 while (($#)); do
@@ -43,7 +43,7 @@ cat >"$CONFIG" <<JSON
 {
   "enabled": true,
   "mode": "single-decider",
-  "maxCorrectionCycles": 3,
+  "maxCorrectionCycles": 30,
   "reviewWhen": "changed-files",
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,
@@ -52,7 +52,7 @@ cat >"$CONFIG" <<JSON
   "decider": {
     "id": "claude",
     "adapter": "claude-cli",
-    "timeoutMs": 120000
+    "timeoutMs": 600000
   }
 }
 JSON

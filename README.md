@@ -86,7 +86,8 @@ For little-coder plus Codex review, use:
 ```
 
 The development wrappers pass all ordinary arguments through to `little-coder`.
-By default they do not retain review temp bundles. To keep review bundles, pass:
+By default they retain review temp bundles on reviewer failure. To keep every
+review bundle, pass:
 
 ```bash
 ./scripts/little-coder-codex-review.sh --retain-review-bundles

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${TMPDIR:-/tmp}/pi-review-gate-little-coder-glm-52-review.json"
-RETAIN_BUNDLES="${PI_REVIEW_GATE_RETAIN_BUNDLES:-never}"
+RETAIN_BUNDLES="${PI_REVIEW_GATE_RETAIN_BUNDLES:-on-failure}"
 LITTLE_CODER_ARGS=()
 
 while (($#)); do
@@ -43,7 +43,7 @@ cat >"$CONFIG" <<JSON
 {
   "enabled": true,
   "mode": "single-decider",
-  "maxCorrectionCycles": 3,
+  "maxCorrectionCycles": 30,
   "reviewWhen": "changed-files",
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,
@@ -53,7 +53,7 @@ cat >"$CONFIG" <<JSON
     "id": "glm-5.2",
     "adapter": "little-coder-model",
     "model": "ollama/glm-5.2",
-    "timeoutMs": 180000
+    "timeoutMs": 600000
   }
 }
 JSON

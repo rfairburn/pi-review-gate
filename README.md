@@ -154,8 +154,8 @@ note to the primary model as your next message, edit it first if needed, or pres
 Escape/Ctrl+C to clear it without sending anything.
 
 Retained review bundles include `request.md`, `changed-files.json`,
-`patch.diff`, `reviewer-prompt.md`, `evidence.json`, `evidence.md`,
-`acting-model-usage.json`, `reviewer-usage.json`, `raw-output.txt`, and
-`stderr.txt`. When supported by the reviewer CLI, user-facing notices include a
-compact reviewer token summary, for example `review gate: passed (review tokens:
-in 1.2k, out 340, total 1.6k)`.
+`patch.diff`, `side-effect.patch.diff`, `reviewer-prompt.md`, `evidence.json`,
+`evidence.md`, `acting-model-usage.json`, `reviewer-usage.json`,
+`raw-output.txt`, and `stderr.txt`. When supported by the reviewer CLI,
+user-facing notices include a compact reviewer token summary, for example
+`review gate: passed (review tokens: in 1.2k, out 340, total 1.6k)`.

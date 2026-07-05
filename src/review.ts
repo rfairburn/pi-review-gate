@@ -66,12 +66,18 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       maxSnapshotBytes: input.config.maxSnapshotBytes,
     })
     : [];
-  const changes = mergeChanges(workspaceChanges, evidenceChanges);
+  const split = splitReviewChanges(workspaceChanges, evidenceChanges);
+  const { changes, sideEffectChanges } = split;
   if (changes.length === 0) {
     return { changed: false, changes };
   }
 
-  const patchResult = buildUnifiedPatch(changes, input.config.maxPatchBytes);
+  const patchResult = workspaceChanges.length > 0
+    ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes)
+    : { patch: "(no submitted workspace changes detected; review captured side effects below)", truncated: false, omitted: [] };
+  const sideEffectPatchResult = sideEffectChanges.length > 0
+    ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
+    : { patch: "", truncated: false, omitted: [] };
   const decider = input.config.decider;
   if (!decider) {
     return {
@@ -85,7 +91,10 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     cwd: input.cwd,
     request: input.request,
     changes,
+    submittedChanges: split.workspaceChanges,
+    sideEffectChanges,
     patch: patchResult.patch,
+    sideEffectPatch: sideEffectPatchResult.patch,
     evidence: input.evidence
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
@@ -93,6 +102,8 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     metadata: {
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
+      sideEffectPatchTruncated: sideEffectPatchResult.truncated,
+      omittedSideEffectDiffs: sideEffectPatchResult.omitted,
     },
   });
 
@@ -142,15 +153,18 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
 }
 
 export async function runAskReviewer(input: AskReviewerInput): Promise<AskReviewerOutput> {
-  const { changes, evidenceChanges } = await collectCurrentChanges({
+  const { changes, workspaceChanges, evidenceChanges, sideEffectChanges } = await collectCurrentChanges({
     cwd: input.cwd,
     before: input.before,
     config: input.config,
     evidence: input.evidence,
   });
-  const patchResult = changes.length > 0
-    ? buildUnifiedPatch(changes, input.config.maxPatchBytes)
+  const patchResult = workspaceChanges.length > 0
+    ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes)
     : { patch: input.before ? "(no file changes detected)" : "(no baseline available; answering from request context and session evidence)", truncated: false, omitted: [] };
+  const sideEffectPatchResult = sideEffectChanges.length > 0
+    ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
+    : { patch: "", truncated: false, omitted: [] };
   const decider = input.config.decider;
   if (!decider) {
     return {
@@ -164,13 +178,18 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     question: input.question,
     request: input.request,
     changes,
+    submittedChanges: workspaceChanges,
+    sideEffectChanges,
     patch: patchResult.patch,
+    sideEffectPatch: sideEffectPatchResult.patch,
     evidence: input.evidence
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
     metadata: {
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
+      sideEffectPatchTruncated: sideEffectPatchResult.truncated,
+      omittedSideEffectDiffs: sideEffectPatchResult.omitted,
     },
   });
 
@@ -239,9 +258,9 @@ async function collectCurrentChanges(input: {
   before?: WorkspaceSnapshot;
   config: ReviewGateConfig;
   evidence?: EvidenceState;
-}): Promise<{ changes: ChangedFile[]; evidenceChanges: ChangedFile[] }> {
+}): Promise<{ changes: ChangedFile[]; workspaceChanges: ChangedFile[]; evidenceChanges: ChangedFile[]; sideEffectChanges: ChangedFile[] }> {
   if (!input.before) {
-    return { changes: [], evidenceChanges: [] };
+    return { changes: [], workspaceChanges: [], evidenceChanges: [], sideEffectChanges: [] };
   }
   const after = await createWorkspaceSnapshot(input.cwd, {
     maxFileBytes: input.config.maxFileBytes,
@@ -254,9 +273,19 @@ async function collectCurrentChanges(input: {
       maxSnapshotBytes: input.config.maxSnapshotBytes,
     })
     : [];
+  return splitReviewChanges(workspaceChanges, evidenceChanges);
+}
+
+function splitReviewChanges(
+  workspaceChanges: ChangedFile[],
+  evidenceChanges: ChangedFile[],
+): { changes: ChangedFile[]; workspaceChanges: ChangedFile[]; evidenceChanges: ChangedFile[]; sideEffectChanges: ChangedFile[] } {
+  const workspacePathSet = new Set(workspaceChanges.map((change) => change.path));
   return {
     changes: mergeChanges(workspaceChanges, evidenceChanges),
+    workspaceChanges,
     evidenceChanges,
+    sideEffectChanges: evidenceChanges.filter((change) => !workspacePathSet.has(change.path)),
   };
 }
 

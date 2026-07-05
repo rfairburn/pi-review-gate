@@ -1,24 +1,34 @@
 import type { ChangedFile } from "./capture";
+import { summarizeSideEffectChanges, summarizeSubmittedChanges } from "./change-context";
 import type { ReviewFinding, ReviewResult } from "./schema";
+
+const REVIEW_CONTEXT_POLICY = `Review policy:
+- Submitted workspace changes are the primary implementation under review.
+- Captured side-effect changes are evidence from tool activity that was not detected as submitted workspace changes. They may include temp-like process artifacts, generated files, or real outside-workspace side effects.
+- A temp-like side-effect classification is a heuristic, not a guarantee. Do not block solely because a temp-like external file exists, but do block if it is referenced by submitted code, contains secrets, stores meaningful user content, changes persistent behavior, or indicates unsafe/unmanaged side effects.
+- Persistent-looking external side effects should be treated as high risk and blocking unless the user explicitly requested them or they are clearly allowed by the task.
+- Workspace side effects that are not submitted changes should be reviewed for accidental generated output, ignored files needed by the implementation, or files that should be cleaned up.`;
 
 export function buildReviewerPrompt(input: {
   request: string;
   changes: ChangedFile[];
+  submittedChanges?: ChangedFile[];
+  sideEffectChanges?: ChangedFile[];
   patch: string;
+  sideEffectPatch?: string;
   cwd: string;
   evidenceMarkdown?: string;
 }): string {
-  const changedFiles = input.changes.map((change) => ({
-    path: change.path,
-    status: change.status,
-    binary: change.binary,
-    oversized: change.oversized,
-    diffOmittedReason: change.diffOmittedReason,
-  }));
+  const submittedChanges = input.submittedChanges ?? input.changes;
+  const sideEffectChanges = input.sideEffectChanges ?? [];
+  const submittedChangeSummaries = summarizeSubmittedChanges(input.cwd, submittedChanges);
+  const sideEffectChangeSummaries = summarizeSideEffectChanges(input.cwd, sideEffectChanges);
 
   return `You are reviewing code changes made by another coding agent.
 
-Review only the supplied user request context, patch, and session evidence. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the patch is impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
+Review only the supplied user request context, submitted workspace patch, captured side-effect evidence, and session evidence. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the supplied context is impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
+
+${REVIEW_CONTEXT_POLICY}
 
 Workspace:
 ${input.cwd}
@@ -28,15 +38,25 @@ User request context:
 ${input.request}
 </request>
 
-Changed files:
-<changed_files_json>
-${JSON.stringify(changedFiles, null, 2)}
-</changed_files_json>
+Submitted workspace changes:
+<submitted_changes_json>
+${JSON.stringify(submittedChangeSummaries, null, 2)}
+</submitted_changes_json>
 
-Patch:
-<patch_diff>
-${input.patch}
-</patch_diff>
+Submitted workspace patch:
+<submitted_patch_diff>
+${input.patch || "(no submitted workspace changes detected)"}
+</submitted_patch_diff>
+
+Captured side-effect changes:
+<captured_side_effect_changes_json>
+${JSON.stringify(sideEffectChangeSummaries, null, 2)}
+</captured_side_effect_changes_json>
+
+Captured side-effect patch:
+<captured_side_effect_patch_diff>
+${input.sideEffectPatch || "(no captured side-effect changes detected)"}
+</captured_side_effect_patch_diff>
 
 Session evidence:
 <session_evidence>
@@ -64,21 +84,23 @@ export function buildReviewerQuestionPrompt(input: {
   question: string;
   request: string;
   changes: ChangedFile[];
+  submittedChanges?: ChangedFile[];
+  sideEffectChanges?: ChangedFile[];
   patch: string;
+  sideEffectPatch?: string;
   cwd: string;
   evidenceMarkdown?: string;
 }): string {
-  const changedFiles = input.changes.map((change) => ({
-    path: change.path,
-    status: change.status,
-    binary: change.binary,
-    oversized: change.oversized,
-    diffOmittedReason: change.diffOmittedReason,
-  }));
+  const submittedChanges = input.submittedChanges ?? input.changes;
+  const sideEffectChanges = input.sideEffectChanges ?? [];
+  const submittedChangeSummaries = summarizeSubmittedChanges(input.cwd, submittedChanges);
+  const sideEffectChangeSummaries = summarizeSideEffectChanges(input.cwd, sideEffectChanges);
 
   return `You are an independent reviewer consulted about work done by another coding agent.
 
-Answer the user's reviewer question using only the supplied context. The context may include code changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no patch is present, answer from the request context and session evidence. Do not include chain of thought. Return only valid JSON matching the schema.
+Answer the user's reviewer question using only the supplied context. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, and session evidence. Do not include chain of thought. Return only valid JSON matching the schema.
+
+${REVIEW_CONTEXT_POLICY}
 
 Workspace:
 ${input.cwd}
@@ -93,15 +115,25 @@ User request context:
 ${input.request}
 </request>
 
-Changed files:
-<changed_files_json>
-${JSON.stringify(changedFiles, null, 2)}
-</changed_files_json>
+Submitted workspace changes:
+<submitted_changes_json>
+${JSON.stringify(submittedChangeSummaries, null, 2)}
+</submitted_changes_json>
 
-Patch:
-<patch_diff>
-${input.patch || "(no patch supplied)"}
-</patch_diff>
+Submitted workspace patch:
+<submitted_patch_diff>
+${input.patch || "(no submitted workspace patch supplied)"}
+</submitted_patch_diff>
+
+Captured side-effect changes:
+<captured_side_effect_changes_json>
+${JSON.stringify(sideEffectChangeSummaries, null, 2)}
+</captured_side_effect_changes_json>
+
+Captured side-effect patch:
+<captured_side_effect_patch_diff>
+${input.sideEffectPatch || "(no captured side-effect changes detected)"}
+</captured_side_effect_patch_diff>
 
 Session evidence:
 <session_evidence>

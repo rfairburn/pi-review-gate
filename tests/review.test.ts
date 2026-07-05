@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ReviewGateConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
-import { createEvidenceState } from "../src/evidence";
+import { createEvidenceState, recordToolCallEvidence } from "../src/evidence";
 import { runAskReviewer, runReview } from "../src/review";
 
 const baseConfig: ReviewGateConfig = {
@@ -192,5 +192,80 @@ test("runAskReviewer answers with request and evidence even when there is no pat
     assert.match(output.result?.summary ?? "", /reviewable from evidence/);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview frames temp-like outside files as captured side effects, not submitted changes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-side-effects-"));
+  const outside = join(tmpdir(), `test_debug_${Date.now()}.js`);
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    const evidence = createEvidenceState();
+    await recordToolCallEvidence({
+      state: evidence,
+      cwd: dir,
+      toolName: "bash",
+      toolInput: { command: `cat > ${outside} <<EOF\nconsole.log('debug')\nEOF` },
+      snapshotOptions: {
+        maxFileBytes: baseConfig.maxFileBytes,
+        maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+      },
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await writeFile(outside, "console.log('debug')\n", "utf8");
+
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      decider: {
+        id: "prompt-checker",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "process.stdin.resume();",
+            "let s='';",
+            "process.stdin.on('data',c=>s+=c);",
+            "process.stdin.on('end',()=>{",
+            "const submitted=(s.match(/<submitted_changes_json>\\n([\\s\\S]*?)\\n<\\/submitted_changes_json>/)||[])[1]||'';",
+            "const side=(s.match(/<captured_side_effect_changes_json>\\n([\\s\\S]*?)\\n<\\/captured_side_effect_changes_json>/)||[])[1]||'';",
+            "const submittedPatch=(s.match(/<submitted_patch_diff>\\n([\\s\\S]*?)\\n<\\/submitted_patch_diff>/)||[])[1]||'';",
+            "const sidePatch=(s.match(/<captured_side_effect_patch_diff>\\n([\\s\\S]*?)\\n<\\/captured_side_effect_patch_diff>/)||[])[1]||'';",
+            `const outside=${JSON.stringify(outside)};`,
+            "const ok=submitted.includes('index.ts')",
+            "&& !submitted.includes(outside)",
+            "&& side.includes(outside)",
+            "&& side.includes('external_temp_like')",
+            "&& side.includes('heuristic')",
+            "&& submittedPatch.includes('+after')",
+            "&& !submittedPatch.includes(outside)",
+            "&& sidePatch.includes(outside)",
+            "&& s.includes('A temp-like side-effect classification is a heuristic');",
+            "process.stdout.write(JSON.stringify(ok",
+            "?{verdict:'pass',summary:'side effects framed separately',findings:[]}",
+            ":{verdict:'needs_changes',summary:'side effects were not framed separately',findings:[{severity:'blocking',file:'reviewer-prompt',line:null,issue:'external temp side effect was mixed into submitted changes',recommendation:'separate submitted changes from captured side effects'}]}));",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    };
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config,
+      evidence,
+    });
+
+    assert.equal(output.result?.verdict, "pass");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { force: true });
   }
 });

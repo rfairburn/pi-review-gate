@@ -71,6 +71,33 @@ export function parseCodexUsageFromJsonl(stdout: string): TokenUsage | undefined
   return normalizeOpenAiStyleUsage(raw, lastUsage);
 }
 
+export function extractReviewTextFromCodexJsonl(stdout: string): string {
+  let lastText = "";
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isRecord(parsed)) {
+      continue;
+    }
+    if (isRecord(parsed.item) && parsed.item.type === "agent_message" && typeof parsed.item.text === "string" && parsed.item.text.trim()) {
+      lastText = parsed.item.text;
+    } else if (parsed.type === "message" && isRecord(parsed.message) && parsed.message.role === "assistant") {
+      const text = textFromContent(parsed.message.content);
+      if (text.trim()) {
+        lastText = text;
+      }
+    }
+  }
+  return lastText;
+}
+
 export function parseClaudeUsage(value: unknown): TokenUsage | undefined {
   if (!isRecord(value)) {
     return undefined;

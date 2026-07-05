@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   extractPiUsageFromMessages,
+  extractReviewTextFromCodexJsonl,
   extractReviewTextFromClaudeJson,
   extractReviewTextFromPiJsonl,
   formatTokenUsage,
@@ -56,6 +57,45 @@ test("parseCodexUsageFromJsonl reads turn.completed usage events", () => {
   assert.equal(usage?.outputTokens, 556);
   assert.equal(usage?.reasoningOutputTokens, 516);
   assert.equal(usage?.totalTokens, 19586);
+});
+
+test("extractReviewTextFromCodexJsonl reads completed agent message text", () => {
+  const reviewerJson = JSON.stringify({
+    verdict: "needs_changes",
+    summary: "missing command",
+    findings: [
+      {
+        severity: "blocking",
+        file: null,
+        line: null,
+        issue: "required command was not run",
+        recommendation: "run npm test",
+      },
+    ],
+  });
+  const output = [
+    JSON.stringify({ type: "thread.started", thread_id: "abc" }),
+    JSON.stringify({ type: "turn.started" }),
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "item_0",
+        type: "agent_message",
+        text: reviewerJson,
+      },
+    }),
+    JSON.stringify({
+      type: "turn.completed",
+      usage: {
+        input_tokens: 40488,
+        cached_input_tokens: 9600,
+        output_tokens: 689,
+        reasoning_output_tokens: 516,
+      },
+    }),
+  ].join("\n");
+
+  assert.equal(extractReviewTextFromCodexJsonl(output), reviewerJson);
 });
 
 test("parseClaudeUsage reads json output usage and review text", () => {

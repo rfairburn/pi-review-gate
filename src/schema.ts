@@ -88,8 +88,8 @@ export function normalizeReviewResult(
     if (severity !== "blocking" && severity !== "non_blocking") {
       return schemaError(reviewerId, "Each finding must include a valid severity.", rawOutputPath);
     }
-    if (typeof item.file !== "string" || typeof item.issue !== "string" || typeof item.recommendation !== "string") {
-      return schemaError(reviewerId, "Each finding must include file, issue, and recommendation strings.", rawOutputPath);
+    if ((item.file !== null && typeof item.file !== "string") || typeof item.issue !== "string" || typeof item.recommendation !== "string") {
+      return schemaError(reviewerId, "Each finding must include issue and recommendation strings, with file as a string or null.", rawOutputPath);
     }
     const line = item.line;
     if (line !== null && !(typeof line === "number" && Number.isInteger(line) && line > 0)) {
@@ -97,7 +97,7 @@ export function normalizeReviewResult(
     }
     findings.push({
       severity,
-      file: item.file,
+      file: normalizeFindingFile(item.file),
       line,
       issue: item.issue.trim(),
       recommendation: item.recommendation.trim(),
@@ -149,6 +149,14 @@ export function extractJsonObject(text: string): string | null {
   }
 
   return null;
+}
+
+function normalizeFindingFile(value: unknown): string {
+  if (typeof value !== "string") {
+    return "session";
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : "session";
 }
 
 function schemaError(reviewerId: string, summary: string, rawOutputPath?: string): ReviewResult {

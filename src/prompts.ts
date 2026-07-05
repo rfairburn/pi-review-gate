@@ -78,6 +78,8 @@ Return JSON:
     }
   ]
 }
+
+Use "file": "session" and "line": null for findings about missing commands, process evidence, or other issues that do not belong to a specific file.
 `;
 }
 
@@ -155,6 +157,8 @@ Return JSON:
     }
   ]
 }
+
+Use "file": "session" and "line": null for findings about missing commands, process evidence, or other issues that do not belong to a specific file.
 
 Use "pass" when the answer does not require the primary model to change course. Use "needs_changes" when the answer identifies something the primary model should fix, inspect, or ask the user about.
 `;

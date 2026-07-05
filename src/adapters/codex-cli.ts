@@ -2,7 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CodexCliDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
-import { parseCodexUsageFromJsonl } from "../usage";
+import { extractReviewTextFromCodexJsonl, parseCodexUsageFromJsonl } from "../usage";
 import { reviewerEnv, runPromptProcess } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 
@@ -56,7 +56,8 @@ export class CodexCliAdapter implements ModelAdapter {
       return errorResult(req.id, `Reviewer exited with status ${output.code}.`, rawOutputPath, `exit_${output.code}`, usage);
     }
 
-    const finalText = await readFile(finalPath, "utf8").catch(() => output.stdout);
+    const finalTextFromFile = await readFile(finalPath, "utf8").catch(() => "");
+    const finalText = finalTextFromFile.trim() ? finalTextFromFile : extractReviewTextFromCodexJsonl(output.stdout) || output.stdout;
     const result = parseReviewResult(req.id, finalText, rawOutputPath);
     result.usage = usage;
     return result;

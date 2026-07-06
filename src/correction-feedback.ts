@@ -9,6 +9,7 @@ export interface CorrectionFeedbackMarker {
 }
 
 export interface CorrectionFeedbackFinding {
+  reviewerId?: string;
   severity: string;
   file: string;
   line: number | null;
@@ -53,6 +54,7 @@ function normalizeFeedbackFindings(result: ReviewResult): CorrectionFeedbackFind
   const findings = blocking.length > 0 ? blocking : result.findings;
   return findings
     .map((finding) => ({
+      reviewerId: finding.reviewerId,
       severity: finding.severity,
       file: finding.file,
       line: finding.line,
@@ -101,7 +103,7 @@ function normalizeFindingText(finding: ReviewFinding): string {
 }
 
 function feedbackLocationKey(finding: CorrectionFeedbackFinding): string {
-  return `${finding.severity}\0${finding.file}\0${finding.line ?? ""}`;
+  return `${finding.reviewerId ?? ""}\0${finding.severity}\0${finding.file}\0${finding.line ?? ""}`;
 }
 
 function tokenSetSimilarity(left: string, right: string): number {

@@ -78,6 +78,46 @@ test("runReview skips reviewer when no files changed", async () => {
   }
 });
 
+test("runReview runs configured reviewers in parallel and aggregates blocking findings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewers-"));
+  const markerA = join(tmpdir(), `pi-review-gate-reviewer-a-${process.pid}-${Date.now()}`);
+  const markerB = join(tmpdir(), `pi-review-gate-reviewer-b-${process.pid}-${Date.now()}`);
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      decider: undefined,
+      reviewers: [
+        blockingReviewer("alpha", markerA, markerB, "alpha finding", "fix alpha"),
+        blockingReviewer("beta", markerB, markerA, "beta finding", "fix beta"),
+      ],
+    };
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config,
+    });
+
+    assert.equal(output.result?.verdict, "needs_changes");
+    assert.match(output.result?.summary ?? "", /alpha:/);
+    assert.match(output.result?.summary ?? "", /beta:/);
+    assert.match(output.followUpMessage ?? "", /\[alpha\] index\.ts - alpha finding fix alpha/);
+    assert.match(output.followUpMessage ?? "", /\[beta\] index\.ts - beta finding fix beta/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(markerA, { force: true });
+    await rm(markerB, { force: true });
+  }
+});
+
 test("runReview prompt preserves request context and original baseline across continued work", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-continued-"));
   try {
@@ -269,3 +309,34 @@ test("runReview frames temp-like outside files as captured side effects, not sub
     await rm(outside, { force: true });
   }
 });
+
+function blockingReviewer(
+  id: string,
+  ownMarker: string,
+  otherMarker: string,
+  issue: string,
+  recommendation: string,
+): NonNullable<ReviewGateConfig["decider"]> {
+  return {
+    id,
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [
+      "-e",
+      [
+        "const fs=require('node:fs');",
+        `const own=${JSON.stringify(ownMarker)};`,
+        `const other=${JSON.stringify(otherMarker)};`,
+        `const issue=${JSON.stringify(issue)};`,
+        `const recommendation=${JSON.stringify(recommendation)};`,
+        "fs.writeFileSync(own,'started');",
+        "const deadline=Date.now()+2000;",
+        "while(!fs.existsSync(other)&&Date.now()<deadline){}",
+        "if(!fs.existsSync(other)){process.stdout.write(JSON.stringify({verdict:'error',summary:'other reviewer did not start',findings:[]}));process.exit(0);}",
+        "process.stdin.resume();",
+        "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue,recommendation}]})));",
+      ].join(""),
+    ],
+    timeoutMs: 5000,
+  };
+}

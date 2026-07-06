@@ -1,6 +1,6 @@
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ReviewGateConfig } from "./config";
+import type { DeciderConfig, ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
@@ -78,12 +78,12 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   const sideEffectPatchResult = sideEffectChanges.length > 0
     ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
     : { patch: "", truncated: false, omitted: [] };
-  const decider = input.config.decider;
-  if (!decider) {
+  const reviewers = getReviewers(input.config);
+  if (reviewers.length === 0) {
     return {
       changed: true,
       changes,
-      error: "No decider configured.",
+      error: "No reviewers configured.",
     };
   }
 
@@ -107,35 +107,20 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     },
   });
 
-  let result: ReviewResult;
-  try {
-    const adapter = createAdapter(decider);
-    await input.notify?.(`review gate: reviewing changes with ${decider.id}`);
-    result = await adapter.run({
-      id: decider.id,
-      cwd: input.cwd,
-      prompt: bundle.prompt,
-      bundleDir: bundle.dir,
-      timeoutMs: decider.timeoutMs ?? 300_000,
-      signal: input.signal,
-    });
-    await Promise.all([
-      writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-      writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
-    ]);
-  } catch (error) {
-    result = {
-      reviewerId: decider.id,
-      verdict: "error",
-      summary: error instanceof Error ? error.message : "Reviewer failed.",
-      findings: [],
-      error: error instanceof Error ? error.message : "review_failed",
-    };
-    await Promise.all([
-      writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-      writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
-    ]).catch(() => undefined);
-  }
+  await input.notify?.(`review gate: reviewing changes with ${reviewers.map((reviewer) => reviewer.id).join(", ")}`);
+  const reviewerResults = await Promise.all(reviewers.map((reviewer) => runSingleReviewer({
+    reviewer,
+    cwd: input.cwd,
+    prompt: bundle.prompt,
+    bundleDir: bundle.dir,
+    signal: input.signal,
+  })));
+  const result = aggregateReviewResults(reviewerResults);
+  await Promise.all([
+    writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
+    writeFile(join(bundle.dir, "reviewer-results.json"), JSON.stringify(reviewerResults, null, 2), "utf8"),
+    writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+  ]).catch(() => undefined);
 
   const shouldRetain = input.config.retainBundles === "always" || (input.config.retainBundles === "on-failure" && result.verdict === "error");
   if (!shouldRetain) {
@@ -165,11 +150,11 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   const sideEffectPatchResult = sideEffectChanges.length > 0
     ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
     : { patch: "", truncated: false, omitted: [] };
-  const decider = input.config.decider;
-  if (!decider) {
+  const reviewers = getReviewers(input.config);
+  if (reviewers.length === 0) {
     return {
       changes,
-      error: "No decider configured.",
+      error: "No reviewers configured.",
     };
   }
 
@@ -193,35 +178,20 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     },
   });
 
-  let result: ReviewResult;
-  try {
-    const adapter = createAdapter(decider);
-    await input.notify?.(`review gate: asking reviewer ${decider.id}`);
-    result = await adapter.run({
-      id: decider.id,
-      cwd: input.cwd,
-      prompt: bundle.prompt,
-      bundleDir: bundle.dir,
-      timeoutMs: decider.timeoutMs ?? 300_000,
-      signal: input.signal,
-    });
-    await Promise.all([
-      writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-      writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
-    ]);
-  } catch (error) {
-    result = {
-      reviewerId: decider.id,
-      verdict: "error",
-      summary: error instanceof Error ? error.message : "Reviewer failed.",
-      findings: [],
-      error: error instanceof Error ? error.message : "review_failed",
-    };
-    await Promise.all([
-      writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-      writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
-    ]).catch(() => undefined);
-  }
+  await input.notify?.(`review gate: asking reviewers ${reviewers.map((reviewer) => reviewer.id).join(", ")}`);
+  const reviewerResults = await Promise.all(reviewers.map((reviewer) => runSingleReviewer({
+    reviewer,
+    cwd: input.cwd,
+    prompt: bundle.prompt,
+    bundleDir: bundle.dir,
+    signal: input.signal,
+  })));
+  const result = aggregateReviewResults(reviewerResults);
+  await Promise.all([
+    writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
+    writeFile(join(bundle.dir, "reviewer-results.json"), JSON.stringify(reviewerResults, null, 2), "utf8"),
+    writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+  ]).catch(() => undefined);
 
   const shouldRetain = input.config.retainBundles === "always" || (input.config.retainBundles === "on-failure" && result.verdict === "error");
   if (!shouldRetain) {
@@ -236,7 +206,130 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   };
 }
 
-function createAdapter(decider: NonNullable<ReviewGateConfig["decider"]>): ModelAdapter {
+async function runSingleReviewer(input: {
+  reviewer: DeciderConfig;
+  cwd: string;
+  prompt: string;
+  bundleDir: string;
+  signal?: AbortSignal;
+}): Promise<ReviewResult> {
+  const reviewerDir = join(input.bundleDir, "reviewers", safePathSegment(input.reviewer.id));
+  await mkdir(reviewerDir, { recursive: true });
+  let result: ReviewResult;
+  try {
+    const adapter = createAdapter(input.reviewer);
+    result = await adapter.run({
+      id: input.reviewer.id,
+      cwd: input.cwd,
+      prompt: input.prompt,
+      bundleDir: reviewerDir,
+      timeoutMs: input.reviewer.timeoutMs ?? 300_000,
+      signal: input.signal,
+    });
+  } catch (error) {
+    result = {
+      reviewerId: input.reviewer.id,
+      verdict: "error",
+      summary: error instanceof Error ? error.message : "Reviewer failed.",
+      findings: [],
+      error: error instanceof Error ? error.message : "review_failed",
+    };
+  }
+  await Promise.all([
+    writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
+    writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+  ]).catch(() => undefined);
+  return result;
+}
+
+function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
+  if (results.length === 1 && results[0]) {
+    return results[0];
+  }
+  const needsChanges = results.filter((result) => result.verdict === "needs_changes");
+  const errors = results.filter((result) => result.verdict === "error");
+  const usage = aggregateUsage(results);
+  if (needsChanges.length > 0) {
+    return {
+      reviewerId: "aggregate",
+      verdict: "needs_changes",
+      summary: aggregateSummary(results),
+      findings: needsChanges.flatMap((result) => result.findings.map((finding) => ({
+        ...finding,
+        reviewerId: result.reviewerId,
+      }))),
+      usage,
+      error: errors.length > 0 ? "partial_reviewer_error" : undefined,
+    };
+  }
+  if (errors.length > 0) {
+    return {
+      reviewerId: "aggregate",
+      verdict: "error",
+      summary: aggregateSummary(results),
+      findings: [],
+      usage,
+      error: errors.every((result) => result.error === "aborted") ? "aborted" : "reviewer_error",
+    };
+  }
+  return {
+    reviewerId: "aggregate",
+    verdict: "pass",
+    summary: aggregateSummary(results),
+    findings: results.flatMap((result) => result.findings.map((finding) => ({
+      ...finding,
+      reviewerId: result.reviewerId,
+    }))),
+    usage,
+  };
+}
+
+function aggregateSummary(results: ReviewResult[]): string {
+  return results.map((result) => `${result.reviewerId}: ${result.summary}`).join("\n");
+}
+
+function aggregateUsage(results: ReviewResult[]): ReviewResult["usage"] {
+  const usages = results.map((result) => result.usage).filter((usage) => usage !== undefined);
+  if (usages.length === 0) {
+    return undefined;
+  }
+  return {
+    inputTokens: sumUsage(usages, "inputTokens"),
+    cachedInputTokens: sumUsage(usages, "cachedInputTokens"),
+    outputTokens: sumUsage(usages, "outputTokens"),
+    reasoningOutputTokens: sumUsage(usages, "reasoningOutputTokens"),
+    cacheWriteTokens: sumUsage(usages, "cacheWriteTokens"),
+    totalTokens: sumUsage(usages, "totalTokens"),
+    costTotal: sumUsage(usages, "costTotal"),
+    raw: Object.fromEntries(results.map((result) => [result.reviewerId, result.usage?.raw ?? result.usage ?? null])),
+  };
+}
+
+function sumUsage(usages: Array<NonNullable<ReviewResult["usage"]>>, key: keyof NonNullable<ReviewResult["usage"]>): number | undefined {
+  let found = false;
+  let total = 0;
+  for (const usage of usages) {
+    const value = usage[key];
+    if (typeof value === "number") {
+      found = true;
+      total += value;
+    }
+  }
+  return found ? total : undefined;
+}
+
+function getReviewers(config: ReviewGateConfig): DeciderConfig[] {
+  if (config.reviewers && config.reviewers.length > 0) {
+    return config.reviewers;
+  }
+  return config.decider ? [config.decider] : [];
+}
+
+function safePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/g, "_") || "reviewer";
+}
+
+function createAdapter(decider: DeciderConfig): ModelAdapter {
   if (decider.adapter === "generic-cli") {
     return new GenericCliAdapter(decider);
   }

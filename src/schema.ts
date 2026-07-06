@@ -5,6 +5,7 @@ export type ReviewVerdict = "pass" | "needs_changes" | "error";
 export type FindingSeverity = "blocking" | "non_blocking";
 
 export interface ReviewFinding {
+  reviewerId?: string;
   severity: FindingSeverity;
   file: string;
   line: number | null;

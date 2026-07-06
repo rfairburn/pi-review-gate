@@ -132,3 +132,42 @@ test("normalizeConfig keeps little-coder model selection generic", () => {
     timeoutMs: 300000,
   });
 });
+
+test("normalizeConfig supports multiple reviewers without legacy decider", () => {
+  const loaded = normalizeConfig({
+    enabled: true,
+    mode: "single-decider",
+    reviewers: [
+      {
+        id: "codex",
+        adapter: "codex-cli",
+      },
+      {
+        id: "claude",
+        adapter: "claude-cli",
+      },
+    ],
+  });
+
+  assert.equal(loaded.decider, undefined);
+  assert.deepEqual(loaded.reviewers?.map((reviewer) => reviewer.id), ["codex", "claude"]);
+});
+
+test("normalizeConfig rejects duplicate reviewer ids", () => {
+  assert.throws(
+    () => normalizeConfig({
+      enabled: true,
+      reviewers: [
+        {
+          id: "same",
+          adapter: "codex-cli",
+        },
+        {
+          id: "same",
+          adapter: "claude-cli",
+        },
+      ],
+    }),
+    /reviewer id must be unique: same/,
+  );
+});

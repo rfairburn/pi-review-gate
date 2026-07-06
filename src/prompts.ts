@@ -182,5 +182,6 @@ export function buildFollowUpMessage(result: ReviewResult): string {
 
 function formatFinding(finding: ReviewFinding): string {
   const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
-  return `${location} - ${finding.issue} ${finding.recommendation}`;
+  const reviewer = finding.reviewerId ? `[${finding.reviewerId}] ` : "";
+  return `${reviewer}${location} - ${finding.issue} ${finding.recommendation}`;
 }

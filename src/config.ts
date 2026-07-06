@@ -119,8 +119,12 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     reviewers: Array.isArray(value.reviewers) ? value.reviewers.map(normalizeDecider) : undefined,
   };
 
-  if (config.enabled && config.mode === "single-decider" && !config.decider) {
-    throw new Error("enabled single-decider config requires decider");
+  if (config.reviewers) {
+    validateUniqueReviewerIds(config.reviewers);
+  }
+
+  if (config.enabled && !config.decider && (!config.reviewers || config.reviewers.length === 0)) {
+    throw new Error("enabled review gate config requires decider or reviewers");
   }
 
   return config;
@@ -199,6 +203,16 @@ function normalizeDecider(value: unknown): DeciderConfig {
 
 function normalizeRetainBundles(value: unknown): RetainBundles {
   return value === "never" || value === "always" || value === "on-failure" ? value : DEFAULT_CONFIG.retainBundles;
+}
+
+function validateUniqueReviewerIds(reviewers: DeciderConfig[]): void {
+  const seen = new Set<string>();
+  for (const reviewer of reviewers) {
+    if (seen.has(reviewer.id)) {
+      throw new Error(`reviewer id must be unique: ${reviewer.id}`);
+    }
+    seen.add(reviewer.id);
+  }
 }
 
 function numberOrDefault(value: unknown, fallback: number): number {

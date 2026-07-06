@@ -21,7 +21,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
   registerCommand("review-gate-ping", {
     description: "Verify pi-review-gate is loaded.",
     handler: async (_args: string, ctx: unknown) => {
-      await sendNotice(ctx, `review gate: loaded; mode=${input.config.mode}; decider=${input.config.decider?.id ?? "none"}`);
+      const reviewers = input.config.reviewers?.map((reviewer) => reviewer.id).join(", ") ?? input.config.decider?.id ?? "none";
+      await sendNotice(ctx, `review gate: loaded; mode=${input.config.mode}; reviewers=${reviewers}`);
     },
   });
 

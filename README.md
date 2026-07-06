@@ -48,6 +48,36 @@ Example config using Codex as the reviewer:
 }
 ```
 
+Multiple reviewers can be configured with `reviewers`. They run in parallel
+against the same review bundle. Review-gate waits for every reviewer, then
+aggregates the independent results: any reviewer requesting changes causes a
+combined `needs_changes` response with that reviewer's findings attributed in
+the follow-up.
+
+```json
+{
+  "enabled": true,
+  "mode": "single-decider",
+  "maxCorrectionCycles": 3,
+  "reviewWhen": "changed-files",
+  "retainBundles": "on-failure",
+  "reviewers": [
+    {
+      "id": "codex",
+      "adapter": "codex-cli",
+      "timeoutMs": 300000
+    },
+    {
+      "id": "claude",
+      "adapter": "claude-cli",
+      "timeoutMs": 300000
+    }
+  ]
+}
+```
+
+The older single `decider` field is still supported for compatibility.
+
 Load during development by pointing your pi host at the built extension:
 
 ```bash
@@ -132,7 +162,7 @@ outside the current worktree.
 
 ## Commands
 
-`/review-now` reruns the configured reviewer against the current captured
+`/review-now` reruns the configured reviewer or reviewers against the current captured
 baseline and evidence.
 
 `/review-continue` sends the last reviewer feedback that was held back because
@@ -144,9 +174,9 @@ holds that input locally until the review finishes. When the reviewer requests
 changes, reviewer feedback is queued first, then your held guidance is queued
 after it in the same order you typed it.
 
-`/ask-reviewer <question>` asks the configured reviewer an ad hoc question about
-the current work. It includes the current request context, changed files and
-patch when available, and the session evidence digest, including
+`/ask-reviewer <question>` asks the configured reviewer or reviewers an ad hoc
+question about the current work. It includes the current request context,
+changed files and patch when available, and the session evidence digest, including
 read-only/tool-call activity and the primary agent's final summary. This makes it
 useful after planning-only turns as well as after edits.
 
@@ -156,7 +186,9 @@ Escape/Ctrl+C to clear it without sending anything.
 
 Retained review bundles include `request.md`, `changed-files.json`,
 `patch.diff`, `side-effect.patch.diff`, `reviewer-prompt.md`, `evidence.json`,
-`evidence.md`, `acting-model-usage.json`, `reviewer-usage.json`,
-`raw-output.txt`, and `stderr.txt`. When supported by the reviewer CLI,
-user-facing notices include a compact reviewer token summary, for example
+`evidence.md`, `acting-model-usage.json`, aggregate `parsed-result.json`,
+`reviewer-results.json`, and aggregate `reviewer-usage.json`. Each reviewer also
+writes isolated outputs under `reviewers/<id>/`, including `raw-output.txt`,
+`stderr.txt`, `parsed-result.json`, and `reviewer-usage.json`. When supported by
+the reviewer CLI, user-facing notices include a compact reviewer token summary, for example
 `review gate: passed (review tokens: in 1.2k, out 340, total 1.6k)`.

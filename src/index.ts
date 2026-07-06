@@ -1,6 +1,7 @@
 import { loadConfig } from "./config";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
+import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
 import { runReview, type ReviewRunOutput } from "./review";
@@ -137,6 +138,7 @@ export async function activate(pi: unknown): Promise<void> {
 
     if (!output.changed) {
       state.runActive = false;
+      state.lastCorrectionFeedback = undefined;
       await releaseQueuedUserInputs(pi, state);
       return;
     }
@@ -151,11 +153,38 @@ export async function activate(pi: unknown): Promise<void> {
     if (output.result?.verdict === "pass") {
       await sendNotice(noticeTarget, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
       state.runActive = false;
+      state.lastCorrectionFeedback = undefined;
       await releaseQueuedUserInputs(pi, state);
       return;
     }
 
     if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
+      if (isRepeatedNoProgressFeedback({
+        previous: state.lastCorrectionFeedback,
+        result: output.result,
+        changes: output.changes,
+        evidenceEventCount: state.evidence.events.length,
+      })) {
+        await sendNotice(
+          noticeTarget,
+          [
+            `review gate: repeated changes requested with no new correction evidence (${formatTokenUsage(output.result.usage)})`,
+            "Reviewer feedback matched the previous blocking feedback, and the correction turn produced no new tool evidence or file-change fingerprint.",
+            "Stopping automatic correction to avoid a loop.",
+            "",
+            output.followUpMessage,
+          ].join("\n"),
+        );
+        state.runActive = false;
+        await releaseQueuedUserInputs(pi, state);
+        return;
+      }
+
+      state.lastCorrectionFeedback = createCorrectionFeedbackMarker({
+        result: output.result,
+        changes: output.changes,
+        evidenceEventCount: state.evidence.events.length,
+      });
       if (state.correctionCycles >= config.maxCorrectionCycles) {
         state.lastCappedFollowUp = output.followUpMessage;
         state.reviewPausedAtCap = true;
@@ -184,6 +213,7 @@ export async function activate(pi: unknown): Promise<void> {
     const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
     await sendNotice(noticeTarget, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
     state.runActive = false;
+    state.lastCorrectionFeedback = undefined;
     await releaseQueuedUserInputs(pi, state);
   });
 

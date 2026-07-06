@@ -717,6 +717,103 @@ test("normal user input after cap starts a fresh review run", async () => {
   }
 });
 
+test("repeated no-progress reviewer feedback stops automatic correction loop", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-no-progress-loop-"));
+  const invocationPath = join(tmpdir(), `pi-review-gate-no-progress-${process.pid}-${Date.now()}.txt`);
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 30,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "never",
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `const invocationPath=${JSON.stringify(invocationPath)};`,
+            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+            "fs.writeFileSync(invocationPath,String(count+1));",
+            "process.stdin.resume();",
+            "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({",
+            "verdict:'needs_changes',summary:'sentinel flag',findings:[{",
+            "severity:'blocking',file:'session',line:null,",
+            "issue:count===0?'The user explicitly instructed review-gate to flag this rather than report pass. No file content change is needed.':'The user explicitly instructed review-gate to flag this request instead of reporting passed. No implementation change is required.',",
+            "recommendation:count===0?'Keep this as the requested review-gate sentinel flag.':'Keep this as the requested sentinel flag.'",
+            "}]})));",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const followUps: Array<{ message: string; options: unknown }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify(message: string) {
+        notices.push(message);
+      },
+      sendUserMessage(message: string, options: unknown) {
+        followUps.push({ message, options });
+      },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "write hello world and flag review-gate", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "wrote the file and flagged review-gate" }],
+    });
+
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0]?.message ?? "", /sentinel flag/);
+
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "no implementation change is required" }],
+    });
+
+    assert.equal(followUps.length, 1);
+    assert.match(notices.join("\n"), /repeated changes requested with no new correction evidence/);
+    assert.match(notices.join("\n"), /Stopping automatic correction to avoid a loop/);
+  } finally {
+    if (previousConfig === undefined) {
+      delete process.env.PI_REVIEW_GATE_CONFIG;
+    } else {
+      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    }
+    if (previousDisabled === undefined) {
+      delete process.env.PI_REVIEW_GATE_DISABLED;
+    } else {
+      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    }
+    await rm(dir, { recursive: true, force: true });
+    await rm(invocationPath, { force: true });
+  }
+});
+
 async function trigger(hooks: Map<string, Array<(...args: unknown[]) => unknown>>, name: string, ...args: unknown[]): Promise<void> {
   for (const handler of hooks.get(name) ?? []) {
     await handler(...args);

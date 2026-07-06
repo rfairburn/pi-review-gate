@@ -1,4 +1,5 @@
 import type { WorkspaceSnapshot } from "./capture";
+import type { CorrectionFeedbackMarker } from "./correction-feedback";
 import { createEvidenceState, type EvidenceState } from "./evidence";
 
 export interface ReviewGateState {
@@ -6,6 +7,7 @@ export interface ReviewGateState {
   requestHistory: UserRequestContext[];
   correctionCycles: number;
   lastCappedFollowUp?: string;
+  lastCorrectionFeedback?: CorrectionFeedbackMarker;
   reviewPausedAtCap: boolean;
   reviewInProgress: boolean;
   queuedUserInputsDuringReview: string[];
@@ -27,6 +29,7 @@ export function createState(): ReviewGateState {
     requestHistory: [],
     correctionCycles: 0,
     lastCappedFollowUp: undefined,
+    lastCorrectionFeedback: undefined,
     reviewPausedAtCap: false,
     reviewInProgress: false,
     queuedUserInputsDuringReview: [],
@@ -45,6 +48,7 @@ export function rememberUserRequest(state: ReviewGateState, request: string): vo
   if (state.reviewPausedAtCap) {
     state.reviewPausedAtCap = false;
     state.lastCappedFollowUp = undefined;
+    state.lastCorrectionFeedback = undefined;
     state.runActive = false;
   }
 
@@ -66,6 +70,7 @@ export function rememberUserRequest(state: ReviewGateState, request: string): vo
   }];
   state.correctionCycles = 0;
   state.lastCappedFollowUp = undefined;
+  state.lastCorrectionFeedback = undefined;
   state.reviewPausedAtCap = false;
   state.queuedUserInputsDuringReview = [];
   state.touchedPaths.clear();

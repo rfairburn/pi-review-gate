@@ -8,7 +8,8 @@ const REVIEW_CONTEXT_POLICY = `Review policy:
 - A temp-like side-effect classification is a heuristic, not a guarantee. Do not block solely because a temp-like external file exists, but do block if it is referenced by submitted code, contains secrets, stores meaningful user content, changes persistent behavior, or indicates unsafe/unmanaged side effects.
 - Persistent-looking external side effects deserve scrutiny, but do not block solely because they are outside the workspace or not explicitly named in the user request. Block only when they are unrelated to the task, modify user/environment configuration, create or change executable/runtime content, store meaningful user data in an unmanaged location, leak secrets, or leave state that affects future behavior.
 - Working notes or review documents may be acceptable when they are consistent with the session context; review them for correctness, not for their mere existence.
-- Workspace side effects that are not submitted changes should be reviewed for accidental generated output, ignored files needed by the implementation, or files that should be cleaned up.`;
+- Workspace side effects that are not submitted changes should be reviewed for accidental generated output, ignored files needed by the implementation, or files that should be cleaned up.
+- Return "needs_changes" only when the primary agent can take a concrete follow-up action that could make a later review pass. If a finding is only a sentinel/status flag, acknowledgement, or other terminal note with no requested fix, return "pass" with a non_blocking finding instead of a blocking finding.`;
 
 export function buildReviewerPrompt(input: {
   request: string;

@@ -49,6 +49,7 @@ export interface AskReviewerInput {
 export interface AskReviewerOutput {
   changes: ChangedFile[];
   result?: ReviewResult;
+  reviewerResults?: ReviewResult[];
   bundleDir?: string;
   bundleRetained?: boolean;
   error?: string;
@@ -122,7 +123,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
   ]).catch(() => undefined);
 
-  const shouldRetain = input.config.retainBundles === "always" || (input.config.retainBundles === "on-failure" && result.verdict === "error");
+  const shouldRetain = shouldRetainBundle(input.config, result, reviewerResults);
   if (!shouldRetain) {
     await removeReviewBundle(bundle.dir);
   }
@@ -193,7 +194,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
   ]).catch(() => undefined);
 
-  const shouldRetain = input.config.retainBundles === "always" || (input.config.retainBundles === "on-failure" && result.verdict === "error");
+  const shouldRetain = shouldRetainBundle(input.config, result, reviewerResults);
   if (!shouldRetain) {
     await removeReviewBundle(bundle.dir);
   }
@@ -201,6 +202,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   return {
     changes,
     result,
+    reviewerResults,
     bundleDir: bundle.dir,
     bundleRetained: shouldRetain,
   };
@@ -282,6 +284,20 @@ function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
     }))),
     usage,
   };
+}
+
+function shouldRetainBundle(
+  config: ReviewGateConfig,
+  result: ReviewResult,
+  reviewerResults: ReviewResult[],
+): boolean {
+  if (config.retainBundles === "always") {
+    return true;
+  }
+  if (config.retainBundles !== "on-failure") {
+    return false;
+  }
+  return result.verdict === "error" || reviewerResults.some((reviewerResult) => reviewerResult.verdict === "error");
 }
 
 function aggregateSummary(results: ReviewResult[]): string {

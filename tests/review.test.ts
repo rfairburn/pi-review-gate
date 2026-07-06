@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -115,6 +115,66 @@ test("runReview runs configured reviewers in parallel and aggregates blocking fi
     await rm(dir, { recursive: true, force: true });
     await rm(markerA, { force: true });
     await rm(markerB, { force: true });
+  }
+});
+
+test("runReview retains on any reviewer error even when aggregate requests changes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-retain-partial-error-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: {
+        ...baseConfig,
+        retainBundles: "on-failure",
+        decider: undefined,
+        reviewers: [
+          jsonReviewer("blocking", "{verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]}"),
+          jsonReviewer("bad-json", "{verdict:'maybe',summary:'invalid verdict',findings:[]}"),
+        ],
+      },
+    });
+
+    assert.equal(output.result?.verdict, "needs_changes");
+    assert.equal(output.result?.error, "partial_reviewer_error");
+    assert.equal(output.bundleRetained, true);
+    await access(join(output.bundleDir ?? "", "reviewers", "bad-json", "raw-output.txt"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runAskReviewer retains on any reviewer error even when aggregate answer is usable", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-retain-partial-error-"));
+  try {
+    const output = await runAskReviewer({
+      cwd: dir,
+      question: "do you agree?",
+      request: "review the plan",
+      config: {
+        ...baseConfig,
+        retainBundles: "on-failure",
+        decider: undefined,
+        reviewers: [
+          jsonReviewer("passing", "{verdict:'pass',summary:'answer ready',findings:[]}"),
+          jsonReviewer("bad-json", "{verdict:'maybe',summary:'invalid verdict',findings:[]}"),
+        ],
+      },
+    });
+
+    assert.equal(output.result?.verdict, "error");
+    assert.equal(output.bundleRetained, true);
+    await access(join(output.bundleDir ?? "", "reviewers", "bad-json", "raw-output.txt"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -336,6 +396,19 @@ function blockingReviewer(
         "process.stdin.resume();",
         "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue,recommendation}]})));",
       ].join(""),
+    ],
+    timeoutMs: 5000,
+  };
+}
+
+function jsonReviewer(id: string, objectLiteral: string): NonNullable<ReviewGateConfig["decider"]> {
+  return {
+    id,
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [
+      "-e",
+      `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify(${objectLiteral})))`,
     ],
     timeoutMs: 5000,
   };

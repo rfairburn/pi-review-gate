@@ -28,7 +28,7 @@ export function buildReviewerPrompt(input: {
 
   return `You are reviewing code changes made by another coding agent.
 
-Review only the supplied user request context, submitted workspace patch, captured side-effect evidence, and session evidence. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the supplied context is impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
+Review only the supplied user request context, submitted workspace patch, captured side-effect evidence, and session evidence. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not call tools, inspect files, run shell commands, or use the network. Do not ask for more context unless the supplied context is impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
 
 ${REVIEW_CONTEXT_POLICY}
 
@@ -102,7 +102,7 @@ export function buildReviewerQuestionPrompt(input: {
 
   return `You are an independent reviewer consulted about work done by another coding agent.
 
-Answer the user's reviewer question using only the supplied context. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, and session evidence. Do not include chain of thought. Return only valid JSON matching the schema.
+Answer the user's reviewer question using only the supplied context. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, and session evidence. Do not call tools, inspect files, run shell commands, or use the network. Do not include chain of thought. Return only valid JSON matching the schema.
 
 ${REVIEW_CONTEXT_POLICY}
 

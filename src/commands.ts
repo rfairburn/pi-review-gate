@@ -103,19 +103,20 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
 
-      if (output.result.verdict === "error") {
+      if (output.result.verdict === "error" && !hasUsableReviewerAnswer(output.reviewerResults)) {
         const failed = `review gate: ask-reviewer failed: ${output.result.summary} (${formatTokenUsage(output.result.usage)})`;
         await sendNotice(ctx, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
         return;
       }
 
-      const payload = formatReviewerAnswer(question, output.result);
+      const payload = formatReviewerAnswer(question, output.result, output.bundleRetained ? output.bundleDir : undefined);
       const submittedPayload = await showPrivateReviewerAnswer(ctx, payload);
       if (typeof submittedPayload === "string" && submittedPayload.trim()) {
         await sendUserPrompt(input.pi, submittedPayload.trim());
         return;
       }
-      await sendNotice(ctx, `${formatTokenUsage(output.result.usage)}\nreview gate: reviewer answer cleared`);
+      const cleared = `${formatTokenUsage(output.result.usage)}\nreview gate: reviewer answer cleared`;
+      await sendNotice(ctx, output.bundleRetained ? `${cleared}, bundle retained at ${output.bundleDir}` : cleared);
     },
   });
 }
@@ -135,7 +136,7 @@ function getRegisterCommand(pi: unknown): RegisterCommand | undefined {
   return undefined;
 }
 
-function formatReviewerAnswer(question: string, result: ReviewResult): string {
+function formatReviewerAnswer(question: string, result: ReviewResult, bundleDir?: string): string {
   const lines = [
     "Reviewer note from /ask-reviewer:",
     "",
@@ -143,6 +144,9 @@ function formatReviewerAnswer(question: string, result: ReviewResult): string {
     "",
     `Answer: ${result.summary}`,
   ];
+  if (bundleDir) {
+    lines.push("", `Retained review bundle: ${bundleDir}`);
+  }
   const findings = formatFindings(result.findings);
   if (findings.length > 0) {
     lines.push("", "Relevant findings:", ...findings);
@@ -155,6 +159,10 @@ function formatFindings(findings: ReviewFinding[]): string[] {
     const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
     return `${index + 1}. ${location} - ${finding.issue} ${finding.recommendation}`;
   });
+}
+
+function hasUsableReviewerAnswer(results: ReviewResult[] | undefined): boolean {
+  return Boolean(results?.some((result) => result.verdict !== "error"));
 }
 
 async function showPrivateReviewerAnswer(ctx: unknown, message: string): Promise<string | undefined> {

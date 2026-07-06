@@ -3,6 +3,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 export interface ProcessRunResult {
   stdout: string;
   stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
   code: number | null;
   timedOut: boolean;
   aborted: boolean;
@@ -18,9 +20,10 @@ export async function runPromptProcess(input: {
   timeoutMs: number;
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
+  onStdoutChunk?: (chunk: string) => void;
 }): Promise<ProcessRunResult> {
   if (input.signal?.aborted) {
-    return { stdout: "", stderr: "", code: null, timedOut: false, aborted: true };
+    return { stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false, code: null, timedOut: false, aborted: true };
   }
 
   return await new Promise((resolve, reject) => {
@@ -34,6 +37,8 @@ export async function runPromptProcess(input: {
 
     let stdout = "";
     let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let settled = false;
     let timedOut = false;
     let aborted = false;
@@ -84,19 +89,20 @@ export async function runPromptProcess(input: {
     });
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => {
-      if (Buffer.byteLength(stdout) < MAX_OUTPUT_BYTES) {
-        stdout += chunk;
-      }
+      input.onStdoutChunk?.(chunk);
+      const captured = appendCapped(stdout, chunk, MAX_OUTPUT_BYTES);
+      stdout = captured.value;
+      stdoutTruncated = stdoutTruncated || captured.truncated;
     });
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (chunk: string) => {
-      if (Buffer.byteLength(stderr) < MAX_OUTPUT_BYTES) {
-        stderr += chunk;
-      }
+      const captured = appendCapped(stderr, chunk, MAX_OUTPUT_BYTES);
+      stderr = captured.value;
+      stderrTruncated = stderrTruncated || captured.truncated;
     });
     proc.on("close", (code) => {
       input.signal?.removeEventListener("abort", onAbort);
-      finish({ stdout, stderr, code, timedOut, aborted });
+      finish({ stdout, stderr, stdoutTruncated, stderrTruncated, code, timedOut, aborted });
     });
     proc.stdin.end(input.prompt);
 
@@ -104,6 +110,22 @@ export async function runPromptProcess(input: {
       onAbort();
     }
   });
+}
+
+function appendCapped(current: string, chunk: string, maxBytes: number): { value: string; truncated: boolean } {
+  const currentBytes = Buffer.byteLength(current);
+  if (currentBytes >= maxBytes) {
+    return { value: current, truncated: chunk.length > 0 };
+  }
+  const remaining = maxBytes - currentBytes;
+  const chunkBytes = Buffer.byteLength(chunk);
+  if (chunkBytes <= remaining) {
+    return { value: current + chunk, truncated: false };
+  }
+  return {
+    value: current + Buffer.from(chunk).subarray(0, remaining).toString("utf8"),
+    truncated: true,
+  };
 }
 
 export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {

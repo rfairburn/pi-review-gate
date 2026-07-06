@@ -203,35 +203,108 @@ export function extractReviewTextFromClaudeJson(value: unknown): string {
 }
 
 export function extractReviewTextFromPiJsonl(stdout: string): { text: string; usage?: TokenUsage } {
-  let lastText = "";
-  let usage: TokenUsage | undefined;
-  for (const line of stdout.split(/\r?\n/)) {
+  const extractor = new PiJsonlReviewExtractor();
+  extractor.push(stdout);
+  return extractor.finish();
+}
+
+export class PiJsonlReviewExtractor {
+  private pending = "";
+  private finalText = "";
+  private currentDeltaText = "";
+  private partialText = "";
+  private usage: TokenUsage | undefined;
+
+  push(chunk: string): void {
+    this.pending += chunk;
+    while (true) {
+      const newlineIndex = this.pending.search(/\r?\n/);
+      if (newlineIndex === -1) {
+        return;
+      }
+      const line = this.pending.slice(0, newlineIndex);
+      const newlineLength = this.pending[newlineIndex] === "\r" && this.pending[newlineIndex + 1] === "\n" ? 2 : 1;
+      this.pending = this.pending.slice(newlineIndex + newlineLength);
+      this.processLine(line);
+    }
+  }
+
+  finish(): { text: string; usage?: TokenUsage } {
+    if (this.pending.trim()) {
+      this.processLine(this.pending);
+    }
+    this.pending = "";
+    return this.result();
+  }
+
+  result(): { text: string; usage?: TokenUsage } {
+    return {
+      text: this.finalText || this.currentDeltaText || this.partialText,
+      usage: this.usage,
+    };
+  }
+
+  private processLine(line: string): void {
     if (!line.trim()) {
-      continue;
+      return;
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
     } catch {
-      continue;
+      return;
     }
+
     const parsedUsage = parsePiUsage(parsed);
     if (parsedUsage) {
-      usage = parsedUsage;
+      this.usage = parsedUsage;
     }
-    if (isRecord(parsed) && isRecord(parsed.message) && parsed.message.role === "assistant") {
-      const text = textFromContent(parsed.message.content);
+    if (!isRecord(parsed)) {
+      return;
+    }
+
+    if (parsed.type === "message_start" && isAssistantMessage(parsed.message)) {
+      this.currentDeltaText = "";
+      this.partialText = "";
+      return;
+    }
+
+    if (parsed.type === "message_update") {
+      this.applyMessageUpdate(parsed);
+      return;
+    }
+
+    if (isAssistantMessage(parsed.message)) {
+      this.captureAssistantText(parsed.message.content);
+    }
+  }
+
+  private applyMessageUpdate(parsed: Record<string, unknown>): void {
+    const event = isRecord(parsed.assistantMessageEvent) ? parsed.assistantMessageEvent : undefined;
+    if (event?.type === "text_delta" && typeof event.delta === "string") {
+      this.currentDeltaText += event.delta;
+    }
+    const partial = isRecord(event?.partial)
+      ? event.partial
+      : isRecord(parsed.message) && parsed.message.role === "assistant"
+        ? parsed.message
+        : undefined;
+    if (isAssistantMessage(partial)) {
+      const text = textFromContent(partial.content);
       if (text.trim()) {
-        lastText = text;
-      }
-    } else if (isRecord(parsed) && parsed.type === "message" && isRecord(parsed.message) && parsed.message.role === "assistant") {
-      const text = textFromContent(parsed.message.content);
-      if (text.trim()) {
-        lastText = text;
+        this.partialText = text;
       }
     }
   }
-  return { text: lastText, usage };
+
+  private captureAssistantText(content: unknown): void {
+    const text = textFromContent(content);
+    if (text.trim()) {
+      this.finalText = text;
+      this.currentDeltaText = text;
+      this.partialText = text;
+    }
+  }
 }
 
 function normalizeOpenAiStyleUsage(value: Record<string, unknown>, raw: unknown): TokenUsage {
@@ -296,4 +369,8 @@ function isZeroUsage(usage: TokenUsage): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isAssistantMessage(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && value.role === "assistant";
 }

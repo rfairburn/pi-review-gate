@@ -2,7 +2,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { LittleCoderDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
-import { extractReviewTextFromPiJsonl } from "../usage";
+import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../usage";
 import { reviewerEnv, runPromptProcess } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 
@@ -13,14 +13,18 @@ export class LittleCoderAdapter implements ModelAdapter {
 
   async run(req: ModelAdapterRequest): Promise<ReviewResult> {
     const rawOutputPath = join(req.bundleDir, "raw-output.txt");
+    const finalOutputPath = join(req.bundleDir, "reviewer-final.txt");
     const stderrPath = join(req.bundleDir, "stderr.txt");
     const usagePath = join(req.bundleDir, "usage.json");
+    const processResultPath = join(req.bundleDir, "process-result.json");
+    const streamExtractor = new PiJsonlReviewExtractor();
     const args = [
       "--model",
       this.config.model,
       "--mode",
       "json",
       "--print",
+      "--no-tools",
       "--no-extensions",
       "--no-skills",
       "--no-prompt-templates",
@@ -36,13 +40,25 @@ export class LittleCoderAdapter implements ModelAdapter {
       timeoutMs: req.timeoutMs,
       env: reviewerEnv(process.env),
       signal: req.signal,
+      onStdoutChunk: (chunk) => streamExtractor.push(chunk),
     });
+    const streamExtracted = streamExtractor.finish();
+    const cappedExtracted = extractReviewTextFromPiJsonl(output.stdout);
+    const extracted = streamExtracted.text.trim() ? streamExtracted : cappedExtracted;
     await Promise.all([
       writeFile(rawOutputPath, output.stdout, "utf8"),
+      writeFile(finalOutputPath, extracted.text, "utf8"),
       writeFile(stderrPath, output.stderr, "utf8"),
+      writeFile(processResultPath, JSON.stringify({
+        code: output.code,
+        timedOut: output.timedOut,
+        aborted: output.aborted,
+        stdoutTruncated: output.stdoutTruncated,
+        stderrTruncated: output.stderrTruncated,
+        finalTextCaptured: extracted.text.trim().length > 0,
+      }, null, 2), "utf8"),
     ]);
 
-    const extracted = extractReviewTextFromPiJsonl(output.stdout);
     await writeFile(usagePath, JSON.stringify(extracted.usage ?? null, null, 2), "utf8").catch(() => undefined);
 
     if (output.aborted) {
@@ -54,8 +70,14 @@ export class LittleCoderAdapter implements ModelAdapter {
     if (output.code !== 0) {
       return errorResult(req.id, `Reviewer exited with status ${output.code}.`, rawOutputPath, `exit_${output.code}`, extracted.usage);
     }
+    if (!extracted.text.trim()) {
+      const summary = output.stdoutTruncated
+        ? "Reviewer output was truncated before a final assistant text was captured."
+        : "Reviewer did not produce final assistant text.";
+      return errorResult(req.id, summary, rawOutputPath, output.stdoutTruncated ? "output_truncated" : "missing_final_text", extracted.usage);
+    }
 
-    const result = parseReviewResult(req.id, extracted.text || output.stdout, rawOutputPath);
+    const result = parseReviewResult(req.id, extracted.text, rawOutputPath);
     result.usage = extracted.usage;
     return result;
   }

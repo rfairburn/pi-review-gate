@@ -185,6 +185,54 @@ test("/ask-reviewer submits edited reviewer text when the editor is submitted", 
   }
 });
 
+test("/ask-reviewer opens partial multi-reviewer answers when one reviewer errors", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-partial-"));
+  try {
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const userMessages: string[] = [];
+    const notices: string[] = [];
+    const editorViews: Array<{ title: string; prefill: string }> = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        userMessages.push(message);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        async editor(title: string, prefill: string) {
+          editorViews.push({ title, prefill });
+          return undefined;
+        },
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: askReviewerPartialErrorConfig(),
+      state: createState(),
+    });
+
+    await commands.get("ask-reviewer")?.("do you agree?", ctx);
+
+    assert.equal(userMessages.length, 0);
+    assert.equal(editorViews.length, 1);
+    assert.match(editorViews[0]?.prefill ?? "", /Answer: passing: reviewer answer ready/);
+    assert.match(editorViews[0]?.prefill ?? "", /bad-json: Reviewer JSON has an invalid verdict/);
+    assert.match(editorViews[0]?.prefill ?? "", /Retained review bundle: /);
+    assert.match(notices.join("\n"), /reviewer answer cleared, bundle retained at /);
+    assert.doesNotMatch(notices.join("\n"), /ask-reviewer failed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function reviewConfig(): ReviewGateConfig {
   return {
     enabled: true,
@@ -205,6 +253,41 @@ function reviewConfig(): ReviewGateConfig {
       ],
       timeoutMs: 5000,
     },
+  };
+}
+
+function askReviewerPartialErrorConfig(): ReviewGateConfig {
+  return {
+    enabled: true,
+    mode: "single-decider",
+    maxCorrectionCycles: 3,
+    reviewWhen: "changed-files",
+    maxPatchBytes: 200_000,
+    maxFileBytes: 1_048_576,
+    maxSnapshotBytes: 52_428_800,
+    retainBundles: "on-failure",
+    reviewers: [
+      {
+        id: "passing",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewer answer ready',findings:[]})))",
+        ],
+        timeoutMs: 5000,
+      },
+      {
+        id: "bad-json",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'maybe',summary:'invalid verdict',findings:[]})))",
+        ],
+        timeoutMs: 5000,
+      },
+    ],
   };
 }
 

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   collectEvidenceChanges,
+  buildEvidenceBundle,
   createEvidenceState,
   extractCandidatePaths,
   recordToolCallEvidence,
@@ -98,4 +99,42 @@ test("rememberFinalAssistantSummary extracts the last assistant text", () => {
   ]);
 
   assert.equal(state.finalAssistantSummary, "final summary");
+});
+
+test("rememberFinalAssistantSummary keeps multiple turn summaries for continued review", () => {
+  const state = createEvidenceState();
+
+  rememberFinalAssistantSummary(state, [{ messages: [{ role: "assistant", content: "first summary" }] }]);
+  rememberFinalAssistantSummary(state, [{ messages: [{ role: "assistant", content: "second summary" }] }]);
+
+  const bundle = buildEvidenceBundle(state, []);
+
+  assert.equal(state.finalAssistantSummary, "second summary");
+  assert.deepEqual(state.finalAssistantSummaries, ["first summary", "second summary"]);
+  assert.match(bundle.markdown, /Summary 1/);
+  assert.match(bundle.markdown, /first summary/);
+  assert.match(bundle.markdown, /Summary 2/);
+  assert.match(bundle.markdown, /second summary/);
+});
+
+test("evidence markdown preserves initial and recent tool events", () => {
+  const state = createEvidenceState();
+  for (let index = 1; index <= 200; index += 1) {
+    state.events.push({
+      sequence: index,
+      phase: "tool_call",
+      toolName: "bash",
+      summary: `event ${index}`,
+      candidatePaths: [],
+      riskSignals: [],
+    });
+  }
+
+  const bundle = buildEvidenceBundle(state, []);
+
+  assert.match(bundle.markdown, /#1 tool_call bash: event 1/);
+  assert.match(bundle.markdown, /#40 tool_call bash: event 40/);
+  assert.match(bundle.markdown, /40 middle events omitted/);
+  assert.match(bundle.markdown, /#81 tool_call bash: event 81/);
+  assert.match(bundle.markdown, /#200 tool_call bash: event 200/);
 });

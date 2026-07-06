@@ -68,6 +68,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const followUp = input.state.lastCappedFollowUp;
       input.state.lastCappedFollowUp = undefined;
+      input.state.reviewPausedAtCap = false;
+      input.state.runActive = true;
       input.state.correctionCycles = 0;
       await sendNotice(ctx, `review gate: continuing review; correction budget reset to ${input.config.maxCorrectionCycles}`);
       await sendFollowUp(input.pi, followUp);

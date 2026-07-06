@@ -158,6 +158,7 @@ export async function activate(pi: unknown): Promise<void> {
     if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
       if (state.correctionCycles >= config.maxCorrectionCycles) {
         state.lastCappedFollowUp = output.followUpMessage;
+        state.reviewPausedAtCap = true;
         await sendNotice(
           noticeTarget,
           [
@@ -175,7 +176,6 @@ export async function activate(pi: unknown): Promise<void> {
       state.lastCappedFollowUp = undefined;
       state.correctionCycles += 1;
       await sendNotice(noticeTarget, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
-      state.runActive = false;
       await sendFollowUp(pi, output.followUpMessage);
       await releaseQueuedUserInputs(pi, state);
       return;

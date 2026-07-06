@@ -63,6 +63,7 @@ test("/review-continue sends capped feedback and resets the correction budget", 
   const state = createState();
   state.correctionCycles = 3;
   state.lastCappedFollowUp = "Review found blocking issues.\n\n1. index.ts - missing guard add it";
+  state.reviewPausedAtCap = true;
   const pi = {
     registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
       commands.set(name, options.handler);
@@ -88,6 +89,8 @@ test("/review-continue sends capped feedback and resets the correction budget", 
 
   assert.equal(state.correctionCycles, 0);
   assert.equal(state.lastCappedFollowUp, undefined);
+  assert.equal(state.reviewPausedAtCap, false);
+  assert.equal(state.runActive, true);
   assert.deepEqual(followUps, ["Review found blocking issues.\n\n1. index.ts - missing guard add it"]);
   assert.match(notices.join("\n"), /correction budget reset to 3/);
 

@@ -12,6 +12,7 @@ export interface EvidenceState {
   events: EvidenceEvent[];
   candidates: Map<string, EvidenceCandidate>;
   finalAssistantSummary?: string;
+  finalAssistantSummaries: string[];
 }
 
 export interface EvidenceEvent {
@@ -41,6 +42,7 @@ export interface EvidenceBundle {
     baseline: "captured" | "missing" | "error";
   }>;
   finalAssistantSummary?: string;
+  finalAssistantSummaries: string[];
   changedCandidatePaths: string[];
   markdown: string;
 }
@@ -50,6 +52,7 @@ export function createEvidenceState(): EvidenceState {
     nextSequence: 1,
     events: [],
     candidates: new Map(),
+    finalAssistantSummaries: [],
   };
 }
 
@@ -135,6 +138,7 @@ export function buildEvidenceBundle(state: EvidenceState, changedCandidatePaths:
     events: state.events,
     candidates,
     finalAssistantSummary: state.finalAssistantSummary,
+    finalAssistantSummaries: state.finalAssistantSummaries,
     changedCandidatePaths,
   };
 
@@ -147,7 +151,12 @@ export function buildEvidenceBundle(state: EvidenceState, changedCandidatePaths:
 export function rememberFinalAssistantSummary(state: EvidenceState, args: unknown[]): void {
   const summary = extractFinalAssistantText(args);
   if (summary) {
-    state.finalAssistantSummary = truncate(summary, 4000);
+    const truncated = truncate(summary, 4000);
+    state.finalAssistantSummary = truncated;
+    state.finalAssistantSummaries.push(truncated);
+    if (state.finalAssistantSummaries.length > 10) {
+      state.finalAssistantSummaries.splice(0, state.finalAssistantSummaries.length - 10);
+    }
   }
 }
 
@@ -328,7 +337,12 @@ function summarizeToolResult(result: unknown, isError: boolean | undefined): str
 function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): string {
   const lines: string[] = ["## Session Evidence", ""];
 
-  if (bundle.finalAssistantSummary) {
+  if (bundle.finalAssistantSummaries.length > 0) {
+    lines.push("### Agent final summaries", "");
+    for (const [index, summary] of bundle.finalAssistantSummaries.entries()) {
+      lines.push(`#### Summary ${index + 1}`, "", summary, "");
+    }
+  } else if (bundle.finalAssistantSummary) {
     lines.push("### Agent final summary", "", bundle.finalAssistantSummary, "");
   }
 
@@ -353,17 +367,30 @@ function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): strin
 
   if (bundle.events.length > 0) {
     lines.push("### Tool event digest");
-    for (const event of bundle.events.slice(-80)) {
+    const renderedEvents = selectEventsForMarkdown(bundle.events);
+    for (const event of renderedEvents) {
+      if (event === "omitted") {
+        lines.push(`- ... ${Math.max(0, bundle.events.length - renderedEvents.length + 1)} middle events omitted`);
+        continue;
+      }
       const risks = event.riskSignals.length > 0 ? ` risks=${event.riskSignals.join(",")}` : "";
       const paths = event.candidatePaths.length > 0 ? ` paths=${event.candidatePaths.join(",")}` : "";
       lines.push(`- #${event.sequence} ${event.phase} ${event.toolName}${event.isError ? " ERROR" : ""}${paths}${risks}: ${event.summary}`);
     }
-    if (bundle.events.length > 80) {
-      lines.push(`- ... ${bundle.events.length - 80} earlier events omitted`);
-    }
   }
 
   return lines.join("\n");
+}
+
+function selectEventsForMarkdown(events: EvidenceEvent[]): Array<EvidenceEvent | "omitted"> {
+  if (events.length <= 160) {
+    return events;
+  }
+  return [
+    ...events.slice(0, 40),
+    "omitted" as const,
+    ...events.slice(-120),
+  ];
 }
 
 function extractFinalAssistantText(args: unknown[]): string {

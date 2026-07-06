@@ -56,6 +56,31 @@ test("parseReviewResult normalizes null finding files to session", () => {
   assert.equal(result.findings[0]?.line, null);
 });
 
+test("parseReviewResult accepts session-level missing acceptance verification findings", () => {
+  const result = parseReviewResult(
+    "reviewer",
+    JSON.stringify({
+      verdict: "needs_changes",
+      summary: "The implementation appears to address the build_chess_mjs.js finding itself, and updating ../outsidefiles/review.md was explicitly requested. However, the submitted session does not include the required acceptance verification for code changes.",
+      findings: [
+        {
+          severity: "blocking",
+          file: null,
+          line: null,
+          issue: "The project instructions require `npm run lint`, `npm run format:check`, and a final `npm test` before considering code changes complete. The session evidence shows `npm test` was attempted only once via `npm test 2>&1 | tail -30` and timed out, then the agent ran focused tests only. There is no evidence that lint or format checks were run, and focused tests are explicitly not a substitute for the final full `npm test` run.",
+          recommendation: "Run `npm run lint`, `npm run format:check`, and `npm test` successfully, or document the exact environmental reason if any required command cannot complete.",
+        },
+      ],
+    }),
+  );
+
+  assert.equal(result.verdict, "needs_changes");
+  assert.equal(result.error, undefined);
+  assert.equal(result.findings[0]?.severity, "blocking");
+  assert.equal(result.findings[0]?.file, "session");
+  assert.match(result.findings[0]?.issue ?? "", /npm run lint/);
+});
+
 test("parseReviewResult rejects invalid output safely", () => {
   const result = parseReviewResult("reviewer", "not json");
   assert.equal(result.verdict, "error");

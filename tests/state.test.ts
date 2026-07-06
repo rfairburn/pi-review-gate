@@ -52,6 +52,32 @@ test("rememberUserRequest appends mid-run guidance without clearing evidence", (
   assert.equal(state.evidence.events.length, 1);
 });
 
+test("rememberUserRequest after capped pause starts a fresh request", () => {
+  const state = createState();
+  rememberUserRequest(state, "original task");
+  state.runActive = false;
+  state.reviewPausedAtCap = true;
+  state.lastCappedFollowUp = "Review found blocking issues.";
+  state.correctionCycles = 3;
+  state.evidence.events.push({
+    sequence: 1,
+    phase: "tool_call",
+    toolName: "edit",
+    summary: "old evidence",
+    candidatePaths: ["old.ts"],
+    riskSignals: [],
+  });
+
+  rememberUserRequest(state, "new task");
+
+  assert.equal(state.reviewPausedAtCap, false);
+  assert.equal(state.lastCappedFollowUp, undefined);
+  assert.equal(state.latestRequest, "new task");
+  assert.deepEqual(state.requestHistory.map((item) => item.text), ["new task"]);
+  assert.equal(state.correctionCycles, 0);
+  assert.equal(state.evidence.events.length, 0);
+});
+
 test("buildRequestContext preserves initial request and later user guidance", () => {
   const state = createState();
 

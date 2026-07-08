@@ -61,6 +61,54 @@ test("buildUnifiedPatch emits context hunks instead of whole-file replacement", 
   assert.doesNotMatch(result.patch, /^ line 20$/m);
 });
 
+test("buildUnifiedPatch merges edits separated by a short gap into one hunk", () => {
+  const oldContent = "a\ng1\ng2\ng3\ng4\nb\n";
+  const newContent = "A\ng1\ng2\ng3\ng4\nB\n";
+
+  const result = buildUnifiedPatch(
+    [{
+      path: "gap.txt",
+      status: "modified",
+      binary: false,
+      oversized: false,
+      oldContent,
+      newContent,
+    }],
+    10_000,
+  );
+
+  assert.equal(result.patch.match(/^@@ /gm)?.length, 1);
+  assert.match(result.patch, /@@ -1,6 \+1,6 @@/);
+  assert.match(result.patch, /-a\n\+A\n g1\n g2\n g3\n g4\n-b\n\+B/);
+});
+
+test("buildUnifiedPatch splits distant edits into non-overlapping hunks", () => {
+  const gap = Array.from({ length: 9 }, (_, index) => `g${index + 1}`);
+  const oldContent = ["a", ...gap, "b"].join("\n") + "\n";
+  const newContent = ["A", ...gap, "B"].join("\n") + "\n";
+
+  const result = buildUnifiedPatch(
+    [{
+      path: "split.txt",
+      status: "modified",
+      binary: false,
+      oversized: false,
+      oldContent,
+      newContent,
+    }],
+    10_000,
+  );
+
+  const headers = [...result.patch.matchAll(/^@@ -(\d+),(\d+) \+\d+,\d+ @@$/gm)]
+    .map((match) => ({ start: Number(match[1]), count: Number(match[2]) }));
+  assert.equal(headers.length, 2);
+  const firstEnd = headers[0].start + headers[0].count - 1;
+  assert.equal(firstEnd < headers[1].start, true);
+  for (const line of ["g1", "g2", "g3", "g7", "g8", "g9"]) {
+    assert.equal(result.patch.match(new RegExp(`^ ${line}$`, "gm"))?.length, 1);
+  }
+});
+
 test("buildUnifiedPatch omits binary changes", () => {
   const result = buildUnifiedPatch(
     [

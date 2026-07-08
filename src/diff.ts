@@ -75,10 +75,13 @@ function buildHunks(oldLines: string[], newLines: string[]): string[] {
     const start = Math.max(0, index - context);
     let end = index;
     let trailingEquals = 0;
+    // Keep scanning through equal runs up to 2*context so nearby changes merge
+    // into one hunk; splitting sooner would make the next hunk's leading
+    // context overlap this hunk's trailing context.
     while (end < ops.length) {
       if (ops[end]?.type === "equal") {
         trailingEquals += 1;
-        if (trailingEquals > context) {
+        if (trailingEquals > context * 2) {
           break;
         }
       } else {
@@ -86,7 +89,15 @@ function buildHunks(oldLines: string[], newLines: string[]): string[] {
       }
       end += 1;
     }
-    hunks.push(ops.slice(start, end));
+    const hunkOps = ops.slice(start, end);
+    let trailing = 0;
+    while (trailing < hunkOps.length && hunkOps[hunkOps.length - 1 - trailing]?.type === "equal") {
+      trailing += 1;
+    }
+    if (trailing > context) {
+      hunkOps.length -= trailing - context;
+    }
+    hunks.push(hunkOps);
     index = end;
   }
 

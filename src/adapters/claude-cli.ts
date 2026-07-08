@@ -25,7 +25,7 @@ export class ClaudeCliAdapter implements ModelAdapter {
       "--permission-mode",
       "dontAsk",
       "--tools",
-      "Read,Grep,Glob,LS",
+      "Read,Grep,Glob",
       "--add-dir",
       req.bundleDir,
       "--append-system-prompt",

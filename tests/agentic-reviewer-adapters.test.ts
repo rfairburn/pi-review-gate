@@ -83,7 +83,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools and review bundle acc
     const argv = JSON.parse(await readFile(argvPath, "utf8"));
     assert.equal(result.verdict, "pass");
     assert.deepEqual(argv.includes("--tools"), true);
-    assert.equal(argv[argv.indexOf("--tools") + 1], "Read,Grep,Glob,LS");
+    assert.equal(argv[argv.indexOf("--tools") + 1], "Read,Grep,Glob");
     assert.deepEqual(argv.includes("--add-dir"), true);
     assert.equal(argv[argv.indexOf("--add-dir") + 1], dir);
     assert.deepEqual(argv.includes("--append-system-prompt"), true);

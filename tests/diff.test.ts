@@ -39,6 +39,28 @@ test("buildUnifiedPatch includes added, modified, and deleted text files", () =>
   assert.equal(result.truncated, false);
 });
 
+test("buildUnifiedPatch emits context hunks instead of whole-file replacement", () => {
+  const oldContent = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n") + "\n";
+  const newContent = oldContent.replace("line 10\n", "line ten\n");
+
+  const result = buildUnifiedPatch(
+    [{
+      path: "large.txt",
+      status: "modified",
+      binary: false,
+      oversized: false,
+      oldContent,
+      newContent,
+    }],
+    10_000,
+  );
+
+  assert.match(result.patch, /@@ -7,7 \+7,7 @@/);
+  assert.match(result.patch, / line 9\n-line 10\n\+line ten\n line 11/);
+  assert.doesNotMatch(result.patch, /^ line 1$/m);
+  assert.doesNotMatch(result.patch, /^ line 20$/m);
+});
+
 test("buildUnifiedPatch omits binary changes", () => {
   const result = buildUnifiedPatch(
     [

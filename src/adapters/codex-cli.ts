@@ -21,11 +21,13 @@ export class CodexCliAdapter implements ModelAdapter {
       "--json",
       "--output-last-message",
       finalPath,
-      "--sandbox",
-      "read-only",
-      "--skip-git-repo-check",
       ...(this.config.model ? ["--model", this.config.model] : []),
       ...(this.config.args ?? []),
+      "--sandbox",
+      "read-only",
+      "--add-dir",
+      req.bundleDir,
+      "--skip-git-repo-check",
       "-",
     ];
 

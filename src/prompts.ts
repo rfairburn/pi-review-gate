@@ -9,6 +9,8 @@ const REVIEW_CONTEXT_POLICY = `Review policy:
 - Persistent-looking external side effects deserve scrutiny, but do not block solely because they are outside the workspace or not explicitly named in the user request. Block only when they are unrelated to the task, modify user/environment configuration, create or change executable/runtime content, store meaningful user data in an unmanaged location, leak secrets, or leave state that affects future behavior.
 - Working notes or review documents may be acceptable when they are consistent with the session context; review them for correctness, not for their mere existence.
 - Workspace side effects that are not submitted changes should be reviewed for accidental generated output, ignored files needed by the implementation, or files that should be cleaned up.
+- If you have read-only tools, use them as needed to inspect the workspace and review bundle. Treat the workspace as ground truth. Do not modify files, run shell commands, use network access, or ask the primary model for more context.
+- If you do not have tools, review from the supplied prompt and be explicit in your summary when the supplied context is insufficient for certainty.
 - Return "needs_changes" only when the primary agent can take a concrete follow-up action that could make a later review pass. If a finding is only a sentinel/status flag, acknowledgement, or other terminal note with no requested fix, return "pass" with a non_blocking finding instead of a blocking finding.`;
 
 export function buildReviewerPrompt(input: {
@@ -19,6 +21,7 @@ export function buildReviewerPrompt(input: {
   patch: string;
   sideEffectPatch?: string;
   cwd: string;
+  bundleDir?: string;
   evidenceMarkdown?: string;
 }): string {
   const submittedChanges = input.submittedChanges ?? input.changes;
@@ -28,12 +31,15 @@ export function buildReviewerPrompt(input: {
 
   return `You are reviewing code changes made by another coding agent.
 
-Review only the supplied user request context, submitted workspace patch, captured side-effect evidence, and session evidence. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not call tools, inspect files, run shell commands, or use the network. Do not ask for more context unless the supplied context is impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
+Review the supplied user request context, submitted workspace patch, captured side-effect evidence, session evidence, and the current workspace. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the supplied context and read-only inspection are impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
 
 ${REVIEW_CONTEXT_POLICY}
 
 Workspace:
 ${input.cwd}
+
+Review bundle:
+${input.bundleDir ?? "(not supplied)"}
 
 User request context:
 <request>
@@ -93,6 +99,7 @@ export function buildReviewerQuestionPrompt(input: {
   patch: string;
   sideEffectPatch?: string;
   cwd: string;
+  bundleDir?: string;
   evidenceMarkdown?: string;
 }): string {
   const submittedChanges = input.submittedChanges ?? input.changes;
@@ -102,12 +109,15 @@ export function buildReviewerQuestionPrompt(input: {
 
   return `You are an independent reviewer consulted about work done by another coding agent.
 
-Answer the user's reviewer question using only the supplied context. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, and session evidence. Do not call tools, inspect files, run shell commands, or use the network. Do not include chain of thought. Return only valid JSON matching the schema.
+Answer the user's reviewer question using the supplied context and read-only inspection of the current workspace when tools are available. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, session evidence, and any relevant files you inspect. Do not modify files, run shell commands, use network access, or include chain of thought. Return only valid JSON matching the schema.
 
 ${REVIEW_CONTEXT_POLICY}
 
 Workspace:
 ${input.cwd}
+
+Review bundle:
+${input.bundleDir ?? "(not supplied)"}
 
 Reviewer question:
 <question>

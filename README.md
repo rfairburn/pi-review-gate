@@ -52,7 +52,10 @@ Multiple reviewers can be configured with `reviewers`. They run in parallel
 against the same review bundle. Review-gate waits for every reviewer, then
 aggregates the independent results: any reviewer requesting changes causes a
 combined `needs_changes` response with that reviewer's findings attributed in
-the follow-up.
+the follow-up. The built-in Codex, Claude, and little-coder model adapters run
+as read-only agentic reviewers so they can inspect the workspace and retained
+review bundle before deciding. Generic CLI reviewers remain prompt-only unless
+the configured command provides its own safe read-only behavior.
 
 ```json
 {
@@ -103,6 +106,14 @@ Claude and little-coder model examples are available at:
 ```bash
 examples/single-claude.json
 examples/single-little-coder-model.json
+```
+
+Multi-reviewer examples matching the double and triple wrapper scripts are
+available at:
+
+```bash
+examples/double-review.json
+examples/triple-review.json
 ```
 
 The little-coder model adapter is generic. The example currently uses
@@ -187,8 +198,12 @@ Escape/Ctrl+C to clear it without sending anything.
 Retained review bundles include `request.md`, `changed-files.json`,
 `patch.diff`, `side-effect.patch.diff`, `reviewer-prompt.md`, `evidence.json`,
 `evidence.md`, `acting-model-usage.json`, aggregate `parsed-result.json`,
-`reviewer-results.json`, and aggregate `reviewer-usage.json`. Each reviewer also
-writes isolated outputs under `reviewers/<id>/`, including `raw-output.txt`,
-`stderr.txt`, `parsed-result.json`, and `reviewer-usage.json`. When supported by
-the reviewer CLI, user-facing notices include a compact reviewer token summary, for example
+`reviewer-results.json`, aggregate `reviewer-usage.json`, and an `artifacts/`
+tree with captured before/after file contents and evidence baselines where
+available. Each reviewer also writes isolated outputs under `reviewers/<id>/`,
+including `raw-output.txt`, `stderr.txt`, `parsed-result.json`, and
+`reviewer-usage.json`. The little-coder model adapter stores the extracted final
+review in `raw-output.txt` and the capped JSONL stream separately as
+`raw-stream.jsonl`. When supported by the reviewer CLI, user-facing notices
+include a compact reviewer token summary, for example
 `review gate: passed (review tokens: in 1.2k, out 340, total 1.6k)`.

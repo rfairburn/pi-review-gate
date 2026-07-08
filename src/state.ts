@@ -13,7 +13,6 @@ export interface ReviewGateState {
   queuedUserInputsDuringReview: string[];
   baseline?: WorkspaceSnapshot;
   runActive: boolean;
-  touchedPaths: Set<string>;
   evidence: EvidenceState;
 }
 
@@ -34,7 +33,6 @@ export function createState(): ReviewGateState {
     reviewInProgress: false,
     queuedUserInputsDuringReview: [],
     runActive: false,
-    touchedPaths: new Set<string>(),
     evidence: createEvidenceState(),
   };
 }
@@ -73,19 +71,11 @@ export function rememberUserRequest(state: ReviewGateState, request: string): vo
   state.lastCorrectionFeedback = undefined;
   state.reviewPausedAtCap = false;
   state.queuedUserInputsDuringReview = [];
-  state.touchedPaths.clear();
   state.evidence = createEvidenceState();
-}
-
-export function recordTouchedPath(state: ReviewGateState, path: unknown): void {
-  if (typeof path === "string" && path.trim()) {
-    state.touchedPaths.add(path);
-  }
 }
 
 export function resetRunEvidence(state: ReviewGateState): void {
   state.evidence = createEvidenceState();
-  state.touchedPaths.clear();
 }
 
 export function beginAgentRun(state: ReviewGateState): "new" | "continuation" {

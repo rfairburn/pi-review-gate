@@ -6,7 +6,6 @@ test("resetRunEvidence clears per-run evidence without resetting correction cycl
   const state = createState();
   state.latestRequest = "original";
   state.correctionCycles = 1;
-  state.touchedPaths.add("a.txt");
   state.evidence.events.push({
     sequence: 1,
     phase: "tool_call",
@@ -21,7 +20,6 @@ test("resetRunEvidence clears per-run evidence without resetting correction cycl
   assert.equal(state.latestRequest, "original");
   assert.equal(state.requestHistory.length, 0);
   assert.equal(state.correctionCycles, 1);
-  assert.equal(state.touchedPaths.size, 0);
   assert.equal(state.evidence.events.length, 0);
 });
 
@@ -31,7 +29,6 @@ test("rememberUserRequest appends mid-run guidance without clearing evidence", (
   rememberUserRequest(state, "update Fleet release bits");
   state.runActive = true;
   state.correctionCycles = 1;
-  state.touchedPaths.add("shared/docker.tf");
   state.evidence.events.push({
     sequence: 1,
     phase: "tool_call",
@@ -48,7 +45,6 @@ test("rememberUserRequest appends mid-run guidance without clearing evidence", (
   assert.equal(state.requestHistory[0]?.phase, "initial");
   assert.equal(state.requestHistory[1]?.phase, "mid_run");
   assert.equal(state.correctionCycles, 1);
-  assert.equal(state.touchedPaths.has("shared/docker.tf"), true);
   assert.equal(state.evidence.events.length, 1);
 });
 

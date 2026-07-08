@@ -6,7 +6,7 @@ import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistan
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
 import { buildReviewerResultsNotice } from "./prompts";
 import { runReview, type ReviewRunOutput } from "./review";
-import { beginAgentRun, buildRequestContext, createState, recordTouchedPath, rememberUserRequest, type ReviewGateState } from "./state";
+import { beginAgentRun, buildRequestContext, createState, rememberUserRequest, type ReviewGateState } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
 
 declare const module: {
@@ -43,11 +43,11 @@ export async function activate(pi: unknown): Promise<void> {
       return;
     }
     const text = extractInputText(args);
-    rememberUserRequest(state, text);
     if (state.reviewInProgress && text.trim()) {
       state.queuedUserInputsDuringReview.push(text.trim());
       return { action: "handled" };
     }
+    rememberUserRequest(state, text);
   });
 
   registerHook(pi, "before_agent_start", async (...args) => {
@@ -75,9 +75,6 @@ export async function activate(pi: unknown): Promise<void> {
         maxSnapshotBytes: config.maxSnapshotBytes,
       },
     });
-    if (["write", "Write", "edit", "Edit"].includes(name)) {
-      recordTouchedPath(state, toolArgs?.path ?? toolArgs?.file_path ?? toolArgs?.filePath);
-    }
   });
 
   registerHook(pi, "tool_result", (...args) => {
@@ -90,9 +87,6 @@ export async function activate(pi: unknown): Promise<void> {
       result: args[0],
       isError: isToolError(args[0]),
     });
-    if (["write", "Write", "edit", "Edit"].includes(name)) {
-      recordTouchedPath(state, toolArgs?.path ?? toolArgs?.file_path ?? toolArgs?.filePath);
-    }
   });
 
   registerHook(pi, "agent_end", async (...args) => {
@@ -251,6 +245,7 @@ async function releaseQueuedUserInputs(pi: unknown, state: ReviewGateState): Pro
   state.reviewInProgress = false;
   const queuedInputs = state.queuedUserInputsDuringReview.splice(0);
   for (const input of queuedInputs) {
+    rememberUserRequest(state, input);
     await sendFollowUp(pi, input);
   }
 }

@@ -13,6 +13,7 @@ export class LittleCoderAdapter implements ModelAdapter {
 
   async run(req: ModelAdapterRequest): Promise<ReviewResult> {
     const rawOutputPath = join(req.bundleDir, "raw-output.txt");
+    const rawStreamPath = join(req.bundleDir, "raw-stream.jsonl");
     const finalOutputPath = join(req.bundleDir, "reviewer-final.txt");
     const stderrPath = join(req.bundleDir, "stderr.txt");
     const usagePath = join(req.bundleDir, "usage.json");
@@ -24,12 +25,16 @@ export class LittleCoderAdapter implements ModelAdapter {
       "--mode",
       "json",
       "--print",
+      ...(this.config.args ?? []),
       "--no-tools",
-      "--no-extensions",
+      "--tools",
+      "read,grep,find,ls",
       "--no-skills",
+      "--no-extensions",
       "--no-prompt-templates",
       "--no-themes",
-      ...(this.config.args ?? []),
+      "--system-prompt",
+      readOnlyReviewerSystemPrompt(),
     ];
 
     const output = await runPromptProcess({
@@ -48,6 +53,7 @@ export class LittleCoderAdapter implements ModelAdapter {
     const rawOutputText = extracted.text.trim() ? extracted.text : missingFinalTextDiagnostic(output);
     await Promise.all([
       writeFile(rawOutputPath, rawOutputText, "utf8"),
+      writeFile(rawStreamPath, output.stdout, "utf8"),
       writeFile(finalOutputPath, extracted.text, "utf8"),
       writeFile(stderrPath, output.stderr, "utf8"),
       writeFile(processResultPath, JSON.stringify({
@@ -59,6 +65,7 @@ export class LittleCoderAdapter implements ModelAdapter {
         finalTextCaptured: extracted.text.trim().length > 0,
         stdoutBytesCaptured: Buffer.byteLength(output.stdout),
         rawOutputContainsStream: false,
+        rawStreamPath,
       }, null, 2), "utf8"),
     ]);
 
@@ -105,4 +112,14 @@ function missingFinalTextDiagnostic(output: {
     `stdoutTruncated: ${output.stdoutTruncated}`,
     `stderrTruncated: ${output.stderrTruncated}`,
   ].join("\n");
+}
+
+function readOnlyReviewerSystemPrompt(): string {
+  return [
+    "You are an independent read-only code reviewer.",
+    "You have exactly these tools available: read, grep, find, and ls.",
+    "Use those tools as needed to inspect the current workspace and the supplied review bundle.",
+    "Do not modify files, run shell commands, use network access, or ask the primary agent for more context.",
+    "Return only valid JSON matching the requested schema.",
+  ].join(" ");
 }

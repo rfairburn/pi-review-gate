@@ -152,6 +152,36 @@ test("runReview retains on any reviewer error even when aggregate requests chang
   }
 });
 
+test("runReview writes changed file artifacts into retained bundles", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-artifacts-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: {
+        ...baseConfig,
+        retainBundles: "always",
+        decider: jsonReviewer("passing", "{verdict:'pass',summary:'ok',findings:[]}"),
+      },
+    });
+
+    assert.equal(output.bundleRetained, true);
+    await access(join(output.bundleDir ?? "", "artifacts", "submitted", "before", "index.ts"));
+    await access(join(output.bundleDir ?? "", "artifacts", "submitted", "after", "index.ts"));
+    await access(join(output.bundleDir ?? "", "artifacts", "index.json"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("runAskReviewer retains on any reviewer error even when aggregate answer is usable", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-retain-partial-error-"));
   try {

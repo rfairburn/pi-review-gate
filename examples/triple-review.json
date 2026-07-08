@@ -1,0 +1,28 @@
+{
+  "enabled": true,
+  "mode": "single-decider",
+  "maxCorrectionCycles": 30,
+  "reviewWhen": "changed-files",
+  "maxPatchBytes": 200000,
+  "maxFileBytes": 1048576,
+  "maxSnapshotBytes": 52428800,
+  "retainBundles": "on-failure",
+  "reviewers": [
+    {
+      "id": "codex",
+      "adapter": "codex-cli",
+      "timeoutMs": 600000
+    },
+    {
+      "id": "glm-5.2",
+      "adapter": "little-coder-model",
+      "model": "ollama/glm-5.2",
+      "timeoutMs": 600000
+    },
+    {
+      "id": "claude",
+      "adapter": "claude-cli",
+      "timeoutMs": 600000
+    }
+  ]
+}

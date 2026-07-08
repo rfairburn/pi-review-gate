@@ -38,7 +38,11 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
     assert.equal(result.verdict, "error");
     assert.equal(result.error, "missing_final_text");
     assert.equal(result.summary, "Reviewer did not produce final assistant text.");
-    assert.deepEqual(JSON.parse(await readFile(argvPath, "utf8")).includes("--no-tools"), true);
+    const argv = JSON.parse(await readFile(argvPath, "utf8"));
+    assert.deepEqual(argv.includes("--no-tools"), true);
+    assert.deepEqual(argv.includes("--tools"), true);
+    assert.deepEqual(argv.includes("read,grep,find,ls"), true);
+    assert.deepEqual(argv.includes("--system-prompt"), true);
     assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -127,6 +131,7 @@ test("LittleCoderAdapter captures final assistant text after retained stdout cap
     assert.deepEqual(processResult.stdoutTruncated, true);
     assert.deepEqual(processResult.rawOutputContainsStream, false);
     assert.equal(await readFile(join(dir, "raw-output.txt"), "utf8"), reviewJson);
+    assert.equal((await readFile(join(dir, "raw-stream.jsonl"), "utf8")).length, 1000000);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

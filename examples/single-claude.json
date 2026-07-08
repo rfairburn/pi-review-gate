@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "mode": "single-decider",
-  "maxCorrectionCycles": 3,
+  "maxCorrectionCycles": 30,
   "reviewWhen": "changed-files",
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,
@@ -10,6 +10,6 @@
   "decider": {
     "id": "claude",
     "adapter": "claude-cli",
-    "timeoutMs": 300000
+    "timeoutMs": 600000
   }
 }

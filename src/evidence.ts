@@ -20,6 +20,7 @@ export interface EvidenceEvent {
   phase: "tool_call" | "tool_result";
   toolName: string;
   summary: string;
+  detail?: string;
   candidatePaths: string[];
   riskSignals: string[];
   isError?: boolean;
@@ -40,6 +41,7 @@ export interface EvidenceBundle {
     absolutePath: string;
     sources: string[];
     baseline: "captured" | "missing" | "error";
+    baselineSnapshot?: FileSnapshot;
   }>;
   finalAssistantSummary?: string;
   finalAssistantSummaries: string[];
@@ -76,6 +78,7 @@ export async function recordToolCallEvidence(input: {
     phase: "tool_call",
     toolName: input.toolName || "unknown",
     summary: summarizeToolInput(input.toolInput),
+    detail: detailedToolInput(input.toolInput),
     candidatePaths: unique(candidatePaths),
     riskSignals: extracted.riskSignals,
   });
@@ -94,6 +97,7 @@ export function recordToolResultEvidence(input: {
     phase: "tool_result",
     toolName: input.toolName || "unknown",
     summary: summarizeToolResult(input.result, input.isError),
+    detail: detailedToolResult(input.result),
     candidatePaths: unique(extracted.paths.map((candidate) => candidate.path)),
     riskSignals: input.isError ? ["tool_result_error"] : [],
     isError: input.isError,
@@ -132,6 +136,7 @@ export function buildEvidenceBundle(state: EvidenceState, changedCandidatePaths:
       : candidate.baseline?.exists
         ? "captured" as const
         : "missing" as const,
+    baselineSnapshot: candidate.baseline,
   }));
 
   const bundle: Omit<EvidenceBundle, "markdown"> = {
@@ -332,6 +337,37 @@ function summarizeToolResult(result: unknown, isError: boolean | undefined): str
     }
   }
   return prefix + truncate(JSON.stringify(redactLargeValues(result)), 1000);
+}
+
+function detailedToolInput(input?: Record<string, unknown>): string | undefined {
+  if (!input) {
+    return undefined;
+  }
+  const command = commandText(input);
+  if (command) {
+    return truncate(command, 20_000);
+  }
+  return truncate(JSON.stringify(input, null, 2), 20_000);
+}
+
+function detailedToolResult(result: unknown): string | undefined {
+  if (typeof result === "string") {
+    return truncate(result, 50_000);
+  }
+  if (isRecord(result)) {
+    const content = result.content;
+    if (Array.isArray(content)) {
+      const text = content
+        .map((item) => isRecord(item) && typeof item.text === "string" ? item.text : "")
+        .filter(Boolean)
+        .join("\n");
+      if (text) {
+        return truncate(text, 50_000);
+      }
+    }
+  }
+  const encoded = JSON.stringify(result, null, 2);
+  return encoded ? truncate(encoded, 50_000) : undefined;
 }
 
 function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): string {

@@ -76,7 +76,10 @@ test("LittleCoderAdapter reports truncated output before final assistant text", 
     assert.equal(result.error, "output_truncated");
     assert.equal(result.summary, "Reviewer output was truncated before a final assistant text was captured.");
     assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, true);
-    assert.equal((await readFile(join(dir, "raw-output.txt"), "utf8")).length, 1000000);
+    const rawOutput = await readFile(join(dir, "raw-output.txt"), "utf8");
+    assert.match(rawOutput, /No final assistant text was captured/);
+    assert.match(rawOutput, /stdoutTruncated: true/);
+    assert.equal(rawOutput.includes("x".repeat(1000)), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -120,8 +123,10 @@ test("LittleCoderAdapter captures final assistant text after retained stdout cap
     assert.equal(result.summary, "final response captured");
     assert.equal(result.usage?.totalTokens, 3);
     assert.equal(await readFile(join(dir, "reviewer-final.txt"), "utf8"), reviewJson);
-    assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, true);
-    assert.equal((await readFile(join(dir, "raw-output.txt"), "utf8")).length, 1000000);
+    const processResult = JSON.parse(await readFile(join(dir, "process-result.json"), "utf8"));
+    assert.deepEqual(processResult.stdoutTruncated, true);
+    assert.deepEqual(processResult.rawOutputContainsStream, false);
+    assert.equal(await readFile(join(dir, "raw-output.txt"), "utf8"), reviewJson);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

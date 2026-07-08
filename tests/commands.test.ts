@@ -56,6 +56,56 @@ test("/review-now requested changes reset the automatic correction budget", asyn
   }
 });
 
+test("/review-now notice shows non-blocking reviewer results in multi-reviewer runs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-multi-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "change index");
+    state.baseline = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: 1_048_576,
+      maxSnapshotBytes: 52_428_800,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const followUps: string[] = [];
+    const notices: string[] = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
+      },
+    };
+    const ctx = {
+      notify(message: string) {
+        notices.push(message);
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: multiReviewerReviewConfig(),
+      state,
+    });
+
+    await commands.get("review-now")?.("", ctx);
+
+    const noticeText = notices.join("\n");
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0] ?? "", /\[blocking\] index\.ts - missing test add coverage/);
+    assert.doesNotMatch(followUps[0] ?? "", /claude found no blocking issues/);
+    assert.match(noticeText, /Reviewer results:/);
+    assert.match(noticeText, /- blocking: needs_changes, 1 blocking - fix required/);
+    assert.match(noticeText, /- claude: pass - claude found no blocking issues/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("/review-continue sends capped feedback and resets the correction budget", async () => {
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
   const followUps: string[] = [];
@@ -253,6 +303,41 @@ function reviewConfig(): ReviewGateConfig {
       ],
       timeoutMs: 5000,
     },
+  };
+}
+
+function multiReviewerReviewConfig(): ReviewGateConfig {
+  return {
+    enabled: true,
+    mode: "single-decider",
+    maxCorrectionCycles: 3,
+    reviewWhen: "changed-files",
+    maxPatchBytes: 200_000,
+    maxFileBytes: 1_048_576,
+    maxSnapshotBytes: 52_428_800,
+    retainBundles: "never",
+    reviewers: [
+      {
+        id: "blocking",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
+        ],
+        timeoutMs: 5000,
+      },
+      {
+        id: "claude",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'claude found no blocking issues',findings:[]})))",
+        ],
+        timeoutMs: 5000,
+      },
+    ],
   };
 }
 

@@ -2,6 +2,7 @@ import type { ReviewGateConfig } from "./config";
 import { buildRequestContext, type ReviewGateState } from "./state";
 import { runAskReviewer, runReview } from "./review";
 import { extractSignal, sendNotice, sendFollowUp, sendUserPrompt } from "./pi";
+import { buildReviewerResultsNotice } from "./prompts";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 
@@ -48,14 +49,14 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       if (output.result?.verdict === "pass") {
-        await sendNotice(ctx, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
+        await sendNotice(ctx, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
       } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
-        await sendNotice(ctx, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
+        await sendNotice(ctx, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
         input.state.correctionCycles = 0;
         await sendFollowUp(input.pi, output.followUpMessage);
       } else {
         const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
-        await sendNotice(ctx, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
+        await sendNotice(ctx, withReviewDetails(failed, output));
       }
     },
   });
@@ -134,6 +135,11 @@ function getRegisterCommand(pi: unknown): RegisterCommand | undefined {
     return pi.registerCommand.bind(pi) as RegisterCommand;
   }
   return undefined;
+}
+
+function withReviewDetails(header: string, output: { reviewerResults?: ReviewResult[]; bundleRetained?: boolean; bundleDir?: string }): string {
+  const details = buildReviewerResultsNotice(output.reviewerResults, output.bundleRetained ? output.bundleDir : undefined);
+  return details ? `${header}\n${details}` : header;
 }
 
 function formatReviewerAnswer(question: string, result: ReviewResult, bundleDir?: string): string {

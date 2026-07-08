@@ -4,6 +4,7 @@ import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
+import { buildReviewerResultsNotice } from "./prompts";
 import { runReview, type ReviewRunOutput } from "./review";
 import { beginAgentRun, buildRequestContext, createState, recordTouchedPath, rememberUserRequest, type ReviewGateState } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
@@ -151,7 +152,7 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     if (output.result?.verdict === "pass") {
-      await sendNotice(noticeTarget, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
+      await sendNotice(noticeTarget, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
       state.runActive = false;
       state.lastCorrectionFeedback = undefined;
       await releaseQueuedUserInputs(pi, state);
@@ -169,6 +170,7 @@ export async function activate(pi: unknown): Promise<void> {
           noticeTarget,
           [
             `review gate: repeated changes requested with no new correction evidence (${formatTokenUsage(output.result.usage)})`,
+            ...reviewDetailsLines(output),
             "Reviewer feedback matched the previous blocking feedback, and the correction turn produced no new tool evidence or file-change fingerprint.",
             "Stopping automatic correction to avoid a loop.",
             "",
@@ -192,6 +194,7 @@ export async function activate(pi: unknown): Promise<void> {
           noticeTarget,
           [
             `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`,
+            ...reviewDetailsLines(output),
             "Reviewer feedback was not sent to the primary model.",
             `Use /review-continue to send this feedback and allow another ${config.maxCorrectionCycles} automatic correction cycle(s).`,
             "",
@@ -204,14 +207,14 @@ export async function activate(pi: unknown): Promise<void> {
       }
       state.lastCappedFollowUp = undefined;
       state.correctionCycles += 1;
-      await sendNotice(noticeTarget, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
+      await sendNotice(noticeTarget, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
       await sendFollowUp(pi, output.followUpMessage);
       await releaseQueuedUserInputs(pi, state);
       return;
     }
 
     const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
-    await sendNotice(noticeTarget, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
+    await sendNotice(noticeTarget, withReviewDetails(failed, output));
     state.runActive = false;
     state.lastCorrectionFeedback = undefined;
     await releaseQueuedUserInputs(pi, state);
@@ -229,6 +232,16 @@ export default activate;
 
 module.exports = activate;
 Object.assign(module.exports as Record<string, unknown>, { activate });
+
+function withReviewDetails(header: string, output: ReviewRunOutput): string {
+  const [details] = reviewDetailsLines(output);
+  return details ? `${header}\n${details}` : header;
+}
+
+function reviewDetailsLines(output: ReviewRunOutput): string[] {
+  const details = buildReviewerResultsNotice(output.reviewerResults, output.bundleRetained ? output.bundleDir : undefined);
+  return details ? [details] : [];
+}
 
 function isToolError(value: unknown): boolean {
   return typeof value === "object" && value !== null && "isError" in value && Boolean((value as { isError?: unknown }).isError);

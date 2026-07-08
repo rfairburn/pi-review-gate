@@ -29,6 +29,7 @@ export interface ReviewRunOutput {
   changed: boolean;
   changes: ChangedFile[];
   result?: ReviewResult;
+  reviewerResults?: ReviewResult[];
   followUpMessage?: string;
   bundleDir?: string;
   bundleRetained?: boolean;
@@ -132,6 +133,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     changed: true,
     changes,
     result,
+    reviewerResults,
     followUpMessage: result.verdict === "needs_changes" ? buildFollowUpMessage(result) : undefined,
     bundleDir: bundle.dir,
     bundleRetained: shouldRetain,

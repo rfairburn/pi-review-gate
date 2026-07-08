@@ -45,8 +45,9 @@ export class LittleCoderAdapter implements ModelAdapter {
     const streamExtracted = streamExtractor.finish();
     const cappedExtracted = extractReviewTextFromPiJsonl(output.stdout);
     const extracted = streamExtracted.text.trim() ? streamExtracted : cappedExtracted;
+    const rawOutputText = extracted.text.trim() ? extracted.text : missingFinalTextDiagnostic(output);
     await Promise.all([
-      writeFile(rawOutputPath, output.stdout, "utf8"),
+      writeFile(rawOutputPath, rawOutputText, "utf8"),
       writeFile(finalOutputPath, extracted.text, "utf8"),
       writeFile(stderrPath, output.stderr, "utf8"),
       writeFile(processResultPath, JSON.stringify({
@@ -56,6 +57,8 @@ export class LittleCoderAdapter implements ModelAdapter {
         stdoutTruncated: output.stdoutTruncated,
         stderrTruncated: output.stderrTruncated,
         finalTextCaptured: extracted.text.trim().length > 0,
+        stdoutBytesCaptured: Buffer.byteLength(output.stdout),
+        rawOutputContainsStream: false,
       }, null, 2), "utf8"),
     ]);
 
@@ -85,4 +88,21 @@ export class LittleCoderAdapter implements ModelAdapter {
 
 function errorResult(reviewerId: string, summary: string, rawOutputPath: string, error: string, usage: ReviewResult["usage"]): ReviewResult {
   return { reviewerId, verdict: "error", summary, findings: [], rawOutputPath, error, usage };
+}
+
+function missingFinalTextDiagnostic(output: {
+  code: number | null;
+  timedOut: boolean;
+  aborted: boolean;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+}): string {
+  return [
+    "No final assistant text was captured from the little-coder JSONL stream.",
+    `exitCode: ${output.code === null ? "null" : output.code}`,
+    `timedOut: ${output.timedOut}`,
+    `aborted: ${output.aborted}`,
+    `stdoutTruncated: ${output.stdoutTruncated}`,
+    `stderrTruncated: ${output.stderrTruncated}`,
+  ].join("\n");
 }

@@ -180,8 +180,42 @@ export function buildFollowUpMessage(result: ReviewResult): string {
   ].join("\n");
 }
 
+export function buildReviewerResultsNotice(results: ReviewResult[] | undefined, bundleDir?: string): string {
+  const lines: string[] = [];
+  if (results && results.length > 1) {
+    lines.push("Reviewer results:");
+    for (const result of results) {
+      lines.push(formatReviewerResult(result));
+    }
+  }
+  if (bundleDir) {
+    lines.push(`Retained review bundle: ${bundleDir}`);
+  }
+  return lines.join("\n");
+}
+
 function formatFinding(finding: ReviewFinding): string {
   const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
   const reviewer = finding.reviewerId ? `[${finding.reviewerId}] ` : "";
   return `${reviewer}${location} - ${finding.issue} ${finding.recommendation}`;
+}
+
+function formatReviewerResult(result: ReviewResult): string {
+  const counts = [];
+  const blocking = result.findings.filter((finding) => finding.severity === "blocking").length;
+  const nonBlocking = result.findings.filter((finding) => finding.severity === "non_blocking").length;
+  if (blocking > 0) {
+    counts.push(`${blocking} blocking`);
+  }
+  if (nonBlocking > 0) {
+    counts.push(`${nonBlocking} non-blocking`);
+  }
+  const status = counts.length > 0 ? `${result.verdict}, ${counts.join(", ")}` : result.verdict;
+  const error = result.error ? ` (${result.error})` : "";
+  return `- ${result.reviewerId}: ${status}${error} - ${compactReviewerSummary(result.summary)}`;
+}
+
+function compactReviewerSummary(summary: string): string {
+  const compact = summary.replace(/\s+/g, " ").trim();
+  return compact.length > 360 ? `${compact.slice(0, 357)}...` : compact;
 }

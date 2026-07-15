@@ -171,14 +171,24 @@ and the agent's final assistant summary. Exact `write` / `edit` paths and easy
 shell targets are pre-captured before execution, including absolute paths
 outside the current worktree.
 
+Repository baselines, pre-captured outside-file baselines, user guidance,
+tool evidence, assistant summaries, and reviewer feedback belong to one review
+window. A requested correction keeps that window open so the next reviewer sees
+the original baseline and all intervening context. A passing review checkpoints
+and closes the window; later work starts from current file contents and does not
+re-review changes that already passed.
+
 ## Commands
 
-`/review-now` reruns the configured reviewer or reviewers against the current captured
-baseline and evidence.
+`/review-now` reruns the configured reviewer or reviewers against the active
+review window's baseline and evidence. A pass checkpoints and closes that
+window, so `/review-now` cannot resurrect changes from an earlier passing review.
 
 `/review-continue` sends the last reviewer feedback that was held back because
 the automatic correction cap was reached. It resets the correction counter, so
 the configured correction budget is available again for the continued fix.
+Reaching the cap does not accept or checkpoint the changes. Normal user guidance
+also remains in the same unresolved window unless that window later passes.
 
 If you send normal guidance while the reviewer is still running, the plugin
 holds that input locally until the review finishes. When the reviewer requests
@@ -189,7 +199,9 @@ after it in the same order you typed it.
 question about the current work. It includes the current request context,
 changed files and patch when available, and the session evidence digest, including
 read-only/tool-call activity and the primary agent's final summary. This makes it
-useful after planning-only turns as well as after edits.
+useful after planning-only turns as well as after edits. At the automatic
+correction cap it also includes the prior reviewer result and the held correction
+message from the same unresolved review window.
 
 Reviewer answers open in an editable prompt. Press Enter to submit the reviewer
 note to the primary model as your next message, edit it first if needed, or press

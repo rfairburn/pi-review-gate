@@ -6,7 +6,17 @@ import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistan
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
 import { buildReviewerResultsNotice } from "./prompts";
 import { runReview, type ReviewRunOutput } from "./review";
-import { beginAgentRun, buildRequestContext, createState, rememberUserRequest, type ReviewGateState } from "./state";
+import {
+  beginAgentRun,
+  buildRequestContext,
+  closeReviewWindow,
+  createState,
+  pauseReviewWindow,
+  recordReviewerFeedback,
+  rememberUserRequest,
+  setReviewWindowBaseline,
+  type ReviewGateState,
+} from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
 
 declare const module: {
@@ -56,17 +66,22 @@ export async function activate(pi: unknown): Promise<void> {
     if (runKind === "continuation") {
       return;
     }
-    state.baseline = await createWorkspaceSnapshot(currentCwd, {
+    const baseline = await createWorkspaceSnapshot(currentCwd, {
       maxFileBytes: config.maxFileBytes,
       maxSnapshotBytes: config.maxSnapshotBytes,
     });
+    setReviewWindowBaseline(state, baseline);
   });
 
   registerHook(pi, "tool_call", async (...args) => {
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
+    const window = state.reviewWindow;
+    if (!window) {
+      return;
+    }
     await recordToolCallEvidence({
-      state: state.evidence,
+      state: window.evidence,
       cwd: currentCwd,
       toolName: name,
       toolInput: toolArgs,
@@ -80,8 +95,12 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "tool_result", (...args) => {
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
+    const window = state.reviewWindow;
+    if (!window) {
+      return;
+    }
     recordToolResultEvidence({
-      state: state.evidence,
+      state: window.evidence,
       toolName: name,
       toolInput: toolArgs,
       result: args[0],
@@ -93,10 +112,14 @@ export async function activate(pi: unknown): Promise<void> {
     currentCwd = extractCwd(args, currentCwd);
     const noticeTarget = extractContext(args) ?? pi;
     const signal = extractSignal(args);
-    rememberFinalAssistantSummary(state.evidence, args);
+    const window = state.reviewWindow;
+    if (!window) {
+      return;
+    }
+    rememberFinalAssistantSummary(window.evidence, args);
     const actingUsage = extractPiUsageFromMessages(args);
-    if (!state.baseline) {
-      state.runActive = false;
+    if (!window.baseline) {
+      closeReviewWindow(state);
       return;
     }
     if (signal?.aborted) {
@@ -116,15 +139,15 @@ export async function activate(pi: unknown): Promise<void> {
       output = await runReview({
         cwd: currentCwd,
         request: buildRequestContext(state),
-        before: state.baseline,
+        before: window.baseline,
         config,
-        evidence: state.evidence,
+        evidence: window.evidence,
         actingUsage,
         signal: reviewAbort.signal,
         notify: (message) => sendNotice(noticeTarget, message),
       });
     } catch (error) {
-      state.runActive = false;
+      pauseReviewWindow(state, "paused");
       await releaseQueuedUserInputs(pi, state);
       throw error;
     } finally {
@@ -132,8 +155,7 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     if (!output.changed) {
-      state.runActive = false;
-      state.lastCorrectionFeedback = undefined;
+      closeReviewWindow(state, true);
       await releaseQueuedUserInputs(pi, state);
       return;
     }
@@ -147,19 +169,24 @@ export async function activate(pi: unknown): Promise<void> {
 
     if (output.result?.verdict === "pass") {
       await sendNotice(noticeTarget, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
-      state.runActive = false;
-      state.lastCorrectionFeedback = undefined;
+      closeReviewWindow(state);
       await releaseQueuedUserInputs(pi, state);
       return;
     }
 
     if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
       if (isRepeatedNoProgressFeedback({
-        previous: state.lastCorrectionFeedback,
+        previous: window.lastCorrectionFeedback,
         result: output.result,
         changes: output.changes,
-        evidenceEventCount: state.evidence.events.length,
+        evidenceEventCount: window.evidence.events.length,
       })) {
+        recordReviewerFeedback(state, {
+          result: output.result,
+          source: "automatic",
+          disposition: "reported_only",
+          followUpMessage: output.followUpMessage,
+        });
         await sendNotice(
           noticeTarget,
           [
@@ -171,19 +198,25 @@ export async function activate(pi: unknown): Promise<void> {
             output.followUpMessage,
           ].join("\n"),
         );
-        state.runActive = false;
+        pauseReviewWindow(state, "paused");
         await releaseQueuedUserInputs(pi, state);
         return;
       }
 
-      state.lastCorrectionFeedback = createCorrectionFeedbackMarker({
+      window.lastCorrectionFeedback = createCorrectionFeedbackMarker({
         result: output.result,
         changes: output.changes,
-        evidenceEventCount: state.evidence.events.length,
+        evidenceEventCount: window.evidence.events.length,
       });
-      if (state.correctionCycles >= config.maxCorrectionCycles) {
-        state.lastCappedFollowUp = output.followUpMessage;
-        state.reviewPausedAtCap = true;
+      if (window.correctionCycles >= config.maxCorrectionCycles) {
+        window.lastCappedFollowUp = output.followUpMessage;
+        recordReviewerFeedback(state, {
+          result: output.result,
+          source: "automatic",
+          disposition: "held_at_cap",
+          followUpMessage: output.followUpMessage,
+        });
+        pauseReviewWindow(state, "paused_at_cap");
         await sendNotice(
           noticeTarget,
           [
@@ -195,12 +228,17 @@ export async function activate(pi: unknown): Promise<void> {
             output.followUpMessage,
           ].join("\n"),
         );
-        state.runActive = false;
         await releaseQueuedUserInputs(pi, state);
         return;
       }
-      state.lastCappedFollowUp = undefined;
-      state.correctionCycles += 1;
+      window.lastCappedFollowUp = undefined;
+      window.correctionCycles += 1;
+      recordReviewerFeedback(state, {
+        result: output.result,
+        source: "automatic",
+        disposition: "sent_for_correction",
+        followUpMessage: output.followUpMessage,
+      });
       await sendNotice(noticeTarget, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
       await sendFollowUp(pi, output.followUpMessage);
       await releaseQueuedUserInputs(pi, state);
@@ -208,9 +246,15 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
+    if (output.result) {
+      recordReviewerFeedback(state, {
+        result: output.result,
+        source: "automatic",
+        disposition: "reported_only",
+      });
+    }
     await sendNotice(noticeTarget, withReviewDetails(failed, output));
-    state.runActive = false;
-    state.lastCorrectionFeedback = undefined;
+    pauseReviewWindow(state, "paused");
     await releaseQueuedUserInputs(pi, state);
   });
 

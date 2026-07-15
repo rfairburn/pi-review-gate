@@ -6,7 +6,7 @@ import test from "node:test";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
-import { createState, rememberUserRequest } from "../src/state";
+import { createState, recordReviewerFeedback, rememberUserRequest } from "../src/state";
 
 test("/review-now requested changes reset the automatic correction budget", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-"));
@@ -14,8 +14,8 @@ test("/review-now requested changes reset the automatic correction budget", asyn
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const state = createState();
     rememberUserRequest(state, "change index");
-    state.correctionCycles = 2;
-    state.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.correctionCycles = 2;
+    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
     });
@@ -47,7 +47,7 @@ test("/review-now requested changes reset the automatic correction budget", asyn
 
     await commands.get("review-now")?.("", ctx);
 
-    assert.equal(state.correctionCycles, 0);
+    assert.equal(state.reviewWindow!.correctionCycles, 0);
     assert.equal(followUps.length, 1);
     assert.match(followUps[0] ?? "", /missing test/);
     assert.match(notices.join("\n"), /review gate: changes requested/);
@@ -62,7 +62,7 @@ test("/review-now notice shows non-blocking reviewer results in multi-reviewer r
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const state = createState();
     rememberUserRequest(state, "change index");
-    state.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
     });
@@ -106,14 +106,58 @@ test("/review-now notice shows non-blocking reviewer results in multi-reviewer r
   }
 });
 
+test("a passing /review-now checkpoints and closes its review window", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-pass-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "change index");
+    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: 1_048_576,
+      maxSnapshotBytes: 52_428_800,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const notices: string[] = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+    };
+    const ctx = {
+      notify(message: string) {
+        notices.push(message);
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: passingReviewConfig(),
+      state,
+    });
+
+    await commands.get("review-now")?.("", ctx);
+    assert.equal(state.reviewWindow, undefined);
+    assert.match(notices.join("\n"), /review gate: passed/);
+
+    await commands.get("review-now")?.("", ctx);
+    assert.match(notices.join("\n"), /no active review window with a baseline/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("/review-continue sends capped feedback and resets the correction budget", async () => {
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
   const followUps: string[] = [];
   const notices: string[] = [];
   const state = createState();
-  state.correctionCycles = 3;
-  state.lastCappedFollowUp = "Review found blocking issues.\n\n1. index.ts - missing guard add it";
-  state.reviewPausedAtCap = true;
+  rememberUserRequest(state, "change index");
+  state.reviewWindow!.correctionCycles = 3;
+  state.reviewWindow!.lastCappedFollowUp = "Review found blocking issues.\n\n1. index.ts - missing guard add it";
+  state.reviewWindow!.status = "paused_at_cap";
   const pi = {
     registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
       commands.set(name, options.handler);
@@ -137,16 +181,92 @@ test("/review-continue sends capped feedback and resets the correction budget", 
 
   await commands.get("review-continue")?.("", ctx);
 
-  assert.equal(state.correctionCycles, 0);
-  assert.equal(state.lastCappedFollowUp, undefined);
-  assert.equal(state.reviewPausedAtCap, false);
-  assert.equal(state.runActive, true);
+  assert.equal(state.reviewWindow!.correctionCycles, 0);
+  assert.equal(state.reviewWindow!.lastCappedFollowUp, undefined);
+  assert.equal(state.reviewWindow!.status, "active");
   assert.deepEqual(followUps, ["Review found blocking issues.\n\n1. index.ts - missing guard add it"]);
   assert.match(notices.join("\n"), /correction budget reset to 3/);
 
   await commands.get("review-continue")?.("", ctx);
   assert.equal(followUps.length, 1);
   assert.match(notices.join("\n"), /no capped reviewer feedback available/);
+});
+
+test("/ask-reviewer at the correction cap receives the complete unresolved review window", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-capped-window-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "change index with the existing API");
+    const window = state.reviewWindow!;
+    window.baseline = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: 1_048_576,
+      maxSnapshotBytes: 52_428_800,
+    });
+    window.evidence.events.push({
+      sequence: 1,
+      phase: "tool_call",
+      toolName: "edit",
+      summary: "capped-window-tool-evidence",
+      candidatePaths: ["index.ts"],
+      riskSignals: [],
+    });
+    const cappedFollowUp = "Review found blocking issues. Add the missing guard.";
+    window.lastCappedFollowUp = cappedFollowUp;
+    window.status = "paused_at_cap";
+    recordReviewerFeedback(state, {
+      source: "automatic",
+      disposition: "held_at_cap",
+      followUpMessage: cappedFollowUp,
+      result: {
+        reviewerId: "codex",
+        verdict: "needs_changes",
+        summary: "The existing API path is missing a guard.",
+        findings: [{
+          severity: "blocking",
+          file: "index.ts",
+          line: 1,
+          issue: "Missing guard.",
+          recommendation: "Add the guard.",
+        }],
+      },
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const editorViews: Array<{ title: string; prefill: string }> = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify() {},
+        async editor(title: string, prefill: string) {
+          editorViews.push({ title, prefill });
+          return undefined;
+        },
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: cappedWindowAskReviewerConfig(),
+      state,
+    });
+
+    await commands.get("ask-reviewer")?.("is the capped finding still valid?", ctx);
+
+    assert.equal(editorViews.length, 1);
+    assert.match(editorViews[0]?.prefill ?? "", /complete capped review window/);
+    assert.equal(state.reviewWindow, window);
+    assert.equal(window.status, "paused_at_cap");
+    assert.equal(window.lastCappedFollowUp, cappedFollowUp);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("/ask-reviewer opens the reviewer answer in the editor when canceled", async () => {
@@ -306,6 +426,22 @@ function reviewConfig(): ReviewGateConfig {
   };
 }
 
+function passingReviewConfig(): ReviewGateConfig {
+  return {
+    ...reviewConfig(),
+    decider: {
+      id: "passing",
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'approved',findings:[]})))",
+      ],
+      timeoutMs: 5000,
+    },
+  };
+}
+
 function multiReviewerReviewConfig(): ReviewGateConfig {
   return {
     enabled: true,
@@ -373,6 +509,46 @@ function askReviewerPartialErrorConfig(): ReviewGateConfig {
         timeoutMs: 5000,
       },
     ],
+  };
+}
+
+function cappedWindowAskReviewerConfig(): ReviewGateConfig {
+  return {
+    enabled: true,
+    mode: "single-decider",
+    maxCorrectionCycles: 0,
+    reviewWhen: "changed-files",
+    maxPatchBytes: 200_000,
+    maxFileBytes: 1_048_576,
+    maxSnapshotBytes: 52_428_800,
+    retainBundles: "never",
+    decider: {
+      id: "prompt-checker",
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const ok=s.includes('is the capped finding still valid?')",
+          "&& s.includes('change index with the existing API')",
+          "&& s.includes('capped-window-tool-evidence')",
+          "&& s.includes('feedback held at the correction cap')",
+          "&& s.includes('The existing API path is missing a guard.')",
+          "&& s.includes('Review found blocking issues. Add the missing guard.')",
+          "&& s.includes('-before')",
+          "&& s.includes('+after');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'complete capped review window',findings:[]}",
+          ":{verdict:'needs_changes',summary:'incomplete capped review window',findings:[{severity:'blocking',file:'session',line:null,issue:'ask-reviewer lost capped context',recommendation:'supply the complete review window'}]}));",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 5000,
+    },
   };
 }
 

@@ -159,9 +159,6 @@ export function rememberFinalAssistantSummary(state: EvidenceState, args: unknow
     const truncated = truncate(summary, 4000);
     state.finalAssistantSummary = truncated;
     state.finalAssistantSummaries.push(truncated);
-    if (state.finalAssistantSummaries.length > 10) {
-      state.finalAssistantSummaries.splice(0, state.finalAssistantSummaries.length - 10);
-    }
   }
 }
 
@@ -384,18 +381,15 @@ function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): strin
 
   if (bundle.candidates.length > 0) {
     lines.push("### Pre-captured candidate files");
-    for (const candidate of bundle.candidates.slice(0, 50)) {
+    for (const candidate of bundle.candidates) {
       lines.push(`- ${candidate.path} (${candidate.baseline}; ${candidate.sources.join(", ")})`);
-    }
-    if (bundle.candidates.length > 50) {
-      lines.push(`- ... ${bundle.candidates.length - 50} more candidates omitted`);
     }
     lines.push("");
   }
 
   if (bundle.changedCandidatePaths.length > 0) {
     lines.push("### Evidence candidates changed");
-    for (const path of bundle.changedCandidatePaths.slice(0, 50)) {
+    for (const path of bundle.changedCandidatePaths) {
       lines.push(`- ${path}`);
     }
     lines.push("");
@@ -403,12 +397,7 @@ function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): strin
 
   if (bundle.events.length > 0) {
     lines.push("### Tool event digest");
-    const renderedEvents = selectEventsForMarkdown(bundle.events);
-    for (const event of renderedEvents) {
-      if (event === "omitted") {
-        lines.push(`- ... ${Math.max(0, bundle.events.length - renderedEvents.length + 1)} middle events omitted`);
-        continue;
-      }
+    for (const event of bundle.events) {
       const risks = event.riskSignals.length > 0 ? ` risks=${event.riskSignals.join(",")}` : "";
       const paths = event.candidatePaths.length > 0 ? ` paths=${event.candidatePaths.join(",")}` : "";
       lines.push(`- #${event.sequence} ${event.phase} ${event.toolName}${event.isError ? " ERROR" : ""}${paths}${risks}: ${event.summary}`);
@@ -416,17 +405,6 @@ function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): strin
   }
 
   return lines.join("\n");
-}
-
-function selectEventsForMarkdown(events: EvidenceEvent[]): Array<EvidenceEvent | "omitted"> {
-  if (events.length <= 160) {
-    return events;
-  }
-  return [
-    ...events.slice(0, 40),
-    "omitted" as const,
-    ...events.slice(-120),
-  ];
 }
 
 function extractFinalAssistantText(args: unknown[]): string {

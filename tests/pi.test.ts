@@ -19,7 +19,7 @@ test("extractSignal reads pi event context signal", () => {
 test("extension follow-up input should not reset correction cycle state", () => {
   const state = createState();
   rememberUserRequest(state, "original user request");
-  state.correctionCycles = 1;
+  state.reviewWindow!.correctionCycles = 1;
 
   const event = {
     type: "input",
@@ -31,6 +31,6 @@ test("extension follow-up input should not reset correction cycle state", () => 
     rememberUserRequest(state, extractInputText([event]));
   }
 
-  assert.equal(state.latestRequest, "original user request");
-  assert.equal(state.correctionCycles, 1);
+  assert.equal(state.reviewWindow!.latestRequest, "original user request");
+  assert.equal(state.reviewWindow!.correctionCycles, 1);
 });

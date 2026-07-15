@@ -606,7 +606,7 @@ test("/review-continue after cap preserves original baseline and accumulated evi
   }
 });
 
-test("normal user input after cap starts a fresh review run", async () => {
+test("normal user input after cap continues the unresolved review window with complete context", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-capped-fresh-input-"));
   const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
@@ -644,14 +644,20 @@ test("normal user input after cap starts a fresh review run", async () => {
             "return;",
             "}",
             "const ok=input.includes('fresh-task-evidence')",
-            "&& input.includes('-broken')",
+            "&& input.includes('old-capped-evidence')",
+            "&& input.includes('first capped summary')",
+            "&& input.includes('missing guard')",
+            "&& input.includes('feedback held at the correction cap')",
+            "&& input.includes('Initial user request:')",
+            "&& input.includes('change index')",
+            "&& input.includes('Additional user guidance during the same review window:')",
+            "&& input.includes('start a different task')",
+            "&& input.includes('-before')",
             "&& input.includes('+fresh change')",
-            "&& !input.includes('old-capped-evidence')",
-            "&& !input.includes('first capped summary')",
-            "&& !input.includes('-before');",
+            ";",
             "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'fresh run did not inherit capped evidence',findings:[]}",
-            ":{verdict:'needs_changes',summary:'fresh run inherited capped evidence',findings:[{severity:'blocking',file:'session',line:null,issue:'normal prompt after cap reused old evidence or baseline',recommendation:'start a fresh run on normal input after correction cap'}]}));",
+            "?{verdict:'pass',summary:'capped window retained complete context',findings:[]}",
+            ":{verdict:'needs_changes',summary:'capped window lost context',findings:[{severity:'blocking',file:'session',line:null,issue:'normal prompt after cap lost evidence, feedback, or baseline',recommendation:'keep the unresolved review window intact'}]}));",
             "});",
           ].join(""),
         ],
@@ -700,7 +706,7 @@ test("normal user input after cap starts a fresh review run", async () => {
     });
 
     assert.match(notices.join("\n"), /review gate: passed/);
-    assert.doesNotMatch(notices.join("\n"), /fresh run inherited capped evidence/);
+    assert.doesNotMatch(notices.join("\n"), /capped window lost context/);
     assert.equal(commands.has("review-continue"), true);
   } finally {
     if (previousConfig === undefined) {
@@ -714,6 +720,107 @@ test("normal user input after cap starts a fresh review run", async () => {
       process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
     }
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a passed outside-file change is checkpointed out of the next review window", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-window-checkpoint-"));
+  const outside = join(tmpdir(), `pi-review-gate-outside-review-${process.pid}-${Date.now()}.md`);
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+
+  try {
+    await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.19\n", "utf8");
+    await writeFile(outside, "old review document\n", "utf8");
+    const invocationPath = join(dir, "review-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 0,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "never",
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `const invocationPath=${JSON.stringify(invocationPath)};`,
+            `const outside=${JSON.stringify(outside)};`,
+            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+            "fs.writeFileSync(invocationPath,String(count+1));",
+            "process.stdin.resume();",
+            "let input='';",
+            "process.stdin.on('data',chunk=>input+=chunk);",
+            "process.stdin.on('end',()=>{",
+            "const ok=count===0",
+            "?input.includes(outside)&&input.includes('old review document')&&input.includes('rewritten review document')&&input.includes('first Docker task')",
+            ":!input.includes(outside)&&!input.includes('old review document')&&!input.includes('rewritten review document')&&!input.includes('first Docker task')&&input.includes('second Docker task')&&input.includes('+FROM alpine:3.21');",
+            "process.stdout.write(JSON.stringify(ok",
+            "?{verdict:'pass',summary:count===0?'first window complete':'second window isolated',findings:[]}",
+            ":{verdict:'needs_changes',summary:'review windows mixed',findings:[{severity:'blocking',file:'session',line:null,issue:'a review used changes or context from the wrong window',recommendation:'checkpoint passed changes and open an isolated window'}]}));",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify(message: string) {
+        notices.push(message);
+      },
+      sendUserMessage() {},
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "first Docker task", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: outside } });
+    await writeFile(outside, "rewritten review document\n", "utf8");
+    await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.20\n", "utf8");
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "finished first Docker task and review document" }],
+    });
+
+    await trigger(hooks, "input", { cwd: dir, text: "second Docker task", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.21\n", "utf8");
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "finished second Docker task" }],
+    });
+
+    assert.equal(notices.filter((notice) => /review gate: passed/.test(notice)).length, 2);
+    assert.doesNotMatch(notices.join("\n"), /review windows mixed/);
+  } finally {
+    if (previousConfig === undefined) {
+      delete process.env.PI_REVIEW_GATE_CONFIG;
+    } else {
+      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    }
+    if (previousDisabled === undefined) {
+      delete process.env.PI_REVIEW_GATE_DISABLED;
+    } else {
+      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    }
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { force: true });
   }
 });
 

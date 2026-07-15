@@ -1,5 +1,13 @@
 import type { ReviewGateConfig } from "./config";
-import { buildRequestContext, type ReviewGateState } from "./state";
+import {
+  buildRequestContext,
+  closeReviewWindow,
+  getReviewerQuestionWindow,
+  markCappedFeedbackSent,
+  pauseReviewWindow,
+  recordReviewerFeedback,
+  type ReviewGateState,
+} from "./state";
 import { runAskReviewer, runReview } from "./review";
 import { extractSignal, sendNotice, sendFollowUp, sendUserPrompt } from "./pi";
 import { buildReviewerResultsNotice } from "./prompts";
@@ -30,32 +38,51 @@ export function registerCommands(input: RegisterCommandsInput): void {
   registerCommand("review-now", {
     description: "Run pi-review-gate against the current turn baseline.",
     handler: async (_args: string, ctx: unknown) => {
-      if (!input.state.baseline) {
-        await sendNotice(ctx, "review gate: no baseline available");
+      const window = input.state.reviewWindow;
+      if (!window?.baseline) {
+        await sendNotice(ctx, "review gate: no active review window with a baseline");
         return;
       }
       const output = await runReview({
         cwd: input.cwd(),
         request: buildRequestContext(input.state) || "Manual /review-now request",
-        before: input.state.baseline,
+        before: window.baseline,
         config: input.config,
-        evidence: input.state.evidence,
+        evidence: window.evidence,
         signal: extractSignal([ctx]),
         notify: (message) => sendNotice(ctx, message),
       });
 
       if (!output.changed) {
         await sendNotice(ctx, "review gate: no changes detected");
+        closeReviewWindow(input.state, true);
         return;
       }
       if (output.result?.verdict === "pass") {
         await sendNotice(ctx, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
+        closeReviewWindow(input.state);
       } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
         await sendNotice(ctx, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
-        input.state.correctionCycles = 0;
+        window.correctionCycles = 0;
+        window.lastCappedFollowUp = undefined;
+        window.status = "active";
+        recordReviewerFeedback(input.state, {
+          result: output.result,
+          source: "manual",
+          disposition: "sent_for_correction",
+          followUpMessage: output.followUpMessage,
+        });
         await sendFollowUp(input.pi, output.followUpMessage);
       } else {
         const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
+        if (output.result) {
+          recordReviewerFeedback(input.state, {
+            result: output.result,
+            source: "manual",
+            disposition: "reported_only",
+          });
+        }
+        pauseReviewWindow(input.state, "paused");
         await sendNotice(ctx, withReviewDetails(failed, output));
       }
     },
@@ -64,15 +91,16 @@ export function registerCommands(input: RegisterCommandsInput): void {
   registerCommand("review-continue", {
     description: "Send the last capped reviewer feedback and reset the correction budget.",
     handler: async (_args: string, ctx: unknown) => {
-      if (!input.state.lastCappedFollowUp) {
+      const window = input.state.reviewWindow;
+      if (!window?.lastCappedFollowUp) {
         await sendNotice(ctx, "review gate: no capped reviewer feedback available");
         return;
       }
-      const followUp = input.state.lastCappedFollowUp;
-      input.state.lastCappedFollowUp = undefined;
-      input.state.reviewPausedAtCap = false;
-      input.state.runActive = true;
-      input.state.correctionCycles = 0;
+      const followUp = window.lastCappedFollowUp;
+      markCappedFeedbackSent(input.state, followUp);
+      window.lastCappedFollowUp = undefined;
+      window.status = "active";
+      window.correctionCycles = 0;
       await sendNotice(ctx, `review gate: continuing review; correction budget reset to ${input.config.maxCorrectionCycles}`);
       await sendFollowUp(input.pi, followUp);
     },
@@ -88,13 +116,15 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
 
       await sendNotice(ctx, `review gate: asking reviewer\n\nQuestion: ${question}`);
+      const activeWindow = input.state.reviewWindow;
+      const contextWindow = getReviewerQuestionWindow(input.state);
       const output = await runAskReviewer({
         cwd: input.cwd(),
         question,
-        request: buildRequestContext(input.state),
-        before: input.state.baseline,
+        request: buildRequestContext(input.state, contextWindow),
+        before: activeWindow?.baseline,
         config: input.config,
-        evidence: input.state.evidence,
+        evidence: contextWindow?.evidence,
         signal: extractSignal([ctx]),
         notify: (message) => sendNotice(ctx, message),
       });

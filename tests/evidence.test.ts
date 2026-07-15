@@ -117,7 +117,20 @@ test("rememberFinalAssistantSummary keeps multiple turn summaries for continued 
   assert.match(bundle.markdown, /second summary/);
 });
 
-test("evidence markdown preserves initial and recent tool events", () => {
+test("review-window evidence does not discard older assistant summaries", () => {
+  const state = createEvidenceState();
+  for (let index = 1; index <= 12; index += 1) {
+    rememberFinalAssistantSummary(state, [{ messages: [{ role: "assistant", content: `summary ${index}` }] }]);
+  }
+
+  const bundle = buildEvidenceBundle(state, []);
+
+  assert.equal(state.finalAssistantSummaries.length, 12);
+  assert.match(bundle.markdown, /Summary 1\n\nsummary 1/);
+  assert.match(bundle.markdown, /Summary 12\n\nsummary 12/);
+});
+
+test("evidence markdown preserves every tool event in the review window", () => {
   const state = createEvidenceState();
   for (let index = 1; index <= 200; index += 1) {
     state.events.push({
@@ -134,7 +147,9 @@ test("evidence markdown preserves initial and recent tool events", () => {
 
   assert.match(bundle.markdown, /#1 tool_call bash: event 1/);
   assert.match(bundle.markdown, /#40 tool_call bash: event 40/);
-  assert.match(bundle.markdown, /40 middle events omitted/);
+  assert.match(bundle.markdown, /#41 tool_call bash: event 41/);
+  assert.match(bundle.markdown, /#80 tool_call bash: event 80/);
   assert.match(bundle.markdown, /#81 tool_call bash: event 81/);
   assert.match(bundle.markdown, /#200 tool_call bash: event 200/);
+  assert.doesNotMatch(bundle.markdown, /events omitted/);
 });

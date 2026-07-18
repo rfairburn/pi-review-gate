@@ -24,37 +24,51 @@ export interface ReviewResult {
 }
 
 export function parseReviewResult(reviewerId: string, rawOutput: string, rawOutputPath?: string): ReviewResult {
-  const jsonText = extractJsonObject(rawOutput);
-  if (!jsonText) {
-    return {
-      reviewerId,
-      verdict: "error",
-      summary: "Reviewer did not return a JSON object.",
-      findings: [],
-      rawOutputPath,
-      error: "missing_json",
-    };
+  const candidates = extractJsonCandidates(rawOutput);
+  let firstParseError: unknown;
+  let firstSchemaError: ReviewResult | undefined;
+
+  for (const candidate of candidates) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch (error) {
+      firstParseError ??= error;
+      continue;
+    }
+
+    const validated = normalizeReviewResult(reviewerId, parsed, rawOutputPath);
+    if (validated.error === "schema_error") {
+      firstSchemaError ??= validated;
+      continue;
+    }
+    if (validated.verdict !== "error" && validated.findings.some((finding) => finding.severity === "blocking")) {
+      validated.verdict = "needs_changes";
+    }
+    return validated;
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonText);
-  } catch (error) {
+  if (firstSchemaError) {
+    return firstSchemaError;
+  }
+  if (firstParseError && (rawOutput.includes("{") || /```[ \t]*json\b/i.test(rawOutput))) {
     return {
       reviewerId,
       verdict: "error",
       summary: "Reviewer returned invalid JSON.",
       findings: [],
       rawOutputPath,
-      error: error instanceof Error ? error.message : "invalid_json",
+      error: firstParseError instanceof Error ? firstParseError.message : "invalid_json",
     };
   }
-
-  const validated = normalizeReviewResult(reviewerId, parsed, rawOutputPath);
-  if (validated.verdict !== "error" && validated.findings.some((finding) => finding.severity === "blocking")) {
-    validated.verdict = "needs_changes";
-  }
-  return validated;
+  return {
+    reviewerId,
+    verdict: "error",
+    summary: "Reviewer did not return a JSON object.",
+    findings: [],
+    rawOutputPath,
+    error: "missing_json",
+  };
 }
 
 export function normalizeReviewResult(
@@ -116,15 +130,56 @@ export function normalizeReviewResult(
 }
 
 export function extractJsonObject(text: string): string | null {
-  const firstBrace = text.indexOf("{");
-  if (firstBrace === -1) {
-    return null;
+  return extractBalancedJsonObjects(text)[0] ?? null;
+}
+
+function extractJsonCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const add = (candidate: string): void => {
+    const trimmed = candidate.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      candidates.push(trimmed);
+    }
+  };
+
+  const trimmed = text.trim();
+  if (trimmed) {
+    add(trimmed);
   }
 
+  const fencePattern = /```[ \t]*json\b[ \t]*(?:\r?\n)?([\s\S]*?)```/gi;
+  for (const match of text.matchAll(fencePattern)) {
+    const fenced = match[1] ?? "";
+    add(fenced);
+    for (const candidate of extractBalancedJsonObjects(fenced)) {
+      add(candidate);
+    }
+  }
+
+  for (const candidate of extractBalancedJsonObjects(text)) {
+    add(candidate);
+  }
+  return candidates;
+}
+
+function extractBalancedJsonObjects(text: string): string[] {
+  const candidates: string[] = [];
+  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
+    const candidate = extractBalancedJsonObjectAt(text, start);
+    if (candidate) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+function extractBalancedJsonObjectAt(text: string, start: number): string | null {
   let depth = 0;
   let inString = false;
   let escaped = false;
-  for (let index = firstBrace; index < text.length; index += 1) {
+  for (let index = start; index < text.length; index += 1) {
     const char = text[index];
     if (inString) {
       if (escaped) {
@@ -144,7 +199,7 @@ export function extractJsonObject(text: string): string | null {
     } else if (char === "}") {
       depth -= 1;
       if (depth === 0) {
-        return text.slice(firstBrace, index + 1);
+        return text.slice(start, index + 1);
       }
     }
   }

@@ -13,6 +13,71 @@ test("parseReviewResult accepts clean JSON", () => {
   assert.equal(result.summary, "ok");
 });
 
+test("parseReviewResult accepts a fenced JSON review after prose containing braces", () => {
+  const result = parseReviewResult(
+    "reviewer",
+    [
+      "All blocking issues have been fixed:",
+      "1. capturedPieces now uses `{{white: string[], black: string[]}}`.",
+      "2. MoveResult now uses `{ok: false, reason}` and `{ok: true, ...}`.",
+      "",
+      "```json",
+      JSON.stringify({
+        verdict: "pass",
+        summary: "All blocking issues were fixed.",
+        findings: [],
+      }),
+      "```",
+    ].join("\n"),
+  );
+
+  assert.equal(result.verdict, "pass");
+  assert.equal(result.summary, "All blocking issues were fixed.");
+});
+
+test("parseReviewResult prefers a JSON fence over earlier balanced review-shaped prose", () => {
+  const result = parseReviewResult(
+    "reviewer",
+    [
+      "An earlier example was:",
+      JSON.stringify({
+        verdict: "needs_changes",
+        summary: "stale example",
+        findings: [],
+      }),
+      "",
+      "```json",
+      JSON.stringify({
+        verdict: "pass",
+        summary: "authoritative fenced result",
+        findings: [],
+      }),
+      "```",
+    ].join("\n"),
+  );
+
+  assert.equal(result.verdict, "pass");
+  assert.equal(result.summary, "authoritative fenced result");
+});
+
+test("parseReviewResult scans later balanced objects for a schema-valid review", () => {
+  const result = parseReviewResult(
+    "reviewer",
+    [
+      "Runtime shape: {{white: string[], black: string[]}}",
+      "Metadata example: {\"kind\":\"review\"}",
+      JSON.stringify({
+        verdict: "pass",
+        summary: "later object accepted",
+        findings: [],
+      }),
+    ].join("\n"),
+  );
+
+  assert.equal(result.verdict, "pass");
+  assert.equal(result.summary, "later object accepted");
+});
+
 test("parseReviewResult treats blocking findings as needs_changes", () => {
   const result = parseReviewResult(
     "reviewer",

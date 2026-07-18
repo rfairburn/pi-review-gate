@@ -171,3 +171,35 @@ test("normalizeConfig rejects duplicate reviewer ids", () => {
     /reviewer id must be unique: same/,
   );
 });
+
+test("normalizeConfig rejects reviewer ids that could share an output directory", () => {
+  for (const id of ["review/a", "review?a"]) {
+    assert.throws(
+      () => normalizeConfig({
+        enabled: true,
+        reviewers: [
+          {
+            id,
+            adapter: "codex-cli",
+          },
+        ],
+      }),
+      /reviewer id may contain only letters, numbers, underscores, periods, and hyphens/,
+    );
+  }
+});
+
+test("normalizeConfig rejects path-reserved reviewer ids", () => {
+  for (const id of [".", ".."]) {
+    assert.throws(
+      () => normalizeConfig({
+        enabled: true,
+        decider: {
+          id,
+          adapter: "codex-cli",
+        },
+      }),
+      /reviewer id may contain only letters, numbers, underscores, periods, and hyphens/,
+    );
+  }
+});

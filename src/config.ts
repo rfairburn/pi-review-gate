@@ -73,6 +73,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
 };
 
 const DEFAULT_REVIEWER_TIMEOUT_MS = 300_000;
+const REVIEWER_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
   const disabledVar = firstTruthyEnv(env, ["PI_REVIEW_GATE_DISABLED", "LITTLE_CODER_REVIEW_GATE_DISABLED"]);
@@ -152,6 +153,9 @@ function normalizeDecider(value: unknown): DeciderConfig {
   }
   if (typeof value.id !== "string" || !value.id.trim()) {
     throw new Error("decider requires id");
+  }
+  if (!REVIEWER_ID_PATTERN.test(value.id) || value.id === "." || value.id === "..") {
+    throw new Error("reviewer id may contain only letters, numbers, underscores, periods, and hyphens");
   }
   if (value.adapter === "generic-cli") {
     if (typeof value.command !== "string" || !value.command.trim()) {

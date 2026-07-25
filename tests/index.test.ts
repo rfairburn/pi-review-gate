@@ -249,6 +249,112 @@ test("agent end skips reviewer when primary turn signal is already aborted", asy
   }
 });
 
+test("/new shutdown silently aborts review work before its context becomes stale", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-new-session-abort-"));
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const markerPath = join(dir, "review-started.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 3,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "never",
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `fs.writeFileSync(${JSON.stringify(markerPath)},'started');`,
+            "setInterval(()=>{},1000);",
+          ].join(""),
+        ],
+        timeoutMs: 300000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const terminalHandlers: Array<(input: unknown) => unknown> = [];
+    const ui = {
+      notify(message: string) {
+        notices.push(message);
+      },
+      onTerminalInput(handler: (input: unknown) => unknown) {
+        terminalHandlers.push(handler);
+        return () => {
+          const index = terminalHandlers.indexOf(handler);
+          if (index >= 0) {
+            terminalHandlers.splice(index, 1);
+          }
+        };
+      },
+    };
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+    };
+    const controller = new AbortController();
+    let contextActive = true;
+    const ctx = {
+      cwd: dir,
+      signal: controller.signal,
+      get ui() {
+        if (!contextActive) {
+          throw new Error("test context is stale after /new");
+        }
+        return ui;
+      },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const reviewPromise = trigger(hooks, "agent_end", ctx);
+    await waitForFile(markerPath);
+    assert.equal(terminalHandlers.length, 1);
+
+    controller.abort();
+    const shutdownPromise = trigger(hooks, "session_shutdown", { reason: "new" }, ctx);
+    contextActive = false;
+
+    await shutdownPromise;
+    await reviewPromise;
+
+    assert.equal(terminalHandlers.length, 0);
+    assert.doesNotMatch(notices.join("\n"), /review gate: review cancelled/);
+    assert.doesNotMatch(notices.join("\n"), /reviewer failed/);
+  } finally {
+    if (previousConfig === undefined) {
+      delete process.env.PI_REVIEW_GATE_CONFIG;
+    } else {
+      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    }
+    if (previousDisabled === undefined) {
+      delete process.env.PI_REVIEW_GATE_DISABLED;
+    } else {
+      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("escape terminal input aborts an active reviewer process", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-escape-review-"));
   const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;

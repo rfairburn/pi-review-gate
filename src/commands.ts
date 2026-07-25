@@ -19,6 +19,8 @@ export interface RegisterCommandsInput {
   cwd: () => string;
   config: ReviewGateConfig;
   state: ReviewGateState;
+  isSessionActive?: () => boolean;
+  sessionSignal?: AbortSignal;
 }
 
 export function registerCommands(input: RegisterCommandsInput): void {
@@ -26,21 +28,30 @@ export function registerCommands(input: RegisterCommandsInput): void {
   if (!registerCommand) {
     return;
   }
+  const isSessionActive = input.isSessionActive ?? (() => true);
+  const sendCommandNotice = (ctx: unknown, message: string): Promise<void> =>
+    isSessionActive() ? sendNotice(ctx, message) : Promise.resolve();
 
   registerCommand("review-gate-ping", {
     description: "Verify pi-review-gate is loaded.",
     handler: async (_args: string, ctx: unknown) => {
+      if (!isSessionActive()) {
+        return;
+      }
       const reviewers = input.config.reviewers?.map((reviewer) => reviewer.id).join(", ") ?? input.config.decider?.id ?? "none";
-      await sendNotice(ctx, `review gate: loaded; mode=${input.config.mode}; reviewers=${reviewers}`);
+      await sendCommandNotice(ctx, `review gate: loaded; mode=${input.config.mode}; reviewers=${reviewers}`);
     },
   });
 
   registerCommand("review-now", {
     description: "Run pi-review-gate against the current turn baseline.",
     handler: async (_args: string, ctx: unknown) => {
+      if (!isSessionActive()) {
+        return;
+      }
       const window = input.state.reviewWindow;
       if (!window?.baseline) {
-        await sendNotice(ctx, "review gate: no active review window with a baseline");
+        await sendCommandNotice(ctx, "review gate: no active review window with a baseline");
         return;
       }
       const output = await runReview({
@@ -49,20 +60,23 @@ export function registerCommands(input: RegisterCommandsInput): void {
         before: window.baseline,
         config: input.config,
         evidence: window.evidence,
-        signal: extractSignal([ctx]),
-        notify: (message) => sendNotice(ctx, message),
+        signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
+        notify: (message) => sendCommandNotice(ctx, message),
       });
 
+      if (!isSessionActive()) {
+        return;
+      }
       if (!output.changed) {
-        await sendNotice(ctx, "review gate: no changes detected");
+        await sendCommandNotice(ctx, "review gate: no changes detected");
         closeReviewWindow(input.state, true);
         return;
       }
       if (output.result?.verdict === "pass") {
-        await sendNotice(ctx, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
+        await sendCommandNotice(ctx, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
         closeReviewWindow(input.state, true);
       } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
-        await sendNotice(ctx, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
+        await sendCommandNotice(ctx, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
         window.correctionCycles = 0;
         window.lastCappedFollowUp = undefined;
         window.status = "active";
@@ -72,7 +86,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
           disposition: "sent_for_correction",
           followUpMessage: output.followUpMessage,
         });
-        await sendFollowUp(input.pi, output.followUpMessage);
+        if (isSessionActive()) {
+          await sendFollowUp(input.pi, output.followUpMessage);
+        }
       } else {
         const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
         if (output.result) {
@@ -83,7 +99,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           });
         }
         pauseReviewWindow(input.state, "paused");
-        await sendNotice(ctx, withReviewDetails(failed, output));
+        await sendCommandNotice(ctx, withReviewDetails(failed, output));
       }
     },
   });
@@ -91,9 +107,12 @@ export function registerCommands(input: RegisterCommandsInput): void {
   registerCommand("review-continue", {
     description: "Send the last capped reviewer feedback and reset the correction budget.",
     handler: async (_args: string, ctx: unknown) => {
+      if (!isSessionActive()) {
+        return;
+      }
       const window = input.state.reviewWindow;
       if (!window?.lastCappedFollowUp) {
-        await sendNotice(ctx, "review gate: no capped reviewer feedback available");
+        await sendCommandNotice(ctx, "review gate: no capped reviewer feedback available");
         return;
       }
       const followUp = window.lastCappedFollowUp;
@@ -101,21 +120,26 @@ export function registerCommands(input: RegisterCommandsInput): void {
       window.lastCappedFollowUp = undefined;
       window.status = "active";
       window.correctionCycles = 0;
-      await sendNotice(ctx, `review gate: continuing review; correction budget reset to ${input.config.maxCorrectionCycles}`);
-      await sendFollowUp(input.pi, followUp);
+      await sendCommandNotice(ctx, `review gate: continuing review; correction budget reset to ${input.config.maxCorrectionCycles}`);
+      if (isSessionActive()) {
+        await sendFollowUp(input.pi, followUp);
+      }
     },
   });
 
   registerCommand("ask-reviewer", {
     description: "Ask the configured reviewer a question about the current work.",
     handler: async (args: string, ctx: unknown) => {
+      if (!isSessionActive()) {
+        return;
+      }
       const question = args.trim();
       if (!question) {
-        await sendNotice(ctx, "review gate: usage: /ask-reviewer <question>");
+        await sendCommandNotice(ctx, "review gate: usage: /ask-reviewer <question>");
         return;
       }
 
-      await sendNotice(ctx, `review gate: asking reviewer\n\nQuestion: ${question}`);
+      await sendCommandNotice(ctx, `review gate: asking reviewer\n\nQuestion: ${question}`);
       const contextWindow = getReviewerQuestionWindow(input.state);
       const output = await runAskReviewer({
         cwd: input.cwd(),
@@ -124,29 +148,35 @@ export function registerCommands(input: RegisterCommandsInput): void {
         before: contextWindow?.baseline,
         config: input.config,
         evidence: contextWindow?.evidence,
-        signal: extractSignal([ctx]),
-        notify: (message) => sendNotice(ctx, message),
+        signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
+        notify: (message) => sendCommandNotice(ctx, message),
       });
 
+      if (!isSessionActive()) {
+        return;
+      }
       if (!output.result) {
-        await sendNotice(ctx, output.error ?? "review gate: reviewer failed");
+        await sendCommandNotice(ctx, output.error ?? "review gate: reviewer failed");
         return;
       }
 
       if (output.result.verdict === "error" && !hasUsableReviewerAnswer(output.reviewerResults)) {
         const failed = `review gate: ask-reviewer failed: ${output.result.summary} (${formatTokenUsage(output.result.usage)})`;
-        await sendNotice(ctx, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
+        await sendCommandNotice(ctx, output.bundleRetained ? `${failed}, bundle retained at ${output.bundleDir}` : failed);
         return;
       }
 
       const payload = formatReviewerAnswer(question, output.result, output.bundleRetained ? output.bundleDir : undefined);
       const submittedPayload = await showPrivateReviewerAnswer(ctx, payload);
+      if (!isSessionActive()) {
+        return;
+      }
       if (typeof submittedPayload === "string" && submittedPayload.trim()) {
         await sendUserPrompt(input.pi, submittedPayload.trim());
         return;
       }
       const cleared = `${formatTokenUsage(output.result.usage)}\nreview gate: reviewer answer cleared`;
-      await sendNotice(ctx, output.bundleRetained ? `${cleared}, bundle retained at ${output.bundleDir}` : cleared);
+      await sendCommandNotice(ctx, output.bundleRetained ? `${cleared}, bundle retained at ${output.bundleDir}` : cleared);
     },
   });
 }
@@ -198,6 +228,17 @@ function formatFindings(findings: ReviewFinding[]): string[] {
 
 function hasUsableReviewerAnswer(results: ReviewResult[] | undefined): boolean {
   return Boolean(results?.some((result) => result.verdict !== "error"));
+}
+
+function combineAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (activeSignals.length === 0) {
+    return undefined;
+  }
+  if (activeSignals.length === 1) {
+    return activeSignals[0];
+  }
+  return AbortSignal.any(activeSignals);
 }
 
 async function showPrivateReviewerAnswer(ctx: unknown, message: string): Promise<string | undefined> {

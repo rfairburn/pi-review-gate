@@ -42,6 +42,17 @@ export async function activate(pi: unknown): Promise<void> {
 
   const state = createState();
   let currentCwd = process.cwd();
+  let sessionActive = true;
+  let activeReviewAbort: ReviewAbortHandle | undefined;
+  const sessionAbortController = new AbortController();
+
+  registerHook(pi, "session_shutdown", () => {
+    sessionActive = false;
+    sessionAbortController.abort();
+    activeReviewAbort?.shutdown();
+    activeReviewAbort = undefined;
+    discardSessionState(state);
+  });
 
   registerHook(pi, "session_start", async (...args) => {
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
@@ -133,7 +144,9 @@ export async function activate(pi: unknown): Promise<void> {
       signal,
       noticeTarget,
       state,
+      isSessionActive: () => sessionActive,
     });
+    activeReviewAbort = reviewAbort;
     let output: ReviewRunOutput;
     try {
       output = await runReview({
@@ -144,33 +157,49 @@ export async function activate(pi: unknown): Promise<void> {
         evidence: window.evidence,
         actingUsage,
         signal: reviewAbort.signal,
-        notify: (message) => sendNotice(noticeTarget, message),
+        notify: (message) => sendNoticeWhileSessionActive(noticeTarget, message, () => sessionActive),
       });
     } catch (error) {
+      if (!sessionActive) {
+        return;
+      }
       pauseReviewWindow(state, "paused");
-      await releaseQueuedUserInputs(pi, state);
+      await releaseQueuedUserInputs(pi, state, () => sessionActive);
       throw error;
     } finally {
       reviewAbort.cleanup();
+      if (activeReviewAbort === reviewAbort) {
+        activeReviewAbort = undefined;
+      }
+    }
+
+    if (!sessionActive) {
+      return;
     }
 
     if (!output.changed) {
       closeReviewWindow(state, true);
-      await releaseQueuedUserInputs(pi, state);
+      await releaseQueuedUserInputs(pi, state, () => sessionActive);
       return;
     }
 
     if (output.result?.error === "aborted") {
-      reviewAbort.notifyCancellation();
+      if (reviewAbort.getReason() === "escape") {
+        await reviewAbort.notifyCancellation();
+      }
       state.reviewInProgress = false;
       state.queuedUserInputsDuringReview.splice(0);
       return;
     }
 
     if (output.result?.verdict === "pass") {
-      await sendNotice(noticeTarget, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
+      await sendNoticeWhileSessionActive(
+        noticeTarget,
+        withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output),
+        () => sessionActive,
+      );
       closeReviewWindow(state, true);
-      await releaseQueuedUserInputs(pi, state);
+      await releaseQueuedUserInputs(pi, state, () => sessionActive);
       return;
     }
 
@@ -187,7 +216,7 @@ export async function activate(pi: unknown): Promise<void> {
           disposition: "reported_only",
           followUpMessage: output.followUpMessage,
         });
-        await sendNotice(
+        await sendNoticeWhileSessionActive(
           noticeTarget,
           [
             `review gate: repeated changes requested with no new correction evidence (${formatTokenUsage(output.result.usage)})`,
@@ -197,9 +226,10 @@ export async function activate(pi: unknown): Promise<void> {
             "",
             output.followUpMessage,
           ].join("\n"),
+          () => sessionActive,
         );
         pauseReviewWindow(state, "paused");
-        await releaseQueuedUserInputs(pi, state);
+        await releaseQueuedUserInputs(pi, state, () => sessionActive);
         return;
       }
 
@@ -217,7 +247,7 @@ export async function activate(pi: unknown): Promise<void> {
           followUpMessage: output.followUpMessage,
         });
         pauseReviewWindow(state, "paused_at_cap");
-        await sendNotice(
+        await sendNoticeWhileSessionActive(
           noticeTarget,
           [
             `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`,
@@ -227,8 +257,9 @@ export async function activate(pi: unknown): Promise<void> {
             "",
             output.followUpMessage,
           ].join("\n"),
+          () => sessionActive,
         );
-        await releaseQueuedUserInputs(pi, state);
+        await releaseQueuedUserInputs(pi, state, () => sessionActive);
         return;
       }
       window.lastCappedFollowUp = undefined;
@@ -239,9 +270,15 @@ export async function activate(pi: unknown): Promise<void> {
         disposition: "sent_for_correction",
         followUpMessage: output.followUpMessage,
       });
-      await sendNotice(noticeTarget, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
-      await sendFollowUp(pi, output.followUpMessage);
-      await releaseQueuedUserInputs(pi, state);
+      await sendNoticeWhileSessionActive(
+        noticeTarget,
+        withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output),
+        () => sessionActive,
+      );
+      if (sessionActive) {
+        await sendFollowUp(pi, output.followUpMessage);
+      }
+      await releaseQueuedUserInputs(pi, state, () => sessionActive);
       return;
     }
 
@@ -253,9 +290,9 @@ export async function activate(pi: unknown): Promise<void> {
         disposition: "reported_only",
       });
     }
-    await sendNotice(noticeTarget, withReviewDetails(failed, output));
+    await sendNoticeWhileSessionActive(noticeTarget, withReviewDetails(failed, output), () => sessionActive);
     pauseReviewWindow(state, "paused");
-    await releaseQueuedUserInputs(pi, state);
+    await releaseQueuedUserInputs(pi, state, () => sessionActive);
   });
 
   registerCommands({
@@ -263,6 +300,8 @@ export async function activate(pi: unknown): Promise<void> {
     cwd: () => currentCwd,
     config,
     state,
+    isSessionActive: () => sessionActive,
+    sessionSignal: sessionAbortController.signal,
   });
 }
 
@@ -285,58 +324,111 @@ function isToolError(value: unknown): boolean {
   return typeof value === "object" && value !== null && "isError" in value && Boolean((value as { isError?: unknown }).isError);
 }
 
-async function releaseQueuedUserInputs(pi: unknown, state: ReviewGateState): Promise<void> {
+async function releaseQueuedUserInputs(
+  pi: unknown,
+  state: ReviewGateState,
+  isSessionActive: () => boolean,
+): Promise<void> {
   state.reviewInProgress = false;
   const queuedInputs = state.queuedUserInputsDuringReview.splice(0);
   for (const input of queuedInputs) {
+    if (!isSessionActive()) {
+      return;
+    }
     rememberUserRequest(state, input);
     await sendFollowUp(pi, input);
   }
+}
+
+type ReviewAbortReason = "parent" | "escape" | "session_shutdown";
+
+interface ReviewAbortHandle {
+  signal: AbortSignal;
+  cleanup: () => void;
+  getReason: () => ReviewAbortReason | undefined;
+  notifyCancellation: () => Promise<void>;
+  shutdown: () => void;
 }
 
 function createReviewAbortController(input: {
   signal: AbortSignal | undefined;
   noticeTarget: unknown;
   state: ReviewGateState;
-}): { signal: AbortSignal; cleanup: () => void; notifyCancellation: () => void } {
+  isSessionActive: () => boolean;
+}): ReviewAbortHandle {
   const controller = new AbortController();
-  let cancellationNoticeSent = false;
+  let abortReason: ReviewAbortReason | undefined;
+  let cancellationNotice: Promise<void> | undefined;
+  let cleanedUp = false;
 
-  const abortReview = () => {
+  const abortReview = (reason: ReviewAbortReason) => {
     if (!controller.signal.aborted) {
+      abortReason = reason;
       controller.abort();
     }
   };
   const notifyCancellation = () => {
-    if (cancellationNoticeSent) {
-      return;
+    if (!input.isSessionActive()) {
+      return Promise.resolve();
     }
-    cancellationNoticeSent = true;
-    void sendNotice(input.noticeTarget, "review gate: review cancelled");
+    if (!cancellationNotice) {
+      cancellationNotice = sendNotice(input.noticeTarget, "review gate: review cancelled").catch(() => undefined);
+    }
+    return cancellationNotice;
   };
+  const abortFromParent = () => abortReview("parent");
 
   if (input.signal?.aborted) {
-    abortReview();
+    abortFromParent();
   }
-  input.signal?.addEventListener("abort", abortReview, { once: true });
+  input.signal?.addEventListener("abort", abortFromParent, { once: true });
 
   const unsubscribeTerminalInput = onTerminalInput(input.noticeTarget, (terminalInput) => {
     if (!input.state.reviewInProgress || !isEscapeTerminalInput(terminalInput)) {
       return undefined;
     }
-    abortReview();
-    notifyCancellation();
+    abortReview("escape");
+    void notifyCancellation();
     return { action: "handled", consume: true };
   });
 
+  const cleanup = () => {
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+    input.signal?.removeEventListener("abort", abortFromParent);
+    unsubscribeTerminalInput?.();
+  };
+
   return {
     signal: controller.signal,
-    cleanup: () => {
-      input.signal?.removeEventListener("abort", abortReview);
-      unsubscribeTerminalInput?.();
-    },
+    cleanup,
+    getReason: () => abortReason,
     notifyCancellation,
+    shutdown: () => {
+      abortReview("session_shutdown");
+      cleanup();
+    },
   };
+}
+
+async function sendNoticeWhileSessionActive(
+  target: unknown,
+  message: string,
+  isSessionActive: () => boolean,
+): Promise<void> {
+  if (!isSessionActive()) {
+    return;
+  }
+  await sendNotice(target, message);
+}
+
+function discardSessionState(state: ReviewGateState): void {
+  state.reviewInProgress = false;
+  state.queuedUserInputsDuringReview.splice(0);
+  state.reviewWindow = undefined;
+  state.lastQuestionWindow = undefined;
 }
 
 function isEscapeTerminalInput(input: unknown): boolean {

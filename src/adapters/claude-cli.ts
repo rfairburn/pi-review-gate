@@ -21,7 +21,6 @@ export class ClaudeCliAdapter implements ModelAdapter {
       "json",
       ...(this.config.model ? ["--model", this.config.model] : []),
       ...(this.config.args ?? []),
-      "--no-session-persistence",
       "--permission-mode",
       "dontAsk",
       "--tools",

@@ -93,6 +93,12 @@ export function closeReviewWindow(state: ReviewGateState, preserveForReviewerQue
   state.reviewWindow = undefined;
 }
 
+export function clearReviewState(state: ReviewGateState): void {
+  state.reviewWindow = undefined;
+  state.lastQuestionWindow = undefined;
+  state.queuedUserInputsDuringReview.splice(0);
+}
+
 export function getReviewerQuestionWindow(state: ReviewGateState): ReviewWindow | undefined {
   return state.reviewWindow ?? state.lastQuestionWindow;
 }

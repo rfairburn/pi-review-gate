@@ -55,6 +55,30 @@ test("runReview returns a follow-up message for blocking findings", async () => 
   }
 });
 
+test("runReview removes its bundle when retainBundles is never", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-no-retain-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: baseConfig,
+    });
+
+    assert.equal(output.bundleRetained, false);
+    await assert.rejects(access(output.bundleDir ?? ""), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("runReview skips reviewer when no files changed", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-empty-"));
   try {

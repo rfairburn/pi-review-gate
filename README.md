@@ -142,6 +142,11 @@ The wrapper flag also accepts explicit modes:
 --retain-review-bundles=always
 ```
 
+Built-in Codex, Claude, and little-coder reviewers currently retain their own
+CLI sessions. This is independent of `retainBundles`, which controls only the
+temporary review bundle. A future configuration option is planned for disabling
+reviewer-session persistence when an ephemeral review is preferred.
+
 ## Temporary fake reviewer
 
 For local wiring tests, use the fake reviewer wrapper:
@@ -181,6 +186,16 @@ discards that retained question context, and does not re-review changes that
 already passed.
 
 ## Commands
+
+`/review-clear` discards the active or retained review window, including its
+baseline, request history, captured evidence, prior reviewer feedback, held
+correction feedback, and queued user input. The next ordinary prompt starts a
+fresh window from the workspace's current contents. It does not revert files or
+override bundle retention: bundles continue to be retained or removed by the
+configured `retainBundles` policy (`never`, `on-failure`, or `always`).
+Already-retained bundles and reviewer CLI sessions are not deleted by
+`/review-clear`. If a review is currently running, cancel it first and then run
+`/review-clear`.
 
 `/review-now` reruns the configured reviewer or reviewers against the active
 review window's baseline and evidence. A pass checkpoints and closes that

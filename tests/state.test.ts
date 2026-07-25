@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   beginAgentRun,
   buildRequestContext,
+  clearReviewState,
   closeReviewWindow,
   createState,
   getReviewerQuestionWindow,
@@ -86,6 +87,39 @@ test("closing a passed review window makes the next request start a fresh window
   assert.deepEqual(second.requestHistory.map((item) => item.text), ["second task"]);
   assert.equal(second.evidence.events.length, 0);
   assert.equal(second.baseline, undefined);
+});
+
+test("clearReviewState discards every review context and queued input", () => {
+  const state = createState();
+  rememberUserRequest(state, "old task");
+  const oldWindow = state.reviewWindow!;
+  oldWindow.lastCappedFollowUp = "old held feedback";
+  oldWindow.correctionCycles = 2;
+  oldWindow.evidence.events.push({
+    sequence: 1,
+    phase: "tool_call",
+    toolName: "edit",
+    summary: "old evidence",
+    candidatePaths: ["old.ts"],
+    riskSignals: [],
+  });
+  state.lastQuestionWindow = oldWindow;
+  state.queuedUserInputsDuringReview.push("old queued input");
+
+  clearReviewState(state);
+
+  assert.equal(state.reviewWindow, undefined);
+  assert.equal(state.lastQuestionWindow, undefined);
+  assert.deepEqual(state.queuedUserInputsDuringReview, []);
+
+  rememberUserRequest(state, "fresh task");
+  const freshWindow = state.reviewWindow!;
+  assert.notEqual(freshWindow.id, oldWindow.id);
+  assert.deepEqual(freshWindow.requestHistory.map((item) => item.text), ["fresh task"]);
+  assert.equal(freshWindow.baseline, undefined);
+  assert.equal(freshWindow.evidence.events.length, 0);
+  assert.equal(freshWindow.reviewHistory.length, 0);
+  assert.equal(freshWindow.correctionCycles, 0);
 });
 
 test("a passed window remains available only until the next regular request", () => {

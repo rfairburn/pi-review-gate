@@ -45,12 +45,13 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
     assert.equal(argv[argv.indexOf("--sandbox") + 1], "read-only");
     assert.deepEqual(argv.includes("--add-dir"), true);
     assert.equal(argv[argv.indexOf("--add-dir") + 1], dir);
+    assert.equal(argv.includes("--ephemeral"), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("ClaudeCliAdapter limits reviewers to read-only tools and review bundle access", async () => {
+test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, and retains its session", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-claude-adapter-"));
   try {
     const argvPath = join(dir, "argv.json");
@@ -87,6 +88,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools and review bundle acc
     assert.deepEqual(argv.includes("--add-dir"), true);
     assert.equal(argv[argv.indexOf("--add-dir") + 1], dir);
     assert.deepEqual(argv.includes("--append-system-prompt"), true);
+    assert.equal(argv.includes("--no-session-persistence"), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

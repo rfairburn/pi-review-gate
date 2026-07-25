@@ -43,6 +43,7 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
     assert.deepEqual(argv.includes("--tools"), true);
     assert.deepEqual(argv.includes("read,grep,find,ls"), true);
     assert.deepEqual(argv.includes("--system-prompt"), true);
+    assert.equal(argv.includes("--no-session"), false);
     assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, false);
   } finally {
     await rm(dir, { recursive: true, force: true });

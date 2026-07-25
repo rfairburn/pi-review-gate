@@ -1,12 +1,87 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
-import { createState, recordReviewerFeedback, rememberUserRequest } from "../src/state";
+import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest } from "../src/state";
+
+test("/review-clear starts the next prompt fresh without deleting retained review artifacts", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-clear-"));
+  try {
+    const retainedBundleMarker = join(dir, "retained-review-bundle.txt");
+    await writeFile(retainedBundleMarker, "keep me", "utf8");
+    await writeFile(join(dir, "index.ts"), "current workspace\n", "utf8");
+
+    const state = createState();
+    rememberUserRequest(state, "old task");
+    const oldWindow = state.reviewWindow!;
+    oldWindow.baseline = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: 1_048_576,
+      maxSnapshotBytes: 52_428_800,
+    });
+    oldWindow.lastCappedFollowUp = "old held feedback";
+    oldWindow.correctionCycles = 2;
+    oldWindow.evidence.events.push({
+      sequence: 1,
+      phase: "tool_call",
+      toolName: "edit",
+      summary: "old evidence",
+      candidatePaths: ["index.ts"],
+      riskSignals: [],
+    });
+    state.queuedUserInputsDuringReview.push("old queued input");
+
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const notices: string[] = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+    };
+    const ctx = {
+      notify(message: string) {
+        notices.push(message);
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: { ...reviewConfig(), retainBundles: "always" },
+      state,
+    });
+
+    state.reviewInProgress = true;
+    await commands.get("review-clear")?.("", ctx);
+    assert.equal(state.reviewWindow, oldWindow);
+    assert.match(notices.at(-1) ?? "", /cannot clear while a review is in progress/);
+
+    state.reviewInProgress = false;
+    await commands.get("review-clear")?.("", ctx);
+
+    assert.equal(state.reviewWindow, undefined);
+    assert.equal(state.lastQuestionWindow, undefined);
+    assert.deepEqual(state.queuedUserInputsDuringReview, []);
+    assert.equal(await readFile(retainedBundleMarker, "utf8"), "keep me");
+    assert.match(notices.at(-1) ?? "", /next prompt will start fresh from the current workspace/);
+    assert.match(notices.at(-1) ?? "", /bundle retention remains governed by retainBundles=always/);
+    assert.match(notices.at(-1) ?? "", /reviewer sessions were not deleted/);
+
+    rememberUserRequest(state, "fresh task");
+    const freshWindow = getReviewerQuestionWindow(state)!;
+    assert.notEqual(freshWindow.id, oldWindow.id);
+    assert.deepEqual(freshWindow.requestHistory.map((item) => item.text), ["fresh task"]);
+    assert.equal(freshWindow.baseline, undefined);
+    assert.equal(freshWindow.evidence.events.length, 0);
+    assert.equal(freshWindow.reviewHistory.length, 0);
+    assert.equal(freshWindow.correctionCycles, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("/review-now requested changes reset the automatic correction budget", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-"));

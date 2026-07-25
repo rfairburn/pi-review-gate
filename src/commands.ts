@@ -1,6 +1,7 @@
 import type { ReviewGateConfig } from "./config";
 import {
   buildRequestContext,
+  clearReviewState,
   closeReviewWindow,
   getReviewerQuestionWindow,
   markCappedFeedbackSent,
@@ -40,6 +41,24 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const reviewers = input.config.reviewers?.map((reviewer) => reviewer.id).join(", ") ?? input.config.decider?.id ?? "none";
       await sendCommandNotice(ctx, `review gate: loaded; mode=${input.config.mode}; reviewers=${reviewers}`);
+    },
+  });
+
+  registerCommand("review-clear", {
+    description: "Clear review-gate context so the next prompt starts a fresh review window.",
+    handler: async (_args: string, ctx: unknown) => {
+      if (!isSessionActive()) {
+        return;
+      }
+      if (input.state.reviewInProgress) {
+        await sendCommandNotice(ctx, "review gate: cannot clear while a review is in progress; cancel the review first, then retry /review-clear");
+        return;
+      }
+      clearReviewState(input.state);
+      await sendCommandNotice(
+        ctx,
+        `review gate: cleared; the next prompt will start fresh from the current workspace; bundle retention remains governed by retainBundles=${input.config.retainBundles}; reviewer sessions were not deleted`,
+      );
     },
   });
 

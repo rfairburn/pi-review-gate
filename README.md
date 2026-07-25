@@ -175,8 +175,10 @@ Repository baselines, pre-captured outside-file baselines, user guidance,
 tool evidence, assistant summaries, and reviewer feedback belong to one review
 window. A requested correction keeps that window open so the next reviewer sees
 the original baseline and all intervening context. A passing review checkpoints
-and closes the window; later work starts from current file contents and does not
-re-review changes that already passed.
+and closes the window, while retaining it for an immediate `/ask-reviewer`
+follow-up. Later ordinary work starts a fresh window from current file contents,
+discards that retained question context, and does not re-review changes that
+already passed.
 
 ## Commands
 
@@ -199,9 +201,11 @@ after it in the same order you typed it.
 question about the current work. It includes the current request context,
 changed files and patch when available, and the session evidence digest, including
 read-only/tool-call activity and the primary agent's final summary. This makes it
-useful after planning-only turns as well as after edits. At the automatic
-correction cap it also includes the prior reviewer result and the held correction
-message from the same unresolved review window.
+useful after planning-only turns as well as after edits. Immediately after a
+passing review, it can still use that passed window's patch and evidence; a
+regular prompt starts a fresh window instead. At the automatic correction cap it
+also includes the prior reviewer result and the held correction message from the
+same unresolved review window.
 
 Reviewer answers open in an editable prompt. Press Enter to submit the reviewer
 note to the primary model as your next message, edit it first if needed, or press

@@ -723,7 +723,7 @@ test("normal user input after cap continues the unresolved review window with co
   }
 });
 
-test("a passed outside-file change is checkpointed out of the next review window", async () => {
+test("a passed review remains available to /ask-reviewer but is checkpointed out of the next regular window", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-window-checkpoint-"));
   const outside = join(tmpdir(), `pi-review-gate-outside-review-${process.pid}-${Date.now()}.md`);
   const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
@@ -759,11 +759,14 @@ test("a passed outside-file change is checkpointed out of the next review window
             "let input='';",
             "process.stdin.on('data',chunk=>input+=chunk);",
             "process.stdin.on('end',()=>{",
+            "const firstContext=input.includes(outside)&&input.includes('old review document')&&input.includes('rewritten review document')&&input.includes('first Docker task');",
             "const ok=count===0",
-            "?input.includes(outside)&&input.includes('old review document')&&input.includes('rewritten review document')&&input.includes('first Docker task')",
+            "?firstContext",
+            ":count===1",
+            "?firstContext&&input.includes('Reviewer question:')&&input.includes('what changed outside the workspace?')&&input.includes('-FROM alpine:3.19')&&input.includes('+FROM alpine:3.20')",
             ":!input.includes(outside)&&!input.includes('old review document')&&!input.includes('rewritten review document')&&!input.includes('first Docker task')&&input.includes('second Docker task')&&input.includes('+FROM alpine:3.21');",
             "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:count===0?'first window complete':'second window isolated',findings:[]}",
+            "?{verdict:'pass',summary:count===0?'first window complete':count===1?'passed context retained for question':'second window isolated',findings:[]}",
             ":{verdict:'needs_changes',summary:'review windows mixed',findings:[{severity:'blocking',file:'session',line:null,issue:'a review used changes or context from the wrong window',recommendation:'checkpoint passed changes and open an isolated window'}]}));",
             "});",
           ].join(""),
@@ -776,10 +779,15 @@ test("a passed outside-file change is checkpointed out of the next review window
     delete process.env.PI_REVIEW_GATE_DISABLED;
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const notices: string[] = [];
+    const editorViews: Array<{ title: string; prefill: string }> = [];
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
       },
       notify(message: string) {
         notices.push(message);
@@ -798,6 +806,18 @@ test("a passed outside-file change is checkpointed out of the next review window
       messages: [{ role: "assistant", content: "finished first Docker task and review document" }],
     });
 
+    await commands.get("ask-reviewer")?.("what changed outside the workspace?", {
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        async editor(title: string, prefill: string) {
+          editorViews.push({ title, prefill });
+          return undefined;
+        },
+      },
+    });
+
     await trigger(hooks, "input", { cwd: dir, text: "second Docker task", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.21\n", "utf8");
@@ -807,6 +827,7 @@ test("a passed outside-file change is checkpointed out of the next review window
     });
 
     assert.equal(notices.filter((notice) => /review gate: passed/.test(notice)).length, 2);
+    assert.match(editorViews[0]?.prefill ?? "", /passed context retained for question/);
     assert.doesNotMatch(notices.join("\n"), /review windows mixed/);
   } finally {
     if (previousConfig === undefined) {

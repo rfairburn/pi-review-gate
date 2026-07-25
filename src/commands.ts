@@ -60,7 +60,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       if (output.result?.verdict === "pass") {
         await sendNotice(ctx, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
-        closeReviewWindow(input.state);
+        closeReviewWindow(input.state, true);
       } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
         await sendNotice(ctx, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
         window.correctionCycles = 0;
@@ -116,13 +116,12 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
 
       await sendNotice(ctx, `review gate: asking reviewer\n\nQuestion: ${question}`);
-      const activeWindow = input.state.reviewWindow;
       const contextWindow = getReviewerQuestionWindow(input.state);
       const output = await runAskReviewer({
         cwd: input.cwd(),
         question,
         request: buildRequestContext(input.state, contextWindow),
-        before: activeWindow?.baseline,
+        before: contextWindow?.baseline,
         config: input.config,
         evidence: contextWindow?.evidence,
         signal: extractSignal([ctx]),

@@ -169,7 +169,7 @@ export async function activate(pi: unknown): Promise<void> {
 
     if (output.result?.verdict === "pass") {
       await sendNotice(noticeTarget, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
-      closeReviewWindow(state);
+      closeReviewWindow(state, true);
       await releaseQueuedUserInputs(pi, state);
       return;
     }

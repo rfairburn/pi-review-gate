@@ -174,6 +174,7 @@ export function buildRequestContext(state: ReviewGateState, window = state.revie
 }
 
 function openReviewWindow(state: ReviewGateState): ReviewWindow {
+  state.lastQuestionWindow = undefined;
   const window: ReviewWindow = {
     id: state.nextReviewWindowId++,
     startedAt: new Date().toISOString(),

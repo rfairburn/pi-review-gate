@@ -149,6 +149,66 @@ test("a passing /review-now checkpoints and closes its review window", async () 
   }
 });
 
+test("/ask-reviewer retains a passing review's patch and evidence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-pass-ask-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "change index");
+    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: 1_048_576,
+      maxSnapshotBytes: 52_428_800,
+    });
+    state.reviewWindow!.evidence.events.push({
+      sequence: 1,
+      phase: "tool_call",
+      toolName: "edit",
+      summary: "passed-review-tool-evidence",
+      candidatePaths: ["index.ts"],
+      riskSignals: [],
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const notices: string[] = [];
+    const editorViews: Array<{ title: string; prefill: string }> = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        async editor(title: string, prefill: string) {
+          editorViews.push({ title, prefill });
+          return undefined;
+        },
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: passingReviewWithQuestionCheckConfig(),
+      state,
+    });
+
+    await commands.get("review-now")?.("", ctx);
+    assert.equal(state.reviewWindow, undefined);
+    assert.match(notices.join("\n"), /review gate: passed/);
+
+    await commands.get("ask-reviewer")?.("what supports the passed change?", ctx);
+
+    assert.equal(editorViews.length, 1);
+    assert.match(editorViews[0]?.prefill ?? "", /retained passed patch and evidence/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("/review-continue sends capped feedback and resets the correction budget", async () => {
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
   const followUps: string[] = [];
@@ -436,6 +496,39 @@ function passingReviewConfig(): ReviewGateConfig {
       args: [
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'approved',findings:[]})))",
+      ],
+      timeoutMs: 5000,
+    },
+  };
+}
+
+function passingReviewWithQuestionCheckConfig(): ReviewGateConfig {
+  return {
+    ...reviewConfig(),
+    decider: {
+      id: "prompt-checker",
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const asking=s.includes('Reviewer question:');",
+          "const complete=s.includes('what supports the passed change?')",
+          "&& s.includes('change index')",
+          "&& s.includes('passed-review-tool-evidence')",
+          "&& s.includes('-before')",
+          "&& s.includes('+after');",
+          "process.stdout.write(JSON.stringify(asking",
+          "?(complete",
+          "?{verdict:'pass',summary:'retained passed patch and evidence',findings:[]}",
+          ":{verdict:'needs_changes',summary:'lost passed review context',findings:[]})",
+          ":{verdict:'pass',summary:'approved',findings:[]}));",
+          "});",
+        ].join(""),
       ],
       timeoutMs: 5000,
     },

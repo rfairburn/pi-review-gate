@@ -88,6 +88,34 @@ test("closing a passed review window makes the next request start a fresh window
   assert.equal(second.baseline, undefined);
 });
 
+test("a passed window remains available only until the next regular request", () => {
+  const state = createState();
+  rememberUserRequest(state, "first task");
+  const passed = state.reviewWindow!;
+  passed.evidence.events.push({
+    sequence: 1,
+    phase: "tool_call",
+    toolName: "edit",
+    summary: "passed-window evidence",
+    candidatePaths: ["old.ts"],
+    riskSignals: [],
+  });
+
+  closeReviewWindow(state, true);
+
+  assert.equal(state.reviewWindow, undefined);
+  assert.equal(getReviewerQuestionWindow(state), passed);
+
+  rememberUserRequest(state, "second task");
+
+  const fresh = state.reviewWindow!;
+  assert.notEqual(fresh, passed);
+  assert.equal(getReviewerQuestionWindow(state), fresh);
+  assert.deepEqual(fresh.requestHistory.map((item) => item.text), ["second task"]);
+  assert.equal(fresh.evidence.events.length, 0);
+  assert.equal(state.lastQuestionWindow, undefined);
+});
+
 test("a no-change window can retain context for reviewer questions without remaining active", () => {
   const state = createState();
   rememberUserRequest(state, "inspect the project and propose a plan");

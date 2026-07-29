@@ -13,6 +13,14 @@ export interface EvidenceState {
   candidates: Map<string, EvidenceCandidate>;
   finalAssistantSummary?: string;
   finalAssistantSummaries: string[];
+  acceptedReviewerQuestions: AcceptedReviewerQuestion[];
+}
+
+export interface AcceptedReviewerQuestion {
+  sequence: number;
+  question: string;
+  acceptedAnswer: string;
+  acceptedAt: string;
 }
 
 export interface EvidenceEvent {
@@ -45,6 +53,7 @@ export interface EvidenceBundle {
   }>;
   finalAssistantSummary?: string;
   finalAssistantSummaries: string[];
+  acceptedReviewerQuestions: AcceptedReviewerQuestion[];
   changedCandidatePaths: string[];
   markdown: string;
 }
@@ -55,7 +64,22 @@ export function createEvidenceState(): EvidenceState {
     events: [],
     candidates: new Map(),
     finalAssistantSummaries: [],
+    acceptedReviewerQuestions: [],
   };
+}
+
+export function recordAcceptedReviewerQuestion(
+  state: EvidenceState,
+  input: { question: string; acceptedAnswer: string; acceptedAt?: string },
+): AcceptedReviewerQuestion {
+  const entry: AcceptedReviewerQuestion = {
+    sequence: state.acceptedReviewerQuestions.length + 1,
+    question: input.question.trim(),
+    acceptedAnswer: input.acceptedAnswer.trim(),
+    acceptedAt: input.acceptedAt ?? new Date().toISOString(),
+  };
+  state.acceptedReviewerQuestions.push(entry);
+  return entry;
 }
 
 export async function recordToolCallEvidence(input: {
@@ -144,6 +168,7 @@ export function buildEvidenceBundle(state: EvidenceState, changedCandidatePaths:
     candidates,
     finalAssistantSummary: state.finalAssistantSummary,
     finalAssistantSummaries: state.finalAssistantSummaries,
+    acceptedReviewerQuestions: state.acceptedReviewerQuestions,
     changedCandidatePaths,
   };
 
@@ -377,6 +402,20 @@ function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): strin
     }
   } else if (bundle.finalAssistantSummary) {
     lines.push("### Agent final summary", "", bundle.finalAssistantSummary, "");
+  }
+
+  if (bundle.acceptedReviewerQuestions.length > 0) {
+    lines.push("### Accepted reviewer questions and answers", "");
+    for (const entry of bundle.acceptedReviewerQuestions) {
+      lines.push(
+        `#### Accepted reviewer answer ${entry.sequence}`,
+        "",
+        `Question: ${entry.question}`,
+        "",
+        entry.acceptedAnswer,
+        "",
+      );
+    }
   }
 
   if (bundle.candidates.length > 0) {

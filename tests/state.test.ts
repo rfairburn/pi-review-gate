@@ -7,8 +7,10 @@ import {
   closeReviewWindow,
   createState,
   getReviewerQuestionWindow,
+  getFailedCorrectionCount,
   markCappedFeedbackSent,
   pauseReviewWindow,
+  recordAcceptedReviewerQuestion,
   recordReviewerFeedback,
   rememberUserRequest,
   setReviewWindowBaseline,
@@ -227,4 +229,57 @@ test("beginAgentRun preserves the review-window baseline and evidence across con
   assert.equal(state.reviewWindow!.baseline!.files.size, 0);
   assert.equal(state.reviewWindow!.evidence.events.length, 1);
   assert.equal(state.reviewWindow!.evidence.events[0]?.summary, "edit before interrupt");
+});
+
+test("an accepted answer after a passed review seeds the next review window evidence", () => {
+  const state = createState();
+  rememberUserRequest(state, "first task");
+  const passed = state.reviewWindow!;
+  closeReviewWindow(state, true);
+
+  recordAcceptedReviewerQuestion(state, passed, {
+    question: "show the exact fix",
+    acceptedAnswer: "Apply:\n\n```diff\n-old\n+new\n```",
+  });
+
+  assert.equal(passed.evidence.acceptedReviewerQuestions.length, 1);
+  assert.equal(state.pendingAcceptedReviewerQuestions.length, 1);
+
+  beginAgentRun(state);
+
+  assert.notEqual(state.reviewWindow, passed);
+  assert.equal(state.reviewWindow!.evidence.acceptedReviewerQuestions.length, 1);
+  assert.match(
+    state.reviewWindow!.evidence.acceptedReviewerQuestions[0]?.acceptedAnswer ?? "",
+    /```diff/,
+  );
+  assert.equal(state.pendingAcceptedReviewerQuestions.length, 0);
+});
+
+test("failed correction count survives correction-cap budget resets", () => {
+  const state = createState();
+  rememberUserRequest(state, "fix it");
+  recordReviewerFeedback(state, {
+    source: "automatic",
+    disposition: "sent_for_correction",
+    result: {
+      reviewerId: "codex",
+      verdict: "needs_changes",
+      summary: "first correction",
+      findings: [],
+    },
+  });
+  recordReviewerFeedback(state, {
+    source: "automatic",
+    disposition: "held_then_sent",
+    result: {
+      reviewerId: "codex",
+      verdict: "needs_changes",
+      summary: "continued correction",
+      findings: [],
+    },
+  });
+  state.reviewWindow!.correctionCycles = 0;
+
+  assert.equal(getFailedCorrectionCount(state.reviewWindow), 2);
 });

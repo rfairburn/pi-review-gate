@@ -13,6 +13,18 @@ const REVIEW_CONTEXT_POLICY = `Review policy:
 - If you do not have tools, review from the supplied prompt and be explicit in your summary when the supplied context is insufficient for certainty.
 - Return "needs_changes" only when the primary agent can take a concrete follow-up action that could make a later review pass. If a finding is only a sentinel/status flag, acknowledgement, or other terminal note with no requested fix, return "pass" with a non_blocking finding instead of a blocking finding.`;
 
+function implementationGuidancePolicy(requireConcreteGuidance: boolean): string {
+  return `Response quality:
+- Put the direct conclusion in "summary".
+- Put actionable explanation in "guidance" as Markdown.
+- Include a concise fenced code snippet or minimal diff in "guidance" or a finding recommendation whenever it would materially help the primary model implement or correct the work.
+- Do not add decorative or redundant code when prose is sufficient.
+- Preserve exact identifiers, commands, and replacement text needed to act on the review.
+${requireConcreteGuidance
+    ? "- A prior correction attempt has not resolved the review window. For every substantive problem that remains, you MUST provide a concrete implementation example or minimal diff unless code would be inapplicable; in that case, provide exact actionable steps."
+    : "- Make the first response implementation-ready; do not defer useful concrete guidance to a later review."}`;
+}
+
 export function buildReviewerPrompt(input: {
   request: string;
   changes: ChangedFile[];
@@ -23,6 +35,7 @@ export function buildReviewerPrompt(input: {
   cwd: string;
   bundleDir?: string;
   evidenceMarkdown?: string;
+  requireConcreteGuidance?: boolean;
 }): string {
   const submittedChanges = input.submittedChanges ?? input.changes;
   const sideEffectChanges = input.sideEffectChanges ?? [];
@@ -34,6 +47,8 @@ export function buildReviewerPrompt(input: {
 Review the supplied user request context, submitted workspace patch, captured side-effect evidence, session evidence, and the current workspace. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the supplied context and read-only inspection are impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
 
 ${REVIEW_CONTEXT_POLICY}
+
+${implementationGuidancePolicy(input.requireConcreteGuidance ?? false)}
 
 Workspace:
 ${input.cwd}
@@ -74,7 +89,8 @@ ${input.evidenceMarkdown || "(no session evidence captured)"}
 Return JSON:
 {
   "verdict": "pass" | "needs_changes",
-  "summary": string,
+  "summary": "Direct conclusion.",
+  "guidance": "Markdown explanation and implementation guidance.",
   "findings": [
     {
       "severity": "blocking" | "non_blocking",
@@ -101,6 +117,7 @@ export function buildReviewerQuestionPrompt(input: {
   cwd: string;
   bundleDir?: string;
   evidenceMarkdown?: string;
+  requireConcreteGuidance?: boolean;
 }): string {
   const submittedChanges = input.submittedChanges ?? input.changes;
   const sideEffectChanges = input.sideEffectChanges ?? [];
@@ -112,6 +129,8 @@ export function buildReviewerQuestionPrompt(input: {
 Answer the user's reviewer question using the supplied context and read-only inspection of the current workspace when tools are available. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, session evidence, and any relevant files you inspect. Do not modify files, run shell commands, use network access, or include chain of thought. Return only valid JSON matching the schema.
 
 ${REVIEW_CONTEXT_POLICY}
+
+${implementationGuidancePolicy(input.requireConcreteGuidance ?? false)}
 
 Workspace:
 ${input.cwd}
@@ -157,7 +176,8 @@ ${input.evidenceMarkdown || "(no session evidence captured)"}
 Return JSON:
 {
   "verdict": "pass" | "needs_changes",
-  "summary": "Direct answer to the reviewer question.",
+  "summary": "Direct conclusion.",
+  "guidance": "Direct Markdown answer and implementation guidance.",
   "findings": [
     {
       "severity": "blocking" | "non_blocking",
@@ -178,10 +198,11 @@ Use "pass" when the answer does not require the primary model to change course. 
 export function buildFollowUpMessage(result: ReviewResult): string {
   const blocking = result.findings.filter((finding) => finding.severity === "blocking");
   const findings = blocking.length > 0 ? blocking : result.findings;
-  const lines = findings.map((finding, index) => `${index + 1}. ${formatFinding(finding)}`);
+  const lines = findings.map((finding, index) => `${index + 1}. ${formatFindingForFollowUp(finding)}`);
 
   return [
     "Review found blocking issues in your last changes.",
+    ...(result.guidance ? ["", "Implementation guidance:", result.guidance] : []),
     "",
     "Fix only these items:",
     ...lines,
@@ -208,6 +229,16 @@ function formatFinding(finding: ReviewFinding): string {
   const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
   const reviewer = finding.reviewerId ? `[${finding.reviewerId}] ` : "";
   return `${reviewer}${location} - ${finding.issue} ${finding.recommendation}`;
+}
+
+function formatFindingForFollowUp(finding: ReviewFinding): string {
+  const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
+  const reviewer = finding.reviewerId ? `[${finding.reviewerId}] ` : "";
+  return [
+    `${reviewer}${location}`,
+    `Issue: ${finding.issue}`,
+    `Recommendation: ${finding.recommendation}`,
+  ].join("\n");
 }
 
 function formatReviewerResult(result: ReviewResult): string {

@@ -171,7 +171,7 @@ test("/review-now notice shows non-blocking reviewer results in multi-reviewer r
 
     const noticeText = notices.join("\n");
     assert.equal(followUps.length, 1);
-    assert.match(followUps[0] ?? "", /\[blocking\] index\.ts - missing test add coverage/);
+    assert.match(followUps[0] ?? "", /\[blocking\] index\.ts\nIssue: missing test\nRecommendation: add coverage/);
     assert.doesNotMatch(followUps[0] ?? "", /claude found no blocking issues/);
     assert.match(noticeText, /Reviewer results:/);
     assert.match(noticeText, /- blocking: needs_changes, 1 blocking - fix required/);
@@ -407,6 +407,7 @@ test("/ask-reviewer at the correction cap receives the complete unresolved revie
 test("/ask-reviewer opens the reviewer answer in the editor when canceled", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-command-"));
   try {
+    const state = createState();
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const userMessages: string[] = [];
     const notices: string[] = [];
@@ -435,7 +436,7 @@ test("/ask-reviewer opens the reviewer answer in the editor when canceled", asyn
       pi,
       cwd: () => dir,
       config: askReviewerConfig(),
-      state: createState(),
+      state,
     });
 
     await commands.get("ask-reviewer")?.("does this plan look right?", ctx);
@@ -444,7 +445,10 @@ test("/ask-reviewer opens the reviewer answer in the editor when canceled", asyn
     assert.equal(editorViews[0]?.title, "review gate: reviewer answer");
     assert.match(editorViews[0]?.prefill ?? "", /Question: does this plan look right\?/);
     assert.match(editorViews[0]?.prefill ?? "", /Answer: reviewer answer ready/);
+    assert.match(editorViews[0]?.prefill ?? "", /```ts\nconst ready = true;\n```/);
     assert.match(notices.join("\n"), /reviewer answer cleared/);
+    assert.equal(state.reviewWindow, undefined);
+    assert.equal(state.pendingAcceptedReviewerQuestions.length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -453,6 +457,7 @@ test("/ask-reviewer opens the reviewer answer in the editor when canceled", asyn
 test("/ask-reviewer submits edited reviewer text when the editor is submitted", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-submit-"));
   try {
+    const state = createState();
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const userMessages: string[] = [];
     const pi = {
@@ -476,7 +481,7 @@ test("/ask-reviewer submits edited reviewer text when the editor is submitted", 
       pi,
       cwd: () => dir,
       config: askReviewerConfig(),
-      state: createState(),
+      state,
     });
 
     await commands.get("ask-reviewer")?.("should this be shared?", ctx);
@@ -485,6 +490,19 @@ test("/ask-reviewer submits edited reviewer text when the editor is submitted", 
     assert.match(userMessages[0] ?? "", /Reviewer note from \/ask-reviewer:/);
     assert.match(userMessages[0] ?? "", /Question: should this be shared\?/);
     assert.match(userMessages[0] ?? "", /Please act on this\./);
+    assert.equal(state.reviewWindow?.evidence.acceptedReviewerQuestions.length, 1);
+    assert.equal(
+      state.reviewWindow?.evidence.acceptedReviewerQuestions[0]?.question,
+      "should this be shared?",
+    );
+    assert.match(
+      state.reviewWindow?.evidence.acceptedReviewerQuestions[0]?.acceptedAnswer ?? "",
+      /Please act on this\./,
+    );
+    assert.match(
+      state.reviewWindow?.evidence.acceptedReviewerQuestions[0]?.acceptedAnswer ?? "",
+      /```ts\nconst ready = true;\n```/,
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -543,6 +561,7 @@ function reviewConfig(): ReviewGateConfig {
     enabled: true,
     mode: "single-decider",
     maxCorrectionCycles: 3,
+    implementationGuidanceAfterFailedCorrections: 1,
     reviewWhen: "changed-files",
     maxPatchBytes: 200_000,
     maxFileBytes: 1_048_576,
@@ -615,6 +634,7 @@ function multiReviewerReviewConfig(): ReviewGateConfig {
     enabled: true,
     mode: "single-decider",
     maxCorrectionCycles: 3,
+    implementationGuidanceAfterFailedCorrections: 1,
     reviewWhen: "changed-files",
     maxPatchBytes: 200_000,
     maxFileBytes: 1_048_576,
@@ -650,6 +670,7 @@ function askReviewerPartialErrorConfig(): ReviewGateConfig {
     enabled: true,
     mode: "single-decider",
     maxCorrectionCycles: 3,
+    implementationGuidanceAfterFailedCorrections: 1,
     reviewWhen: "changed-files",
     maxPatchBytes: 200_000,
     maxFileBytes: 1_048_576,
@@ -685,6 +706,7 @@ function cappedWindowAskReviewerConfig(): ReviewGateConfig {
     enabled: true,
     mode: "single-decider",
     maxCorrectionCycles: 0,
+    implementationGuidanceAfterFailedCorrections: 1,
     reviewWhen: "changed-files",
     maxPatchBytes: 200_000,
     maxFileBytes: 1_048_576,
@@ -725,6 +747,7 @@ function askReviewerConfig(): ReviewGateConfig {
     enabled: true,
     mode: "single-decider",
     maxCorrectionCycles: 3,
+    implementationGuidanceAfterFailedCorrections: 1,
     reviewWhen: "changed-files",
     maxPatchBytes: 200_000,
     maxFileBytes: 1_048_576,
@@ -743,7 +766,7 @@ function askReviewerConfig(): ReviewGateConfig {
           "process.stdin.on('end',()=>{",
           "const ok=s.includes('Reviewer question:')&&(s.includes('does this plan look right?')||s.includes('should this be shared?'));",
           "process.stdout.write(JSON.stringify(ok",
-          "?{verdict:'pass',summary:'reviewer answer ready',findings:[]}",
+          "?{verdict:'pass',summary:'reviewer answer ready',guidance:'Use this when helpful:\\n\\n```ts\\nconst ready = true;\\n```',findings:[]}",
           ":{verdict:'needs_changes',summary:'question text was not passed through',findings:[]}));",
           "});",
         ].join(""),

@@ -1,6 +1,11 @@
 import type { WorkspaceSnapshot } from "./capture";
 import type { CorrectionFeedbackMarker } from "./correction-feedback";
-import { createEvidenceState, type EvidenceState } from "./evidence";
+import {
+  createEvidenceState,
+  recordAcceptedReviewerQuestion as recordAcceptedQuestionEvidence,
+  type AcceptedReviewerQuestion,
+  type EvidenceState,
+} from "./evidence";
 import type { ReviewFinding, ReviewResult } from "./schema";
 
 export type ReviewWindowStatus = "pending" | "active" | "paused_at_cap" | "paused";
@@ -25,6 +30,7 @@ export interface ReviewGateState {
   nextReviewWindowId: number;
   reviewWindow?: ReviewWindow;
   lastQuestionWindow?: ReviewWindow;
+  pendingAcceptedReviewerQuestions: AcceptedReviewerQuestion[];
   reviewInProgress: boolean;
   queuedUserInputsDuringReview: string[];
 }
@@ -48,6 +54,7 @@ export interface ReviewFeedbackContext {
 export function createState(): ReviewGateState {
   return {
     nextReviewWindowId: 1,
+    pendingAcceptedReviewerQuestions: [],
     reviewInProgress: false,
     queuedUserInputsDuringReview: [],
   };
@@ -96,11 +103,30 @@ export function closeReviewWindow(state: ReviewGateState, preserveForReviewerQue
 export function clearReviewState(state: ReviewGateState): void {
   state.reviewWindow = undefined;
   state.lastQuestionWindow = undefined;
+  state.pendingAcceptedReviewerQuestions.splice(0);
   state.queuedUserInputsDuringReview.splice(0);
 }
 
 export function getReviewerQuestionWindow(state: ReviewGateState): ReviewWindow | undefined {
   return state.reviewWindow ?? state.lastQuestionWindow;
+}
+
+export function getFailedCorrectionCount(window: ReviewWindow | undefined): number {
+  return window?.reviewHistory.filter((feedback) =>
+    feedback.disposition === "sent_for_correction" || feedback.disposition === "held_then_sent"
+  ).length ?? 0;
+}
+
+export function recordAcceptedReviewerQuestion(
+  state: ReviewGateState,
+  contextWindow: ReviewWindow | undefined,
+  input: { question: string; acceptedAnswer: string },
+): void {
+  const window = contextWindow ?? state.reviewWindow ?? openReviewWindow(state);
+  recordAcceptedQuestionEvidence(window.evidence, input);
+  if (!state.reviewWindow && window === state.lastQuestionWindow) {
+    state.pendingAcceptedReviewerQuestions = window.evidence.acceptedReviewerQuestions.map((entry) => ({ ...entry }));
+  }
 }
 
 export function pauseReviewWindow(state: ReviewGateState, status: "paused_at_cap" | "paused"): void {
@@ -180,7 +206,13 @@ export function buildRequestContext(state: ReviewGateState, window = state.revie
 }
 
 function openReviewWindow(state: ReviewGateState): ReviewWindow {
+  const carriedQuestions = state.pendingAcceptedReviewerQuestions.splice(0);
   state.lastQuestionWindow = undefined;
+  const evidence = createEvidenceState();
+  evidence.acceptedReviewerQuestions.push(...carriedQuestions.map((entry, index) => ({
+    ...entry,
+    sequence: index + 1,
+  })));
   const window: ReviewWindow = {
     id: state.nextReviewWindowId++,
     startedAt: new Date().toISOString(),
@@ -188,7 +220,7 @@ function openReviewWindow(state: ReviewGateState): ReviewWindow {
     latestRequest: "",
     requestHistory: [],
     correctionCycles: 0,
-    evidence: createEvidenceState(),
+    evidence,
     reviewHistory: [],
   };
   state.reviewWindow = window;

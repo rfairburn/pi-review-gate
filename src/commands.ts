@@ -3,9 +3,11 @@ import {
   buildRequestContext,
   clearReviewState,
   closeReviewWindow,
+  getFailedCorrectionCount,
   getReviewerQuestionWindow,
   markCappedFeedbackSent,
   pauseReviewWindow,
+  recordAcceptedReviewerQuestion,
   recordReviewerFeedback,
   type ReviewGateState,
 } from "./state";
@@ -79,6 +81,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         before: window.baseline,
         config: input.config,
         evidence: window.evidence,
+        failedCorrectionCount: getFailedCorrectionCount(window),
         signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
         notify: (message) => sendCommandNotice(ctx, message),
       });
@@ -167,6 +170,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         before: contextWindow?.baseline,
         config: input.config,
         evidence: contextWindow?.evidence,
+        failedCorrectionCount: getFailedCorrectionCount(contextWindow),
         signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
         notify: (message) => sendCommandNotice(ctx, message),
       });
@@ -191,7 +195,12 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       if (typeof submittedPayload === "string" && submittedPayload.trim()) {
-        await sendUserPrompt(input.pi, submittedPayload.trim());
+        const acceptedAnswer = submittedPayload.trim();
+        recordAcceptedReviewerQuestion(input.state, contextWindow, {
+          question,
+          acceptedAnswer,
+        });
+        await sendUserPrompt(input.pi, acceptedAnswer);
         return;
       }
       const cleared = `${formatTokenUsage(output.result.usage)}\nreview gate: reviewer answer cleared`;
@@ -228,6 +237,9 @@ function formatReviewerAnswer(question: string, result: ReviewResult, bundleDir?
     "",
     `Answer: ${result.summary}`,
   ];
+  if (result.guidance) {
+    lines.push("", "Implementation guidance:", result.guidance);
+  }
   if (bundleDir) {
     lines.push("", `Retained review bundle: ${bundleDir}`);
   }
@@ -241,7 +253,11 @@ function formatReviewerAnswer(question: string, result: ReviewResult, bundleDir?
 function formatFindings(findings: ReviewFinding[]): string[] {
   return findings.map((finding, index) => {
     const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
-    return `${index + 1}. ${location} - ${finding.issue} ${finding.recommendation}`;
+    return [
+      `${index + 1}. ${location}`,
+      `Issue: ${finding.issue}`,
+      `Recommendation: ${finding.recommendation}`,
+    ].join("\n");
   });
 }
 

@@ -17,6 +17,7 @@ export interface ReviewResult {
   reviewerId: string;
   verdict: ReviewVerdict;
   summary: string;
+  guidance?: string;
   findings: ReviewFinding[];
   rawOutputPath?: string;
   usage?: TokenUsage;
@@ -89,6 +90,10 @@ export function normalizeReviewResult(
   if (!summary) {
     return schemaError(reviewerId, "Reviewer JSON must include a summary string.", rawOutputPath);
   }
+  if (value.guidance !== undefined && typeof value.guidance !== "string") {
+    return schemaError(reviewerId, "Reviewer JSON guidance must be a string when supplied.", rawOutputPath);
+  }
+  const guidance = typeof value.guidance === "string" ? value.guidance.trim() : "";
 
   if (!Array.isArray(value.findings)) {
     return schemaError(reviewerId, "Reviewer JSON must include findings array.", rawOutputPath);
@@ -123,6 +128,7 @@ export function normalizeReviewResult(
     reviewerId,
     verdict,
     summary,
+    guidance: guidance || undefined,
     findings,
     rawOutputPath,
     error: typeof value.error === "string" ? value.error : undefined,

@@ -11,6 +11,7 @@ import {
   buildRequestContext,
   closeReviewWindow,
   createState,
+  getFailedCorrectionCount,
   pauseReviewWindow,
   recordReviewerFeedback,
   rememberUserRequest,
@@ -155,6 +156,7 @@ export async function activate(pi: unknown): Promise<void> {
         before: window.baseline,
         config,
         evidence: window.evidence,
+        failedCorrectionCount: getFailedCorrectionCount(window),
         actingUsage,
         signal: reviewAbort.signal,
         notify: (message) => sendNoticeWhileSessionActive(noticeTarget, message, () => sessionActive),
@@ -429,6 +431,7 @@ function discardSessionState(state: ReviewGateState): void {
   state.queuedUserInputsDuringReview.splice(0);
   state.reviewWindow = undefined;
   state.lastQuestionWindow = undefined;
+  state.pendingAcceptedReviewerQuestions.splice(0);
 }
 
 function isEscapeTerminalInput(input: unknown): boolean {

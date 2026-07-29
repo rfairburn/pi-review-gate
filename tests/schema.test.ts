@@ -13,6 +13,17 @@ test("parseReviewResult accepts clean JSON", () => {
   assert.equal(result.summary, "ok");
 });
 
+test("parseReviewResult preserves Markdown implementation guidance", () => {
+  const result = parseReviewResult("reviewer", JSON.stringify({
+    verdict: "needs_changes",
+    summary: "Use the guarded branch.",
+    guidance: "Apply this:\n\n```diff\n-old\n+new\n```",
+    findings: [],
+  }));
+
+  assert.equal(result.guidance, "Apply this:\n\n```diff\n-old\n+new\n```");
+});
+
 test("parseReviewResult accepts a fenced JSON review after prose containing braces", () => {
   const result = parseReviewResult(
     "reviewer",

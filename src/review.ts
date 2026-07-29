@@ -21,6 +21,7 @@ export interface ReviewRunInput {
   config: ReviewGateConfig;
   evidence?: EvidenceState;
   actingUsage?: TokenUsage;
+  failedCorrectionCount?: number;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
 }
@@ -43,6 +44,7 @@ export interface AskReviewerInput {
   before?: WorkspaceSnapshot;
   config: ReviewGateConfig;
   evidence?: EvidenceState;
+  failedCorrectionCount?: number;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
 }
@@ -57,6 +59,7 @@ export interface AskReviewerOutput {
 }
 
 export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput> {
+  const requireConcreteGuidance = shouldRequireConcreteGuidance(input.config, input.failedCorrectionCount);
   const after = await createWorkspaceSnapshot(input.cwd, {
     maxFileBytes: input.config.maxFileBytes,
     maxSnapshotBytes: input.config.maxSnapshotBytes,
@@ -101,7 +104,10 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
     actingUsage: input.actingUsage,
+    requireConcreteGuidance,
     metadata: {
+      failedCorrectionCount: input.failedCorrectionCount ?? 0,
+      requireConcreteGuidance,
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
@@ -141,6 +147,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
 }
 
 export async function runAskReviewer(input: AskReviewerInput): Promise<AskReviewerOutput> {
+  const requireConcreteGuidance = shouldRequireConcreteGuidance(input.config, input.failedCorrectionCount);
   const { changes, workspaceChanges, evidenceChanges, sideEffectChanges } = await collectCurrentChanges({
     cwd: input.cwd,
     before: input.before,
@@ -173,7 +180,10 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     evidence: input.evidence
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
+    requireConcreteGuidance,
     metadata: {
+      failedCorrectionCount: input.failedCorrectionCount ?? 0,
+      requireConcreteGuidance,
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
@@ -258,6 +268,7 @@ function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
       reviewerId: "aggregate",
       verdict: "needs_changes",
       summary: aggregateSummary(results),
+      guidance: aggregateGuidance(needsChanges),
       findings: needsChanges.flatMap((result) => result.findings.map((finding) => ({
         ...finding,
         reviewerId: result.reviewerId,
@@ -271,6 +282,7 @@ function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
       reviewerId: "aggregate",
       verdict: "error",
       summary: aggregateSummary(results),
+      guidance: aggregateGuidance(results),
       findings: [],
       usage,
       error: errors.every((result) => result.error === "aborted") ? "aborted" : "reviewer_error",
@@ -280,6 +292,7 @@ function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
     reviewerId: "aggregate",
     verdict: "pass",
     summary: aggregateSummary(results),
+    guidance: aggregateGuidance(results),
     findings: results.flatMap((result) => result.findings.map((finding) => ({
       ...finding,
       reviewerId: result.reviewerId,
@@ -304,6 +317,18 @@ function shouldRetainBundle(
 
 function aggregateSummary(results: ReviewResult[]): string {
   return results.map((result) => `${result.reviewerId}: ${result.summary}`).join("\n");
+}
+
+function aggregateGuidance(results: ReviewResult[]): string | undefined {
+  const guidance = results
+    .filter((result) => result.guidance)
+    .map((result) => `### ${result.reviewerId}\n\n${result.guidance}`)
+    .join("\n\n");
+  return guidance || undefined;
+}
+
+function shouldRequireConcreteGuidance(config: ReviewGateConfig, failedCorrectionCount = 0): boolean {
+  return failedCorrectionCount >= config.implementationGuidanceAfterFailedCorrections;
 }
 
 function aggregateUsage(results: ReviewResult[]): ReviewResult["usage"] {

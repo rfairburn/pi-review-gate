@@ -8,6 +8,7 @@ import {
   buildEvidenceBundle,
   createEvidenceState,
   extractCandidatePaths,
+  recordAcceptedReviewerQuestion,
   recordToolCallEvidence,
   rememberFinalAssistantSummary,
 } from "../src/evidence";
@@ -152,4 +153,25 @@ test("evidence markdown preserves every tool event in the review window", () => 
   assert.match(bundle.markdown, /#81 tool_call bash: event 81/);
   assert.match(bundle.markdown, /#200 tool_call bash: event 200/);
   assert.doesNotMatch(bundle.markdown, /events omitted/);
+});
+
+test("accepted reviewer questions and edited answers become structured evidence", () => {
+  const state = createEvidenceState();
+
+  recordAcceptedReviewerQuestion(state, {
+    question: "How should this be fixed?",
+    acceptedAnswer: "Use this exact edit:\n\n```diff\n-old\n+new\n```",
+    acceptedAt: "2026-07-29T00:00:00.000Z",
+  });
+
+  const bundle = buildEvidenceBundle(state, []);
+
+  assert.deepEqual(bundle.acceptedReviewerQuestions, [{
+    sequence: 1,
+    question: "How should this be fixed?",
+    acceptedAnswer: "Use this exact edit:\n\n```diff\n-old\n+new\n```",
+    acceptedAt: "2026-07-29T00:00:00.000Z",
+  }]);
+  assert.match(bundle.markdown, /Accepted reviewer questions and answers/);
+  assert.match(bundle.markdown, /```diff\n-old\n\+new\n```/);
 });

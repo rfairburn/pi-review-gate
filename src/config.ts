@@ -46,6 +46,7 @@ export interface ReviewGateConfig {
   enabled: boolean;
   mode: ReviewMode;
   maxCorrectionCycles: number;
+  implementationGuidanceAfterFailedCorrections: number;
   reviewWhen: "changed-files";
   maxPatchBytes: number;
   maxFileBytes: number;
@@ -65,6 +66,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   enabled: true,
   mode: "single-decider",
   maxCorrectionCycles: 1,
+  implementationGuidanceAfterFailedCorrections: 1,
   reviewWhen: "changed-files",
   maxPatchBytes: 200_000,
   maxFileBytes: 1_048_576,
@@ -111,6 +113,10 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     enabled: value.enabled === undefined ? DEFAULT_CONFIG.enabled : Boolean(value.enabled),
     mode: value.mode === "quorum" ? "quorum" : "single-decider",
     maxCorrectionCycles: numberOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles),
+    implementationGuidanceAfterFailedCorrections: nonNegativeIntegerOrDefault(
+      value.implementationGuidanceAfterFailedCorrections,
+      DEFAULT_CONFIG.implementationGuidanceAfterFailedCorrections,
+    ),
     reviewWhen: "changed-files",
     maxPatchBytes: numberOrDefault(value.maxPatchBytes, DEFAULT_CONFIG.maxPatchBytes),
     maxFileBytes: numberOrDefault(value.maxFileBytes, DEFAULT_CONFIG.maxFileBytes),
@@ -221,6 +227,10 @@ function validateUniqueReviewerIds(reviewers: DeciderConfig[]): void {
 
 function numberOrDefault(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function nonNegativeIntegerOrDefault(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
 function isTruthy(value: string | undefined): boolean {

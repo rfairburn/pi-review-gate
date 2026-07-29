@@ -17,6 +17,7 @@ export interface ReviewBundleInput {
   sideEffectPatch?: string;
   evidence?: EvidenceBundle;
   actingUsage?: TokenUsage;
+  requireConcreteGuidance?: boolean;
   metadata?: Record<string, unknown>;
 }
 
@@ -41,6 +42,7 @@ export interface ReviewerQuestionBundleInput {
   patch: string;
   sideEffectPatch?: string;
   evidence?: EvidenceBundle;
+  requireConcreteGuidance?: boolean;
   metadata?: Record<string, unknown>;
 }
 
@@ -56,6 +58,7 @@ export async function createReviewBundle(input: ReviewBundleInput): Promise<Revi
     cwd: input.cwd,
     bundleDir: dir,
     evidenceMarkdown: input.evidence?.markdown,
+    requireConcreteGuidance: input.requireConcreteGuidance,
   });
 
   const requestPath = join(dir, "request.md");
@@ -112,6 +115,7 @@ export async function createReviewerQuestionBundle(input: ReviewerQuestionBundle
     cwd: input.cwd,
     bundleDir: dir,
     evidenceMarkdown: input.evidence?.markdown,
+    requireConcreteGuidance: input.requireConcreteGuidance,
   });
 
   const questionPath = join(dir, "question.md");

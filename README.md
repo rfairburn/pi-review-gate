@@ -35,6 +35,7 @@ Example config using Codex as the reviewer:
   "enabled": true,
   "mode": "single-decider",
   "maxCorrectionCycles": 3,
+  "implementationGuidanceAfterFailedCorrections": 1,
   "reviewWhen": "changed-files",
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,
@@ -62,6 +63,7 @@ the configured command provides its own safe read-only behavior.
   "enabled": true,
   "mode": "single-decider",
   "maxCorrectionCycles": 3,
+  "implementationGuidanceAfterFailedCorrections": 1,
   "reviewWhen": "changed-files",
   "retainBundles": "on-failure",
   "reviewers": [
@@ -80,6 +82,16 @@ the configured command provides its own safe read-only behavior.
 ```
 
 The older single `decider` field is still supported for compatibility.
+
+`implementationGuidanceAfterFailedCorrections` controls when every review path
+strengthens its request for concrete implementation guidance. The default is
+`1`: reviewer responses are implementation-ready from the start, and after one
+unsuccessful correction the next automatic review, `/review-now`, or
+`/ask-reviewer` explicitly requires a targeted code example, minimal diff, or
+exact actionable steps for any remaining problem. Set it to `0` to require that
+concrete guidance on the first review. There is no separate disabled value; use
+a threshold higher than the configured correction budget to prevent threshold
+escalation while retaining the normal implementation-ready prompt.
 
 Load during development by pointing your pi host at the built extension:
 
@@ -225,6 +237,14 @@ same unresolved review window.
 Reviewer answers open in an editable prompt. Press Enter to submit the reviewer
 note to the primary model as your next message, edit it first if needed, or press
 Escape/Ctrl+C to clear it without sending anything.
+
+Submitting that editor accepts the question and the exact submitted reviewer
+note into structured session evidence. Later automatic reviews, `/review-now`,
+and `/ask-reviewer` calls in the resulting review window receive the accumulated
+accepted Q&A, including preserved Markdown and fenced code. Clearing the editor
+does not accept or record the answer. When a question follows a passing review,
+its accepted Q&A is carried into the new review window created for the submitted
+reviewer note without reusing the already-checkpointed file baseline.
 
 Retained review bundles include `request.md`, `changed-files.json`,
 `patch.diff`, `side-effect.patch.diff`, `reviewer-prompt.md`, `evidence.json`,

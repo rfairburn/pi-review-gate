@@ -2,7 +2,7 @@
   "enabled": true,
   "mode": "single-decider",
   "maxCorrectionCycles": 1,
-  "implementationGuidanceAfterFailedCorrections": 1,
+  "implementationGuidanceAfterCorrectionAttempts": 1,
   "reviewWhen": "changed-files",
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,

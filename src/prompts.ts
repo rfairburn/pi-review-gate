@@ -10,6 +10,8 @@ const REVIEW_CONTEXT_POLICY = `Review policy:
 - Working notes or review documents may be acceptable when they are consistent with the session context; review them for correctness, not for their mere existence.
 - Workspace side effects that are not submitted changes should be reviewed for accidental generated output, ignored files needed by the implementation, or files that should be cleaned up.
 - If you have read-only tools, use them as needed to inspect the workspace and review bundle. Treat the workspace as ground truth. Do not modify files, run shell commands, use network access, or ask the primary model for more context.
+- Prior review feedback in the request context is historical evidence, not a statement of the current workspace. Independently verify every prior finding against the current files and patch.
+- Do not repeat a prior finding when its requested correction is present. Repeat it only if you can cite current file/line or current session evidence showing a concrete remaining defect, and explain why the prior correction was insufficient.
 - If you do not have tools, review from the supplied prompt and be explicit in your summary when the supplied context is insufficient for certainty.
 - Return "needs_changes" only when the primary agent can take a concrete follow-up action that could make a later review pass. If a finding is only a sentinel/status flag, acknowledgement, or other terminal note with no requested fix, return "pass" with a non_blocking finding instead of a blocking finding.`;
 
@@ -21,7 +23,7 @@ function implementationGuidancePolicy(requireConcreteGuidance: boolean): string 
 - Do not add decorative or redundant code when prose is sufficient.
 - Preserve exact identifiers, commands, and replacement text needed to act on the review.
 ${requireConcreteGuidance
-    ? "- A prior correction attempt has not resolved the review window. For every substantive problem that remains, you MUST provide a concrete implementation example or minimal diff unless code would be inapplicable; in that case, provide exact actionable steps."
+    ? "- One or more correction attempts have occurred. First determine from the current workspace whether each historical finding is resolved. Only for a problem you independently verify still remains, you MUST provide a concrete implementation example or minimal diff unless code would be inapplicable; in that case, provide exact actionable steps. Do not infer that a problem remains merely because it appears in prior feedback."
     : "- Make the first response implementation-ready; do not defer useful concrete guidance to a later review."}`;
 }
 

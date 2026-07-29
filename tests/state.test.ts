@@ -7,7 +7,7 @@ import {
   closeReviewWindow,
   createState,
   getReviewerQuestionWindow,
-  getFailedCorrectionCount,
+  getCorrectionAttemptCount,
   markCappedFeedbackSent,
   pauseReviewWindow,
   recordAcceptedReviewerQuestion,
@@ -200,6 +200,8 @@ test("buildRequestContext preserves user guidance and prior capped reviewer feed
   assert.match(context, /Additional user guidance during the same review window:/);
   assert.match(context, /2\. the -geolite2 needs to go back for pinterest/);
   assert.match(context, /feedback held at the correction cap/);
+  assert.match(context, /Historical prior review feedback/);
+  assert.match(context, /Do not assume they remain unresolved/);
   assert.match(context, /A guard is missing/);
   assert.match(context, /Review found blocking issues\. Add the missing guard/);
 
@@ -256,7 +258,7 @@ test("an accepted answer after a passed review seeds the next review window evid
   assert.equal(state.pendingAcceptedReviewerQuestions.length, 0);
 });
 
-test("failed correction count survives correction-cap budget resets", () => {
+test("correction attempt count survives correction-cap budget resets", () => {
   const state = createState();
   rememberUserRequest(state, "fix it");
   recordReviewerFeedback(state, {
@@ -281,5 +283,5 @@ test("failed correction count survives correction-cap budget resets", () => {
   });
   state.reviewWindow!.correctionCycles = 0;
 
-  assert.equal(getFailedCorrectionCount(state.reviewWindow), 2);
+  assert.equal(getCorrectionAttemptCount(state.reviewWindow), 2);
 });

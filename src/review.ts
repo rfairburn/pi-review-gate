@@ -21,7 +21,7 @@ export interface ReviewRunInput {
   config: ReviewGateConfig;
   evidence?: EvidenceState;
   actingUsage?: TokenUsage;
-  failedCorrectionCount?: number;
+  correctionAttemptCount?: number;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
 }
@@ -44,7 +44,7 @@ export interface AskReviewerInput {
   before?: WorkspaceSnapshot;
   config: ReviewGateConfig;
   evidence?: EvidenceState;
-  failedCorrectionCount?: number;
+  correctionAttemptCount?: number;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
 }
@@ -59,7 +59,8 @@ export interface AskReviewerOutput {
 }
 
 export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput> {
-  const requireConcreteGuidance = shouldRequireConcreteGuidance(input.config, input.failedCorrectionCount);
+  const correctionAttemptCount = input.correctionAttemptCount ?? 0;
+  const requireConcreteGuidance = shouldRequireConcreteGuidance(input.config, correctionAttemptCount);
   const after = await createWorkspaceSnapshot(input.cwd, {
     maxFileBytes: input.config.maxFileBytes,
     maxSnapshotBytes: input.config.maxSnapshotBytes,
@@ -106,7 +107,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     actingUsage: input.actingUsage,
     requireConcreteGuidance,
     metadata: {
-      failedCorrectionCount: input.failedCorrectionCount ?? 0,
+      correctionAttemptCount,
       requireConcreteGuidance,
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
@@ -147,7 +148,8 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
 }
 
 export async function runAskReviewer(input: AskReviewerInput): Promise<AskReviewerOutput> {
-  const requireConcreteGuidance = shouldRequireConcreteGuidance(input.config, input.failedCorrectionCount);
+  const correctionAttemptCount = input.correctionAttemptCount ?? 0;
+  const requireConcreteGuidance = shouldRequireConcreteGuidance(input.config, correctionAttemptCount);
   const { changes, workspaceChanges, evidenceChanges, sideEffectChanges } = await collectCurrentChanges({
     cwd: input.cwd,
     before: input.before,
@@ -182,7 +184,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       : undefined,
     requireConcreteGuidance,
     metadata: {
-      failedCorrectionCount: input.failedCorrectionCount ?? 0,
+      correctionAttemptCount,
       requireConcreteGuidance,
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
@@ -327,8 +329,8 @@ function aggregateGuidance(results: ReviewResult[]): string | undefined {
   return guidance || undefined;
 }
 
-function shouldRequireConcreteGuidance(config: ReviewGateConfig, failedCorrectionCount = 0): boolean {
-  return failedCorrectionCount >= config.implementationGuidanceAfterFailedCorrections;
+function shouldRequireConcreteGuidance(config: ReviewGateConfig, correctionAttemptCount = 0): boolean {
+  return correctionAttemptCount >= config.implementationGuidanceAfterCorrectionAttempts;
 }
 
 function aggregateUsage(results: ReviewResult[]): ReviewResult["usage"] {

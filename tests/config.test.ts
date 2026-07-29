@@ -92,7 +92,7 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
     model: undefined,
     timeoutMs: 300000,
   });
-  assert.equal(codex.implementationGuidanceAfterFailedCorrections, 1);
+  assert.equal(codex.implementationGuidanceAfterCorrectionAttempts, 1);
 
   const claude = normalizeConfig({
     enabled: true,
@@ -116,7 +116,7 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
 test("normalizeConfig validates implementation guidance escalation thresholds", () => {
   const configured = normalizeConfig({
     enabled: true,
-    implementationGuidanceAfterFailedCorrections: 0,
+    implementationGuidanceAfterCorrectionAttempts: 0,
     decider: {
       id: "codex",
       adapter: "codex-cli",
@@ -124,15 +124,15 @@ test("normalizeConfig validates implementation guidance escalation thresholds", 
   });
   const invalid = normalizeConfig({
     enabled: true,
-    implementationGuidanceAfterFailedCorrections: 1.5,
+    implementationGuidanceAfterCorrectionAttempts: 1.5,
     decider: {
       id: "codex",
       adapter: "codex-cli",
     },
   });
 
-  assert.equal(configured.implementationGuidanceAfterFailedCorrections, 0);
-  assert.equal(invalid.implementationGuidanceAfterFailedCorrections, 1);
+  assert.equal(configured.implementationGuidanceAfterCorrectionAttempts, 0);
+  assert.equal(invalid.implementationGuidanceAfterCorrectionAttempts, 1);
 });
 
 test("normalizeConfig keeps little-coder model selection generic", () => {

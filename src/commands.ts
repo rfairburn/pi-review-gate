@@ -3,7 +3,7 @@ import {
   buildRequestContext,
   clearReviewState,
   closeReviewWindow,
-  getFailedCorrectionCount,
+  getCorrectionAttemptCount,
   getReviewerQuestionWindow,
   markCappedFeedbackSent,
   pauseReviewWindow,
@@ -81,7 +81,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         before: window.baseline,
         config: input.config,
         evidence: window.evidence,
-        failedCorrectionCount: getFailedCorrectionCount(window),
+        correctionAttemptCount: getCorrectionAttemptCount(window),
         signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
         notify: (message) => sendCommandNotice(ctx, message),
       });
@@ -170,7 +170,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         before: contextWindow?.baseline,
         config: input.config,
         evidence: contextWindow?.evidence,
-        failedCorrectionCount: getFailedCorrectionCount(contextWindow),
+        correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
         signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
         notify: (message) => sendCommandNotice(ctx, message),
       });

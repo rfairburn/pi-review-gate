@@ -12,7 +12,7 @@ const baseConfig: ReviewGateConfig = {
   enabled: true,
   mode: "single-decider",
   maxCorrectionCycles: 1,
-  implementationGuidanceAfterFailedCorrections: 1,
+  implementationGuidanceAfterCorrectionAttempts: 1,
   reviewWhen: "changed-files",
   maxPatchBytes: 200_000,
   maxFileBytes: 1_048_576,
@@ -417,7 +417,7 @@ test("accepted reviewer Q&A is visible to later automatic and question reviews",
   }
 });
 
-test("failed-correction escalation reaches automatic and question review prompts", async () => {
+test("correction-attempt escalation reaches automatic and question review prompts", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-guidance-escalation-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -428,7 +428,7 @@ test("failed-correction escalation reaches automatic and question review prompts
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
       ...baseConfig,
-      implementationGuidanceAfterFailedCorrections: 1,
+      implementationGuidanceAfterCorrectionAttempts: 1,
       decider: {
         id: "prompt-checker",
         adapter: "generic-cli",
@@ -456,7 +456,7 @@ test("failed-correction escalation reaches automatic and question review prompts
       request: "change index",
       before,
       config,
-      failedCorrectionCount: 1,
+      correctionAttemptCount: 1,
     });
     const question = await runAskReviewer({
       cwd: dir,
@@ -464,7 +464,7 @@ test("failed-correction escalation reaches automatic and question review prompts
       request: "change index",
       before,
       config,
-      failedCorrectionCount: 1,
+      correctionAttemptCount: 1,
     });
 
     assert.equal(automatic.result?.verdict, "pass");

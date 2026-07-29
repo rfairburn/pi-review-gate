@@ -46,7 +46,7 @@ export interface ReviewGateConfig {
   enabled: boolean;
   mode: ReviewMode;
   maxCorrectionCycles: number;
-  implementationGuidanceAfterFailedCorrections: number;
+  implementationGuidanceAfterCorrectionAttempts: number;
   reviewWhen: "changed-files";
   maxPatchBytes: number;
   maxFileBytes: number;
@@ -66,7 +66,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   enabled: true,
   mode: "single-decider",
   maxCorrectionCycles: 1,
-  implementationGuidanceAfterFailedCorrections: 1,
+  implementationGuidanceAfterCorrectionAttempts: 1,
   reviewWhen: "changed-files",
   maxPatchBytes: 200_000,
   maxFileBytes: 1_048_576,
@@ -113,9 +113,9 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     enabled: value.enabled === undefined ? DEFAULT_CONFIG.enabled : Boolean(value.enabled),
     mode: value.mode === "quorum" ? "quorum" : "single-decider",
     maxCorrectionCycles: numberOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles),
-    implementationGuidanceAfterFailedCorrections: nonNegativeIntegerOrDefault(
-      value.implementationGuidanceAfterFailedCorrections,
-      DEFAULT_CONFIG.implementationGuidanceAfterFailedCorrections,
+    implementationGuidanceAfterCorrectionAttempts: nonNegativeIntegerOrDefault(
+      value.implementationGuidanceAfterCorrectionAttempts,
+      DEFAULT_CONFIG.implementationGuidanceAfterCorrectionAttempts,
     ),
     reviewWhen: "changed-files",
     maxPatchBytes: numberOrDefault(value.maxPatchBytes, DEFAULT_CONFIG.maxPatchBytes),

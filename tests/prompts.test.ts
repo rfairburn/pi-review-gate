@@ -35,7 +35,7 @@ test("every review prompt requests implementation-ready Markdown guidance", () =
   }
 });
 
-test("every review prompt can require concrete guidance after failed corrections", () => {
+test("every review prompt conditionally requires concrete guidance after correction attempts", () => {
   const common = {
     request: "fix the behavior",
     changes: [],
@@ -50,9 +50,30 @@ test("every review prompt can require concrete guidance after failed corrections
   });
 
   for (const prompt of [automatic, question]) {
-    assert.match(prompt, /prior correction attempt has not resolved/);
+    assert.match(prompt, /One or more correction attempts have occurred/);
+    assert.match(prompt, /First determine from the current workspace whether each historical finding is resolved/);
     assert.match(prompt, /MUST provide a concrete implementation example or minimal diff/);
+    assert.match(prompt, /Do not infer that a problem remains merely because it appears in prior feedback/);
+    assert.doesNotMatch(prompt, /correction attempt has not resolved/);
   }
+});
+
+test("review prompts require current evidence before repeating historical findings", () => {
+  const prompt = buildReviewerPrompt({
+    request: [
+      "Historical prior review feedback:",
+      "Replace unsafe() with safe().",
+    ].join("\n"),
+    changes: [],
+    patch: "+safe();",
+    cwd: "/tmp/project",
+    requireConcreteGuidance: true,
+  });
+
+  assert.match(prompt, /Prior review feedback .* is historical evidence/);
+  assert.match(prompt, /Do not repeat a prior finding when its requested correction is present/);
+  assert.match(prompt, /cite current file\/line or current session evidence/);
+  assert.match(prompt, /\+safe\(\);/);
 });
 
 test("automatic correction feedback preserves Markdown guidance and fenced diffs", () => {

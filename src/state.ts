@@ -111,7 +111,7 @@ export function getReviewerQuestionWindow(state: ReviewGateState): ReviewWindow 
   return state.reviewWindow ?? state.lastQuestionWindow;
 }
 
-export function getFailedCorrectionCount(window: ReviewWindow | undefined): number {
+export function getCorrectionAttemptCount(window: ReviewWindow | undefined): number {
   return window?.reviewHistory.filter((feedback) =>
     feedback.disposition === "sent_for_correction" || feedback.disposition === "held_then_sent"
   ).length ?? 0;
@@ -185,7 +185,11 @@ export function buildRequestContext(state: ReviewGateState, window = state.revie
   ];
 
   if (window.reviewHistory.length > 0) {
-    lines.push("", "Prior review feedback from this same review window:");
+    lines.push(
+      "",
+      "Historical prior review feedback from this same review window:",
+      "These findings describe earlier workspace states. Do not assume they remain unresolved; reconcile each one against the current workspace.",
+    );
     for (const feedback of window.reviewHistory) {
       lines.push(
         "",

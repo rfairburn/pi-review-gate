@@ -1,7 +1,7 @@
 # pi-review-gate
 
 External pi extension that reviews code changes after an agent turn and sends
-concise follow-up instructions when a configured reviewer finds blocking issues.
+the complete classified review pass back to the implementing model.
 
 ## Development
 
@@ -53,7 +53,11 @@ Multiple reviewers can be configured with `reviewers`. They run in parallel
 against the same review bundle. Review-gate waits for every reviewer, then
 aggregates the independent results: any reviewer requesting changes causes a
 combined `needs_changes` response with that reviewer's findings attributed in
-the follow-up. The built-in Codex, Claude, and little-coder model adapters run
+the follow-up. Results from every reviewer are transmitted, including passing
+assessments, non-blocking observations, guidance, disagreements, and reviewer
+errors. Blocking findings are identified as required corrections; passing and
+non-blocking material remains visible without becoming mandatory work. The
+built-in Codex, Claude, and little-coder model adapters run
 as read-only agentic reviewers so they can inspect the workspace and retained
 review bundle before deciding. Generic CLI reviewers remain prompt-only unless
 the configured command provides its own safe read-only behavior.
@@ -158,9 +162,10 @@ The wrapper flag also accepts explicit modes:
 ```
 
 Built-in Codex, Claude, and little-coder reviewers use one explicit CLI session
-per reviewer for the lifetime of a review window. Correction reviews and
-`/ask-reviewer` resume that same reviewer session against the same evidence
-bundle. A new review window always starts new reviewer sessions. The bundle is
+per reviewer for the lifetime of a review window. Correction reviews,
+continuations made after a passing transmission, and `/ask-reviewer` resume that
+same reviewer session against the same evidence bundle. A new review window
+always starts new reviewer sessions. The bundle is
 still authoritative: if a saved session cannot be resumed, the reviewer can be
 restarted from the complete bundle without losing review context.
 
@@ -205,9 +210,15 @@ baselines, user guidance, tool evidence, assistant summaries, reviewer feedback,
 and reviewer sessions belong to one review window. A requested correction keeps
 that window open. Even when a correction exactly restores the original baseline,
 the next reviewer sees the inverse exchange diff and validates the correction.
-A passing review checkpoints and closes the window while retaining it for an
-immediate `/ask-reviewer` follow-up. Later ordinary work starts a fresh window
-from current file contents and does not re-review changes that already passed.
+A passing review is transmitted to the implementing model as a final review
+turn with every reviewer's official notes. The pass certifies the exact reviewed
+workspace snapshot. A response that does not change the workspace or create a
+meaningful persistent side effect checkpoints and closes the window while
+retaining it for an immediate `/ask-reviewer` follow-up. If the implementing
+model makes another change after seeing the passing observations, that response
+becomes a new exchange in the same window and triggers another review. Later
+ordinary work starts a fresh window from current file contents and does not
+re-review changes that already passed.
 
 ## Commands
 
@@ -222,12 +233,14 @@ the cleared window are never reused. If a review is currently running, cancel it
 first and then run `/review-clear`.
 
 `/review-now` reruns the configured reviewer or reviewers against the active
-review window's baseline and evidence. A pass checkpoints and closes that
-window, so `/review-now` cannot resurrect changes from an earlier passing review.
+review window's baseline and evidence. Its complete result is transmitted to
+the implementing model. A pass closes only after the implementing model responds
+without changing the reviewed state.
 
-`/review-continue` sends the last reviewer feedback that was held back because
-the automatic correction cap was reached. It resets the correction counter, so
-the configured correction budget is available again for the continued fix.
+Reaching the automatic correction cap does not hide reviewer information. The
+complete pass is transmitted with correction classified as deferred.
+`/review-continue` authorizes the last capped feedback for correction and resets
+the correction counter, so the configured correction budget is available again.
 Reaching the cap does not accept or checkpoint the changes. Normal user guidance
 also remains in the same unresolved window unless that window later passes.
 
@@ -243,11 +256,11 @@ read-only/tool-call activity and the primary agent's final summary. This makes i
 useful after planning-only turns as well as after edits. Immediately after a
 passing review, it can still use that passed window's patch and evidence; a
 regular prompt starts a fresh window instead. At the automatic correction cap it
-also includes the prior reviewer result and the held correction message from the
-same unresolved review window.
+also includes the prior reviewer results, the deferred transmission, and any
+later `/review-continue` authorization from the same unresolved review window.
 
 Reviewer answers open in an editable prompt. Press Enter to submit the reviewer
-note to the primary model as your next message, edit it first if needed, or press
+note to the implementing model as your next message, edit it first if needed, or press
 Escape/Ctrl+C to clear it without sending anything.
 
 Submitting that editor accepts the question and the exact submitted reviewer
@@ -262,7 +275,12 @@ Retained review bundles include `REVIEW.md`, `manifest.json`, `request.md`, a
 `current/` cumulative view, immutable `exchanges/<sequence>/` evidence,
 numbered `reviews/<sequence>/` and `questions/<sequence>/` invocations,
 `sessions.json`, and captured before/after artifacts. Reviewer outputs remain
-isolated under each invocation's `reviewers/<id>/` directory. The little-coder
+isolated under each invocation's `reviewers/<id>/` directory. Each completed
+review pass also stores `implementing-model-transmission.md`, its structured
+JSON envelope, and additive `delivery.json` receipts recording exactly what the
+implementing model was told and whether the transmission required correction,
+reported a pass, deferred action, or disclosed a review error. Later reviewers
+are directed to read these records before judging a continuation. The little-coder
 model adapter stores the extracted final review in `raw-output.txt` and the
 capped JSONL stream separately as `raw-stream.jsonl`. When supported by the
 reviewer CLI, user-facing notices include a compact reviewer token summary, for

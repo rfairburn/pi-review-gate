@@ -171,8 +171,9 @@ test("/review-now notice shows non-blocking reviewer results in multi-reviewer r
 
     const noticeText = notices.join("\n");
     assert.equal(followUps.length, 1);
-    assert.match(followUps[0] ?? "", /\[blocking\] index\.ts\nIssue: missing test\nRecommendation: add coverage/);
-    assert.doesNotMatch(followUps[0] ?? "", /claude found no blocking issues/);
+    assert.match(followUps[0] ?? "", /\[blocking\] index\.ts\n  Issue: missing test\n  Recommendation: add coverage/);
+    assert.match(followUps[0] ?? "", /### claude — pass/);
+    assert.match(followUps[0] ?? "", /claude found no blocking issues/);
     assert.match(noticeText, /Reviewer results:/);
     assert.match(noticeText, /- blocking: needs_changes, 1 blocking - fix required/);
     assert.match(noticeText, /- claude: pass - claude found no blocking issues/);
@@ -181,7 +182,7 @@ test("/review-now notice shows non-blocking reviewer results in multi-reviewer r
   }
 });
 
-test("a passing /review-now checkpoints and closes its review window", async () => {
+test("a passing /review-now transmits the complete pass and keeps its window open for the response", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-pass-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -195,9 +196,13 @@ test("a passing /review-now checkpoints and closes its review window", async () 
 
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const notices: string[] = [];
+    const followUps: string[] = [];
     const pi = {
       registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
         commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
       },
     };
     const ctx = {
@@ -214,11 +219,12 @@ test("a passing /review-now checkpoints and closes its review window", async () 
     });
 
     await commands.get("review-now")?.("", ctx);
-    assert.equal(state.reviewWindow, undefined);
+    assert.notEqual(state.reviewWindow, undefined);
+    assert.equal(state.reviewWindow?.reviewHistory.at(-1)?.disposition, "sent_for_observation");
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0] ?? "", /Gate verdict: pass/);
+    assert.match(followUps[0] ?? "", /### passing — pass/);
     assert.match(notices.join("\n"), /review gate: passed/);
-
-    await commands.get("review-now")?.("", ctx);
-    assert.match(notices.join("\n"), /no active review window with a baseline/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -272,7 +278,7 @@ test("/ask-reviewer retains a passing review's patch and evidence", async () => 
     });
 
     await commands.get("review-now")?.("", ctx);
-    assert.equal(state.reviewWindow, undefined);
+    assert.notEqual(state.reviewWindow, undefined);
     assert.match(notices.join("\n"), /review gate: passed/);
 
     await commands.get("ask-reviewer")?.("what supports the passed change?", ctx);

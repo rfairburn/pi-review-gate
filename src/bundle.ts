@@ -197,6 +197,18 @@ export async function removeTransientWindowBundle(window: ReviewExchangeBundleOw
   }
 }
 
+export async function syncReviewWindowArtifacts(input: {
+  dir: string;
+  cwd: string;
+  currentReviewSequence: number;
+  exchanges: ReviewExchangeContext[];
+}): Promise<void> {
+  await Promise.all([
+    writeExchangeArtifacts(input.dir, input.exchanges),
+    writeReviewIndex(input.dir, input.cwd, input.currentReviewSequence, input.exchanges, false),
+  ]);
+}
+
 interface ReviewExchangeBundleOwner {
   bundleDir?: string;
   retainBundleAfterClose: boolean;
@@ -234,6 +246,8 @@ async function writeExchangeArtifacts(dir: string, exchanges: ReviewExchangeCont
         startedAt: exchange.startedAt,
         endedAt: exchange.endedAt,
         causedByReviewSequence: exchange.causedByReviewSequence,
+        causedByReviewVerdict: exchange.causedByReviewVerdict,
+        reviewResponseMode: exchange.reviewResponseMode,
       }, null, 2), "utf8"),
       writeFile(join(exchangeDir, "submitted.patch"), exchange.workspacePatch || "(no submitted workspace changes)", "utf8"),
       writeFile(join(exchangeDir, "side-effects.patch"), exchange.sideEffectPatch || "(no captured side-effect changes)", "utf8"),
@@ -283,13 +297,14 @@ async function writeReviewIndex(
     "Read `request.md`, `current/reviewer-context.md`, and the current workspace before deciding.",
     "For correction reviews, read the latest `exchanges/<sequence>/submitted.patch`, tool events, and assistant summary.",
     "Earlier exchange directories and review results are historical evidence; the current workspace is ground truth.",
+    "For every completed prior pass, read `reviews/<sequence>/implementing-model-transmission.md` and `delivery.json`. Those files record exactly what the implementing model was told and whether it was a required correction, passing observation, deferred finding, or review error.",
     "",
     "## Exchanges",
     "",
     ...(exchanges.length > 0
       ? exchanges.map((exchange) => [
         `- Exchange ${exchange.sequence}`,
-        exchange.causedByReviewSequence ? ` (correction for review ${exchange.causedByReviewSequence})` : "",
+        exchange.causedByReviewSequence ? ` (response to review ${exchange.causedByReviewSequence})` : "",
         `: \`exchanges/${sequencePath(exchange.sequence)}/\``,
       ].join(""))
       : ["- None"]),

@@ -44,10 +44,12 @@ export function extractContext(args: unknown[]): unknown {
   return args.find((arg) => isRecord(arg) && isRecord(arg.ui)) ?? undefined;
 }
 
-export async function sendFollowUp(pi: unknown, message: string): Promise<void> {
+export async function sendFollowUp(pi: unknown, message: string): Promise<boolean> {
   if (isRecord(pi) && typeof pi.sendUserMessage === "function") {
     await pi.sendUserMessage(message, { deliverAs: "followUp" });
+    return true;
   }
+  return false;
 }
 
 export async function sendUserPrompt(pi: unknown, message: string): Promise<void> {

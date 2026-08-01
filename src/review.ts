@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DeciderConfig, ReviewGateConfig } from "./config";
-import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle } from "./bundle";
+import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
 import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
@@ -31,10 +31,13 @@ export interface ReviewRunInput {
 export interface ReviewRunOutput {
   changed: boolean;
   changes: ChangedFile[];
+  noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response";
   result?: ReviewResult;
   reviewerResults?: ReviewResult[];
   followUpMessage?: string;
   bundleDir?: string;
+  invocationDir?: string;
+  reviewSequence?: number;
   bundleRetained?: boolean;
   error?: string;
 }
@@ -79,6 +82,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   const { changes, sideEffectChanges } = split;
   const exchangeBefore = input.window?.activeExchange?.baseline;
   const exchangeSequence = input.window?.activeExchange?.sequence;
+  const reviewResponseMode = input.window?.activeExchange?.reviewResponseMode;
   const exchangeWorkspaceChanges = exchangeBefore ? compareSnapshots(exchangeBefore, after) : workspaceChanges;
   const exchangeEvidenceChanges = input.evidence && exchangeSequence !== undefined
     ? await collectEvidenceChanges(input.evidence, input.cwd, {
@@ -102,9 +106,27 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       actingUsage: input.actingUsage,
     });
   }
+  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0;
+  if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
+    if (input.window?.bundleDir) {
+      await syncReviewWindowArtifacts({
+        dir: input.window.bundleDir,
+        cwd: input.cwd,
+        currentReviewSequence: Math.max(1, input.window.nextReviewSequence - 1),
+        exchanges: input.window.exchanges,
+      });
+    }
+    return {
+      changed: false,
+      changes,
+      noReviewReason: reviewResponseMode === "deferred"
+        ? "unchanged_deferred_response"
+        : "unchanged_review_response",
+    };
+  }
   const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
   if (changes.length === 0 && !isCorrectionValidation) {
-    return { changed: false, changes };
+    return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
 
   const patchResult = workspaceChanges.length > 0
@@ -128,9 +150,10 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     };
   }
 
+  const reviewSequence = input.window?.nextReviewSequence ?? 1;
   const bundle = await createReviewBundle({
     dir: input.window?.bundleDir,
-    reviewSequence: input.window?.nextReviewSequence ?? 1,
+    reviewSequence,
     exchanges: input.window?.exchanges,
     cwd: input.cwd,
     request: input.request,
@@ -197,6 +220,8 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     reviewerResults,
     followUpMessage: result.verdict === "needs_changes" ? buildFollowUpMessage(result) : undefined,
     bundleDir: bundle.dir,
+    invocationDir: bundle.invocationDir,
+    reviewSequence,
     bundleRetained: shouldRetain,
   };
 }

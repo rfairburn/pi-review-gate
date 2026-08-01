@@ -73,6 +73,8 @@ test("review prompts require current evidence before repeating historical findin
   assert.match(prompt, /Prior review feedback .* is historical evidence/);
   assert.match(prompt, /Do not repeat a prior finding when its requested correction is present/);
   assert.match(prompt, /cite current file\/line or current session evidence/);
+  assert.match(prompt, /do not call that correction unsolicited merely because it originated with a reviewer/);
+  assert.match(prompt, /Passing assessments and non-blocking observations are visible context, not mandatory corrections/);
   assert.match(prompt, /\+safe\(\);/);
 });
 

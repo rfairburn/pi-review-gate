@@ -24,6 +24,39 @@ test("parseReviewResult preserves Markdown implementation guidance", () => {
   assert.equal(result.guidance, "Apply this:\n\n```diff\n-old\n+new\n```");
 });
 
+test("parseReviewResult repairs literal newlines inside reviewer JSON strings", () => {
+  const result = parseReviewResult(
+    "reviewer",
+    [
+      "Review complete.",
+      "```json",
+      "{",
+      '  "verdict": "needs_changes",',
+      '  "summary": "One correction remains.",',
+      '  "guidance": "Apply this:',
+      "```diff",
+      "-old",
+      '+const mode = "safe";',
+      '```",',
+      '  "findings": [{"severity":"blocking","file":"index.ts","line":1,"issue":"old remains","recommendation":"use new"}],',
+      '  "error": null',
+      "}",
+      "```",
+    ].join("\n"),
+  );
+
+  assert.equal(result.verdict, "needs_changes");
+  assert.match(result.guidance ?? "", /```diff\n-old\n\+const mode = "safe";\n```/);
+  assert.equal(result.findings.length, 1);
+});
+
+test("parseReviewResult reports malformed review-shaped JSON as invalid JSON", () => {
+  const result = parseReviewResult("reviewer", '{"verdict":"pass","summary":"unterminated,"findings":[]}');
+  assert.equal(result.verdict, "error");
+  assert.equal(result.error, "invalid_json");
+  assert.equal(result.summary, "Reviewer returned invalid JSON.");
+});
+
 test("parseReviewResult accepts a fenced JSON review after prose containing braces", () => {
   const result = parseReviewResult(
     "reviewer",

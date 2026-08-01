@@ -9,13 +9,31 @@ const REVIEW_CONTEXT_POLICY = `Review policy:
 - Persistent-looking external side effects deserve scrutiny, but do not block solely because they are outside the workspace or not explicitly named in the user request. Block only when they are unrelated to the task, modify user/environment configuration, create or change executable/runtime content, store meaningful user data in an unmanaged location, leak secrets, or leave state that affects future behavior.
 - Working notes or review documents may be acceptable when they are consistent with the session context; review them for correctness, not for their mere existence.
 - Workspace side effects that are not submitted changes should be reviewed for accidental generated output, ignored files needed by the implementation, or files that should be cleaned up.
-- If you have read-only tools, use them as needed to inspect the workspace and review bundle. Treat the workspace as ground truth. Do not modify files, run shell commands, use network access, or ask the primary model for more context.
+- Use read-only filesystem tools as needed to inspect the workspace and review bundle. If a shell-backed tool is your only filesystem interface, you may run strictly read-only commands such as pwd, ls, find, rg, grep, sed, cat, and git status/diff/show. Treat the workspace as ground truth. Never modify files, run commands with persistent side effects, use network access, or ask the primary model for more context.
 - Prior review feedback in the request context is historical evidence, not a statement of the current workspace. Independently verify every prior finding against the current files and patch.
 - Complete individual results from prior review passes were transmitted to the implementing model under the disposition shown in the request context. A request recorded as sent for correction establishes why the following implementation exchange occurred; do not call that correction unsolicited merely because it originated with a reviewer rather than the user.
 - Passing assessments and non-blocking observations are visible context, not mandatory corrections. Feedback disclosed with correction deferred also does not establish an immediate correction obligation. User instructions remain authoritative when reviewer feedback conflicts with them.
 - Do not repeat a prior finding when its requested correction is present. Repeat it only if you can cite current file/line or current session evidence showing a concrete remaining defect, and explain why the prior correction was insufficient.
 - If you do not have tools, review from the supplied prompt and be explicit in your summary when the supplied context is insufficient for certainty.
 - Return "needs_changes" only when the primary agent can take a concrete follow-up action that could make a later review pass. If a finding is only a sentinel/status flag, acknowledgement, or other terminal note with no requested fix, return "pass" with a non_blocking finding instead of a blocking finding.`;
+
+export const REVIEW_RESPONSE_FORMAT = `Return one JSON object with exactly this shape. Do not wrap it in a Markdown fence and do not put literal, unescaped newlines inside JSON strings:
+{
+  "verdict": "pass" | "needs_changes" | "error",
+  "summary": string,
+  "guidance": string | null,
+  "findings": [
+    {
+      "severity": "blocking" | "non_blocking",
+      "file": string | null,
+      "line": number | null,
+      "issue": string,
+      "recommendation": string
+    }
+  ],
+  "error": string | null
+}
+Use "error" only when infrastructure or unavailable evidence prevents an actual review; explain the failure in "error" and return no findings.`;
 
 function implementationGuidancePolicy(requireConcreteGuidance: boolean): string {
   return `Response quality:
@@ -90,21 +108,7 @@ Session evidence:
 ${input.evidenceMarkdown || "(no session evidence captured)"}
 </session_evidence>
 
-Return JSON:
-{
-  "verdict": "pass" | "needs_changes",
-  "summary": "Direct conclusion.",
-  "guidance": "Markdown explanation and implementation guidance.",
-  "findings": [
-    {
-      "severity": "blocking" | "non_blocking",
-      "file": string,
-      "line": number | null,
-      "issue": string,
-      "recommendation": string
-    }
-  ]
-}
+${REVIEW_RESPONSE_FORMAT}
 
 Use "file": "session" and "line": null for findings about missing commands, process evidence, or other issues that do not belong to a specific file.
 `;
@@ -130,7 +134,7 @@ export function buildReviewerQuestionPrompt(input: {
 
   return `You are an independent reviewer consulted about work done by another coding agent.
 
-Answer the user's reviewer question using the supplied context and read-only inspection of the current workspace when tools are available. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, session evidence, and any relevant files you inspect. Do not modify files, run shell commands, use network access, or include chain of thought. Return only valid JSON matching the schema.
+Answer the user's reviewer question using the supplied context and read-only inspection of the current workspace when tools are available. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, session evidence, and any relevant files you inspect. Do not modify files, run commands with persistent side effects, use network access, or include chain of thought. Return only valid JSON matching the schema.
 
 ${REVIEW_CONTEXT_POLICY}
 
@@ -177,21 +181,7 @@ Session evidence:
 ${input.evidenceMarkdown || "(no session evidence captured)"}
 </session_evidence>
 
-Return JSON:
-{
-  "verdict": "pass" | "needs_changes",
-  "summary": "Direct conclusion.",
-  "guidance": "Direct Markdown answer and implementation guidance.",
-  "findings": [
-    {
-      "severity": "blocking" | "non_blocking",
-      "file": string,
-      "line": number | null,
-      "issue": string,
-      "recommendation": string
-    }
-  ]
-}
+${REVIEW_RESPONSE_FORMAT}
 
 Use "file": "session" and "line": null for findings about missing commands, process evidence, or other issues that do not belong to a specific file.
 

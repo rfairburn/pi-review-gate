@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import type { ChangedFile } from "./capture";
 import { summarizeReviewChanges } from "./change-context";
 import type { EvidenceBundle } from "./evidence";
-import { buildReviewerPrompt, buildReviewerQuestionPrompt } from "./prompts";
+import { buildReviewerPrompt, buildReviewerQuestionPrompt, REVIEW_RESPONSE_FORMAT } from "./prompts";
 import type { ReviewExchangeContext } from "./state";
 import type { TokenUsage } from "./usage";
 
@@ -328,8 +328,9 @@ function buildBundlePrompt(dir: string, invocationDir: string, question: boolean
     `You are an independent read-only ${question ? "reviewer answering a question" : "code reviewer"}.`,
     `The authoritative evidence bundle is ${dir}.`,
     `Read ${join(dir, "REVIEW.md")} first, then ${join(invocationDir, "reviewer-context.md")}, the latest exchange files it references, and the current workspace.`,
-    "Do not modify files, run shell commands, use network access, or ask the primary agent for more context.",
-    "Return only the JSON response required by reviewer-context.md.",
+    "Use read-only filesystem tools to inspect the evidence. If shell execution is the only filesystem interface, strictly read-only commands such as pwd, ls, find, rg, grep, sed, cat, and git status/diff/show are allowed.",
+    "Never modify files, run commands with persistent side effects, use network access, or ask the primary agent for more context.",
+    REVIEW_RESPONSE_FORMAT,
   ].join("\n");
 }
 

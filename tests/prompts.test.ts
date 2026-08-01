@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { createReviewBundle } from "../src/bundle";
 import { buildFollowUpMessage, buildReviewerPrompt, buildReviewerQuestionPrompt } from "../src/prompts";
 
 test("reviewer prompt treats sentinel-only flags as terminal notes", () => {
@@ -32,6 +36,9 @@ test("every review prompt requests implementation-ready Markdown guidance", () =
     assert.match(prompt, /Put actionable explanation in "guidance" as Markdown/);
     assert.match(prompt, /concise fenced code snippet or minimal diff/);
     assert.match(prompt, /do not defer useful concrete guidance/);
+    assert.match(prompt, /Do not wrap it in a Markdown fence/);
+    assert.match(prompt, /literal, unescaped newlines/);
+    assert.match(prompt, /"verdict": "pass" \| "needs_changes" \| "error"/);
   }
 });
 
@@ -96,4 +103,24 @@ test("automatic correction feedback preserves Markdown guidance and fenced diffs
   assert.match(message, /Implementation guidance:/);
   assert.match(message, /```diff\n-run\(\)\n\+runSafely\(\)\n```/);
   assert.match(message, /Recommendation: Use `runSafely\(\)`/);
+});
+
+test("agentic reviewer bundle prompt permits only read-only filesystem commands and includes the response schema", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-bundle-prompt-"));
+  try {
+    const bundle = await createReviewBundle({
+      dir,
+      cwd: dir,
+      request: "review the change",
+      changes: [],
+      patch: "",
+    });
+
+    assert.match(bundle.bundlePrompt, /strictly read-only commands such as pwd, ls, find, rg, grep, sed, cat/);
+    assert.match(bundle.bundlePrompt, /Never modify files, run commands with persistent side effects/);
+    assert.doesNotMatch(bundle.bundlePrompt, /Do not modify files, run shell commands/);
+    assert.match(bundle.bundlePrompt, /"verdict": "pass" \| "needs_changes" \| "error"/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

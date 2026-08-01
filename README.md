@@ -57,13 +57,24 @@ pass. Each reviewer appears once in the implementing-model transmission, and
 review decisions are stored per reviewer rather than as an additional combined
 result. There is no separate aggregate summary, guidance, or finding set.
 Results from every reviewer are transmitted, including passing assessments,
-non-blocking observations, guidance, disagreements, and reviewer errors. Blocking findings
-are identified as required corrections; passing and non-blocking material
-remains visible without becoming mandatory work. The built-in Codex, Claude,
+non-blocking observations, guidance, disagreements, and reviewer errors.
+Blocking findings are identified as required corrections; passing and
+non-blocking material remains visible without becoming mandatory work. The built-in Codex, Claude,
 and little-coder model adapters run
 as read-only agentic reviewers so they can inspect the workspace and retained
 review bundle before deciding. Generic CLI reviewers remain prompt-only unless
 the configured command provides its own safe read-only behavior.
+
+Agentic reviewers may use their native read tools or strictly read-only shell
+commands (`ls`, `find`, `rg`, `grep`, `sed`, `cat`, and read-only Git commands)
+when the shell is their only filesystem interface. Codex starts in its
+`read-only` sandbox and receives a native output schema on the initial turn. A
+local no-op sandbox preflight detects platform sandbox startup failures before
+a model turn is spent.
+Reviewer output is parsed strictly first; a narrow fallback recovers the same
+schema when a model emits otherwise-valid fields with unescaped multiline
+Markdown. Sandbox startup failures remain explicit reviewer errors rather than
+being mislabeled as verdict-schema failures.
 
 ```json
 {

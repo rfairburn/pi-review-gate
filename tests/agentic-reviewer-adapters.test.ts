@@ -4,7 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ClaudeCliAdapter } from "../src/adapters/claude-cli";
-import { CodexCliAdapter } from "../src/adapters/codex-cli";
+import { CodexCliAdapter, codexSandboxPreflightArgs } from "../src/adapters/codex-cli";
+
+test("CodexCliAdapter uses the platform-agnostic current sandbox command", () => {
+  assert.deepEqual(codexSandboxPreflightArgs(), [
+    "sandbox",
+    "--permissions-profile",
+    ":read-only",
+    process.execPath,
+    "-e",
+    "",
+  ]);
+});
 
 test("CodexCliAdapter runs with read-only sandbox and review bundle access", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-codex-adapter-"));
@@ -56,11 +67,91 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
     assert.equal(resumed.verdict, "pass");
     assert.deepEqual(argv.includes("--sandbox"), true);
     assert.equal(argv[argv.indexOf("--sandbox") + 1], "read-only");
-    assert.deepEqual(argv.includes("--add-dir"), true);
-    assert.equal(argv[argv.indexOf("--add-dir") + 1], dir);
+    assert.equal(argv.includes("--add-dir"), false);
+    assert.deepEqual(argv.includes("--output-schema"), true);
+    const outputSchemaPath = argv[argv.indexOf("--output-schema") + 1];
+    const outputSchema = JSON.parse(await readFile(outputSchemaPath, "utf8"));
+    assert.deepEqual(outputSchema.properties.verdict.enum, ["pass", "needs_changes", "error"]);
     assert.equal(argv.includes("--ephemeral"), false);
     assert.deepEqual(resumedArgv.slice(0, 2), ["exec", "resume"]);
     assert.equal(resumedArgv.includes("codex-session-1"), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CodexCliAdapter reports a read-only sandbox startup failure explicitly", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-codex-sandbox-error-"));
+  try {
+    const commandPath = join(dir, "fake-codex.mjs");
+    await writeFile(commandPath, [
+      "#!/usr/bin/env node",
+      "import { writeFileSync } from 'node:fs';",
+      "const args=process.argv.slice(2);",
+      "const out=args[args.indexOf('--output-last-message')+1];",
+      "writeFileSync(out,JSON.stringify({decision:'blocked',summary:'cannot read',findings:[]}));",
+      "process.stderr.write('fs sandbox helper failed: bwrap: loopback: Failed RTM_NEWADDR');",
+      "process.stdin.resume();",
+      "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'sandbox-session'})+'\\n'));",
+    ].join("\n"), "utf8");
+    await chmod(commandPath, 0o755);
+
+    const adapter = new CodexCliAdapter({
+      id: "codex",
+      adapter: "codex-cli",
+      command: commandPath,
+      timeoutMs: 5000,
+    });
+    const result = await adapter.run({
+      id: "codex",
+      cwd: process.cwd(),
+      prompt: "review",
+      evidenceBundleDir: dir,
+      bundleDir: dir,
+      timeoutMs: 5000,
+    });
+
+    assert.equal(result.verdict, "error");
+    assert.equal(result.error, "sandbox_unavailable");
+    assert.match(result.summary, /read-only filesystem sandbox failed to start/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CodexCliAdapter preflights the platform sandbox before spending a reviewer turn", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-codex-preflight-"));
+  try {
+    const commandPath = join(dir, "codex");
+    const invocationPath = join(dir, "invocations.txt");
+    await writeFile(commandPath, [
+      "#!/usr/bin/env node",
+      "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
+      `const invocationPath=${JSON.stringify(invocationPath)};`,
+      "const count=existsSync(invocationPath)?Number(readFileSync(invocationPath,'utf8')):0;",
+      "writeFileSync(invocationPath,String(count+1));",
+      "if(process.argv[2]==='sandbox'){process.stderr.write('bwrap: loopback: Failed RTM_NEWADDR');process.exit(1);}",
+      "process.exit(9);",
+    ].join("\n"), "utf8");
+    await chmod(commandPath, 0o755);
+
+    const adapter = new CodexCliAdapter({
+      id: "codex",
+      adapter: "codex-cli",
+      command: commandPath,
+      timeoutMs: 5000,
+    });
+    const result = await adapter.run({
+      id: "codex",
+      cwd: process.cwd(),
+      prompt: "review",
+      evidenceBundleDir: dir,
+      bundleDir: dir,
+      timeoutMs: 5000,
+    });
+
+    assert.equal(result.error, "sandbox_unavailable");
+    assert.equal(await readFile(invocationPath, "utf8"), "1");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

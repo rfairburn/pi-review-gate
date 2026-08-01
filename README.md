@@ -151,7 +151,8 @@ examples/triple-review.json
 
 The little-coder model adapter is generic. The example currently uses
 `ollama/glm-5.2`, matching a provider/model entry from
-`~/.config/little-coder/models.json`.
+`~/.config/little-coder/models.json`. Review invocations use Pi's `high`
+thinking level by default; an explicit `args` entry can override it.
 
 For little-coder plus Codex review, use:
 

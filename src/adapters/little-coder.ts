@@ -30,6 +30,8 @@ export class LittleCoderAdapter implements ModelAdapter {
       "--mode",
       "json",
       "--print",
+      "--thinking",
+      "high",
       ...(this.config.args ?? []),
       "--session-id",
       sessionId,

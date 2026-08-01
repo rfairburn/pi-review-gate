@@ -68,7 +68,7 @@ test("/review-clear starts the next prompt fresh without deleting retained revie
     assert.equal(await readFile(retainedBundleMarker, "utf8"), "keep me");
     assert.match(notices.at(-1) ?? "", /next prompt will start fresh from the current workspace/);
     assert.match(notices.at(-1) ?? "", /bundle retention remains governed by retainBundles=always/);
-    assert.match(notices.at(-1) ?? "", /reviewer sessions were not deleted/);
+    assert.match(notices.at(-1) ?? "", /reviewer sessions from the cleared window will not be reused/);
 
     rememberUserRequest(state, "fresh task");
     const freshWindow = getReviewerQuestionWindow(state)!;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   extractPiUsageFromMessages,
+  extractCodexSessionId,
   extractReviewTextFromCodexJsonl,
   extractReviewTextFromClaudeJson,
   extractReviewTextFromPiJsonl,
@@ -96,6 +97,7 @@ test("extractReviewTextFromCodexJsonl reads completed agent message text", () =>
   ].join("\n");
 
   assert.equal(extractReviewTextFromCodexJsonl(output), reviewerJson);
+  assert.equal(extractCodexSessionId(output), "abc");
 });
 
 test("parseClaudeUsage reads json output usage and review text", () => {

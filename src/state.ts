@@ -1,12 +1,15 @@
-import type { WorkspaceSnapshot } from "./capture";
+import type { ChangedFile, WorkspaceSnapshot } from "./capture";
 import type { CorrectionFeedbackMarker } from "./correction-feedback";
 import {
   createEvidenceState,
   recordAcceptedReviewerQuestion as recordAcceptedQuestionEvidence,
   type AcceptedReviewerQuestion,
+  type EvidenceEvent,
   type EvidenceState,
 } from "./evidence";
+import type { ReviewerSession } from "./adapters/types";
 import type { ReviewFinding, ReviewResult } from "./schema";
+import type { TokenUsage } from "./usage";
 
 export type ReviewWindowStatus = "pending" | "active" | "paused_at_cap" | "paused";
 export type ReviewFeedbackSource = "automatic" | "manual";
@@ -24,6 +27,39 @@ export interface ReviewWindow {
   baseline?: WorkspaceSnapshot;
   evidence: EvidenceState;
   reviewHistory: ReviewFeedbackContext[];
+  exchanges: ReviewExchangeContext[];
+  activeExchange?: ActiveReviewExchange;
+  nextExchangeSequence: number;
+  bundleDir?: string;
+  nextReviewSequence: number;
+  reviewerSessions: Map<string, ReviewerSession>;
+  retainBundleAfterClose: boolean;
+  nextExchangeRequestIndex: number;
+}
+
+export interface ActiveReviewExchange {
+  sequence: number;
+  startedAt: string;
+  baseline?: WorkspaceSnapshot;
+  evidenceEventStart: number;
+  assistantSummaryStart: number;
+  requestHistoryStart: number;
+  causedByReviewSequence?: number;
+}
+
+export interface ReviewExchangeContext {
+  sequence: number;
+  startedAt: string;
+  endedAt: string;
+  workspaceChanges: ChangedFile[];
+  sideEffectChanges: ChangedFile[];
+  workspacePatch: string;
+  sideEffectPatch: string;
+  evidenceEvents: EvidenceEvent[];
+  assistantSummaries: string[];
+  userRequests: UserRequestContext[];
+  causedByReviewSequence?: number;
+  actingUsage?: TokenUsage;
 }
 
 export interface ReviewGateState {
@@ -86,13 +122,71 @@ export function rememberUserRequest(state: ReviewGateState, request: string): vo
 export function beginAgentRun(state: ReviewGateState): "new" | "continuation" {
   const window = state.reviewWindow ?? openReviewWindow(state);
   window.status = "active";
+  if (!window.activeExchange) {
+    window.activeExchange = {
+      sequence: window.nextExchangeSequence++,
+      startedAt: new Date().toISOString(),
+      evidenceEventStart: window.evidence.events.length,
+      assistantSummaryStart: window.evidence.finalAssistantSummaries.length,
+      requestHistoryStart: window.nextExchangeRequestIndex,
+      causedByReviewSequence: [...window.reviewHistory].reverse().find((feedback) => feedback.verdict === "needs_changes")?.sequence,
+    };
+  }
   return window.baseline ? "continuation" : "new";
 }
 
 export function setReviewWindowBaseline(state: ReviewGateState, baseline: WorkspaceSnapshot): void {
   const window = state.reviewWindow ?? openReviewWindow(state);
-  window.baseline = baseline;
+  window.baseline ??= baseline;
+  if (window.activeExchange && !window.activeExchange.baseline) {
+    window.activeExchange.baseline = baseline;
+  }
   window.status = "active";
+}
+
+export function activeExchangeHasBaseline(state: ReviewGateState): boolean {
+  return Boolean(state.reviewWindow?.activeExchange?.baseline);
+}
+
+export function completeActiveExchange(
+  window: ReviewWindow,
+  input: {
+    workspaceChanges: ChangedFile[];
+    sideEffectChanges: ChangedFile[];
+    workspacePatch: string;
+    sideEffectPatch: string;
+    actingUsage?: TokenUsage;
+  },
+): ReviewExchangeContext | undefined {
+  const active = window.activeExchange;
+  if (!active) {
+    return undefined;
+  }
+  const exchange: ReviewExchangeContext = {
+    sequence: active.sequence,
+    startedAt: active.startedAt,
+    endedAt: new Date().toISOString(),
+    workspaceChanges: input.workspaceChanges,
+    sideEffectChanges: input.sideEffectChanges,
+    workspacePatch: input.workspacePatch,
+    sideEffectPatch: input.sideEffectPatch,
+    evidenceEvents: window.evidence.events.slice(active.evidenceEventStart),
+    assistantSummaries: window.evidence.finalAssistantSummaries.slice(active.assistantSummaryStart),
+    userRequests: window.requestHistory.slice(active.requestHistoryStart).map((request) => ({ ...request })),
+    causedByReviewSequence: active.causedByReviewSequence,
+    actingUsage: input.actingUsage,
+  };
+  window.exchanges.push(exchange);
+  window.nextExchangeRequestIndex = window.requestHistory.length;
+  window.activeExchange = undefined;
+  return exchange;
+}
+
+export function hasUnresolvedReview(window: ReviewWindow | undefined): boolean {
+  if (!window) {
+    return false;
+  }
+  return window.reviewHistory.some((feedback) => feedback.verdict === "needs_changes");
 }
 
 export function closeReviewWindow(state: ReviewGateState, preserveForReviewerQuestions = false): void {
@@ -226,6 +320,12 @@ function openReviewWindow(state: ReviewGateState): ReviewWindow {
     correctionCycles: 0,
     evidence,
     reviewHistory: [],
+    exchanges: [],
+    nextExchangeSequence: 1,
+    nextReviewSequence: 1,
+    reviewerSessions: new Map(),
+    retainBundleAfterClose: false,
+    nextExchangeRequestIndex: 0,
   };
   state.reviewWindow = window;
   return window;

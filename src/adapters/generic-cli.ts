@@ -21,7 +21,7 @@ export class GenericCliAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs,
-      env: reviewerEnv(process.env),
+      env: reviewerEnv(process.env, req.evidenceBundleDir),
       signal: req.signal,
     });
 

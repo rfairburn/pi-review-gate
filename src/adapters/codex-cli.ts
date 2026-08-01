@@ -2,7 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CodexCliDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
-import { extractReviewTextFromCodexJsonl, parseCodexUsageFromJsonl } from "../usage";
+import { extractCodexSessionId, extractReviewTextFromCodexJsonl, parseCodexUsageFromJsonl } from "../usage";
 import { reviewerEnv, runPromptProcess } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 
@@ -16,20 +16,33 @@ export class CodexCliAdapter implements ModelAdapter {
     const stderrPath = join(req.bundleDir, "stderr.txt");
     const finalPath = join(req.bundleDir, "reviewer-final.txt");
     const usagePath = join(req.bundleDir, "usage.json");
-    const args = [
-      "exec",
-      "--json",
-      "--output-last-message",
-      finalPath,
-      ...(this.config.model ? ["--model", this.config.model] : []),
-      ...(this.config.args ?? []),
-      "--sandbox",
-      "read-only",
-      "--add-dir",
-      req.bundleDir,
-      "--skip-git-repo-check",
-      "-",
-    ];
+    const args = req.session
+      ? [
+        "exec",
+        "resume",
+        "--json",
+        "--output-last-message",
+        finalPath,
+        ...(this.config.model ? ["--model", this.config.model] : []),
+        ...(this.config.args ?? []),
+        "--skip-git-repo-check",
+        req.session.id,
+        "-",
+      ]
+      : [
+        "exec",
+        "--json",
+        "--output-last-message",
+        finalPath,
+        ...(this.config.model ? ["--model", this.config.model] : []),
+        ...(this.config.args ?? []),
+        "--sandbox",
+        "read-only",
+        "--add-dir",
+        req.evidenceBundleDir ?? req.bundleDir,
+        "--skip-git-repo-check",
+        "-",
+      ];
 
     const output = await runPromptProcess({
       command: this.config.command ?? "codex",
@@ -37,7 +50,7 @@ export class CodexCliAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: reviewerEnv(process.env),
+      env: reviewerEnv(process.env, req.evidenceBundleDir),
       signal: req.signal,
     });
     await Promise.all([
@@ -46,6 +59,10 @@ export class CodexCliAdapter implements ModelAdapter {
     ]);
 
     const usage = parseCodexUsageFromJsonl(output.stdout);
+    const sessionId = extractCodexSessionId(output.stdout) ?? req.session?.id;
+    if (sessionId) {
+      req.onSession?.({ adapter: this.kind, id: sessionId });
+    }
     await writeFile(usagePath, JSON.stringify(usage ?? null, null, 2), "utf8").catch(() => undefined);
 
     if (output.aborted) {

@@ -140,11 +140,14 @@ export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals)
   proc.kill(signal);
 }
 
-export function reviewerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function reviewerEnv(env: NodeJS.ProcessEnv, evidenceBundleDir?: string): NodeJS.ProcessEnv {
   const next = { ...env };
   next.PI_REVIEW_GATE_DISABLED = "1";
   next.LITTLE_CODER_REVIEW_GATE_DISABLED = "1";
   delete next.PI_EXTRA_EXTENSIONS;
   delete next.LITTLE_CODER_EXTRA_EXTENSIONS;
+  if (evidenceBundleDir) {
+    next.PI_REVIEW_GATE_BUNDLE_DIR = evidenceBundleDir;
+  }
   return next;
 }

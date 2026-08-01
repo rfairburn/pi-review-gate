@@ -12,8 +12,10 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
     const commandPath = join(dir, "fake-little-coder.mjs");
     await writeFile(commandPath, [
       "#!/usr/bin/env node",
-      "import { writeFileSync } from 'node:fs';",
-      `writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)));`,
+      "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
+      `const argvPath=${JSON.stringify(argvPath)};`,
+      "const history=existsSync(argvPath)?JSON.parse(readFileSync(argvPath,'utf8')):[];",
+      "history.push(process.argv.slice(2));writeFileSync(argvPath,JSON.stringify(history));",
       "process.stdin.resume();",
       "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({type:'message',message:{role:'assistant',content:[{type:'thinking',thinking:'still thinking'}]}})+'\\n'));",
     ].join("\n"), "utf8");
@@ -27,23 +29,37 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
       timeoutMs: 5000,
     });
 
+    let session;
     const result = await adapter.run({
       id: "glm",
       cwd: process.cwd(),
       prompt: "review",
       bundleDir: dir,
       timeoutMs: 5000,
+      onSession(value) { session = value; },
+    });
+    await adapter.run({
+      id: "glm",
+      cwd: process.cwd(),
+      prompt: "review correction",
+      bundleDir: dir,
+      timeoutMs: 5000,
+      session,
     });
 
     assert.equal(result.verdict, "error");
     assert.equal(result.error, "missing_final_text");
     assert.equal(result.summary, "Reviewer did not produce final assistant text.");
-    const argv = JSON.parse(await readFile(argvPath, "utf8"));
+    const [argv, resumedArgv] = JSON.parse(await readFile(argvPath, "utf8"));
     assert.deepEqual(argv.includes("--no-tools"), true);
     assert.deepEqual(argv.includes("--tools"), true);
     assert.deepEqual(argv.includes("read,grep,find,ls"), true);
     assert.deepEqual(argv.includes("--system-prompt"), true);
     assert.equal(argv.includes("--no-session"), false);
+    const sessionId = argv[argv.indexOf("--session-id") + 1];
+    assert.equal(typeof sessionId, "string");
+    assert.equal(resumedArgv[resumedArgv.indexOf("--session-id") + 1], sessionId);
+    assert.equal(argv[argv.indexOf("--session-dir") + 1], join(dir, "sessions", "glm"));
     assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, false);
   } finally {
     await rm(dir, { recursive: true, force: true });

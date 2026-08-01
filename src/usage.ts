@@ -98,6 +98,23 @@ export function extractReviewTextFromCodexJsonl(stdout: string): string {
   return lastText;
 }
 
+export function extractCodexSessionId(stdout: string): string | undefined {
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (isRecord(parsed) && parsed.type === "thread.started" && typeof parsed.thread_id === "string") {
+        return parsed.thread_id;
+      }
+    } catch {
+      // Ignore non-JSON diagnostic lines.
+    }
+  }
+  return undefined;
+}
+
 export function parseClaudeUsage(value: unknown): TokenUsage | undefined {
   if (!isRecord(value)) {
     return undefined;

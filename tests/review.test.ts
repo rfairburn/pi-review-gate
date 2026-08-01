@@ -175,7 +175,7 @@ test("runReview retains on any reviewer error even when aggregate requests chang
     assert.equal(output.result?.verdict, "needs_changes");
     assert.equal(output.result?.error, "partial_reviewer_error");
     assert.equal(output.bundleRetained, true);
-    await access(join(output.bundleDir ?? "", "reviewers", "bad-json", "raw-output.txt"));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", "reviewers", "bad-json", "raw-output.txt"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -203,9 +203,9 @@ test("runReview writes changed file artifacts into retained bundles", async () =
     });
 
     assert.equal(output.bundleRetained, true);
-    await access(join(output.bundleDir ?? "", "artifacts", "submitted", "before", "index.ts"));
-    await access(join(output.bundleDir ?? "", "artifacts", "submitted", "after", "index.ts"));
-    await access(join(output.bundleDir ?? "", "artifacts", "index.json"));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "submitted", "before", "index.ts"));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "submitted", "after", "index.ts"));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "index.json"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -231,7 +231,7 @@ test("runAskReviewer retains on any reviewer error even when aggregate answer is
 
     assert.equal(output.result?.verdict, "error");
     assert.equal(output.bundleRetained, true);
-    await access(join(output.bundleDir ?? "", "reviewers", "bad-json", "raw-output.txt"));
+    await access(join(output.bundleDir ?? "", "questions", "0001", "reviewers", "bad-json", "raw-output.txt"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

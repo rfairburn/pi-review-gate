@@ -1,4 +1,5 @@
 import type { ReviewGateConfig } from "./config";
+import { removeTransientWindowBundle } from "./bundle";
 import {
   buildRequestContext,
   clearReviewState,
@@ -56,10 +57,12 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, "review gate: cannot clear while a review is in progress; cancel the review first, then retry /review-clear");
         return;
       }
+      const windows = [input.state.reviewWindow, input.state.lastQuestionWindow];
       clearReviewState(input.state);
+      await Promise.all(windows.map((window) => removeTransientWindowBundle(window)));
       await sendCommandNotice(
         ctx,
-        `review gate: cleared; the next prompt will start fresh from the current workspace; bundle retention remains governed by retainBundles=${input.config.retainBundles}; reviewer sessions were not deleted`,
+        `review gate: cleared; the next prompt will start fresh from the current workspace; bundle retention remains governed by retainBundles=${input.config.retainBundles}; reviewer sessions from the cleared window will not be reused`,
       );
     },
   });
@@ -82,6 +85,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         config: input.config,
         evidence: window.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(window),
+        window,
         signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
         notify: (message) => sendCommandNotice(ctx, message),
       });
@@ -171,6 +175,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         config: input.config,
         evidence: contextWindow?.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
+        window: contextWindow,
         signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
         notify: (message) => sendCommandNotice(ctx, message),
       });

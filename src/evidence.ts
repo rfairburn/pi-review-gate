@@ -25,6 +25,7 @@ export interface AcceptedReviewerQuestion {
 
 export interface EvidenceEvent {
   sequence: number;
+  exchangeSequence?: number;
   phase: "tool_call" | "tool_result";
   toolName: string;
   summary: string;
@@ -40,6 +41,7 @@ export interface EvidenceCandidate {
   sources: string[];
   baseline?: FileSnapshot;
   baselineError?: string;
+  exchangeBaselines: Map<number, { snapshot?: FileSnapshot; error?: string }>;
 }
 
 export interface EvidenceBundle {
@@ -88,17 +90,26 @@ export async function recordToolCallEvidence(input: {
   toolName: string;
   toolInput?: Record<string, unknown>;
   snapshotOptions: SnapshotOptions;
+  exchangeSequence?: number;
 }): Promise<void> {
   const extracted = extractCandidatePaths(input.toolName, input.toolInput);
   const candidatePaths: string[] = [];
 
   for (const candidate of extracted.paths) {
     candidatePaths.push(candidate.path);
-    await addCandidate(input.state, input.cwd, candidate.path, candidate.source, input.snapshotOptions);
+    await addCandidate(
+      input.state,
+      input.cwd,
+      candidate.path,
+      candidate.source,
+      input.snapshotOptions,
+      input.exchangeSequence,
+    );
   }
 
   input.state.events.push({
     sequence: input.state.nextSequence++,
+    exchangeSequence: input.exchangeSequence,
     phase: "tool_call",
     toolName: input.toolName || "unknown",
     summary: summarizeToolInput(input.toolInput),
@@ -114,10 +125,12 @@ export function recordToolResultEvidence(input: {
   toolInput?: Record<string, unknown>;
   result?: unknown;
   isError?: boolean;
+  exchangeSequence?: number;
 }): void {
   const extracted = extractCandidatePaths(input.toolName, input.toolInput);
   input.state.events.push({
     sequence: input.state.nextSequence++,
+    exchangeSequence: input.exchangeSequence,
     phase: "tool_result",
     toolName: input.toolName || "unknown",
     summary: summarizeToolResult(input.result, input.isError),
@@ -132,17 +145,21 @@ export async function collectEvidenceChanges(
   state: EvidenceState,
   cwd: string,
   snapshotOptions: SnapshotOptions,
+  exchangeSequence?: number,
 ): Promise<ChangedFile[]> {
   const changes: ChangedFile[] = [];
   for (const candidate of state.candidates.values()) {
-    if (!candidate.baseline) {
+    const baseline = exchangeSequence === undefined
+      ? candidate.baseline
+      : candidate.exchangeBaselines.get(exchangeSequence)?.snapshot;
+    if (!baseline) {
       continue;
     }
     const after = await createPathSnapshot(cwd, candidate.absolutePath, snapshotOptions).catch(() => undefined);
     if (!after) {
       continue;
     }
-    const change = compareFileSnapshots(candidate.baseline, after);
+    const change = compareFileSnapshots(baseline, after);
     if (change) {
       changes.push(change);
     }
@@ -234,6 +251,7 @@ async function addCandidate(
   path: string,
   source: string,
   snapshotOptions: SnapshotOptions,
+  exchangeSequence?: number,
 ): Promise<void> {
   const absolutePath = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
   const key = absolutePath;
@@ -242,6 +260,7 @@ async function addCandidate(
     if (!existing.sources.includes(source)) {
       existing.sources.push(source);
     }
+    await captureExchangeBaseline(existing, inputSnapshotArgs(cwd, absolutePath, snapshotOptions, exchangeSequence));
     return;
   }
 
@@ -249,6 +268,7 @@ async function addCandidate(
     path,
     absolutePath,
     sources: [source],
+    exchangeBaselines: new Map(),
   };
   try {
     candidate.baseline = await createPathSnapshot(cwd, absolutePath, snapshotOptions);
@@ -256,6 +276,34 @@ async function addCandidate(
     candidate.baselineError = error instanceof Error ? error.message : "snapshot_failed";
   }
   state.candidates.set(key, candidate);
+  await captureExchangeBaseline(candidate, inputSnapshotArgs(cwd, absolutePath, snapshotOptions, exchangeSequence));
+}
+
+function inputSnapshotArgs(
+  cwd: string,
+  absolutePath: string,
+  snapshotOptions: SnapshotOptions,
+  exchangeSequence: number | undefined,
+): { cwd: string; absolutePath: string; snapshotOptions: SnapshotOptions; exchangeSequence: number } | undefined {
+  return exchangeSequence === undefined ? undefined : { cwd, absolutePath, snapshotOptions, exchangeSequence };
+}
+
+async function captureExchangeBaseline(
+  candidate: EvidenceCandidate,
+  input: { cwd: string; absolutePath: string; snapshotOptions: SnapshotOptions; exchangeSequence: number } | undefined,
+): Promise<void> {
+  if (!input || candidate.exchangeBaselines.has(input.exchangeSequence)) {
+    return;
+  }
+  try {
+    candidate.exchangeBaselines.set(input.exchangeSequence, {
+      snapshot: await createPathSnapshot(input.cwd, input.absolutePath, input.snapshotOptions),
+    });
+  } catch (error) {
+    candidate.exchangeBaselines.set(input.exchangeSequence, {
+      error: error instanceof Error ? error.message : "snapshot_failed",
+    });
+  }
 }
 
 function extractShellCandidatePaths(command: string): { paths: string[]; riskSignals: string[] } {

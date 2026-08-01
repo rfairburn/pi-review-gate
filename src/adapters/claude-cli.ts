@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ClaudeCliDeciderConfig } from "../config";
@@ -15,18 +16,21 @@ export class ClaudeCliAdapter implements ModelAdapter {
     const rawOutputPath = join(req.bundleDir, "raw-output.txt");
     const stderrPath = join(req.bundleDir, "stderr.txt");
     const usagePath = join(req.bundleDir, "usage.json");
+    const sessionId = req.session?.id ?? randomUUID();
+    req.onSession?.({ adapter: this.kind, id: sessionId });
     const args = [
       "--print",
       "--output-format",
       "json",
       ...(this.config.model ? ["--model", this.config.model] : []),
       ...(this.config.args ?? []),
+      ...(req.session ? ["--resume", sessionId] : ["--session-id", sessionId]),
       "--permission-mode",
       "dontAsk",
       "--tools",
       "Read,Grep,Glob",
       "--add-dir",
-      req.bundleDir,
+      req.evidenceBundleDir ?? req.bundleDir,
       "--append-system-prompt",
       "You are a read-only reviewer. You may inspect files with read-only tools, but you must not modify files, run shell commands, use network access, or ask the primary agent for more context. Return only the requested JSON.",
     ];
@@ -37,7 +41,7 @@ export class ClaudeCliAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: reviewerEnv(process.env),
+      env: reviewerEnv(process.env, req.evidenceBundleDir),
       signal: req.signal,
     });
     await Promise.all([

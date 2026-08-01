@@ -157,10 +157,12 @@ The wrapper flag also accepts explicit modes:
 --retain-review-bundles=always
 ```
 
-Built-in Codex, Claude, and little-coder reviewers currently retain their own
-CLI sessions. This is independent of `retainBundles`, which controls only the
-temporary review bundle. A future configuration option is planned for disabling
-reviewer-session persistence when an ephemeral review is preferred.
+Built-in Codex, Claude, and little-coder reviewers use one explicit CLI session
+per reviewer for the lifetime of a review window. Correction reviews and
+`/ask-reviewer` resume that same reviewer session against the same evidence
+bundle. A new review window always starts new reviewer sessions. The bundle is
+still authoritative: if a saved session cannot be resumed, the reviewer can be
+restarted from the complete bundle without losing review context.
 
 ## Temporary fake reviewer
 
@@ -185,20 +187,27 @@ PI_REVIEW_GATE_FAKE_VERDICT=retry \
 ./scripts/little-coder-fake-review.sh
 ```
 
-The review bundle includes a compact evidence ledger built from tool calls,
-tool results, high-confidence file path arguments, shell redirection targets,
-and the agent's final assistant summary. Exact `write` / `edit` paths and easy
-shell targets are pre-captured before execution, including absolute paths
-outside the current worktree.
+Each review window uses one stable temporary evidence bundle. Every completed
+agent run is appended as a numbered exchange containing its snapshot-derived
+workspace diff, captured side-effect diff, tool calls and results, assistant
+summary, usage, and before/after artifacts. The bundle also maintains the
+cumulative baseline-to-current patch and numbered reviewer invocations.
 
-Repository baselines, pre-captured outside-file baselines, user guidance,
-tool evidence, assistant summaries, and reviewer feedback belong to one review
-window. A requested correction keeps that window open so the next reviewer sees
-the original baseline and all intervening context. A passing review checkpoints
-and closes the window, while retaining it for an immediate `/ask-reviewer`
-follow-up. Later ordinary work starts a fresh window from current file contents,
-discards that retained question context, and does not re-review changes that
-already passed.
+Codex, Claude, and little-coder reviewers receive a compact prompt pointing to
+the bundle's `REVIEW.md` entry point and inspect the evidence with read-only
+tools. The generic CLI adapter retains the inline prompt as a compatibility
+transport and also receives the bundle path in `PI_REVIEW_GATE_BUNDLE_DIR`.
+Exact `write` / `edit` paths and easy shell targets are pre-captured before
+execution, including absolute paths outside the current worktree.
+
+Repository baselines, per-exchange snapshots, pre-captured outside-file
+baselines, user guidance, tool evidence, assistant summaries, reviewer feedback,
+and reviewer sessions belong to one review window. A requested correction keeps
+that window open. Even when a correction exactly restores the original baseline,
+the next reviewer sees the inverse exchange diff and validates the correction.
+A passing review checkpoints and closes the window while retaining it for an
+immediate `/ask-reviewer` follow-up. Later ordinary work starts a fresh window
+from current file contents and does not re-review changes that already passed.
 
 ## Commands
 
@@ -208,9 +217,9 @@ correction feedback, and queued user input. The next ordinary prompt starts a
 fresh window from the workspace's current contents. It does not revert files or
 override bundle retention: bundles continue to be retained or removed by the
 configured `retainBundles` policy (`never`, `on-failure`, or `always`).
-Already-retained bundles and reviewer CLI sessions are not deleted by
-`/review-clear`. If a review is currently running, cancel it first and then run
-`/review-clear`.
+Already-retained bundles remain governed by that policy. Reviewer sessions from
+the cleared window are never reused. If a review is currently running, cancel it
+first and then run `/review-clear`.
 
 `/review-now` reruns the configured reviewer or reviewers against the active
 review window's baseline and evidence. A pass checkpoints and closes that
@@ -249,15 +258,13 @@ does not accept or record the answer. When a question follows a passing review,
 its accepted Q&A is carried into the new review window created for the submitted
 reviewer note without reusing the already-checkpointed file baseline.
 
-Retained review bundles include `request.md`, `changed-files.json`,
-`patch.diff`, `side-effect.patch.diff`, `reviewer-prompt.md`, `evidence.json`,
-`evidence.md`, `acting-model-usage.json`, aggregate `parsed-result.json`,
-`reviewer-results.json`, aggregate `reviewer-usage.json`, and an `artifacts/`
-tree with captured before/after file contents and evidence baselines where
-available. Each reviewer also writes isolated outputs under `reviewers/<id>/`,
-including `raw-output.txt`, `stderr.txt`, `parsed-result.json`, and
-`reviewer-usage.json`. The little-coder model adapter stores the extracted final
-review in `raw-output.txt` and the capped JSONL stream separately as
-`raw-stream.jsonl`. When supported by the reviewer CLI, user-facing notices
-include a compact reviewer token summary, for example
+Retained review bundles include `REVIEW.md`, `manifest.json`, `request.md`, a
+`current/` cumulative view, immutable `exchanges/<sequence>/` evidence,
+numbered `reviews/<sequence>/` and `questions/<sequence>/` invocations,
+`sessions.json`, and captured before/after artifacts. Reviewer outputs remain
+isolated under each invocation's `reviewers/<id>/` directory. The little-coder
+model adapter stores the extracted final review in `raw-output.txt` and the
+capped JSONL stream separately as `raw-stream.jsonl`. When supported by the
+reviewer CLI, user-facing notices include a compact reviewer token summary, for
+example
 `review gate: passed (review tokens: in 1.2k, out 340, total 1.6k)`.

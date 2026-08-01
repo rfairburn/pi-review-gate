@@ -1,4 +1,5 @@
 import { loadConfig } from "./config";
+import { removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
@@ -7,6 +8,7 @@ import { registerHook, extractContext, extractCwd, extractInputSource, extractIn
 import { buildReviewerResultsNotice } from "./prompts";
 import { runReview, type ReviewRunOutput } from "./review";
 import {
+  activeExchangeHasBaseline,
   beginAgentRun,
   buildRequestContext,
   closeReviewWindow,
@@ -47,19 +49,21 @@ export async function activate(pi: unknown): Promise<void> {
   let activeReviewAbort: ReviewAbortHandle | undefined;
   const sessionAbortController = new AbortController();
 
-  registerHook(pi, "session_shutdown", () => {
+  registerHook(pi, "session_shutdown", async () => {
     sessionActive = false;
     sessionAbortController.abort();
     activeReviewAbort?.shutdown();
     activeReviewAbort = undefined;
+    const retainedQuestionWindow = state.lastQuestionWindow;
     discardSessionState(state);
+    await removeTransientWindowBundle(retainedQuestionWindow);
   });
 
   registerHook(pi, "session_start", async (...args) => {
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
   });
 
-  registerHook(pi, "input", (...args) => {
+  registerHook(pi, "input", async (...args) => {
     currentCwd = extractCwd(args, currentCwd);
     if (extractInputSource(args) === "extension") {
       return;
@@ -69,13 +73,15 @@ export async function activate(pi: unknown): Promise<void> {
       state.queuedUserInputsDuringReview.push(text.trim());
       return { action: "handled" };
     }
+    const expiredQuestionWindow = state.reviewWindow ? undefined : state.lastQuestionWindow;
     rememberUserRequest(state, text);
+    await removeTransientWindowBundle(expiredQuestionWindow);
   });
 
   registerHook(pi, "before_agent_start", async (...args) => {
     currentCwd = extractCwd(args, currentCwd);
-    const runKind = beginAgentRun(state);
-    if (runKind === "continuation") {
+    beginAgentRun(state);
+    if (activeExchangeHasBaseline(state)) {
       return;
     }
     const baseline = await createWorkspaceSnapshot(currentCwd, {
@@ -101,6 +107,7 @@ export async function activate(pi: unknown): Promise<void> {
         maxFileBytes: config.maxFileBytes,
         maxSnapshotBytes: config.maxSnapshotBytes,
       },
+      exchangeSequence: window.activeExchange?.sequence,
     });
   });
 
@@ -117,6 +124,7 @@ export async function activate(pi: unknown): Promise<void> {
       toolInput: toolArgs,
       result: args[0],
       isError: isToolError(args[0]),
+      exchangeSequence: window.activeExchange?.sequence,
     });
   });
 
@@ -158,6 +166,7 @@ export async function activate(pi: unknown): Promise<void> {
         evidence: window.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(window),
         actingUsage,
+        window,
         signal: reviewAbort.signal,
         notify: (message) => sendNoticeWhileSessionActive(noticeTarget, message, () => sessionActive),
       });
@@ -172,6 +181,9 @@ export async function activate(pi: unknown): Promise<void> {
       reviewAbort.cleanup();
       if (activeReviewAbort === reviewAbort) {
         activeReviewAbort = undefined;
+      }
+      if (!sessionActive) {
+        await removeTransientWindowBundle(window);
       }
     }
 

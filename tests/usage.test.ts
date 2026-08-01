@@ -32,6 +32,8 @@ test("parseCodexUsageFromJsonl reads token_count events", () => {
   ].join("\n"));
 
   assert.equal(usage?.inputTokens, 1200);
+  assert.equal(usage?.totalInputTokens, 1200);
+  assert.equal(usage?.uncachedInputTokens, 1100);
   assert.equal(usage?.cachedInputTokens, 100);
   assert.equal(usage?.outputTokens, 250);
   assert.equal(usage?.reasoningOutputTokens, 75);
@@ -54,6 +56,8 @@ test("parseCodexUsageFromJsonl reads turn.completed usage events", () => {
   ].join("\n"));
 
   assert.equal(usage?.inputTokens, 19030);
+  assert.equal(usage?.totalInputTokens, 19030);
+  assert.equal(usage?.uncachedInputTokens, 14038);
   assert.equal(usage?.cachedInputTokens, 4992);
   assert.equal(usage?.outputTokens, 556);
   assert.equal(usage?.reasoningOutputTokens, 516);
@@ -116,6 +120,8 @@ test("parseClaudeUsage reads json output usage and review text", () => {
 
   assert.equal(extractReviewTextFromClaudeJson(output), output.result);
   assert.equal(usage?.inputTokens, 900);
+  assert.equal(usage?.totalInputTokens, 1350);
+  assert.equal(usage?.uncachedInputTokens, 900);
   assert.equal(usage?.cachedInputTokens, 400);
   assert.equal(usage?.cacheWriteTokens, 50);
   assert.equal(usage?.outputTokens, 150);
@@ -165,6 +171,8 @@ test("extractReviewTextFromPiJsonl reads assistant text and little-coder usage",
 
   assert.match(extracted.text, /"verdict":"pass"/);
   assert.equal(extracted.usage?.inputTokens, 800);
+  assert.equal(extracted.usage?.totalInputTokens, 1025);
+  assert.equal(extracted.usage?.uncachedInputTokens, 800);
   assert.equal(extracted.usage?.cachedInputTokens, 200);
   assert.equal(extracted.usage?.cacheWriteTokens, 25);
   assert.equal(extracted.usage?.outputTokens, 125);
@@ -183,6 +191,8 @@ test("extractPiUsageFromMessages sums acting model usage from agent_end args", (
   ]);
 
   assert.equal(usage?.inputTokens, 300);
+  assert.equal(usage?.totalInputTokens, 360);
+  assert.equal(usage?.uncachedInputTokens, 300);
   assert.equal(usage?.cachedInputTokens, 20);
   assert.equal(usage?.cacheWriteTokens, 40);
   assert.equal(usage?.outputTokens, 90);
@@ -193,7 +203,19 @@ test("extractPiUsageFromMessages sums acting model usage from agent_end args", (
 test("formatTokenUsage returns compact user-facing summary", () => {
   assert.equal(
     formatTokenUsage({ inputTokens: 1200, outputTokens: 345, totalTokens: 1545 }),
-    "review tokens: in 1.2k, out 345, total 1.5k",
+    "review tokens (this pass): input 1.2k, out 345, total 1.5k",
+  );
+  assert.equal(
+    formatTokenUsage({
+      scope: "invocation",
+      inputTokens: 1200,
+      totalInputTokens: 1200,
+      uncachedInputTokens: 1100,
+      cachedInputTokens: 100,
+      outputTokens: 345,
+      totalTokens: 1545,
+    }),
+    "review tokens (this pass): input 1.2k (uncached 1.1k, cached 100), out 345, total 1.5k",
   );
   assert.equal(formatTokenUsage(undefined), "review tokens: unavailable");
   assert.equal(formatTokenUsage({ inputTokens: 0, outputTokens: 0, totalTokens: 0 }), "review tokens: unavailable");

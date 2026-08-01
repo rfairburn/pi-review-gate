@@ -314,4 +314,4 @@ model adapter stores the extracted final review in `raw-output.txt` and the
 capped JSONL stream separately as `raw-stream.jsonl`. When supported by the
 reviewer CLI, user-facing notices include a compact reviewer token summary, for
 example
-`review gate: passed (review tokens: in 1.2k, out 340, total 1.6k)`.
+`review gate: passed (review tokens (this pass): input 1.2k (uncached 400, cached 800), out 340, total 1.6k)`.

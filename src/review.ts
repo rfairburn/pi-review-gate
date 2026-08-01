@@ -531,7 +531,10 @@ function aggregateUsage(results: ReviewResult[]): ReviewResult["usage"] {
     return undefined;
   }
   return {
+    scope: "invocation",
     inputTokens: sumUsage(usages, "inputTokens"),
+    totalInputTokens: sumUsage(usages, "totalInputTokens"),
+    uncachedInputTokens: sumUsage(usages, "uncachedInputTokens"),
     cachedInputTokens: sumUsage(usages, "cachedInputTokens"),
     outputTokens: sumUsage(usages, "outputTokens"),
     reasoningOutputTokens: sumUsage(usages, "reasoningOutputTokens"),

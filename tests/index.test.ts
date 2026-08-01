@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { activate } from "../src/index";
 
-test("cap notice includes reviewer requested changes", async () => {
+test("cap status is concise while reviewer results are delivered once in the transmission", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-cap-"));
   const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
@@ -39,12 +39,16 @@ test("cap notice includes reviewer requested changes", async () => {
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
     const notices: string[] = [];
+    const followUps: string[] = [];
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
       notify(message: string) {
         notices.push(message);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
       },
     };
 
@@ -58,8 +62,10 @@ test("cap notice includes reviewer requested changes", async () => {
     assert.match(noticeText, /automatic correction cap reached/);
     assert.match(noticeText, /Complete reviewer feedback was transmitted to the implementing model/);
     assert.match(noticeText, /Use \/review-continue to authorize/);
-    assert.match(noticeText, /missing guard/);
-    assert.match(noticeText, /add the guard/);
+    assert.doesNotMatch(noticeText, /missing guard/);
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0] ?? "", /missing guard/);
+    assert.match(followUps[0] ?? "", /add the guard/);
   } finally {
     if (previousConfig === undefined) {
       delete process.env.PI_REVIEW_GATE_CONFIG;
@@ -467,7 +473,14 @@ test("escape terminal input aborts an active reviewer process", async () => {
     assert.match(notices.join("\n"), /review gate: passed/);
     assert.doesNotMatch(notices.join("\n"), /lost cancelled review context/);
     assert.equal(followUps.length, 1);
+    assert.match(followUps[0]?.message ?? "", /Review pass 2 transmission/);
     assert.match(followUps[0]?.message ?? "", /Gate verdict: pass/);
+    const bundleDir = extractBundleDir(followUps[0]?.message ?? "", 2);
+    assert.match(
+      await readFile(join(bundleDir, "reviews", "0001", "CANCELED.md"), "utf8"),
+      /A review would have been run here but was canceled by the user\./,
+    );
+    await assert.rejects(access(join(bundleDir, "reviews", "0001", "reviewers", "fake", "parsed-result.json")), /ENOENT/);
     assert.equal(terminalHandlers.length, 0);
   } finally {
     if (previousConfig === undefined) {
@@ -912,7 +925,8 @@ test("/review-continue after cap preserves original baseline and accumulated evi
     await commands.get("review-continue")?.("", { notify(message: string) { notices.push(message); } });
 
     assert.equal(followUps.length, 2);
-    assert.match(followUps[1]?.message ?? "", /missing guard/);
+    assert.match(followUps[1]?.message ?? "", /correction authorization/);
+    assert.doesNotMatch(followUps[1]?.message ?? "", /missing guard/);
     const cappedBundleDir = extractBundleDir(followUps[0]?.message ?? "", 1);
     const cappedDeliveries = JSON.parse(await readFile(
       join(cappedBundleDir, "reviews", "0001", "delivery.json"),
@@ -923,7 +937,6 @@ test("/review-continue after cap preserves original baseline and accumulated evi
       ["deferred", "correction_required"],
     );
 
-    await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo continued-fix-evidence" } });
     await writeFile(join(dir, "index.ts"), "fixed after continue\n", "utf8");
     await trigger(hooks, "agent_end", {
@@ -1068,13 +1081,13 @@ test("normal user input after cap continues the unresolved review window with co
 test("a passed review remains available to /ask-reviewer but is checkpointed out of the next regular window", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-window-checkpoint-"));
   const outside = join(tmpdir(), `pi-review-gate-outside-review-${process.pid}-${Date.now()}.md`);
+  const invocationPath = join(tmpdir(), `pi-review-gate-window-invocations-${process.pid}-${Date.now()}.txt`);
   const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.19\n", "utf8");
     await writeFile(outside, "old review document\n", "utf8");
-    const invocationPath = join(dir, "review-invocations.txt");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
       enabled: true,
@@ -1148,7 +1161,6 @@ test("a passed review remains available to /ask-reviewer but is checkpointed out
       messages: [{ role: "assistant", content: "finished first Docker task and review document" }],
     });
 
-    await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "agent_end", {
       cwd: dir,
       messages: [{ role: "assistant", content: "acknowledged the passing review" }],
@@ -1174,7 +1186,11 @@ test("a passed review remains available to /ask-reviewer but is checkpointed out
       messages: [{ role: "assistant", content: "finished second Docker task" }],
     });
 
-    assert.equal(notices.filter((notice) => /review gate: passed/.test(notice)).length, 2);
+    assert.equal(
+      notices.filter((notice) => /review gate: passed/.test(notice)).length,
+      2,
+      notices.join("\n"),
+    );
     assert.match(editorViews[0]?.prefill ?? "", /passed context retained for question/);
     assert.doesNotMatch(notices.join("\n"), /review windows mixed/);
   } finally {
@@ -1190,6 +1206,7 @@ test("a passed review remains available to /ask-reviewer but is checkpointed out
     }
     await rm(dir, { recursive: true, force: true });
     await rm(outside, { force: true });
+    await rm(invocationPath, { force: true });
   }
 });
 
@@ -1265,7 +1282,6 @@ test("repeated no-progress reviewer feedback stops automatic correction loop", a
     assert.equal(followUps.length, 1);
     assert.match(followUps[0]?.message ?? "", /sentinel flag/);
 
-    await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "agent_end", {
       cwd: dir,
       messages: [{ role: "assistant", content: "no implementation change is required" }],
@@ -1376,17 +1392,23 @@ test("a passing multi-model review discloses every result and reviews changes ma
     assert.match(followUps[0] ?? "", /### beta — pass/);
     assert.match(followUps[0] ?? "", /beta optional guidance/);
     assert.match(followUps[0] ?? "", /beta observational note/);
+    assert.doesNotMatch(followUps[0] ?? "", /Aggregate decision/);
 
     const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
     const passOneDir = join(bundleDir, "reviews", "0001");
     assert.equal(await readFile(join(passOneDir, "implementing-model-transmission.md"), "utf8"), followUps[0]);
+    const envelope = JSON.parse(await readFile(join(passOneDir, "implementing-model-transmission.json"), "utf8"));
+    assert.equal(envelope.gateVerdict, "pass");
+    assert.equal(envelope.reviewerResults.length, 2);
+    assert.equal("aggregateResult" in envelope, false);
+    await assert.rejects(access(join(passOneDir, "parsed-result.json")), /ENOENT/);
     const delivery = JSON.parse(await readFile(join(passOneDir, "delivery.json"), "utf8"));
     assert.equal(delivery.recipient, "implementing_model");
     assert.equal(delivery.deliveries.length, 1);
     assert.equal(delivery.deliveries[0].action, "passed");
-    assert.equal(delivery.deliveries[0].message, followUps[0]);
+    assert.equal(delivery.deliveries[0].content, "implementing-model-transmission.md");
+    assert.equal(delivery.deliveries[0].message, undefined);
 
-    await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "follow-up implementation\n", "utf8");
     await trigger(hooks, "agent_end", { cwd: dir });
 
@@ -1459,7 +1481,6 @@ test("an unchanged response to a passing transmission closes without another rev
     await trigger(hooks, "agent_end", { cwd: dir });
     const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
 
-    await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "agent_end", {
       cwd: dir,
       messages: [{ role: "assistant", content: "acknowledged the review without changing files" }],

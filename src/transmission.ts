@@ -16,7 +16,7 @@ export interface ReviewTransmissionEnvelope {
   reviewSequence: number;
   intendedRecipient: "implementing_model";
   action: ReviewTransmissionAction;
-  aggregateResult: ReviewResult;
+  gateVerdict: ReviewResult["verdict"];
   reviewerResults: Array<{
     result: ReviewResult;
     findings: Array<{ id: string; finding: ReviewFinding }>;
@@ -25,7 +25,7 @@ export interface ReviewTransmissionEnvelope {
 
 export function buildReviewTransmission(input: {
   reviewSequence: number;
-  result: ReviewResult;
+  gateVerdict: ReviewResult["verdict"];
   reviewerResults: ReviewResult[];
   bundleDir: string;
   action: ReviewTransmissionAction;
@@ -42,7 +42,7 @@ export function buildReviewTransmission(input: {
     reviewSequence: input.reviewSequence,
     intendedRecipient: "implementing_model",
     action: input.action,
-    aggregateResult: input.result,
+    gateVerdict: input.gateVerdict,
     reviewerResults,
   };
 
@@ -75,12 +75,17 @@ export async function writeReviewDeliveryReceipt(
     .then((content) => JSON.parse(content) as { deliveries?: unknown[] })
     .catch(() => ({ deliveries: [] as unknown[] }));
   const deliveries = Array.isArray(existing.deliveries) ? existing.deliveries : [];
-  deliveries.push({
+  const delivery: Record<string, unknown> = {
     sequence: deliveries.length + 1,
     deliveredAt: new Date().toISOString(),
     action,
-    message,
-  });
+  };
+  if (deliveries.length === 0) {
+    delivery.content = "implementing-model-transmission.md";
+  } else {
+    delivery.message = message;
+  }
+  deliveries.push(delivery);
   await writeFile(path, JSON.stringify({
     recipient: "implementing_model",
     deliveries,
@@ -91,7 +96,7 @@ function renderTransmission(envelope: ReviewTransmissionEnvelope, bundleDir: str
   const lines = [
     `Review pass ${envelope.reviewSequence} transmission for the implementing model.`,
     "",
-    `Gate verdict: ${envelope.aggregateResult.verdict}`,
+    `Gate verdict: ${envelope.gateVerdict}`,
     actionText(envelope.action),
     "",
     "Every official reviewer result from this pass is included below. Passing assessments and non-blocking notes are informational; they are not hidden and do not become required corrections unless explicitly identified as required.",
@@ -132,20 +137,25 @@ function renderTransmission(envelope: ReviewTransmissionEnvelope, bundleDir: str
 
   lines.push(
     "",
-    "## Aggregate decision",
-    "",
-    `Summary: ${envelope.aggregateResult.summary}`,
-  );
-  if (envelope.aggregateResult.guidance) {
-    lines.push("", "Guidance:", envelope.aggregateResult.guidance);
-  }
-  lines.push(
-    "",
     `Complete immutable pass evidence: ${join(bundleDir, "reviews", sequencePath(envelope.reviewSequence))}`,
     "",
     "This verdict applies to the workspace snapshot reviewed in this pass. If you make additional workspace or persistent side-effect changes, they will be treated as a continuation and reviewed again.",
   );
   return lines.join("\n");
+}
+
+export function buildReviewAuthorizationMessage(input: {
+  reviewSequence: number;
+  bundleDir: string;
+}): string {
+  return [
+    `Review pass ${input.reviewSequence} correction authorization for the implementing model.`,
+    "",
+    "The complete individual reviewer results were already disclosed in the earlier deferred transmission.",
+    "Action: Correction is now authorized. Address the blocking findings, run relevant tests, and report the result.",
+    "",
+    `Complete immutable pass evidence: ${join(input.bundleDir, "reviews", sequencePath(input.reviewSequence))}`,
+  ].join("\n");
 }
 
 function actionText(action: ReviewTransmissionAction): string {

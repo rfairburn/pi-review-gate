@@ -131,7 +131,7 @@ test("/review-now requested changes reset the automatic correction budget", asyn
   }
 });
 
-test("/review-now notice shows non-blocking reviewer results in multi-reviewer runs", async () => {
+test("/review-now delivers multi-reviewer results once and keeps its notice concise", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-multi-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -174,9 +174,9 @@ test("/review-now notice shows non-blocking reviewer results in multi-reviewer r
     assert.match(followUps[0] ?? "", /\[blocking\] index\.ts\n  Issue: missing test\n  Recommendation: add coverage/);
     assert.match(followUps[0] ?? "", /### claude — pass/);
     assert.match(followUps[0] ?? "", /claude found no blocking issues/);
-    assert.match(noticeText, /Reviewer results:/);
-    assert.match(noticeText, /- blocking: needs_changes, 1 blocking - fix required/);
-    assert.match(noticeText, /- claude: pass - claude found no blocking issues/);
+    assert.match(noticeText, /review gate: changes requested/);
+    assert.doesNotMatch(noticeText, /Reviewer results:/);
+    assert.doesNotMatch(noticeText, /claude found no blocking issues/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -358,7 +358,6 @@ test("/ask-reviewer at the correction cap receives the complete unresolved revie
     recordReviewerFeedback(state, {
       source: "automatic",
       disposition: "held_at_cap",
-      followUpMessage: cappedFollowUp,
       result: {
         reviewerId: "codex",
         verdict: "needs_changes",
@@ -552,8 +551,11 @@ test("/ask-reviewer opens partial multi-reviewer answers when one reviewer error
 
     assert.equal(userMessages.length, 0);
     assert.equal(editorViews.length, 1);
-    assert.match(editorViews[0]?.prefill ?? "", /Answer: passing: reviewer answer ready/);
-    assert.match(editorViews[0]?.prefill ?? "", /bad-json: Reviewer JSON has an invalid verdict/);
+    assert.match(editorViews[0]?.prefill ?? "", /## passing — pass/);
+    assert.match(editorViews[0]?.prefill ?? "", /Answer: reviewer answer ready/);
+    assert.match(editorViews[0]?.prefill ?? "", /## bad-json — error/);
+    assert.match(editorViews[0]?.prefill ?? "", /Answer: Reviewer JSON has an invalid verdict/);
+    assert.match(editorViews[0]?.prefill ?? "", /Reviewer error: schema_error/);
     assert.match(editorViews[0]?.prefill ?? "", /Retained review bundle: /);
     assert.match(notices.join("\n"), /reviewer answer cleared, bundle retained at /);
     assert.doesNotMatch(notices.join("\n"), /ask-reviewer failed/);

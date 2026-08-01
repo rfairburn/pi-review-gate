@@ -8,7 +8,7 @@ import {
   type EvidenceState,
 } from "./evidence";
 import type { ReviewerSession } from "./adapters/types";
-import type { ReviewFinding, ReviewResult } from "./schema";
+import type { ReviewResult } from "./schema";
 import type { TokenUsage } from "./usage";
 
 export type ReviewWindowStatus = "pending" | "active" | "paused_at_cap" | "paused";
@@ -93,12 +93,7 @@ export interface ReviewFeedbackContext {
   source: ReviewFeedbackSource;
   disposition: ReviewFeedbackDisposition;
   verdict: ReviewResult["verdict"];
-  summary: string;
-  findings: ReviewFinding[];
-  guidance?: string;
   reviewerResults: ReviewResult[];
-  transmissions: string[];
-  followUpMessage?: string;
 }
 
 export function createState(): ReviewGateState {
@@ -159,6 +154,22 @@ export function setReviewWindowBaseline(state: ReviewGateState, baseline: Worksp
     window.activeExchange.baseline = baseline;
   }
   window.status = "active";
+}
+
+export function armReviewResponseExchange(state: ReviewGateState, reviewedSnapshot: WorkspaceSnapshot): void {
+  beginAgentRun(state);
+  const window = state.reviewWindow;
+  const active = state.reviewWindow?.activeExchange;
+  if (!active || !window) {
+    return;
+  }
+  active.baseline ??= reviewedSnapshot;
+  const feedback = [...window.reviewHistory].reverse().find((item) => reviewResponseMode(item.disposition) !== undefined);
+  if (feedback) {
+    active.causedByReviewSequence = feedback.sequence;
+    active.causedByReviewVerdict = feedback.verdict;
+    active.reviewResponseMode = reviewResponseMode(feedback.disposition);
+  }
 }
 
 export function activeExchangeHasBaseline(state: ReviewGateState): boolean {
@@ -256,7 +267,6 @@ export function recordReviewerFeedback(
     reviewSequence?: number;
     source: ReviewFeedbackSource;
     disposition: ReviewFeedbackDisposition;
-    followUpMessage?: string;
   },
 ): void {
   const window = state.reviewWindow;
@@ -268,33 +278,22 @@ export function recordReviewerFeedback(
     source: input.source,
     disposition: input.disposition,
     verdict: input.result.verdict,
-    summary: input.result.summary,
-    guidance: input.result.guidance,
-    findings: input.result.findings.map((finding) => ({ ...finding })),
     reviewerResults: (input.reviewerResults ?? [input.result]).map(cloneReviewResult),
-    transmissions: input.followUpMessage ? [input.followUpMessage] : [],
-    followUpMessage: input.followUpMessage,
   });
 }
 
 export function markCappedFeedbackSent(
   state: ReviewGateState,
-  followUpMessage: string,
 ): ReviewFeedbackContext | undefined {
   const history = state.reviewWindow?.reviewHistory;
   if (!history) {
     return;
   }
   const feedback = [...history].reverse().find((item) =>
-    item.disposition === "sent_at_cap"
-      || (item.disposition === "held_at_cap" && item.followUpMessage === followUpMessage)
+    item.disposition === "sent_at_cap" || item.disposition === "held_at_cap"
   );
   if (feedback) {
     feedback.disposition = "held_then_sent";
-    if (!feedback.transmissions.includes(followUpMessage)) {
-      feedback.transmissions.push(followUpMessage);
-    }
-    feedback.followUpMessage = followUpMessage;
   }
   return feedback;
 }
@@ -321,12 +320,7 @@ export function buildRequestContext(state: ReviewGateState, window = state.revie
       lines.push(
         "",
         `Review ${feedback.sequence} (${feedback.source}; ${feedback.verdict}; ${formatDisposition(feedback.disposition)}):`,
-        `Summary: ${feedback.summary}`,
       );
-      for (const finding of feedback.findings) {
-        const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
-        lines.push(`- ${finding.severity} ${location}: ${finding.issue} ${finding.recommendation}`);
-      }
       if (feedback.reviewerResults.length > 0) {
         lines.push("Complete individual reviewer results delivered to the implementing model:");
         for (const reviewer of feedback.reviewerResults) {
@@ -339,12 +333,6 @@ export function buildRequestContext(state: ReviewGateState, window = state.revie
             lines.push(`  - ${finding.severity} ${location}: ${finding.issue} ${finding.recommendation}`);
           }
         }
-      }
-      if (feedback.transmissions.length > 0) {
-        lines.push("Implementing-model transmissions delivered during this pass:");
-        feedback.transmissions.forEach((transmission, index) => {
-          lines.push(`${index + 1}.`, transmission);
-        });
       }
     }
   }

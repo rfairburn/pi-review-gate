@@ -298,6 +298,7 @@ async function writeReviewIndex(
     "For correction reviews, read the latest `exchanges/<sequence>/submitted.patch`, tool events, and assistant summary.",
     "Earlier exchange directories and review results are historical evidence; the current workspace is ground truth.",
     "For every completed prior pass, read `reviews/<sequence>/implementing-model-transmission.md` and `delivery.json`. Those files record exactly what the implementing model was told and whether it was a required correction, passing observation, deferred finding, or review error.",
+    "A numbered invocation containing `CANCELED.md` is a cancellation tombstone, not a completed reviewer result. It preserves sequence history but contributes no verdict or findings.",
     "",
     "## Exchanges",
     "",

@@ -5,10 +5,10 @@ import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
-import { buildReviewerResultsNotice } from "./prompts";
 import { runReview, type ReviewRunOutput } from "./review";
 import {
   activeExchangeHasBaseline,
+  armReviewResponseExchange,
   beginAgentRun,
   buildRequestContext,
   closeReviewWindow,
@@ -21,7 +21,7 @@ import {
   type ReviewGateState,
 } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
-import { buildReviewTransmission, writeReviewDeliveryReceipt, writeReviewTransmission, type ReviewTransmissionAction } from "./transmission";
+import { buildReviewAuthorizationMessage, buildReviewTransmission, writeReviewDeliveryReceipt, writeReviewTransmission, type ReviewTransmissionAction } from "./transmission";
 
 declare const module: {
   exports: unknown;
@@ -225,7 +225,7 @@ export async function activate(pi: unknown): Promise<void> {
       });
       await sendNoticeWhileSessionActive(
         noticeTarget,
-        withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output),
+        `review gate: passed (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
       if (sessionActive) {
@@ -255,11 +255,8 @@ export async function activate(pi: unknown): Promise<void> {
           noticeTarget,
           [
             `review gate: repeated changes requested with no new correction evidence (${formatTokenUsage(output.result.usage)})`,
-            ...reviewDetailsLines(output),
             "Reviewer feedback matched the previous blocking feedback, and the correction turn produced no new tool evidence or file-change fingerprint.",
             "Stopping automatic correction to avoid a loop.",
-            "",
-            transmission,
           ].join("\n"),
           () => sessionActive,
         );
@@ -286,17 +283,17 @@ export async function activate(pi: unknown): Promise<void> {
           disposition: "sent_at_cap",
           action: "deferred",
         });
-        window.lastCappedFollowUp = buildTransmissionMessage(output, "correction_required");
+        window.lastCappedFollowUp = buildReviewAuthorizationMessage({
+          reviewSequence: output.reviewSequence!,
+          bundleDir: output.bundleDir!,
+        });
         pauseReviewWindow(state, "paused_at_cap");
         await sendNoticeWhileSessionActive(
           noticeTarget,
           [
             `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`,
-            ...reviewDetailsLines(output),
             "Complete reviewer feedback was transmitted to the implementing model, but automatic correction is deferred.",
             `Use /review-continue to authorize another ${config.maxCorrectionCycles} automatic correction cycle(s).`,
-            "",
-            deferredTransmission,
           ].join("\n"),
           () => sessionActive,
         );
@@ -319,7 +316,7 @@ export async function activate(pi: unknown): Promise<void> {
       });
       await sendNoticeWhileSessionActive(
         noticeTarget,
-        withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output),
+        `review gate: changes requested (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
       if (sessionActive) {
@@ -346,7 +343,7 @@ export async function activate(pi: unknown): Promise<void> {
         }
       }
     }
-    await sendNoticeWhileSessionActive(noticeTarget, withReviewDetails(failed, output), () => sessionActive);
+    await sendNoticeWhileSessionActive(noticeTarget, failed, () => sessionActive);
     pauseReviewWindow(state, "paused");
     await releaseQueuedUserInputs(pi, state, () => sessionActive);
   });
@@ -370,7 +367,7 @@ async function transmitReviewPass(input: {
 }): Promise<string> {
   const transmission = buildReviewTransmission({
     reviewSequence: input.output.reviewSequence!,
-    result: input.output.result!,
+    gateVerdict: input.output.result!.verdict,
     reviewerResults: input.output.reviewerResults!,
     bundleDir: input.output.bundleDir!,
     action: input.action,
@@ -383,38 +380,15 @@ async function transmitReviewPass(input: {
     reviewSequence: input.output.reviewSequence,
     source: input.source,
     disposition: input.disposition,
-    followUpMessage: message,
   });
+  armReviewResponseExchange(input.state, input.output.reviewedSnapshot!);
   return message;
-}
-
-function buildTransmissionMessage(output: ReviewRunOutput, action: ReviewTransmissionAction): string {
-  if (!output.result || !output.reviewerResults || !output.bundleDir || output.reviewSequence === undefined) {
-    throw new Error("review gate: cannot transmit an incomplete review pass");
-  }
-  return buildReviewTransmission({
-    reviewSequence: output.reviewSequence,
-    result: output.result,
-    reviewerResults: output.reviewerResults,
-    bundleDir: output.bundleDir,
-    action,
-  }).message;
 }
 
 export default activate;
 
 module.exports = activate;
 Object.assign(module.exports as Record<string, unknown>, { activate });
-
-function withReviewDetails(header: string, output: ReviewRunOutput): string {
-  const [details] = reviewDetailsLines(output);
-  return details ? `${header}\n${details}` : header;
-}
-
-function reviewDetailsLines(output: ReviewRunOutput): string[] {
-  const details = buildReviewerResultsNotice(output.reviewerResults, output.bundleRetained ? output.bundleDir : undefined);
-  return details ? [details] : [];
-}
 
 function isToolError(value: unknown): boolean {
   return typeof value === "object" && value !== null && "isError" in value && Boolean((value as { isError?: unknown }).isError);
@@ -460,7 +434,7 @@ function createReviewAbortController(input: {
   const abortReview = (reason: ReviewAbortReason) => {
     if (!controller.signal.aborted) {
       abortReason = reason;
-      controller.abort();
+      controller.abort(reason);
     }
   };
   const notifyCancellation = () => {

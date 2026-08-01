@@ -50,14 +50,17 @@ Example config using Codex as the reviewer:
 ```
 
 Multiple reviewers can be configured with `reviewers`. They run in parallel
-against the same review bundle. Review-gate waits for every reviewer, then
-aggregates the independent results: any reviewer requesting changes causes a
-combined `needs_changes` response with that reviewer's findings attributed in
-the follow-up. Results from every reviewer are transmitted, including passing
-assessments, non-blocking observations, guidance, disagreements, and reviewer
-errors. Blocking findings are identified as required corrections; passing and
-non-blocking material remains visible without becoming mandatory work. The
-built-in Codex, Claude, and little-coder model adapters run
+against the same review bundle. Review-gate waits for every reviewer and applies
+a simple gate: any `needs_changes` verdict means changes are required, all
+reviewers must pass for the gate to pass, and reviewer errors prevent a silent
+pass. Each reviewer appears once in the implementing-model transmission, and
+review decisions are stored per reviewer rather than as an additional combined
+result. There is no separate aggregate summary, guidance, or finding set.
+Results from every reviewer are transmitted, including passing assessments,
+non-blocking observations, guidance, disagreements, and reviewer errors. Blocking findings
+are identified as required corrections; passing and non-blocking material
+remains visible without becoming mandatory work. The built-in Codex, Claude,
+and little-coder model adapters run
 as read-only agentic reviewers so they can inspect the workspace and retained
 review bundle before deciding. Generic CLI reviewers remain prompt-only unless
 the configured command provides its own safe read-only behavior.
@@ -169,6 +172,14 @@ always starts new reviewer sessions. The bundle is
 still authoritative: if a saved session cannot be resumed, the reviewer can be
 restarted from the complete bundle without losing review context.
 
+Canceling a running review with Escape cancels the whole parallel review, even
+if one reviewer has already completed. Partial results are discarded and are
+not transmitted. The numbered invocation remains as a `CANCELED.md` tombstone
+stating that a review would have run there but was canceled by the user, so pass
+order remains unambiguous. Cancellation restores the reviewer-session handles
+from before that invocation; the next review keeps the same evidence bundle and
+resumes from the last successful sessions instead of starting a new window.
+
 ## Temporary fake reviewer
 
 For local wiring tests, use the fake reviewer wrapper:
@@ -240,7 +251,9 @@ without changing the reviewed state.
 Reaching the automatic correction cap does not hide reviewer information. The
 complete pass is transmitted with correction classified as deferred.
 `/review-continue` authorizes the last capped feedback for correction and resets
-the correction counter, so the configured correction budget is available again.
+the correction counter using a compact authorization message that references the
+already-delivered pass instead of repeating its reviewer results, so the
+configured correction budget is available again.
 Reaching the cap does not accept or checkpoint the changes. Normal user guidance
 also remains in the same unresolved window unless that window later passes.
 
@@ -280,7 +293,10 @@ review pass also stores `implementing-model-transmission.md`, its structured
 JSON envelope, and additive `delivery.json` receipts recording exactly what the
 implementing model was told and whether the transmission required correction,
 reported a pass, deferred action, or disclosed a review error. Later reviewers
-are directed to read these records before judging a continuation. The little-coder
+are directed to read these records before judging a continuation. The envelope
+contains the gate verdict and the individual reviewer results; no unsent
+aggregate result is persisted. A canceled numbered invocation contains
+`CANCELED.md` and `canceled.json` rather than reviewer results. The little-coder
 model adapter stores the extracted final review in `raw-output.txt` and the
 capped JSONL stream separately as `raw-stream.jsonl`. When supported by the
 reviewer CLI, user-facing notices include a compact reviewer token summary, for

@@ -1,8 +1,10 @@
 import type { ReviewGateConfig } from "./config";
 import { join } from "node:path";
 import { removeTransientWindowBundle } from "./bundle";
+import { createWorkspaceSnapshot } from "./capture";
 import {
   buildRequestContext,
+  armReviewResponseExchange,
   clearReviewState,
   closeReviewWindow,
   getCorrectionAttemptCount,
@@ -15,7 +17,6 @@ import {
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
 import { extractSignal, sendNotice, sendFollowUp, sendUserPrompt } from "./pi";
-import { buildReviewerResultsNotice } from "./prompts";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { buildReviewTransmission, writeReviewDeliveryReceipt, writeReviewTransmission, type ReviewTransmissionAction } from "./transmission";
@@ -100,6 +101,10 @@ export function registerCommands(input: RegisterCommandsInput): void {
         closeReviewWindow(input.state, true);
         return;
       }
+      if (output.result?.error === "aborted") {
+        await sendCommandNotice(ctx, "review gate: review cancelled");
+        return;
+      }
       if (output.result?.verdict === "pass") {
         const transmission = await createCommandTransmission(output, "passed");
         recordReviewerFeedback(input.state, {
@@ -108,9 +113,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
           reviewSequence: output.reviewSequence,
           source: "manual",
           disposition: "sent_for_observation",
-          followUpMessage: transmission,
         });
-        await sendCommandNotice(ctx, withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output));
+        armReviewResponseExchange(input.state, output.reviewedSnapshot!);
+        await sendCommandNotice(ctx, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
         if (isSessionActive()) {
           if (await sendFollowUp(input.pi, transmission)) {
             await writeReviewDeliveryReceipt(output.invocationDir!, "passed", transmission);
@@ -118,7 +123,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         }
       } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
         const transmission = await createCommandTransmission(output, "correction_required");
-        await sendCommandNotice(ctx, withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output));
+        await sendCommandNotice(ctx, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
         window.correctionCycles = 0;
         window.lastCappedFollowUp = undefined;
         window.status = "active";
@@ -128,8 +133,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
           reviewSequence: output.reviewSequence,
           source: "manual",
           disposition: "sent_for_correction",
-          followUpMessage: transmission,
         });
+        armReviewResponseExchange(input.state, output.reviewedSnapshot!);
         if (isSessionActive()) {
           if (await sendFollowUp(input.pi, transmission)) {
             await writeReviewDeliveryReceipt(output.invocationDir!, "correction_required", transmission);
@@ -145,8 +150,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
             reviewSequence: output.reviewSequence,
             source: "manual",
             disposition: "sent_review_error",
-            followUpMessage: transmission,
           });
+          armReviewResponseExchange(input.state, output.reviewedSnapshot!);
           if (isSessionActive()) {
             if (await sendFollowUp(input.pi, transmission)) {
               await writeReviewDeliveryReceipt(output.invocationDir!, "review_error", transmission);
@@ -154,7 +159,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           }
         }
         pauseReviewWindow(input.state, "paused");
-        await sendCommandNotice(ctx, withReviewDetails(failed, output));
+        await sendCommandNotice(ctx, failed);
       }
     },
   });
@@ -171,10 +176,14 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       const followUp = window.lastCappedFollowUp;
-      const feedback = markCappedFeedbackSent(input.state, followUp);
+      const feedback = markCappedFeedbackSent(input.state);
       window.lastCappedFollowUp = undefined;
       window.status = "active";
       window.correctionCycles = 0;
+      armReviewResponseExchange(input.state, await createWorkspaceSnapshot(input.cwd(), {
+        maxFileBytes: input.config.maxFileBytes,
+        maxSnapshotBytes: input.config.maxSnapshotBytes,
+      }));
       await sendCommandNotice(ctx, `review gate: continuing review; correction budget reset to ${input.config.maxCorrectionCycles}`);
       if (isSessionActive()) {
         if (await sendFollowUp(input.pi, followUp) && feedback && window.bundleDir) {
@@ -222,6 +231,10 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, output.error ?? "review gate: reviewer failed");
         return;
       }
+      if (output.result.error === "aborted") {
+        await sendCommandNotice(ctx, "review gate: reviewer question cancelled");
+        return;
+      }
 
       if (output.result.verdict === "error" && !hasUsableReviewerAnswer(output.reviewerResults)) {
         const failed = `review gate: ask-reviewer failed: ${output.result.summary} (${formatTokenUsage(output.result.usage)})`;
@@ -229,7 +242,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
 
-      const payload = formatReviewerAnswer(question, output.result, output.bundleRetained ? output.bundleDir : undefined);
+      const payload = formatReviewerAnswer(question, output.reviewerResults ?? [], output.bundleRetained ? output.bundleDir : undefined);
       const submittedPayload = await showPrivateReviewerAnswer(ctx, payload);
       if (!isSessionActive()) {
         return;
@@ -258,7 +271,7 @@ async function createCommandTransmission(
   }
   const transmission = buildReviewTransmission({
     reviewSequence: output.reviewSequence,
-    result: output.result,
+    gateVerdict: output.result.verdict,
     reviewerResults: output.reviewerResults,
     bundleDir: output.bundleDir,
     action,
@@ -282,28 +295,27 @@ function getRegisterCommand(pi: unknown): RegisterCommand | undefined {
   return undefined;
 }
 
-function withReviewDetails(header: string, output: { reviewerResults?: ReviewResult[]; bundleRetained?: boolean; bundleDir?: string }): string {
-  const details = buildReviewerResultsNotice(output.reviewerResults, output.bundleRetained ? output.bundleDir : undefined);
-  return details ? `${header}\n${details}` : header;
-}
-
-function formatReviewerAnswer(question: string, result: ReviewResult, bundleDir?: string): string {
+function formatReviewerAnswer(question: string, results: ReviewResult[], bundleDir?: string): string {
   const lines = [
     "Reviewer note from /ask-reviewer:",
     "",
     `Question: ${question}`,
-    "",
-    `Answer: ${result.summary}`,
   ];
-  if (result.guidance) {
-    lines.push("", "Implementation guidance:", result.guidance);
+  for (const result of results) {
+    lines.push("", `## ${result.reviewerId} — ${result.verdict}`, "", `Answer: ${result.summary}`);
+    if (result.guidance) {
+      lines.push("", "Implementation guidance:", result.guidance);
+    }
+    if (result.error) {
+      lines.push("", `Reviewer error: ${result.error}`);
+    }
+    const findings = formatFindings(result.findings);
+    if (findings.length > 0) {
+      lines.push("", "Relevant findings:", ...findings);
+    }
   }
   if (bundleDir) {
     lines.push("", `Retained review bundle: ${bundleDir}`);
-  }
-  const findings = formatFindings(result.findings);
-  if (findings.length > 0) {
-    lines.push("", "Relevant findings:", ...findings);
   }
   return lines.join("\n");
 }

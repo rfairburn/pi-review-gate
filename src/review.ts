@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DeciderConfig, ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts } from "./bundle";
@@ -11,7 +11,7 @@ import { GenericCliAdapter } from "./adapters/generic-cli";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
 import { LittleCoderAdapter } from "./adapters/little-coder";
-import type { ModelAdapter } from "./adapters/types";
+import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, type ReviewWindow } from "./state";
 
@@ -38,6 +38,7 @@ export interface ReviewRunOutput {
   bundleDir?: string;
   invocationDir?: string;
   reviewSequence?: number;
+  reviewedSnapshot?: WorkspaceSnapshot;
   bundleRetained?: boolean;
   error?: string;
 }
@@ -183,6 +184,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   }
 
   await input.notify?.(`review gate: reviewing changes with ${reviewers.map((reviewer) => reviewer.id).join(", ")}`);
+  const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
   const reviewerResults = await Promise.all(reviewers.map((reviewer) => runSingleReviewer({
     reviewer,
     cwd: input.cwd,
@@ -193,10 +195,12 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     window: input.window,
     signal: input.signal,
   })));
-  const result = aggregateReviewResults(reviewerResults);
+  if (reviewWasAborted(input.signal, reviewerResults)) {
+    await recordCanceledInvocation(bundle.invocationDir, input.window, sessionsBeforeReview, reviewSequence, "review", input.signal);
+    return abortedReviewOutput(changes, bundle.dir);
+  }
+  const result = decideReviewResults(reviewerResults);
   await Promise.all([
-    writeFile(join(bundle.invocationDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-    writeFile(join(bundle.invocationDir, "reviewer-results.json"), JSON.stringify(reviewerResults, null, 2), "utf8"),
     writeFile(join(bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
     writeFile(join(bundle.dir, "sessions.json"), JSON.stringify(
       Object.fromEntries(input.window?.reviewerSessions ?? []),
@@ -222,6 +226,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     bundleDir: bundle.dir,
     invocationDir: bundle.invocationDir,
     reviewSequence,
+    reviewedSnapshot: after,
     bundleRetained: shouldRetain,
   };
 }
@@ -249,9 +254,10 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     };
   }
 
+  const reviewSequence = input.window?.nextReviewSequence ?? 1;
   const bundle = await createReviewerQuestionBundle({
     dir: input.window?.bundleDir,
-    reviewSequence: input.window?.nextReviewSequence ?? 1,
+    reviewSequence,
     exchanges: input.window?.exchanges,
     cwd: input.cwd,
     question: input.question,
@@ -281,6 +287,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   }
 
   await input.notify?.(`review gate: asking reviewers ${reviewers.map((reviewer) => reviewer.id).join(", ")}`);
+  const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
   const reviewerResults = await Promise.all(reviewers.map((reviewer) => runSingleReviewer({
     reviewer,
     cwd: input.cwd,
@@ -291,10 +298,17 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     window: input.window,
     signal: input.signal,
   })));
-  const result = aggregateReviewResults(reviewerResults);
+  if (reviewWasAborted(input.signal, reviewerResults)) {
+    await recordCanceledInvocation(bundle.invocationDir, input.window, sessionsBeforeReview, reviewSequence, "reviewer question", input.signal);
+    return {
+      changes,
+      result: abortedResult(),
+      bundleDir: bundle.dir,
+      bundleRetained: false,
+    };
+  }
+  const result = decideReviewResults(reviewerResults);
   await Promise.all([
-    writeFile(join(bundle.invocationDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-    writeFile(join(bundle.invocationDir, "reviewer-results.json"), JSON.stringify(reviewerResults, null, 2), "utf8"),
     writeFile(join(bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
     writeFile(join(bundle.dir, "sessions.json"), JSON.stringify(
       Object.fromEntries(input.window?.reviewerSessions ?? []),
@@ -386,7 +400,7 @@ function isResumeFailure(result: ReviewResult): boolean {
   return result.verdict === "error" && Boolean(result.error?.startsWith("exit_"));
 }
 
-function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
+function decideReviewResults(results: ReviewResult[]): ReviewResult {
   if (results.length === 1 && results[0]) {
     return results[0];
   }
@@ -395,10 +409,9 @@ function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
   const usage = aggregateUsage(results);
   if (needsChanges.length > 0) {
     return {
-      reviewerId: "aggregate",
+      reviewerId: "gate",
       verdict: "needs_changes",
-      summary: aggregateSummary(results),
-      guidance: aggregateGuidance(needsChanges),
+      summary: reviewerVerdictSummary(results),
       findings: needsChanges.flatMap((result) => result.findings.map((finding) => ({
         ...finding,
         reviewerId: result.reviewerId,
@@ -409,24 +422,19 @@ function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
   }
   if (errors.length > 0) {
     return {
-      reviewerId: "aggregate",
+      reviewerId: "gate",
       verdict: "error",
-      summary: aggregateSummary(results),
-      guidance: aggregateGuidance(results),
+      summary: reviewerVerdictSummary(results),
       findings: [],
       usage,
       error: errors.every((result) => result.error === "aborted") ? "aborted" : "reviewer_error",
     };
   }
   return {
-    reviewerId: "aggregate",
+    reviewerId: "gate",
     verdict: "pass",
-    summary: aggregateSummary(results),
-    guidance: aggregateGuidance(results),
-    findings: results.flatMap((result) => result.findings.map((finding) => ({
-      ...finding,
-      reviewerId: result.reviewerId,
-    }))),
+    summary: reviewerVerdictSummary(results),
+    findings: [],
     usage,
   };
 }
@@ -445,16 +453,72 @@ function shouldRetainBundle(
   return result.verdict === "error" || reviewerResults.some((reviewerResult) => reviewerResult.verdict === "error");
 }
 
-function aggregateSummary(results: ReviewResult[]): string {
-  return results.map((result) => `${result.reviewerId}: ${result.summary}`).join("\n");
+function reviewerVerdictSummary(results: ReviewResult[]): string {
+  const counts = new Map<ReviewResult["verdict"], number>();
+  for (const result of results) {
+    counts.set(result.verdict, (counts.get(result.verdict) ?? 0) + 1);
+  }
+  return (["needs_changes", "pass", "error"] as const)
+    .filter((verdict) => counts.has(verdict))
+    .map((verdict) => `${counts.get(verdict)} ${verdict}`)
+    .join(", ");
 }
 
-function aggregateGuidance(results: ReviewResult[]): string | undefined {
-  const guidance = results
-    .filter((result) => result.guidance)
-    .map((result) => `### ${result.reviewerId}\n\n${result.guidance}`)
-    .join("\n\n");
-  return guidance || undefined;
+function reviewWasAborted(signal: AbortSignal | undefined, results: ReviewResult[]): boolean {
+  return Boolean(signal?.aborted || results.some((result) => result.error === "aborted"));
+}
+
+async function recordCanceledInvocation(
+  invocationDir: string,
+  window: ReviewWindow | undefined,
+  sessionsBeforeReview: Map<string, ReviewerSession>,
+  reviewSequence: number,
+  kind: "review" | "reviewer question",
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  await rm(invocationDir, { recursive: true, force: true });
+  await mkdir(invocationDir, { recursive: true });
+  const canceledAt = new Date().toISOString();
+  const canceledBy = signal?.reason === "escape" ? "user" : "session";
+  const summary = canceledBy === "user"
+    ? `A ${kind} would have been run here but was canceled by the user.`
+    : `A ${kind} would have been run here but was canceled with the active session.`;
+  await Promise.all([
+    writeFile(join(invocationDir, "CANCELED.md"), `${summary}\n`, "utf8"),
+    writeFile(join(invocationDir, "canceled.json"), JSON.stringify({
+      reviewSequence,
+      kind,
+      canceledAt,
+      canceledBy,
+      summary,
+    }, null, 2), "utf8"),
+  ]);
+  if (window) {
+    window.reviewerSessions.clear();
+    for (const [reviewerId, session] of sessionsBeforeReview) {
+      window.reviewerSessions.set(reviewerId, session);
+    }
+  }
+}
+
+function abortedResult(): ReviewResult {
+  return {
+    reviewerId: "gate",
+    verdict: "error",
+    summary: "Review aborted.",
+    findings: [],
+    error: "aborted",
+  };
+}
+
+function abortedReviewOutput(changes: ChangedFile[], bundleDir: string): ReviewRunOutput {
+  return {
+    changed: true,
+    changes,
+    result: abortedResult(),
+    bundleDir,
+    bundleRetained: false,
+  };
 }
 
 function shouldRequireConcreteGuidance(config: ReviewGateConfig, correctionAttemptCount = 0): boolean {

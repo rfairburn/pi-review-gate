@@ -197,15 +197,14 @@ export function registerCommands(input: RegisterCommandsInput): void {
     },
   });
 
-  registerCommand("ask-reviewer", {
-    description: "Ask the configured reviewer a question about the current work.",
-    handler: async (args: string, ctx: unknown) => {
+  const askReviewerHandler = (autoSubmit: boolean, commandName: string) =>
+    async (args: string, ctx: unknown) => {
       if (!isSessionActive()) {
         return;
       }
       const question = args.trim();
       if (!question) {
-        await sendCommandNotice(ctx, "review gate: usage: /ask-reviewer <question>");
+        await sendCommandNotice(ctx, `review gate: usage: /${commandName} <question>`);
         return;
       }
 
@@ -243,7 +242,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
 
       const payload = formatReviewerAnswer(question, output.reviewerResults ?? [], output.bundleRetained ? output.bundleDir : undefined);
-      const submittedPayload = await showPrivateReviewerAnswer(ctx, payload);
+      const submittedPayload = autoSubmit ? payload : await showPrivateReviewerAnswer(ctx, payload);
       if (!isSessionActive()) {
         return;
       }
@@ -258,7 +257,16 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const cleared = `${formatTokenUsage(output.result.usage)}\nreview gate: reviewer answer cleared`;
       await sendCommandNotice(ctx, output.bundleRetained ? `${cleared}, bundle retained at ${output.bundleDir}` : cleared);
-    },
+    };
+
+  registerCommand("ask-reviewer", {
+    description: "Ask the configured reviewer a question and submit its answer immediately.",
+    handler: askReviewerHandler(true, "ask-reviewer"),
+  });
+
+  registerCommand("ask-reviewer-interactive", {
+    description: "Ask the configured reviewer a question and edit its answer before submitting it.",
+    handler: askReviewerHandler(false, "ask-reviewer-interactive"),
   });
 }
 

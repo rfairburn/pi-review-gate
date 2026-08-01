@@ -283,13 +283,15 @@ regular prompt starts a fresh window instead. At the automatic correction cap it
 also includes the prior reviewer results, the deferred transmission, and any
 later `/review-continue` authorization from the same unresolved review window.
 
-Reviewer answers open in an editable prompt. Press Enter to submit the reviewer
-note to the implementing model as your next message, edit it first if needed, or press
-Escape/Ctrl+C to clear it without sending anything.
+`/ask-reviewer` submits the resulting reviewer note to the implementing model
+immediately. `/ask-reviewer-interactive <question>` uses the same reviewer,
+session, evidence, answer formatting, and acceptance path, but opens the answer
+in an editable prompt first. Press Enter to submit it, edit it first if needed,
+or press Escape/Ctrl+C to clear it without sending anything.
 
-Submitting that editor accepts the question and the exact submitted reviewer
+Submitting either command accepts the question and the exact submitted reviewer
 note into structured session evidence. Later automatic reviews, `/review-now`,
-and `/ask-reviewer` calls in the resulting review window receive the accumulated
+and reviewer-question calls in the resulting review window receive the accumulated
 accepted Q&A, including preserved Markdown and fenced code. Clearing the editor
 does not accept or record the answer. When a question follows a passing review,
 its accepted Q&A is carried into the new review window created for the submitted

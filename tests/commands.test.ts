@@ -230,7 +230,7 @@ test("a passing /review-now transmits the complete pass and keeps its window ope
   }
 });
 
-test("/ask-reviewer retains a passing review's patch and evidence", async () => {
+test("/ask-reviewer-interactive retains a passing review's patch and evidence", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-pass-ask-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -281,7 +281,7 @@ test("/ask-reviewer retains a passing review's patch and evidence", async () => 
     assert.notEqual(state.reviewWindow, undefined);
     assert.match(notices.join("\n"), /review gate: passed/);
 
-    await commands.get("ask-reviewer")?.("what supports the passed change?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("what supports the passed change?", ctx);
 
     assert.equal(editorViews.length, 1);
     assert.match(editorViews[0]?.prefill ?? "", /retained passed patch and evidence/);
@@ -333,7 +333,7 @@ test("/review-continue sends capped feedback and resets the correction budget", 
   assert.match(notices.join("\n"), /no capped reviewer feedback available/);
 });
 
-test("/ask-reviewer at the correction cap receives the complete unresolved review window", async () => {
+test("/ask-reviewer-interactive at the correction cap receives the complete unresolved review window", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-capped-window-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -397,7 +397,7 @@ test("/ask-reviewer at the correction cap receives the complete unresolved revie
       state,
     });
 
-    await commands.get("ask-reviewer")?.("is the capped finding still valid?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("is the capped finding still valid?", ctx);
 
     assert.equal(editorViews.length, 1);
     assert.match(editorViews[0]?.prefill ?? "", /complete capped review window/);
@@ -409,7 +409,7 @@ test("/ask-reviewer at the correction cap receives the complete unresolved revie
   }
 });
 
-test("/ask-reviewer opens the reviewer answer in the editor when canceled", async () => {
+test("/ask-reviewer-interactive opens the reviewer answer in the editor when canceled", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-command-"));
   try {
     const state = createState();
@@ -444,7 +444,7 @@ test("/ask-reviewer opens the reviewer answer in the editor when canceled", asyn
       state,
     });
 
-    await commands.get("ask-reviewer")?.("does this plan look right?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("does this plan look right?", ctx);
     assert.equal(userMessages.length, 0);
     assert.equal(editorViews.length, 1);
     assert.equal(editorViews[0]?.title, "review gate: reviewer answer");
@@ -459,7 +459,7 @@ test("/ask-reviewer opens the reviewer answer in the editor when canceled", asyn
   }
 });
 
-test("/ask-reviewer submits edited reviewer text when the editor is submitted", async () => {
+test("/ask-reviewer-interactive submits edited reviewer text when the editor is submitted", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-submit-"));
   try {
     const state = createState();
@@ -489,7 +489,7 @@ test("/ask-reviewer submits edited reviewer text when the editor is submitted", 
       state,
     });
 
-    await commands.get("ask-reviewer")?.("should this be shared?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("should this be shared?", ctx);
 
     assert.equal(userMessages.length, 1);
     assert.match(userMessages[0] ?? "", /Reviewer note from \/ask-reviewer:/);
@@ -513,7 +513,51 @@ test("/ask-reviewer submits edited reviewer text when the editor is submitted", 
   }
 });
 
-test("/ask-reviewer opens partial multi-reviewer answers when one reviewer errors", async () => {
+test("/ask-reviewer submits the same reviewer text without opening the interactive editor", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-now-"));
+  try {
+    const state = createState();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const userMessages: string[] = [];
+    let editorCalls = 0;
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        userMessages.push(message);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify() {},
+        async editor(_title: string, prefill: string) {
+          editorCalls += 1;
+          return prefill;
+        },
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: askReviewerConfig(),
+      state,
+    });
+
+    await commands.get("ask-reviewer-interactive")?.("should this be shared?", ctx);
+    await commands.get("ask-reviewer")?.("should this be shared?", ctx);
+
+    assert.equal(editorCalls, 1);
+    assert.equal(userMessages.length, 2);
+    assert.equal(userMessages[1], userMessages[0]);
+    assert.equal(state.reviewWindow?.evidence.acceptedReviewerQuestions.length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/ask-reviewer-interactive opens partial multi-reviewer answers when one reviewer errors", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-partial-"));
   try {
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
@@ -547,7 +591,7 @@ test("/ask-reviewer opens partial multi-reviewer answers when one reviewer error
       state: createState(),
     });
 
-    await commands.get("ask-reviewer")?.("do you agree?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("do you agree?", ctx);
 
     assert.equal(userMessages.length, 0);
     assert.equal(editorViews.length, 1);

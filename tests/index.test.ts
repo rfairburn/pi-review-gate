@@ -1078,7 +1078,7 @@ test("normal user input after cap continues the unresolved review window with co
   }
 });
 
-test("a passed review remains available to /ask-reviewer but is checkpointed out of the next regular window", async () => {
+test("a passed review remains available to /ask-reviewer-interactive but is checkpointed out of the next regular window", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-window-checkpoint-"));
   const outside = join(tmpdir(), `pi-review-gate-outside-review-${process.pid}-${Date.now()}.md`);
   const invocationPath = join(tmpdir(), `pi-review-gate-window-invocations-${process.pid}-${Date.now()}.txt`);
@@ -1166,7 +1166,7 @@ test("a passed review remains available to /ask-reviewer but is checkpointed out
       messages: [{ role: "assistant", content: "acknowledged the passing review" }],
     });
 
-    await commands.get("ask-reviewer")?.("what changed outside the workspace?", {
+    await commands.get("ask-reviewer-interactive")?.("what changed outside the workspace?", {
       ui: {
         notify(message: string) {
           notices.push(message);

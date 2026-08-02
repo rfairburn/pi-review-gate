@@ -43,6 +43,14 @@ export interface ReviewRunOutput {
   error?: string;
 }
 
+export interface PausedExchangeInput {
+  cwd: string;
+  config: ReviewGateConfig;
+  evidence?: EvidenceState;
+  actingUsage?: TokenUsage;
+  window: ReviewWindow;
+}
+
 export interface AskReviewerInput {
   cwd: string;
   question: string;
@@ -229,6 +237,44 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     reviewedSnapshot: after,
     bundleRetained: shouldRetain,
   };
+}
+
+export async function collectPausedReviewExchange(input: PausedExchangeInput): Promise<void> {
+  const active = input.window.activeExchange;
+  if (!active) {
+    return;
+  }
+  const after = await createWorkspaceSnapshot(input.cwd, {
+    maxFileBytes: input.config.maxFileBytes,
+    maxSnapshotBytes: input.config.maxSnapshotBytes,
+  });
+  const workspaceChanges = active.baseline ? compareSnapshots(active.baseline, after) : [];
+  const evidenceChanges = input.evidence
+    ? await collectEvidenceChanges(input.evidence, input.cwd, {
+      maxFileBytes: input.config.maxFileBytes,
+      maxSnapshotBytes: input.config.maxSnapshotBytes,
+    }, active.sequence)
+    : [];
+  const split = splitReviewChanges(workspaceChanges, evidenceChanges);
+  completeActiveExchange(input.window, {
+    workspaceChanges,
+    sideEffectChanges: split.sideEffectChanges,
+    workspacePatch: workspaceChanges.length > 0
+      ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes).patch
+      : "",
+    sideEffectPatch: split.sideEffectChanges.length > 0
+      ? buildUnifiedPatch(split.sideEffectChanges, input.config.maxPatchBytes).patch
+      : "",
+    actingUsage: input.actingUsage,
+  });
+  if (input.window.bundleDir) {
+    await syncReviewWindowArtifacts({
+      dir: input.window.bundleDir,
+      cwd: input.cwd,
+      currentReviewSequence: Math.max(1, input.window.nextReviewSequence - 1),
+      exchanges: input.window.exchanges,
+    });
+  }
 }
 
 export async function runAskReviewer(input: AskReviewerInput): Promise<AskReviewerOutput> {

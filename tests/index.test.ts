@@ -81,6 +81,107 @@ test("cap status is concise while reviewer results are delivered once in the tra
   }
 });
 
+test("review pause collects separate exchanges and defers reviewer execution until unpaused", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-paused-"));
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+  const invocationMarker = join(dir, "reviewer-invoked.txt");
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 1,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "always",
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed accumulated paused work',findings:[]})))`,
+        ],
+        timeoutMs: 5000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const notices: string[] = [];
+    const followUps: string[] = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      notify(message: string) {
+        notices.push(message);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
+      },
+    };
+
+    await activate(pi);
+    await commands.get("review-pause")?.("", pi);
+
+    await trigger(hooks, "input", { cwd: dir, text: "first paused change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "paused one\n", "utf8");
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo paused-tool-one" } });
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "completed first paused change" }],
+    });
+
+    await trigger(hooks, "input", { cwd: dir, text: "second paused change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "paused two\n", "utf8");
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo paused-tool-two" } });
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "completed second paused change" }],
+    });
+
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+    assert.equal(followUps.length, 0);
+
+    await commands.get("review-unpause")?.("", pi);
+    await trigger(hooks, "input", { cwd: dir, text: "review the accumulated work", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "ready for accumulated review" }],
+    });
+
+    assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0] ?? "", /reviewed accumulated paused work/);
+    const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
+    assert.match(await readFile(join(bundleDir, "exchanges", "0001", "tool-events.md"), "utf8"), /paused-tool-one/);
+    assert.match(await readFile(join(bundleDir, "exchanges", "0002", "tool-events.md"), "utf8"), /paused-tool-two/);
+    assert.match(await readFile(join(bundleDir, "exchanges", "0001", "assistant-summary.md"), "utf8"), /first paused change/);
+    assert.match(await readFile(join(bundleDir, "exchanges", "0002", "assistant-summary.md"), "utf8"), /second paused change/);
+    assert.match(notices.join("\n"), /reviews unpaused/);
+  } finally {
+    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
+    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("user steering during review is held until reviewer feedback is queued", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-steer-during-review-"));
   const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;

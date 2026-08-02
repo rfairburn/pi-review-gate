@@ -260,6 +260,12 @@ review window's baseline and evidence. Its complete result is transmitted to
 the implementing model. A pass closes only after the implementing model responds
 without changing the reviewed state.
 
+`/review-pause` suppresses automatic and explicitly requested reviewer runs
+without stopping evidence collection. Each primary-model turn is still captured
+as a separate exchange. `/review-unpause` resumes reviewer execution; the next
+eligible turn reviews the accumulated changes and evidence. `/review-now` and
+`/ask-reviewer*` remain unavailable while reviews are paused.
+
 Reaching the automatic correction cap does not hide reviewer information. The
 complete pass is transmitted with correction classified as deferred.
 `/review-continue` authorizes the last capped feedback for correction and resets

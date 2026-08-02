@@ -5,7 +5,7 @@ import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
-import { runReview, type ReviewRunOutput } from "./review";
+import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
   activeExchangeHasBaseline,
   armReviewResponseExchange,
@@ -149,6 +149,16 @@ export async function activate(pi: unknown): Promise<void> {
     if (signal?.aborted) {
       state.reviewInProgress = false;
       state.queuedUserInputsDuringReview = [];
+      return;
+    }
+    if (state.reviewsPaused) {
+      await collectPausedReviewExchange({
+        cwd: currentCwd,
+        config,
+        evidence: window.evidence,
+        actingUsage,
+        window,
+      });
       return;
     }
 

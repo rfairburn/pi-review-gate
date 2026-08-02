@@ -78,6 +78,7 @@ export interface ReviewGateState {
   reviewWindow?: ReviewWindow;
   lastQuestionWindow?: ReviewWindow;
   pendingAcceptedReviewerQuestions: AcceptedReviewerQuestion[];
+  reviewsPaused: boolean;
   reviewInProgress: boolean;
   queuedUserInputsDuringReview: string[];
 }
@@ -100,6 +101,7 @@ export function createState(): ReviewGateState {
   return {
     nextReviewWindowId: 1,
     pendingAcceptedReviewerQuestions: [],
+    reviewsPaused: false,
     reviewInProgress: false,
     queuedUserInputsDuringReview: [],
   };

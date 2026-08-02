@@ -8,6 +8,43 @@ import { registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
 import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest } from "../src/state";
 
+test("/review-pause and /review-unpause gate explicit reviewer commands", async () => {
+  const state = createState();
+  const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+  const notices: string[] = [];
+  const pi = {
+    registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+      commands.set(name, options.handler);
+    },
+  };
+  const ctx = {
+    notify(message: string) {
+      notices.push(message);
+    },
+  };
+
+  registerCommands({
+    pi,
+    cwd: () => process.cwd(),
+    config: reviewConfig(),
+    state,
+  });
+
+  await commands.get("review-pause")?.("", ctx);
+  assert.equal(state.reviewsPaused, true);
+  assert.match(notices.at(-1) ?? "", /reviews paused; turn evidence will still be collected/);
+
+  await commands.get("review-now")?.("", ctx);
+  assert.match(notices.at(-1) ?? "", /use \/review-unpause before \/review-now/);
+
+  await commands.get("ask-reviewer")?.("is this safe?", ctx);
+  assert.match(notices.at(-1) ?? "", /use \/review-unpause before \/ask-reviewer/);
+
+  await commands.get("review-unpause")?.("", ctx);
+  assert.equal(state.reviewsPaused, false);
+  assert.match(notices.at(-1) ?? "", /next eligible turn will review accumulated changes and evidence/);
+});
+
 test("/review-clear starts the next prompt fresh without deleting retained review artifacts", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-clear-"));
   try {

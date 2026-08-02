@@ -46,7 +46,39 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       const reviewers = input.config.reviewers?.map((reviewer) => reviewer.id).join(", ") ?? input.config.decider?.id ?? "none";
-      await sendCommandNotice(ctx, `review gate: loaded; mode=${input.config.mode}; reviewers=${reviewers}`);
+      await sendCommandNotice(ctx, `review gate: loaded; mode=${input.config.mode}; reviewers=${reviewers}; paused=${input.state.reviewsPaused}`);
+    },
+  });
+
+  registerCommand("review-pause", {
+    description: "Pause reviewer execution while continuing to collect turn evidence.",
+    handler: async (_args: string, ctx: unknown) => {
+      if (!isSessionActive()) {
+        return;
+      }
+      if (input.state.reviewsPaused) {
+        await sendCommandNotice(ctx, "review gate: reviews are already paused; turn evidence is still being collected");
+        return;
+      }
+      input.state.reviewsPaused = true;
+      await sendCommandNotice(ctx, input.state.reviewInProgress
+        ? "review gate: reviews paused after the active review finishes; subsequent turn evidence will still be collected"
+        : "review gate: reviews paused; turn evidence will still be collected");
+    },
+  });
+
+  registerCommand("review-unpause", {
+    description: "Resume reviewer execution after /review-pause.",
+    handler: async (_args: string, ctx: unknown) => {
+      if (!isSessionActive()) {
+        return;
+      }
+      if (!input.state.reviewsPaused) {
+        await sendCommandNotice(ctx, "review gate: reviews are already unpaused");
+        return;
+      }
+      input.state.reviewsPaused = false;
+      await sendCommandNotice(ctx, "review gate: reviews unpaused; the next eligible turn will review accumulated changes and evidence");
     },
   });
 
@@ -74,6 +106,10 @@ export function registerCommands(input: RegisterCommandsInput): void {
     description: "Run pi-review-gate against the current turn baseline.",
     handler: async (_args: string, ctx: unknown) => {
       if (!isSessionActive()) {
+        return;
+      }
+      if (input.state.reviewsPaused) {
+        await sendCommandNotice(ctx, "review gate: reviews are paused; use /review-unpause before /review-now");
         return;
       }
       const window = input.state.reviewWindow;
@@ -200,6 +236,10 @@ export function registerCommands(input: RegisterCommandsInput): void {
   const askReviewerHandler = (autoSubmit: boolean, commandName: string) =>
     async (args: string, ctx: unknown) => {
       if (!isSessionActive()) {
+        return;
+      }
+      if (input.state.reviewsPaused) {
+        await sendCommandNotice(ctx, `review gate: reviews are paused; use /review-unpause before /${commandName}`);
         return;
       }
       const question = args.trim();

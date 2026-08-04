@@ -1,5 +1,8 @@
 export interface TokenUsage {
+  scope?: "invocation";
   inputTokens?: number;
+  totalInputTokens?: number;
+  uncachedInputTokens?: number;
   cachedInputTokens?: number;
   outputTokens?: number;
   reasoningOutputTokens?: number;
@@ -14,14 +17,19 @@ export function formatTokenUsage(usage: TokenUsage | undefined): string {
     return "review tokens: unavailable";
   }
   const parts: string[] = [];
-  if (usage.inputTokens !== undefined) {
-    parts.push(`in ${formatCount(usage.inputTokens)}`);
-  }
-  if (usage.cachedInputTokens !== undefined) {
-    parts.push(`cached ${formatCount(usage.cachedInputTokens)}`);
-  }
-  if (usage.cacheWriteTokens !== undefined) {
-    parts.push(`cache-write ${formatCount(usage.cacheWriteTokens)}`);
+  const totalInputTokens = usage.totalInputTokens ?? usage.inputTokens;
+  if (totalInputTokens !== undefined) {
+    const inputBreakdown: string[] = [];
+    if (usage.uncachedInputTokens !== undefined) {
+      inputBreakdown.push(`uncached ${formatCount(usage.uncachedInputTokens)}`);
+    }
+    if (usage.cachedInputTokens !== undefined) {
+      inputBreakdown.push(`cached ${formatCount(usage.cachedInputTokens)}`);
+    }
+    if (usage.cacheWriteTokens !== undefined) {
+      inputBreakdown.push(`cache-write ${formatCount(usage.cacheWriteTokens)}`);
+    }
+    parts.push(`input ${formatCount(totalInputTokens)}${inputBreakdown.length > 0 ? ` (${inputBreakdown.join(", ")})` : ""}`);
   }
   if (usage.outputTokens !== undefined) {
     parts.push(`out ${formatCount(usage.outputTokens)}`);
@@ -35,7 +43,7 @@ export function formatTokenUsage(usage: TokenUsage | undefined): string {
   if (usage.costTotal !== undefined && usage.costTotal > 0) {
     parts.push(`cost $${usage.costTotal.toFixed(4)}`);
   }
-  return parts.length > 0 ? `review tokens: ${parts.join(", ")}` : "review tokens: unavailable";
+  return parts.length > 0 ? `review tokens (this pass): ${parts.join(", ")}` : "review tokens: unavailable";
 }
 
 export function parseCodexUsageFromJsonl(stdout: string): TokenUsage | undefined {
@@ -98,6 +106,23 @@ export function extractReviewTextFromCodexJsonl(stdout: string): string {
   return lastText;
 }
 
+export function extractCodexSessionId(stdout: string): string | undefined {
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (isRecord(parsed) && parsed.type === "thread.started" && typeof parsed.thread_id === "string") {
+        return parsed.thread_id;
+      }
+    } catch {
+      // Ignore non-JSON diagnostic lines.
+    }
+  }
+  return undefined;
+}
+
 export function parseClaudeUsage(value: unknown): TokenUsage | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -110,10 +135,16 @@ export function parseClaudeUsage(value: unknown): TokenUsage | undefined {
   if (!usage) {
     return undefined;
   }
+  const inputTokens = numberValue(usage.input_tokens);
+  const cachedInputTokens = numberValue(usage.cache_read_input_tokens);
+  const cacheWriteTokens = numberValue(usage.cache_creation_input_tokens);
   const result = {
-    inputTokens: numberValue(usage.input_tokens),
-    cachedInputTokens: numberValue(usage.cache_read_input_tokens),
-    cacheWriteTokens: numberValue(usage.cache_creation_input_tokens),
+    scope: "invocation" as const,
+    inputTokens,
+    totalInputTokens: sumDefined([inputTokens, cachedInputTokens, cacheWriteTokens]),
+    uncachedInputTokens: inputTokens,
+    cachedInputTokens,
+    cacheWriteTokens,
     outputTokens: numberValue(usage.output_tokens),
     totalTokens: sumDefined([
       numberValue(usage.input_tokens),
@@ -139,10 +170,16 @@ export function parsePiUsage(value: unknown): TokenUsage | undefined {
   if (!usage) {
     return undefined;
   }
+  const inputTokens = numberValue(usage.input);
+  const cachedInputTokens = numberValue(usage.cacheRead);
+  const cacheWriteTokens = numberValue(usage.cacheWrite);
   return {
-    inputTokens: numberValue(usage.input),
-    cachedInputTokens: numberValue(usage.cacheRead),
-    cacheWriteTokens: numberValue(usage.cacheWrite),
+    scope: "invocation",
+    inputTokens,
+    totalInputTokens: sumDefined([inputTokens, cachedInputTokens, cacheWriteTokens]),
+    uncachedInputTokens: inputTokens,
+    cachedInputTokens,
+    cacheWriteTokens,
     outputTokens: numberValue(usage.output),
     totalTokens: numberValue(usage.totalTokens) ?? sumDefined([
       numberValue(usage.input),
@@ -156,8 +193,10 @@ export function parsePiUsage(value: unknown): TokenUsage | undefined {
 }
 
 export function extractPiUsageFromMessages(args: unknown[]): TokenUsage | undefined {
-  const combined: Required<Pick<TokenUsage, "inputTokens" | "cachedInputTokens" | "cacheWriteTokens" | "outputTokens" | "totalTokens" | "costTotal">> = {
+  const combined: Required<Pick<TokenUsage, "inputTokens" | "totalInputTokens" | "uncachedInputTokens" | "cachedInputTokens" | "cacheWriteTokens" | "outputTokens" | "totalTokens" | "costTotal">> = {
     inputTokens: 0,
+    totalInputTokens: 0,
+    uncachedInputTokens: 0,
     cachedInputTokens: 0,
     cacheWriteTokens: 0,
     outputTokens: 0,
@@ -176,6 +215,8 @@ export function extractPiUsageFromMessages(args: unknown[]): TokenUsage | undefi
       }
       found = true;
       combined.inputTokens += usage.inputTokens ?? 0;
+      combined.totalInputTokens += usage.totalInputTokens ?? usage.inputTokens ?? 0;
+      combined.uncachedInputTokens += usage.uncachedInputTokens ?? usage.inputTokens ?? 0;
       combined.cachedInputTokens += usage.cachedInputTokens ?? 0;
       combined.cacheWriteTokens += usage.cacheWriteTokens ?? 0;
       combined.outputTokens += usage.outputTokens ?? 0;
@@ -183,7 +224,7 @@ export function extractPiUsageFromMessages(args: unknown[]): TokenUsage | undefi
       combined.costTotal += usage.costTotal ?? 0;
     }
   }
-  return found ? combined : undefined;
+  return found ? { scope: "invocation", ...combined } : undefined;
 }
 
 export function extractReviewTextFromClaudeJson(value: unknown): string {
@@ -310,16 +351,28 @@ export class PiJsonlReviewExtractor {
 function normalizeOpenAiStyleUsage(value: Record<string, unknown>, raw: unknown): TokenUsage {
   const inputTokens = numberValue(value.input_tokens);
   const cachedInputTokens = numberValue(value.cached_input_tokens);
+  const cacheWriteTokens = numberValue(value.cache_write_input_tokens);
   const outputTokens = numberValue(value.output_tokens);
   const reasoningOutputTokens = numberValue(value.reasoning_output_tokens);
   return {
+    scope: "invocation",
     inputTokens,
+    totalInputTokens: inputTokens,
+    uncachedInputTokens: subtractDefined(inputTokens, cachedInputTokens, cacheWriteTokens),
     cachedInputTokens,
+    cacheWriteTokens,
     outputTokens,
     reasoningOutputTokens,
     totalTokens: numberValue(value.total_tokens) ?? sumDefined([inputTokens, outputTokens]),
     raw,
   };
+}
+
+function subtractDefined(total: number | undefined, ...parts: Array<number | undefined>): number | undefined {
+  if (total === undefined) {
+    return undefined;
+  }
+  return Math.max(0, total - parts.reduce<number>((sum, value) => sum + (value ?? 0), 0));
 }
 
 function textFromContent(content: unknown): string {
@@ -357,6 +410,8 @@ function formatCount(value: number): string {
 function isZeroUsage(usage: TokenUsage): boolean {
   const values = [
     usage.inputTokens,
+    usage.totalInputTokens,
+    usage.uncachedInputTokens,
     usage.cachedInputTokens,
     usage.outputTokens,
     usage.reasoningOutputTokens,

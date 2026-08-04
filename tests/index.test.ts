@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { activate } from "../src/index";
 
-test("cap notice includes reviewer requested changes", async () => {
+test("cap status is concise while reviewer results are delivered once in the transmission", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-cap-"));
   const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
@@ -39,12 +39,16 @@ test("cap notice includes reviewer requested changes", async () => {
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
     const notices: string[] = [];
+    const followUps: string[] = [];
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
       notify(message: string) {
         notices.push(message);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
       },
     };
 
@@ -56,11 +60,12 @@ test("cap notice includes reviewer requested changes", async () => {
 
     const noticeText = notices.join("\n\n");
     assert.match(noticeText, /automatic correction cap reached/);
-    assert.match(noticeText, /Reviewer feedback was not sent to the primary model/);
-    assert.match(noticeText, /Use \/review-continue to send this feedback/);
-    assert.match(noticeText, /Review found blocking issues/);
-    assert.match(noticeText, /missing guard/);
-    assert.match(noticeText, /add the guard/);
+    assert.match(noticeText, /Complete reviewer feedback was transmitted to the implementing model/);
+    assert.match(noticeText, /Use \/review-continue to authorize/);
+    assert.doesNotMatch(noticeText, /missing guard/);
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0] ?? "", /missing guard/);
+    assert.match(followUps[0] ?? "", /add the guard/);
   } finally {
     if (previousConfig === undefined) {
       delete process.env.PI_REVIEW_GATE_CONFIG;
@@ -72,6 +77,107 @@ test("cap notice includes reviewer requested changes", async () => {
     } else {
       process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
     }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("review pause collects separate exchanges and defers reviewer execution until unpaused", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-paused-"));
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+  const invocationMarker = join(dir, "reviewer-invoked.txt");
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 1,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "always",
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed accumulated paused work',findings:[]})))`,
+        ],
+        timeoutMs: 5000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const notices: string[] = [];
+    const followUps: string[] = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      notify(message: string) {
+        notices.push(message);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
+      },
+    };
+
+    await activate(pi);
+    await commands.get("review-pause")?.("", pi);
+
+    await trigger(hooks, "input", { cwd: dir, text: "first paused change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "paused one\n", "utf8");
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo paused-tool-one" } });
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "completed first paused change" }],
+    });
+
+    await trigger(hooks, "input", { cwd: dir, text: "second paused change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "paused two\n", "utf8");
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo paused-tool-two" } });
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "completed second paused change" }],
+    });
+
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+    assert.equal(followUps.length, 0);
+
+    await commands.get("review-unpause")?.("", pi);
+    await trigger(hooks, "input", { cwd: dir, text: "review the accumulated work", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "ready for accumulated review" }],
+    });
+
+    assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0] ?? "", /reviewed accumulated paused work/);
+    const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
+    assert.match(await readFile(join(bundleDir, "exchanges", "0001", "tool-events.md"), "utf8"), /paused-tool-one/);
+    assert.match(await readFile(join(bundleDir, "exchanges", "0002", "tool-events.md"), "utf8"), /paused-tool-two/);
+    assert.match(await readFile(join(bundleDir, "exchanges", "0001", "assistant-summary.md"), "utf8"), /first paused change/);
+    assert.match(await readFile(join(bundleDir, "exchanges", "0002", "assistant-summary.md"), "utf8"), /second paused change/);
+    assert.match(notices.join("\n"), /reviews unpaused/);
+  } finally {
+    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
+    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -467,7 +573,15 @@ test("escape terminal input aborts an active reviewer process", async () => {
 
     assert.match(notices.join("\n"), /review gate: passed/);
     assert.doesNotMatch(notices.join("\n"), /lost cancelled review context/);
-    assert.equal(followUps.length, 0);
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0]?.message ?? "", /Review pass 2 transmission/);
+    assert.match(followUps[0]?.message ?? "", /Gate verdict: pass/);
+    const bundleDir = extractBundleDir(followUps[0]?.message ?? "", 2);
+    assert.match(
+      await readFile(join(bundleDir, "reviews", "0001", "CANCELED.md"), "utf8"),
+      /A review would have been run here but was canceled by the user\./,
+    );
+    await assert.rejects(access(join(bundleDir, "reviews", "0001", "reviewers", "fake", "parsed-result.json")), /ENOENT/);
     assert.equal(terminalHandlers.length, 0);
   } finally {
     if (previousConfig === undefined) {
@@ -578,7 +692,8 @@ test("automatic correction turns preserve original baseline and accumulated evid
 
     assert.match(notices.join("\n"), /review gate: passed/);
     assert.doesNotMatch(notices.join("\n"), /lost accumulated evidence/);
-    assert.equal(followUps.length, 1);
+    assert.equal(followUps.length, 2);
+    assert.match(followUps[1]?.message ?? "", /Gate verdict: pass/);
   } finally {
     if (previousConfig === undefined) {
       delete process.env.PI_REVIEW_GATE_CONFIG;
@@ -591,6 +706,231 @@ test("automatic correction turns preserve original baseline and accumulated evid
       process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
     }
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("automatic correction is reviewed when it exactly restores the original baseline", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-auto-correction-exact-revert-"));
+  const invocationPath = join(tmpdir(), `pi-review-gate-exact-revert-${process.pid}-${Date.now()}.txt`);
+  const bundlePathRecord = join(tmpdir(), `pi-review-gate-exact-revert-bundle-${process.pid}-${Date.now()}.txt`);
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+
+  try {
+    await writeFile(join(dir, "index.ts"), "original\n", "utf8");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 3,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "never",
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `const invocationPath=${JSON.stringify(invocationPath)};`,
+            `const bundlePathRecord=${JSON.stringify(bundlePathRecord)};`,
+            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+            "fs.writeFileSync(invocationPath,String(count+1));",
+            "const bundle=process.env.PI_REVIEW_GATE_BUNDLE_DIR;",
+            "const firstBundle=fs.existsSync(bundlePathRecord)?fs.readFileSync(bundlePathRecord,'utf8'):'';",
+            "if(!firstBundle&&bundle)fs.writeFileSync(bundlePathRecord,bundle);",
+            "process.stdin.resume();",
+            "let input='';",
+            "process.stdin.on('data',chunk=>input+=chunk);",
+            "process.stdin.on('end',()=>{",
+            "if(count===0){",
+            "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'restore required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'original content was removed',recommendation:'restore the original content'}]}));",
+            "return;",
+            "}",
+            "const ok=input.includes('no net submitted workspace changes')",
+            "&& input.includes('original content was removed')",
+            "&& input.includes('restore the original content')",
+            "&& input.includes('correction-tool-evidence')",
+            "&& bundle===firstBundle",
+            "&& fs.readFileSync(bundle+'/exchanges/0002/submitted.patch','utf8').includes('-incorrect')",
+            "&& fs.readFileSync(bundle+'/exchanges/0002/submitted.patch','utf8').includes('+original')",
+            "&& fs.readFileSync(bundle+'/exchanges/0002/tool-events.md','utf8').includes('correction-tool-evidence');",
+            "process.stdout.write(JSON.stringify(ok",
+            "?{verdict:'pass',summary:'exact restoration validated',findings:[]}",
+            ":{verdict:'needs_changes',summary:'lost exact-restoration context',findings:[{severity:'blocking',file:'session',line:null,issue:'follow-up review lost the prior feedback or correction evidence',recommendation:'preserve and review the correction window'}]}));",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const followUps: Array<{ message: string; options: unknown }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify(message: string) {
+        notices.push(message);
+      },
+      sendUserMessage(message: string, options: unknown) {
+        followUps.push({ message, options });
+      },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "incorrect\n", "utf8");
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "changed the original content" }],
+    });
+
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0]?.message ?? "", /restore the original content/);
+
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo correction-tool-evidence" } });
+    await writeFile(join(dir, "index.ts"), "original\n", "utf8");
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "restored the original content" }],
+    });
+
+    assert.equal(await readFile(invocationPath, "utf8"), "2");
+    assert.match(notices.join("\n"), /review gate: passed/);
+    assert.doesNotMatch(notices.join("\n"), /lost exact-restoration context/);
+    assert.equal(followUps.length, 2);
+    assert.match(followUps[1]?.message ?? "", /Gate verdict: pass/);
+  } finally {
+    if (previousConfig === undefined) {
+      delete process.env.PI_REVIEW_GATE_CONFIG;
+    } else {
+      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    }
+    if (previousDisabled === undefined) {
+      delete process.env.PI_REVIEW_GATE_DISABLED;
+    } else {
+      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    }
+    await rm(dir, { recursive: true, force: true });
+    await rm(invocationPath, { force: true });
+    await rm(bundlePathRecord, { force: true });
+  }
+});
+
+test("automatic correction resumes each reviewer session against the stable window bundle", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-session-resume-"));
+  const argvPath = join(tmpdir(), `pi-review-gate-reviewer-session-argv-${process.pid}-${Date.now()}.json`);
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const reviewerPath = join(dir, "fake-codex.mjs");
+    await writeFile(reviewerPath, [
+      "#!/usr/bin/env node",
+      "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
+      `const argvPath=${JSON.stringify(argvPath)};`,
+      "const history=existsSync(argvPath)?JSON.parse(readFileSync(argvPath,'utf8')):[];",
+      "history.push({argv:process.argv.slice(2),bundle:process.env.PI_REVIEW_GATE_BUNDLE_DIR});",
+      "writeFileSync(argvPath,JSON.stringify(history));",
+      "const args=process.argv.slice(2);",
+      "const out=args[args.indexOf('--output-last-message')+1];",
+      "const result=history.length===1",
+      "?{verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'bad value',recommendation:'write the fixed value'}]}",
+      ":{verdict:'pass',summary:'correction accepted',findings:[]};",
+      "writeFileSync(out,JSON.stringify(result));",
+      "let prompt='';process.stdin.on('data',chunk=>prompt+=chunk);",
+      "process.stdin.on('end',()=>{history.at(-1).prompt=prompt;writeFileSync(argvPath,JSON.stringify(history));process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'stable-review-session'})+'\\n'+JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}})+'\\n')});",
+    ].join("\n"), "utf8");
+    await chmod(reviewerPath, 0o755);
+
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 3,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "never",
+      decider: {
+        id: "codex",
+        adapter: "codex-cli",
+        command: reviewerPath,
+        timeoutMs: 5000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const followUps: string[] = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify() {},
+      sendUserMessage(message: string) {
+        followUps.push(message);
+      },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "broken\n", "utf8");
+    await trigger(hooks, "agent_end", { cwd: dir });
+    assert.equal(followUps.length, 1);
+
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "fixed\n", "utf8");
+    await trigger(hooks, "agent_end", { cwd: dir });
+
+    const history = JSON.parse(await readFile(argvPath, "utf8"));
+    assert.equal(history.length, 2);
+    assert.deepEqual(history[1].argv.slice(0, 2), ["exec", "resume"]);
+    assert.equal(history[1].argv.includes("stable-review-session"), true);
+    assert.equal(history[0].bundle, history[1].bundle);
+    assert.match(history[0].prompt, /authoritative evidence bundle/);
+    assert.match(history[1].prompt, /REVIEW\.md/);
+    assert.doesNotMatch(history[1].prompt, /submitted_patch_diff/);
+    const resumedInvocation = JSON.parse(await readFile(
+      join(history[1].bundle, "reviews", "0002", "reviewers", "codex", "invocation.json"),
+      "utf8",
+    ));
+    assert.equal(resumedInvocation.resumed, true);
+    assert.equal(resumedInvocation.session.id, "stable-review-session");
+
+    const bundleDir = history[1].bundle;
+    await trigger(hooks, "session_shutdown", { reason: "test" });
+    await assert.rejects(access(bundleDir), /ENOENT/);
+  } finally {
+    if (previousConfig === undefined) {
+      delete process.env.PI_REVIEW_GATE_CONFIG;
+    } else {
+      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    }
+    if (previousDisabled === undefined) {
+      delete process.env.PI_REVIEW_GATE_DISABLED;
+    } else {
+      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    }
+    await rm(dir, { recursive: true, force: true });
+    await rm(argvPath, { force: true });
   }
 });
 
@@ -680,14 +1020,24 @@ test("/review-continue after cap preserves original baseline and accumulated evi
     });
 
     assert.match(notices.join("\n"), /automatic correction cap reached/);
-    assert.equal(followUps.length, 0);
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0]?.message ?? "", /automatic correction is deferred/);
 
     await commands.get("review-continue")?.("", { notify(message: string) { notices.push(message); } });
 
-    assert.equal(followUps.length, 1);
-    assert.match(followUps[0]?.message ?? "", /missing guard/);
+    assert.equal(followUps.length, 2);
+    assert.match(followUps[1]?.message ?? "", /correction authorization/);
+    assert.doesNotMatch(followUps[1]?.message ?? "", /missing guard/);
+    const cappedBundleDir = extractBundleDir(followUps[0]?.message ?? "", 1);
+    const cappedDeliveries = JSON.parse(await readFile(
+      join(cappedBundleDir, "reviews", "0001", "delivery.json"),
+      "utf8",
+    ));
+    assert.deepEqual(
+      cappedDeliveries.deliveries.map((delivery: { action: string }) => delivery.action),
+      ["deferred", "correction_required"],
+    );
 
-    await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo continued-fix-evidence" } });
     await writeFile(join(dir, "index.ts"), "fixed after continue\n", "utf8");
     await trigger(hooks, "agent_end", {
@@ -753,7 +1103,7 @@ test("normal user input after cap continues the unresolved review window with co
             "&& input.includes('old-capped-evidence')",
             "&& input.includes('first capped summary')",
             "&& input.includes('missing guard')",
-            "&& input.includes('feedback held at the correction cap')",
+            "&& input.includes('complete feedback transmitted to the implementing model with correction deferred at the cap')",
             "&& input.includes('Initial user request:')",
             "&& input.includes('change index')",
             "&& input.includes('Additional user guidance during the same review window:')",
@@ -829,16 +1179,16 @@ test("normal user input after cap continues the unresolved review window with co
   }
 });
 
-test("a passed review remains available to /ask-reviewer but is checkpointed out of the next regular window", async () => {
+test("a passed review remains available to /ask-reviewer-interactive but is checkpointed out of the next regular window", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-window-checkpoint-"));
   const outside = join(tmpdir(), `pi-review-gate-outside-review-${process.pid}-${Date.now()}.md`);
+  const invocationPath = join(tmpdir(), `pi-review-gate-window-invocations-${process.pid}-${Date.now()}.txt`);
   const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.19\n", "utf8");
     await writeFile(outside, "old review document\n", "utf8");
-    const invocationPath = join(dir, "review-invocations.txt");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
       enabled: true,
@@ -912,7 +1262,12 @@ test("a passed review remains available to /ask-reviewer but is checkpointed out
       messages: [{ role: "assistant", content: "finished first Docker task and review document" }],
     });
 
-    await commands.get("ask-reviewer")?.("what changed outside the workspace?", {
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "acknowledged the passing review" }],
+    });
+
+    await commands.get("ask-reviewer-interactive")?.("what changed outside the workspace?", {
       ui: {
         notify(message: string) {
           notices.push(message);
@@ -932,7 +1287,11 @@ test("a passed review remains available to /ask-reviewer but is checkpointed out
       messages: [{ role: "assistant", content: "finished second Docker task" }],
     });
 
-    assert.equal(notices.filter((notice) => /review gate: passed/.test(notice)).length, 2);
+    assert.equal(
+      notices.filter((notice) => /review gate: passed/.test(notice)).length,
+      2,
+      notices.join("\n"),
+    );
     assert.match(editorViews[0]?.prefill ?? "", /passed context retained for question/);
     assert.doesNotMatch(notices.join("\n"), /review windows mixed/);
   } finally {
@@ -948,6 +1307,7 @@ test("a passed review remains available to /ask-reviewer but is checkpointed out
     }
     await rm(dir, { recursive: true, force: true });
     await rm(outside, { force: true });
+    await rm(invocationPath, { force: true });
   }
 });
 
@@ -1023,13 +1383,13 @@ test("repeated no-progress reviewer feedback stops automatic correction loop", a
     assert.equal(followUps.length, 1);
     assert.match(followUps[0]?.message ?? "", /sentinel flag/);
 
-    await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "agent_end", {
       cwd: dir,
       messages: [{ role: "assistant", content: "no implementation change is required" }],
     });
 
-    assert.equal(followUps.length, 1);
+    assert.equal(followUps.length, 2);
+    assert.match(followUps[1]?.message ?? "", /automatic correction is deferred/);
     assert.match(notices.join("\n"), /repeated changes requested with no new correction evidence/);
     assert.match(notices.join("\n"), /Stopping automatic correction to avoid a loop/);
   } finally {
@@ -1047,6 +1407,218 @@ test("repeated no-progress reviewer feedback stops automatic correction loop", a
     await rm(invocationPath, { force: true });
   }
 });
+
+test("a passing multi-model review discloses every result and reviews changes made after the transmission", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-pass-transmission-continuation-"));
+  const alphaCount = join(tmpdir(), `pi-review-gate-alpha-pass-${process.pid}-${Date.now()}.txt`);
+  const betaCount = join(tmpdir(), `pi-review-gate-beta-pass-${process.pid}-${Date.now()}.txt`);
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const reviewer = (id: string, countPath: string, peerSummary: string) => ({
+      id,
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const countPath=${JSON.stringify(countPath)};`,
+          "const count=fs.existsSync(countPath)?Number(fs.readFileSync(countPath,'utf8')):0;",
+          "fs.writeFileSync(countPath,String(count+1));",
+          "let input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{",
+          "if(count===0){process.stdout.write(JSON.stringify({verdict:'pass',",
+          `summary:${JSON.stringify(`${id} approved with useful observation`)},`,
+          `guidance:${JSON.stringify(`${id} optional guidance`)},`,
+          `findings:[{severity:'non_blocking',file:'index.ts',line:1,issue:${JSON.stringify(`${id} observational note`)},recommendation:${JSON.stringify(`${id} optional next step`)}}]}));return;}`,
+          "const sawHistory=input.includes('Complete individual reviewer results delivered to the implementing model:')",
+          `&&input.includes(${JSON.stringify(peerSummary)})`,
+          `&&input.includes(${JSON.stringify(`${id} approved with useful observation`)})`,
+          "&&input.includes('complete passing review transmitted to the implementing model');",
+          "process.stdout.write(JSON.stringify(sawHistory",
+          `?{verdict:'pass',summary:${JSON.stringify(`${id} saw the complete prior pass`)},findings:[]}`,
+          `:{verdict:'needs_changes',summary:${JSON.stringify(`${id} did not see complete prior reviewer results`)},findings:[{severity:'blocking',file:'session',line:null,issue:'prior multi-model pass was hidden',recommendation:'deliver every prior reviewer result'}]}));`,
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 5000,
+    });
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "quorum",
+      maxCorrectionCycles: 3,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "never",
+      reviewers: [
+        reviewer("alpha", alphaCount, "beta approved with useful observation"),
+        reviewer("beta", betaCount, "alpha approved with useful observation"),
+      ],
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const followUps: string[] = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify(message: string) {
+        notices.push(message);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
+      },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "implement the change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "first implementation\n", "utf8");
+    await trigger(hooks, "agent_end", { cwd: dir });
+
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0] ?? "", /Gate verdict: pass/);
+    assert.match(followUps[0] ?? "", /### alpha — pass/);
+    assert.match(followUps[0] ?? "", /alpha optional guidance/);
+    assert.match(followUps[0] ?? "", /alpha observational note/);
+    assert.match(followUps[0] ?? "", /### beta — pass/);
+    assert.match(followUps[0] ?? "", /beta optional guidance/);
+    assert.match(followUps[0] ?? "", /beta observational note/);
+    assert.doesNotMatch(followUps[0] ?? "", /Aggregate decision/);
+
+    const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
+    const passOneDir = join(bundleDir, "reviews", "0001");
+    assert.equal(await readFile(join(passOneDir, "implementing-model-transmission.md"), "utf8"), followUps[0]);
+    const envelope = JSON.parse(await readFile(join(passOneDir, "implementing-model-transmission.json"), "utf8"));
+    assert.equal(envelope.gateVerdict, "pass");
+    assert.equal(envelope.reviewerResults.length, 2);
+    assert.equal("aggregateResult" in envelope, false);
+    await assert.rejects(access(join(passOneDir, "parsed-result.json")), /ENOENT/);
+    const delivery = JSON.parse(await readFile(join(passOneDir, "delivery.json"), "utf8"));
+    assert.equal(delivery.recipient, "implementing_model");
+    assert.equal(delivery.deliveries.length, 1);
+    assert.equal(delivery.deliveries[0].action, "passed");
+    assert.equal(delivery.deliveries[0].content, "implementing-model-transmission.md");
+    assert.equal(delivery.deliveries[0].message, undefined);
+
+    await writeFile(join(dir, "index.ts"), "follow-up implementation\n", "utf8");
+    await trigger(hooks, "agent_end", { cwd: dir });
+
+    assert.equal(await readFile(alphaCount, "utf8"), "2");
+    assert.equal(await readFile(betaCount, "utf8"), "2");
+    assert.equal(followUps.length, 2);
+    assert.match(followUps[1] ?? "", /alpha saw the complete prior pass/);
+    assert.match(followUps[1] ?? "", /beta saw the complete prior pass/);
+    assert.doesNotMatch(notices.join("\n"), /prior multi-model pass was hidden/);
+    const exchange = JSON.parse(await readFile(join(bundleDir, "exchanges", "0002", "metadata.json"), "utf8"));
+    assert.equal(exchange.causedByReviewSequence, 1);
+    assert.equal(exchange.causedByReviewVerdict, "pass");
+    assert.equal(exchange.reviewResponseMode, "observation");
+  } finally {
+    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
+    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    await rm(dir, { recursive: true, force: true });
+    await rm(alphaCount, { force: true });
+    await rm(betaCount, { force: true });
+  }
+});
+
+test("an unchanged response to a passing transmission closes without another review", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-pass-transmission-unchanged-"));
+  const invocationCount = join(tmpdir(), `pi-review-gate-pass-unchanged-${process.pid}-${Date.now()}.txt`);
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 3,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "never",
+      decider: {
+        id: "passing",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(invocationCount)},'1');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'final useful observation',guidance:'consider a later cleanup',findings:[]})))`],
+        timeoutMs: 5000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const followUps: string[] = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify() {},
+      sendUserMessage(message: string) {
+        followUps.push(message);
+      },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "implement the change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "implemented\n", "utf8");
+    await trigger(hooks, "agent_end", { cwd: dir });
+    const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
+
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "acknowledged the review without changing files" }],
+    });
+
+    assert.equal(await readFile(invocationCount, "utf8"), "1");
+    assert.equal(followUps.length, 1);
+    const finalExchange = JSON.parse(await readFile(
+      join(bundleDir, "exchanges", "0002", "metadata.json"),
+      "utf8",
+    ));
+    assert.equal(finalExchange.causedByReviewSequence, 1);
+    assert.equal(finalExchange.reviewResponseMode, "observation");
+    assert.match(
+      await readFile(join(bundleDir, "exchanges", "0002", "assistant-summary.md"), "utf8"),
+      /acknowledged the review without changing files/,
+    );
+    await trigger(hooks, "input", { cwd: dir, text: "next independent task", source: "user" });
+    await assert.rejects(access(bundleDir), /ENOENT/);
+  } finally {
+    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
+    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    await rm(dir, { recursive: true, force: true });
+    await rm(invocationCount, { force: true });
+  }
+});
+
+function extractBundleDir(message: string, reviewSequence: number): string {
+  const suffix = `/reviews/${String(reviewSequence).padStart(4, "0")}`;
+  const line = message.split("\n").find((entry) => entry.startsWith("Complete immutable pass evidence: "));
+  assert.ok(line, "transmission includes the immutable pass path");
+  const passDir = line.slice("Complete immutable pass evidence: ".length);
+  assert.ok(passDir.endsWith(suffix));
+  return passDir.slice(0, -suffix.length);
+}
 
 async function trigger(hooks: Map<string, Array<(...args: unknown[]) => unknown>>, name: string, ...args: unknown[]): Promise<void> {
   for (const handler of hooks.get(name) ?? []) {

@@ -179,7 +179,6 @@ test("buildRequestContext preserves user guidance and prior capped reviewer feed
   recordReviewerFeedback(state, {
     source: "automatic",
     disposition: "held_at_cap",
-    followUpMessage: "Review found blocking issues. Add the missing guard.",
     result: {
       reviewerId: "codex",
       verdict: "needs_changes",
@@ -203,9 +202,8 @@ test("buildRequestContext preserves user guidance and prior capped reviewer feed
   assert.match(context, /Historical prior review feedback/);
   assert.match(context, /Do not assume they remain unresolved/);
   assert.match(context, /A guard is missing/);
-  assert.match(context, /Review found blocking issues\. Add the missing guard/);
 
-  markCappedFeedbackSent(state, "Review found blocking issues. Add the missing guard.");
+  markCappedFeedbackSent(state);
   assert.match(buildRequestContext(state), /feedback held at the correction cap, then sent by \/review-continue/);
 });
 

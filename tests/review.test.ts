@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import type { ReviewGateConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { createEvidenceState, recordAcceptedReviewerQuestion, recordToolCallEvidence } from "../src/evidence";
 import { runAskReviewer, runReview } from "../src/review";
+import { beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
 
 const baseConfig: ReviewGateConfig = {
   enabled: true,
@@ -103,7 +104,7 @@ test("runReview skips reviewer when no files changed", async () => {
   }
 });
 
-test("runReview runs configured reviewers in parallel and aggregates blocking findings", async () => {
+test("runReview uses an OR gate and preserves individual blocking finding identities", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewers-"));
   const markerA = join(tmpdir(), `pi-review-gate-reviewer-a-${process.pid}-${Date.now()}`);
   const markerB = join(tmpdir(), `pi-review-gate-reviewer-b-${process.pid}-${Date.now()}`);
@@ -132,14 +133,10 @@ test("runReview runs configured reviewers in parallel and aggregates blocking fi
     });
 
     assert.equal(output.result?.verdict, "needs_changes");
-    assert.match(output.result?.summary ?? "", /alpha:/);
-    assert.match(output.result?.summary ?? "", /beta:/);
-    assert.match(output.result?.guidance ?? "", /### alpha/);
-    assert.match(output.result?.guidance ?? "", /```diff\n-alpha old\n\+alpha new\n```/);
-    assert.match(output.result?.guidance ?? "", /### beta/);
+    assert.equal(output.result?.summary, "2 needs_changes");
+    assert.equal(output.result?.guidance, undefined);
     assert.match(output.followUpMessage ?? "", /\[alpha\] index\.ts\nIssue: alpha finding\nRecommendation: fix alpha/);
     assert.match(output.followUpMessage ?? "", /\[beta\] index\.ts\nIssue: beta finding\nRecommendation: fix beta/);
-    assert.match(output.followUpMessage ?? "", /```diff\n-beta old\n\+beta new\n```/);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(markerA, { force: true });
@@ -147,7 +144,129 @@ test("runReview runs configured reviewers in parallel and aggregates blocking fi
   }
 });
 
-test("runReview retains on any reviewer error even when aggregate requests changes", async () => {
+test("an aborted multi-review is atomic, records a tombstone, and preserves prior reviewer sessions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-atomic-abort-"));
+  const fastCompleted = join(tmpdir(), `pi-review-gate-fast-completed-${process.pid}-${Date.now()}`);
+  let bundleDir: string | undefined;
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    const state = createState();
+    rememberUserRequest(state, "change index");
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, before);
+    const window = state.reviewWindow!;
+    window.reviewerSessions.set("fast", { adapter: "codex-cli", id: "previous-fast-session" });
+    window.reviewerSessions.set("slow", { adapter: "codex-cli", id: "previous-slow-session" });
+    await writeFile(join(dir, "index.ts"), "first change\n", "utf8");
+
+    const reviewer = (id: "fast" | "slow") => ({
+      id,
+      adapter: "generic-cli" as const,
+      command: process.execPath,
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          "const path=require('node:path');",
+          `const id=${JSON.stringify(id)};`,
+          `const fastCompleted=${JSON.stringify(fastCompleted)};`,
+          "const canceled=path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'reviews','0001','CANCELED.md');",
+          "let input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{",
+          "if(fs.existsSync(canceled)){process.stdout.write(JSON.stringify({verdict:'pass',summary:id+' resumed after canceled sequence',findings:[]}));return;}",
+          "if(id==='fast'){fs.writeFileSync(fastCompleted,'done');process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'partial result must be discarded',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'discard me',recommendation:'do not transmit partial results'}]}));return;}",
+          "const wait=setInterval(()=>{if(fs.existsSync(fastCompleted)){clearInterval(wait);setInterval(()=>{},1000);}},5);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 5000,
+    });
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      decider: undefined,
+      reviewers: [reviewer("fast"), reviewer("slow")],
+    };
+    const controller = new AbortController();
+    const pending = runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config,
+      window,
+      signal: controller.signal,
+    });
+    await waitForPath(fastCompleted);
+    controller.abort("escape");
+    const aborted = await pending;
+    bundleDir = aborted.bundleDir;
+
+    assert.equal(aborted.result?.error, "aborted");
+    assert.equal(aborted.reviewerResults, undefined);
+    assert.equal(aborted.followUpMessage, undefined);
+    assert.equal(window.nextReviewSequence, 2);
+    assert.deepEqual(Object.fromEntries(window.reviewerSessions), {
+      fast: { adapter: "codex-cli", id: "previous-fast-session" },
+      slow: { adapter: "codex-cli", id: "previous-slow-session" },
+    });
+    const canceledDir = join(aborted.bundleDir!, "reviews", "0001");
+    assert.match(
+      await readFile(join(canceledDir, "CANCELED.md"), "utf8"),
+      /A review would have been run here but was canceled by the user\./,
+    );
+    const canceled = JSON.parse(await readFile(join(canceledDir, "canceled.json"), "utf8"));
+    assert.equal(canceled.reviewSequence, 1);
+    assert.equal(canceled.canceledBy, "user");
+    await assert.rejects(access(join(canceledDir, "reviewer-results.json")), /ENOENT/);
+    await assert.rejects(access(join(canceledDir, "reviewers", "fast", "parsed-result.json")), /ENOENT/);
+
+    const nextExchangeBaseline = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, nextExchangeBaseline);
+    await writeFile(join(dir, "index.ts"), "second change\n", "utf8");
+    const resumed = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config,
+      window,
+    });
+
+    assert.equal(resumed.reviewSequence, 2);
+    assert.equal(resumed.result?.verdict, "pass");
+    assert.equal(resumed.reviewerResults?.length, 2);
+    assert.equal(window.nextReviewSequence, 3);
+    assert.deepEqual(Object.fromEntries(window.reviewerSessions), {
+      fast: { adapter: "codex-cli", id: "previous-fast-session" },
+      slow: { adapter: "codex-cli", id: "previous-slow-session" },
+    });
+    assert.match(
+      await readFile(join(aborted.bundleDir!, "REVIEW.md"), "utf8"),
+      /CANCELED\.md.*cancellation tombstone/,
+    );
+    assert.match(
+      await readFile(join(aborted.bundleDir!, "reviews", "0002", "reviewers", "fast", "parsed-result.json"), "utf8"),
+      /resumed after canceled sequence/,
+    );
+    assert.match(
+      await readFile(join(aborted.bundleDir!, "reviews", "0002", "reviewers", "slow", "parsed-result.json"), "utf8"),
+      /resumed after canceled sequence/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(fastCompleted, { force: true });
+    if (bundleDir) {
+      await rm(bundleDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("runReview retains on any reviewer error even when another reviewer requests changes", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-retain-partial-error-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -175,7 +294,7 @@ test("runReview retains on any reviewer error even when aggregate requests chang
     assert.equal(output.result?.verdict, "needs_changes");
     assert.equal(output.result?.error, "partial_reviewer_error");
     assert.equal(output.bundleRetained, true);
-    await access(join(output.bundleDir ?? "", "reviewers", "bad-json", "raw-output.txt"));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", "reviewers", "bad-json", "raw-output.txt"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -203,15 +322,15 @@ test("runReview writes changed file artifacts into retained bundles", async () =
     });
 
     assert.equal(output.bundleRetained, true);
-    await access(join(output.bundleDir ?? "", "artifacts", "submitted", "before", "index.ts"));
-    await access(join(output.bundleDir ?? "", "artifacts", "submitted", "after", "index.ts"));
-    await access(join(output.bundleDir ?? "", "artifacts", "index.json"));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "submitted", "before", "index.ts"));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "submitted", "after", "index.ts"));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "index.json"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("runAskReviewer retains on any reviewer error even when aggregate answer is usable", async () => {
+test("runAskReviewer retains on any reviewer error even when another answer is usable", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-retain-partial-error-"));
   try {
     const output = await runAskReviewer({
@@ -231,7 +350,7 @@ test("runAskReviewer retains on any reviewer error even when aggregate answer is
 
     assert.equal(output.result?.verdict, "error");
     assert.equal(output.bundleRetained, true);
-    await access(join(output.bundleDir ?? "", "reviewers", "bad-json", "raw-output.txt"));
+    await access(join(output.bundleDir ?? "", "questions", "0001", "reviewers", "bad-json", "raw-output.txt"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -592,4 +711,16 @@ function jsonReviewer(id: string, objectLiteral: string): NonNullable<ReviewGate
     ],
     timeoutMs: 5000,
   };
+}
+
+async function waitForPath(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`Timed out waiting for ${path}`);
 }

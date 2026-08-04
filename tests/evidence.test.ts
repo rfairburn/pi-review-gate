@@ -86,6 +86,47 @@ test("evidence pre-captures an existing outside-worktree file before modificatio
   }
 });
 
+test("outside-worktree evidence keeps an independent baseline for each exchange", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-review-gate-evidence-exchanges-cwd-"));
+  const outside = join(tmpdir(), `pi-review-gate-outside-exchanges-${Date.now()}.txt`);
+  const state = createEvidenceState();
+  try {
+    await writeFile(outside, "original\n", "utf8");
+    await recordToolCallEvidence({
+      state,
+      cwd,
+      toolName: "write",
+      toolInput: { path: outside },
+      snapshotOptions,
+      exchangeSequence: 1,
+    });
+    await writeFile(outside, "incorrect\n", "utf8");
+
+    await recordToolCallEvidence({
+      state,
+      cwd,
+      toolName: "write",
+      toolInput: { path: outside },
+      snapshotOptions,
+      exchangeSequence: 2,
+    });
+    await writeFile(outside, "original\n", "utf8");
+
+    const cumulative = await collectEvidenceChanges(state, cwd, snapshotOptions);
+    const correction = await collectEvidenceChanges(state, cwd, snapshotOptions, 2);
+
+    assert.equal(cumulative.length, 0);
+    assert.equal(correction.length, 1);
+    assert.equal(correction[0]?.oldContent, "incorrect\n");
+    assert.equal(correction[0]?.newContent, "original\n");
+    assert.equal(state.events[0]?.exchangeSequence, 1);
+    assert.equal(state.events[1]?.exchangeSequence, 2);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(outside, { force: true });
+  }
+});
+
 test("rememberFinalAssistantSummary extracts the last assistant text", () => {
   const state = createEvidenceState();
 

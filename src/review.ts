@@ -1,7 +1,7 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DeciderConfig, ReviewGateConfig } from "./config";
-import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle } from "./bundle";
+import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
 import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
@@ -11,8 +11,9 @@ import { GenericCliAdapter } from "./adapters/generic-cli";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
 import { LittleCoderAdapter } from "./adapters/little-coder";
-import type { ModelAdapter } from "./adapters/types";
+import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
+import { completeActiveExchange, hasUnresolvedReview, type ReviewWindow } from "./state";
 
 export interface ReviewRunInput {
   cwd: string;
@@ -24,17 +25,30 @@ export interface ReviewRunInput {
   correctionAttemptCount?: number;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
+  window?: ReviewWindow;
 }
 
 export interface ReviewRunOutput {
   changed: boolean;
   changes: ChangedFile[];
+  noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response";
   result?: ReviewResult;
   reviewerResults?: ReviewResult[];
   followUpMessage?: string;
   bundleDir?: string;
+  invocationDir?: string;
+  reviewSequence?: number;
+  reviewedSnapshot?: WorkspaceSnapshot;
   bundleRetained?: boolean;
   error?: string;
+}
+
+export interface PausedExchangeInput {
+  cwd: string;
+  config: ReviewGateConfig;
+  evidence?: EvidenceState;
+  actingUsage?: TokenUsage;
+  window: ReviewWindow;
 }
 
 export interface AskReviewerInput {
@@ -47,6 +61,7 @@ export interface AskReviewerInput {
   correctionAttemptCount?: number;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
+  window?: ReviewWindow;
 }
 
 export interface AskReviewerOutput {
@@ -74,13 +89,64 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     : [];
   const split = splitReviewChanges(workspaceChanges, evidenceChanges);
   const { changes, sideEffectChanges } = split;
-  if (changes.length === 0) {
-    return { changed: false, changes };
+  const exchangeBefore = input.window?.activeExchange?.baseline;
+  const exchangeSequence = input.window?.activeExchange?.sequence;
+  const reviewResponseMode = input.window?.activeExchange?.reviewResponseMode;
+  const exchangeWorkspaceChanges = exchangeBefore ? compareSnapshots(exchangeBefore, after) : workspaceChanges;
+  const exchangeEvidenceChanges = input.evidence && exchangeSequence !== undefined
+    ? await collectEvidenceChanges(input.evidence, input.cwd, {
+      maxFileBytes: input.config.maxFileBytes,
+      maxSnapshotBytes: input.config.maxSnapshotBytes,
+    }, exchangeSequence)
+    : evidenceChanges;
+  const exchangeSplit = splitReviewChanges(exchangeWorkspaceChanges, exchangeEvidenceChanges);
+  const exchangeWorkspacePatch = exchangeWorkspaceChanges.length > 0
+    ? buildUnifiedPatch(exchangeWorkspaceChanges, input.config.maxPatchBytes).patch
+    : "";
+  const exchangeSideEffectPatch = exchangeSplit.sideEffectChanges.length > 0
+    ? buildUnifiedPatch(exchangeSplit.sideEffectChanges, input.config.maxPatchBytes).patch
+    : "";
+  if (input.window) {
+    completeActiveExchange(input.window, {
+      workspaceChanges: exchangeWorkspaceChanges,
+      sideEffectChanges: exchangeSplit.sideEffectChanges,
+      workspacePatch: exchangeWorkspacePatch,
+      sideEffectPatch: exchangeSideEffectPatch,
+      actingUsage: input.actingUsage,
+    });
+  }
+  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0;
+  if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
+    if (input.window?.bundleDir) {
+      await syncReviewWindowArtifacts({
+        dir: input.window.bundleDir,
+        cwd: input.cwd,
+        currentReviewSequence: Math.max(1, input.window.nextReviewSequence - 1),
+        exchanges: input.window.exchanges,
+      });
+    }
+    return {
+      changed: false,
+      changes,
+      noReviewReason: reviewResponseMode === "deferred"
+        ? "unchanged_deferred_response"
+        : "unchanged_review_response",
+    };
+  }
+  const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
+  if (changes.length === 0 && !isCorrectionValidation) {
+    return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
 
   const patchResult = workspaceChanges.length > 0
     ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes)
-    : { patch: "(no submitted workspace changes detected; review captured side effects below)", truncated: false, omitted: [] };
+    : {
+      patch: isCorrectionValidation
+        ? "(no net submitted workspace changes; validate the current workspace against the prior review feedback)"
+        : "(no submitted workspace changes detected; review captured side effects below)",
+      truncated: false,
+      omitted: [],
+    };
   const sideEffectPatchResult = sideEffectChanges.length > 0
     ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
     : { patch: "", truncated: false, omitted: [] };
@@ -93,7 +159,11 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     };
   }
 
+  const reviewSequence = input.window?.nextReviewSequence ?? 1;
   const bundle = await createReviewBundle({
+    dir: input.window?.bundleDir,
+    reviewSequence,
+    exchanges: input.window?.exchanges,
     cwd: input.cwd,
     request: input.request,
     changes,
@@ -107,6 +177,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     actingUsage: input.actingUsage,
     requireConcreteGuidance,
     metadata: {
+      exchangeSequence: input.window?.exchanges.at(-1)?.sequence,
       correctionAttemptCount,
       requireConcreteGuidance,
       patchTruncated: patchResult.truncated,
@@ -115,24 +186,42 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
     },
   });
+  if (input.window) {
+    input.window.bundleDir = bundle.dir;
+    input.window.nextReviewSequence += 1;
+  }
 
   await input.notify?.(`review gate: reviewing changes with ${reviewers.map((reviewer) => reviewer.id).join(", ")}`);
+  const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
   const reviewerResults = await Promise.all(reviewers.map((reviewer) => runSingleReviewer({
     reviewer,
     cwd: input.cwd,
     prompt: bundle.prompt,
+    bundlePrompt: bundle.bundlePrompt,
     bundleDir: bundle.dir,
+    invocationDir: bundle.invocationDir,
+    window: input.window,
     signal: input.signal,
   })));
-  const result = aggregateReviewResults(reviewerResults);
+  if (reviewWasAborted(input.signal, reviewerResults)) {
+    await recordCanceledInvocation(bundle.invocationDir, input.window, sessionsBeforeReview, reviewSequence, "review", input.signal);
+    return abortedReviewOutput(changes, bundle.dir);
+  }
+  const result = decideReviewResults(reviewerResults);
   await Promise.all([
-    writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-    writeFile(join(bundle.dir, "reviewer-results.json"), JSON.stringify(reviewerResults, null, 2), "utf8"),
-    writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    writeFile(join(bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    writeFile(join(bundle.dir, "sessions.json"), JSON.stringify(
+      Object.fromEntries(input.window?.reviewerSessions ?? []),
+      null,
+      2,
+    ), "utf8"),
   ]).catch(() => undefined);
 
   const shouldRetain = shouldRetainBundle(input.config, result, reviewerResults);
-  if (!shouldRetain) {
+  if (input.window) {
+    input.window.retainBundleAfterClose ||= shouldRetain;
+  }
+  if (!input.window && !shouldRetain) {
     await removeReviewBundle(bundle.dir);
   }
 
@@ -143,8 +232,49 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     reviewerResults,
     followUpMessage: result.verdict === "needs_changes" ? buildFollowUpMessage(result) : undefined,
     bundleDir: bundle.dir,
+    invocationDir: bundle.invocationDir,
+    reviewSequence,
+    reviewedSnapshot: after,
     bundleRetained: shouldRetain,
   };
+}
+
+export async function collectPausedReviewExchange(input: PausedExchangeInput): Promise<void> {
+  const active = input.window.activeExchange;
+  if (!active) {
+    return;
+  }
+  const after = await createWorkspaceSnapshot(input.cwd, {
+    maxFileBytes: input.config.maxFileBytes,
+    maxSnapshotBytes: input.config.maxSnapshotBytes,
+  });
+  const workspaceChanges = active.baseline ? compareSnapshots(active.baseline, after) : [];
+  const evidenceChanges = input.evidence
+    ? await collectEvidenceChanges(input.evidence, input.cwd, {
+      maxFileBytes: input.config.maxFileBytes,
+      maxSnapshotBytes: input.config.maxSnapshotBytes,
+    }, active.sequence)
+    : [];
+  const split = splitReviewChanges(workspaceChanges, evidenceChanges);
+  completeActiveExchange(input.window, {
+    workspaceChanges,
+    sideEffectChanges: split.sideEffectChanges,
+    workspacePatch: workspaceChanges.length > 0
+      ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes).patch
+      : "",
+    sideEffectPatch: split.sideEffectChanges.length > 0
+      ? buildUnifiedPatch(split.sideEffectChanges, input.config.maxPatchBytes).patch
+      : "",
+    actingUsage: input.actingUsage,
+  });
+  if (input.window.bundleDir) {
+    await syncReviewWindowArtifacts({
+      dir: input.window.bundleDir,
+      cwd: input.cwd,
+      currentReviewSequence: Math.max(1, input.window.nextReviewSequence - 1),
+      exchanges: input.window.exchanges,
+    });
+  }
 }
 
 export async function runAskReviewer(input: AskReviewerInput): Promise<AskReviewerOutput> {
@@ -170,7 +300,11 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     };
   }
 
+  const reviewSequence = input.window?.nextReviewSequence ?? 1;
   const bundle = await createReviewerQuestionBundle({
+    dir: input.window?.bundleDir,
+    reviewSequence,
+    exchanges: input.window?.exchanges,
     cwd: input.cwd,
     question: input.question,
     request: input.request,
@@ -184,6 +318,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       : undefined,
     requireConcreteGuidance,
     metadata: {
+      exchangeSequence: input.window?.exchanges.at(-1)?.sequence,
       correctionAttemptCount,
       requireConcreteGuidance,
       patchTruncated: patchResult.truncated,
@@ -192,24 +327,47 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
     },
   });
+  if (input.window) {
+    input.window.bundleDir = bundle.dir;
+    input.window.nextReviewSequence += 1;
+  }
 
   await input.notify?.(`review gate: asking reviewers ${reviewers.map((reviewer) => reviewer.id).join(", ")}`);
+  const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
   const reviewerResults = await Promise.all(reviewers.map((reviewer) => runSingleReviewer({
     reviewer,
     cwd: input.cwd,
     prompt: bundle.prompt,
+    bundlePrompt: bundle.bundlePrompt,
     bundleDir: bundle.dir,
+    invocationDir: bundle.invocationDir,
+    window: input.window,
     signal: input.signal,
   })));
-  const result = aggregateReviewResults(reviewerResults);
+  if (reviewWasAborted(input.signal, reviewerResults)) {
+    await recordCanceledInvocation(bundle.invocationDir, input.window, sessionsBeforeReview, reviewSequence, "reviewer question", input.signal);
+    return {
+      changes,
+      result: abortedResult(),
+      bundleDir: bundle.dir,
+      bundleRetained: false,
+    };
+  }
+  const result = decideReviewResults(reviewerResults);
   await Promise.all([
-    writeFile(join(bundle.dir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-    writeFile(join(bundle.dir, "reviewer-results.json"), JSON.stringify(reviewerResults, null, 2), "utf8"),
-    writeFile(join(bundle.dir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    writeFile(join(bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    writeFile(join(bundle.dir, "sessions.json"), JSON.stringify(
+      Object.fromEntries(input.window?.reviewerSessions ?? []),
+      null,
+      2,
+    ), "utf8"),
   ]).catch(() => undefined);
 
   const shouldRetain = shouldRetainBundle(input.config, result, reviewerResults);
-  if (!shouldRetain) {
+  if (input.window) {
+    input.window.retainBundleAfterClose ||= shouldRetain;
+  }
+  if (!input.window && !shouldRetain) {
     await removeReviewBundle(bundle.dir);
   }
 
@@ -226,22 +384,40 @@ async function runSingleReviewer(input: {
   reviewer: DeciderConfig;
   cwd: string;
   prompt: string;
+  bundlePrompt: string;
   bundleDir: string;
+  invocationDir: string;
+  window?: ReviewWindow;
   signal?: AbortSignal;
 }): Promise<ReviewResult> {
-  const reviewerDir = join(input.bundleDir, "reviewers", safePathSegment(input.reviewer.id));
+  const reviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
   await mkdir(reviewerDir, { recursive: true });
+  const startedAt = Date.now();
+  let resumed = false;
+  let restartedAfterResumeFailure = false;
   let result: ReviewResult;
   try {
     const adapter = createAdapter(input.reviewer);
-    result = await adapter.run({
+    const previousSession = input.window?.reviewerSessions.get(input.reviewer.id);
+    const usableSession = previousSession?.adapter === adapter.kind ? previousSession : undefined;
+    resumed = Boolean(usableSession);
+    const invoke = (session = usableSession) => adapter.run({
       id: input.reviewer.id,
       cwd: input.cwd,
-      prompt: input.prompt,
+      prompt: input.reviewer.adapter === "generic-cli" ? input.prompt : input.bundlePrompt,
+      evidenceBundleDir: input.bundleDir,
       bundleDir: reviewerDir,
       timeoutMs: input.reviewer.timeoutMs ?? 300_000,
       signal: input.signal,
+      session,
+      onSession: (nextSession) => input.window?.reviewerSessions.set(input.reviewer.id, nextSession),
     });
+    result = await invoke();
+    if (usableSession && isResumeFailure(result)) {
+      input.window?.reviewerSessions.delete(input.reviewer.id);
+      restartedAfterResumeFailure = true;
+      result = await invoke(undefined);
+    }
   } catch (error) {
     result = {
       reviewerId: input.reviewer.id,
@@ -254,11 +430,23 @@ async function runSingleReviewer(input: {
   await Promise.all([
     writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
     writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    writeFile(join(reviewerDir, "invocation.json"), JSON.stringify({
+      reviewerId: input.reviewer.id,
+      adapter: input.reviewer.adapter,
+      resumed,
+      restartedAfterResumeFailure,
+      durationMs: Date.now() - startedAt,
+      session: input.window?.reviewerSessions.get(input.reviewer.id) ?? null,
+    }, null, 2), "utf8"),
   ]).catch(() => undefined);
   return result;
 }
 
-function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
+function isResumeFailure(result: ReviewResult): boolean {
+  return result.verdict === "error" && Boolean(result.error?.startsWith("exit_"));
+}
+
+function decideReviewResults(results: ReviewResult[]): ReviewResult {
   if (results.length === 1 && results[0]) {
     return results[0];
   }
@@ -267,10 +455,9 @@ function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
   const usage = aggregateUsage(results);
   if (needsChanges.length > 0) {
     return {
-      reviewerId: "aggregate",
+      reviewerId: "gate",
       verdict: "needs_changes",
-      summary: aggregateSummary(results),
-      guidance: aggregateGuidance(needsChanges),
+      summary: reviewerVerdictSummary(results),
       findings: needsChanges.flatMap((result) => result.findings.map((finding) => ({
         ...finding,
         reviewerId: result.reviewerId,
@@ -281,24 +468,19 @@ function aggregateReviewResults(results: ReviewResult[]): ReviewResult {
   }
   if (errors.length > 0) {
     return {
-      reviewerId: "aggregate",
+      reviewerId: "gate",
       verdict: "error",
-      summary: aggregateSummary(results),
-      guidance: aggregateGuidance(results),
+      summary: reviewerVerdictSummary(results),
       findings: [],
       usage,
       error: errors.every((result) => result.error === "aborted") ? "aborted" : "reviewer_error",
     };
   }
   return {
-    reviewerId: "aggregate",
+    reviewerId: "gate",
     verdict: "pass",
-    summary: aggregateSummary(results),
-    guidance: aggregateGuidance(results),
-    findings: results.flatMap((result) => result.findings.map((finding) => ({
-      ...finding,
-      reviewerId: result.reviewerId,
-    }))),
+    summary: reviewerVerdictSummary(results),
+    findings: [],
     usage,
   };
 }
@@ -317,16 +499,72 @@ function shouldRetainBundle(
   return result.verdict === "error" || reviewerResults.some((reviewerResult) => reviewerResult.verdict === "error");
 }
 
-function aggregateSummary(results: ReviewResult[]): string {
-  return results.map((result) => `${result.reviewerId}: ${result.summary}`).join("\n");
+function reviewerVerdictSummary(results: ReviewResult[]): string {
+  const counts = new Map<ReviewResult["verdict"], number>();
+  for (const result of results) {
+    counts.set(result.verdict, (counts.get(result.verdict) ?? 0) + 1);
+  }
+  return (["needs_changes", "pass", "error"] as const)
+    .filter((verdict) => counts.has(verdict))
+    .map((verdict) => `${counts.get(verdict)} ${verdict}`)
+    .join(", ");
 }
 
-function aggregateGuidance(results: ReviewResult[]): string | undefined {
-  const guidance = results
-    .filter((result) => result.guidance)
-    .map((result) => `### ${result.reviewerId}\n\n${result.guidance}`)
-    .join("\n\n");
-  return guidance || undefined;
+function reviewWasAborted(signal: AbortSignal | undefined, results: ReviewResult[]): boolean {
+  return Boolean(signal?.aborted || results.some((result) => result.error === "aborted"));
+}
+
+async function recordCanceledInvocation(
+  invocationDir: string,
+  window: ReviewWindow | undefined,
+  sessionsBeforeReview: Map<string, ReviewerSession>,
+  reviewSequence: number,
+  kind: "review" | "reviewer question",
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  await rm(invocationDir, { recursive: true, force: true });
+  await mkdir(invocationDir, { recursive: true });
+  const canceledAt = new Date().toISOString();
+  const canceledBy = signal?.reason === "escape" ? "user" : "session";
+  const summary = canceledBy === "user"
+    ? `A ${kind} would have been run here but was canceled by the user.`
+    : `A ${kind} would have been run here but was canceled with the active session.`;
+  await Promise.all([
+    writeFile(join(invocationDir, "CANCELED.md"), `${summary}\n`, "utf8"),
+    writeFile(join(invocationDir, "canceled.json"), JSON.stringify({
+      reviewSequence,
+      kind,
+      canceledAt,
+      canceledBy,
+      summary,
+    }, null, 2), "utf8"),
+  ]);
+  if (window) {
+    window.reviewerSessions.clear();
+    for (const [reviewerId, session] of sessionsBeforeReview) {
+      window.reviewerSessions.set(reviewerId, session);
+    }
+  }
+}
+
+function abortedResult(): ReviewResult {
+  return {
+    reviewerId: "gate",
+    verdict: "error",
+    summary: "Review aborted.",
+    findings: [],
+    error: "aborted",
+  };
+}
+
+function abortedReviewOutput(changes: ChangedFile[], bundleDir: string): ReviewRunOutput {
+  return {
+    changed: true,
+    changes,
+    result: abortedResult(),
+    bundleDir,
+    bundleRetained: false,
+  };
 }
 
 function shouldRequireConcreteGuidance(config: ReviewGateConfig, correctionAttemptCount = 0): boolean {
@@ -339,7 +577,10 @@ function aggregateUsage(results: ReviewResult[]): ReviewResult["usage"] {
     return undefined;
   }
   return {
+    scope: "invocation",
     inputTokens: sumUsage(usages, "inputTokens"),
+    totalInputTokens: sumUsage(usages, "totalInputTokens"),
+    uncachedInputTokens: sumUsage(usages, "uncachedInputTokens"),
     cachedInputTokens: sumUsage(usages, "cachedInputTokens"),
     outputTokens: sumUsage(usages, "outputTokens"),
     reasoningOutputTokens: sumUsage(usages, "reasoningOutputTokens"),

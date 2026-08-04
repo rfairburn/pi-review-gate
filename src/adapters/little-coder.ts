@@ -1,4 +1,5 @@
-import { writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { LittleCoderDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
@@ -18,6 +19,10 @@ export class LittleCoderAdapter implements ModelAdapter {
     const stderrPath = join(req.bundleDir, "stderr.txt");
     const usagePath = join(req.bundleDir, "usage.json");
     const processResultPath = join(req.bundleDir, "process-result.json");
+    const sessionId = req.session?.id ?? randomUUID();
+    const sessionDir = join(req.evidenceBundleDir ?? req.bundleDir, "sessions", safePathSegment(req.id));
+    await mkdir(sessionDir, { recursive: true });
+    req.onSession?.({ adapter: this.kind, id: sessionId });
     const streamExtractor = new PiJsonlReviewExtractor();
     const args = [
       "--model",
@@ -25,7 +30,13 @@ export class LittleCoderAdapter implements ModelAdapter {
       "--mode",
       "json",
       "--print",
+      "--thinking",
+      "high",
       ...(this.config.args ?? []),
+      "--session-id",
+      sessionId,
+      "--session-dir",
+      sessionDir,
       "--no-tools",
       "--tools",
       "read,grep,find,ls",
@@ -43,7 +54,7 @@ export class LittleCoderAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: reviewerEnv(process.env),
+      env: reviewerEnv(process.env, req.evidenceBundleDir),
       signal: req.signal,
       onStdoutChunk: (chunk) => streamExtractor.push(chunk),
     });
@@ -91,6 +102,10 @@ export class LittleCoderAdapter implements ModelAdapter {
     result.usage = extracted.usage;
     return result;
   }
+}
+
+function safePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/g, "_") || "reviewer";
 }
 
 function errorResult(reviewerId: string, summary: string, rawOutputPath: string, error: string, usage: ReviewResult["usage"]): ReviewResult {

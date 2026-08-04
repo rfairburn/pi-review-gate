@@ -8,6 +8,43 @@ import { registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
 import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest } from "../src/state";
 
+test("/review-pause and /review-unpause gate explicit reviewer commands", async () => {
+  const state = createState();
+  const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+  const notices: string[] = [];
+  const pi = {
+    registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+      commands.set(name, options.handler);
+    },
+  };
+  const ctx = {
+    notify(message: string) {
+      notices.push(message);
+    },
+  };
+
+  registerCommands({
+    pi,
+    cwd: () => process.cwd(),
+    config: reviewConfig(),
+    state,
+  });
+
+  await commands.get("review-pause")?.("", ctx);
+  assert.equal(state.reviewsPaused, true);
+  assert.match(notices.at(-1) ?? "", /reviews paused; turn evidence will still be collected/);
+
+  await commands.get("review-now")?.("", ctx);
+  assert.match(notices.at(-1) ?? "", /use \/review-unpause before \/review-now/);
+
+  await commands.get("ask-reviewer")?.("is this safe?", ctx);
+  assert.match(notices.at(-1) ?? "", /use \/review-unpause before \/ask-reviewer/);
+
+  await commands.get("review-unpause")?.("", ctx);
+  assert.equal(state.reviewsPaused, false);
+  assert.match(notices.at(-1) ?? "", /next eligible turn will review accumulated changes and evidence/);
+});
+
 test("/review-clear starts the next prompt fresh without deleting retained review artifacts", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-clear-"));
   try {
@@ -68,7 +105,7 @@ test("/review-clear starts the next prompt fresh without deleting retained revie
     assert.equal(await readFile(retainedBundleMarker, "utf8"), "keep me");
     assert.match(notices.at(-1) ?? "", /next prompt will start fresh from the current workspace/);
     assert.match(notices.at(-1) ?? "", /bundle retention remains governed by retainBundles=always/);
-    assert.match(notices.at(-1) ?? "", /reviewer sessions were not deleted/);
+    assert.match(notices.at(-1) ?? "", /reviewer sessions from the cleared window will not be reused/);
 
     rememberUserRequest(state, "fresh task");
     const freshWindow = getReviewerQuestionWindow(state)!;
@@ -131,7 +168,7 @@ test("/review-now requested changes reset the automatic correction budget", asyn
   }
 });
 
-test("/review-now notice shows non-blocking reviewer results in multi-reviewer runs", async () => {
+test("/review-now delivers multi-reviewer results once and keeps its notice concise", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-multi-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -171,17 +208,18 @@ test("/review-now notice shows non-blocking reviewer results in multi-reviewer r
 
     const noticeText = notices.join("\n");
     assert.equal(followUps.length, 1);
-    assert.match(followUps[0] ?? "", /\[blocking\] index\.ts\nIssue: missing test\nRecommendation: add coverage/);
-    assert.doesNotMatch(followUps[0] ?? "", /claude found no blocking issues/);
-    assert.match(noticeText, /Reviewer results:/);
-    assert.match(noticeText, /- blocking: needs_changes, 1 blocking - fix required/);
-    assert.match(noticeText, /- claude: pass - claude found no blocking issues/);
+    assert.match(followUps[0] ?? "", /\[blocking\] index\.ts\n  Issue: missing test\n  Recommendation: add coverage/);
+    assert.match(followUps[0] ?? "", /### claude — pass/);
+    assert.match(followUps[0] ?? "", /claude found no blocking issues/);
+    assert.match(noticeText, /review gate: changes requested/);
+    assert.doesNotMatch(noticeText, /Reviewer results:/);
+    assert.doesNotMatch(noticeText, /claude found no blocking issues/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("a passing /review-now checkpoints and closes its review window", async () => {
+test("a passing /review-now transmits the complete pass and keeps its window open for the response", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-pass-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -195,9 +233,13 @@ test("a passing /review-now checkpoints and closes its review window", async () 
 
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const notices: string[] = [];
+    const followUps: string[] = [];
     const pi = {
       registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
         commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
       },
     };
     const ctx = {
@@ -214,17 +256,18 @@ test("a passing /review-now checkpoints and closes its review window", async () 
     });
 
     await commands.get("review-now")?.("", ctx);
-    assert.equal(state.reviewWindow, undefined);
+    assert.notEqual(state.reviewWindow, undefined);
+    assert.equal(state.reviewWindow?.reviewHistory.at(-1)?.disposition, "sent_for_observation");
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0] ?? "", /Gate verdict: pass/);
+    assert.match(followUps[0] ?? "", /### passing — pass/);
     assert.match(notices.join("\n"), /review gate: passed/);
-
-    await commands.get("review-now")?.("", ctx);
-    assert.match(notices.join("\n"), /no active review window with a baseline/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("/ask-reviewer retains a passing review's patch and evidence", async () => {
+test("/ask-reviewer-interactive retains a passing review's patch and evidence", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-pass-ask-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -272,10 +315,10 @@ test("/ask-reviewer retains a passing review's patch and evidence", async () => 
     });
 
     await commands.get("review-now")?.("", ctx);
-    assert.equal(state.reviewWindow, undefined);
+    assert.notEqual(state.reviewWindow, undefined);
     assert.match(notices.join("\n"), /review gate: passed/);
 
-    await commands.get("ask-reviewer")?.("what supports the passed change?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("what supports the passed change?", ctx);
 
     assert.equal(editorViews.length, 1);
     assert.match(editorViews[0]?.prefill ?? "", /retained passed patch and evidence/);
@@ -327,7 +370,7 @@ test("/review-continue sends capped feedback and resets the correction budget", 
   assert.match(notices.join("\n"), /no capped reviewer feedback available/);
 });
 
-test("/ask-reviewer at the correction cap receives the complete unresolved review window", async () => {
+test("/ask-reviewer-interactive at the correction cap receives the complete unresolved review window", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-capped-window-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -352,7 +395,6 @@ test("/ask-reviewer at the correction cap receives the complete unresolved revie
     recordReviewerFeedback(state, {
       source: "automatic",
       disposition: "held_at_cap",
-      followUpMessage: cappedFollowUp,
       result: {
         reviewerId: "codex",
         verdict: "needs_changes",
@@ -392,7 +434,7 @@ test("/ask-reviewer at the correction cap receives the complete unresolved revie
       state,
     });
 
-    await commands.get("ask-reviewer")?.("is the capped finding still valid?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("is the capped finding still valid?", ctx);
 
     assert.equal(editorViews.length, 1);
     assert.match(editorViews[0]?.prefill ?? "", /complete capped review window/);
@@ -404,7 +446,7 @@ test("/ask-reviewer at the correction cap receives the complete unresolved revie
   }
 });
 
-test("/ask-reviewer opens the reviewer answer in the editor when canceled", async () => {
+test("/ask-reviewer-interactive opens the reviewer answer in the editor when canceled", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-command-"));
   try {
     const state = createState();
@@ -439,7 +481,7 @@ test("/ask-reviewer opens the reviewer answer in the editor when canceled", asyn
       state,
     });
 
-    await commands.get("ask-reviewer")?.("does this plan look right?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("does this plan look right?", ctx);
     assert.equal(userMessages.length, 0);
     assert.equal(editorViews.length, 1);
     assert.equal(editorViews[0]?.title, "review gate: reviewer answer");
@@ -454,7 +496,7 @@ test("/ask-reviewer opens the reviewer answer in the editor when canceled", asyn
   }
 });
 
-test("/ask-reviewer submits edited reviewer text when the editor is submitted", async () => {
+test("/ask-reviewer-interactive submits edited reviewer text when the editor is submitted", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-submit-"));
   try {
     const state = createState();
@@ -484,7 +526,7 @@ test("/ask-reviewer submits edited reviewer text when the editor is submitted", 
       state,
     });
 
-    await commands.get("ask-reviewer")?.("should this be shared?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("should this be shared?", ctx);
 
     assert.equal(userMessages.length, 1);
     assert.match(userMessages[0] ?? "", /Reviewer note from \/ask-reviewer:/);
@@ -508,7 +550,51 @@ test("/ask-reviewer submits edited reviewer text when the editor is submitted", 
   }
 });
 
-test("/ask-reviewer opens partial multi-reviewer answers when one reviewer errors", async () => {
+test("/ask-reviewer submits the same reviewer text without opening the interactive editor", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-now-"));
+  try {
+    const state = createState();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const userMessages: string[] = [];
+    let editorCalls = 0;
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        userMessages.push(message);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify() {},
+        async editor(_title: string, prefill: string) {
+          editorCalls += 1;
+          return prefill;
+        },
+      },
+    };
+
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: askReviewerConfig(),
+      state,
+    });
+
+    await commands.get("ask-reviewer-interactive")?.("should this be shared?", ctx);
+    await commands.get("ask-reviewer")?.("should this be shared?", ctx);
+
+    assert.equal(editorCalls, 1);
+    assert.equal(userMessages.length, 2);
+    assert.equal(userMessages[1], userMessages[0]);
+    assert.equal(state.reviewWindow?.evidence.acceptedReviewerQuestions.length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/ask-reviewer-interactive opens partial multi-reviewer answers when one reviewer errors", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-partial-"));
   try {
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
@@ -542,12 +628,15 @@ test("/ask-reviewer opens partial multi-reviewer answers when one reviewer error
       state: createState(),
     });
 
-    await commands.get("ask-reviewer")?.("do you agree?", ctx);
+    await commands.get("ask-reviewer-interactive")?.("do you agree?", ctx);
 
     assert.equal(userMessages.length, 0);
     assert.equal(editorViews.length, 1);
-    assert.match(editorViews[0]?.prefill ?? "", /Answer: passing: reviewer answer ready/);
-    assert.match(editorViews[0]?.prefill ?? "", /bad-json: Reviewer JSON has an invalid verdict/);
+    assert.match(editorViews[0]?.prefill ?? "", /## passing — pass/);
+    assert.match(editorViews[0]?.prefill ?? "", /Answer: reviewer answer ready/);
+    assert.match(editorViews[0]?.prefill ?? "", /## bad-json — error/);
+    assert.match(editorViews[0]?.prefill ?? "", /Answer: Reviewer JSON has an invalid verdict/);
+    assert.match(editorViews[0]?.prefill ?? "", /Reviewer error: schema_error/);
     assert.match(editorViews[0]?.prefill ?? "", /Retained review bundle: /);
     assert.match(notices.join("\n"), /reviewer answer cleared, bundle retained at /);
     assert.doesNotMatch(notices.join("\n"), /ask-reviewer failed/);

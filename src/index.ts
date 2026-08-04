@@ -1,12 +1,14 @@
 import { loadConfig } from "./config";
+import { removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
-import { buildReviewerResultsNotice } from "./prompts";
-import { runReview, type ReviewRunOutput } from "./review";
+import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
+  activeExchangeHasBaseline,
+  armReviewResponseExchange,
   beginAgentRun,
   buildRequestContext,
   closeReviewWindow,
@@ -19,6 +21,7 @@ import {
   type ReviewGateState,
 } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
+import { buildReviewAuthorizationMessage, buildReviewTransmission, writeReviewDeliveryReceipt, writeReviewTransmission, type ReviewTransmissionAction } from "./transmission";
 
 declare const module: {
   exports: unknown;
@@ -47,19 +50,24 @@ export async function activate(pi: unknown): Promise<void> {
   let activeReviewAbort: ReviewAbortHandle | undefined;
   const sessionAbortController = new AbortController();
 
-  registerHook(pi, "session_shutdown", () => {
+  registerHook(pi, "session_shutdown", async () => {
     sessionActive = false;
     sessionAbortController.abort();
+    const reviewWasActive = Boolean(activeReviewAbort);
     activeReviewAbort?.shutdown();
     activeReviewAbort = undefined;
+    const windows = [state.reviewWindow, state.lastQuestionWindow];
     discardSessionState(state);
+    await Promise.all(windows.map((window, index) =>
+      reviewWasActive && index === 0 ? Promise.resolve() : removeTransientWindowBundle(window)
+    ));
   });
 
   registerHook(pi, "session_start", async (...args) => {
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
   });
 
-  registerHook(pi, "input", (...args) => {
+  registerHook(pi, "input", async (...args) => {
     currentCwd = extractCwd(args, currentCwd);
     if (extractInputSource(args) === "extension") {
       return;
@@ -69,13 +77,15 @@ export async function activate(pi: unknown): Promise<void> {
       state.queuedUserInputsDuringReview.push(text.trim());
       return { action: "handled" };
     }
+    const expiredQuestionWindow = state.reviewWindow ? undefined : state.lastQuestionWindow;
     rememberUserRequest(state, text);
+    await removeTransientWindowBundle(expiredQuestionWindow);
   });
 
   registerHook(pi, "before_agent_start", async (...args) => {
     currentCwd = extractCwd(args, currentCwd);
-    const runKind = beginAgentRun(state);
-    if (runKind === "continuation") {
+    beginAgentRun(state);
+    if (activeExchangeHasBaseline(state)) {
       return;
     }
     const baseline = await createWorkspaceSnapshot(currentCwd, {
@@ -101,6 +111,7 @@ export async function activate(pi: unknown): Promise<void> {
         maxFileBytes: config.maxFileBytes,
         maxSnapshotBytes: config.maxSnapshotBytes,
       },
+      exchangeSequence: window.activeExchange?.sequence,
     });
   });
 
@@ -117,6 +128,7 @@ export async function activate(pi: unknown): Promise<void> {
       toolInput: toolArgs,
       result: args[0],
       isError: isToolError(args[0]),
+      exchangeSequence: window.activeExchange?.sequence,
     });
   });
 
@@ -139,6 +151,16 @@ export async function activate(pi: unknown): Promise<void> {
       state.queuedUserInputsDuringReview = [];
       return;
     }
+    if (state.reviewsPaused) {
+      await collectPausedReviewExchange({
+        cwd: currentCwd,
+        config,
+        evidence: window.evidence,
+        actingUsage,
+        window,
+      });
+      return;
+    }
 
     state.reviewInProgress = true;
     const reviewAbort = createReviewAbortController({
@@ -158,6 +180,7 @@ export async function activate(pi: unknown): Promise<void> {
         evidence: window.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(window),
         actingUsage,
+        window,
         signal: reviewAbort.signal,
         notify: (message) => sendNoticeWhileSessionActive(noticeTarget, message, () => sessionActive),
       });
@@ -173,6 +196,9 @@ export async function activate(pi: unknown): Promise<void> {
       if (activeReviewAbort === reviewAbort) {
         activeReviewAbort = undefined;
       }
+      if (!sessionActive) {
+        await removeTransientWindowBundle(window);
+      }
     }
 
     if (!sessionActive) {
@@ -180,6 +206,11 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     if (!output.changed) {
+      if (output.noReviewReason === "unchanged_deferred_response") {
+        pauseReviewWindow(state, "paused");
+        await releaseQueuedUserInputs(pi, state, () => sessionActive);
+        return;
+      }
       closeReviewWindow(state, true);
       await releaseQueuedUserInputs(pi, state, () => sessionActive);
       return;
@@ -195,12 +226,23 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     if (output.result?.verdict === "pass") {
+      const transmission = await transmitReviewPass({
+        state,
+        output,
+        source: "automatic",
+        disposition: "sent_for_observation",
+        action: "passed",
+      });
       await sendNoticeWhileSessionActive(
         noticeTarget,
-        withReviewDetails(`review gate: passed (${formatTokenUsage(output.result.usage)})`, output),
+        `review gate: passed (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
-      closeReviewWindow(state, true);
+      if (sessionActive) {
+        if (await sendFollowUp(pi, transmission)) {
+          await writeReviewDeliveryReceipt(output.invocationDir!, "passed", transmission);
+        }
+      }
       await releaseQueuedUserInputs(pi, state, () => sessionActive);
       return;
     }
@@ -212,25 +254,28 @@ export async function activate(pi: unknown): Promise<void> {
         changes: output.changes,
         evidenceEventCount: window.evidence.events.length,
       })) {
-        recordReviewerFeedback(state, {
-          result: output.result,
+        const transmission = await transmitReviewPass({
+          state,
+          output,
           source: "automatic",
-          disposition: "reported_only",
-          followUpMessage: output.followUpMessage,
+          disposition: "sent_at_cap",
+          action: "deferred",
         });
         await sendNoticeWhileSessionActive(
           noticeTarget,
           [
             `review gate: repeated changes requested with no new correction evidence (${formatTokenUsage(output.result.usage)})`,
-            ...reviewDetailsLines(output),
             "Reviewer feedback matched the previous blocking feedback, and the correction turn produced no new tool evidence or file-change fingerprint.",
             "Stopping automatic correction to avoid a loop.",
-            "",
-            output.followUpMessage,
           ].join("\n"),
           () => sessionActive,
         );
         pauseReviewWindow(state, "paused");
+        if (sessionActive) {
+          if (await sendFollowUp(pi, transmission)) {
+            await writeReviewDeliveryReceipt(output.invocationDir!, "deferred", transmission);
+          }
+        }
         await releaseQueuedUserInputs(pi, state, () => sessionActive);
         return;
       }
@@ -241,44 +286,53 @@ export async function activate(pi: unknown): Promise<void> {
         evidenceEventCount: window.evidence.events.length,
       });
       if (window.correctionCycles >= config.maxCorrectionCycles) {
-        window.lastCappedFollowUp = output.followUpMessage;
-        recordReviewerFeedback(state, {
-          result: output.result,
+        const deferredTransmission = await transmitReviewPass({
+          state,
+          output,
           source: "automatic",
-          disposition: "held_at_cap",
-          followUpMessage: output.followUpMessage,
+          disposition: "sent_at_cap",
+          action: "deferred",
+        });
+        window.lastCappedFollowUp = buildReviewAuthorizationMessage({
+          reviewSequence: output.reviewSequence!,
+          bundleDir: output.bundleDir!,
         });
         pauseReviewWindow(state, "paused_at_cap");
         await sendNoticeWhileSessionActive(
           noticeTarget,
           [
             `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`,
-            ...reviewDetailsLines(output),
-            "Reviewer feedback was not sent to the primary model.",
-            `Use /review-continue to send this feedback and allow another ${config.maxCorrectionCycles} automatic correction cycle(s).`,
-            "",
-            output.followUpMessage,
+            "Complete reviewer feedback was transmitted to the implementing model, but automatic correction is deferred.",
+            `Use /review-continue to authorize another ${config.maxCorrectionCycles} automatic correction cycle(s).`,
           ].join("\n"),
           () => sessionActive,
         );
+        if (sessionActive) {
+          if (await sendFollowUp(pi, deferredTransmission)) {
+            await writeReviewDeliveryReceipt(output.invocationDir!, "deferred", deferredTransmission);
+          }
+        }
         await releaseQueuedUserInputs(pi, state, () => sessionActive);
         return;
       }
       window.lastCappedFollowUp = undefined;
       window.correctionCycles += 1;
-      recordReviewerFeedback(state, {
-        result: output.result,
+      const transmission = await transmitReviewPass({
+        state,
+        output,
         source: "automatic",
         disposition: "sent_for_correction",
-        followUpMessage: output.followUpMessage,
+        action: "correction_required",
       });
       await sendNoticeWhileSessionActive(
         noticeTarget,
-        withReviewDetails(`review gate: changes requested (${formatTokenUsage(output.result.usage)})`, output),
+        `review gate: changes requested (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
       if (sessionActive) {
-        await sendFollowUp(pi, output.followUpMessage);
+        if (await sendFollowUp(pi, transmission)) {
+          await writeReviewDeliveryReceipt(output.invocationDir!, "correction_required", transmission);
+        }
       }
       await releaseQueuedUserInputs(pi, state, () => sessionActive);
       return;
@@ -286,13 +340,20 @@ export async function activate(pi: unknown): Promise<void> {
 
     const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
     if (output.result) {
-      recordReviewerFeedback(state, {
-        result: output.result,
+      const transmission = await transmitReviewPass({
+        state,
+        output,
         source: "automatic",
-        disposition: "reported_only",
+        disposition: "sent_review_error",
+        action: "review_error",
       });
+      if (sessionActive) {
+        if (await sendFollowUp(pi, transmission)) {
+          await writeReviewDeliveryReceipt(output.invocationDir!, "review_error", transmission);
+        }
+      }
     }
-    await sendNoticeWhileSessionActive(noticeTarget, withReviewDetails(failed, output), () => sessionActive);
+    await sendNoticeWhileSessionActive(noticeTarget, failed, () => sessionActive);
     pauseReviewWindow(state, "paused");
     await releaseQueuedUserInputs(pi, state, () => sessionActive);
   });
@@ -307,20 +368,37 @@ export async function activate(pi: unknown): Promise<void> {
   });
 }
 
+async function transmitReviewPass(input: {
+  state: ReviewGateState;
+  output: ReviewRunOutput;
+  source: "automatic" | "manual";
+  disposition: "sent_for_correction" | "sent_for_observation" | "sent_at_cap" | "sent_review_error";
+  action: ReviewTransmissionAction;
+}): Promise<string> {
+  const transmission = buildReviewTransmission({
+    reviewSequence: input.output.reviewSequence!,
+    gateVerdict: input.output.result!.verdict,
+    reviewerResults: input.output.reviewerResults!,
+    bundleDir: input.output.bundleDir!,
+    action: input.action,
+  });
+  const message = transmission.message;
+  await writeReviewTransmission(input.output.invocationDir!, transmission);
+  recordReviewerFeedback(input.state, {
+    result: input.output.result!,
+    reviewerResults: input.output.reviewerResults,
+    reviewSequence: input.output.reviewSequence,
+    source: input.source,
+    disposition: input.disposition,
+  });
+  armReviewResponseExchange(input.state, input.output.reviewedSnapshot!);
+  return message;
+}
+
 export default activate;
 
 module.exports = activate;
 Object.assign(module.exports as Record<string, unknown>, { activate });
-
-function withReviewDetails(header: string, output: ReviewRunOutput): string {
-  const [details] = reviewDetailsLines(output);
-  return details ? `${header}\n${details}` : header;
-}
-
-function reviewDetailsLines(output: ReviewRunOutput): string[] {
-  const details = buildReviewerResultsNotice(output.reviewerResults, output.bundleRetained ? output.bundleDir : undefined);
-  return details ? [details] : [];
-}
 
 function isToolError(value: unknown): boolean {
   return typeof value === "object" && value !== null && "isError" in value && Boolean((value as { isError?: unknown }).isError);
@@ -366,7 +444,7 @@ function createReviewAbortController(input: {
   const abortReview = (reason: ReviewAbortReason) => {
     if (!controller.signal.aborted) {
       abortReason = reason;
-      controller.abort();
+      controller.abort(reason);
     }
   };
   const notifyCancellation = () => {

@@ -4,9 +4,17 @@ export interface ModelAdapterRequest {
   id: string;
   cwd: string;
   prompt: string;
+  evidenceBundleDir?: string;
   bundleDir: string;
   timeoutMs: number;
   signal?: AbortSignal;
+  session?: ReviewerSession;
+  onSession?: (session: ReviewerSession) => void;
+}
+
+export interface ReviewerSession {
+  adapter: string;
+  id: string;
 }
 
 export interface ModelAdapter {

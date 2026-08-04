@@ -1,11 +1,10 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DeciderConfig, ReviewGateConfig } from "./config";
-import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts } from "./bundle";
+import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
 import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
-import { buildFollowUpMessage } from "./prompts";
 import type { ReviewResult } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
 import { CodexCliAdapter } from "./adapters/codex-cli";
@@ -34,7 +33,6 @@ export interface ReviewRunOutput {
   noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response";
   result?: ReviewResult;
   reviewerResults?: ReviewResult[];
-  followUpMessage?: string;
   bundleDir?: string;
   invocationDir?: string;
   reviewSequence?: number;
@@ -166,7 +164,6 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     exchanges: input.window?.exchanges,
     cwd: input.cwd,
     request: input.request,
-    changes,
     submittedChanges: split.workspaceChanges,
     sideEffectChanges,
     patch: patchResult.patch,
@@ -187,56 +184,32 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
     },
   });
-  if (input.window) {
-    input.window.bundleDir = bundle.dir;
-    input.window.nextReviewSequence += 1;
-  }
-
-  await input.notify?.(`review gate: reviewing changes with ${reviewers.map((reviewer) => reviewer.id).join(", ")}`);
-  const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
-  const reviewerResults = await Promise.all(reviewers.map((reviewer) => runSingleReviewer({
-    reviewer,
+  registerBundleWithWindow(input.window, bundle.dir);
+  const invocation = await executeReviewerInvocation({
+    reviewers,
+    bundle,
     cwd: input.cwd,
-    prompt: bundle.prompt,
-    bundlePrompt: bundle.bundlePrompt,
-    bundleDir: bundle.dir,
-    invocationDir: bundle.invocationDir,
+    config: input.config,
     window: input.window,
     signal: input.signal,
-  })));
-  if (reviewWasAborted(input.signal, reviewerResults)) {
-    await recordCanceledInvocation(bundle.invocationDir, input.window, sessionsBeforeReview, reviewSequence, "review", input.signal);
+    reviewSequence,
+    kind: "review",
+    notify: input.notify,
+  });
+  if (invocation.aborted) {
     return abortedReviewOutput(changes, bundle.dir);
-  }
-  const result = decideReviewResults(reviewerResults);
-  await Promise.all([
-    writeFile(join(bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
-    writeFile(join(bundle.dir, "sessions.json"), JSON.stringify(
-      Object.fromEntries(input.window?.reviewerSessions ?? []),
-      null,
-      2,
-    ), "utf8"),
-  ]).catch(() => undefined);
-
-  const shouldRetain = shouldRetainBundle(input.config, result, reviewerResults);
-  if (input.window) {
-    input.window.retainBundleAfterClose ||= shouldRetain;
-  }
-  if (!input.window && !shouldRetain) {
-    await removeReviewBundle(bundle.dir);
   }
 
   return {
     changed: true,
     changes,
-    result,
-    reviewerResults,
-    followUpMessage: result.verdict === "needs_changes" ? buildFollowUpMessage(result) : undefined,
+    result: invocation.result,
+    reviewerResults: invocation.reviewerResults,
     bundleDir: bundle.dir,
     invocationDir: bundle.invocationDir,
     reviewSequence,
     reviewedSnapshot: after,
-    bundleRetained: shouldRetain,
+    bundleRetained: invocation.bundleRetained,
   };
 }
 
@@ -309,7 +282,6 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     cwd: input.cwd,
     question: input.question,
     request: input.request,
-    changes,
     submittedChanges: workspaceChanges,
     sideEffectChanges,
     patch: patchResult.patch,
@@ -329,25 +301,19 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
     },
   });
-  if (input.window) {
-    input.window.bundleDir = bundle.dir;
-    input.window.nextReviewSequence += 1;
-  }
-
-  await input.notify?.(`review gate: asking reviewers ${reviewers.map((reviewer) => reviewer.id).join(", ")}`);
-  const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
-  const reviewerResults = await Promise.all(reviewers.map((reviewer) => runSingleReviewer({
-    reviewer,
+  registerBundleWithWindow(input.window, bundle.dir);
+  const invocation = await executeReviewerInvocation({
+    reviewers,
+    bundle,
     cwd: input.cwd,
-    prompt: bundle.prompt,
-    bundlePrompt: bundle.bundlePrompt,
-    bundleDir: bundle.dir,
-    invocationDir: bundle.invocationDir,
+    config: input.config,
     window: input.window,
     signal: input.signal,
-  })));
-  if (reviewWasAborted(input.signal, reviewerResults)) {
-    await recordCanceledInvocation(bundle.invocationDir, input.window, sessionsBeforeReview, reviewSequence, "reviewer question", input.signal);
+    reviewSequence,
+    kind: "reviewer question",
+    notify: input.notify,
+  });
+  if (invocation.aborted) {
     return {
       changes,
       result: abortedResult(),
@@ -355,31 +321,79 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       bundleRetained: false,
     };
   }
+
+  return {
+    changes,
+    result: invocation.result,
+    reviewerResults: invocation.reviewerResults,
+    bundleDir: bundle.dir,
+    bundleRetained: invocation.bundleRetained,
+  };
+}
+
+function registerBundleWithWindow(window: ReviewWindow | undefined, bundleDir: string): void {
+  if (window) {
+    window.bundleDir = bundleDir;
+    window.nextReviewSequence += 1;
+  }
+}
+
+async function executeReviewerInvocation(input: {
+  reviewers: DeciderConfig[];
+  bundle: ReviewBundle;
+  cwd: string;
+  config: ReviewGateConfig;
+  window?: ReviewWindow;
+  signal?: AbortSignal;
+  reviewSequence: number;
+  kind: "review" | "reviewer question";
+  notify?: (message: string) => void | Promise<void>;
+}): Promise<
+  | { aborted: true; bundleRetained: false }
+  | { aborted: false; result: ReviewResult; reviewerResults: ReviewResult[]; bundleRetained: boolean }
+> {
+  const verb = input.kind === "review" ? "reviewing changes with" : "asking reviewers";
+  await input.notify?.(`review gate: ${verb} ${input.reviewers.map((reviewer) => reviewer.id).join(", ")}`);
+  const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
+  const reviewerResults = await Promise.all(input.reviewers.map((reviewer) => runSingleReviewer({
+    reviewer,
+    cwd: input.cwd,
+    prompt: input.bundle.prompt,
+    bundlePrompt: input.bundle.bundlePrompt,
+    bundleDir: input.bundle.dir,
+    invocationDir: input.bundle.invocationDir,
+    window: input.window,
+    signal: input.signal,
+  })));
+  if (reviewWasAborted(input.signal, reviewerResults)) {
+    await recordCanceledInvocation(
+      input.bundle.invocationDir,
+      input.window,
+      sessionsBeforeReview,
+      input.reviewSequence,
+      input.kind,
+      input.signal,
+    );
+    return { aborted: true, bundleRetained: false };
+  }
+
   const result = decideReviewResults(reviewerResults);
   await Promise.all([
-    writeFile(join(bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
-    writeFile(join(bundle.dir, "sessions.json"), JSON.stringify(
+    writeFile(join(input.bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    writeFile(join(input.bundle.dir, "sessions.json"), JSON.stringify(
       Object.fromEntries(input.window?.reviewerSessions ?? []),
       null,
       2,
     ), "utf8"),
   ]).catch(() => undefined);
 
-  const shouldRetain = shouldRetainBundle(input.config, result, reviewerResults);
+  const bundleRetained = shouldRetainBundle(input.config, result, reviewerResults);
   if (input.window) {
-    input.window.retainBundleAfterClose ||= shouldRetain;
+    input.window.retainBundleAfterClose ||= bundleRetained;
+  } else if (!bundleRetained) {
+    await removeReviewBundle(input.bundle.dir);
   }
-  if (!input.window && !shouldRetain) {
-    await removeReviewBundle(bundle.dir);
-  }
-
-  return {
-    changes,
-    result,
-    reviewerResults,
-    bundleDir: bundle.dir,
-    bundleRetained: shouldRetain,
-  };
+  return { aborted: false, result, reviewerResults, bundleRetained };
 }
 
 async function runSingleReviewer(input: {

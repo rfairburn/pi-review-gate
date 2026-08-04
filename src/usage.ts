@@ -47,7 +47,25 @@ export function formatTokenUsage(usage: TokenUsage | undefined): string {
 }
 
 export function parseCodexUsageFromJsonl(stdout: string): TokenUsage | undefined {
+  return extractCodexReviewFromJsonl(stdout).usage;
+}
+
+export function extractReviewTextFromCodexJsonl(stdout: string): string {
+  return extractCodexReviewFromJsonl(stdout).text;
+}
+
+export function extractCodexSessionId(stdout: string): string | undefined {
+  return extractCodexReviewFromJsonl(stdout).sessionId;
+}
+
+export function extractCodexReviewFromJsonl(stdout: string): {
+  text: string;
+  usage?: TokenUsage;
+  sessionId?: string;
+} {
   let lastUsage: unknown;
+  let text = "";
+  let sessionId: string | undefined;
   for (const line of stdout.split(/\r?\n/)) {
     if (!line.trim()) {
       continue;
@@ -66,61 +84,26 @@ export function parseCodexUsageFromJsonl(stdout: string): TokenUsage | undefined
     } else if (isRecord(parsed.payload) && parsed.payload.type === "token_count") {
       lastUsage = parsed.payload.info;
     }
-  }
-  if (!isRecord(lastUsage)) {
-    return undefined;
-  }
-  const lastTokenUsage = isRecord(lastUsage.last_token_usage) ? lastUsage.last_token_usage : undefined;
-  const totalTokenUsage = isRecord(lastUsage.total_token_usage) ? lastUsage.total_token_usage : undefined;
-  const raw = lastTokenUsage ?? totalTokenUsage;
-  if (!raw) {
-    return normalizeOpenAiStyleUsage(lastUsage, lastUsage);
-  }
-  return normalizeOpenAiStyleUsage(raw, lastUsage);
-}
-
-export function extractReviewTextFromCodexJsonl(stdout: string): string {
-  let lastText = "";
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) {
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!isRecord(parsed)) {
-      continue;
-    }
     if (isRecord(parsed.item) && parsed.item.type === "agent_message" && typeof parsed.item.text === "string" && parsed.item.text.trim()) {
-      lastText = parsed.item.text;
+      text = parsed.item.text;
     } else if (parsed.type === "message" && isRecord(parsed.message) && parsed.message.role === "assistant") {
-      const text = textFromContent(parsed.message.content);
-      if (text.trim()) {
-        lastText = text;
+      const messageText = textFromContent(parsed.message.content);
+      if (messageText.trim()) {
+        text = messageText;
       }
     }
-  }
-  return lastText;
-}
-
-export function extractCodexSessionId(stdout: string): string | undefined {
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(line) as unknown;
-      if (isRecord(parsed) && parsed.type === "thread.started" && typeof parsed.thread_id === "string") {
-        return parsed.thread_id;
-      }
-    } catch {
-      // Ignore non-JSON diagnostic lines.
+    if (parsed.type === "thread.started" && typeof parsed.thread_id === "string") {
+      sessionId = parsed.thread_id;
     }
   }
-  return undefined;
+  let usage: TokenUsage | undefined;
+  if (isRecord(lastUsage)) {
+    const lastTokenUsage = isRecord(lastUsage.last_token_usage) ? lastUsage.last_token_usage : undefined;
+    const totalTokenUsage = isRecord(lastUsage.total_token_usage) ? lastUsage.total_token_usage : undefined;
+    const raw = lastTokenUsage ?? totalTokenUsage;
+    usage = normalizeOpenAiStyleUsage(raw ?? lastUsage, lastUsage);
+  }
+  return { text, usage, sessionId };
 }
 
 export function parseClaudeUsage(value: unknown): TokenUsage | undefined {

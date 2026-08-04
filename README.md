@@ -33,10 +33,8 @@ Example config using Codex as the reviewer:
 ```json
 {
   "enabled": true,
-  "mode": "single-decider",
   "maxCorrectionCycles": 3,
   "implementationGuidanceAfterCorrectionAttempts": 1,
-  "reviewWhen": "changed-files",
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,
   "maxSnapshotBytes": 52428800,
@@ -79,10 +77,8 @@ being mislabeled as verdict-schema failures.
 ```json
 {
   "enabled": true,
-  "mode": "single-decider",
   "maxCorrectionCycles": 3,
   "implementationGuidanceAfterCorrectionAttempts": 1,
-  "reviewWhen": "changed-files",
   "retainBundles": "on-failure",
   "reviewers": [
     {
@@ -161,6 +157,13 @@ For little-coder plus Codex review, use:
 
 ```bash
 ./scripts/little-coder-codex-review.sh
+```
+
+All named development wrappers delegate to one preset launcher. It can also be
+used directly with `codex`, `claude`, `glm-5.2`, `double`, `triple`, or `fake`:
+
+```bash
+./scripts/little-coder-review.sh double
 ```
 
 The development wrappers pass all ordinary arguments through to `little-coder`.

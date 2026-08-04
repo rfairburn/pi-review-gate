@@ -9,7 +9,6 @@ import {
   getReviewerQuestionWindow,
   getCorrectionAttemptCount,
   markCappedFeedbackSent,
-  pauseReviewWindow,
   recordAcceptedReviewerQuestion,
   recordReviewerFeedback,
   rememberUserRequest,
@@ -34,7 +33,7 @@ test("rememberUserRequest appends guidance to the active review window without c
   rememberUserRequest(state, "the -geolite2 needs to go back for pinterest");
 
   assert.equal(state.reviewWindow, window);
-  assert.equal(window.latestRequest, "the -geolite2 needs to go back for pinterest");
+  assert.equal(window.requestHistory.at(-1)?.text, "the -geolite2 needs to go back for pinterest");
   assert.equal(window.requestHistory.length, 2);
   assert.equal(window.requestHistory[0]?.phase, "initial");
   assert.equal(window.requestHistory[1]?.phase, "mid_run");
@@ -56,12 +55,9 @@ test("normal user input at the correction cap stays in the unresolved review win
     candidatePaths: ["old.ts"],
     riskSignals: [],
   });
-  pauseReviewWindow(state, "paused_at_cap");
-
   rememberUserRequest(state, "additional user guidance");
 
   assert.equal(state.reviewWindow, window);
-  assert.equal(window.status, "paused_at_cap");
   assert.equal(window.lastCappedFollowUp, "Review found blocking issues.");
   assert.deepEqual(window.requestHistory.map((item) => item.text), ["original task", "additional user guidance"]);
   assert.equal(window.correctionCycles, 3);
@@ -178,7 +174,7 @@ test("buildRequestContext preserves user guidance and prior capped reviewer feed
   rememberUserRequest(state, "the -geolite2 needs to go back for pinterest");
   recordReviewerFeedback(state, {
     source: "automatic",
-    disposition: "held_at_cap",
+    disposition: "sent_at_cap",
     result: {
       reviewerId: "codex",
       verdict: "needs_changes",
@@ -198,7 +194,7 @@ test("buildRequestContext preserves user guidance and prior capped reviewer feed
   assert.match(context, /Initial user request:\nupdate Fleet release bits/);
   assert.match(context, /Additional user guidance during the same review window:/);
   assert.match(context, /2\. the -geolite2 needs to go back for pinterest/);
-  assert.match(context, /feedback held at the correction cap/);
+  assert.match(context, /complete feedback transmitted to the implementing model with correction deferred at the cap/);
   assert.match(context, /Historical prior review feedback/);
   assert.match(context, /Do not assume they remain unresolved/);
   assert.match(context, /A guard is missing/);

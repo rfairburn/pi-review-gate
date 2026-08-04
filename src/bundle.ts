@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ChangedFile } from "./capture";
@@ -13,14 +13,13 @@ import {
 import type { ReviewExchangeContext } from "./state";
 import type { TokenUsage } from "./usage";
 
-export interface ReviewBundleInput {
+interface ReviewBundleContext {
   dir?: string;
   reviewSequence?: number;
   exchanges?: ReviewExchangeContext[];
   cwd: string;
   request: string;
-  changes: ChangedFile[];
-  submittedChanges?: ChangedFile[];
+  submittedChanges: ChangedFile[];
   sideEffectChanges?: ChangedFile[];
   patch: string;
   sideEffectPatch?: string;
@@ -30,110 +29,40 @@ export interface ReviewBundleInput {
   metadata?: Record<string, unknown>;
 }
 
+export interface ReviewBundleInput extends ReviewBundleContext {}
+
 export interface ReviewBundle {
   dir: string;
   invocationDir: string;
   prompt: string;
   bundlePrompt: string;
-  requestPath: string;
-  changedFilesPath: string;
-  patchPath: string;
-  sideEffectPatchPath: string;
-  metadataPath: string;
-  promptPath: string;
 }
 
-export interface ReviewerQuestionBundleInput {
-  dir?: string;
-  reviewSequence?: number;
-  exchanges?: ReviewExchangeContext[];
-  cwd: string;
+export interface ReviewerQuestionBundleInput extends ReviewBundleContext {
   question: string;
-  request: string;
-  changes: ChangedFile[];
-  submittedChanges?: ChangedFile[];
-  sideEffectChanges?: ChangedFile[];
-  patch: string;
-  sideEffectPatch?: string;
-  evidence?: EvidenceBundle;
-  guidanceEscalation?: ImplementationGuidanceEscalation;
-  metadata?: Record<string, unknown>;
 }
 
 export async function createReviewBundle(input: ReviewBundleInput): Promise<ReviewBundle> {
-  const dir = input.dir ?? await mkdtemp(join(tmpdir(), "pi-review-gate-"));
-  const invocationDir = join(dir, "reviews", sequencePath(input.reviewSequence ?? 1));
-  await mkdir(invocationDir, { recursive: true });
-  const prompt = buildReviewerPrompt({
-    request: input.request,
-    changes: input.changes,
-    submittedChanges: input.submittedChanges ?? input.changes,
-    sideEffectChanges: input.sideEffectChanges ?? [],
-    patch: input.patch,
-    sideEffectPatch: input.sideEffectPatch,
-    cwd: input.cwd,
-    bundleDir: dir,
-    evidenceMarkdown: input.evidence?.markdown,
-    guidanceEscalation: input.guidanceEscalation,
-  });
-
-  const requestPath = join(invocationDir, "request.md");
-  const changedFilesPath = join(invocationDir, "changed-files.json");
-  const patchPath = join(invocationDir, "patch.diff");
-  const sideEffectPatchPath = join(invocationDir, "side-effect.patch.diff");
-  const metadataPath = join(invocationDir, "metadata.json");
-  const promptPath = join(invocationDir, "reviewer-context.md");
-  const evidenceJsonPath = join(invocationDir, "evidence.json");
-  const evidenceMarkdownPath = join(invocationDir, "evidence.md");
-  const actingUsagePath = join(invocationDir, "acting-model-usage.json");
-
-  const changedFiles = summarizeReviewChanges({
-    cwd: input.cwd,
-    submittedChanges: input.submittedChanges ?? input.changes,
-    sideEffectChanges: input.sideEffectChanges ?? [],
-  });
-
-  await Promise.all([
-    writeFile(requestPath, input.request, "utf8"),
-    writeFile(changedFilesPath, JSON.stringify(changedFiles, null, 2), "utf8"),
-    writeFile(patchPath, input.patch, "utf8"),
-    writeFile(sideEffectPatchPath, input.sideEffectPatch ?? "", "utf8"),
-    writeFile(metadataPath, JSON.stringify({ cwd: input.cwd, createdAt: new Date().toISOString(), ...input.metadata }, null, 2), "utf8"),
-    writeFile(promptPath, prompt, "utf8"),
-    writeFile(evidenceJsonPath, JSON.stringify(input.evidence ?? null, null, 2), "utf8"),
-    writeFile(evidenceMarkdownPath, input.evidence?.markdown ?? "", "utf8"),
-    writeFile(actingUsagePath, JSON.stringify(input.actingUsage ?? null, null, 2), "utf8"),
-    writeReviewArtifacts(invocationDir, input.submittedChanges ?? input.changes, input.sideEffectChanges ?? [], input.evidence),
-    writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence),
-    writeExchangeArtifacts(dir, input.exchanges ?? []),
-    writeReviewIndex(dir, input.cwd, input.reviewSequence ?? 1, input.exchanges ?? [], false),
-  ]);
-
-  const bundlePrompt = buildBundlePrompt(dir, invocationDir, false);
-
-  return {
-    dir,
-    invocationDir,
-    prompt,
-    bundlePrompt,
-    requestPath,
-    changedFilesPath,
-    patchPath,
-    sideEffectPatchPath,
-    metadataPath,
-    promptPath,
-  };
+  return createBundle({ kind: "review", ...input });
 }
 
 export async function createReviewerQuestionBundle(input: ReviewerQuestionBundleInput): Promise<ReviewBundle> {
+  return createBundle({ kind: "question", ...input });
+}
+
+type CreateBundleInput =
+  | ({ kind: "review" } & ReviewBundleInput)
+  | ({ kind: "question" } & ReviewerQuestionBundleInput);
+
+async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
+  const question = input.kind === "question";
   const dir = input.dir ?? await mkdtemp(join(tmpdir(), "pi-review-gate-"));
-  const invocationDir = join(dir, "questions", sequencePath(input.reviewSequence ?? 1));
+  const reviewSequence = input.reviewSequence ?? 1;
+  const invocationDir = join(dir, question ? "questions" : "reviews", sequencePath(reviewSequence));
   await mkdir(invocationDir, { recursive: true });
-  const prompt = buildReviewerQuestionPrompt({
-    question: input.question,
+  const promptContext = {
     request: input.request,
-    changes: input.changes,
-    submittedChanges: input.submittedChanges ?? input.changes,
+    submittedChanges: input.submittedChanges,
     sideEffectChanges: input.sideEffectChanges ?? [],
     patch: input.patch,
     sideEffectPatch: input.sideEffectPatch,
@@ -141,53 +70,48 @@ export async function createReviewerQuestionBundle(input: ReviewerQuestionBundle
     bundleDir: dir,
     evidenceMarkdown: input.evidence?.markdown,
     guidanceEscalation: input.guidanceEscalation,
-  });
-
-  const questionPath = join(invocationDir, "question.md");
-  const requestPath = join(invocationDir, "request.md");
-  const changedFilesPath = join(invocationDir, "changed-files.json");
-  const patchPath = join(invocationDir, "patch.diff");
-  const sideEffectPatchPath = join(invocationDir, "side-effect.patch.diff");
-  const metadataPath = join(invocationDir, "metadata.json");
-  const promptPath = join(invocationDir, "reviewer-context.md");
-  const evidenceJsonPath = join(invocationDir, "evidence.json");
-  const evidenceMarkdownPath = join(invocationDir, "evidence.md");
+  };
+  const prompt = question
+    ? buildReviewerQuestionPrompt({ ...promptContext, question: input.question })
+    : buildReviewerPrompt(promptContext);
 
   const changedFiles = summarizeReviewChanges({
     cwd: input.cwd,
-    submittedChanges: input.submittedChanges ?? input.changes,
+    submittedChanges: input.submittedChanges,
     sideEffectChanges: input.sideEffectChanges ?? [],
   });
 
-  await Promise.all([
-    writeFile(questionPath, input.question, "utf8"),
-    writeFile(requestPath, input.request, "utf8"),
-    writeFile(changedFilesPath, JSON.stringify(changedFiles, null, 2), "utf8"),
-    writeFile(patchPath, input.patch, "utf8"),
-    writeFile(sideEffectPatchPath, input.sideEffectPatch ?? "", "utf8"),
-    writeFile(metadataPath, JSON.stringify({ cwd: input.cwd, createdAt: new Date().toISOString(), kind: "ask-reviewer", ...input.metadata }, null, 2), "utf8"),
-    writeFile(promptPath, prompt, "utf8"),
-    writeFile(evidenceJsonPath, JSON.stringify(input.evidence ?? null, null, 2), "utf8"),
-    writeFile(evidenceMarkdownPath, input.evidence?.markdown ?? "", "utf8"),
-    writeReviewArtifacts(invocationDir, input.submittedChanges ?? input.changes, input.sideEffectChanges ?? [], input.evidence),
+  const writes: Array<Promise<void>> = [
+    writeFile(join(invocationDir, "request.md"), input.request, "utf8"),
+    writeFile(join(invocationDir, "changed-files.json"), JSON.stringify(changedFiles, null, 2), "utf8"),
+    writeFile(join(invocationDir, "patch.diff"), input.patch, "utf8"),
+    writeFile(join(invocationDir, "side-effect.patch.diff"), input.sideEffectPatch ?? "", "utf8"),
+    writeFile(join(invocationDir, "metadata.json"), JSON.stringify({
+      cwd: input.cwd,
+      createdAt: new Date().toISOString(),
+      ...(question ? { kind: "ask-reviewer" } : {}),
+      ...input.metadata,
+    }, null, 2), "utf8"),
+    writeFile(join(invocationDir, "reviewer-context.md"), prompt, "utf8"),
+    writeFile(join(invocationDir, "evidence.json"), JSON.stringify(input.evidence ?? null, null, 2), "utf8"),
+    writeFile(join(invocationDir, "evidence.md"), input.evidence?.markdown ?? "", "utf8"),
+    writeReviewArtifacts(invocationDir, input.submittedChanges, input.sideEffectChanges ?? [], input.evidence),
     writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence),
-    writeExchangeArtifacts(dir, input.exchanges ?? []),
-    writeReviewIndex(dir, input.cwd, input.reviewSequence ?? 1, input.exchanges ?? [], true),
-  ]);
-
-  const bundlePrompt = buildBundlePrompt(dir, invocationDir, true);
+    writeExchangeArtifacts(dir, input.dir ? (input.exchanges ?? []).slice(-1) : input.exchanges ?? []),
+    writeReviewIndex(dir, input.cwd, reviewSequence, input.exchanges ?? [], question),
+  ];
+  if (question) {
+    writes.push(writeFile(join(invocationDir, "question.md"), input.question, "utf8"));
+  } else {
+    writes.push(writeFile(join(invocationDir, "acting-model-usage.json"), JSON.stringify(input.actingUsage ?? null, null, 2), "utf8"));
+  }
+  await Promise.all(writes);
 
   return {
     dir,
     invocationDir,
     prompt,
-    bundlePrompt,
-    requestPath,
-    changedFilesPath,
-    patchPath,
-    sideEffectPatchPath,
-    metadataPath,
-    promptPath,
+    bundlePrompt: buildBundlePrompt(dir, invocationDir, question),
   };
 }
 
@@ -209,7 +133,7 @@ export async function syncReviewWindowArtifacts(input: {
   exchanges: ReviewExchangeContext[];
 }): Promise<void> {
   await Promise.all([
-    writeExchangeArtifacts(input.dir, input.exchanges),
+    writeExchangeArtifacts(input.dir, input.exchanges.slice(-1)),
     writeReviewIndex(input.dir, input.cwd, input.currentReviewSequence, input.exchanges, false),
   ]);
 }
@@ -244,9 +168,14 @@ async function writeCurrentReviewFiles(
 async function writeExchangeArtifacts(dir: string, exchanges: ReviewExchangeContext[]): Promise<void> {
   for (const exchange of exchanges) {
     const exchangeDir = join(dir, "exchanges", sequencePath(exchange.sequence));
+    const metadataPath = join(exchangeDir, "metadata.json");
+    const completionPath = join(exchangeDir, ".complete");
+    if (await access(completionPath).then(() => true, () => false)) {
+      continue;
+    }
     await mkdir(exchangeDir, { recursive: true });
     await Promise.all([
-      writeFile(join(exchangeDir, "metadata.json"), JSON.stringify({
+      writeFile(metadataPath, JSON.stringify({
         sequence: exchange.sequence,
         startedAt: exchange.startedAt,
         endedAt: exchange.endedAt,
@@ -263,6 +192,7 @@ async function writeExchangeArtifacts(dir: string, exchanges: ReviewExchangeCont
       writeFile(join(exchangeDir, "acting-model-usage.json"), JSON.stringify(exchange.actingUsage ?? null, null, 2), "utf8"),
       writeReviewArtifacts(exchangeDir, exchange.workspaceChanges, exchange.sideEffectChanges, undefined),
     ]);
+    await writeFile(completionPath, "", "utf8");
   }
 }
 

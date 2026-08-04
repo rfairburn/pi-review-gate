@@ -65,6 +65,19 @@ export async function writeReviewTransmission(
   ]);
 }
 
+export async function createReviewTransmissionMessage(input: {
+  invocationDir: string;
+  reviewSequence: number;
+  gateVerdict: ReviewResult["verdict"];
+  reviewerResults: ReviewResult[];
+  bundleDir: string;
+  action: ReviewTransmissionAction;
+}): Promise<string> {
+  const transmission = buildReviewTransmission(input);
+  await writeReviewTransmission(input.invocationDir, transmission);
+  return transmission.message;
+}
+
 export async function writeReviewDeliveryReceipt(
   invocationDir: string,
   action: ReviewTransmissionAction,
@@ -90,6 +103,19 @@ export async function writeReviewDeliveryReceipt(
     recipient: "implementing_model",
     deliveries,
   }, null, 2), "utf8");
+}
+
+export async function deliverReviewTransmission(input: {
+  invocationDir: string;
+  action: ReviewTransmissionAction;
+  message: string;
+  deliver: () => Promise<boolean>;
+}): Promise<boolean> {
+  const delivered = await input.deliver();
+  if (delivered) {
+    await writeReviewDeliveryReceipt(input.invocationDir, input.action, input.message);
+  }
+  return delivered;
 }
 
 function renderTransmission(envelope: ReviewTransmissionEnvelope, bundleDir: string): string {

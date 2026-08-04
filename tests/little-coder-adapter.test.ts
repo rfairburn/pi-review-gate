@@ -145,7 +145,6 @@ test("LittleCoderAdapter captures final assistant text after retained stdout cap
     assert.equal(result.verdict, "pass");
     assert.equal(result.summary, "final response captured");
     assert.equal(result.usage?.totalTokens, 3);
-    assert.equal(await readFile(join(dir, "reviewer-final.txt"), "utf8"), reviewJson);
     const processResult = JSON.parse(await readFile(join(dir, "process-result.json"), "utf8"));
     assert.deepEqual(processResult.stdoutTruncated, true);
     assert.deepEqual(processResult.rawOutputContainsStream, false);

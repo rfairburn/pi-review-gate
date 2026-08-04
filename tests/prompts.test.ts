@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createReviewBundle } from "../src/bundle";
-import { buildFollowUpMessage, buildReviewerPrompt, buildReviewerQuestionPrompt } from "../src/prompts";
+import { buildReviewerPrompt, buildReviewerQuestionPrompt } from "../src/prompts";
 
 test("reviewer prompt treats sentinel-only flags as terminal notes", () => {
   const prompt = buildReviewerPrompt({
     request: "write hello world and flag review-gate instead of passing",
-    changes: [],
+    submittedChanges: [],
     patch: "",
     cwd: "/tmp/project",
   });
@@ -22,7 +22,7 @@ test("reviewer prompt treats sentinel-only flags as terminal notes", () => {
 test("every review prompt requests implementation-ready Markdown guidance", () => {
   const common = {
     request: "fix the behavior",
-    changes: [],
+    submittedChanges: [],
     patch: "",
     cwd: "/tmp/project",
   };
@@ -45,7 +45,7 @@ test("every review prompt requests implementation-ready Markdown guidance", () =
 test("every review prompt conditionally requires concrete guidance after correction attempts", () => {
   const common = {
     request: "fix the behavior",
-    changes: [],
+    submittedChanges: [],
     patch: "",
     cwd: "/tmp/project",
     guidanceEscalation: {
@@ -76,7 +76,7 @@ test("review prompts require current evidence before repeating historical findin
       "Historical prior review feedback:",
       "Replace unsafe() with safe().",
     ].join("\n"),
-    changes: [],
+    submittedChanges: [],
     patch: "+safe();",
     cwd: "/tmp/project",
     guidanceEscalation: {
@@ -93,26 +93,6 @@ test("review prompts require current evidence before repeating historical findin
   assert.match(prompt, /\+safe\(\);/);
 });
 
-test("automatic correction feedback preserves Markdown guidance and fenced diffs", () => {
-  const message = buildFollowUpMessage({
-    reviewerId: "reviewer",
-    verdict: "needs_changes",
-    summary: "Guard the update.",
-    guidance: "Apply this change:\n\n```diff\n-run()\n+runSafely()\n```",
-    findings: [{
-      severity: "blocking",
-      file: "index.ts",
-      line: 4,
-      issue: "The unsafe call remains.",
-      recommendation: "Use `runSafely()`.",
-    }],
-  });
-
-  assert.match(message, /Implementation guidance:/);
-  assert.match(message, /```diff\n-run\(\)\n\+runSafely\(\)\n```/);
-  assert.match(message, /Recommendation: Use `runSafely\(\)`/);
-});
-
 test("agentic reviewer bundle prompt permits only read-only filesystem commands and includes the response schema", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-bundle-prompt-"));
   try {
@@ -120,7 +100,7 @@ test("agentic reviewer bundle prompt permits only read-only filesystem commands 
       dir,
       cwd: dir,
       request: "review the change",
-      changes: [],
+      submittedChanges: [],
       patch: "",
     });
 

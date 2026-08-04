@@ -1,4 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { ReviewResult } from "../schema";
 
 export interface ProcessRunResult {
   stdout: string;
@@ -10,7 +13,86 @@ export interface ProcessRunResult {
   aborted: boolean;
 }
 
+export interface ReviewerArtifactPaths {
+  rawOutput: string;
+  stderr: string;
+  usage: string;
+  processResult: string;
+}
+
 const MAX_OUTPUT_BYTES = 1_000_000;
+
+export function reviewerArtifactPaths(bundleDir: string): ReviewerArtifactPaths {
+  return {
+    rawOutput: join(bundleDir, "raw-output.txt"),
+    stderr: join(bundleDir, "stderr.txt"),
+    usage: join(bundleDir, "usage.json"),
+    processResult: join(bundleDir, "process-result.json"),
+  };
+}
+
+export async function writeReviewerProcessArtifacts(input: {
+  paths: ReviewerArtifactPaths;
+  output: ProcessRunResult;
+  rawOutput?: string;
+  usage?: ReviewResult["usage"];
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  await Promise.all([
+    writeFile(input.paths.rawOutput, input.rawOutput ?? input.output.stdout, "utf8"),
+    writeFile(input.paths.stderr, input.output.stderr, "utf8"),
+    writeFile(input.paths.usage, JSON.stringify(input.usage ?? null, null, 2), "utf8"),
+    writeFile(input.paths.processResult, JSON.stringify({
+      code: input.output.code,
+      timedOut: input.output.timedOut,
+      aborted: input.output.aborted,
+      stdoutTruncated: input.output.stdoutTruncated,
+      stderrTruncated: input.output.stderrTruncated,
+      ...input.metadata,
+    }, null, 2), "utf8"),
+  ]);
+}
+
+export function reviewerErrorResult(
+  reviewerId: string,
+  summary: string,
+  rawOutputPath: string,
+  error: string,
+  usage?: ReviewResult["usage"],
+): ReviewResult {
+  return { reviewerId, verdict: "error", summary, findings: [], rawOutputPath, error, usage };
+}
+
+export function processFailureResult(input: {
+  reviewerId: string;
+  output: ProcessRunResult;
+  rawOutputPath: string;
+  timeoutMs: number;
+  usage?: ReviewResult["usage"];
+}): ReviewResult | undefined {
+  if (input.output.aborted) {
+    return reviewerErrorResult(input.reviewerId, "Reviewer was aborted.", input.rawOutputPath, "aborted", input.usage);
+  }
+  if (input.output.timedOut) {
+    return reviewerErrorResult(
+      input.reviewerId,
+      `Reviewer timed out after ${input.timeoutMs}ms.`,
+      input.rawOutputPath,
+      "timeout",
+      input.usage,
+    );
+  }
+  if (input.output.code !== 0) {
+    return reviewerErrorResult(
+      input.reviewerId,
+      `Reviewer exited with status ${input.output.code}.`,
+      input.rawOutputPath,
+      `exit_${input.output.code}`,
+      input.usage,
+    );
+  }
+  return undefined;
+}
 
 export async function runPromptProcess(input: {
   command: string;

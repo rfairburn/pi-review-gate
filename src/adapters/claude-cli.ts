@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import type { ClaudeCliDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
 import { extractReviewTextFromClaudeJson, parseClaudeUsage } from "../usage";
-import { reviewerEnv, runPromptProcess } from "./process";
+import {
+  processFailureResult,
+  reviewerArtifactPaths,
+  reviewerEnv,
+  reviewerErrorResult,
+  runPromptProcess,
+  writeReviewerProcessArtifacts,
+} from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 
 export class ClaudeCliAdapter implements ModelAdapter {
@@ -13,9 +18,7 @@ export class ClaudeCliAdapter implements ModelAdapter {
   constructor(private readonly config: ClaudeCliDeciderConfig) {}
 
   async run(req: ModelAdapterRequest): Promise<ReviewResult> {
-    const rawOutputPath = join(req.bundleDir, "raw-output.txt");
-    const stderrPath = join(req.bundleDir, "stderr.txt");
-    const usagePath = join(req.bundleDir, "usage.json");
+    const artifacts = reviewerArtifactPaths(req.bundleDir);
     const sessionId = req.session?.id ?? randomUUID();
     req.onSession?.({ adapter: this.kind, id: sessionId });
     const args = [
@@ -44,11 +47,6 @@ export class ClaudeCliAdapter implements ModelAdapter {
       env: reviewerEnv(process.env, req.evidenceBundleDir),
       signal: req.signal,
     });
-    await Promise.all([
-      writeFile(rawOutputPath, output.stdout, "utf8"),
-      writeFile(stderrPath, output.stderr, "utf8"),
-    ]);
-
     let parsed: unknown;
     try {
       parsed = JSON.parse(output.stdout);
@@ -56,31 +54,29 @@ export class ClaudeCliAdapter implements ModelAdapter {
       parsed = undefined;
     }
     const usage = parseClaudeUsage(parsed);
-    await writeFile(usagePath, JSON.stringify(usage ?? null, null, 2), "utf8").catch(() => undefined);
-
-    if (output.aborted) {
-      return errorResult(req.id, "Reviewer was aborted.", rawOutputPath, "aborted", usage);
-    }
-    if (output.timedOut) {
-      return errorResult(req.id, `Reviewer timed out after ${req.timeoutMs}ms.`, rawOutputPath, "timeout", usage);
-    }
-    if (output.code !== 0) {
-      return errorResult(req.id, claudeErrorSummary(parsed) ?? `Reviewer exited with status ${output.code}.`, rawOutputPath, `exit_${output.code}`, usage);
+    await writeReviewerProcessArtifacts({ paths: artifacts, output, usage });
+    const failure = processFailureResult({
+      reviewerId: req.id,
+      output,
+      rawOutputPath: artifacts.rawOutput,
+      timeoutMs: req.timeoutMs,
+      usage,
+    });
+    if (failure) {
+      return output.code !== 0 && claudeErrorSummary(parsed)
+        ? { ...failure, summary: claudeErrorSummary(parsed)! }
+        : failure;
     }
     const claudeError = claudeErrorSummary(parsed);
     if (claudeError) {
-      return errorResult(req.id, claudeError, rawOutputPath, "claude_error", usage);
+      return reviewerErrorResult(req.id, claudeError, artifacts.rawOutput, "claude_error", usage);
     }
 
     const finalText = extractReviewTextFromClaudeJson(parsed) || output.stdout;
-    const result = parseReviewResult(req.id, finalText, rawOutputPath);
+    const result = parseReviewResult(req.id, finalText, artifacts.rawOutput);
     result.usage = usage;
     return result;
   }
-}
-
-function errorResult(reviewerId: string, summary: string, rawOutputPath: string, error: string, usage: ReviewResult["usage"]): ReviewResult {
-  return { reviewerId, verdict: "error", summary, findings: [], rawOutputPath, error, usage };
 }
 
 function claudeErrorSummary(value: unknown): string | undefined {

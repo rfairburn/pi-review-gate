@@ -7,6 +7,7 @@ import { createWorkspaceSnapshot } from "../src/capture";
 import { registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
 import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest } from "../src/state";
+import { fakeNeedsChangesConfig } from "./helpers";
 
 test("/review-pause and /review-unpause gate explicit reviewer commands", async () => {
   const state = createState();
@@ -335,7 +336,6 @@ test("/review-continue sends capped feedback and resets the correction budget", 
   rememberUserRequest(state, "change index");
   state.reviewWindow!.correctionCycles = 3;
   state.reviewWindow!.lastCappedFollowUp = "Review found blocking issues.\n\n1. index.ts - missing guard add it";
-  state.reviewWindow!.status = "paused_at_cap";
   const pi = {
     registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
       commands.set(name, options.handler);
@@ -361,7 +361,6 @@ test("/review-continue sends capped feedback and resets the correction budget", 
 
   assert.equal(state.reviewWindow!.correctionCycles, 0);
   assert.equal(state.reviewWindow!.lastCappedFollowUp, undefined);
-  assert.equal(state.reviewWindow!.status, "active");
   assert.deepEqual(followUps, ["Review found blocking issues.\n\n1. index.ts - missing guard add it"]);
   assert.match(notices.join("\n"), /correction budget reset to 3/);
 
@@ -391,10 +390,9 @@ test("/ask-reviewer-interactive at the correction cap receives the complete unre
     });
     const cappedFollowUp = "Review found blocking issues. Add the missing guard.";
     window.lastCappedFollowUp = cappedFollowUp;
-    window.status = "paused_at_cap";
     recordReviewerFeedback(state, {
       source: "automatic",
-      disposition: "held_at_cap",
+      disposition: "sent_at_cap",
       result: {
         reviewerId: "codex",
         verdict: "needs_changes",
@@ -439,7 +437,6 @@ test("/ask-reviewer-interactive at the correction cap receives the complete unre
     assert.equal(editorViews.length, 1);
     assert.match(editorViews[0]?.prefill ?? "", /complete capped review window/);
     assert.equal(state.reviewWindow, window);
-    assert.equal(window.status, "paused_at_cap");
     assert.equal(window.lastCappedFollowUp, cappedFollowUp);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -661,27 +658,7 @@ test("/ask-reviewer-interactive opens partial multi-reviewer answers when one re
 });
 
 function reviewConfig(): ReviewGateConfig {
-  return {
-    enabled: true,
-    mode: "single-decider",
-    maxCorrectionCycles: 3,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    reviewWhen: "changed-files",
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    decider: {
-      id: "fake",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
-        "-e",
-        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
-      ],
-      timeoutMs: 5000,
-    },
-  };
+  return fakeNeedsChangesConfig();
 }
 
 function passingReviewConfig(): ReviewGateConfig {
@@ -735,15 +712,8 @@ function passingReviewWithQuestionCheckConfig(): ReviewGateConfig {
 
 function multiReviewerReviewConfig(): ReviewGateConfig {
   return {
-    enabled: true,
-    mode: "single-decider",
-    maxCorrectionCycles: 3,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    reviewWhen: "changed-files",
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
+    ...reviewConfig(),
+    decider: undefined,
     reviewers: [
       {
         id: "blocking",
@@ -771,14 +741,8 @@ function multiReviewerReviewConfig(): ReviewGateConfig {
 
 function askReviewerPartialErrorConfig(): ReviewGateConfig {
   return {
-    enabled: true,
-    mode: "single-decider",
-    maxCorrectionCycles: 3,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    reviewWhen: "changed-files",
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
+    ...reviewConfig(),
+    decider: undefined,
     retainBundles: "on-failure",
     reviewers: [
       {
@@ -807,15 +771,8 @@ function askReviewerPartialErrorConfig(): ReviewGateConfig {
 
 function cappedWindowAskReviewerConfig(): ReviewGateConfig {
   return {
-    enabled: true,
-    mode: "single-decider",
+    ...reviewConfig(),
     maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    reviewWhen: "changed-files",
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
     decider: {
       id: "prompt-checker",
       adapter: "generic-cli",
@@ -830,7 +787,7 @@ function cappedWindowAskReviewerConfig(): ReviewGateConfig {
           "const ok=s.includes('is the capped finding still valid?')",
           "&& s.includes('change index with the existing API')",
           "&& s.includes('capped-window-tool-evidence')",
-          "&& s.includes('feedback held at the correction cap')",
+          "&& s.includes('complete feedback transmitted to the implementing model with correction deferred at the cap')",
           "&& s.includes('The existing API path is missing a guard.')",
           "&& s.includes('Review found blocking issues. Add the missing guard.')",
           "&& s.includes('-before')",
@@ -848,15 +805,7 @@ function cappedWindowAskReviewerConfig(): ReviewGateConfig {
 
 function askReviewerConfig(): ReviewGateConfig {
   return {
-    enabled: true,
-    mode: "single-decider",
-    maxCorrectionCycles: 3,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    reviewWhen: "changed-files",
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
+    ...reviewConfig(),
     decider: {
       id: "fake",
       adapter: "generic-cli",

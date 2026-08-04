@@ -8,20 +8,18 @@ import { registerHook, extractContext, extractCwd, extractInputSource, extractIn
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
   activeExchangeHasBaseline,
-  armReviewResponseExchange,
   beginAgentRun,
   buildRequestContext,
   closeReviewWindow,
   createState,
   getCorrectionAttemptCount,
-  pauseReviewWindow,
-  recordReviewerFeedback,
+  recordReviewerFeedbackAndArmExchange,
   rememberUserRequest,
   setReviewWindowBaseline,
   type ReviewGateState,
 } from "./state";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
-import { buildReviewAuthorizationMessage, buildReviewTransmission, writeReviewDeliveryReceipt, writeReviewTransmission, type ReviewTransmissionAction } from "./transmission";
+import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, type ReviewTransmissionAction } from "./transmission";
 
 declare const module: {
   exports: unknown;
@@ -224,7 +222,6 @@ export async function activate(pi: unknown): Promise<void> {
       if (!sessionActive) {
         return;
       }
-      pauseReviewWindow(state, "paused");
       await releaseQueuedUserInputs(pi, state, () => sessionActive);
       throw error;
     } finally {
@@ -243,7 +240,6 @@ export async function activate(pi: unknown): Promise<void> {
 
     if (!output.changed) {
       if (output.noReviewReason === "unchanged_deferred_response") {
-        pauseReviewWindow(state, "paused");
         await releaseQueuedUserInputs(pi, state, () => sessionActive);
         return;
       }
@@ -274,16 +270,12 @@ export async function activate(pi: unknown): Promise<void> {
         `review gate: passed (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
-      if (sessionActive) {
-        if (await sendFollowUp(pi, transmission)) {
-          await writeReviewDeliveryReceipt(output.invocationDir!, "passed", transmission);
-        }
-      }
+      await deliverAutomaticTransmission(pi, output, "passed", transmission, () => sessionActive);
       await releaseQueuedUserInputs(pi, state, () => sessionActive);
       return;
     }
 
-    if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
+    if (output.result?.verdict === "needs_changes") {
       if (isRepeatedNoProgressFeedback({
         previous: window.lastCorrectionFeedback,
         result: output.result,
@@ -306,12 +298,7 @@ export async function activate(pi: unknown): Promise<void> {
           ].join("\n"),
           () => sessionActive,
         );
-        pauseReviewWindow(state, "paused");
-        if (sessionActive) {
-          if (await sendFollowUp(pi, transmission)) {
-            await writeReviewDeliveryReceipt(output.invocationDir!, "deferred", transmission);
-          }
-        }
+        await deliverAutomaticTransmission(pi, output, "deferred", transmission, () => sessionActive);
         await releaseQueuedUserInputs(pi, state, () => sessionActive);
         return;
       }
@@ -333,7 +320,6 @@ export async function activate(pi: unknown): Promise<void> {
           reviewSequence: output.reviewSequence!,
           bundleDir: output.bundleDir!,
         });
-        pauseReviewWindow(state, "paused_at_cap");
         await sendNoticeWhileSessionActive(
           noticeTarget,
           [
@@ -343,11 +329,7 @@ export async function activate(pi: unknown): Promise<void> {
           ].join("\n"),
           () => sessionActive,
         );
-        if (sessionActive) {
-          if (await sendFollowUp(pi, deferredTransmission)) {
-            await writeReviewDeliveryReceipt(output.invocationDir!, "deferred", deferredTransmission);
-          }
-        }
+        await deliverAutomaticTransmission(pi, output, "deferred", deferredTransmission, () => sessionActive);
         await releaseQueuedUserInputs(pi, state, () => sessionActive);
         return;
       }
@@ -365,11 +347,7 @@ export async function activate(pi: unknown): Promise<void> {
         `review gate: changes requested (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
-      if (sessionActive) {
-        if (await sendFollowUp(pi, transmission)) {
-          await writeReviewDeliveryReceipt(output.invocationDir!, "correction_required", transmission);
-        }
-      }
+      await deliverAutomaticTransmission(pi, output, "correction_required", transmission, () => sessionActive);
       await releaseQueuedUserInputs(pi, state, () => sessionActive);
       return;
     }
@@ -383,14 +361,9 @@ export async function activate(pi: unknown): Promise<void> {
         disposition: "sent_review_error",
         action: "review_error",
       });
-      if (sessionActive) {
-        if (await sendFollowUp(pi, transmission)) {
-          await writeReviewDeliveryReceipt(output.invocationDir!, "review_error", transmission);
-        }
-      }
+      await deliverAutomaticTransmission(pi, output, "review_error", transmission, () => sessionActive);
     }
     await sendNoticeWhileSessionActive(noticeTarget, failed, () => sessionActive);
-    pauseReviewWindow(state, "paused");
     await releaseQueuedUserInputs(pi, state, () => sessionActive);
   });
 
@@ -433,24 +406,41 @@ async function transmitReviewPass(input: {
   disposition: "sent_for_correction" | "sent_for_observation" | "sent_at_cap" | "sent_review_error";
   action: ReviewTransmissionAction;
 }): Promise<string> {
-  const transmission = buildReviewTransmission({
+  const message = await createReviewTransmissionMessage({
+    invocationDir: input.output.invocationDir!,
     reviewSequence: input.output.reviewSequence!,
     gateVerdict: input.output.result!.verdict,
     reviewerResults: input.output.reviewerResults!,
     bundleDir: input.output.bundleDir!,
     action: input.action,
   });
-  const message = transmission.message;
-  await writeReviewTransmission(input.output.invocationDir!, transmission);
-  recordReviewerFeedback(input.state, {
+  recordReviewerFeedbackAndArmExchange(input.state, {
     result: input.output.result!,
     reviewerResults: input.output.reviewerResults,
     reviewSequence: input.output.reviewSequence,
     source: input.source,
     disposition: input.disposition,
+    reviewedSnapshot: input.output.reviewedSnapshot!,
   });
-  armReviewResponseExchange(input.state, input.output.reviewedSnapshot!);
   return message;
+}
+
+async function deliverAutomaticTransmission(
+  pi: unknown,
+  output: ReviewRunOutput,
+  action: ReviewTransmissionAction,
+  message: string,
+  isSessionActive: () => boolean,
+): Promise<void> {
+  if (!output.invocationDir || !isSessionActive()) {
+    return;
+  }
+  await deliverReviewTransmission({
+    invocationDir: output.invocationDir,
+    action,
+    message,
+    deliver: () => isSessionActive() ? sendFollowUp(pi, message) : Promise.resolve(false),
+  });
 }
 
 export default activate;

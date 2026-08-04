@@ -13,7 +13,6 @@ test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
       path,
       JSON.stringify({
         enabled: true,
-        mode: "single-decider",
         decider: {
           id: "fake",
           adapter: "generic-cli",
@@ -44,7 +43,6 @@ test("loadConfig supports little-coder config env as compatibility alias", async
       path,
       JSON.stringify({
         enabled: true,
-        mode: "single-decider",
         decider: {
           id: "alias",
           adapter: "generic-cli",
@@ -77,7 +75,6 @@ test("loadConfig supports PI_REVIEW_GATE_DISABLED", () => {
 test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
   const codex = normalizeConfig({
     enabled: true,
-    mode: "single-decider",
     decider: {
       id: "codex",
       adapter: "codex-cli",
@@ -96,7 +93,6 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
 
   const claude = normalizeConfig({
     enabled: true,
-    mode: "single-decider",
     decider: {
       id: "claude",
       adapter: "claude-cli",
@@ -138,7 +134,6 @@ test("normalizeConfig validates implementation guidance escalation thresholds", 
 test("normalizeConfig keeps little-coder model selection generic", () => {
   const loaded = normalizeConfig({
     enabled: true,
-    mode: "single-decider",
     decider: {
       id: "glm",
       adapter: "little-coder-model",
@@ -159,7 +154,6 @@ test("normalizeConfig keeps little-coder model selection generic", () => {
 test("normalizeConfig supports multiple reviewers without legacy decider", () => {
   const loaded = normalizeConfig({
     enabled: true,
-    mode: "single-decider",
     reviewers: [
       {
         id: "codex",

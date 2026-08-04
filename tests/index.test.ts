@@ -2,26 +2,43 @@ import assert from "node:assert/strict";
 import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
+
+let previousConfig: string | undefined;
+let previousDisabled: string | undefined;
+
+beforeEach(() => {
+  previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+});
+
+afterEach(() => {
+  if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+  else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+  if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
+  else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+});
+
+const indexTestConfig = {
+  enabled: true,
+  maxCorrectionCycles: 3,
+  implementationGuidanceAfterCorrectionAttempts: 1,
+  maxPatchBytes: 200_000,
+  maxFileBytes: 1_048_576,
+  maxSnapshotBytes: 52_428_800,
+  retainBundles: "never",
+} as const;
 
 test("cap status is concise while reviewer results are delivered once in the transmission", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-cap-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
+      ...indexTestConfig,
       maxCorrectionCycles: 0,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -67,37 +84,20 @@ test("cap status is concise while reviewer results are delivered once in the tra
     assert.match(followUps[0] ?? "", /missing guard/);
     assert.match(followUps[0] ?? "", /add the guard/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("review pause collects separate exchanges and defers reviewer execution until unpaused", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-paused-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
   const invocationMarker = join(dir, "reviewer-invoked.txt");
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
+      ...indexTestConfig,
       maxCorrectionCycles: 1,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
       retainBundles: "always",
       decider: {
         id: "fake",
@@ -174,31 +174,18 @@ test("review pause collects separate exchanges and defers reviewer execution unt
     assert.match(await readFile(join(bundleDir, "exchanges", "0002", "assistant-summary.md"), "utf8"), /second paused change/);
     assert.match(notices.join("\n"), /reviews unpaused/);
   } finally {
-    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
-    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
-    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
     await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("user steering during review is held until reviewer feedback is queued", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-steer-during-review-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -247,38 +234,19 @@ test("user steering during review is held until reviewer feedback is queued", as
     assert.equal(followUps[1]?.message, "also keep the API name stable");
     assert.deepEqual(followUps.map((item) => item.options), [{ deliverAs: "followUp" }, { deliverAs: "followUp" }]);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("agent end skips reviewer when primary turn signal is already aborted", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-aborted-before-review-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const markerPath = join(dir, "review-started.txt");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -341,38 +309,19 @@ test("agent end skips reviewer when primary turn signal is already aborted", asy
     assert.match(notices.join("\n"), /review gate: passed/);
     assert.doesNotMatch(notices.join("\n"), /lost interrupted context/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("/new shutdown silently aborts review work before its context becomes stale", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-new-session-abort-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const markerPath = join(dir, "review-started.txt");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -447,24 +396,12 @@ test("/new shutdown silently aborts review work before its context becomes stale
     assert.doesNotMatch(notices.join("\n"), /review gate: review cancelled/);
     assert.doesNotMatch(notices.join("\n"), /reviewer failed/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("escape terminal input aborts an active reviewer process", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-escape-review-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -472,14 +409,7 @@ test("escape terminal input aborts an active reviewer process", async () => {
     const invocationPath = join(dir, "review-invocations.txt");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -584,38 +514,19 @@ test("escape terminal input aborts an active reviewer process", async () => {
     await assert.rejects(access(join(bundleDir, "reviews", "0001", "reviewers", "fake", "parsed-result.json")), /ENOENT/);
     assert.equal(terminalHandlers.length, 0);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("automatic correction turns preserve original baseline and accumulated evidence", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-auto-correction-evidence-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const invocationPath = join(dir, "review-invocations.txt");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -695,16 +606,6 @@ test("automatic correction turns preserve original baseline and accumulated evid
     assert.equal(followUps.length, 2);
     assert.match(followUps[1]?.message ?? "", /Gate verdict: pass/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -713,21 +614,12 @@ test("automatic correction is reviewed when it exactly restores the original bas
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-auto-correction-exact-revert-"));
   const invocationPath = join(tmpdir(), `pi-review-gate-exact-revert-${process.pid}-${Date.now()}.txt`);
   const bundlePathRecord = join(tmpdir(), `pi-review-gate-exact-revert-bundle-${process.pid}-${Date.now()}.txt`);
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "original\n", "utf8");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -813,16 +705,6 @@ test("automatic correction is reviewed when it exactly restores the original bas
     assert.equal(followUps.length, 2);
     assert.match(followUps[1]?.message ?? "", /Gate verdict: pass/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
     await rm(invocationPath, { force: true });
     await rm(bundlePathRecord, { force: true });
@@ -832,8 +714,6 @@ test("automatic correction is reviewed when it exactly restores the original bas
 test("automatic correction resumes each reviewer session against the stable window bundle", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-session-resume-"));
   const argvPath = join(tmpdir(), `pi-review-gate-reviewer-session-argv-${process.pid}-${Date.now()}.json`);
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -858,14 +738,7 @@ test("automatic correction resumes each reviewer session against the stable wind
 
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       decider: {
         id: "codex",
         adapter: "codex-cli",
@@ -919,16 +792,6 @@ test("automatic correction resumes each reviewer session against the stable wind
     await trigger(hooks, "session_shutdown", { reason: "test" });
     await assert.rejects(access(bundleDir), /ENOENT/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
     await rm(argvPath, { force: true });
   }
@@ -936,22 +799,14 @@ test("automatic correction resumes each reviewer session against the stable wind
 
 test("/review-continue after cap preserves original baseline and accumulated evidence", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-capped-continue-evidence-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const invocationPath = join(dir, "review-invocations.txt");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
+      ...indexTestConfig,
       maxCorrectionCycles: 0,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -1048,38 +903,20 @@ test("/review-continue after cap preserves original baseline and accumulated evi
     assert.match(notices.join("\n"), /review gate: passed/);
     assert.doesNotMatch(notices.join("\n"), /lost capped continuation evidence/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("normal user input after cap continues the unresolved review window with complete context", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-capped-fresh-input-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const invocationPath = join(dir, "review-invocations.txt");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
+      ...indexTestConfig,
       maxCorrectionCycles: 0,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -1165,16 +1002,6 @@ test("normal user input after cap continues the unresolved review window with co
     assert.doesNotMatch(notices.join("\n"), /capped window lost context/);
     assert.equal(commands.has("review-continue"), true);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -1183,22 +1010,14 @@ test("a passed review remains available to /ask-reviewer-interactive but is chec
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-window-checkpoint-"));
   const outside = join(tmpdir(), `pi-review-gate-outside-review-${process.pid}-${Date.now()}.md`);
   const invocationPath = join(tmpdir(), `pi-review-gate-window-invocations-${process.pid}-${Date.now()}.txt`);
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.19\n", "utf8");
     await writeFile(outside, "old review document\n", "utf8");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
+      ...indexTestConfig,
       maxCorrectionCycles: 0,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -1295,16 +1114,6 @@ test("a passed review remains available to /ask-reviewer-interactive but is chec
     assert.match(editorViews[0]?.prefill ?? "", /passed context retained for question/);
     assert.doesNotMatch(notices.join("\n"), /review windows mixed/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
     await rm(outside, { force: true });
     await rm(invocationPath, { force: true });
@@ -1314,21 +1123,13 @@ test("a passed review remains available to /ask-reviewer-interactive but is chec
 test("repeated no-progress reviewer feedback stops automatic correction loop", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-no-progress-loop-"));
   const invocationPath = join(tmpdir(), `pi-review-gate-no-progress-${process.pid}-${Date.now()}.txt`);
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
+      ...indexTestConfig,
       maxCorrectionCycles: 30,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -1393,16 +1194,6 @@ test("repeated no-progress reviewer feedback stops automatic correction loop", a
     assert.match(notices.join("\n"), /repeated changes requested with no new correction evidence/);
     assert.match(notices.join("\n"), /Stopping automatic correction to avoid a loop/);
   } finally {
-    if (previousConfig === undefined) {
-      delete process.env.PI_REVIEW_GATE_CONFIG;
-    } else {
-      process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    }
-    if (previousDisabled === undefined) {
-      delete process.env.PI_REVIEW_GATE_DISABLED;
-    } else {
-      process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
-    }
     await rm(dir, { recursive: true, force: true });
     await rm(invocationPath, { force: true });
   }
@@ -1412,8 +1203,6 @@ test("a passing multi-model review discloses every result and reviews changes ma
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-pass-transmission-continuation-"));
   const alphaCount = join(tmpdir(), `pi-review-gate-alpha-pass-${process.pid}-${Date.now()}.txt`);
   const betaCount = join(tmpdir(), `pi-review-gate-beta-pass-${process.pid}-${Date.now()}.txt`);
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -1447,14 +1236,7 @@ test("a passing multi-model review discloses every result and reviews changes ma
     });
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "quorum",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       reviewers: [
         reviewer("alpha", alphaCount, "beta approved with useful observation"),
         reviewer("beta", betaCount, "alpha approved with useful observation"),
@@ -1524,10 +1306,6 @@ test("a passing multi-model review discloses every result and reviews changes ma
     assert.equal(exchange.causedByReviewVerdict, "pass");
     assert.equal(exchange.reviewResponseMode, "observation");
   } finally {
-    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
-    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
-    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
     await rm(dir, { recursive: true, force: true });
     await rm(alphaCount, { force: true });
     await rm(betaCount, { force: true });
@@ -1537,21 +1315,12 @@ test("a passing multi-model review discloses every result and reviews changes ma
 test("an unchanged response to a passing transmission closes without another review", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-pass-transmission-unchanged-"));
   const invocationCount = join(tmpdir(), `pi-review-gate-pass-unchanged-${process.pid}-${Date.now()}.txt`);
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
-      maxCorrectionCycles: 3,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
+      ...indexTestConfig,
       decider: {
         id: "passing",
         adapter: "generic-cli",
@@ -1602,10 +1371,6 @@ test("an unchanged response to a passing transmission closes without another rev
     await trigger(hooks, "input", { cwd: dir, text: "next independent task", source: "user" });
     await assert.rejects(access(bundleDir), /ENOENT/);
   } finally {
-    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
-    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
-    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
     await rm(dir, { recursive: true, force: true });
     await rm(invocationCount, { force: true });
   }
@@ -1613,23 +1378,14 @@ test("an unchanged response to a passing transmission closes without another rev
 
 test("/ask-reviewer pauses an active turn before invoking the reviewer and then steers the answer", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-active-turn-"));
-  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
   const invocationMarker = join(dir, "reviewer-invoked.txt");
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      mode: "single-decider",
+      ...indexTestConfig,
       maxCorrectionCycles: 1,
-      implementationGuidanceAfterCorrectionAttempts: 1,
-      reviewWhen: "changed-files",
-      maxPatchBytes: 200000,
-      maxFileBytes: 1048576,
-      maxSnapshotBytes: 52428800,
-      retainBundles: "never",
       decider: {
         id: "fake",
         adapter: "generic-cli",
@@ -1698,10 +1454,6 @@ test("/ask-reviewer pauses an active turn before invoking the reviewer and then 
     assert.match(userMessages[1]?.message ?? "", /reviewed the paused workspace/);
     assert.doesNotMatch(userMessages[1]?.message ?? "", /Review pass .* transmission/);
   } finally {
-    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
-    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
-    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
-    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
     await rm(dir, { recursive: true, force: true });
   }
 });

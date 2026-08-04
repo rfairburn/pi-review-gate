@@ -11,22 +11,17 @@ import type { ReviewerSession } from "./adapters/types";
 import type { ReviewResult } from "./schema";
 import type { TokenUsage } from "./usage";
 
-export type ReviewWindowStatus = "pending" | "active" | "paused_at_cap" | "paused";
 export type ReviewFeedbackSource = "automatic" | "manual";
 export type ReviewFeedbackDisposition =
   | "sent_for_correction"
   | "sent_for_observation"
   | "sent_at_cap"
   | "sent_review_error"
-  | "held_at_cap"
-  | "held_then_sent"
-  | "reported_only";
+  | "held_then_sent";
 
 export interface ReviewWindow {
   id: number;
   startedAt: string;
-  status: ReviewWindowStatus;
-  latestRequest: string;
   requestHistory: UserRequestContext[];
   correctionCycles: number;
   lastCappedFollowUp?: string;
@@ -127,12 +122,10 @@ export function rememberUserRequest(state: ReviewGateState, request: string): vo
       text,
     });
   }
-  window.latestRequest = text;
 }
 
 export function beginAgentRun(state: ReviewGateState): "new" | "continuation" {
   const window = state.reviewWindow ?? openReviewWindow(state);
-  window.status = "active";
   if (!window.activeExchange) {
     const feedback = [...window.reviewHistory].reverse().find((item) => reviewResponseMode(item.disposition) !== undefined);
     window.activeExchange = {
@@ -155,7 +148,6 @@ export function setReviewWindowBaseline(state: ReviewGateState, baseline: Worksp
   if (window.activeExchange && !window.activeExchange.baseline) {
     window.activeExchange.baseline = baseline;
   }
-  window.status = "active";
 }
 
 export function armReviewResponseExchange(state: ReviewGateState, reviewedSnapshot: WorkspaceSnapshot): void {
@@ -255,12 +247,6 @@ export function recordAcceptedReviewerQuestion(
   }
 }
 
-export function pauseReviewWindow(state: ReviewGateState, status: "paused_at_cap" | "paused"): void {
-  if (state.reviewWindow) {
-    state.reviewWindow.status = status;
-  }
-}
-
 export function recordReviewerFeedback(
   state: ReviewGateState,
   input: {
@@ -284,6 +270,21 @@ export function recordReviewerFeedback(
   });
 }
 
+export function recordReviewerFeedbackAndArmExchange(
+  state: ReviewGateState,
+  input: {
+    result: ReviewResult;
+    reviewerResults?: ReviewResult[];
+    reviewSequence?: number;
+    source: ReviewFeedbackSource;
+    disposition: ReviewFeedbackDisposition;
+    reviewedSnapshot: WorkspaceSnapshot;
+  },
+): void {
+  recordReviewerFeedback(state, input);
+  armReviewResponseExchange(state, input.reviewedSnapshot);
+}
+
 export function markCappedFeedbackSent(
   state: ReviewGateState,
 ): ReviewFeedbackContext | undefined {
@@ -292,7 +293,7 @@ export function markCappedFeedbackSent(
     return;
   }
   const feedback = [...history].reverse().find((item) =>
-    item.disposition === "sent_at_cap" || item.disposition === "held_at_cap"
+    item.disposition === "sent_at_cap"
   );
   if (feedback) {
     feedback.disposition = "held_then_sent";
@@ -353,8 +354,6 @@ function openReviewWindow(state: ReviewGateState): ReviewWindow {
   const window: ReviewWindow = {
     id: state.nextReviewWindowId++,
     startedAt: new Date().toISOString(),
-    status: "pending",
-    latestRequest: "",
     requestHistory: [],
     correctionCycles: 0,
     evidence,
@@ -372,7 +371,7 @@ function openReviewWindow(state: ReviewGateState): ReviewWindow {
 
 function renderUserRequestContext(window: ReviewWindow): string[] {
   if (window.requestHistory.length === 0) {
-    return [window.latestRequest || "No original request captured."];
+    return ["No original request captured."];
   }
   if (window.requestHistory.length === 1) {
     return [window.requestHistory[0]?.text || "No original request captured."];
@@ -398,9 +397,6 @@ function formatDisposition(disposition: ReviewFeedbackDisposition): string {
   }
   if (disposition === "sent_review_error") {
     return "review failure details transmitted to the implementing model";
-  }
-  if (disposition === "held_at_cap") {
-    return "feedback held at the correction cap";
   }
   if (disposition === "sent_for_correction") {
     return "feedback sent for correction";

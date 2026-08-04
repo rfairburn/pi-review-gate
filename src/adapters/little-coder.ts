@@ -4,7 +4,14 @@ import { join } from "node:path";
 import type { LittleCoderDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../usage";
-import { reviewerEnv, runPromptProcess } from "./process";
+import {
+  processFailureResult,
+  reviewerArtifactPaths,
+  reviewerEnv,
+  reviewerErrorResult,
+  runPromptProcess,
+  writeReviewerProcessArtifacts,
+} from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 
 export class LittleCoderAdapter implements ModelAdapter {
@@ -13,12 +20,8 @@ export class LittleCoderAdapter implements ModelAdapter {
   constructor(private readonly config: LittleCoderDeciderConfig) {}
 
   async run(req: ModelAdapterRequest): Promise<ReviewResult> {
-    const rawOutputPath = join(req.bundleDir, "raw-output.txt");
+    const artifacts = reviewerArtifactPaths(req.bundleDir);
     const rawStreamPath = join(req.bundleDir, "raw-stream.jsonl");
-    const finalOutputPath = join(req.bundleDir, "reviewer-final.txt");
-    const stderrPath = join(req.bundleDir, "stderr.txt");
-    const usagePath = join(req.bundleDir, "usage.json");
-    const processResultPath = join(req.bundleDir, "process-result.json");
     const sessionId = req.session?.id ?? randomUUID();
     const sessionDir = join(req.evidenceBundleDir ?? req.bundleDir, "sessions", safePathSegment(req.id));
     await mkdir(sessionDir, { recursive: true });
@@ -59,46 +62,46 @@ export class LittleCoderAdapter implements ModelAdapter {
       onStdoutChunk: (chunk) => streamExtractor.push(chunk),
     });
     const streamExtracted = streamExtractor.finish();
-    const cappedExtracted = extractReviewTextFromPiJsonl(output.stdout);
-    const extracted = streamExtracted.text.trim() ? streamExtracted : cappedExtracted;
+    const extracted = streamExtracted.text.trim() ? streamExtracted : extractReviewTextFromPiJsonl(output.stdout);
     const rawOutputText = extracted.text.trim() ? extracted.text : missingFinalTextDiagnostic(output);
     await Promise.all([
-      writeFile(rawOutputPath, rawOutputText, "utf8"),
       writeFile(rawStreamPath, output.stdout, "utf8"),
-      writeFile(finalOutputPath, extracted.text, "utf8"),
-      writeFile(stderrPath, output.stderr, "utf8"),
-      writeFile(processResultPath, JSON.stringify({
-        code: output.code,
-        timedOut: output.timedOut,
-        aborted: output.aborted,
-        stdoutTruncated: output.stdoutTruncated,
-        stderrTruncated: output.stderrTruncated,
+      writeReviewerProcessArtifacts({
+        paths: artifacts,
+        output,
+        rawOutput: rawOutputText,
+        usage: extracted.usage,
+        metadata: {
         finalTextCaptured: extracted.text.trim().length > 0,
         stdoutBytesCaptured: Buffer.byteLength(output.stdout),
         rawOutputContainsStream: false,
         rawStreamPath,
-      }, null, 2), "utf8"),
+        },
+      }),
     ]);
 
-    await writeFile(usagePath, JSON.stringify(extracted.usage ?? null, null, 2), "utf8").catch(() => undefined);
-
-    if (output.aborted) {
-      return errorResult(req.id, "Reviewer was aborted.", rawOutputPath, "aborted", extracted.usage);
-    }
-    if (output.timedOut) {
-      return errorResult(req.id, `Reviewer timed out after ${req.timeoutMs}ms.`, rawOutputPath, "timeout", extracted.usage);
-    }
-    if (output.code !== 0) {
-      return errorResult(req.id, `Reviewer exited with status ${output.code}.`, rawOutputPath, `exit_${output.code}`, extracted.usage);
-    }
+    const failure = processFailureResult({
+      reviewerId: req.id,
+      output,
+      rawOutputPath: artifacts.rawOutput,
+      timeoutMs: req.timeoutMs,
+      usage: extracted.usage,
+    });
+    if (failure) return failure;
     if (!extracted.text.trim()) {
       const summary = output.stdoutTruncated
         ? "Reviewer output was truncated before a final assistant text was captured."
         : "Reviewer did not produce final assistant text.";
-      return errorResult(req.id, summary, rawOutputPath, output.stdoutTruncated ? "output_truncated" : "missing_final_text", extracted.usage);
+      return reviewerErrorResult(
+        req.id,
+        summary,
+        artifacts.rawOutput,
+        output.stdoutTruncated ? "output_truncated" : "missing_final_text",
+        extracted.usage,
+      );
     }
 
-    const result = parseReviewResult(req.id, extracted.text, rawOutputPath);
+    const result = parseReviewResult(req.id, extracted.text, artifacts.rawOutput);
     result.usage = extracted.usage;
     return result;
   }
@@ -106,10 +109,6 @@ export class LittleCoderAdapter implements ModelAdapter {
 
 function safePathSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]+/g, "_") || "reviewer";
-}
-
-function errorResult(reviewerId: string, summary: string, rawOutputPath: string, error: string, usage: ReviewResult["usage"]): ReviewResult {
-  return { reviewerId, verdict: "error", summary, findings: [], rawOutputPath, error, usage };
 }
 
 function missingFinalTextDiagnostic(output: {

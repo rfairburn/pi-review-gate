@@ -1,6 +1,5 @@
 import type { ChangedFile } from "./capture";
 import { summarizeSideEffectChanges, summarizeSubmittedChanges } from "./change-context";
-import type { ReviewFinding, ReviewResult } from "./schema";
 
 const REVIEW_CONTEXT_POLICY = `Review policy:
 - Submitted workspace changes are the primary implementation under review.
@@ -56,10 +55,9 @@ ${escalation
     : "- Make the first response implementation-ready; do not defer useful concrete guidance to a later review."}`;
 }
 
-export function buildReviewerPrompt(input: {
+export interface ReviewerPromptContext {
   request: string;
-  changes: ChangedFile[];
-  submittedChanges?: ChangedFile[];
+  submittedChanges: ChangedFile[];
   sideEffectChanges?: ChangedFile[];
   patch: string;
   sideEffectPatch?: string;
@@ -67,83 +65,48 @@ export function buildReviewerPrompt(input: {
   bundleDir?: string;
   evidenceMarkdown?: string;
   guidanceEscalation?: ImplementationGuidanceEscalation;
-}): string {
-  const submittedChanges = input.submittedChanges ?? input.changes;
-  const sideEffectChanges = input.sideEffectChanges ?? [];
-  const submittedChangeSummaries = summarizeSubmittedChanges(input.cwd, submittedChanges);
-  const sideEffectChangeSummaries = summarizeSideEffectChanges(input.cwd, sideEffectChanges);
-
-  return `You are reviewing code changes made by another coding agent.
-
-Review the supplied user request context, submitted workspace patch, captured side-effect evidence, session evidence, and the current workspace. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the supplied context and read-only inspection are impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.
-
-${REVIEW_CONTEXT_POLICY}
-
-${implementationGuidancePolicy(input.guidanceEscalation)}
-
-Workspace:
-${input.cwd}
-
-Review bundle:
-${input.bundleDir ?? "(not supplied)"}
-
-User request context:
-<request>
-${input.request}
-</request>
-
-Submitted workspace changes:
-<submitted_changes_json>
-${JSON.stringify(submittedChangeSummaries, null, 2)}
-</submitted_changes_json>
-
-Submitted workspace patch:
-<submitted_patch_diff>
-${input.patch || "(no submitted workspace changes detected)"}
-</submitted_patch_diff>
-
-Captured side-effect changes:
-<captured_side_effect_changes_json>
-${JSON.stringify(sideEffectChangeSummaries, null, 2)}
-</captured_side_effect_changes_json>
-
-Captured side-effect patch:
-<captured_side_effect_patch_diff>
-${input.sideEffectPatch || "(no captured side-effect changes detected)"}
-</captured_side_effect_patch_diff>
-
-Session evidence:
-<session_evidence>
-${input.evidenceMarkdown || "(no session evidence captured)"}
-</session_evidence>
-
-${REVIEW_RESPONSE_FORMAT}
-
-Use "file": "session" and "line": null for findings about missing commands, process evidence, or other issues that do not belong to a specific file.
-`;
 }
 
-export function buildReviewerQuestionPrompt(input: {
+export interface ReviewerQuestionPromptContext extends ReviewerPromptContext {
   question: string;
-  request: string;
-  changes: ChangedFile[];
-  submittedChanges?: ChangedFile[];
-  sideEffectChanges?: ChangedFile[];
-  patch: string;
-  sideEffectPatch?: string;
-  cwd: string;
-  bundleDir?: string;
-  evidenceMarkdown?: string;
-  guidanceEscalation?: ImplementationGuidanceEscalation;
-}): string {
-  const submittedChanges = input.submittedChanges ?? input.changes;
+}
+
+export function buildReviewerPrompt(input: ReviewerPromptContext): string {
+  return renderReviewerPrompt({ kind: "review", ...input });
+}
+
+export function buildReviewerQuestionPrompt(input: ReviewerQuestionPromptContext): string {
+  return renderReviewerPrompt({ kind: "question", ...input });
+}
+
+type ReviewerPromptInput =
+  | ({ kind: "review" } & ReviewerPromptContext)
+  | ({ kind: "question" } & ReviewerQuestionPromptContext);
+
+function renderReviewerPrompt(input: ReviewerPromptInput): string {
   const sideEffectChanges = input.sideEffectChanges ?? [];
-  const submittedChangeSummaries = summarizeSubmittedChanges(input.cwd, submittedChanges);
+  const submittedChangeSummaries = summarizeSubmittedChanges(input.cwd, input.submittedChanges);
   const sideEffectChangeSummaries = summarizeSideEffectChanges(input.cwd, sideEffectChanges);
+  const question = input.kind === "question";
+  const role = question
+    ? "You are an independent reviewer consulted about work done by another coding agent."
+    : "You are reviewing code changes made by another coding agent.";
+  const task = question
+    ? "Answer the user's reviewer question using the supplied context and read-only inspection of the current workspace when tools are available. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, session evidence, and any relevant files you inspect. Do not modify files, run commands with persistent side effects, use network access, or include chain of thought. Return only valid JSON matching the schema."
+    : "Review the supplied user request context, submitted workspace patch, captured side-effect evidence, session evidence, and the current workspace. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the supplied context and read-only inspection are impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.";
+  const questionBlock = question
+    ? `Reviewer question:\n<question>\n${input.question}\n</question>\n\n`
+    : "";
+  const emptyPatch = question
+    ? "(no submitted workspace patch supplied)"
+    : "(no submitted workspace changes detected)";
+  const questionVerdictPolicy = question
+    ? '\nUse "pass" when the answer does not require the primary model to change course. Use "needs_changes" when the answer identifies something the primary model should fix, inspect, or ask the user about.\n'
+    : "";
 
-  return `You are an independent reviewer consulted about work done by another coding agent.
+  return `${role}
 
-Answer the user's reviewer question using the supplied context and read-only inspection of the current workspace when tools are available. The context may include submitted workspace changes, captured side-effect changes, tool calls, read-only investigation, shell output, planning discussion, and the primary agent's final summary. If no submitted patch is present, answer from the request context, captured side effects, session evidence, and any relevant files you inspect. Do not modify files, run commands with persistent side effects, use network access, or include chain of thought. Return only valid JSON matching the schema.
+${task}
 
 ${REVIEW_CONTEXT_POLICY}
 
@@ -155,12 +118,7 @@ ${input.cwd}
 Review bundle:
 ${input.bundleDir ?? "(not supplied)"}
 
-Reviewer question:
-<question>
-${input.question}
-</question>
-
-User request context:
+${questionBlock}User request context:
 <request>
 ${input.request}
 </request>
@@ -172,7 +130,7 @@ ${JSON.stringify(submittedChangeSummaries, null, 2)}
 
 Submitted workspace patch:
 <submitted_patch_diff>
-${input.patch || "(no submitted workspace patch supplied)"}
+${input.patch || emptyPatch}
 </submitted_patch_diff>
 
 Captured side-effect changes:
@@ -193,39 +151,5 @@ ${input.evidenceMarkdown || "(no session evidence captured)"}
 ${REVIEW_RESPONSE_FORMAT}
 
 Use "file": "session" and "line": null for findings about missing commands, process evidence, or other issues that do not belong to a specific file.
-
-Use "pass" when the answer does not require the primary model to change course. Use "needs_changes" when the answer identifies something the primary model should fix, inspect, or ask the user about.
-`;
-}
-
-export function buildFollowUpMessage(result: ReviewResult): string {
-  const blocking = result.findings.filter((finding) => finding.severity === "blocking");
-  const findings = blocking.length > 0 ? blocking : result.findings;
-  const lines = findings.map((finding, index) => `${index + 1}. ${formatFindingForFollowUp(finding)}`);
-
-  return [
-    "Review found blocking issues in your last changes.",
-    ...(result.guidance ? ["", "Implementation guidance:", result.guidance] : []),
-    "",
-    "Fix only these items:",
-    ...lines,
-    "",
-    "After fixing, run the relevant tests and report the result.",
-  ].join("\n");
-}
-
-function formatFinding(finding: ReviewFinding): string {
-  const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
-  const reviewer = finding.reviewerId ? `[${finding.reviewerId}] ` : "";
-  return `${reviewer}${location} - ${finding.issue} ${finding.recommendation}`;
-}
-
-function formatFindingForFollowUp(finding: ReviewFinding): string {
-  const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
-  const reviewer = finding.reviewerId ? `[${finding.reviewerId}] ` : "";
-  return [
-    `${reviewer}${location}`,
-    `Issue: ${finding.issue}`,
-    `Recommendation: ${finding.recommendation}`,
-  ].join("\n");
+${questionVerdictPolicy}`;
 }

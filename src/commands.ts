@@ -10,16 +10,15 @@ import {
   getCorrectionAttemptCount,
   getReviewerQuestionWindow,
   markCappedFeedbackSent,
-  pauseReviewWindow,
   recordAcceptedReviewerQuestion,
-  recordReviewerFeedback,
+  recordReviewerFeedbackAndArmExchange,
   type ReviewGateState,
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
 import { extractSignal, sendNotice, sendFollowUp, sendSteeringPrompt } from "./pi";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
-import { buildReviewTransmission, writeReviewDeliveryReceipt, writeReviewTransmission, type ReviewTransmissionAction } from "./transmission";
+import { createReviewTransmissionMessage, deliverReviewTransmission, writeReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
 
 export interface RegisterCommandsInput {
   pi: unknown;
@@ -47,7 +46,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       const reviewers = input.config.reviewers?.map((reviewer) => reviewer.id).join(", ") ?? input.config.decider?.id ?? "none";
-      await sendCommandNotice(ctx, `review gate: loaded; mode=${input.config.mode}; reviewers=${reviewers}; paused=${input.state.reviewsPaused}`);
+      await sendCommandNotice(ctx, `review gate: loaded; reviewers=${reviewers}; paused=${input.state.reviewsPaused}`);
     },
   });
 
@@ -144,58 +143,44 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       if (output.result?.verdict === "pass") {
         const transmission = await createCommandTransmission(output, "passed");
-        recordReviewerFeedback(input.state, {
+        recordReviewerFeedbackAndArmExchange(input.state, {
           result: output.result,
           reviewerResults: output.reviewerResults,
           reviewSequence: output.reviewSequence,
           source: "manual",
           disposition: "sent_for_observation",
+          reviewedSnapshot: output.reviewedSnapshot!,
         });
-        armReviewResponseExchange(input.state, output.reviewedSnapshot!);
         await sendCommandNotice(ctx, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
-        if (isSessionActive()) {
-          if (await sendFollowUp(input.pi, transmission)) {
-            await writeReviewDeliveryReceipt(output.invocationDir!, "passed", transmission);
-          }
-        }
-      } else if (output.result?.verdict === "needs_changes" && output.followUpMessage) {
+        await deliverCommandTransmission(input.pi, output, "passed", transmission, isSessionActive);
+      } else if (output.result?.verdict === "needs_changes") {
         const transmission = await createCommandTransmission(output, "correction_required");
         await sendCommandNotice(ctx, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
         window.correctionCycles = 0;
         window.lastCappedFollowUp = undefined;
-        window.status = "active";
-        recordReviewerFeedback(input.state, {
+        recordReviewerFeedbackAndArmExchange(input.state, {
           result: output.result,
           reviewerResults: output.reviewerResults,
           reviewSequence: output.reviewSequence,
           source: "manual",
           disposition: "sent_for_correction",
+          reviewedSnapshot: output.reviewedSnapshot!,
         });
-        armReviewResponseExchange(input.state, output.reviewedSnapshot!);
-        if (isSessionActive()) {
-          if (await sendFollowUp(input.pi, transmission)) {
-            await writeReviewDeliveryReceipt(output.invocationDir!, "correction_required", transmission);
-          }
-        }
+        await deliverCommandTransmission(input.pi, output, "correction_required", transmission, isSessionActive);
       } else {
         const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
         if (output.result) {
           const transmission = await createCommandTransmission(output, "review_error");
-          recordReviewerFeedback(input.state, {
+          recordReviewerFeedbackAndArmExchange(input.state, {
             result: output.result,
             reviewerResults: output.reviewerResults,
             reviewSequence: output.reviewSequence,
             source: "manual",
             disposition: "sent_review_error",
+            reviewedSnapshot: output.reviewedSnapshot!,
           });
-          armReviewResponseExchange(input.state, output.reviewedSnapshot!);
-          if (isSessionActive()) {
-            if (await sendFollowUp(input.pi, transmission)) {
-              await writeReviewDeliveryReceipt(output.invocationDir!, "review_error", transmission);
-            }
-          }
+          await deliverCommandTransmission(input.pi, output, "review_error", transmission, isSessionActive);
         }
-        pauseReviewWindow(input.state, "paused");
         await sendCommandNotice(ctx, failed);
       }
     },
@@ -215,7 +200,6 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const followUp = window.lastCappedFollowUp;
       const feedback = markCappedFeedbackSent(input.state);
       window.lastCappedFollowUp = undefined;
-      window.status = "active";
       window.correctionCycles = 0;
       armReviewResponseExchange(input.state, await createWorkspaceSnapshot(input.cwd(), {
         maxFileBytes: input.config.maxFileBytes,
@@ -322,15 +306,32 @@ async function createCommandTransmission(
   if (!output.result || !output.reviewerResults || !output.bundleDir || !output.invocationDir || output.reviewSequence === undefined) {
     throw new Error("review gate: cannot transmit an incomplete review pass");
   }
-  const transmission = buildReviewTransmission({
+  return createReviewTransmissionMessage({
+    invocationDir: output.invocationDir,
     reviewSequence: output.reviewSequence,
     gateVerdict: output.result.verdict,
     reviewerResults: output.reviewerResults,
     bundleDir: output.bundleDir,
     action,
   });
-  await writeReviewTransmission(output.invocationDir, transmission);
-  return transmission.message;
+}
+
+async function deliverCommandTransmission(
+  pi: unknown,
+  output: Awaited<ReturnType<typeof runReview>>,
+  action: ReviewTransmissionAction,
+  message: string,
+  isSessionActive: () => boolean,
+): Promise<void> {
+  if (!output.invocationDir || !isSessionActive()) {
+    return;
+  }
+  await deliverReviewTransmission({
+    invocationDir: output.invocationDir,
+    action,
+    message,
+    deliver: () => isSessionActive() ? sendFollowUp(pi, message) : Promise.resolve(false),
+  });
 }
 
 type RegisterCommand = (

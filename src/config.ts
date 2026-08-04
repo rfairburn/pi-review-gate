@@ -2,7 +2,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type ReviewMode = "single-decider" | "quorum";
 export type RetainBundles = "never" | "on-failure" | "always";
 
 export interface GenericCliDeciderConfig {
@@ -44,10 +43,8 @@ export type DeciderConfig = GenericCliDeciderConfig | CodexCliDeciderConfig | Cl
 
 export interface ReviewGateConfig {
   enabled: boolean;
-  mode: ReviewMode;
   maxCorrectionCycles: number;
   implementationGuidanceAfterCorrectionAttempts: number;
-  reviewWhen: "changed-files";
   maxPatchBytes: number;
   maxFileBytes: number;
   maxSnapshotBytes: number;
@@ -64,10 +61,8 @@ export interface LoadedConfig {
 
 export const DEFAULT_CONFIG: ReviewGateConfig = {
   enabled: true,
-  mode: "single-decider",
   maxCorrectionCycles: 1,
   implementationGuidanceAfterCorrectionAttempts: 1,
-  reviewWhen: "changed-files",
   maxPatchBytes: 200_000,
   maxFileBytes: 1_048_576,
   maxSnapshotBytes: 52_428_800,
@@ -109,15 +104,12 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
 
   const config: ReviewGateConfig = {
     ...DEFAULT_CONFIG,
-    ...value,
     enabled: value.enabled === undefined ? DEFAULT_CONFIG.enabled : Boolean(value.enabled),
-    mode: value.mode === "quorum" ? "quorum" : "single-decider",
     maxCorrectionCycles: numberOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles),
     implementationGuidanceAfterCorrectionAttempts: nonNegativeIntegerOrDefault(
       value.implementationGuidanceAfterCorrectionAttempts,
       DEFAULT_CONFIG.implementationGuidanceAfterCorrectionAttempts,
     ),
-    reviewWhen: "changed-files",
     maxPatchBytes: numberOrDefault(value.maxPatchBytes, DEFAULT_CONFIG.maxPatchBytes),
     maxFileBytes: numberOrDefault(value.maxFileBytes, DEFAULT_CONFIG.maxFileBytes),
     maxSnapshotBytes: numberOrDefault(value.maxSnapshotBytes, DEFAULT_CONFIG.maxSnapshotBytes),

@@ -31,6 +31,6 @@ test("extension follow-up input should not reset correction cycle state", () => 
     rememberUserRequest(state, extractInputText([event]));
   }
 
-  assert.equal(state.reviewWindow!.latestRequest, "original user request");
+  assert.equal(state.reviewWindow!.requestHistory.at(-1)?.text, "original user request");
   assert.equal(state.reviewWindow!.correctionCycles, 1);
 });

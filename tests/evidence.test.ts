@@ -140,7 +140,7 @@ test("rememberFinalAssistantSummary extracts the last assistant text", () => {
     },
   ]);
 
-  assert.equal(state.finalAssistantSummary, "final summary");
+  assert.equal(state.finalAssistantSummaries.at(-1), "final summary");
 });
 
 test("rememberFinalAssistantSummary keeps multiple turn summaries for continued review", () => {
@@ -151,7 +151,6 @@ test("rememberFinalAssistantSummary keeps multiple turn summaries for continued 
 
   const bundle = buildEvidenceBundle(state, []);
 
-  assert.equal(state.finalAssistantSummary, "second summary");
   assert.deepEqual(state.finalAssistantSummaries, ["first summary", "second summary"]);
   assert.match(bundle.markdown, /Summary 1/);
   assert.match(bundle.markdown, /first summary/);

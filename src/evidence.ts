@@ -11,7 +11,6 @@ export interface EvidenceState {
   nextSequence: number;
   events: EvidenceEvent[];
   candidates: Map<string, EvidenceCandidate>;
-  finalAssistantSummary?: string;
   finalAssistantSummaries: string[];
   acceptedReviewerQuestions: AcceptedReviewerQuestion[];
 }
@@ -53,7 +52,6 @@ export interface EvidenceBundle {
     baseline: "captured" | "missing" | "error";
     baselineSnapshot?: FileSnapshot;
   }>;
-  finalAssistantSummary?: string;
   finalAssistantSummaries: string[];
   acceptedReviewerQuestions: AcceptedReviewerQuestion[];
   changedCandidatePaths: string[];
@@ -183,7 +181,6 @@ export function buildEvidenceBundle(state: EvidenceState, changedCandidatePaths:
   const bundle: Omit<EvidenceBundle, "markdown"> = {
     events: state.events,
     candidates,
-    finalAssistantSummary: state.finalAssistantSummary,
     finalAssistantSummaries: state.finalAssistantSummaries,
     acceptedReviewerQuestions: state.acceptedReviewerQuestions,
     changedCandidatePaths,
@@ -199,7 +196,6 @@ export function rememberFinalAssistantSummary(state: EvidenceState, args: unknow
   const summary = extractFinalAssistantText(args);
   if (summary) {
     const truncated = truncate(summary, 4000);
-    state.finalAssistantSummary = truncated;
     state.finalAssistantSummaries.push(truncated);
   }
 }
@@ -448,8 +444,6 @@ function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): strin
     for (const [index, summary] of bundle.finalAssistantSummaries.entries()) {
       lines.push(`#### Summary ${index + 1}`, "", summary, "");
     }
-  } else if (bundle.finalAssistantSummary) {
-    lines.push("### Agent final summary", "", bundle.finalAssistantSummary, "");
   }
 
   if (bundle.acceptedReviewerQuestions.length > 0) {

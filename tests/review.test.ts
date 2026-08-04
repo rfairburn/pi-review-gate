@@ -8,30 +8,11 @@ import { createWorkspaceSnapshot } from "../src/capture";
 import { createEvidenceState, recordAcceptedReviewerQuestion, recordToolCallEvidence } from "../src/evidence";
 import { runAskReviewer, runReview } from "../src/review";
 import { beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
+import { fakeNeedsChangesConfig } from "./helpers";
 
-const baseConfig: ReviewGateConfig = {
-  enabled: true,
-  mode: "single-decider",
-  maxCorrectionCycles: 1,
-  implementationGuidanceAfterCorrectionAttempts: 1,
-  reviewWhen: "changed-files",
-  maxPatchBytes: 200_000,
-  maxFileBytes: 1_048_576,
-  maxSnapshotBytes: 52_428_800,
-  retainBundles: "never",
-  decider: {
-    id: "fake",
-    adapter: "generic-cli",
-    command: process.execPath,
-    args: [
-      "-e",
-      "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
-    ],
-    timeoutMs: 5000,
-  },
-};
+const baseConfig = fakeNeedsChangesConfig({ maxCorrectionCycles: 1 });
 
-test("runReview returns a follow-up message for blocking findings", async () => {
+test("runReview returns blocking findings", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -50,8 +31,8 @@ test("runReview returns a follow-up message for blocking findings", async () => 
 
     assert.equal(output.changed, true);
     assert.equal(output.result?.verdict, "needs_changes");
-    assert.match(output.followUpMessage ?? "", /Review found blocking issues/);
-    assert.match(output.followUpMessage ?? "", /index\.ts\nIssue: missing test\nRecommendation: add coverage/);
+    assert.equal(output.result?.findings[0]?.issue, "missing test");
+    assert.equal(output.result?.findings[0]?.recommendation, "add coverage");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -135,8 +116,7 @@ test("runReview uses an OR gate and preserves individual blocking finding identi
     assert.equal(output.result?.verdict, "needs_changes");
     assert.equal(output.result?.summary, "2 needs_changes");
     assert.equal(output.result?.guidance, undefined);
-    assert.match(output.followUpMessage ?? "", /\[alpha\] index\.ts\nIssue: alpha finding\nRecommendation: fix alpha/);
-    assert.match(output.followUpMessage ?? "", /\[beta\] index\.ts\nIssue: beta finding\nRecommendation: fix beta/);
+    assert.deepEqual(output.result?.findings.map((finding) => finding.reviewerId), ["alpha", "beta"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(markerA, { force: true });
@@ -205,7 +185,6 @@ test("an aborted multi-review is atomic, records a tombstone, and preserves prio
 
     assert.equal(aborted.result?.error, "aborted");
     assert.equal(aborted.reviewerResults, undefined);
-    assert.equal(aborted.followUpMessage, undefined);
     assert.equal(window.nextReviewSequence, 2);
     assert.deepEqual(Object.fromEntries(window.reviewerSessions), {
       fast: { adapter: "codex-cli", id: "previous-fast-session" },
@@ -428,7 +407,7 @@ test("runAskReviewer answers with request and evidence even when there is no pat
       candidatePaths: ["main.tf"],
       riskSignals: [],
     });
-    evidence.finalAssistantSummary = "Plan: update shared docker locals after confirming release branch naming.";
+    evidence.finalAssistantSummaries.push("Plan: update shared docker locals after confirming release branch naming.");
 
     const config: ReviewGateConfig = {
       ...baseConfig,

@@ -35,15 +35,24 @@ export const REVIEW_RESPONSE_FORMAT = `Return one JSON object with exactly this 
 }
 Use "error" only when infrastructure or unavailable evidence prevents an actual review; explain the failure in "error" and return no findings.`;
 
-function implementationGuidancePolicy(requireConcreteGuidance: boolean): string {
+export interface ImplementationGuidanceEscalation {
+  correctionAttemptCount: number;
+  threshold: number;
+}
+
+function implementationGuidancePolicy(escalation?: ImplementationGuidanceEscalation): string {
   return `Response quality:
 - Put the direct conclusion in "summary".
 - Put actionable explanation in "guidance" as Markdown.
 - Include a concise fenced code snippet or minimal diff in "guidance" or a finding recommendation whenever it would materially help the primary model implement or correct the work.
 - Do not add decorative or redundant code when prose is sufficient.
 - Preserve exact identifiers, commands, and replacement text needed to act on the review.
-${requireConcreteGuidance
-    ? "- One or more correction attempts have occurred. First determine from the current workspace whether each historical finding is resolved. Only for a problem you independently verify still remains, you MUST provide a concrete implementation example or minimal diff unless code would be inapplicable; in that case, provide exact actionable steps. Do not infer that a problem remains merely because it appears in prior feedback."
+${escalation
+    ? `- Concrete-guidance escalation is active: ${escalation.correctionAttemptCount} correction attempt(s) have occurred, meeting the configured threshold of ${escalation.threshold}.
+- First determine from the current workspace whether each historical finding is resolved. Do not infer that a problem remains merely because it appears in prior feedback.
+- For every code problem you independently verify still remains, you MUST put a concise fenced code snippet or minimal diff in "guidance". Pair it with a finding whose "recommendation" says exactly where and how to apply it.
+- Keep the outer response as JSON: encode Markdown line breaks inside the "guidance" JSON string. The implementing model will receive that string rendered under the formatted Guidance section.
+- Omit a snippet only when code is genuinely inapplicable. In that case, put exact commands, paths, or ordered steps in "guidance" and explain the non-code action in the finding recommendation.`
     : "- Make the first response implementation-ready; do not defer useful concrete guidance to a later review."}`;
 }
 
@@ -57,7 +66,7 @@ export function buildReviewerPrompt(input: {
   cwd: string;
   bundleDir?: string;
   evidenceMarkdown?: string;
-  requireConcreteGuidance?: boolean;
+  guidanceEscalation?: ImplementationGuidanceEscalation;
 }): string {
   const submittedChanges = input.submittedChanges ?? input.changes;
   const sideEffectChanges = input.sideEffectChanges ?? [];
@@ -70,7 +79,7 @@ Review the supplied user request context, submitted workspace patch, captured si
 
 ${REVIEW_CONTEXT_POLICY}
 
-${implementationGuidancePolicy(input.requireConcreteGuidance ?? false)}
+${implementationGuidancePolicy(input.guidanceEscalation)}
 
 Workspace:
 ${input.cwd}
@@ -125,7 +134,7 @@ export function buildReviewerQuestionPrompt(input: {
   cwd: string;
   bundleDir?: string;
   evidenceMarkdown?: string;
-  requireConcreteGuidance?: boolean;
+  guidanceEscalation?: ImplementationGuidanceEscalation;
 }): string {
   const submittedChanges = input.submittedChanges ?? input.changes;
   const sideEffectChanges = input.sideEffectChanges ?? [];
@@ -138,7 +147,7 @@ Answer the user's reviewer question using the supplied context and read-only ins
 
 ${REVIEW_CONTEXT_POLICY}
 
-${implementationGuidancePolicy(input.requireConcreteGuidance ?? false)}
+${implementationGuidancePolicy(input.guidanceEscalation)}
 
 Workspace:
 ${input.cwd}

@@ -1611,6 +1611,101 @@ test("an unchanged response to a passing transmission closes without another rev
   }
 });
 
+test("/ask-reviewer pauses an active turn before invoking the reviewer and then steers the answer", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-active-turn-"));
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+  const invocationMarker = join(dir, "reviewer-invoked.txt");
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      enabled: true,
+      mode: "single-decider",
+      maxCorrectionCycles: 1,
+      implementationGuidanceAfterCorrectionAttempts: 1,
+      reviewWhen: "changed-files",
+      maxPatchBytes: 200000,
+      maxFileBytes: 1048576,
+      maxSnapshotBytes: 52428800,
+      retainBundles: "never",
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');`,
+            "process.stdin.resume();let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>",
+            "process.stdout.write(JSON.stringify(s.includes('paused at a stable boundary')",
+            "?{verdict:'pass',summary:'reviewed the paused workspace',guidance:null,findings:[],error:null}",
+            ":{verdict:'needs_changes',summary:'missing paused exchange',guidance:null,findings:[],error:null})));",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const userMessages: Array<{ message: string; options: unknown }> = [];
+    let idle = true;
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      notify() {},
+      sendUserMessage(message: string, options: unknown) {
+        userMessages.push({ message, options });
+      },
+    };
+    const ctx = {
+      isIdle: () => idle,
+      ui: { notify() {} },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
+    idle = false;
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "changed before consultation\n", "utf8");
+
+    const questionPromise = Promise.resolve(commands.get("ask-reviewer")?.("is this correct?", ctx));
+    await waitForCondition(() => userMessages.length === 1);
+
+    assert.deepEqual(userMessages[0]?.options, { deliverAs: "steer" });
+    assert.match(userMessages[0]?.message ?? "", /Pause implementation at this steering boundary/);
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "paused at a stable boundary" }],
+    });
+    idle = true;
+    await questionPromise;
+
+    assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
+    assert.equal(userMessages.length, 2);
+    assert.deepEqual(userMessages[1]?.options, { deliverAs: "steer" });
+    assert.match(userMessages[1]?.message ?? "", /Reviewer note from \/ask-reviewer:/);
+    assert.match(userMessages[1]?.message ?? "", /reviewed the paused workspace/);
+    assert.doesNotMatch(userMessages[1]?.message ?? "", /Review pass .* transmission/);
+  } finally {
+    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
+    else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function extractBundleDir(message: string, reviewSequence: number): string {
   const suffix = `/reviews/${String(reviewSequence).padStart(4, "0")}`;
   const line = message.split("\n").find((entry) => entry.startsWith("Complete immutable pass evidence: "));
@@ -1645,4 +1740,15 @@ async function waitForFile(path: string): Promise<void> {
     }
   }
   await access(path);
+}
+
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    if (condition()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(condition(), "condition became true before timeout");
 }

@@ -48,7 +48,10 @@ test("every review prompt conditionally requires concrete guidance after correct
     changes: [],
     patch: "",
     cwd: "/tmp/project",
-    requireConcreteGuidance: true,
+    guidanceEscalation: {
+      correctionAttemptCount: 3,
+      threshold: 2,
+    },
   };
   const automatic = buildReviewerPrompt(common);
   const question = buildReviewerQuestionPrompt({
@@ -57,9 +60,11 @@ test("every review prompt conditionally requires concrete guidance after correct
   });
 
   for (const prompt of [automatic, question]) {
-    assert.match(prompt, /One or more correction attempts have occurred/);
+    assert.match(prompt, /Concrete-guidance escalation is active: 3 correction attempt\(s\) have occurred, meeting the configured threshold of 2/);
     assert.match(prompt, /First determine from the current workspace whether each historical finding is resolved/);
-    assert.match(prompt, /MUST provide a concrete implementation example or minimal diff/);
+    assert.match(prompt, /MUST put a concise fenced code snippet or minimal diff in "guidance"/);
+    assert.match(prompt, /Pair it with a finding whose "recommendation" says exactly where and how to apply it/);
+    assert.match(prompt, /rendered under the formatted Guidance section/);
     assert.match(prompt, /Do not infer that a problem remains merely because it appears in prior feedback/);
     assert.doesNotMatch(prompt, /correction attempt has not resolved/);
   }
@@ -74,7 +79,10 @@ test("review prompts require current evidence before repeating historical findin
     changes: [],
     patch: "+safe();",
     cwd: "/tmp/project",
-    requireConcreteGuidance: true,
+    guidanceEscalation: {
+      correctionAttemptCount: 1,
+      threshold: 1,
+    },
   });
 
   assert.match(prompt, /Prior review feedback .* is historical evidence/);

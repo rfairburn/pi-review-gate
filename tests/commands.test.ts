@@ -501,13 +501,14 @@ test("/ask-reviewer-interactive submits edited reviewer text when the editor is 
   try {
     const state = createState();
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
-    const userMessages: string[] = [];
+    const userMessages: Array<{ message: string; options: unknown }> = [];
+    const preparedCommands: string[] = [];
     const pi = {
       registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
         commands.set(name, options.handler);
       },
-      sendUserMessage(message: string) {
-        userMessages.push(message);
+      sendUserMessage(message: string, options: unknown) {
+        userMessages.push({ message, options });
       },
     };
     const ctx = {
@@ -524,14 +525,18 @@ test("/ask-reviewer-interactive submits edited reviewer text when the editor is 
       cwd: () => dir,
       config: askReviewerConfig(),
       state,
+      prepareReviewerQuestion: async (commandName) => {
+        preparedCommands.push(commandName);
+      },
     });
 
     await commands.get("ask-reviewer-interactive")?.("should this be shared?", ctx);
 
     assert.equal(userMessages.length, 1);
-    assert.match(userMessages[0] ?? "", /Reviewer note from \/ask-reviewer:/);
-    assert.match(userMessages[0] ?? "", /Question: should this be shared\?/);
-    assert.match(userMessages[0] ?? "", /Please act on this\./);
+    assert.deepEqual(userMessages[0]?.options, { deliverAs: "steer" });
+    assert.match(userMessages[0]?.message ?? "", /Reviewer note from \/ask-reviewer:/);
+    assert.match(userMessages[0]?.message ?? "", /Question: should this be shared\?/);
+    assert.match(userMessages[0]?.message ?? "", /Please act on this\./);
     assert.equal(state.reviewWindow?.evidence.acceptedReviewerQuestions.length, 1);
     assert.equal(
       state.reviewWindow?.evidence.acceptedReviewerQuestions[0]?.question,
@@ -545,6 +550,7 @@ test("/ask-reviewer-interactive submits edited reviewer text when the editor is 
       state.reviewWindow?.evidence.acceptedReviewerQuestions[0]?.acceptedAnswer ?? "",
       /```ts\nconst ready = true;\n```/,
     );
+    assert.deepEqual(preparedCommands, ["ask-reviewer-interactive"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -555,14 +561,15 @@ test("/ask-reviewer submits the same reviewer text without opening the interacti
   try {
     const state = createState();
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
-    const userMessages: string[] = [];
+    const userMessages: Array<{ message: string; options: unknown }> = [];
+    const preparedCommands: string[] = [];
     let editorCalls = 0;
     const pi = {
       registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
         commands.set(name, options.handler);
       },
-      sendUserMessage(message: string) {
-        userMessages.push(message);
+      sendUserMessage(message: string, options: unknown) {
+        userMessages.push({ message, options });
       },
     };
     const ctx = {
@@ -580,6 +587,9 @@ test("/ask-reviewer submits the same reviewer text without opening the interacti
       cwd: () => dir,
       config: askReviewerConfig(),
       state,
+      prepareReviewerQuestion: async (commandName) => {
+        preparedCommands.push(commandName);
+      },
     });
 
     await commands.get("ask-reviewer-interactive")?.("should this be shared?", ctx);
@@ -587,7 +597,12 @@ test("/ask-reviewer submits the same reviewer text without opening the interacti
 
     assert.equal(editorCalls, 1);
     assert.equal(userMessages.length, 2);
-    assert.equal(userMessages[1], userMessages[0]);
+    assert.deepEqual(userMessages.map(({ options }) => options), [
+      { deliverAs: "steer" },
+      { deliverAs: "steer" },
+    ]);
+    assert.equal(userMessages[1]?.message, userMessages[0]?.message);
+    assert.deepEqual(preparedCommands, ["ask-reviewer-interactive", "ask-reviewer"]);
     assert.equal(state.reviewWindow?.evidence.acceptedReviewerQuestions.length, 2);
   } finally {
     await rm(dir, { recursive: true, force: true });

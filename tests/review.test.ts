@@ -559,7 +559,9 @@ test("correction-attempt escalation reaches automatic and question review prompt
             "let s='';",
             "process.stdin.on('data',c=>s+=c);",
             "process.stdin.on('end',()=>{",
-            "const ok=s.includes('MUST provide a concrete implementation example or minimal diff');",
+            "const ok=s.includes('Concrete-guidance escalation is active: 1 correction attempt(s) have occurred, meeting the configured threshold of 1')",
+            "&&s.includes('MUST put a concise fenced code snippet or minimal diff in \\\"guidance\\\"')",
+            "&&s.includes('rendered under the formatted Guidance section');",
             "process.stdout.write(JSON.stringify(ok",
             "?{verdict:'pass',summary:'escalation visible',findings:[]}",
             ":{verdict:'needs_changes',summary:'missing escalation',findings:[]}));",
@@ -588,6 +590,64 @@ test("correction-attempt escalation reaches automatic and question review prompt
 
     assert.equal(automatic.result?.verdict, "pass");
     assert.equal(question.result?.verdict, "pass");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("concrete-guidance escalation starts at the configured correction-attempt threshold", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-guidance-threshold-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      implementationGuidanceAfterCorrectionAttempts: 2,
+      decider: {
+        id: "threshold-checker",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "process.stdin.resume();",
+            "let s='';",
+            "process.stdin.on('data',c=>s+=c);",
+            "process.stdin.on('end',()=>{",
+            "const active=s.includes('Concrete-guidance escalation is active:');",
+            "const below=s.includes('below threshold');",
+            "const ok=below?!active:active&&s.includes('2 correction attempt(s) have occurred, meeting the configured threshold of 2');",
+            "process.stdout.write(JSON.stringify(ok",
+            "?{verdict:'pass',summary:'threshold honored',guidance:null,findings:[],error:null}",
+            ":{verdict:'needs_changes',summary:'wrong threshold mode',guidance:null,findings:[],error:null}));",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    };
+
+    const below = await runReview({
+      cwd: dir,
+      request: "below threshold",
+      before,
+      config,
+      correctionAttemptCount: 1,
+    });
+    const reached = await runReview({
+      cwd: dir,
+      request: "threshold reached",
+      before,
+      config,
+      correctionAttemptCount: 2,
+    });
+
+    assert.equal(below.result?.verdict, "pass");
+    assert.equal(reached.result?.verdict, "pass");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

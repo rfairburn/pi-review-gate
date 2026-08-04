@@ -4,7 +4,7 @@ import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice } from "./pi";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt } from "./pi";
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
   activeExchangeHasBaseline,
@@ -48,7 +48,17 @@ export async function activate(pi: unknown): Promise<void> {
   let currentCwd = process.cwd();
   let sessionActive = true;
   let activeReviewAbort: ReviewAbortHandle | undefined;
+  let agentRunActive = false;
+  let reviewerQuestionPausePending = false;
+  const reviewerQuestionPauseWaiters = new Set<() => void>();
   const sessionAbortController = new AbortController();
+
+  const releaseReviewerQuestionPauseWaiters = () => {
+    for (const resolve of reviewerQuestionPauseWaiters) {
+      resolve();
+    }
+    reviewerQuestionPauseWaiters.clear();
+  };
 
   registerHook(pi, "session_shutdown", async () => {
     sessionActive = false;
@@ -56,6 +66,9 @@ export async function activate(pi: unknown): Promise<void> {
     const reviewWasActive = Boolean(activeReviewAbort);
     activeReviewAbort?.shutdown();
     activeReviewAbort = undefined;
+    agentRunActive = false;
+    reviewerQuestionPausePending = false;
+    releaseReviewerQuestionPauseWaiters();
     const windows = [state.reviewWindow, state.lastQuestionWindow];
     discardSessionState(state);
     await Promise.all(windows.map((window, index) =>
@@ -83,6 +96,7 @@ export async function activate(pi: unknown): Promise<void> {
   });
 
   registerHook(pi, "before_agent_start", async (...args) => {
+    agentRunActive = true;
     currentCwd = extractCwd(args, currentCwd);
     beginAgentRun(state);
     if (activeExchangeHasBaseline(state)) {
@@ -133,15 +147,37 @@ export async function activate(pi: unknown): Promise<void> {
   });
 
   registerHook(pi, "agent_end", async (...args) => {
+    agentRunActive = false;
     currentCwd = extractCwd(args, currentCwd);
     const noticeTarget = extractContext(args) ?? pi;
     const signal = extractSignal(args);
     const window = state.reviewWindow;
+    const pauseForReviewerQuestion = reviewerQuestionPausePending;
+    reviewerQuestionPausePending = false;
     if (!window) {
+      if (pauseForReviewerQuestion) {
+        releaseReviewerQuestionPauseWaiters();
+      }
       return;
     }
     rememberFinalAssistantSummary(window.evidence, args);
     const actingUsage = extractPiUsageFromMessages(args);
+    if (pauseForReviewerQuestion) {
+      try {
+        if (window.baseline && !signal?.aborted) {
+          await collectPausedReviewExchange({
+            cwd: currentCwd,
+            config,
+            evidence: window.evidence,
+            actingUsage,
+            window,
+          });
+        }
+      } finally {
+        releaseReviewerQuestionPauseWaiters();
+      }
+      return;
+    }
     if (!window.baseline) {
       closeReviewWindow(state);
       return;
@@ -365,6 +401,28 @@ export async function activate(pi: unknown): Promise<void> {
     state,
     isSessionActive: () => sessionActive,
     sessionSignal: sessionAbortController.signal,
+    prepareReviewerQuestion: async (commandName, ctx) => {
+      if (!agentRunActive && commandContextIsIdle(ctx)) {
+        return;
+      }
+
+      reviewerQuestionPausePending = true;
+      const paused = new Promise<void>((resolve) => reviewerQuestionPauseWaiters.add(resolve));
+      const delivered = await sendSteeringPrompt(
+        pi,
+        [
+          `Reviewer consultation requested by /${commandName}.`,
+          "Pause implementation at this steering boundary. Do not call any more tools or modify files after receiving this message.",
+          "End this turn so the reviewer can inspect a stable workspace; its response will be provided next.",
+        ].join(" "),
+      );
+      if (!delivered) {
+        reviewerQuestionPausePending = false;
+        releaseReviewerQuestionPauseWaiters();
+        throw new Error("review gate: cannot pause the active turn because sendUserMessage is unavailable");
+      }
+      await paused;
+    },
   });
 }
 
@@ -399,6 +457,13 @@ export default activate;
 
 module.exports = activate;
 Object.assign(module.exports as Record<string, unknown>, { activate });
+
+function commandContextIsIdle(ctx: unknown): boolean {
+  if (typeof ctx === "object" && ctx !== null && "isIdle" in ctx && typeof ctx.isIdle === "function") {
+    return Boolean(ctx.isIdle());
+  }
+  return true;
+}
 
 function isToolError(value: unknown): boolean {
   return typeof value === "object" && value !== null && "isError" in value && Boolean((value as { isError?: unknown }).isError);

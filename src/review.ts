@@ -75,7 +75,7 @@ export interface AskReviewerOutput {
 
 export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput> {
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
-  const requireConcreteGuidance = shouldRequireConcreteGuidance(input.config, correctionAttemptCount);
+  const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
   const after = await createWorkspaceSnapshot(input.cwd, {
     maxFileBytes: input.config.maxFileBytes,
     maxSnapshotBytes: input.config.maxSnapshotBytes,
@@ -175,11 +175,12 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
     actingUsage: input.actingUsage,
-    requireConcreteGuidance,
+    guidanceEscalation,
     metadata: {
       exchangeSequence: input.window?.exchanges.at(-1)?.sequence,
       correctionAttemptCount,
-      requireConcreteGuidance,
+      requireConcreteGuidance: guidanceEscalation !== undefined,
+      implementationGuidanceThreshold: input.config.implementationGuidanceAfterCorrectionAttempts,
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
@@ -279,7 +280,7 @@ export async function collectPausedReviewExchange(input: PausedExchangeInput): P
 
 export async function runAskReviewer(input: AskReviewerInput): Promise<AskReviewerOutput> {
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
-  const requireConcreteGuidance = shouldRequireConcreteGuidance(input.config, correctionAttemptCount);
+  const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
   const { changes, workspaceChanges, evidenceChanges, sideEffectChanges } = await collectCurrentChanges({
     cwd: input.cwd,
     before: input.before,
@@ -316,11 +317,12 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     evidence: input.evidence
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
-    requireConcreteGuidance,
+    guidanceEscalation,
     metadata: {
       exchangeSequence: input.window?.exchanges.at(-1)?.sequence,
       correctionAttemptCount,
-      requireConcreteGuidance,
+      requireConcreteGuidance: guidanceEscalation !== undefined,
+      implementationGuidanceThreshold: input.config.implementationGuidanceAfterCorrectionAttempts,
       patchTruncated: patchResult.truncated,
       omittedDiffs: patchResult.omitted,
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
@@ -567,8 +569,12 @@ function abortedReviewOutput(changes: ChangedFile[], bundleDir: string): ReviewR
   };
 }
 
-function shouldRequireConcreteGuidance(config: ReviewGateConfig, correctionAttemptCount = 0): boolean {
-  return correctionAttemptCount >= config.implementationGuidanceAfterCorrectionAttempts;
+function buildGuidanceEscalation(
+  config: ReviewGateConfig,
+  correctionAttemptCount = 0,
+): { correctionAttemptCount: number; threshold: number } | undefined {
+  const threshold = config.implementationGuidanceAfterCorrectionAttempts;
+  return correctionAttemptCount >= threshold ? { correctionAttemptCount, threshold } : undefined;
 }
 
 function aggregateUsage(results: ReviewResult[]): ReviewResult["usage"] {

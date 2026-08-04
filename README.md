@@ -107,12 +107,15 @@ strengthens its request for concrete implementation guidance. The default is
 correction attempt the next automatic review, `/review-now`, or `/ask-reviewer`
 first verifies historical findings against the current workspace. For only
 those problems it independently confirms still remain, it explicitly requires
-a targeted code example, minimal diff, or exact actionable steps. The presence
-of prior feedback is not treated as proof that the correction failed. Set the
-value to `0` to apply this conditional verification and concrete-guidance
-requirement on the first review. There is no separate disabled value; use a
-threshold higher than the configured correction budget to prevent threshold
-escalation while retaining the normal implementation-ready prompt.
+a targeted code example, minimal diff, or exact actionable steps. Code examples
+stay inside the structured response's Markdown `guidance` field and are rendered
+under the review's Guidance section; the Summary, Issue, and Recommendation
+fields keep their existing formatted layout. The presence of prior feedback is
+not treated as proof that the correction failed. Set the value to `0` to apply
+this conditional verification and concrete-guidance requirement on the first
+review. There is no separate disabled value; use a threshold higher than the
+configured correction budget to prevent threshold escalation while retaining
+the normal implementation-ready prompt.
 
 Load during development by pointing your pi host at the built extension:
 
@@ -290,11 +293,18 @@ regular prompt starts a fresh window instead. At the automatic correction cap it
 also includes the prior reviewer results, the deferred transmission, and any
 later `/review-continue` authorization from the same unresolved review window.
 
-`/ask-reviewer` submits the resulting reviewer note to the implementing model
-immediately. `/ask-reviewer-interactive <question>` uses the same reviewer,
-session, evidence, answer formatting, and acceptance path, but opens the answer
-in an editable prompt first. Press Enter to submit it, edit it first if needed,
-or press Escape/Ctrl+C to clear it without sending anything.
+`/ask-reviewer` uses a two-stage interruption when the implementing model is in
+a turn. It first steers a hold instruction that tells the model not to call more
+tools or modify more files. Any tool calls already issued in the current
+assistant batch may finish before steering is delivered. Once that turn ends
+and its exchange is captured, the gate asks the
+reviewer against the stable workspace and steers the resulting note into the
+next model step. Escape remains available when an immediate hard stop is
+required. `/ask-reviewer-interactive <question>` uses the same reviewer,
+session, evidence, answer formatting,
+two-stage interruption, and acceptance path, but opens the answer in an editable
+prompt first. Press Enter to submit it, edit it first if needed, or press
+Escape/Ctrl+C to clear it without sending anything.
 
 Submitting either command accepts the question and the exact submitted reviewer
 note into structured session evidence. Later automatic reviews, `/review-now`,

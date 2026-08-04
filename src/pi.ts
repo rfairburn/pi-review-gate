@@ -52,10 +52,12 @@ export async function sendFollowUp(pi: unknown, message: string): Promise<boolea
   return false;
 }
 
-export async function sendUserPrompt(pi: unknown, message: string): Promise<void> {
+export async function sendSteeringPrompt(pi: unknown, message: string): Promise<boolean> {
   if (isRecord(pi) && typeof pi.sendUserMessage === "function") {
-    await pi.sendUserMessage(message);
+    await pi.sendUserMessage(message, { deliverAs: "steer" });
+    return true;
   }
+  return false;
 }
 
 export function onTerminalInput(pi: unknown, handler: TerminalInputHandler): (() => void) | undefined {

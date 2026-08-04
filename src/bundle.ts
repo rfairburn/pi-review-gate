@@ -4,7 +4,12 @@ import { dirname, join } from "node:path";
 import type { ChangedFile } from "./capture";
 import { summarizeReviewChanges } from "./change-context";
 import type { EvidenceBundle } from "./evidence";
-import { buildReviewerPrompt, buildReviewerQuestionPrompt, REVIEW_RESPONSE_FORMAT } from "./prompts";
+import {
+  buildReviewerPrompt,
+  buildReviewerQuestionPrompt,
+  REVIEW_RESPONSE_FORMAT,
+  type ImplementationGuidanceEscalation,
+} from "./prompts";
 import type { ReviewExchangeContext } from "./state";
 import type { TokenUsage } from "./usage";
 
@@ -21,7 +26,7 @@ export interface ReviewBundleInput {
   sideEffectPatch?: string;
   evidence?: EvidenceBundle;
   actingUsage?: TokenUsage;
-  requireConcreteGuidance?: boolean;
+  guidanceEscalation?: ImplementationGuidanceEscalation;
   metadata?: Record<string, unknown>;
 }
 
@@ -51,7 +56,7 @@ export interface ReviewerQuestionBundleInput {
   patch: string;
   sideEffectPatch?: string;
   evidence?: EvidenceBundle;
-  requireConcreteGuidance?: boolean;
+  guidanceEscalation?: ImplementationGuidanceEscalation;
   metadata?: Record<string, unknown>;
 }
 
@@ -69,7 +74,7 @@ export async function createReviewBundle(input: ReviewBundleInput): Promise<Revi
     cwd: input.cwd,
     bundleDir: dir,
     evidenceMarkdown: input.evidence?.markdown,
-    requireConcreteGuidance: input.requireConcreteGuidance,
+    guidanceEscalation: input.guidanceEscalation,
   });
 
   const requestPath = join(invocationDir, "request.md");
@@ -135,7 +140,7 @@ export async function createReviewerQuestionBundle(input: ReviewerQuestionBundle
     cwd: input.cwd,
     bundleDir: dir,
     evidenceMarkdown: input.evidence?.markdown,
-    requireConcreteGuidance: input.requireConcreteGuidance,
+    guidanceEscalation: input.guidanceEscalation,
   });
 
   const questionPath = join(invocationDir, "question.md");

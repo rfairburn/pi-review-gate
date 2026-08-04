@@ -16,7 +16,7 @@ import {
   type ReviewGateState,
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
-import { extractSignal, sendNotice, sendFollowUp, sendUserPrompt } from "./pi";
+import { extractSignal, sendNotice, sendFollowUp, sendSteeringPrompt } from "./pi";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { buildReviewTransmission, writeReviewDeliveryReceipt, writeReviewTransmission, type ReviewTransmissionAction } from "./transmission";
@@ -28,6 +28,7 @@ export interface RegisterCommandsInput {
   state: ReviewGateState;
   isSessionActive?: () => boolean;
   sessionSignal?: AbortSignal;
+  prepareReviewerQuestion?: (commandName: string, ctx: unknown) => Promise<void>;
 }
 
 export function registerCommands(input: RegisterCommandsInput): void {
@@ -249,6 +250,10 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
 
       await sendCommandNotice(ctx, `review gate: asking reviewer\n\nQuestion: ${question}`);
+      await input.prepareReviewerQuestion?.(commandName, ctx);
+      if (!isSessionActive()) {
+        return;
+      }
       const contextWindow = getReviewerQuestionWindow(input.state);
       const output = await runAskReviewer({
         cwd: input.cwd(),
@@ -292,7 +297,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           question,
           acceptedAnswer,
         });
-        await sendUserPrompt(input.pi, acceptedAnswer);
+        await sendSteeringPrompt(input.pi, acceptedAnswer);
         return;
       }
       const cleared = `${formatTokenUsage(output.result.usage)}\nreview gate: reviewer answer cleared`;
@@ -300,12 +305,12 @@ export function registerCommands(input: RegisterCommandsInput): void {
     };
 
   registerCommand("ask-reviewer", {
-    description: "Ask the configured reviewer a question and submit its answer immediately.",
+    description: "Ask the configured reviewer a question and steer its answer into the current turn.",
     handler: askReviewerHandler(true, "ask-reviewer"),
   });
 
   registerCommand("ask-reviewer-interactive", {
-    description: "Ask the configured reviewer a question and edit its answer before submitting it.",
+    description: "Ask the configured reviewer a question, edit its answer, then steer it into the current turn.",
     handler: askReviewerHandler(false, "ask-reviewer-interactive"),
   });
 }

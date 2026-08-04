@@ -114,4 +114,8 @@ echo "retainBundles=$RETAIN_BUNDLES"
 export PI_REVIEW_GATE_CONFIG="$CONFIG"
 export LITTLE_CODER_EXTRA_EXTENSIONS="$ROOT/dist/src/index.js${LITTLE_CODER_EXTRA_EXTENSIONS:+:$LITTLE_CODER_EXTRA_EXTENSIONS}"
 echo "LITTLE_CODER_EXTRA_EXTENSIONS=$LITTLE_CODER_EXTRA_EXTENSIONS"
-exec little-coder "${LITTLE_CODER_ARGS[@]}"
+if ((${#LITTLE_CODER_ARGS[@]})); then
+  exec little-coder "${LITTLE_CODER_ARGS[@]}"
+else
+  exec little-coder
+fi

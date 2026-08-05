@@ -150,7 +150,8 @@ examples/triple-review.json
 ```
 
 The DeepSeek double is an alternative to the default Codex + GLM-5.2 pairing;
-it runs Codex and `ollama/deepseek-v4-flash` as independent reviewers.
+it runs Codex and `ollama/deepseek-v4-flash:0731-cloud` as independent
+reviewers.
 
 The little-coder model adapter is generic. The example currently uses
 `ollama/glm-5.2`, matching a provider/model entry from

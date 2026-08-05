@@ -65,7 +65,7 @@ write_reviewer_config() {
     double-deepseek-v4-flash)
       echo '  "reviewers": ['
       echo '    {"id":"codex","adapter":"codex-cli","timeoutMs":600000},'
-      echo '    {"id":"deepseek-v4-flash","adapter":"little-coder-model","model":"ollama/deepseek-v4-flash","timeoutMs":600000}'
+      echo '    {"id":"deepseek-v4-flash","adapter":"little-coder-model","model":"ollama/deepseek-v4-flash:0731-cloud","timeoutMs":600000}'
       echo '  ]'
       ;;
     triple)

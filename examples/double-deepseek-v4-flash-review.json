@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "maxCorrectionCycles": 30,
+  "implementationGuidanceAfterCorrectionAttempts": 1,
+  "maxPatchBytes": 200000,
+  "maxFileBytes": 1048576,
+  "maxSnapshotBytes": 52428800,
+  "retainBundles": "on-failure",
+  "reviewers": [
+    {
+      "id": "codex",
+      "adapter": "codex-cli",
+      "timeoutMs": 600000
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "adapter": "little-coder-model",
+      "model": "ollama/deepseek-v4-flash",
+      "timeoutMs": 600000
+    }
+  ]
+}

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRESET="${1:-}"
 if [[ -z "$PRESET" ]]; then
-  echo "usage: $0 <codex|claude|glm-5.2|double|triple|fake> [little-coder args...]" >&2
+  echo "usage: $0 <codex|claude|glm-5.2|double|double-deepseek-v4-flash|triple|fake> [little-coder args...]" >&2
   exit 2
 fi
 shift
@@ -62,6 +62,12 @@ write_reviewer_config() {
       echo '    {"id":"glm-5.2","adapter":"little-coder-model","model":"ollama/glm-5.2","timeoutMs":600000}'
       echo '  ]'
       ;;
+    double-deepseek-v4-flash)
+      echo '  "reviewers": ['
+      echo '    {"id":"codex","adapter":"codex-cli","timeoutMs":600000},'
+      echo '    {"id":"deepseek-v4-flash","adapter":"little-coder-model","model":"ollama/deepseek-v4-flash","timeoutMs":600000}'
+      echo '  ]'
+      ;;
     triple)
       echo '  "reviewers": ['
       echo '    {"id":"codex","adapter":"codex-cli","timeoutMs":600000},'
@@ -82,7 +88,7 @@ write_reviewer_config() {
 
 # Validate the preset before spending time on the build.
 case "$PRESET" in
-  codex|claude|glm-5.2|double|triple|fake) ;;
+  codex|claude|glm-5.2|double|double-deepseek-v4-flash|triple|fake) ;;
   *)
     echo "unknown reviewer preset: $PRESET" >&2
     exit 2

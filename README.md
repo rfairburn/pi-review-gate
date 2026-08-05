@@ -145,8 +145,12 @@ available at:
 
 ```bash
 examples/double-review.json
+examples/double-deepseek-v4-flash-review.json
 examples/triple-review.json
 ```
+
+The DeepSeek double is an alternative to the default Codex + GLM-5.2 pairing;
+it runs Codex and `ollama/deepseek-v4-flash` as independent reviewers.
 
 The little-coder model adapter is generic. The example currently uses
 `ollama/glm-5.2`, matching a provider/model entry from
@@ -159,8 +163,15 @@ For little-coder plus Codex review, use:
 ./scripts/little-coder-codex-review.sh
 ```
 
+For the Codex + DeepSeek-V4-Flash double, use:
+
+```bash
+./scripts/little-coder-double-deepseek-v4-flash-review.sh
+```
+
 All named development wrappers delegate to one preset launcher. It can also be
-used directly with `codex`, `claude`, `glm-5.2`, `double`, `triple`, or `fake`:
+used directly with `codex`, `claude`, `glm-5.2`, `double`,
+`double-deepseek-v4-flash`, `triple`, or `fake`:
 
 ```bash
 ./scripts/little-coder-review.sh double

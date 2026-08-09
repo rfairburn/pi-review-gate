@@ -43,15 +43,17 @@ function implementationGuidancePolicy(escalation?: ImplementationGuidanceEscalat
   return `Response quality:
 - Put the direct conclusion in "summary".
 - Put actionable explanation in "guidance" as Markdown.
-- Include a concise fenced code snippet or minimal diff in "guidance" or a finding recommendation whenever it would materially help the primary model implement or correct the work.
-- Do not add decorative or redundant code when prose is sufficient.
+${escalation
+    ? "- Keep the required prose and implementation diff concise; do not add decorative or redundant material."
+    : "- Include a concise fenced code snippet or minimal diff in \"guidance\" or a finding recommendation whenever it would materially help the primary model implement or correct the work.\n- Do not add decorative or redundant code when prose is sufficient."}
 - Preserve exact identifiers, commands, and replacement text needed to act on the review.
 ${escalation
     ? `- Concrete-guidance escalation is active: ${escalation.correctionAttemptCount} correction attempt(s) have occurred, meeting the configured threshold of ${escalation.threshold}.
 - First determine from the current workspace whether each historical finding is resolved. Do not infer that a problem remains merely because it appears in prior feedback.
-- For every code problem you independently verify still remains, you MUST put a concise fenced code snippet or minimal diff in "guidance". Pair it with a finding whose "recommendation" says exactly where and how to apply it.
+- For every code problem you independently verify still remains, you MUST put both of the following in "guidance": concise prose that explains and defends the proposed correction, and a concise fenced implementation diff showing exactly what code you expect to see for that finding to pass. Include as much code and context as necessary for the correction to be complete and directly applicable; the diff does not have to be minimal.
+- Do not substitute prose for the implementation diff or provide an implementation diff without the supporting explanation. Pair both with a finding whose "recommendation" says exactly where and how to apply the correction.
 - Keep the outer response as JSON: encode Markdown line breaks inside the "guidance" JSON string. The implementing model will receive that string rendered under the formatted Guidance section.
-- Omit a snippet only when code is genuinely inapplicable. In that case, put exact commands, paths, or ordered steps in "guidance" and explain the non-code action in the finding recommendation.`
+- For a genuinely non-code finding, put exact commands, paths, or ordered steps in "guidance" and defend why those actions are sufficient for that finding to pass.`
     : "- Make the first response implementation-ready; do not defer useful concrete guidance to a later review."}`;
 }
 

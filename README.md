@@ -33,6 +33,8 @@ Example config using Codex as the reviewer:
 ```json
 {
   "enabled": true,
+  "reviewerTimeoutMs": 600000,
+  "executorTimeoutMs": 1800000,
   "maxCorrectionCycles": 3,
   "implementationGuidanceAfterCorrectionAttempts": 1,
   "maxPatchBytes": 200000,
@@ -42,7 +44,7 @@ Example config using Codex as the reviewer:
   "decider": {
     "id": "codex",
     "adapter": "codex-cli",
-    "timeoutMs": 300000
+    "timeoutMs": 600000
   }
 }
 ```
@@ -84,12 +86,12 @@ being mislabeled as verdict-schema failures.
     {
       "id": "codex",
       "adapter": "codex-cli",
-      "timeoutMs": 300000
+      "timeoutMs": 600000
     },
     {
       "id": "claude",
       "adapter": "claude-cli",
-      "timeoutMs": 300000
+      "timeoutMs": 600000
     }
   ]
 }
@@ -97,18 +99,178 @@ being mislabeled as verdict-schema failures.
 
 The older single `decider` field is still supported for compatibility.
 
+### Delegated execution and runtime settings
+
+`/review-settings` opens one staged settings transaction with five sections:
+
+- **Executor** is a single-selection, `/model`-style picker over Pi-scoped
+  little-coder models plus execution-capable entries from `externalAgents`.
+  Selecting an internal model also selects its executor reasoning level.
+- **Reviewers** is a multi-selection, `/scoped-models`-style picker over the
+  same Pi-scoped models plus review-capable entries from `externalAgents`.
+  Clearing every reviewer is valid and disables automatic review without
+  disabling delegated execution. Each selected internal reviewer has its own
+  **Reasoning** row.
+- **Timeouts** edits the default reviewer and executor timeouts in minutes.
+  Reviewers default to 10 minutes and executors to 30 minutes. Explicit
+  `externalAgents[].review.timeoutMs` and `externalAgents[].execution.timeoutMs`
+  values override these defaults for that external harness role.
+- **Review policy** edits `maxCorrectionCycles` and
+  `implementationGuidanceAfterCorrectionAttempts` as non-negative whole
+  numbers.
+- **Bundle retention** selects `never`, `on-failure`, or `always`. Choose
+  `always` when successful executor and reviewer turns need to remain available
+  for inspection.
+
+Escape from a submenu returns to the settings root. Escape or **Cancel** at the
+root discards all staged changes; **Save changes** atomically persists every
+section while preserving unrelated JSON keys. An inactive external definition
+does not need to be installed. Its command is checked when that definition is
+selected or run.
+
+The executor and reviewers are independent:
+
+| Reviewers | Executor | Behavior |
+| --- | --- | --- |
+| selected | selected | delegated execution with the full review/correction loop |
+| none | selected | delegated execution returns `completed_unreviewed` |
+| selected | disabled | automatic parent review only |
+| none | disabled | settings remain available; both behaviors are off |
+
+Top-level `enabled: false` is the automatic-review master switch and does not
+disable an active executor. The environment kill switches disable the whole
+extension, including delegated execution.
+
+With an executor selected, the plugin exposes `execute_subtask`. The primary
+model supplies one bounded phase, its acceptance criteria, and optional context;
+the configured harness/model cannot be changed in tool arguments. Calls are
+serial. The primary model waits for the returned packet before planning the next
+phase. If review is enabled, the child receives corrections in its own session
+and is accepted only after reviewer pass followed by an unchanged child
+response. Child changes are checkpointed so an unchanged parent turn is not
+reviewed again; later parent edits remain parent-owned and follow the ordinary
+gate.
+
+If the parent has already edited the workspace during its active exchange,
+those edits are adopted as seed work for the delegated phase rather than
+blocking delegation. The child is told which paths it inherited, and review is
+still computed from the original parent baseline so inherited and child-authored
+changes receive the same gate treatment. A successful child checkpoints the
+combined result. A failed, timed-out, or cancelled child does not move the
+parent baseline, allowing a retry to adopt all surviving partial work or the
+ordinary parent gate to review it.
+
+Escape while the child is executing or being reviewed aborts that child flow.
+This is the "child Escape" behavior: it cancels only the active delegated
+operation, returns a `cancelled` failure packet, retains failure artifacts under
+the normal bundle policy, and never treats the partial work as accepted.
+
+While `execute_subtask` is active, its tool card shows the current lifecycle
+phase and elapsed time. Press Ctrl+O to expand a bounded live activity view with
+the executor model, artifact directory, recent native little-coder tool and test
+milestones, review cycle, reviewer models, and reviewer completion verdicts.
+Streaming activity updates are UI-only and are not copied into the controlling
+model's context; only the final subtask packet is returned as tool context.
+
+Pi/little-coder internal model selections use the exact canonical
+`provider/model` value and store a role-owned `thinkingLevel`. The allowed
+levels come from that scoped model's runtime metadata, including its
+`thinkingLevelMap`; unsupported extended levels such as `max` are not offered.
+These settings do not inherit the controlling session's thinking level. For
+example, the menu displays:
+
+```text
+gpt-5.6-sol [openai-codex]
+```
+
+and persists:
+
+```json
+{
+  "source": "little-coder",
+  "model": "openai-codex/gpt-5.6-sol",
+  "thinkingLevel": "high"
+}
+```
+
+For internal little-coder providers, review-gate also sets the independent
+thinking-budget cap to match Pi's level guidance: `minimal` is 1,024 tokens,
+`low` is 2,048, `medium` is 8,192, and `high` is 16,384. `xhigh` and `max` use
+the same 16,384-token ceiling because Pi does not define a larger numeric
+budget for those levels. The `anthropic`, `openai`, and `openai-codex`
+providers are excluded because Pi already gives them native token budgets or
+reasoning effort. A second output-side character estimate would duplicate that
+budget or cap a summary rather than the provider's hidden reasoning. Reviewer
+and executor selections remain separate from the orchestrator. External
+harnesses continue to configure reasoning through their role-specific arguments
+or environment.
+
+An end-to-end configuration example is available at
+`examples/delegated-execution.json`. `externalAgents` is one configured catalog
+shared by both menus. Each entry has an optional `review` role, `execution`
+role, or both. Role sections can override shared arguments, environment, model,
+protocol, and timeout, so one harness can use different limits for review and
+execution. Pi-scoped internal models remain runtime-discovered and are never
+copied into the external catalog.
+
+Reviewer selections use discriminated references:
+
+```json
+{
+  "review": {
+    "activeReviewers": [
+      { "source": "little-coder", "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high" },
+      { "source": "external", "id": "codex-sol" }
+    ]
+  }
+}
+```
+
+An internal model may use different reasoning for the two roles because the
+level lives on each selection. External harness reasoning remains native to the
+harness and is configured independently under `externalAgents[].review.args`
+and `externalAgents[].execution.args`. For example, a Codex CLI role can use
+`["-c", "model_reasoning_effort=\"high\""]`, while Claude Code can use
+`["--effort", "high"]`. Arbitrary binary adapters may use their own arguments
+or environment variables.
+
+Legacy `decider`, `reviewers`, `enabledReviewerIds`, and
+`execution.externalExecutors` configurations remain readable. A successful
+`/review-settings` save migrates their definitions into `externalAgents`.
+
+The `run-as-binary` adapter uses the versioned
+`pi-review-executor-jsonl-v1` protocol. It sends the prompt on stdin and sets
+`PI_REVIEW_EXECUTOR_OPERATION` (`start` or `resume`),
+`PI_REVIEW_EXECUTOR_SESSION_ID`, and `PI_REVIEW_EXECUTOR_PROTOCOL`. The process
+emits newline-delimited JSON:
+
+```jsonl
+{"type":"session","sessionId":"stable-session-id"}
+{"type":"assistant","text":"Implemented and verified the bounded phase."}
+{"type":"usage","usage":{"input_tokens":100,"output_tokens":25}}
+```
+
+The assistant event is required. The session event lets later correction and
+post-pass turns resume the same harness context. Authentication remains in each
+harness's own login/configuration; do not put OAuth tokens or API keys in the
+review-gate file.
+
 `implementationGuidanceAfterCorrectionAttempts` controls when every review path
 strengthens its request for concrete implementation guidance. The default is
 `1`: reviewer responses are implementation-ready from the start, and after one
 correction attempt the next automatic review, `/review-now`, or `/ask-reviewer`
 first verifies historical findings against the current workspace. For only
 those problems it independently confirms still remain, it explicitly requires
-a targeted code example, minimal diff, or exact actionable steps. Code examples
-stay inside the structured response's Markdown `guidance` field and are rendered
-under the review's Guidance section; the Summary, Issue, and Recommendation
-fields keep their existing formatted layout. The presence of prior feedback is
-not treated as proof that the correction failed. Set the value to `0` to apply
-this conditional verification and concrete-guidance requirement on the first
+a concise prose defense plus a concise, directly applicable implementation diff
+showing exactly what code the reviewer expects for the finding to pass. The diff
+may be as complete as necessary and does not have to be minimal. Genuinely
+non-code findings require exact actionable steps and a defense of why they are
+sufficient. This guidance stays inside the structured response's Markdown
+`guidance` field and is rendered under the review's Guidance section; the
+Summary, Issue, and Recommendation fields keep their existing formatted layout.
+The presence of prior feedback is not treated as proof that the correction
+failed. Set the value to `0` to apply this conditional verification and
+concrete-guidance requirement on the first
 review. There is no separate disabled value; use a threshold higher than the
 configured correction budget to prevent threshold escalation while retaining
 the normal implementation-ready prompt.
@@ -126,6 +288,19 @@ For little-coder specifically, the same built extension can be loaded with:
 PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json \
 little-coder -e /path/to/pi-review-gate/dist/src/index.js
 ```
+
+For normal use with the first existing fallback config, use the persistent
+launcher:
+
+```bash
+./scripts/little-coder-review-gate.sh
+```
+
+It builds and explicitly enables this extension, forwards all arguments to
+little-coder, and leaves config resolution on the established fallback order:
+`~/.config/pi-review-gate/config.json`, `~/.config/pi/review-gate.json`, then
+`~/.config/little-coder/review-gate.json`. It fails clearly if none exists and
+does not generate or rewrite configuration.
 
 A Codex-oriented starter config is available at:
 
@@ -155,8 +330,9 @@ reviewers.
 
 The little-coder model adapter is generic. The example currently uses
 `ollama/glm-5.2`, matching a provider/model entry from
-`~/.config/little-coder/models.json`. Review invocations use Pi's `high`
-thinking level by default; an explicit `args` entry can override it.
+`~/.config/little-coder/models.json`. Legacy internal selections without a
+`thinkingLevel` continue to use `high`; saving them through `/review-settings`
+materializes an explicit model-supported level.
 
 For little-coder plus Codex review, use:
 

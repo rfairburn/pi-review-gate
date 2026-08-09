@@ -1,0 +1,375 @@
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { normalizeConfig, type ReviewGateConfig } from "../src/config";
+import { registerReviewSettings } from "../src/settings/command";
+import { scopedModelChoices } from "../src/settings/models";
+
+test("/review-settings stages executor and reviewer changes and saves them together", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    customFutureKey: { keep: true },
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+    execution: {
+      activeExecutor: null,
+      externalExecutors: [{
+        id: "fake",
+        adapter: "run-as-binary",
+        protocol: "pi-review-executor-jsonl-v1",
+        command: process.execPath,
+      }],
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const selections = [
+    "Executor          Disabled",
+    "fake [run-as-binary]",
+    "Reviewers         1/2 selected",
+    "two [generic-cli] ✗",
+    "Back",
+    "Save changes",
+  ];
+
+  await registered.handler("", contextWithSelections(selections));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.execution.activeExecutor, { source: "external", id: "fake" });
+  assert.deepEqual(saved.review.activeReviewers, [
+    { source: "external", id: "one" },
+    { source: "external", id: "two" },
+  ]);
+  assert.deepEqual(saved.externalAgents.map((agent: { id: string }) => agent.id), ["fake", "one", "two"]);
+  assert.equal(saved.reviewers, undefined);
+  assert.equal(saved.enabledReviewerIds, undefined);
+  assert.deepEqual(saved.customFutureKey, { keep: true });
+  assert.deepEqual(config.execution?.activeExecutor, { source: "external", id: "fake" });
+});
+
+test("/review-settings clear-all saves a valid review-disabled configuration", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-empty-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    reviewers: [{ id: "one", adapter: "generic-cli", command: process.execPath }],
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Reviewers         1/1 selected",
+    "Clear all",
+    "Back",
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.review.activeReviewers, []);
+});
+
+test("root Escape leaves the settings file unchanged", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-cancel-"));
+  const configPath = join(dir, "review-gate.json");
+  const original = JSON.stringify({
+    enabled: true,
+    reviewers: [{ id: "one", adapter: "generic-cli", command: process.execPath }],
+  });
+  await writeFile(configPath, original, "utf8");
+  const config: ReviewGateConfig = normalizeConfig(JSON.parse(original));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Bundle retention  On failure",
+    "Always",
+    undefined,
+  ]));
+
+  assert.equal(await readFile(configPath, "utf8"), original);
+});
+
+test("internal executor uses the exact Pi model label and canonical value", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-model-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    enabledReviewerIds: [],
+    reviewers: [],
+    execution: { activeExecutor: null, externalExecutors: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Executor          Disabled",
+    "gpt-5.6-sol [openai-codex]",
+    "High  current",
+    "Save changes",
+  ], [{ model: reasoningModel("openai-codex", "gpt-5.6-sol") }]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.execution.activeExecutor, {
+    source: "little-coder",
+    model: "openai-codex/gpt-5.6-sol",
+    thinkingLevel: "high",
+  });
+});
+
+test("first settings save migrates a legacy decider into the shared external catalog", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-legacy-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    decider: {
+      id: "legacy",
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: ["legacy-reviewer.cjs"],
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections(["Save changes"]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.decider, undefined);
+  assert.deepEqual(saved.review.activeReviewers, [{ source: "external", id: "legacy" }]);
+  assert.deepEqual(saved.externalAgents, [{
+    id: "legacy",
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["legacy-reviewer.cjs"],
+      timeoutMs: 600000,
+      protocol: "pi-reviewer-json-v1",
+    },
+  }]);
+});
+
+test("reviewer picker includes scoped models and shared review-capable external agents", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-review-models-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "codex",
+      adapter: "codex-cli",
+      command: "codex",
+      review: { timeoutMs: 300000 },
+      execution: { timeoutMs: 1800000 },
+    }],
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Reviewers         0/2 selected — review disabled by master setting",
+    "gpt-5.6-sol [openai-codex] ✗",
+    "High  current",
+    "codex [codex-cli] ✗",
+    "Back",
+    "Save changes",
+  ], [{ model: reasoningModel("openai-codex", "gpt-5.6-sol") }]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.review.activeReviewers, [
+    { source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
+    { source: "external", id: "codex" },
+  ]);
+});
+
+test("review policy values are staged and saved atomically", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-policy-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    maxCorrectionCycles: 1,
+    implementationGuidanceAfterCorrectionAttempts: 1,
+    review: { activeReviewers: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Review policy     1 corrections · concrete after 1",
+    "Automatic correction attempts  1",
+    "Concrete guidance after        1",
+    "Back",
+    "Save changes",
+  ], [], ["4", "2"]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.maxCorrectionCycles, 4);
+  assert.equal(saved.implementationGuidanceAfterCorrectionAttempts, 2);
+});
+
+test("reviewer and executor timeouts are staged and saved together", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-timeouts-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    reviewerTimeoutMs: 600000,
+    executorTimeoutMs: 1800000,
+    review: { activeReviewers: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Timeouts          review 10m · executor 30m",
+    "Reviewer timeout               10m",
+    "Executor timeout               30m",
+    "Back",
+    "Save changes",
+  ], [], ["20", "90"]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.reviewerTimeoutMs, 1_200_000);
+  assert.equal(saved.executorTimeoutMs, 5_400_000);
+  assert.equal(config.reviewerTimeoutMs, 1_200_000);
+  assert.equal(config.executorTimeoutMs, 5_400_000);
+});
+
+test("bundle retention is staged and saved from review settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-retention-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    retainBundles: "on-failure",
+    review: { activeReviewers: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Bundle retention  On failure",
+    "Always",
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.retainBundles, "always");
+  assert.equal(config.retainBundles, "always");
+});
+
+test("internal executor and reviewers persist independent per-model reasoning levels", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-reasoning-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    execution: {
+      activeExecutor: { source: "little-coder", model: "openai-codex/gpt-5.6-luna" },
+    },
+    review: {
+      activeReviewers: [
+        { source: "little-coder", model: "openai-codex/gpt-5.6-luna" },
+        { source: "little-coder", model: "openai-codex/gpt-5.6-sol" },
+      ],
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [
+    { model: reasoningModel("openai-codex", "gpt-5.6-luna") },
+    { model: reasoningModel("openai-codex", "gpt-5.6-sol") },
+  ];
+
+  await registered.handler("", contextWithSelections([
+    "Executor          gpt-5.6-luna [openai-codex] · High",
+    "gpt-5.6-luna [openai-codex]  current",
+    "Max",
+    "Reviewers         2/2 selected",
+    "Reasoning · gpt-5.6-luna [openai-codex]  High",
+    "Max",
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.execution.activeExecutor, {
+    source: "little-coder",
+    model: "openai-codex/gpt-5.6-luna",
+    thinkingLevel: "max",
+  });
+  assert.deepEqual(saved.review.activeReviewers, [
+    { source: "little-coder", model: "openai-codex/gpt-5.6-luna", thinkingLevel: "max" },
+    { source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
+  ]);
+});
+
+test("scoped model reasoning choices omit unsupported extended levels", () => {
+  const [local] = scopedModelChoices({
+    scopedModels: [{ model: { provider: "llamacpp", id: "local", reasoning: true } }],
+  })!;
+  assert.deepEqual(local.supportedThinkingLevels, ["off", "minimal", "low", "medium", "high"]);
+});
+
+function commandHarness(): {
+  pi: { registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }): void };
+  handler: (args: string, ctx: unknown) => Promise<void>;
+} {
+  let handler: ((args: string, ctx: unknown) => unknown) | undefined;
+  return {
+    pi: {
+      registerCommand(name, options) {
+        if (name === "review-settings") handler = options.handler;
+      },
+    },
+    handler: async (args, ctx) => {
+      assert.ok(handler);
+      await handler(args, ctx);
+    },
+  };
+}
+
+function contextWithSelections(
+  values: Array<string | undefined>,
+  scopedModels: unknown[] = [],
+  inputs: Array<string | undefined> = [],
+): unknown {
+  let index = 0;
+  let inputIndex = 0;
+  return {
+    scopedModels,
+    ui: {
+      async select(_title: string, options: string[]) {
+        const value = values[index++];
+        if (value !== undefined) assert.ok(options.includes(value), `missing selection ${value}: ${options.join(" | ")}`);
+        return value;
+      },
+      async input() {
+        return inputs[inputIndex++];
+      },
+      notify() {},
+    },
+  };
+}
+
+function reasoningModel(provider: string, id: string): Record<string, unknown> {
+  return {
+    provider,
+    id,
+    reasoning: true,
+    thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+  };
+}

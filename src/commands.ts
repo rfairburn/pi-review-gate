@@ -1,4 +1,4 @@
-import type { ReviewGateConfig } from "./config";
+import { automaticReviewEnabled, resolveReviewers, type ReviewGateConfig } from "./config";
 import { join } from "node:path";
 import { removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
@@ -24,6 +24,7 @@ export interface RegisterCommandsInput {
   pi: unknown;
   cwd: () => string;
   config: ReviewGateConfig;
+  getConfig?: () => ReviewGateConfig;
   state: ReviewGateState;
   isSessionActive?: () => boolean;
   sessionSignal?: AbortSignal;
@@ -36,6 +37,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
     return;
   }
   const isSessionActive = input.isSessionActive ?? (() => true);
+  const currentConfig = () => input.getConfig?.() ?? input.config;
   const sendCommandNotice = (ctx: unknown, message: string): Promise<void> =>
     isSessionActive() ? sendNotice(ctx, message) : Promise.resolve();
 
@@ -45,7 +47,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       if (!isSessionActive()) {
         return;
       }
-      const reviewers = input.config.reviewers?.map((reviewer) => reviewer.id).join(", ") ?? input.config.decider?.id ?? "none";
+      const reviewers = resolveReviewers(currentConfig()).reviewers.map((reviewer) => reviewer.id).join(", ") || "none";
       await sendCommandNotice(ctx, `review gate: loaded; reviewers=${reviewers}; paused=${input.state.reviewsPaused}`);
     },
   });
@@ -97,7 +99,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       await Promise.all(windows.map((window) => removeTransientWindowBundle(window)));
       await sendCommandNotice(
         ctx,
-        `review gate: cleared; the next prompt will start fresh from the current workspace; bundle retention remains governed by retainBundles=${input.config.retainBundles}; reviewer sessions from the cleared window will not be reused`,
+        `review gate: cleared; the next prompt will start fresh from the current workspace; bundle retention remains governed by retainBundles=${currentConfig().retainBundles}; reviewer sessions from the cleared window will not be reused`,
       );
     },
   });
@@ -117,11 +119,16 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, "review gate: no active review window with a baseline");
         return;
       }
+      const reviewConfig = window.reviewConfig ?? currentConfig();
+      if (!automaticReviewEnabled(reviewConfig)) {
+        await sendCommandNotice(ctx, "review gate: automatic review is disabled by settings");
+        return;
+      }
       const output = await runReview({
         cwd: input.cwd(),
         request: buildRequestContext(input.state) || "Manual /review-now request",
         before: window.baseline,
-        config: input.config,
+        config: reviewConfig,
         evidence: window.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(window),
         window,
@@ -198,14 +205,15 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       const followUp = window.lastCappedFollowUp;
+      const reviewConfig = window.reviewConfig ?? currentConfig();
       const feedback = markCappedFeedbackSent(input.state);
       window.lastCappedFollowUp = undefined;
       window.correctionCycles = 0;
       armReviewResponseExchange(input.state, await createWorkspaceSnapshot(input.cwd(), {
-        maxFileBytes: input.config.maxFileBytes,
-        maxSnapshotBytes: input.config.maxSnapshotBytes,
+        maxFileBytes: reviewConfig.maxFileBytes,
+        maxSnapshotBytes: reviewConfig.maxSnapshotBytes,
       }));
-      await sendCommandNotice(ctx, `review gate: continuing review; correction budget reset to ${input.config.maxCorrectionCycles}`);
+      await sendCommandNotice(ctx, `review gate: continuing review; correction budget reset to ${reviewConfig.maxCorrectionCycles}`);
       if (isSessionActive()) {
         if (await sendFollowUp(input.pi, followUp) && feedback && window.bundleDir) {
           await writeReviewDeliveryReceipt(
@@ -227,6 +235,11 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, `review gate: reviews are paused; use /review-unpause before /${commandName}`);
         return;
       }
+      const currentReviewConfig = getReviewerQuestionWindow(input.state)?.reviewConfig ?? currentConfig();
+      if (!automaticReviewEnabled(currentReviewConfig)) {
+        await sendCommandNotice(ctx, `review gate: reviewer use is disabled by settings; use /review-settings before /${commandName}`);
+        return;
+      }
       const question = args.trim();
       if (!question) {
         await sendCommandNotice(ctx, `review gate: usage: /${commandName} <question>`);
@@ -239,12 +252,13 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       const contextWindow = getReviewerQuestionWindow(input.state);
+      const reviewConfig = contextWindow?.reviewConfig ?? currentConfig();
       const output = await runAskReviewer({
         cwd: input.cwd(),
         question,
         request: buildRequestContext(input.state, contextWindow),
         before: contextWindow?.baseline,
-        config: input.config,
+        config: reviewConfig,
         evidence: contextWindow?.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
         window: contextWindow,

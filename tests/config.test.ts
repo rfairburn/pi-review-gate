@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadConfig, normalizeConfig } from "../src/config";
+import { activeExternalExecutor, automaticReviewEnabled, loadConfig, normalizeConfig, resolveReviewers } from "../src/config";
 
 test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-config-"));
@@ -87,9 +87,11 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
     command: "codex",
     args: [],
     model: undefined,
-    timeoutMs: 300000,
+    timeoutMs: 600000,
   });
   assert.equal(codex.implementationGuidanceAfterCorrectionAttempts, 1);
+  assert.equal(codex.reviewerTimeoutMs, 600000);
+  assert.equal(codex.executorTimeoutMs, 1800000);
 
   const claude = normalizeConfig({
     enabled: true,
@@ -105,8 +107,34 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
     command: "claude",
     args: [],
     model: undefined,
-    timeoutMs: 300000,
+    timeoutMs: 600000,
   });
+});
+
+test("configured timeouts apply to internal models and unoverridden external roles", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    reviewerTimeoutMs: 900000,
+    executorTimeoutMs: 3600000,
+    review: {
+      activeReviewers: [
+        { source: "little-coder", model: "openai-codex/gpt-5.6-luna" },
+        { source: "external", id: "codex" },
+      ],
+    },
+    execution: { activeExecutor: { source: "external", id: "codex" } },
+    externalAgents: [{
+      id: "codex",
+      adapter: "codex-cli",
+      review: {},
+      execution: {},
+    }],
+  });
+
+  const reviewers = resolveReviewers(config, ["openai-codex/gpt-5.6-luna"]).reviewers;
+  assert.equal(reviewers[0]?.timeoutMs, 900000);
+  assert.equal(reviewers[1]?.timeoutMs, 900000);
+  assert.equal(activeExternalExecutor(config)?.timeoutMs, 3600000);
 });
 
 test("normalizeConfig validates implementation guidance escalation thresholds", () => {
@@ -138,6 +166,7 @@ test("normalizeConfig keeps little-coder model selection generic", () => {
       id: "glm",
       adapter: "little-coder-model",
       model: "ollama/glm-5.2",
+      thinkingLevel: "medium",
     },
   });
 
@@ -147,8 +176,22 @@ test("normalizeConfig keeps little-coder model selection generic", () => {
     command: "little-coder",
     args: [],
     model: "ollama/glm-5.2",
-    timeoutMs: 300000,
+    thinkingLevel: "medium",
+    timeoutMs: 600000,
   });
+});
+
+test("normalizeConfig rejects unsupported internal thinking levels", () => {
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    review: {
+      activeReviewers: [{
+        source: "little-coder",
+        model: "openai-codex/gpt-5.6-sol",
+        thinkingLevel: "ultra",
+      }],
+    },
+  }), /thinkingLevel must be one of/);
 });
 
 test("normalizeConfig supports multiple reviewers without legacy decider", () => {
@@ -219,4 +262,122 @@ test("normalizeConfig rejects path-reserved reviewer ids", () => {
       /reviewer id may contain only letters, numbers, underscores, periods, and hyphens/,
     );
   }
+});
+
+test("normalizeConfig permits zero enabled reviewers as an explicit review opt-out", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: [],
+    reviewers: [{ id: "codex", adapter: "codex-cli" }],
+  });
+
+  assert.deepEqual(resolveReviewers(config).reviewers, []);
+  assert.equal(automaticReviewEnabled(config), false);
+});
+
+test("resolveReviewers filters the catalog in stable config order", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["third", "first"],
+    reviewers: [
+      { id: "first", adapter: "codex-cli" },
+      { id: "second", adapter: "claude-cli" },
+      { id: "third", adapter: "generic-cli", command: "review" },
+    ],
+  });
+
+  assert.deepEqual(resolveReviewers(config).reviewers.map((reviewer) => reviewer.id), ["first", "third"]);
+  assert.equal(automaticReviewEnabled(config), true);
+});
+
+test("normalizeConfig preserves internal and external executor selections", () => {
+  const internal = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: [],
+    execution: {
+      activeExecutor: { source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
+      externalExecutors: [
+        { id: "codex", adapter: "codex-cli", command: "codex", model: "gpt-5.6-sol" },
+        {
+          id: "fake",
+          adapter: "run-as-binary",
+          protocol: "pi-review-executor-jsonl-v1",
+          command: "fake-agent",
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(internal.execution?.activeExecutor, {
+    source: "little-coder",
+    model: "openai-codex/gpt-5.6-sol",
+    thinkingLevel: "high",
+  });
+  assert.deepEqual(internal.execution?.externalExecutors?.map((executor) => executor.id), ["codex", "fake"]);
+});
+
+test("resolveReviewers reports stale and duplicate enabled ids without rejecting config loading", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["codex", "missing", "codex"],
+    reviewers: [{ id: "codex", adapter: "codex-cli" }],
+  });
+  const resolution = resolveReviewers(config);
+
+  assert.deepEqual(resolution.unknownIds, ["missing"]);
+  assert.deepEqual(resolution.duplicateEnabledIds, ["codex"]);
+  assert.equal(automaticReviewEnabled(config), false);
+});
+
+test("shared external agents resolve independently for review and execution", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [{ source: "external", id: "codex" }] },
+    externalAgents: [{
+      id: "codex",
+      adapter: "codex-cli",
+      command: "codex",
+      model: "base-model",
+      review: { model: "review-model", timeoutMs: 300000, args: ["--review"] },
+      execution: { model: "execution-model", timeoutMs: 1800000, args: ["--execute"] },
+    }],
+    execution: { activeExecutor: { source: "external", id: "codex" } },
+  });
+
+  assert.deepEqual(resolveReviewers(config).reviewers[0], {
+    id: "codex",
+    adapter: "codex-cli",
+    command: "codex",
+    args: ["--review"],
+    env: {},
+    model: "review-model",
+    timeoutMs: 300000,
+  });
+  assert.deepEqual(activeExternalExecutor(config), {
+    id: "codex",
+    adapter: "codex-cli",
+    command: "codex",
+    args: ["--execute"],
+    env: {},
+    model: "execution-model",
+    timeoutMs: 1800000,
+  });
+});
+
+test("scoped little-coder models resolve as reviewers only when currently available", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    review: {
+      activeReviewers: [{ source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "max" }],
+    },
+  });
+
+  assert.equal(automaticReviewEnabled(config), false);
+  assert.deepEqual(resolveReviewers(config).unknownIds, ["little-coder:openai-codex/gpt-5.6-sol"]);
+  const resolved = resolveReviewers(config, ["openai-codex/gpt-5.6-sol"]);
+  assert.equal(resolved.unknownIds.length, 0);
+  assert.equal(resolved.reviewers[0]?.adapter, "little-coder-model");
+  assert.equal("model" in resolved.reviewers[0]! ? resolved.reviewers[0].model : undefined, "openai-codex/gpt-5.6-sol");
+  assert.equal("thinkingLevel" in resolved.reviewers[0]! ? resolved.reviewers[0].thinkingLevel : undefined, "max");
+  assert.equal(automaticReviewEnabled(config, ["openai-codex/gpt-5.6-sol"]), true);
 });

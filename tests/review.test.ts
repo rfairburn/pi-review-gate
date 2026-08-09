@@ -6,11 +6,25 @@ import test from "node:test";
 import type { ReviewGateConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { createEvidenceState, recordAcceptedReviewerQuestion, recordToolCallEvidence } from "../src/evidence";
-import { runAskReviewer, runReview } from "../src/review";
+import { reviewerDisplayLabel, runAskReviewer, runReview } from "../src/review";
 import { beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
 import { fakeNeedsChangesConfig } from "./helpers";
 
 const baseConfig = fakeNeedsChangesConfig({ maxCorrectionCycles: 1 });
+
+test("reviewerDisplayLabel shows models instead of encoded internal reviewer ids", () => {
+  assert.equal(reviewerDisplayLabel({
+    id: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+    adapter: "little-coder-model",
+    model: "openai-codex/gpt-5.6-luna",
+    thinkingLevel: "max",
+  }), "openai-codex/gpt-5.6-luna (max)");
+  assert.equal(reviewerDisplayLabel({
+    id: "codex-luna",
+    adapter: "codex-cli",
+    model: "gpt-5.6-luna",
+  }), "codex-luna [codex-cli/gpt-5.6-luna]");
+});
 
 test("runReview returns blocking findings", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-"));
@@ -539,7 +553,9 @@ test("correction-attempt escalation reaches automatic and question review prompt
             "process.stdin.on('data',c=>s+=c);",
             "process.stdin.on('end',()=>{",
             "const ok=s.includes('Concrete-guidance escalation is active: 1 correction attempt(s) have occurred, meeting the configured threshold of 1')",
-            "&&s.includes('MUST put a concise fenced code snippet or minimal diff in \\\"guidance\\\"')",
+            "&&s.includes('concise prose that explains and defends the proposed correction')",
+            "&&s.includes('concise fenced implementation diff showing exactly what code you expect to see for that finding to pass')",
+            "&&s.includes('the diff does not have to be minimal')",
             "&&s.includes('rendered under the formatted Guidance section');",
             "process.stdout.write(JSON.stringify(ok",
             "?{verdict:'pass',summary:'escalation visible',findings:[]}",

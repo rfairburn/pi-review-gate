@@ -3,12 +3,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export type RetainBundles = "never" | "on-failure" | "always";
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = typeof THINKING_LEVELS[number];
 
 export interface GenericCliDeciderConfig {
   id: string;
   adapter: "generic-cli";
   command: string;
   args?: string[];
+  env?: Record<string, string>;
   timeoutMs?: number;
 }
 
@@ -17,6 +20,7 @@ export interface CodexCliDeciderConfig {
   adapter: "codex-cli";
   command?: string;
   args?: string[];
+  env?: Record<string, string>;
   model?: string;
   timeoutMs?: number;
 }
@@ -26,6 +30,7 @@ export interface ClaudeCliDeciderConfig {
   adapter: "claude-cli";
   command?: string;
   args?: string[];
+  env?: Record<string, string>;
   model?: string;
   timeoutMs?: number;
 }
@@ -34,15 +39,84 @@ export interface LittleCoderDeciderConfig {
   id: string;
   adapter: "little-coder-model";
   model: string;
+  thinkingLevel?: ThinkingLevel;
   command?: string;
   args?: string[];
+  env?: Record<string, string>;
   timeoutMs?: number;
 }
 
 export type DeciderConfig = GenericCliDeciderConfig | CodexCliDeciderConfig | ClaudeCliDeciderConfig | LittleCoderDeciderConfig;
 
+export type ActiveExecutorSelection =
+  | { source: "little-coder"; model: string; thinkingLevel?: ThinkingLevel }
+  | { source: "external"; id: string }
+  | null;
+
+interface ExternalExecutorBase {
+  id: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  timeoutMs?: number;
+}
+
+export interface CodexExecutorConfig extends ExternalExecutorBase {
+  adapter: "codex-cli";
+  model?: string;
+}
+
+export interface ClaudeExecutorConfig extends ExternalExecutorBase {
+  adapter: "claude-cli";
+  model?: string;
+}
+
+export interface RunAsBinaryExecutorConfig extends ExternalExecutorBase {
+  adapter: "run-as-binary";
+  protocol: "pi-review-executor-jsonl-v1";
+  command: string;
+}
+
+export type ExternalExecutorConfig = CodexExecutorConfig | ClaudeExecutorConfig | RunAsBinaryExecutorConfig;
+
+export type ExternalAgentAdapter = "codex-cli" | "claude-cli" | "generic-cli" | "run-as-binary";
+
+export interface ExternalAgentRoleConfig {
+  args?: string[];
+  env?: Record<string, string>;
+  model?: string;
+  timeoutMs?: number;
+  protocol?: "pi-review-executor-jsonl-v1" | "pi-reviewer-json-v1";
+}
+
+export interface ExternalAgentConfig {
+  id: string;
+  adapter: ExternalAgentAdapter;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  model?: string;
+  review?: ExternalAgentRoleConfig;
+  execution?: ExternalAgentRoleConfig;
+}
+
+export type ActiveReviewerSelection =
+  | { source: "little-coder"; model: string; thinkingLevel?: ThinkingLevel }
+  | { source: "external"; id: string };
+
+export interface ReviewSelectionConfig {
+  activeReviewers?: ActiveReviewerSelection[];
+}
+
+export interface ExecutionConfig {
+  activeExecutor?: ActiveExecutorSelection;
+  externalExecutors?: ExternalExecutorConfig[];
+}
+
 export interface ReviewGateConfig {
   enabled: boolean;
+  reviewerTimeoutMs: number;
+  executorTimeoutMs: number;
   maxCorrectionCycles: number;
   implementationGuidanceAfterCorrectionAttempts: number;
   maxPatchBytes: number;
@@ -51,16 +125,23 @@ export interface ReviewGateConfig {
   retainBundles: RetainBundles;
   decider?: DeciderConfig;
   reviewers?: DeciderConfig[];
+  enabledReviewerIds?: string[];
+  review?: ReviewSelectionConfig;
+  externalAgents?: ExternalAgentConfig[];
+  execution?: ExecutionConfig;
 }
 
 export interface LoadedConfig {
   config: ReviewGateConfig;
   path?: string;
   disabledReason?: string;
+  globallyDisabled?: boolean;
 }
 
 export const DEFAULT_CONFIG: ReviewGateConfig = {
   enabled: true,
+  reviewerTimeoutMs: 600_000,
+  executorTimeoutMs: 1_800_000,
   maxCorrectionCycles: 1,
   implementationGuidanceAfterCorrectionAttempts: 1,
   maxPatchBytes: 200_000,
@@ -69,7 +150,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   retainBundles: "on-failure",
 };
 
-const DEFAULT_REVIEWER_TIMEOUT_MS = 300_000;
+const DEFAULT_REVIEWER_TIMEOUT_MS = 600_000;
 const REVIEWER_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
@@ -78,6 +159,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     return {
       config: { ...DEFAULT_CONFIG, enabled: false },
       disabledReason: `${disabledVar} is set`,
+      globallyDisabled: true,
     };
   }
 
@@ -102,10 +184,14 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     throw new Error("review gate config must be a JSON object");
   }
 
+  const reviewerTimeoutMs = numberOrDefault(value.reviewerTimeoutMs, DEFAULT_CONFIG.reviewerTimeoutMs);
+  const executorTimeoutMs = numberOrDefault(value.executorTimeoutMs, DEFAULT_CONFIG.executorTimeoutMs);
   const config: ReviewGateConfig = {
     ...DEFAULT_CONFIG,
     enabled: value.enabled === undefined ? DEFAULT_CONFIG.enabled : Boolean(value.enabled),
-    maxCorrectionCycles: numberOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles),
+    reviewerTimeoutMs,
+    executorTimeoutMs,
+    maxCorrectionCycles: nonNegativeIntegerOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles),
     implementationGuidanceAfterCorrectionAttempts: nonNegativeIntegerOrDefault(
       value.implementationGuidanceAfterCorrectionAttempts,
       DEFAULT_CONFIG.implementationGuidanceAfterCorrectionAttempts,
@@ -114,19 +200,125 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     maxFileBytes: numberOrDefault(value.maxFileBytes, DEFAULT_CONFIG.maxFileBytes),
     maxSnapshotBytes: numberOrDefault(value.maxSnapshotBytes, DEFAULT_CONFIG.maxSnapshotBytes),
     retainBundles: normalizeRetainBundles(value.retainBundles),
-    decider: value.decider === undefined ? undefined : normalizeDecider(value.decider),
-    reviewers: Array.isArray(value.reviewers) ? value.reviewers.map(normalizeDecider) : undefined,
+    decider: value.decider === undefined ? undefined : normalizeDecider(value.decider, reviewerTimeoutMs),
+    reviewers: Array.isArray(value.reviewers) ? value.reviewers.map((reviewer) => normalizeDecider(reviewer, reviewerTimeoutMs)) : undefined,
+    enabledReviewerIds: value.enabledReviewerIds === undefined
+      ? undefined
+      : normalizeIdList(value.enabledReviewerIds, "enabledReviewerIds"),
+    review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
+    externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
+    execution: value.execution === undefined ? undefined : normalizeExecution(value.execution, executorTimeoutMs),
   };
 
   if (config.reviewers) {
     validateUniqueReviewerIds(config.reviewers);
   }
 
-  if (config.enabled && !config.decider && (!config.reviewers || config.reviewers.length === 0)) {
-    throw new Error("enabled review gate config requires decider or reviewers");
-  }
-
   return config;
+}
+
+export interface ReviewerResolution {
+  reviewers: DeciderConfig[];
+  unknownIds: string[];
+  duplicateEnabledIds: string[];
+}
+
+export function resolveReviewers(config: ReviewGateConfig, scopedModels: string[] = []): ReviewerResolution {
+  if (config.review?.activeReviewers !== undefined) {
+    return resolveSelectedReviewers(config, scopedModels);
+  }
+  const catalog = config.reviewers && config.reviewers.length > 0
+    ? config.reviewers
+    : config.decider
+      ? [config.decider]
+      : [];
+  const selected = config.enabledReviewerIds ?? catalog.map((reviewer) => reviewer.id);
+  const counts = new Map<string, number>();
+  for (const id of selected) {
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  const selectedSet = new Set(selected);
+  const catalogIds = new Set(catalog.map((reviewer) => reviewer.id));
+  return {
+    reviewers: catalog.filter((reviewer) => selectedSet.has(reviewer.id)),
+    unknownIds: [...selectedSet].filter((id) => !catalogIds.has(id)),
+    duplicateEnabledIds: [...counts].filter(([, count]) => count > 1).map(([id]) => id),
+  };
+}
+
+export function automaticReviewEnabled(config: ReviewGateConfig, scopedModels: string[] = []): boolean {
+  const resolved = resolveReviewers(config, scopedModels);
+  return config.enabled && resolved.reviewers.length > 0
+    && resolved.unknownIds.length === 0
+    && resolved.duplicateEnabledIds.length === 0;
+}
+
+export function configWithReviewers(config: ReviewGateConfig, reviewers: DeciderConfig[], enabled: boolean): ReviewGateConfig {
+  return {
+    ...config,
+    enabled,
+    review: undefined,
+    decider: undefined,
+    reviewers: reviewers.map(cloneDecider),
+    enabledReviewerIds: reviewers.map((reviewer) => reviewer.id),
+  };
+}
+
+export function materializeReviewConfig(config: ReviewGateConfig, scopedModels: string[]): ReviewGateConfig {
+  const resolution = resolveReviewers(config, scopedModels);
+  return configWithReviewers(
+    config,
+    resolution.reviewers,
+    config.enabled && resolution.reviewers.length > 0
+      && resolution.unknownIds.length === 0
+      && resolution.duplicateEnabledIds.length === 0,
+  );
+}
+
+export function activeExternalExecutor(config: ReviewGateConfig): ExternalExecutorConfig | undefined {
+  const active = config.execution?.activeExecutor;
+  if (active?.source !== "external") return undefined;
+  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === active.id);
+  return agent ? executorFromExternalAgent(agent, config.executorTimeoutMs) : undefined;
+}
+
+export function externalAgentCatalog(config: ReviewGateConfig): ExternalAgentConfig[] {
+  const agents = (config.externalAgents ?? []).map(cloneExternalAgent);
+  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+  for (const executor of config.execution?.externalExecutors ?? []) {
+    const existing = byId.get(executor.id);
+    if (existing) continue;
+    const agent = externalAgentFromLegacyExecutor(executor);
+    agents.push(agent);
+    byId.set(agent.id, agent);
+  }
+  const legacyReviewers = config.reviewers?.length ? config.reviewers : config.decider ? [config.decider] : [];
+  for (const reviewer of legacyReviewers) {
+    if (reviewer.adapter === "little-coder-model") continue;
+    const existing = byId.get(reviewer.id);
+    if (existing && existing.adapter === reviewer.adapter) {
+      existing.review ??= roleFromLegacyReviewer(reviewer);
+      continue;
+    }
+    if (!existing) {
+      const agent = externalAgentFromLegacyReviewer(reviewer);
+      agents.push(agent);
+      byId.set(agent.id, agent);
+    }
+  }
+  return agents;
+}
+
+export function externalAgentSupportsReview(agent: ExternalAgentConfig): boolean {
+  return agent.review !== undefined;
+}
+
+export function externalAgentSupportsExecution(agent: ExternalAgentConfig): boolean {
+  return agent.execution !== undefined && agent.adapter !== "generic-cli";
+}
+
+export function internalReviewerId(model: string): string {
+  return `little-coder-${Buffer.from(model).toString("base64url")}`;
 }
 
 function findConfigPath(env: NodeJS.ProcessEnv): string | undefined {
@@ -145,7 +337,7 @@ function findConfigPath(env: NodeJS.ProcessEnv): string | undefined {
   return candidates.find((candidate) => existsSync(candidate));
 }
 
-function normalizeDecider(value: unknown): DeciderConfig {
+function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TIMEOUT_MS): DeciderConfig {
   if (!isRecord(value)) {
     throw new Error("decider must be an object");
   }
@@ -159,52 +351,496 @@ function normalizeDecider(value: unknown): DeciderConfig {
     if (typeof value.command !== "string" || !value.command.trim()) {
       throw new Error("generic-cli decider requires command");
     }
+    const env = normalizeStringRecord(value.env, "generic-cli reviewer env");
     return {
       id: value.id,
       adapter: "generic-cli",
       command: value.command,
       args: Array.isArray(value.args) ? value.args.map(String) : [],
-      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
+      ...(env ? { env } : {}),
+      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
     };
   }
   if (value.adapter === "codex-cli") {
+    const env = normalizeStringRecord(value.env, "codex reviewer env");
     return {
       id: value.id,
       adapter: "codex-cli",
       command: typeof value.command === "string" ? value.command : "codex",
       args: Array.isArray(value.args) ? value.args.map(String) : [],
+      ...(env ? { env } : {}),
       model: typeof value.model === "string" ? value.model : undefined,
-      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
+      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
     };
   }
   if (value.adapter === "claude-cli") {
+    const env = normalizeStringRecord(value.env, "claude reviewer env");
     return {
       id: value.id,
       adapter: "claude-cli",
       command: typeof value.command === "string" ? value.command : "claude",
       args: Array.isArray(value.args) ? value.args.map(String) : [],
+      ...(env ? { env } : {}),
       model: typeof value.model === "string" ? value.model : undefined,
-      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
+      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
     };
   }
   if (value.adapter === "little-coder-model") {
     if (typeof value.model !== "string" || !value.model.trim()) {
       throw new Error("little-coder-model decider requires model");
     }
+    const env = normalizeStringRecord(value.env, "little-coder reviewer env");
+    const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "little-coder reviewer thinkingLevel");
     return {
       id: value.id,
       adapter: "little-coder-model",
       model: value.model,
+      ...(thinkingLevel ? { thinkingLevel } : {}),
       command: typeof value.command === "string" ? value.command : "little-coder",
       args: Array.isArray(value.args) ? value.args.map(String) : [],
-      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
+      ...(env ? { env } : {}),
+      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
     };
   }
   throw new Error("unsupported decider adapter");
 }
 
+function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {
+  if (!isRecord(value)) {
+    throw new Error("review must be an object");
+  }
+  return {
+    activeReviewers: value.activeReviewers === undefined
+      ? undefined
+      : normalizeActiveReviewers(value.activeReviewers),
+  };
+}
+
+function normalizeActiveReviewers(value: unknown): ActiveReviewerSelection[] {
+  if (!Array.isArray(value)) {
+    throw new Error("review.activeReviewers must be an array");
+  }
+  return value.map((selection) => {
+    if (!isRecord(selection)) {
+      throw new Error("review.activeReviewers entries must be objects");
+    }
+    if (selection.source === "little-coder") {
+      if (typeof selection.model !== "string" || !selection.model.trim()) {
+        throw new Error("little-coder reviewer selection requires model");
+      }
+      const thinkingLevel = normalizeOptionalThinkingLevel(selection.thinkingLevel, "little-coder reviewer thinkingLevel");
+      return {
+        source: "little-coder",
+        model: selection.model.trim(),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+      };
+    }
+    if (selection.source === "external") {
+      if (typeof selection.id !== "string" || !selection.id.trim()) {
+        throw new Error("external reviewer selection requires id");
+      }
+      validateConfiguredId(selection.id, "external reviewer");
+      return { source: "external", id: selection.id };
+    }
+    throw new Error("unsupported review.activeReviewers source");
+  });
+}
+
+function normalizeExternalAgents(value: unknown): ExternalAgentConfig[] {
+  if (!Array.isArray(value)) {
+    throw new Error("externalAgents must be an array");
+  }
+  const agents = value.map(normalizeExternalAgent);
+  validateUniqueConfiguredIds(agents, "external agent");
+  return agents;
+}
+
+function normalizeExternalAgent(value: unknown): ExternalAgentConfig {
+  if (!isRecord(value)) {
+    throw new Error("external agent must be an object");
+  }
+  if (typeof value.id !== "string" || !value.id.trim()) {
+    throw new Error("external agent requires id");
+  }
+  validateConfiguredId(value.id, "external agent");
+  if (!["codex-cli", "claude-cli", "generic-cli", "run-as-binary"].includes(String(value.adapter))) {
+    throw new Error("unsupported external agent adapter");
+  }
+  const adapter = value.adapter as ExternalAgentAdapter;
+  const command = typeof value.command === "string" && value.command.trim()
+    ? value.command
+    : adapter === "codex-cli" ? "codex" : adapter === "claude-cli" ? "claude" : undefined;
+  if (!command) {
+    throw new Error(`${adapter} external agent requires command`);
+  }
+  const review = normalizeExternalAgentRole(value.review, "review");
+  const execution = normalizeExternalAgentRole(value.execution, "execution");
+  if (!review && !execution) {
+    throw new Error(`external agent requires review or execution role: ${value.id}`);
+  }
+  if (adapter === "generic-cli" && execution) {
+    throw new Error("generic-cli external agents support only the review role");
+  }
+  if (adapter === "run-as-binary") {
+    if (execution?.protocol !== "pi-review-executor-jsonl-v1") {
+      if (execution) throw new Error("run-as-binary execution role requires protocol pi-review-executor-jsonl-v1");
+    }
+    if (review?.protocol !== "pi-reviewer-json-v1") {
+      if (review) throw new Error("run-as-binary review role requires protocol pi-reviewer-json-v1");
+    }
+  }
+  return {
+    id: value.id,
+    adapter,
+    command,
+    args: Array.isArray(value.args) ? value.args.map(String) : [],
+    env: normalizeStringRecord(value.env, "external agent env"),
+    model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
+    review,
+    execution,
+  };
+}
+
+function normalizeExternalAgentRole(value: unknown, role: "review" | "execution"): ExternalAgentRoleConfig | undefined {
+  if (value === undefined || value === false) return undefined;
+  if (!isRecord(value)) {
+    throw new Error(`external agent ${role} role must be an object`);
+  }
+  const protocol = value.protocol === "pi-review-executor-jsonl-v1" || value.protocol === "pi-reviewer-json-v1"
+    ? value.protocol
+    : undefined;
+  if (value.protocol !== undefined && !protocol) {
+    throw new Error(`unsupported external agent ${role} protocol`);
+  }
+  return {
+    args: Array.isArray(value.args) ? value.args.map(String) : [],
+    env: normalizeStringRecord(value.env, `external agent ${role} env`),
+    model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
+    ...(value.timeoutMs === undefined ? {} : {
+      timeoutMs: nonNegativeIntegerOrDefault(
+        value.timeoutMs,
+        role === "review" ? DEFAULT_REVIEWER_TIMEOUT_MS : DEFAULT_CONFIG.executorTimeoutMs,
+      ),
+    }),
+    protocol,
+  };
+}
+
+function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.executorTimeoutMs): ExecutionConfig {
+  if (!isRecord(value)) {
+    throw new Error("execution must be an object");
+  }
+  const activeExecutor = value.activeExecutor === undefined
+    ? undefined
+    : normalizeActiveExecutor(value.activeExecutor);
+  const externalExecutors = value.externalExecutors === undefined
+    ? undefined
+    : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
+  return { activeExecutor, externalExecutors };
+}
+
+function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new Error("execution.activeExecutor must be an object or null");
+  }
+  if (value.source === "little-coder") {
+    if (typeof value.model !== "string" || !value.model.trim()) {
+      throw new Error("little-coder active executor requires model");
+    }
+    const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "little-coder executor thinkingLevel");
+    return {
+      source: "little-coder",
+      model: value.model.trim(),
+      ...(thinkingLevel ? { thinkingLevel } : {}),
+    };
+  }
+  if (value.source === "external") {
+    if (typeof value.id !== "string" || !value.id.trim()) {
+      throw new Error("external active executor requires id");
+    }
+    validateConfiguredId(value.id, "external executor");
+    return { source: "external", id: value.id };
+  }
+  throw new Error("unsupported execution.activeExecutor source");
+}
+
+function normalizeExternalExecutors(value: unknown, defaultTimeoutMs: number): ExternalExecutorConfig[] {
+  if (!Array.isArray(value)) {
+    throw new Error("execution.externalExecutors must be an array");
+  }
+  const executors = value.map((executor) => normalizeExternalExecutor(executor, defaultTimeoutMs));
+  validateUniqueConfiguredIds(executors, "external executor");
+  return executors;
+}
+
+function normalizeExternalExecutor(value: unknown, defaultTimeoutMs: number): ExternalExecutorConfig {
+  if (!isRecord(value)) {
+    throw new Error("external executor must be an object");
+  }
+  if (typeof value.id !== "string" || !value.id.trim()) {
+    throw new Error("external executor requires id");
+  }
+  validateConfiguredId(value.id, "external executor");
+  const common = {
+    id: value.id,
+    args: Array.isArray(value.args) ? value.args.map(String) : [],
+    env: normalizeStringRecord(value.env, "external executor env"),
+    timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
+  };
+  if (value.adapter === "codex-cli") {
+    return {
+      ...common,
+      adapter: "codex-cli",
+      command: typeof value.command === "string" && value.command.trim() ? value.command : "codex",
+      model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
+    };
+  }
+  if (value.adapter === "claude-cli") {
+    return {
+      ...common,
+      adapter: "claude-cli",
+      command: typeof value.command === "string" && value.command.trim() ? value.command : "claude",
+      model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
+    };
+  }
+  if (value.adapter === "run-as-binary") {
+    if (value.protocol !== "pi-review-executor-jsonl-v1") {
+      throw new Error("run-as-binary external executor requires protocol pi-review-executor-jsonl-v1");
+    }
+    if (typeof value.command !== "string" || !value.command.trim()) {
+      throw new Error("run-as-binary external executor requires command");
+    }
+    return {
+      ...common,
+      adapter: "run-as-binary",
+      protocol: "pi-review-executor-jsonl-v1",
+      command: value.command,
+    };
+  }
+  throw new Error("unsupported external executor adapter");
+}
+
+function resolveSelectedReviewers(config: ReviewGateConfig, scopedModels: string[]): ReviewerResolution {
+  const selections = config.review?.activeReviewers ?? [];
+  const scoped = new Set(scopedModels);
+  const agents = new Map(externalAgentCatalog(config).map((agent) => [agent.id, agent]));
+  const reviewers: DeciderConfig[] = [];
+  const unknownIds: string[] = [];
+  const counts = new Map<string, number>();
+  for (const selection of selections) {
+    const key = selection.source === "little-coder" ? `little-coder:${selection.model}` : `external:${selection.id}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (selection.source === "little-coder") {
+      if (!scoped.has(selection.model)) {
+        unknownIds.push(key);
+        continue;
+      }
+      reviewers.push({
+        id: internalReviewerId(selection.model),
+        adapter: "little-coder-model",
+        model: selection.model,
+        ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
+        command: "little-coder",
+        args: [],
+        timeoutMs: config.reviewerTimeoutMs,
+      });
+      continue;
+    }
+    const agent = agents.get(selection.id);
+    const reviewer = agent ? reviewerFromExternalAgent(agent, config.reviewerTimeoutMs) : undefined;
+    if (!reviewer) {
+      unknownIds.push(key);
+      continue;
+    }
+    reviewers.push(reviewer);
+  }
+  return {
+    reviewers,
+    unknownIds: [...new Set(unknownIds)],
+    duplicateEnabledIds: [...counts].filter(([, count]) => count > 1).map(([key]) => key),
+  };
+}
+
+function reviewerFromExternalAgent(agent: ExternalAgentConfig, defaultTimeoutMs: number): DeciderConfig | undefined {
+  const role = agent.review;
+  if (!role) return undefined;
+  const common = mergedAgentRole(agent, role, defaultTimeoutMs);
+  if (agent.adapter === "codex-cli") {
+    return { id: agent.id, adapter: "codex-cli", ...common, command: agent.command ?? "codex" };
+  }
+  if (agent.adapter === "claude-cli") {
+    return { id: agent.id, adapter: "claude-cli", ...common, command: agent.command ?? "claude" };
+  }
+  return {
+    id: agent.id,
+    adapter: "generic-cli",
+    command: agent.command!,
+    args: common.args,
+    env: {
+      ...common.env,
+      ...(agent.adapter === "run-as-binary" ? { PI_REVIEW_AGENT_PROTOCOL: "pi-reviewer-json-v1" } : {}),
+    },
+    timeoutMs: common.timeoutMs,
+  };
+}
+
+function executorFromExternalAgent(agent: ExternalAgentConfig, defaultTimeoutMs: number): ExternalExecutorConfig | undefined {
+  const role = agent.execution;
+  if (!role || agent.adapter === "generic-cli") return undefined;
+  const common = mergedAgentRole(agent, role, defaultTimeoutMs);
+  if (agent.adapter === "codex-cli") {
+    return { id: agent.id, adapter: "codex-cli", ...common, command: agent.command ?? "codex" };
+  }
+  if (agent.adapter === "claude-cli") {
+    return { id: agent.id, adapter: "claude-cli", ...common, command: agent.command ?? "claude" };
+  }
+  return {
+    id: agent.id,
+    adapter: "run-as-binary",
+    command: agent.command!,
+    args: common.args,
+    env: common.env,
+    timeoutMs: common.timeoutMs,
+    protocol: "pi-review-executor-jsonl-v1",
+  };
+}
+
+function mergedAgentRole(agent: ExternalAgentConfig, role: ExternalAgentRoleConfig, fallbackTimeout: number): {
+  args: string[];
+  env?: Record<string, string>;
+  model?: string;
+  timeoutMs: number;
+} {
+  return {
+    args: [...(agent.args ?? []), ...(role.args ?? [])],
+    env: { ...(agent.env ?? {}), ...(role.env ?? {}) },
+    model: role.model ?? agent.model,
+    timeoutMs: role.timeoutMs ?? fallbackTimeout,
+  };
+}
+
+function externalAgentFromLegacyExecutor(executor: ExternalExecutorConfig): ExternalAgentConfig {
+  return {
+    id: executor.id,
+    adapter: executor.adapter,
+    command: executor.command,
+    model: "model" in executor ? executor.model : undefined,
+    args: [],
+    env: undefined,
+    execution: {
+      args: executor.args ? [...executor.args] : [],
+      env: executor.env ? { ...executor.env } : undefined,
+      timeoutMs: executor.timeoutMs,
+      protocol: executor.adapter === "run-as-binary" ? executor.protocol : undefined,
+    },
+  };
+}
+
+function externalAgentFromLegacyReviewer(reviewer: Exclude<DeciderConfig, LittleCoderDeciderConfig>): ExternalAgentConfig {
+  return {
+    id: reviewer.id,
+    adapter: reviewer.adapter,
+    command: reviewer.command,
+    model: "model" in reviewer ? reviewer.model : undefined,
+    args: [],
+    env: undefined,
+    review: roleFromLegacyReviewer(reviewer),
+  };
+}
+
+function roleFromLegacyReviewer(reviewer: DeciderConfig): ExternalAgentRoleConfig {
+  return {
+    args: reviewer.args ? [...reviewer.args] : [],
+    env: reviewer.env ? { ...reviewer.env } : undefined,
+    model: "model" in reviewer ? reviewer.model : undefined,
+    timeoutMs: reviewer.timeoutMs,
+    protocol: reviewer.adapter === "generic-cli" ? "pi-reviewer-json-v1" : undefined,
+  };
+}
+
+function cloneExternalAgent(agent: ExternalAgentConfig): ExternalAgentConfig {
+  return {
+    ...agent,
+    args: agent.args ? [...agent.args] : undefined,
+    env: agent.env ? { ...agent.env } : undefined,
+    review: agent.review ? {
+      ...agent.review,
+      args: agent.review.args ? [...agent.review.args] : undefined,
+      env: agent.review.env ? { ...agent.review.env } : undefined,
+    } : undefined,
+    execution: agent.execution ? {
+      ...agent.execution,
+      args: agent.execution.args ? [...agent.execution.args] : undefined,
+      env: agent.execution.env ? { ...agent.execution.env } : undefined,
+    } : undefined,
+  };
+}
+
+function normalizeIdList(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${field} must be an array`);
+  }
+  return value.map((item) => {
+    if (typeof item !== "string" || !item.trim()) {
+      throw new Error(`${field} entries must be non-empty strings`);
+    }
+    validateConfiguredId(item, field);
+    return item;
+  });
+}
+
+function normalizeStringRecord(value: unknown, field: string): Record<string, string> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+    if (typeof item !== "string") {
+      throw new Error(`${field} values must be strings`);
+    }
+    return [key, item];
+  }));
+}
+
+function validateConfiguredId(id: string, label: string): void {
+  if (!REVIEWER_ID_PATTERN.test(id) || id === "." || id === "..") {
+    throw new Error(`${label} id may contain only letters, numbers, underscores, periods, and hyphens`);
+  }
+}
+
+function validateUniqueConfiguredIds(values: Array<{ id: string }>, label: string): void {
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value.id)) {
+      throw new Error(`${label} id must be unique: ${value.id}`);
+    }
+    seen.add(value.id);
+  }
+}
+
+function cloneDecider(decider: DeciderConfig): DeciderConfig {
+  return {
+    ...decider,
+    args: decider.args ? [...decider.args] : undefined,
+    env: decider.env ? { ...decider.env } : undefined,
+  };
+}
+
 function normalizeRetainBundles(value: unknown): RetainBundles {
   return value === "never" || value === "always" || value === "on-failure" ? value : DEFAULT_CONFIG.retainBundles;
+}
+
+function normalizeOptionalThinkingLevel(value: unknown, field: string): ThinkingLevel | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value)) {
+    return value as ThinkingLevel;
+  }
+  throw new Error(`${field} must be one of: ${THINKING_LEVELS.join(", ")}`);
 }
 
 function validateUniqueReviewerIds(reviewers: DeciderConfig[]): void {

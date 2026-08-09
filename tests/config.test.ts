@@ -87,9 +87,11 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
     command: "codex",
     args: [],
     model: undefined,
-    timeoutMs: 300000,
+    timeoutMs: 600000,
   });
   assert.equal(codex.implementationGuidanceAfterCorrectionAttempts, 1);
+  assert.equal(codex.reviewerTimeoutMs, 600000);
+  assert.equal(codex.executorTimeoutMs, 1800000);
 
   const claude = normalizeConfig({
     enabled: true,
@@ -105,8 +107,34 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
     command: "claude",
     args: [],
     model: undefined,
-    timeoutMs: 300000,
+    timeoutMs: 600000,
   });
+});
+
+test("configured timeouts apply to internal models and unoverridden external roles", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    reviewerTimeoutMs: 900000,
+    executorTimeoutMs: 3600000,
+    review: {
+      activeReviewers: [
+        { source: "little-coder", model: "openai-codex/gpt-5.6-luna" },
+        { source: "external", id: "codex" },
+      ],
+    },
+    execution: { activeExecutor: { source: "external", id: "codex" } },
+    externalAgents: [{
+      id: "codex",
+      adapter: "codex-cli",
+      review: {},
+      execution: {},
+    }],
+  });
+
+  const reviewers = resolveReviewers(config, ["openai-codex/gpt-5.6-luna"]).reviewers;
+  assert.equal(reviewers[0]?.timeoutMs, 900000);
+  assert.equal(reviewers[1]?.timeoutMs, 900000);
+  assert.equal(activeExternalExecutor(config)?.timeoutMs, 3600000);
 });
 
 test("normalizeConfig validates implementation guidance escalation thresholds", () => {
@@ -149,7 +177,7 @@ test("normalizeConfig keeps little-coder model selection generic", () => {
     args: [],
     model: "ollama/glm-5.2",
     thinkingLevel: "medium",
-    timeoutMs: 300000,
+    timeoutMs: 600000,
   });
 });
 

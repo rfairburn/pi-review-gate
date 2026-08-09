@@ -33,6 +33,8 @@ Example config using Codex as the reviewer:
 ```json
 {
   "enabled": true,
+  "reviewerTimeoutMs": 600000,
+  "executorTimeoutMs": 1800000,
   "maxCorrectionCycles": 3,
   "implementationGuidanceAfterCorrectionAttempts": 1,
   "maxPatchBytes": 200000,
@@ -42,7 +44,7 @@ Example config using Codex as the reviewer:
   "decider": {
     "id": "codex",
     "adapter": "codex-cli",
-    "timeoutMs": 300000
+    "timeoutMs": 600000
   }
 }
 ```
@@ -84,12 +86,12 @@ being mislabeled as verdict-schema failures.
     {
       "id": "codex",
       "adapter": "codex-cli",
-      "timeoutMs": 300000
+      "timeoutMs": 600000
     },
     {
       "id": "claude",
       "adapter": "claude-cli",
-      "timeoutMs": 300000
+      "timeoutMs": 600000
     }
   ]
 }
@@ -99,7 +101,7 @@ The older single `decider` field is still supported for compatibility.
 
 ### Delegated execution and runtime settings
 
-`/review-settings` opens one staged settings transaction with four sections:
+`/review-settings` opens one staged settings transaction with five sections:
 
 - **Executor** is a single-selection, `/model`-style picker over Pi-scoped
   little-coder models plus execution-capable entries from `externalAgents`.
@@ -109,6 +111,10 @@ The older single `decider` field is still supported for compatibility.
   Clearing every reviewer is valid and disables automatic review without
   disabling delegated execution. Each selected internal reviewer has its own
   **Reasoning** row.
+- **Timeouts** edits the default reviewer and executor timeouts in minutes.
+  Reviewers default to 10 minutes and executors to 30 minutes. Explicit
+  `externalAgents[].review.timeoutMs` and `externalAgents[].execution.timeoutMs`
+  values override these defaults for that external harness role.
 - **Review policy** edits `maxCorrectionCycles` and
   `implementationGuidanceAfterCorrectionAttempts` as non-negative whole
   numbers.

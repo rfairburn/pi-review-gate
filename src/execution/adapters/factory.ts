@@ -14,7 +14,11 @@ export function createExecutorAdapter(config: ReviewGateConfig): ExecutorAdapter
     throw new Error("delegated execution is disabled; choose an executor with /review-settings");
   }
   if (active.source === "little-coder") {
-    return new LittleCoderExecutorAdapter({ model: active.model, thinkingLevel: active.thinkingLevel });
+    return new LittleCoderExecutorAdapter({
+      model: active.model,
+      thinkingLevel: active.thinkingLevel,
+      timeoutMs: config.executorTimeoutMs,
+    });
   }
   const external = activeExternalExecutor(config);
   if (!external) {

@@ -13,6 +13,8 @@ import {
 export interface ReviewSettingsSelection {
   activeExecutor: ActiveExecutorSelection;
   activeReviewers: ActiveReviewerSelection[];
+  reviewerTimeoutMs: number;
+  executorTimeoutMs: number;
   maxCorrectionCycles: number;
   implementationGuidanceAfterCorrectionAttempts: number;
   retainBundles: RetainBundles;
@@ -35,6 +37,8 @@ export async function persistReviewSettings(
   const review = isRecord(parsed.review) ? { ...parsed.review } : {};
   review.activeReviewers = selection.activeReviewers.map((reviewer) => ({ ...reviewer }));
   parsed.review = review;
+  parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
+  parsed.executorTimeoutMs = selection.executorTimeoutMs;
   parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
   parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
   parsed.retainBundles = selection.retainBundles;

@@ -154,7 +154,7 @@ test("first settings save migrates a legacy decider into the shared external cat
     args: [],
     review: {
       args: ["legacy-reviewer.cjs"],
-      timeoutMs: 300000,
+      timeoutMs: 600000,
       protocol: "pi-reviewer-json-v1",
     },
   }]);
@@ -218,6 +218,34 @@ test("review policy values are staged and saved atomically", async () => {
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(saved.maxCorrectionCycles, 4);
   assert.equal(saved.implementationGuidanceAfterCorrectionAttempts, 2);
+});
+
+test("reviewer and executor timeouts are staged and saved together", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-timeouts-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    reviewerTimeoutMs: 600000,
+    executorTimeoutMs: 1800000,
+    review: { activeReviewers: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Timeouts          review 10m · executor 30m",
+    "Reviewer timeout               10m",
+    "Executor timeout               30m",
+    "Back",
+    "Save changes",
+  ], [], ["20", "90"]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.reviewerTimeoutMs, 1_200_000);
+  assert.equal(saved.executorTimeoutMs, 5_400_000);
+  assert.equal(config.reviewerTimeoutMs, 1_200_000);
+  assert.equal(config.executorTimeoutMs, 5_400_000);
 });
 
 test("bundle retention is staged and saved from review settings", async () => {

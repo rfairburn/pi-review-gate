@@ -56,6 +56,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   const agents = externalAgentCatalog(input.config);
   let activeExecutor = materializeExecutorThinking(input.config.execution?.activeExecutor ?? null, input.scoped);
   let activeReviewers = materializeReviewerThinking(initialReviewerSelections(input.config), input.scoped);
+  let reviewerTimeoutMs = input.config.reviewerTimeoutMs;
+  let executorTimeoutMs = input.config.executorTimeoutMs;
   let maxCorrectionCycles = input.config.maxCorrectionCycles;
   let guidanceThreshold = input.config.implementationGuidanceAfterCorrectionAttempts;
   let retainBundles = input.config.retainBundles;
@@ -67,11 +69,13 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
     const reviewersRow = settingsRow("Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`);
+    const timeoutsRow = settingsRow("Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`);
     const policyRow = settingsRow("Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`);
     const retentionRow = settingsRow("Bundle retention", retentionLabel(retainBundles));
     const choice = await input.ui.select("Review settings", [
       executorRow,
       reviewersRow,
+      timeoutsRow,
       policyRow,
       retentionRow,
       "Save changes",
@@ -84,6 +88,14 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     }
     if (choice === reviewersRow) {
       activeReviewers = await selectReviewers(input.ui, activeReviewers, agents, input.scoped);
+      continue;
+    }
+    if (choice === timeoutsRow) {
+      ({ reviewerTimeoutMs, executorTimeoutMs } = await selectTimeouts(
+        input.ui,
+        reviewerTimeoutMs,
+        executorTimeoutMs,
+      ));
       continue;
     }
     if (choice === policyRow) {
@@ -106,6 +118,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     const next = await persistReviewSettings(input.configPath!, {
       activeExecutor,
       activeReviewers,
+      reviewerTimeoutMs,
+      executorTimeoutMs,
       maxCorrectionCycles,
       implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
       retainBundles,
@@ -306,6 +320,45 @@ async function selectReviewPolicy(
     if (choice === cyclesRow) maxCorrectionCycles = parsed;
     else guidanceThreshold = parsed;
   }
+}
+
+async function selectTimeouts(
+  ui: UiContext,
+  initialReviewerTimeoutMs: number,
+  initialExecutorTimeoutMs: number,
+): Promise<{ reviewerTimeoutMs: number; executorTimeoutMs: number }> {
+  let reviewerTimeoutMs = initialReviewerTimeoutMs;
+  let executorTimeoutMs = initialExecutorTimeoutMs;
+  while (true) {
+    const reviewerRow = policyValueRow("Reviewer timeout", formatDuration(reviewerTimeoutMs));
+    const executorRow = policyValueRow("Executor timeout", formatDuration(executorTimeoutMs));
+    const choice = await ui.select("Timeouts", [reviewerRow, executorRow, "Back"]);
+    if (!choice || choice === "Back") return { reviewerTimeoutMs, executorTimeoutMs };
+    if (!ui.input) {
+      await notify(ui, "This UI does not support numeric input.", "error");
+      continue;
+    }
+    const currentMs = choice === reviewerRow ? reviewerTimeoutMs : executorTimeoutMs;
+    const entered = await ui.input(
+      choice === reviewerRow ? "Reviewer timeout in minutes" : "Executor timeout in minutes",
+      String(currentMs / 60_000),
+    );
+    if (entered === undefined) continue;
+    const minutes = Number(entered.trim());
+    if (!Number.isFinite(minutes) || minutes <= 0 || minutes * 60_000 > Number.MAX_SAFE_INTEGER) {
+      await notify(ui, "Enter a positive number of minutes.", "error");
+      continue;
+    }
+    const timeoutMs = Math.round(minutes * 60_000);
+    if (choice === reviewerRow) reviewerTimeoutMs = timeoutMs;
+    else executorTimeoutMs = timeoutMs;
+  }
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds % 60_000 === 0) return `${milliseconds / 60_000}m`;
+  if (milliseconds % 1_000 === 0) return `${milliseconds / 1_000}s`;
+  return `${milliseconds}ms`;
 }
 
 async function validateSelection(

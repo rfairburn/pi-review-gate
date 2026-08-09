@@ -115,6 +115,8 @@ export interface ExecutionConfig {
 
 export interface ReviewGateConfig {
   enabled: boolean;
+  reviewerTimeoutMs: number;
+  executorTimeoutMs: number;
   maxCorrectionCycles: number;
   implementationGuidanceAfterCorrectionAttempts: number;
   maxPatchBytes: number;
@@ -138,6 +140,8 @@ export interface LoadedConfig {
 
 export const DEFAULT_CONFIG: ReviewGateConfig = {
   enabled: true,
+  reviewerTimeoutMs: 600_000,
+  executorTimeoutMs: 1_800_000,
   maxCorrectionCycles: 1,
   implementationGuidanceAfterCorrectionAttempts: 1,
   maxPatchBytes: 200_000,
@@ -146,7 +150,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   retainBundles: "on-failure",
 };
 
-const DEFAULT_REVIEWER_TIMEOUT_MS = 300_000;
+const DEFAULT_REVIEWER_TIMEOUT_MS = 600_000;
 const REVIEWER_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
@@ -180,9 +184,13 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     throw new Error("review gate config must be a JSON object");
   }
 
+  const reviewerTimeoutMs = numberOrDefault(value.reviewerTimeoutMs, DEFAULT_CONFIG.reviewerTimeoutMs);
+  const executorTimeoutMs = numberOrDefault(value.executorTimeoutMs, DEFAULT_CONFIG.executorTimeoutMs);
   const config: ReviewGateConfig = {
     ...DEFAULT_CONFIG,
     enabled: value.enabled === undefined ? DEFAULT_CONFIG.enabled : Boolean(value.enabled),
+    reviewerTimeoutMs,
+    executorTimeoutMs,
     maxCorrectionCycles: nonNegativeIntegerOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles),
     implementationGuidanceAfterCorrectionAttempts: nonNegativeIntegerOrDefault(
       value.implementationGuidanceAfterCorrectionAttempts,
@@ -192,14 +200,14 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     maxFileBytes: numberOrDefault(value.maxFileBytes, DEFAULT_CONFIG.maxFileBytes),
     maxSnapshotBytes: numberOrDefault(value.maxSnapshotBytes, DEFAULT_CONFIG.maxSnapshotBytes),
     retainBundles: normalizeRetainBundles(value.retainBundles),
-    decider: value.decider === undefined ? undefined : normalizeDecider(value.decider),
-    reviewers: Array.isArray(value.reviewers) ? value.reviewers.map(normalizeDecider) : undefined,
+    decider: value.decider === undefined ? undefined : normalizeDecider(value.decider, reviewerTimeoutMs),
+    reviewers: Array.isArray(value.reviewers) ? value.reviewers.map((reviewer) => normalizeDecider(reviewer, reviewerTimeoutMs)) : undefined,
     enabledReviewerIds: value.enabledReviewerIds === undefined
       ? undefined
       : normalizeIdList(value.enabledReviewerIds, "enabledReviewerIds"),
     review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
-    execution: value.execution === undefined ? undefined : normalizeExecution(value.execution),
+    execution: value.execution === undefined ? undefined : normalizeExecution(value.execution, executorTimeoutMs),
   };
 
   if (config.reviewers) {
@@ -271,7 +279,7 @@ export function activeExternalExecutor(config: ReviewGateConfig): ExternalExecut
   const active = config.execution?.activeExecutor;
   if (active?.source !== "external") return undefined;
   const agent = externalAgentCatalog(config).find((candidate) => candidate.id === active.id);
-  return agent ? executorFromExternalAgent(agent) : undefined;
+  return agent ? executorFromExternalAgent(agent, config.executorTimeoutMs) : undefined;
 }
 
 export function externalAgentCatalog(config: ReviewGateConfig): ExternalAgentConfig[] {
@@ -329,7 +337,7 @@ function findConfigPath(env: NodeJS.ProcessEnv): string | undefined {
   return candidates.find((candidate) => existsSync(candidate));
 }
 
-function normalizeDecider(value: unknown): DeciderConfig {
+function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TIMEOUT_MS): DeciderConfig {
   if (!isRecord(value)) {
     throw new Error("decider must be an object");
   }
@@ -350,7 +358,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       command: value.command,
       args: Array.isArray(value.args) ? value.args.map(String) : [],
       ...(env ? { env } : {}),
-      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
+      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
     };
   }
   if (value.adapter === "codex-cli") {
@@ -362,7 +370,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       args: Array.isArray(value.args) ? value.args.map(String) : [],
       ...(env ? { env } : {}),
       model: typeof value.model === "string" ? value.model : undefined,
-      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
+      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
     };
   }
   if (value.adapter === "claude-cli") {
@@ -374,7 +382,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       args: Array.isArray(value.args) ? value.args.map(String) : [],
       ...(env ? { env } : {}),
       model: typeof value.model === "string" ? value.model : undefined,
-      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
+      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
     };
   }
   if (value.adapter === "little-coder-model") {
@@ -391,7 +399,7 @@ function normalizeDecider(value: unknown): DeciderConfig {
       command: typeof value.command === "string" ? value.command : "little-coder",
       args: Array.isArray(value.args) ? value.args.map(String) : [],
       ...(env ? { env } : {}),
-      timeoutMs: numberOrDefault(value.timeoutMs, DEFAULT_REVIEWER_TIMEOUT_MS),
+      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
     };
   }
   throw new Error("unsupported decider adapter");
@@ -508,12 +516,17 @@ function normalizeExternalAgentRole(value: unknown, role: "review" | "execution"
     args: Array.isArray(value.args) ? value.args.map(String) : [],
     env: normalizeStringRecord(value.env, `external agent ${role} env`),
     model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
-    timeoutMs: nonNegativeIntegerOrDefault(value.timeoutMs, role === "review" ? DEFAULT_REVIEWER_TIMEOUT_MS : 1_800_000),
+    ...(value.timeoutMs === undefined ? {} : {
+      timeoutMs: nonNegativeIntegerOrDefault(
+        value.timeoutMs,
+        role === "review" ? DEFAULT_REVIEWER_TIMEOUT_MS : DEFAULT_CONFIG.executorTimeoutMs,
+      ),
+    }),
     protocol,
   };
 }
 
-function normalizeExecution(value: unknown): ExecutionConfig {
+function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.executorTimeoutMs): ExecutionConfig {
   if (!isRecord(value)) {
     throw new Error("execution must be an object");
   }
@@ -522,7 +535,7 @@ function normalizeExecution(value: unknown): ExecutionConfig {
     : normalizeActiveExecutor(value.activeExecutor);
   const externalExecutors = value.externalExecutors === undefined
     ? undefined
-    : normalizeExternalExecutors(value.externalExecutors);
+    : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
   return { activeExecutor, externalExecutors };
 }
 
@@ -554,16 +567,16 @@ function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
   throw new Error("unsupported execution.activeExecutor source");
 }
 
-function normalizeExternalExecutors(value: unknown): ExternalExecutorConfig[] {
+function normalizeExternalExecutors(value: unknown, defaultTimeoutMs: number): ExternalExecutorConfig[] {
   if (!Array.isArray(value)) {
     throw new Error("execution.externalExecutors must be an array");
   }
-  const executors = value.map(normalizeExternalExecutor);
+  const executors = value.map((executor) => normalizeExternalExecutor(executor, defaultTimeoutMs));
   validateUniqueConfiguredIds(executors, "external executor");
   return executors;
 }
 
-function normalizeExternalExecutor(value: unknown): ExternalExecutorConfig {
+function normalizeExternalExecutor(value: unknown, defaultTimeoutMs: number): ExternalExecutorConfig {
   if (!isRecord(value)) {
     throw new Error("external executor must be an object");
   }
@@ -575,7 +588,7 @@ function normalizeExternalExecutor(value: unknown): ExternalExecutorConfig {
     id: value.id,
     args: Array.isArray(value.args) ? value.args.map(String) : [],
     env: normalizeStringRecord(value.env, "external executor env"),
-    timeoutMs: numberOrDefault(value.timeoutMs, 1_800_000),
+    timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
   };
   if (value.adapter === "codex-cli") {
     return {
@@ -632,12 +645,12 @@ function resolveSelectedReviewers(config: ReviewGateConfig, scopedModels: string
         ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
         command: "little-coder",
         args: [],
-        timeoutMs: DEFAULT_REVIEWER_TIMEOUT_MS,
+        timeoutMs: config.reviewerTimeoutMs,
       });
       continue;
     }
     const agent = agents.get(selection.id);
-    const reviewer = agent ? reviewerFromExternalAgent(agent) : undefined;
+    const reviewer = agent ? reviewerFromExternalAgent(agent, config.reviewerTimeoutMs) : undefined;
     if (!reviewer) {
       unknownIds.push(key);
       continue;
@@ -651,10 +664,10 @@ function resolveSelectedReviewers(config: ReviewGateConfig, scopedModels: string
   };
 }
 
-function reviewerFromExternalAgent(agent: ExternalAgentConfig): DeciderConfig | undefined {
+function reviewerFromExternalAgent(agent: ExternalAgentConfig, defaultTimeoutMs: number): DeciderConfig | undefined {
   const role = agent.review;
   if (!role) return undefined;
-  const common = mergedAgentRole(agent, role, DEFAULT_REVIEWER_TIMEOUT_MS);
+  const common = mergedAgentRole(agent, role, defaultTimeoutMs);
   if (agent.adapter === "codex-cli") {
     return { id: agent.id, adapter: "codex-cli", ...common, command: agent.command ?? "codex" };
   }
@@ -674,10 +687,10 @@ function reviewerFromExternalAgent(agent: ExternalAgentConfig): DeciderConfig | 
   };
 }
 
-function executorFromExternalAgent(agent: ExternalAgentConfig): ExternalExecutorConfig | undefined {
+function executorFromExternalAgent(agent: ExternalAgentConfig, defaultTimeoutMs: number): ExternalExecutorConfig | undefined {
   const role = agent.execution;
   if (!role || agent.adapter === "generic-cli") return undefined;
-  const common = mergedAgentRole(agent, role, 1_800_000);
+  const common = mergedAgentRole(agent, role, defaultTimeoutMs);
   if (agent.adapter === "codex-cli") {
     return { id: agent.id, adapter: "codex-cli", ...common, command: agent.command ?? "codex" };
   }

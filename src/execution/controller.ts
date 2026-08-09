@@ -347,6 +347,7 @@ async function transmit(
     reviewSequence: output.reviewSequence,
     gateVerdict: output.result.verdict,
     reviewerResults: output.reviewerResults,
+    reviewerDisplayLabels: output.reviewerDisplayLabels,
     bundleDir: output.bundleDir,
     action,
   });

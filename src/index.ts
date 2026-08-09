@@ -455,6 +455,7 @@ async function transmitReviewPass(input: {
     reviewSequence: input.output.reviewSequence!,
     gateVerdict: input.output.result!.verdict,
     reviewerResults: input.output.reviewerResults!,
+    reviewerDisplayLabels: input.output.reviewerDisplayLabels,
     bundleDir: input.output.bundleDir!,
     action: input.action,
   });

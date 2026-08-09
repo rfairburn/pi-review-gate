@@ -34,6 +34,7 @@ export interface ReviewRunOutput {
   noReviewReason?: "no_initial_changes" | "unchanged_review_response" | "unchanged_deferred_response";
   result?: ReviewResult;
   reviewerResults?: ReviewResult[];
+  reviewerDisplayLabels?: Record<string, string>;
   bundleDir?: string;
   invocationDir?: string;
   reviewSequence?: number;
@@ -207,6 +208,9 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     changes,
     result: invocation.result,
     reviewerResults: invocation.reviewerResults,
+    reviewerDisplayLabels: Object.fromEntries(
+      reviewers.map((reviewer) => [reviewer.id, reviewerDisplayLabel(reviewer)]),
+    ),
     bundleDir: bundle.dir,
     invocationDir: bundle.invocationDir,
     reviewSequence,

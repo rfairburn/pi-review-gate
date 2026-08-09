@@ -8,6 +8,7 @@ test("review transmissions preserve formatted findings and fenced implementation
     gateVerdict: "needs_changes",
     bundleDir: "/tmp/review-bundle",
     action: "correction_required",
+    reviewerDisplayLabels: { codex: "openai-codex/gpt-5.6-luna (max)" },
     reviewerResults: [{
       reviewerId: "codex",
       verdict: "needs_changes",
@@ -24,7 +25,10 @@ test("review transmissions preserve formatted findings and fenced implementation
   });
 
   assert.match(transmission.message, /## Reviewer results/);
-  assert.match(transmission.message, /### codex — needs_changes/);
+  assert.match(transmission.message, /### openai-codex\/gpt-5\.6-luna \(max\) — needs_changes/);
+  assert.equal(transmission.envelope.reviewerResults[0]?.displayLabel, "openai-codex/gpt-5.6-luna (max)");
+  assert.equal(transmission.envelope.reviewerResults[0]?.result.reviewerId, "codex");
+  assert.equal(transmission.envelope.reviewerResults[0]?.findings[0]?.id, "review-0002/codex/finding-0001");
   assert.match(transmission.message, /Summary: The null case still fails\./);
   assert.match(transmission.message, /Guidance:\nApply this targeted guard:/);
   assert.match(transmission.message, /```diff\n-run\(value\)\n\+if \(value !== null\) run\(value\)\n```/);

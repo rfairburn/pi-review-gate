@@ -18,6 +18,7 @@ export interface ReviewTransmissionEnvelope {
   action: ReviewTransmissionAction;
   gateVerdict: ReviewResult["verdict"];
   reviewerResults: Array<{
+    displayLabel: string;
     result: ReviewResult;
     findings: Array<{ id: string; finding: ReviewFinding }>;
   }>;
@@ -27,10 +28,12 @@ export function buildReviewTransmission(input: {
   reviewSequence: number;
   gateVerdict: ReviewResult["verdict"];
   reviewerResults: ReviewResult[];
+  reviewerDisplayLabels?: Record<string, string>;
   bundleDir: string;
   action: ReviewTransmissionAction;
 }): ReviewTransmission {
   const reviewerResults = input.reviewerResults.map((result) => ({
+    displayLabel: input.reviewerDisplayLabels?.[result.reviewerId] ?? result.reviewerId,
     result,
     findings: result.findings.map((finding, index) => ({
       id: findingId(input.reviewSequence, result.reviewerId, index + 1),
@@ -70,6 +73,7 @@ export async function createReviewTransmissionMessage(input: {
   reviewSequence: number;
   gateVerdict: ReviewResult["verdict"];
   reviewerResults: ReviewResult[];
+  reviewerDisplayLabels?: Record<string, string>;
   bundleDir: string;
   action: ReviewTransmissionAction;
 }): Promise<string> {
@@ -133,7 +137,7 @@ function renderTransmission(envelope: ReviewTransmissionEnvelope, bundleDir: str
   for (const reviewer of envelope.reviewerResults) {
     lines.push(
       "",
-      `### ${reviewer.result.reviewerId} — ${reviewer.result.verdict}`,
+      `### ${reviewer.displayLabel} — ${reviewer.result.verdict}`,
       "",
       `Summary: ${reviewer.result.summary}`,
     );

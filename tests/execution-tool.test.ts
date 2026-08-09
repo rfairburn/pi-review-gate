@@ -80,8 +80,49 @@ test("execute_subtask is registered only while a configured executor is active",
   assert.match(live, /npx playwright test/);
   assert.match(live, /reviewers: openai-codex\/gpt-5\.6-luna \(max\)/);
 
+  const narrowWidth = 80;
+  const completed = renderResult({
+    content: [{ type: "text", text: "All delegated test files completed successfully." }],
+    details: {
+      kind: "accepted",
+      summary: "All delegated test files completed successfully.",
+      changedFiles: Array.from(
+        { length: 12 },
+        (_, index) => `test/browser/very-long-integration-test-name-${index}.spec.js`,
+      ),
+      bundleDir: "/tmp/pi-review-subtask-with-a-deliberately-long-artifact-directory-name",
+    },
+  }, { expanded: true }, theme).render(narrowWidth);
+  assert.ok(completed.every((line) => line.length <= narrowWidth - 2), completed.join("\n"));
+  assert.match(completed.join("\n"), /changed: .*…/);
+
+  const wide = renderResult({
+    content: [{ type: "text", text: "done" }],
+    details: {
+      state: "running",
+      progress: {
+        title: "wide activity",
+        startedAt: new Date().toISOString(),
+        phase: "executing",
+        message: `\u001b[31m${"界".repeat(100)}\u001b[0m`,
+        activity: [`tool · ${"🧪".repeat(100)}`],
+      },
+    },
+  }, { expanded: true, isPartial: true }, theme).render(narrowWidth);
+  assert.ok(wide.every((line) => testVisibleWidth(line) <= narrowWidth - 2), wide.join("\n"));
+  assert.equal(wide.some((line) => line.includes("\u001b")), false);
+
   config.execution!.activeExecutor = null;
   manager.sync();
   assert.equal(registered.length, 1);
   assert.deepEqual(activeTools, ["read"]);
 });
+
+function testVisibleWidth(value: string): number {
+  let width = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    width += codePoint >= 0x1100 ? 2 : 1;
+  }
+  return width;
+}

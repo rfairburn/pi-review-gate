@@ -165,11 +165,16 @@ function renderSubtaskResult(result: unknown, options: unknown, theme: ThemeLike
       ];
       if (expanded) {
         if (progress.model || progress.adapter) {
-          lines.push(theme.fg("dim", `  executor: ${progress.model ?? progress.adapter}${progress.adapter && progress.model ? ` [${progress.adapter}]` : ""}`));
+          lines.push(theme.fg("dim", clip(
+            `  executor: ${progress.model ?? progress.adapter}${progress.adapter && progress.model ? ` [${progress.adapter}]` : ""}`,
+            width,
+          )));
         }
-        if (progress.reviewers?.length) lines.push(theme.fg("dim", `  reviewers: ${progress.reviewers.join(", ")}`));
-        if (progress.subtaskId) lines.push(theme.fg("dim", `  subtask: ${progress.subtaskId}`));
-        if (progress.artifactDir) lines.push(theme.fg("dim", `  artifacts: ${progress.artifactDir}`));
+        if (progress.reviewers?.length) {
+          lines.push(theme.fg("dim", clip(`  reviewers: ${progress.reviewers.join(", ")}`, width)));
+        }
+        if (progress.subtaskId) lines.push(theme.fg("dim", clip(`  subtask: ${progress.subtaskId}`, width)));
+        if (progress.artifactDir) lines.push(theme.fg("dim", clip(`  artifacts: ${progress.artifactDir}`, width)));
         lines.push("", theme.fg("toolTitle", "  Recent activity"));
         for (const message of progress.activity.slice(-12)) {
           lines.push(`  ${theme.fg("toolOutput", clip(message, width - 4))}`);
@@ -192,9 +197,11 @@ function renderSubtaskResult(result: unknown, options: unknown, theme: ThemeLike
     const shown = expanded ? summaryLines : summaryLines.slice(0, 2);
     for (const line of shown) lines.push(`  ${theme.fg("toolOutput", clip(line, width - 4))}`);
     if (expanded && Array.isArray(details.changedFiles) && details.changedFiles.length > 0) {
-      lines.push("", theme.fg("dim", `  changed: ${details.changedFiles.join(", ")}`));
+      lines.push("", theme.fg("dim", clip(`  changed: ${details.changedFiles.join(", ")}`, width)));
     }
-    if (expanded && typeof details.bundleDir === "string") lines.push(theme.fg("dim", `  artifacts: ${details.bundleDir}`));
+    if (expanded && typeof details.bundleDir === "string") {
+      lines.push(theme.fg("dim", clip(`  artifacts: ${details.bundleDir}`, width)));
+    }
     if (!expanded && (summaryLines.length > shown.length || details.bundleDir)) {
       lines.push(theme.fg("muted", "  (Ctrl+O to expand)"));
     }
@@ -246,9 +253,58 @@ function elapsed(startedAt: string): string {
 }
 
 function clip(value: string, width: number): string {
-  const compact = value.replace(/\s+/g, " ").trim();
+  const compact = stripTerminalSequences(value).replace(/\s+/g, " ").trim();
   const limit = Math.max(8, width);
-  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+  if (displayWidth(compact) <= limit) return compact;
+  const contentLimit = limit - 1;
+  let clipped = "";
+  let used = 0;
+  for (const character of compact) {
+    const characterWidth = terminalCellWidth(character.codePointAt(0)!);
+    if (used + characterWidth > contentLimit) break;
+    clipped += character;
+    used += characterWidth;
+  }
+  return `${clipped}…`;
+}
+
+function stripTerminalSequences(value: string): string {
+  return value
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "")
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function displayWidth(value: string): number {
+  let width = 0;
+  for (const character of value) {
+    width += terminalCellWidth(character.codePointAt(0)!);
+  }
+  return width;
+}
+
+function terminalCellWidth(codePoint: number): number {
+  if (codePoint === 0 || codePoint === 0x200d || (codePoint >= 0xfe00 && codePoint <= 0xfe0f)) return 0;
+  if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint < 0xa0)) return 0;
+  if (/\p{Mark}/u.test(String.fromCodePoint(codePoint))) return 0;
+  return isWideCodePoint(codePoint) ? 2 : 1;
+}
+
+function isWideCodePoint(codePoint: number): boolean {
+  return codePoint >= 0x1100 && (
+    codePoint <= 0x115f
+    || codePoint === 0x2329
+    || codePoint === 0x232a
+    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
+    || (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
+    || (codePoint >= 0xff00 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+    || (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+  );
 }
 
 function textContent(value: unknown): string {

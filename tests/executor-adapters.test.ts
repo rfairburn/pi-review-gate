@@ -24,6 +24,7 @@ test("little-coder executor uses the canonical model, isolated session, and nest
   const captured = JSON.parse(await readFile(fixture.capture, "utf8"));
   assert.deepEqual(valueAfter(captured.argv, "--model"), "openai-codex/gpt-5.6-sol");
   assert.deepEqual(valueAfter(captured.argv, "--thinking"), "max");
+  assert.equal(captured.thinkingBudget, "0");
   assert.deepEqual(valueAfter(captured.argv, "--session-id"), first.session.id);
   assert.equal(captured.disabled, "1");
 });
@@ -93,7 +94,7 @@ async function harnessFixture(mode: "little" | "codex" | "claude"): Promise<{
     `const mode = ${JSON.stringify(mode)};`,
     "const argv = process.argv.slice(2);",
     "const capture = process.env.CAPTURE_PATH || argv.at(-1);",
-    "fs.writeFileSync(capture, JSON.stringify({ argv, disabled: process.env.PI_REVIEW_GATE_DISABLED }));",
+    "fs.writeFileSync(capture, JSON.stringify({ argv, disabled: process.env.PI_REVIEW_GATE_DISABLED, thinkingBudget: process.env.LITTLE_CODER_THINKING_BUDGET }));",
     "if (mode === 'little') {",
     "  console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'little complete' }] } }));",
     "} else if (mode === 'codex') {",

@@ -193,6 +193,18 @@ and persists:
 }
 ```
 
+For internal little-coder providers, review-gate also sets the independent
+thinking-budget cap to match Pi's level guidance: `minimal` is 1,024 tokens,
+`low` is 2,048, `medium` is 8,192, and `high` is 16,384. `xhigh` and `max` use
+the same 16,384-token ceiling because Pi does not define a larger numeric
+budget for those levels. The `anthropic`, `openai`, and `openai-codex`
+providers are excluded because Pi already gives them native token budgets or
+reasoning effort. A second output-side character estimate would duplicate that
+budget or cap a summary rather than the provider's hidden reasoning. Reviewer
+and executor selections remain separate from the orchestrator. External
+harnesses continue to configure reasoning through their role-specific arguments
+or environment.
+
 An end-to-end configuration example is available at
 `examples/delegated-execution.json`. `externalAgents` is one configured catalog
 shared by both menus. Each entry has an optional `review` role, `execution`

@@ -14,6 +14,7 @@ import {
   writeReviewerProcessArtifacts,
 } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
+import { withLittleCoderThinkingBudget } from "../little-coder-thinking";
 
 export class LittleCoderAdapter implements ModelAdapter {
   readonly kind = "little-coder-model";
@@ -21,6 +22,7 @@ export class LittleCoderAdapter implements ModelAdapter {
   constructor(private readonly config: LittleCoderDeciderConfig) {}
 
   async run(req: ModelAdapterRequest): Promise<ReviewResult> {
+    const thinkingLevel = this.config.thinkingLevel ?? "high";
     const artifacts = reviewerArtifactPaths(req.bundleDir);
     const rawStreamPath = join(req.bundleDir, "raw-stream.jsonl");
     const sessionId = req.session?.id ?? randomUUID();
@@ -36,7 +38,7 @@ export class LittleCoderAdapter implements ModelAdapter {
       "json",
       "--print",
       "--thinking",
-      this.config.thinkingLevel ?? "high",
+      thinkingLevel,
       ...(this.config.args ?? []),
       "--session-id",
       sessionId,
@@ -59,7 +61,11 @@ export class LittleCoderAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
+      env: withLittleCoderThinkingBudget(
+        reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
+        this.config.model,
+        thinkingLevel,
+      ),
       signal: req.signal,
       onStdoutChunk: (chunk) => {
         streamExtractor.push(chunk);

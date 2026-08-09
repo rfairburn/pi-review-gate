@@ -7,6 +7,7 @@ import { writeExecutorArtifacts } from "../artifacts";
 import { PiJsonlActivityExtractor } from "../progress";
 import type { ExecutorAdapter, ExecutorRequest, ExecutorTurn } from "../types";
 import type { ThinkingLevel } from "../../config";
+import { withLittleCoderThinkingBudget } from "../../little-coder-thinking";
 
 export interface LittleCoderExecutorOptions {
   model: string;
@@ -25,6 +26,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    const thinkingLevel = this.options.thinkingLevel ?? "high";
     const sessionId = request.session?.id ?? randomUUID();
     const sessionDir = join(request.artifactDir, "executor-sessions");
     await mkdir(sessionDir, { recursive: true });
@@ -34,7 +36,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       "--model", this.options.model,
       "--mode", "json",
       "--print",
-      "--thinking", this.options.thinkingLevel ?? "high",
+      "--thinking", thinkingLevel,
       "--session-id", sessionId,
       "--session-dir", sessionDir,
       "--approve",
@@ -46,7 +48,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       cwd: request.cwd,
       prompt: request.prompt,
       timeoutMs: this.options.timeoutMs ?? 1_800_000,
-      env: executorEnv(),
+      env: executorEnv(this.options.model, thinkingLevel),
       signal: request.signal,
       onStdoutChunk: (chunk) => {
         extractor.push(chunk);
@@ -77,7 +79,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
   }
 }
 
-function executorEnv(): NodeJS.ProcessEnv {
+function executorEnv(model: string, thinkingLevel: ThinkingLevel): NodeJS.ProcessEnv {
   const env = reviewerEnv(process.env);
   // Keep normal little-coder extensions except this gate; the kill-switch is
   // authoritative and prevents nested automatic review.
@@ -87,5 +89,5 @@ function executorEnv(): NodeJS.ProcessEnv {
   if (process.env.PI_EXTRA_EXTENSIONS) {
     env.PI_EXTRA_EXTENSIONS = process.env.PI_EXTRA_EXTENSIONS;
   }
-  return env;
+  return withLittleCoderThinkingBudget(env, model, thinkingLevel);
 }

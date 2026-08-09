@@ -15,7 +15,7 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
       "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
       `const argvPath=${JSON.stringify(argvPath)};`,
       "const history=existsSync(argvPath)?JSON.parse(readFileSync(argvPath,'utf8')):[];",
-      "history.push(process.argv.slice(2));writeFileSync(argvPath,JSON.stringify(history));",
+      "history.push({argv:process.argv.slice(2),budget:process.env.LITTLE_CODER_THINKING_BUDGET});writeFileSync(argvPath,JSON.stringify(history));",
       "process.stdin.resume();",
       "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({type:'message',message:{role:'assistant',content:[{type:'thinking',thinking:'still thinking'}]}})+'\\n'));",
     ].join("\n"), "utf8");
@@ -51,17 +51,21 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
     assert.equal(result.verdict, "error");
     assert.equal(result.error, "missing_final_text");
     assert.equal(result.summary, "Reviewer did not produce final assistant text.");
-    const [argv, resumedArgv] = JSON.parse(await readFile(argvPath, "utf8"));
+    const [firstRun, resumedRun] = JSON.parse(await readFile(argvPath, "utf8"));
+    const argv = firstRun.argv;
+    const resumedArgv = resumedRun.argv;
     assert.deepEqual(argv.includes("--no-tools"), true);
     assert.deepEqual(argv.includes("--tools"), true);
     assert.deepEqual(argv.includes("read,grep,find,ls"), true);
     assert.deepEqual(argv.includes("--system-prompt"), true);
     assert.equal(argv[argv.indexOf("--thinking") + 1], "max");
+    assert.equal(firstRun.budget, "16384");
     assert.equal(argv.includes("--no-session"), false);
     const sessionId = argv[argv.indexOf("--session-id") + 1];
     assert.equal(typeof sessionId, "string");
     assert.equal(resumedArgv[resumedArgv.indexOf("--session-id") + 1], sessionId);
     assert.equal(resumedArgv[resumedArgv.indexOf("--thinking") + 1], "max");
+    assert.equal(resumedRun.budget, "16384");
     assert.equal(argv[argv.indexOf("--session-dir") + 1], join(dir, "sessions", "glm"));
     assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, false);
   } finally {

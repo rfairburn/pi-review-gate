@@ -75,16 +75,8 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
     return failurePacket(input, subtaskId, "blocked", "No clean parent ownership baseline is available.", "missing_parent_baseline");
   }
   const preflight = await snapshot(input.cwd, input.config);
-  if (compareSnapshots(parentBaseline, preflight).length > 0) {
-    return failurePacket(
-      input,
-      subtaskId,
-      "blocked",
-      "The parent has workspace changes in its active exchange. End the parent turn and review or checkpoint those changes before delegating.",
-      "dirty_parent_exchange",
-      preflight,
-    );
-  }
+  const adoptedParentChanges = compareSnapshots(parentBaseline, preflight);
+  const adoptedParentChangedFiles = adoptedParentChanges.map((change) => change.path);
 
   const reviewerResolution = resolveReviewers(input.config, input.scopedModels);
   const reviewerSelectionIssues = [
@@ -116,14 +108,18 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
     cwd: input.cwd,
     adapter: adapter.kind,
     model: adapter.model,
+    adoptedParentChanges: adoptedParentChanges.map((change) => ({
+      path: change.path,
+      status: change.status,
+    })),
     startedAt: new Date().toISOString(),
   }, null, 2), "utf8");
   journal(input, subtaskId, "started", { adapter: adapter.kind, model: adapter.model });
 
   const childState = createState();
-  rememberUserRequest(childState, renderTaskRequest(input.task));
+  rememberUserRequest(childState, renderTaskRequest(input.task, adoptedParentChangedFiles));
   beginAgentRun(childState);
-  setReviewWindowBaseline(childState, preflight);
+  setReviewWindowBaseline(childState, parentBaseline);
   const childWindow = childState.reviewWindow!;
   childWindow.bundleDir = artifactDir;
   const reviewActive = automaticReviewEnabled(input.config, input.scopedModels);
@@ -154,7 +150,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
         input.signal?.aborted ? "cancelled" : "executor_error",
         error instanceof Error ? error.message : "Executor process failed.",
         childState,
-        preflight,
+        parentBaseline,
         adapter.kind,
         adapter.model,
       );
@@ -165,21 +161,21 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
       childWindow.evidence.finalAssistantSummaries.push(turn.text.slice(0, 4000));
     }
     if (turn.aborted || input.signal?.aborted) {
-      return finishFailure(input, subtaskId, artifactDir, "cancelled", "Executor was cancelled.", childState, preflight, adapter.kind, adapter.model);
+      return finishFailure(input, subtaskId, artifactDir, "cancelled", "Executor was cancelled.", childState, parentBaseline, adapter.kind, adapter.model);
     }
     if (turn.timedOut) {
-      return finishFailure(input, subtaskId, artifactDir, "executor_error", "Executor timed out.", childState, preflight, adapter.kind, adapter.model);
+      return finishFailure(input, subtaskId, artifactDir, "executor_error", "Executor timed out.", childState, parentBaseline, adapter.kind, adapter.model);
     }
     if (turn.code !== 0) {
-      return finishFailure(input, subtaskId, artifactDir, "executor_error", `Executor exited with status ${turn.code}.`, childState, preflight, adapter.kind, adapter.model);
+      return finishFailure(input, subtaskId, artifactDir, "executor_error", `Executor exited with status ${turn.code}.`, childState, parentBaseline, adapter.kind, adapter.model);
     }
     if (!turn.text.trim()) {
-      return finishFailure(input, subtaskId, artifactDir, "executor_error", "Executor did not produce a usable final response.", childState, preflight, adapter.kind, adapter.model);
+      return finishFailure(input, subtaskId, artifactDir, "executor_error", "Executor did not produce a usable final response.", childState, parentBaseline, adapter.kind, adapter.model);
     }
     return turn;
   };
 
-  const initial = await invoke(buildInitialExecutorPrompt(input.task));
+  const initial = await invoke(buildInitialExecutorPrompt(input.task, adoptedParentChangedFiles));
   if (isPacket(initial)) return initial;
 
   if (!reviewActive) {
@@ -190,7 +186,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
       artifactDir,
       kind: "completed_unreviewed",
       summary: initial.text,
-      before: preflight,
+      before: parentBaseline,
       childState,
       adapterKind: adapter.kind,
       adapterModel: adapter.model,
@@ -224,7 +220,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
           artifactDir,
           kind: "accepted",
           summary: lastTurn!.text,
-          before: preflight,
+          before: parentBaseline,
           childState,
           adapterKind: adapter.kind,
           adapterModel: adapter.model,
@@ -239,7 +235,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
         artifactDir,
         kind: "completed_unreviewed",
         summary: lastTurn!.text,
-        before: preflight,
+        before: parentBaseline,
         childState,
         adapterKind: adapter.kind,
         adapterModel: adapter.model,
@@ -251,10 +247,10 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
     }
 
     if (output.result?.error === "aborted" || input.signal?.aborted) {
-      return finishFailure(input, subtaskId, artifactDir, "cancelled", "Review was cancelled.", childState, preflight, adapter.kind, adapter.model);
+      return finishFailure(input, subtaskId, artifactDir, "cancelled", "Review was cancelled.", childState, parentBaseline, adapter.kind, adapter.model);
     }
     if (!output.result || !output.reviewedSnapshot) {
-      return finishFailure(input, subtaskId, artifactDir, "review_error", output.error ?? "Review did not produce a decision.", childState, preflight, adapter.kind, adapter.model);
+      return finishFailure(input, subtaskId, artifactDir, "review_error", output.error ?? "Review did not produce a decision.", childState, parentBaseline, adapter.kind, adapter.model);
     }
 
     if (output.result.verdict === "pass") {
@@ -272,7 +268,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
         changes: output.changes,
         evidenceEventCount: childWindow.evidence.events.length,
       })) {
-        return finishFailure(input, subtaskId, artifactDir, "deferred", "Reviewer repeated the same blocking feedback without new correction evidence.", childState, preflight, adapter.kind, adapter.model);
+        return finishFailure(input, subtaskId, artifactDir, "deferred", "Reviewer repeated the same blocking feedback without new correction evidence.", childState, parentBaseline, adapter.kind, adapter.model);
       }
       childWindow.lastCorrectionFeedback = createCorrectionFeedbackMarker({
         result: output.result,
@@ -280,7 +276,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
         evidenceEventCount: childWindow.evidence.events.length,
       });
       if (childWindow.correctionCycles >= frozenConfig.maxCorrectionCycles) {
-        return finishFailure(input, subtaskId, artifactDir, "deferred", "Automatic correction cap reached.", childState, preflight, adapter.kind, adapter.model);
+        return finishFailure(input, subtaskId, artifactDir, "deferred", "Automatic correction cap reached.", childState, parentBaseline, adapter.kind, adapter.model);
       }
       childWindow.correctionCycles += 1;
       const message = await transmit(childState, output, "sent_for_correction", "correction_required");
@@ -290,7 +286,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
       continue;
     }
 
-    return finishFailure(input, subtaskId, artifactDir, "review_error", output.result.summary, childState, preflight, adapter.kind, adapter.model);
+    return finishFailure(input, subtaskId, artifactDir, "review_error", output.result.summary, childState, parentBaseline, adapter.kind, adapter.model);
   }
 }
 
@@ -375,7 +371,6 @@ async function finishFailure(
   adapterModel?: string,
 ): Promise<SubtaskPacket> {
   const after = await snapshot(input.cwd, input.config);
-  checkpointReviewWindow(input.parentState, after);
   const changedFiles = compareSnapshots(before, after).map((change) => change.path);
   const packet: SubtaskPacket = {
     subtaskId,
@@ -422,18 +417,23 @@ function failurePacket(
   };
 }
 
-function buildInitialExecutorPrompt(task: ExecuteSubtaskInput): string {
+function buildInitialExecutorPrompt(task: ExecuteSubtaskInput, adoptedParentChangedFiles: string[]): string {
   return [
     "You are the isolated implementation executor for one bounded phase.",
     "Work directly in the current workspace. Inspect the repository, implement the requested change, and run relevant verification.",
+    ...(adoptedParentChangedFiles.length > 0
+      ? [
+        "The workspace includes changes made by the parent during its active exchange. Adopt these as seed work for this phase: inspect, preserve, complete, or correct them as needed. Do not revert them merely because you did not author them; they are part of the changes that will be reviewed.",
+      ]
+      : []),
     "Do not broaden the task, commit, push, or modify unrelated files.",
     "When finished, summarize changed files, verification performed, and remaining risks.",
     "",
-    renderTaskRequest(task),
+    renderTaskRequest(task, adoptedParentChangedFiles),
   ].join("\n");
 }
 
-function renderTaskRequest(task: ExecuteSubtaskInput): string {
+function renderTaskRequest(task: ExecuteSubtaskInput, adoptedParentChangedFiles: string[] = []): string {
   return [
     `Subtask: ${task.title}`,
     "",
@@ -442,6 +442,9 @@ function renderTaskRequest(task: ExecuteSubtaskInput): string {
     "Acceptance criteria:",
     ...task.acceptanceCriteria.map((criterion) => `- ${criterion}`),
     ...(task.relevantContext ? ["", "Relevant context:", task.relevantContext] : []),
+    ...(adoptedParentChangedFiles.length > 0
+      ? ["", "Changes adopted from the active parent exchange:", ...adoptedParentChangedFiles.map((path) => `- ${path}`)]
+      : []),
   ].join("\n");
 }
 

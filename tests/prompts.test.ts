@@ -62,8 +62,12 @@ test("every review prompt conditionally requires concrete guidance after correct
   for (const prompt of [automatic, question]) {
     assert.match(prompt, /Concrete-guidance escalation is active: 3 correction attempt\(s\) have occurred, meeting the configured threshold of 2/);
     assert.match(prompt, /First determine from the current workspace whether each historical finding is resolved/);
-    assert.match(prompt, /MUST put a concise fenced code snippet or minimal diff in "guidance"/);
-    assert.match(prompt, /Pair it with a finding whose "recommendation" says exactly where and how to apply it/);
+    assert.match(prompt, /MUST put both of the following in "guidance"/);
+    assert.match(prompt, /concise prose that explains and defends the proposed correction/);
+    assert.match(prompt, /concise fenced implementation diff showing exactly what code you expect to see for that finding to pass/);
+    assert.match(prompt, /the diff does not have to be minimal/);
+    assert.match(prompt, /Do not substitute prose for the implementation diff or provide an implementation diff without the supporting explanation/);
+    assert.match(prompt, /recommendation" says exactly where and how to apply the correction/);
     assert.match(prompt, /rendered under the formatted Guidance section/);
     assert.match(prompt, /Do not infer that a problem remains merely because it appears in prior feedback/);
     assert.doesNotMatch(prompt, /correction attempt has not resolved/);

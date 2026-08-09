@@ -353,7 +353,7 @@ async function executeReviewerInvocation(input: {
   | { aborted: false; result: ReviewResult; reviewerResults: ReviewResult[]; bundleRetained: boolean }
 > {
   const verb = input.kind === "review" ? "reviewing changes with" : "asking reviewers";
-  await input.notify?.(`review gate: ${verb} ${input.reviewers.map((reviewer) => reviewer.id).join(", ")}`);
+  await input.notify?.(`review gate: ${verb} ${input.reviewers.map(reviewerDisplayLabel).join(", ")}`);
   const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
   const reviewerResults = await Promise.all(input.reviewers.map((reviewer) => runSingleReviewer({
     reviewer,
@@ -629,6 +629,18 @@ function getReviewers(config: ReviewGateConfig): DeciderConfig[] {
   return resolution.unknownIds.length === 0 && resolution.duplicateEnabledIds.length === 0
     ? resolution.reviewers
     : [];
+}
+
+export function reviewerDisplayLabel(reviewer: DeciderConfig): string {
+  if (reviewer.adapter === "little-coder-model") {
+    return reviewer.thinkingLevel
+      ? `${reviewer.model} (${reviewer.thinkingLevel})`
+      : reviewer.model;
+  }
+  if ((reviewer.adapter === "codex-cli" || reviewer.adapter === "claude-cli") && reviewer.model) {
+    return `${reviewer.id} [${reviewer.adapter}/${reviewer.model}]`;
+  }
+  return reviewer.id;
 }
 
 function safePathSegment(value: string): string {

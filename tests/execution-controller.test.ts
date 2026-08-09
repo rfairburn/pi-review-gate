@@ -47,7 +47,7 @@ test("executeSubtask can complete explicitly without review", async () => {
   assert.deepEqual(packet.changedFiles, ["implemented.txt"]);
 });
 
-test("executeSubtask refuses delegation after parent workspace edits", async () => {
+test("executeSubtask adopts parent workspace edits into an unreviewed child", async () => {
   const fixture = await executionFixture(false);
   await writeFile(join(fixture.workspace, "parent.txt"), "parent edit\n", "utf8");
 
@@ -58,9 +58,62 @@ test("executeSubtask refuses delegation after parent workspace edits", async () 
     parentState: fixture.parentState,
   });
 
-  assert.equal(packet.kind, "blocked");
-  assert.equal(packet.error, "dirty_parent_exchange");
-  await assert.rejects(readFile(join(fixture.workspace, "implemented.txt"), "utf8"));
+  assert.equal(packet.kind, "completed_unreviewed");
+  assert.deepEqual(packet.changedFiles, ["implemented.txt", "parent.txt"]);
+  assert.equal(await readFile(join(fixture.workspace, "implemented.txt"), "utf8"), "implemented\n");
+  const current = await workspaceSnapshot(fixture.workspace, fixture.config);
+  assert.deepEqual(compareSnapshots(activeExchangeBaseline(fixture.parentState)!, current), []);
+});
+
+test("executeSubtask reviews adopted parent edits from the original parent baseline", async () => {
+  const fixture = await executionFixture(true, { retainBundles: "always" });
+  await writeFile(join(fixture.workspace, "parent.txt"), "parent edit\n", "utf8");
+
+  const packet = await executeSubtask({
+    task: task(),
+    cwd: fixture.workspace,
+    config: fixture.config,
+    parentState: fixture.parentState,
+  });
+
+  assert.equal(packet.kind, "accepted");
+  assert.deepEqual(packet.changedFiles, ["implemented.txt", "parent.txt"]);
+  assert.ok(packet.bundleDir);
+  const reviewedPatch = await readFile(join(packet.bundleDir, "current", "cumulative.patch"), "utf8");
+  assert.match(reviewedPatch, /parent\.txt/);
+  assert.match(reviewedPatch, /parent edit/);
+  assert.match(reviewedPatch, /implemented\.txt/);
+  const subtaskMetadata = JSON.parse(await readFile(join(packet.bundleDir, "subtask.json"), "utf8"));
+  assert.deepEqual(subtaskMetadata.adoptedParentChanges, [{ path: "parent.txt", status: "added" }]);
+});
+
+test("failed child execution preserves the parent baseline and can be adopted by a retry", async () => {
+  const fixture = await executionFixture(false, { failFirst: true });
+  await writeFile(join(fixture.workspace, "parent.txt"), "parent edit\n", "utf8");
+  const originalBaseline = activeExchangeBaseline(fixture.parentState)!;
+
+  const failed = await executeSubtask({
+    task: task(),
+    cwd: fixture.workspace,
+    config: fixture.config,
+    parentState: fixture.parentState,
+  });
+
+  assert.equal(failed.kind, "executor_error");
+  assert.deepEqual(failed.changedFiles, [".executor-failed-once", "parent.txt", "partial.txt"]);
+  assert.strictEqual(activeExchangeBaseline(fixture.parentState), originalBaseline);
+
+  const retried = await executeSubtask({
+    task: task(),
+    cwd: fixture.workspace,
+    config: fixture.config,
+    parentState: fixture.parentState,
+  });
+
+  assert.equal(retried.kind, "completed_unreviewed");
+  assert.deepEqual(retried.changedFiles, ["implemented.txt", "parent.txt", "partial.txt"]);
+  const current = await workspaceSnapshot(fixture.workspace, fixture.config);
+  assert.deepEqual(compareSnapshots(activeExchangeBaseline(fixture.parentState)!, current), []);
 });
 
 test("executeSubtask does not mistake an invalid reviewer selection for review disabled", async () => {
@@ -80,7 +133,10 @@ test("executeSubtask does not mistake an invalid reviewer selection for review d
   await assert.rejects(readFile(join(fixture.workspace, "implemented.txt"), "utf8"));
 });
 
-async function executionFixture(reviewed: boolean): Promise<{
+async function executionFixture(reviewed: boolean, options: {
+  failFirst?: boolean;
+  retainBundles?: "always" | "on-failure" | "never";
+} = {}): Promise<{
   workspace: string;
   config: ReviewGateConfig;
   parentState: ReturnType<typeof createState>;
@@ -94,6 +150,15 @@ async function executionFixture(reviewed: boolean): Promise<{
     "const fs = require('node:fs');",
     "const path = require('node:path');",
     "const op = process.env.PI_REVIEW_EXECUTOR_OPERATION;",
+    ...(options.failFirst ? [
+      "const failureMarker = path.join(process.cwd(), '.executor-failed-once');",
+      "if (op === 'start' && !fs.existsSync(failureMarker)) {",
+      "  fs.writeFileSync(failureMarker, 'failed once\\n');",
+      "  fs.writeFileSync(path.join(process.cwd(), 'partial.txt'), 'partial\\n');",
+      "  process.exit(1);",
+      "}",
+      "if (op === 'start' && fs.existsSync(failureMarker)) fs.unlinkSync(failureMarker);",
+    ] : []),
     "if (op === 'start') fs.writeFileSync(path.join(process.cwd(), 'implemented.txt'), 'implemented\\n');",
     "console.log(JSON.stringify({ type: 'session', sessionId: process.env.PI_REVIEW_EXECUTOR_SESSION_ID }));",
     "console.log(JSON.stringify({ type: 'assistant', text: op === 'start' ? 'Implemented the requested file.' : 'Verified the passing review; no further changes.' }));",
@@ -102,7 +167,7 @@ async function executionFixture(reviewed: boolean): Promise<{
   const config = normalizeConfig({
     enabled: true,
     maxCorrectionCycles: 2,
-    retainBundles: "never",
+    retainBundles: options.retainBundles ?? "never",
     review: {
       activeReviewers: reviewed ? [{ source: "external", id: "fake-reviewer" }] : [],
     },

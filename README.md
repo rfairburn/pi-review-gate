@@ -151,6 +151,15 @@ response. Child changes are checkpointed so an unchanged parent turn is not
 reviewed again; later parent edits remain parent-owned and follow the ordinary
 gate.
 
+If the parent has already edited the workspace during its active exchange,
+those edits are adopted as seed work for the delegated phase rather than
+blocking delegation. The child is told which paths it inherited, and review is
+still computed from the original parent baseline so inherited and child-authored
+changes receive the same gate treatment. A successful child checkpoints the
+combined result. A failed, timed-out, or cancelled child does not move the
+parent baseline, allowing a retry to adopt all surviving partial work or the
+ordinary parent gate to review it.
+
 Escape while the child is executing or being reviewed aborts that child flow.
 This is the "child Escape" behavior: it cancels only the active delegated
 operation, returns a `cancelled` failure packet, retains failure artifacts under
@@ -233,12 +242,16 @@ strengthens its request for concrete implementation guidance. The default is
 correction attempt the next automatic review, `/review-now`, or `/ask-reviewer`
 first verifies historical findings against the current workspace. For only
 those problems it independently confirms still remain, it explicitly requires
-a targeted code example, minimal diff, or exact actionable steps. Code examples
-stay inside the structured response's Markdown `guidance` field and are rendered
-under the review's Guidance section; the Summary, Issue, and Recommendation
-fields keep their existing formatted layout. The presence of prior feedback is
-not treated as proof that the correction failed. Set the value to `0` to apply
-this conditional verification and concrete-guidance requirement on the first
+a concise prose defense plus a concise, directly applicable implementation diff
+showing exactly what code the reviewer expects for the finding to pass. The diff
+may be as complete as necessary and does not have to be minimal. Genuinely
+non-code findings require exact actionable steps and a defense of why they are
+sufficient. This guidance stays inside the structured response's Markdown
+`guidance` field and is rendered under the review's Guidance section; the
+Summary, Issue, and Recommendation fields keep their existing formatted layout.
+The presence of prior feedback is not treated as proof that the correction
+failed. Set the value to `0` to apply this conditional verification and
+concrete-guidance requirement on the first
 review. There is no separate disabled value; use a threshold higher than the
 configured correction budget to prevent threshold escalation while retaining
 the normal implementation-ready prompt.

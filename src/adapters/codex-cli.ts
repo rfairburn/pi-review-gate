@@ -31,7 +31,7 @@ export class CodexCliAdapter implements ModelAdapter {
         cwd: req.cwd,
         prompt: "",
         timeoutMs: Math.min(req.timeoutMs, 10_000),
-        env: reviewerEnv(process.env, req.evidenceBundleDir),
+        env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
         signal: req.signal,
       });
       if (codexSandboxFailed(preflight.stderr)) {
@@ -79,7 +79,7 @@ export class CodexCliAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: reviewerEnv(process.env, req.evidenceBundleDir),
+      env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
       signal: req.signal,
     });
     const extracted = extractCodexReviewFromJsonl(output.stdout);

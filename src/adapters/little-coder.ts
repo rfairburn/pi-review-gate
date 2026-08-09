@@ -34,7 +34,7 @@ export class LittleCoderAdapter implements ModelAdapter {
       "json",
       "--print",
       "--thinking",
-      "high",
+      this.config.thinkingLevel ?? "high",
       ...(this.config.args ?? []),
       "--session-id",
       sessionId,
@@ -57,7 +57,7 @@ export class LittleCoderAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: reviewerEnv(process.env, req.evidenceBundleDir),
+      env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
       signal: req.signal,
       onStdoutChunk: (chunk) => streamExtractor.push(chunk),
     });

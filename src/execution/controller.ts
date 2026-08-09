@@ -1,0 +1,479 @@
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createWorkspaceSnapshot, compareSnapshots, type WorkspaceSnapshot } from "../capture";
+import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "../correction-feedback";
+import { automaticReviewEnabled, configWithReviewers, resolveReviewers, type ReviewGateConfig } from "../config";
+import { runReview, type ReviewRunOutput } from "../review";
+import {
+  activeExchangeBaseline,
+  beginAgentRun,
+  buildRequestContext,
+  checkpointReviewWindow,
+  createState,
+  getCorrectionAttemptCount,
+  recordReviewerFeedbackAndArmExchange,
+  rememberUserRequest,
+  setReviewWindowBaseline,
+  type ReviewGateState,
+} from "../state";
+import { createReviewTransmissionMessage, type ReviewTransmissionAction } from "../transmission";
+import type { TokenUsage } from "../usage";
+import { createExecutorAdapter } from "./adapters/factory";
+import type { ExecutorSession, ExecutorTurn } from "./types";
+
+export interface ExecuteSubtaskInput {
+  title: string;
+  instructions: string;
+  acceptanceCriteria: string[];
+  relevantContext?: string;
+}
+
+export type SubtaskOutcomeKind =
+  | "accepted"
+  | "completed_unreviewed"
+  | "blocked"
+  | "deferred"
+  | "review_error"
+  | "executor_error"
+  | "cancelled";
+
+export interface SubtaskPacket {
+  subtaskId: string;
+  title: string;
+  kind: SubtaskOutcomeKind;
+  summary: string;
+  finalSnapshot: string;
+  changedFiles: string[];
+  reviewStatus: "accepted" | "not_run" | "failed";
+  reviewDisabledReason?: "no_enabled_reviewers" | "review_master_disabled" | "no_reviewable_changes";
+  reviewCycles: number;
+  executorAdapter: string;
+  executorModel?: string;
+  usage?: TokenUsage;
+  bundleDir?: string;
+  error?: string;
+}
+
+export interface ExecuteSubtaskControllerInput {
+  task: ExecuteSubtaskInput;
+  cwd: string;
+  config: ReviewGateConfig;
+  parentState: ReviewGateState;
+  scopedModels?: string[];
+  signal?: AbortSignal;
+  notify?: (message: string) => void | Promise<void>;
+  onUpdate?: (message: string) => void;
+  appendJournal?: (entry: Record<string, unknown>) => void;
+}
+
+export async function executeSubtask(input: ExecuteSubtaskControllerInput): Promise<SubtaskPacket> {
+  const subtaskId = randomUUID();
+  const parentBaseline = activeExchangeBaseline(input.parentState);
+  if (!parentBaseline) {
+    return failurePacket(input, subtaskId, "blocked", "No clean parent ownership baseline is available.", "missing_parent_baseline");
+  }
+  const preflight = await snapshot(input.cwd, input.config);
+  if (compareSnapshots(parentBaseline, preflight).length > 0) {
+    return failurePacket(
+      input,
+      subtaskId,
+      "blocked",
+      "The parent has workspace changes in its active exchange. End the parent turn and review or checkpoint those changes before delegating.",
+      "dirty_parent_exchange",
+      preflight,
+    );
+  }
+
+  const reviewerResolution = resolveReviewers(input.config, input.scopedModels);
+  const reviewerSelectionIssues = [
+    reviewerResolution.unknownIds.length > 0
+      ? `unknown enabled reviewer ids: ${reviewerResolution.unknownIds.join(", ")}`
+      : "",
+    reviewerResolution.duplicateEnabledIds.length > 0
+      ? `duplicate enabled reviewer ids: ${reviewerResolution.duplicateEnabledIds.join(", ")}`
+      : "",
+  ].filter(Boolean);
+  if (input.config.enabled && reviewerSelectionIssues.length > 0) {
+    return failurePacket(
+      input,
+      subtaskId,
+      "blocked",
+      `Reviewer selection is invalid: ${reviewerSelectionIssues.join("; ")}. Repair it with /review-settings before delegating.`,
+      "invalid_reviewer_selection",
+      preflight,
+    );
+  }
+
+  const adapter = createExecutorAdapter(input.config);
+  const artifactDir = await mkdtemp(join(tmpdir(), "pi-review-subtask-"));
+  await mkdir(join(artifactDir, "executor"), { recursive: true });
+  await writeFile(join(artifactDir, "subtask.json"), JSON.stringify({
+    version: 1,
+    subtaskId,
+    task: input.task,
+    cwd: input.cwd,
+    adapter: adapter.kind,
+    model: adapter.model,
+    startedAt: new Date().toISOString(),
+  }, null, 2), "utf8");
+  journal(input, subtaskId, "started", { adapter: adapter.kind, model: adapter.model });
+
+  const childState = createState();
+  rememberUserRequest(childState, renderTaskRequest(input.task));
+  beginAgentRun(childState);
+  setReviewWindowBaseline(childState, preflight);
+  const childWindow = childState.reviewWindow!;
+  childWindow.bundleDir = artifactDir;
+  const reviewActive = automaticReviewEnabled(input.config, input.scopedModels);
+  const frozenConfig = configWithReviewers(input.config, reviewerResolution.reviewers, reviewActive);
+  let session: ExecutorSession | undefined;
+  let turnNumber = 0;
+  let lastTurn: ExecutorTurn | undefined;
+
+  const invoke = async (prompt: string): Promise<ExecutorTurn | SubtaskPacket> => {
+    turnNumber += 1;
+    input.onUpdate?.(`executor turn ${turnNumber} running`);
+    let turn: ExecutorTurn;
+    try {
+      turn = await adapter.run({
+        cwd: input.cwd,
+        prompt,
+        artifactDir,
+        turn: turnNumber,
+        signal: input.signal,
+        session,
+        onUpdate: input.onUpdate,
+      });
+    } catch (error) {
+      return finishFailure(
+        input,
+        subtaskId,
+        artifactDir,
+        input.signal?.aborted ? "cancelled" : "executor_error",
+        error instanceof Error ? error.message : "Executor process failed.",
+        childState,
+        preflight,
+        adapter.kind,
+        adapter.model,
+      );
+    }
+    session = turn.session;
+    lastTurn = turn;
+    if (turn.text.trim()) {
+      childWindow.evidence.finalAssistantSummaries.push(turn.text.slice(0, 4000));
+    }
+    if (turn.aborted || input.signal?.aborted) {
+      return finishFailure(input, subtaskId, artifactDir, "cancelled", "Executor was cancelled.", childState, preflight, adapter.kind, adapter.model);
+    }
+    if (turn.timedOut) {
+      return finishFailure(input, subtaskId, artifactDir, "executor_error", "Executor timed out.", childState, preflight, adapter.kind, adapter.model);
+    }
+    if (turn.code !== 0) {
+      return finishFailure(input, subtaskId, artifactDir, "executor_error", `Executor exited with status ${turn.code}.`, childState, preflight, adapter.kind, adapter.model);
+    }
+    if (!turn.text.trim()) {
+      return finishFailure(input, subtaskId, artifactDir, "executor_error", "Executor did not produce a usable final response.", childState, preflight, adapter.kind, adapter.model);
+    }
+    return turn;
+  };
+
+  const initial = await invoke(buildInitialExecutorPrompt(input.task));
+  if (isPacket(initial)) return initial;
+
+  if (!reviewActive) {
+    const reason = input.config.enabled ? "no_enabled_reviewers" : "review_master_disabled";
+    return finishSuccess({
+      input,
+      subtaskId,
+      artifactDir,
+      kind: "completed_unreviewed",
+      summary: initial.text,
+      before: preflight,
+      childState,
+      adapterKind: adapter.kind,
+      adapterModel: adapter.model,
+      usage: initial.usage,
+      reviewStatus: "not_run",
+      reviewDisabledReason: reason,
+      reviewCycles: 0,
+    });
+  }
+
+  while (true) {
+    journal(input, subtaskId, "reviewing", { turn: turnNumber });
+    const output = await runReview({
+      cwd: input.cwd,
+      request: buildRequestContext(childState),
+      before: childWindow.baseline!,
+      config: frozenConfig,
+      evidence: childWindow.evidence,
+      correctionAttemptCount: getCorrectionAttemptCount(childWindow),
+      actingUsage: lastTurn?.usage,
+      window: childWindow,
+      signal: input.signal,
+      notify: input.notify,
+    });
+
+    if (!output.changed) {
+      if (output.noReviewReason === "unchanged_review_response") {
+        return finishSuccess({
+          input,
+          subtaskId,
+          artifactDir,
+          kind: "accepted",
+          summary: lastTurn!.text,
+          before: preflight,
+          childState,
+          adapterKind: adapter.kind,
+          adapterModel: adapter.model,
+          usage: lastTurn?.usage,
+          reviewStatus: "accepted",
+          reviewCycles: childWindow.nextReviewSequence - 1,
+        });
+      }
+      return finishSuccess({
+        input,
+        subtaskId,
+        artifactDir,
+        kind: "completed_unreviewed",
+        summary: lastTurn!.text,
+        before: preflight,
+        childState,
+        adapterKind: adapter.kind,
+        adapterModel: adapter.model,
+        usage: lastTurn?.usage,
+        reviewStatus: "not_run",
+        reviewDisabledReason: "no_reviewable_changes",
+        reviewCycles: 0,
+      });
+    }
+
+    if (output.result?.error === "aborted" || input.signal?.aborted) {
+      return finishFailure(input, subtaskId, artifactDir, "cancelled", "Review was cancelled.", childState, preflight, adapter.kind, adapter.model);
+    }
+    if (!output.result || !output.reviewedSnapshot) {
+      return finishFailure(input, subtaskId, artifactDir, "review_error", output.error ?? "Review did not produce a decision.", childState, preflight, adapter.kind, adapter.model);
+    }
+
+    if (output.result.verdict === "pass") {
+      const message = await transmit(childState, output, "sent_for_observation", "passed");
+      journal(input, subtaskId, "passed_pending_response", { reviewSequence: output.reviewSequence });
+      const response = await invoke(message);
+      if (isPacket(response)) return response;
+      continue;
+    }
+
+    if (output.result.verdict === "needs_changes") {
+      if (isRepeatedNoProgressFeedback({
+        previous: childWindow.lastCorrectionFeedback,
+        result: output.result,
+        changes: output.changes,
+        evidenceEventCount: childWindow.evidence.events.length,
+      })) {
+        return finishFailure(input, subtaskId, artifactDir, "deferred", "Reviewer repeated the same blocking feedback without new correction evidence.", childState, preflight, adapter.kind, adapter.model);
+      }
+      childWindow.lastCorrectionFeedback = createCorrectionFeedbackMarker({
+        result: output.result,
+        changes: output.changes,
+        evidenceEventCount: childWindow.evidence.events.length,
+      });
+      if (childWindow.correctionCycles >= frozenConfig.maxCorrectionCycles) {
+        return finishFailure(input, subtaskId, artifactDir, "deferred", "Automatic correction cap reached.", childState, preflight, adapter.kind, adapter.model);
+      }
+      childWindow.correctionCycles += 1;
+      const message = await transmit(childState, output, "sent_for_correction", "correction_required");
+      journal(input, subtaskId, "correction_required", { reviewSequence: output.reviewSequence });
+      const correction = await invoke(message);
+      if (isPacket(correction)) return correction;
+      continue;
+    }
+
+    return finishFailure(input, subtaskId, artifactDir, "review_error", output.result.summary, childState, preflight, adapter.kind, adapter.model);
+  }
+}
+
+async function transmit(
+  state: ReviewGateState,
+  output: ReviewRunOutput,
+  disposition: "sent_for_correction" | "sent_for_observation",
+  action: ReviewTransmissionAction,
+): Promise<string> {
+  if (!output.result || !output.reviewerResults || !output.invocationDir || !output.bundleDir || output.reviewSequence === undefined || !output.reviewedSnapshot) {
+    throw new Error("cannot transmit an incomplete executor review");
+  }
+  const message = await createReviewTransmissionMessage({
+    invocationDir: output.invocationDir,
+    reviewSequence: output.reviewSequence,
+    gateVerdict: output.result.verdict,
+    reviewerResults: output.reviewerResults,
+    bundleDir: output.bundleDir,
+    action,
+  });
+  recordReviewerFeedbackAndArmExchange(state, {
+    result: output.result,
+    reviewerResults: output.reviewerResults,
+    reviewSequence: output.reviewSequence,
+    source: "automatic",
+    disposition,
+    reviewedSnapshot: output.reviewedSnapshot,
+  });
+  return message;
+}
+
+async function finishSuccess(input: {
+  input: ExecuteSubtaskControllerInput;
+  subtaskId: string;
+  artifactDir: string;
+  kind: "accepted" | "completed_unreviewed";
+  summary: string;
+  before: WorkspaceSnapshot;
+  childState: ReviewGateState;
+  adapterKind: string;
+  adapterModel?: string;
+  usage?: TokenUsage;
+  reviewStatus: "accepted" | "not_run";
+  reviewDisabledReason?: SubtaskPacket["reviewDisabledReason"];
+  reviewCycles: number;
+}): Promise<SubtaskPacket> {
+  const after = await snapshot(input.input.cwd, input.input.config);
+  checkpointReviewWindow(input.input.parentState, after);
+  const retained = input.input.config.retainBundles === "always";
+  const packet: SubtaskPacket = {
+    subtaskId: input.subtaskId,
+    title: input.input.task.title,
+    kind: input.kind,
+    summary: input.summary,
+    finalSnapshot: snapshotDigest(after),
+    changedFiles: compareSnapshots(input.before, after).map((change) => change.path),
+    reviewStatus: input.reviewStatus,
+    reviewDisabledReason: input.reviewDisabledReason,
+    reviewCycles: input.reviewCycles,
+    executorAdapter: input.adapterKind,
+    executorModel: input.adapterModel,
+    usage: input.usage,
+    bundleDir: retained ? input.artifactDir : undefined,
+  };
+  await writeFile(join(input.artifactDir, "completion.json"), JSON.stringify(packet, null, 2), "utf8");
+  journal(input.input, input.subtaskId, input.kind, { reviewStatus: input.reviewStatus });
+  if (!retained) {
+    await rm(input.artifactDir, { recursive: true, force: true });
+  }
+  return packet;
+}
+
+async function finishFailure(
+  input: ExecuteSubtaskControllerInput,
+  subtaskId: string,
+  artifactDir: string,
+  kind: Exclude<SubtaskOutcomeKind, "accepted" | "completed_unreviewed" | "blocked">,
+  message: string,
+  childState: ReviewGateState,
+  before: WorkspaceSnapshot,
+  adapterKind: string,
+  adapterModel?: string,
+): Promise<SubtaskPacket> {
+  const after = await snapshot(input.cwd, input.config);
+  checkpointReviewWindow(input.parentState, after);
+  const changedFiles = compareSnapshots(before, after).map((change) => change.path);
+  const packet: SubtaskPacket = {
+    subtaskId,
+    title: input.task.title,
+    kind,
+    summary: message,
+    finalSnapshot: snapshotDigest(after),
+    changedFiles,
+    reviewStatus: "failed",
+    reviewCycles: childState.reviewWindow ? childState.reviewWindow.nextReviewSequence - 1 : 0,
+    executorAdapter: adapterKind,
+    executorModel: adapterModel,
+    bundleDir: artifactDir,
+    error: message,
+  };
+  await writeFile(join(artifactDir, "failure.json"), JSON.stringify(packet, null, 2), "utf8");
+  journal(input, subtaskId, kind, { error: message });
+  if (input.config.retainBundles === "never") {
+    await rm(artifactDir, { recursive: true, force: true });
+    packet.bundleDir = undefined;
+  }
+  return packet;
+}
+
+function failurePacket(
+  input: ExecuteSubtaskControllerInput,
+  subtaskId: string,
+  kind: "blocked",
+  message: string,
+  error: string,
+  snapshotValue?: WorkspaceSnapshot,
+): SubtaskPacket {
+  return {
+    subtaskId,
+    title: input.task.title,
+    kind,
+    summary: message,
+    finalSnapshot: snapshotValue ? snapshotDigest(snapshotValue) : "unavailable",
+    changedFiles: [],
+    reviewStatus: "failed",
+    reviewCycles: 0,
+    executorAdapter: input.config.execution?.activeExecutor?.source ?? "none",
+    error,
+  };
+}
+
+function buildInitialExecutorPrompt(task: ExecuteSubtaskInput): string {
+  return [
+    "You are the isolated implementation executor for one bounded phase.",
+    "Work directly in the current workspace. Inspect the repository, implement the requested change, and run relevant verification.",
+    "Do not broaden the task, commit, push, or modify unrelated files.",
+    "When finished, summarize changed files, verification performed, and remaining risks.",
+    "",
+    renderTaskRequest(task),
+  ].join("\n");
+}
+
+function renderTaskRequest(task: ExecuteSubtaskInput): string {
+  return [
+    `Subtask: ${task.title}`,
+    "",
+    task.instructions,
+    "",
+    "Acceptance criteria:",
+    ...task.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+    ...(task.relevantContext ? ["", "Relevant context:", task.relevantContext] : []),
+  ].join("\n");
+}
+
+async function snapshot(cwd: string, config: ReviewGateConfig): Promise<WorkspaceSnapshot> {
+  return createWorkspaceSnapshot(cwd, {
+    maxFileBytes: config.maxFileBytes,
+    maxSnapshotBytes: config.maxSnapshotBytes,
+  });
+}
+
+function isPacket(value: ExecutorTurn | SubtaskPacket): value is SubtaskPacket {
+  return "kind" in value;
+}
+
+function snapshotDigest(value: WorkspaceSnapshot): string {
+  const hash = createHash("sha256");
+  for (const [path, file] of [...value.files].sort(([a], [b]) => a.localeCompare(b))) {
+    hash.update(path);
+    hash.update("\0");
+    hash.update(file.sha256 ?? "missing");
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+function journal(input: ExecuteSubtaskControllerInput, subtaskId: string, state: string, detail: Record<string, unknown>): void {
+  input.appendJournal?.({
+    version: 1,
+    subtaskId,
+    title: input.task.title,
+    state,
+    timestamp: new Date().toISOString(),
+    ...detail,
+  });
+}

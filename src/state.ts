@@ -10,6 +10,12 @@ import {
 import type { ReviewerSession } from "./adapters/types";
 import type { ReviewResult } from "./schema";
 import type { TokenUsage } from "./usage";
+import {
+  automaticReviewEnabled,
+  configWithReviewers,
+  resolveReviewers,
+  type ReviewGateConfig,
+} from "./config";
 
 export type ReviewFeedbackSource = "automatic" | "manual";
 export type ReviewFeedbackDisposition =
@@ -37,6 +43,8 @@ export interface ReviewWindow {
   reviewerSessions: Map<string, ReviewerSession>;
   retainBundleAfterClose: boolean;
   nextExchangeRequestIndex: number;
+  reviewConfig?: ReviewGateConfig;
+  reviewConfigurationError?: string;
 }
 
 export interface ActiveReviewExchange {
@@ -168,6 +176,45 @@ export function armReviewResponseExchange(state: ReviewGateState, reviewedSnapsh
 
 export function activeExchangeHasBaseline(state: ReviewGateState): boolean {
   return Boolean(state.reviewWindow?.activeExchange?.baseline);
+}
+
+export function activeExchangeBaseline(state: ReviewGateState): WorkspaceSnapshot | undefined {
+  return state.reviewWindow?.activeExchange?.baseline;
+}
+
+export function freezeReviewWindowConfig(state: ReviewGateState, config: ReviewGateConfig, scopedModels: string[] = []): ReviewGateConfig {
+  const window = state.reviewWindow ?? openReviewWindow(state);
+  if (window.reviewConfig) {
+    return window.reviewConfig;
+  }
+  const resolution = resolveReviewers(config, scopedModels);
+  const issues = [
+    resolution.unknownIds.length > 0 ? `unknown enabled reviewer ids: ${resolution.unknownIds.join(", ")}` : "",
+    resolution.duplicateEnabledIds.length > 0
+      ? `duplicate enabled reviewer ids: ${resolution.duplicateEnabledIds.join(", ")}`
+      : "",
+  ].filter(Boolean);
+  window.reviewConfigurationError = config.enabled && issues.length > 0 ? issues.join("; ") : undefined;
+  window.reviewConfig = configWithReviewers(
+    config,
+    resolution.reviewers,
+    automaticReviewEnabled(config, scopedModels),
+  );
+  return window.reviewConfig;
+}
+
+export function checkpointReviewWindow(state: ReviewGateState, snapshot: WorkspaceSnapshot): void {
+  const window = state.reviewWindow;
+  if (!window) {
+    return;
+  }
+  window.baseline = snapshot;
+  if (window.activeExchange) {
+    window.activeExchange.baseline = snapshot;
+    window.activeExchange.evidenceEventStart = window.evidence.events.length;
+    window.activeExchange.assistantSummaryStart = window.evidence.finalAssistantSummaries.length;
+    window.activeExchange.requestHistoryStart = window.requestHistory.length;
+  }
 }
 
 export function completeActiveExchange(

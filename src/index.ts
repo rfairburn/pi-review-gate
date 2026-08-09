@@ -1,4 +1,4 @@
-import { loadConfig } from "./config";
+import { loadConfig, materializeReviewConfig } from "./config";
 import { removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
@@ -12,12 +12,16 @@ import {
   buildRequestContext,
   closeReviewWindow,
   createState,
+  freezeReviewWindowConfig,
   getCorrectionAttemptCount,
   recordReviewerFeedbackAndArmExchange,
   rememberUserRequest,
   setReviewWindowBaseline,
   type ReviewGateState,
 } from "./state";
+import { registerReviewSettings } from "./settings/command";
+import { scopedModelChoices } from "./settings/models";
+import { ExecutionToolManager } from "./execution/tool";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, type ReviewTransmissionAction } from "./transmission";
 
@@ -35,21 +39,27 @@ export async function activate(pi: unknown): Promise<void> {
   }
 
   const { config } = loaded;
-  if (!config.enabled) {
-    if (loaded.disabledReason) {
-      await sendNotice(pi, `review gate: disabled (${loaded.disabledReason})`);
-    }
+  if (loaded.globallyDisabled) {
+    await sendNotice(pi, `review gate: disabled (${loaded.disabledReason ?? "environment kill switch"})`);
     return;
   }
 
   const state = createState();
   let currentCwd = process.cwd();
+  let currentScopedModels: string[] = [];
   let sessionActive = true;
   let activeReviewAbort: ReviewAbortHandle | undefined;
   let agentRunActive = false;
   let reviewerQuestionPausePending = false;
   const reviewerQuestionPauseWaiters = new Set<() => void>();
   const sessionAbortController = new AbortController();
+  const executionTools = new ExecutionToolManager({
+    pi,
+    config,
+    state,
+    cwd: () => currentCwd,
+    notify: (message) => sendNotice(pi, message),
+  });
 
   const releaseReviewerQuestionPauseWaiters = () => {
     for (const resolve of reviewerQuestionPauseWaiters) {
@@ -75,6 +85,8 @@ export async function activate(pi: unknown): Promise<void> {
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    updateScopedModels(args);
+    executionTools.sync();
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
   });
 
@@ -96,6 +108,7 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "before_agent_start", async (...args) => {
     agentRunActive = true;
     currentCwd = extractCwd(args, currentCwd);
+    updateScopedModels(args);
     beginAgentRun(state);
     if (activeExchangeHasBaseline(state)) {
       return;
@@ -105,6 +118,7 @@ export async function activate(pi: unknown): Promise<void> {
       maxSnapshotBytes: config.maxSnapshotBytes,
     });
     setReviewWindowBaseline(state, baseline);
+    freezeReviewWindowConfig(state, config, currentScopedModels);
   });
 
   registerHook(pi, "tool_call", async (...args) => {
@@ -165,7 +179,7 @@ export async function activate(pi: unknown): Promise<void> {
         if (window.baseline && !signal?.aborted) {
           await collectPausedReviewExchange({
             cwd: currentCwd,
-            config,
+            config: window.reviewConfig ?? config,
             evidence: window.evidence,
             actingUsage,
             window,
@@ -180,6 +194,20 @@ export async function activate(pi: unknown): Promise<void> {
       closeReviewWindow(state);
       return;
     }
+    const reviewConfig = window.reviewConfig ?? freezeReviewWindowConfig(state, config, currentScopedModels);
+    if (window.reviewConfigurationError) {
+      await sendNoticeWhileSessionActive(
+        noticeTarget,
+        `review gate: reviewer selection error: ${window.reviewConfigurationError}; use /review-settings`,
+        () => sessionActive,
+      );
+      closeReviewWindow(state);
+      return;
+    }
+    if (!reviewConfig.enabled) {
+      closeReviewWindow(state, true);
+      return;
+    }
     if (signal?.aborted) {
       state.reviewInProgress = false;
       state.queuedUserInputsDuringReview = [];
@@ -188,7 +216,7 @@ export async function activate(pi: unknown): Promise<void> {
     if (state.reviewsPaused) {
       await collectPausedReviewExchange({
         cwd: currentCwd,
-        config,
+        config: reviewConfig,
         evidence: window.evidence,
         actingUsage,
         window,
@@ -210,7 +238,7 @@ export async function activate(pi: unknown): Promise<void> {
         cwd: currentCwd,
         request: buildRequestContext(state),
         before: window.baseline,
-        config,
+        config: reviewConfig,
         evidence: window.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(window),
         actingUsage,
@@ -308,7 +336,7 @@ export async function activate(pi: unknown): Promise<void> {
         changes: output.changes,
         evidenceEventCount: window.evidence.events.length,
       });
-      if (window.correctionCycles >= config.maxCorrectionCycles) {
+      if (window.correctionCycles >= reviewConfig.maxCorrectionCycles) {
         const deferredTransmission = await transmitReviewPass({
           state,
           output,
@@ -325,7 +353,7 @@ export async function activate(pi: unknown): Promise<void> {
           [
             `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`,
             "Complete reviewer feedback was transmitted to the implementing model, but automatic correction is deferred.",
-            `Use /review-continue to authorize another ${config.maxCorrectionCycles} automatic correction cycle(s).`,
+            `Use /review-continue to authorize another ${reviewConfig.maxCorrectionCycles} automatic correction cycle(s).`,
           ].join("\n"),
           () => sessionActive,
         );
@@ -371,6 +399,7 @@ export async function activate(pi: unknown): Promise<void> {
     pi,
     cwd: () => currentCwd,
     config,
+    getConfig: () => materializeReviewConfig(config, currentScopedModels),
     state,
     isSessionActive: () => sessionActive,
     sessionSignal: sessionAbortController.signal,
@@ -397,6 +426,21 @@ export async function activate(pi: unknown): Promise<void> {
       await paused;
     },
   });
+
+  registerReviewSettings({
+    pi,
+    config,
+    configPath: loaded.path,
+    onSaved: () => executionTools.sync(),
+    onScopedModels: (models) => {
+      currentScopedModels = [...models];
+    },
+  });
+
+  function updateScopedModels(args: unknown[]): void {
+    const choices = scopedModelChoices(extractContext(args) ?? args.find((arg) => scopedModelChoices(arg) !== undefined));
+    if (choices) currentScopedModels = choices.map((choice) => choice.model);
+  }
 }
 
 async function transmitReviewPass(input: {

@@ -44,7 +44,7 @@ export class ClaudeCliAdapter implements ModelAdapter {
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: reviewerEnv(process.env, req.evidenceBundleDir),
+      env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
       signal: req.signal,
     });
     let parsed: unknown;

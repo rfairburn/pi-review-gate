@@ -25,6 +25,7 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
       id: "glm",
       adapter: "little-coder-model",
       model: "ollama/glm-5.2",
+      thinkingLevel: "max",
       command: commandPath,
       timeoutMs: 5000,
     });
@@ -55,12 +56,12 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
     assert.deepEqual(argv.includes("--tools"), true);
     assert.deepEqual(argv.includes("read,grep,find,ls"), true);
     assert.deepEqual(argv.includes("--system-prompt"), true);
-    assert.equal(argv[argv.indexOf("--thinking") + 1], "high");
+    assert.equal(argv[argv.indexOf("--thinking") + 1], "max");
     assert.equal(argv.includes("--no-session"), false);
     const sessionId = argv[argv.indexOf("--session-id") + 1];
     assert.equal(typeof sessionId, "string");
     assert.equal(resumedArgv[resumedArgv.indexOf("--session-id") + 1], sessionId);
-    assert.equal(resumedArgv[resumedArgv.indexOf("--thinking") + 1], "high");
+    assert.equal(resumedArgv[resumedArgv.indexOf("--thinking") + 1], "max");
     assert.equal(argv[argv.indexOf("--session-dir") + 1], join(dir, "sessions", "glm"));
     assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, false);
   } finally {

@@ -30,6 +30,64 @@ const indexTestConfig = {
   retainBundles: "never",
 } as const;
 
+test("delegated execution tool activation waits for session_start", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-runtime-start-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "fake",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" },
+      }],
+      execution: {
+        activeExecutor: { source: "external", id: "fake" },
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const registeredTools: string[] = [];
+    let activeTools = ["read"];
+    let runtimeInitialized = false;
+    const assertRuntime = () => {
+      if (!runtimeInitialized) throw new Error("Extension runtime not initialized");
+    };
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand() {},
+      registerTool(tool: { name: string }) {
+        registeredTools.push(tool.name);
+      },
+      getActiveTools() {
+        assertRuntime();
+        return activeTools;
+      },
+      setActiveTools(next: string[]) {
+        assertRuntime();
+        activeTools = next;
+      },
+      notify() {},
+    };
+
+    await activate(pi);
+    assert.deepEqual(registeredTools, []);
+
+    runtimeInitialized = true;
+    await trigger(hooks, "session_start", { cwd: dir });
+    assert.deepEqual(registeredTools, ["execute_subtask"]);
+    assert.deepEqual(activeTools, ["read", "execute_subtask"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("cap status is concise while reviewer results are delivered once in the transmission", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-cap-"));
 

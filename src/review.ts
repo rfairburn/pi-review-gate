@@ -1,6 +1,6 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { DeciderConfig, ReviewGateConfig } from "./config";
+import { resolveReviewers, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
@@ -625,10 +625,10 @@ function sumUsage(usages: Array<NonNullable<ReviewResult["usage"]>>, key: keyof 
 }
 
 function getReviewers(config: ReviewGateConfig): DeciderConfig[] {
-  if (config.reviewers && config.reviewers.length > 0) {
-    return config.reviewers;
-  }
-  return config.decider ? [config.decider] : [];
+  const resolution = resolveReviewers(config);
+  return resolution.unknownIds.length === 0 && resolution.duplicateEnabledIds.length === 0
+    ? resolution.reviewers
+    : [];
 }
 
 function safePathSegment(value: string): string {

@@ -6,6 +6,7 @@ import {
   clearReviewState,
   closeReviewWindow,
   createState,
+  freezeReviewWindowConfig,
   getReviewerQuestionWindow,
   getCorrectionAttemptCount,
   markCappedFeedbackSent,
@@ -14,6 +15,7 @@ import {
   rememberUserRequest,
   setReviewWindowBaseline,
 } from "../src/state";
+import { normalizeConfig } from "../src/config";
 
 test("rememberUserRequest appends guidance to the active review window without clearing evidence", () => {
   const state = createState();
@@ -225,6 +227,48 @@ test("beginAgentRun preserves the review-window baseline and evidence across con
   assert.equal(state.reviewWindow!.baseline!.files.size, 0);
   assert.equal(state.reviewWindow!.evidence.events.length, 1);
   assert.equal(state.reviewWindow!.evidence.events[0]?.summary, "edit before interrupt");
+});
+
+test("a review window keeps its original reviewer selection after live config changes", () => {
+  const state = createState();
+  beginAgentRun(state);
+  const config = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+
+  const frozen = freezeReviewWindowConfig(state, config);
+  config.enabledReviewerIds = ["two"];
+
+  assert.deepEqual(frozen.enabledReviewerIds, ["one"]);
+  assert.deepEqual(frozen.reviewers?.map((reviewer) => reviewer.id), ["one"]);
+  assert.equal(freezeReviewWindowConfig(state, config), frozen);
+});
+
+test("a review window materializes and freezes scoped little-coder reviewers", () => {
+  const state = createState();
+  beginAgentRun(state);
+  const config = normalizeConfig({
+    enabled: true,
+    review: {
+      activeReviewers: [{ source: "little-coder", model: "openai-codex/gpt-5.6-sol" }],
+    },
+  });
+
+  const frozen = freezeReviewWindowConfig(state, config, ["openai-codex/gpt-5.6-sol"]);
+
+  assert.equal(frozen.enabled, true);
+  assert.equal(frozen.review, undefined);
+  assert.equal(frozen.reviewers?.[0]?.adapter, "little-coder-model");
+  assert.equal(
+    frozen.reviewers?.[0] && "model" in frozen.reviewers[0] ? frozen.reviewers[0].model : undefined,
+    "openai-codex/gpt-5.6-sol",
+  );
+  assert.equal(freezeReviewWindowConfig(state, config, []), frozen);
 });
 
 test("an accepted answer after a passed review seeds the next review window evidence", () => {

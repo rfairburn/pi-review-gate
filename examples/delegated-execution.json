@@ -1,0 +1,70 @@
+{
+  "enabled": true,
+  "maxCorrectionCycles": 3,
+  "implementationGuidanceAfterCorrectionAttempts": 1,
+  "retainBundles": "on-failure",
+  "review": {
+    "activeReviewers": [
+      {
+        "source": "external",
+        "id": "codex-sol"
+      }
+    ]
+  },
+  "execution": {
+    "activeExecutor": {
+      "source": "little-coder",
+      "model": "openai-codex/gpt-5.6-sol",
+      "thinkingLevel": "high"
+    }
+  },
+  "externalAgents": [
+    {
+      "id": "codex-luna",
+      "adapter": "codex-cli",
+      "command": "codex",
+      "review": {
+        "model": "gpt-5.6-luna",
+        "args": ["-c", "model_reasoning_effort=\"max\""],
+        "timeoutMs": 300000
+      },
+      "execution": {
+        "model": "gpt-5.6-luna",
+        "args": ["-c", "model_reasoning_effort=\"max\""],
+        "timeoutMs": 1800000
+      }
+    },
+    {
+      "id": "codex-sol",
+      "adapter": "codex-cli",
+      "command": "codex",
+      "review": {
+        "model": "gpt-5.6-sol",
+        "args": ["-c", "model_reasoning_effort=\"high\""],
+        "timeoutMs": 300000
+      },
+      "execution": {
+        "model": "gpt-5.6-sol",
+        "args": ["-c", "model_reasoning_effort=\"high\""],
+        "timeoutMs": 1800000
+      }
+    },
+    {
+      "id": "claude",
+      "adapter": "claude-cli",
+      "command": "claude",
+      "review": { "timeoutMs": 300000 },
+      "execution": { "timeoutMs": 1800000 }
+    },
+    {
+      "id": "my-binary-agent",
+      "adapter": "run-as-binary",
+      "command": "/absolute/path/to/my-agent",
+      "execution": {
+        "protocol": "pi-review-executor-jsonl-v1",
+        "args": [],
+        "timeoutMs": 1800000
+      }
+    }
+  ]
+}

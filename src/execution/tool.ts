@@ -2,6 +2,7 @@ import { externalAgentCatalog, externalAgentSupportsExecution, type ReviewGateCo
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
 import { executeSubtask, type ExecuteSubtaskInput, type SubtaskPacket } from "./controller";
+import type { SubtaskProgressPhase, SubtaskProgressUpdate } from "./types";
 
 const TOOL_NAME = "execute_subtask";
 
@@ -11,6 +12,12 @@ interface ExecutionToolManagerInput {
   state: ReviewGateState;
   cwd: () => string;
   notify?: (message: string) => void | Promise<void>;
+}
+
+interface SubtaskProgressView extends SubtaskProgressUpdate {
+  title: string;
+  startedAt: string;
+  activity: string[];
 }
 
 export class ExecutionToolManager {
@@ -84,6 +91,29 @@ export class ExecutionToolManager {
         if (modelError) {
           return toolResult({ kind: "blocked", summary: modelError }, true);
         }
+        const progress: SubtaskProgressView = {
+          title: task.title,
+          startedAt: new Date().toISOString(),
+          phase: "starting",
+          message: "preparing delegated execution",
+          activity: ["preparing delegated execution"],
+        };
+        const publish = (update?: SubtaskProgressUpdate) => {
+          if (update) {
+            Object.assign(progress, update);
+            if (progress.activity.at(-1) !== update.message) {
+              progress.activity.push(update.message);
+              if (progress.activity.length > 40) progress.activity.splice(0, progress.activity.length - 40);
+            }
+          }
+          onUpdate?.({
+            content: [{ type: "text", text: `${phaseLabel(progress.phase)} · ${elapsed(progress.startedAt)} · ${progress.message}` }],
+            details: { state: "running", progress: { ...progress, activity: [...progress.activity] } },
+          });
+        };
+        publish();
+        const ticker = onUpdate ? setInterval(() => publish(), 5_000) : undefined;
+        ticker?.unref?.();
         this.running = true;
         try {
           const packet = await executeSubtask({
@@ -94,20 +124,136 @@ export class ExecutionToolManager {
             scopedModels,
             signal,
             notify: this.input.notify,
-            onUpdate: (message) => onUpdate?.({
-              content: [{ type: "text", text: message }],
-              details: { state: "running", message },
-            }),
+            onUpdate: publish,
             appendJournal: (entry) => appendJournal(this.input.pi, entry),
           });
           return toolResult(packet, isFailure(packet));
         } finally {
+          if (ticker) clearInterval(ticker);
           this.running = false;
         }
       },
+      renderCall: (args: unknown, theme: ThemeLike) => renderSubtaskCall(args, theme),
+      renderResult: (result: unknown, options: unknown, theme: ThemeLike) => renderSubtaskResult(result, options, theme),
     });
     this.registered = true;
   }
+}
+
+interface ThemeLike {
+  bold(text: string): string;
+  fg(color: string, text: string): string;
+}
+
+function renderSubtaskCall(args: unknown, theme: ThemeLike) {
+  const task = isRecord(args) && typeof args.title === "string" ? args.title : "delegated phase";
+  return textComponent((width) => [
+    theme.fg("toolTitle", theme.bold("execute_subtask ")) + theme.fg("accent", clip(task, width - 20)),
+  ]);
+}
+
+function renderSubtaskResult(result: unknown, options: unknown, theme: ThemeLike) {
+  const value = isRecord(result) ? result : {};
+  const details = isRecord(value.details) ? value.details : {};
+  const expanded = isRecord(options) && options.expanded === true;
+  const progress = isProgressView(details.progress) ? details.progress : undefined;
+  if (progress) {
+    return textComponent((width) => {
+      const lines = [
+        `${theme.fg("warning", "◌")} ${theme.fg("accent", phaseLabel(progress.phase))}${theme.fg("muted", ` · ${elapsed(progress.startedAt)}`)}`,
+        `  ${theme.fg("toolOutput", clip(progress.message, width - 4))}`,
+      ];
+      if (expanded) {
+        if (progress.model || progress.adapter) {
+          lines.push(theme.fg("dim", `  executor: ${progress.model ?? progress.adapter}${progress.adapter && progress.model ? ` [${progress.adapter}]` : ""}`));
+        }
+        if (progress.reviewers?.length) lines.push(theme.fg("dim", `  reviewers: ${progress.reviewers.join(", ")}`));
+        if (progress.subtaskId) lines.push(theme.fg("dim", `  subtask: ${progress.subtaskId}`));
+        if (progress.artifactDir) lines.push(theme.fg("dim", `  artifacts: ${progress.artifactDir}`));
+        lines.push("", theme.fg("toolTitle", "  Recent activity"));
+        for (const message of progress.activity.slice(-12)) {
+          lines.push(`  ${theme.fg("toolOutput", clip(message, width - 4))}`);
+        }
+      } else {
+        lines.push(theme.fg("muted", "  (Ctrl+O to expand live activity)"));
+      }
+      return lines;
+    });
+  }
+
+  const kind = typeof details.kind === "string" ? details.kind : "completed";
+  const failed = value.isError === true || !["accepted", "completed_unreviewed"].includes(kind);
+  return textComponent((width) => {
+    const lines = [
+      `${theme.fg(failed ? "error" : "success", failed ? "✗" : "✓")} ${theme.fg("accent", kind)}`,
+    ];
+    const summary = typeof details.summary === "string" ? details.summary : textContent(value.content);
+    const summaryLines = summary.trim().split(/\r?\n/).filter(Boolean);
+    const shown = expanded ? summaryLines : summaryLines.slice(0, 2);
+    for (const line of shown) lines.push(`  ${theme.fg("toolOutput", clip(line, width - 4))}`);
+    if (expanded && Array.isArray(details.changedFiles) && details.changedFiles.length > 0) {
+      lines.push("", theme.fg("dim", `  changed: ${details.changedFiles.join(", ")}`));
+    }
+    if (expanded && typeof details.bundleDir === "string") lines.push(theme.fg("dim", `  artifacts: ${details.bundleDir}`));
+    if (!expanded && (summaryLines.length > shown.length || details.bundleDir)) {
+      lines.push(theme.fg("muted", "  (Ctrl+O to expand)"));
+    }
+    return lines;
+  });
+}
+
+function textComponent(render: (width: number) => string[]) {
+  return { render: (width: number) => render(Math.max(20, width - 2)), invalidate() {} };
+}
+
+function isProgressView(value: unknown): value is SubtaskProgressView {
+  return isRecord(value)
+    && typeof value.title === "string"
+    && typeof value.startedAt === "string"
+    && isProgressPhase(value.phase)
+    && typeof value.message === "string"
+    && Array.isArray(value.activity);
+}
+
+function isProgressPhase(value: unknown): value is SubtaskProgressPhase {
+  return value === "starting"
+    || value === "executing"
+    || value === "reviewing"
+    || value === "correcting"
+    || value === "confirming"
+    || value === "completing";
+}
+
+function phaseLabel(phase: SubtaskProgressPhase): string {
+  return ({
+    starting: "Starting",
+    executing: "Executing",
+    reviewing: "Reviewing",
+    correcting: "Correcting",
+    confirming: "Confirming review",
+    completing: "Completing",
+  })[phase];
+}
+
+function elapsed(startedAt: string): string {
+  const milliseconds = Math.max(0, Date.now() - Date.parse(startedAt));
+  const seconds = Math.floor(milliseconds / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  if (hours > 0) return `${hours}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+  return `${seconds}s`;
+}
+
+function clip(value: string, width: number): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  const limit = Math.max(8, width);
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
+function textContent(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.map((item) => isRecord(item) && item.type === "text" && typeof item.text === "string" ? item.text : "").join("\n");
 }
 
 function toolResult(packet: Partial<SubtaskPacket> & { kind: string; summary: string }, isError: boolean): Record<string, unknown> {

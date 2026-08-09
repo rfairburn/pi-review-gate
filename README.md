@@ -165,6 +165,13 @@ This is the "child Escape" behavior: it cancels only the active delegated
 operation, returns a `cancelled` failure packet, retains failure artifacts under
 the normal bundle policy, and never treats the partial work as accepted.
 
+While `execute_subtask` is active, its tool card shows the current lifecycle
+phase and elapsed time. Press Ctrl+O to expand a bounded live activity view with
+the executor model, artifact directory, recent native little-coder tool and test
+milestones, review cycle, reviewer models, and reviewer completion verdicts.
+Streaming activity updates are UI-only and are not copied into the controlling
+model's context; only the final subtask packet is returned as tool context.
+
 Pi/little-coder internal model selections use the exact canonical
 `provider/model` value and store a role-owned `thinkingLevel`. The allowed
 levels come from that scoped model's runtime metadata, including its

@@ -24,6 +24,7 @@ export interface ReviewRunInput {
   correctionAttemptCount?: number;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
+  onUpdate?: (message: string) => void;
   window?: ReviewWindow;
 }
 
@@ -195,6 +196,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     reviewSequence,
     kind: "review",
     notify: input.notify,
+    onUpdate: input.onUpdate,
   });
   if (invocation.aborted) {
     return abortedReviewOutput(changes, bundle.dir);
@@ -348,6 +350,7 @@ async function executeReviewerInvocation(input: {
   reviewSequence: number;
   kind: "review" | "reviewer question";
   notify?: (message: string) => void | Promise<void>;
+  onUpdate?: (message: string) => void;
 }): Promise<
   | { aborted: true; bundleRetained: false }
   | { aborted: false; result: ReviewResult; reviewerResults: ReviewResult[]; bundleRetained: boolean }
@@ -355,16 +358,23 @@ async function executeReviewerInvocation(input: {
   const verb = input.kind === "review" ? "reviewing changes with" : "asking reviewers";
   await input.notify?.(`review gate: ${verb} ${input.reviewers.map(reviewerDisplayLabel).join(", ")}`);
   const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
-  const reviewerResults = await Promise.all(input.reviewers.map((reviewer) => runSingleReviewer({
-    reviewer,
-    cwd: input.cwd,
-    prompt: input.bundle.prompt,
-    bundlePrompt: input.bundle.bundlePrompt,
-    bundleDir: input.bundle.dir,
-    invocationDir: input.bundle.invocationDir,
-    window: input.window,
-    signal: input.signal,
-  })));
+  const reviewerResults = await Promise.all(input.reviewers.map(async (reviewer) => {
+    const label = reviewerDisplayLabel(reviewer);
+    input.onUpdate?.(`${label} started`);
+    const result = await runSingleReviewer({
+      reviewer,
+      cwd: input.cwd,
+      prompt: input.bundle.prompt,
+      bundlePrompt: input.bundle.bundlePrompt,
+      bundleDir: input.bundle.dir,
+      invocationDir: input.bundle.invocationDir,
+      window: input.window,
+      signal: input.signal,
+      onUpdate: (message) => input.onUpdate?.(`${label} · ${message}`),
+    });
+    input.onUpdate?.(`${label} finished · ${result.verdict}`);
+    return result;
+  }));
   if (reviewWasAborted(input.signal, reviewerResults)) {
     await recordCanceledInvocation(
       input.bundle.invocationDir,
@@ -405,6 +415,7 @@ async function runSingleReviewer(input: {
   invocationDir: string;
   window?: ReviewWindow;
   signal?: AbortSignal;
+  onUpdate?: (message: string) => void;
 }): Promise<ReviewResult> {
   const reviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
   await mkdir(reviewerDir, { recursive: true });
@@ -427,6 +438,7 @@ async function runSingleReviewer(input: {
       signal: input.signal,
       session,
       onSession: (nextSession) => input.window?.reviewerSessions.set(input.reviewer.id, nextSession),
+      onUpdate: input.onUpdate,
     });
     result = await invoke();
     if (usableSession && isResumeFailure(result)) {

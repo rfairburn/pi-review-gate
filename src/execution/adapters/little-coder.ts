@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { reviewerEnv, runPromptProcess } from "../../adapters/process";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
 import { writeExecutorArtifacts } from "../artifacts";
+import { PiJsonlActivityExtractor } from "../progress";
 import type { ExecutorAdapter, ExecutorRequest, ExecutorTurn } from "../types";
 import type { ThinkingLevel } from "../../config";
 
@@ -28,6 +29,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
     const sessionDir = join(request.artifactDir, "executor-sessions");
     await mkdir(sessionDir, { recursive: true });
     const extractor = new PiJsonlReviewExtractor();
+    const activity = new PiJsonlActivityExtractor((message) => request.onUpdate?.(message));
     const args = [
       "--model", this.options.model,
       "--mode", "json",
@@ -48,9 +50,10 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       signal: request.signal,
       onStdoutChunk: (chunk) => {
         extractor.push(chunk);
-        request.onUpdate?.("little-coder executor running");
+        activity.push(chunk);
       },
     });
+    activity.finish();
     const streamed = extractor.finish();
     const extracted = streamed.text.trim() ? streamed : extractReviewTextFromPiJsonl(output.stdout);
     const artifacts = await writeExecutorArtifacts({

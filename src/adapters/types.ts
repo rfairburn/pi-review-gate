@@ -10,6 +10,7 @@ export interface ModelAdapterRequest {
   signal?: AbortSignal;
   session?: ReviewerSession;
   onSession?: (session: ReviewerSession) => void;
+  onUpdate?: (message: string) => void;
 }
 
 export interface ReviewerSession {

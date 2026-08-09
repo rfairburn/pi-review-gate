@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createWorkspaceSnapshot, compareSnapshots, type WorkspaceSnapshot } from "../capture";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "../correction-feedback";
 import { automaticReviewEnabled, configWithReviewers, resolveReviewers, type ReviewGateConfig } from "../config";
-import { runReview, type ReviewRunOutput } from "../review";
+import { reviewerDisplayLabel, runReview, type ReviewRunOutput } from "../review";
 import {
   activeExchangeBaseline,
   beginAgentRun,
@@ -21,7 +21,7 @@ import {
 import { createReviewTransmissionMessage, type ReviewTransmissionAction } from "../transmission";
 import type { TokenUsage } from "../usage";
 import { createExecutorAdapter } from "./adapters/factory";
-import type { ExecutorSession, ExecutorTurn } from "./types";
+import type { ExecutorSession, ExecutorTurn, SubtaskProgressPhase, SubtaskProgressUpdate } from "./types";
 
 export interface ExecuteSubtaskInput {
   title: string;
@@ -64,7 +64,7 @@ export interface ExecuteSubtaskControllerInput {
   scopedModels?: string[];
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
-  onUpdate?: (message: string) => void;
+  onUpdate?: (update: SubtaskProgressUpdate) => void;
   appendJournal?: (entry: Record<string, unknown>) => void;
 }
 
@@ -100,6 +100,13 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
 
   const adapter = createExecutorAdapter(input.config);
   const artifactDir = await mkdtemp(join(tmpdir(), "pi-review-subtask-"));
+  reportProgress(input, subtaskId, {
+    phase: "starting",
+    message: "subtask workspace captured; starting executor",
+    artifactDir,
+    adapter: adapter.kind,
+    model: adapter.model,
+  });
   await mkdir(join(artifactDir, "executor"), { recursive: true });
   await writeFile(join(artifactDir, "subtask.json"), JSON.stringify({
     version: 1,
@@ -128,9 +135,16 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
   let turnNumber = 0;
   let lastTurn: ExecutorTurn | undefined;
 
-  const invoke = async (prompt: string): Promise<ExecutorTurn | SubtaskPacket> => {
+  const invoke = async (prompt: string, phase: SubtaskProgressPhase): Promise<ExecutorTurn | SubtaskPacket> => {
     turnNumber += 1;
-    input.onUpdate?.(`executor turn ${turnNumber} running`);
+    reportProgress(input, subtaskId, {
+      phase,
+      message: `executor turn ${turnNumber} running`,
+      artifactDir,
+      adapter: adapter.kind,
+      model: adapter.model,
+      executorTurn: turnNumber,
+    });
     let turn: ExecutorTurn;
     try {
       turn = await adapter.run({
@@ -140,7 +154,14 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
         turn: turnNumber,
         signal: input.signal,
         session,
-        onUpdate: input.onUpdate,
+        onUpdate: (message) => reportProgress(input, subtaskId, {
+          phase,
+          message,
+          artifactDir,
+          adapter: adapter.kind,
+          model: adapter.model,
+          executorTurn: turnNumber,
+        }),
       });
     } catch (error) {
       return finishFailure(
@@ -175,7 +196,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
     return turn;
   };
 
-  const initial = await invoke(buildInitialExecutorPrompt(input.task, adoptedParentChangedFiles));
+  const initial = await invoke(buildInitialExecutorPrompt(input.task, adoptedParentChangedFiles), "executing");
   if (isPacket(initial)) return initial;
 
   if (!reviewActive) {
@@ -198,6 +219,18 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
   }
 
   while (true) {
+    const reviewCycle = childWindow.nextReviewSequence;
+    const reviewerLabels = reviewerResolution.reviewers.map(reviewerDisplayLabel);
+    reportProgress(input, subtaskId, {
+      phase: "reviewing",
+      message: `review cycle ${reviewCycle} running with ${reviewerLabels.join(", ")}`,
+      artifactDir,
+      adapter: adapter.kind,
+      model: adapter.model,
+      executorTurn: turnNumber,
+      reviewCycle,
+      reviewers: reviewerLabels,
+    });
     journal(input, subtaskId, "reviewing", { turn: turnNumber });
     const output = await runReview({
       cwd: input.cwd,
@@ -210,6 +243,16 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
       window: childWindow,
       signal: input.signal,
       notify: input.notify,
+      onUpdate: (message) => reportProgress(input, subtaskId, {
+        phase: "reviewing",
+        message,
+        artifactDir,
+        adapter: adapter.kind,
+        model: adapter.model,
+        executorTurn: turnNumber,
+        reviewCycle,
+        reviewers: reviewerLabels,
+      }),
     });
 
     if (!output.changed) {
@@ -256,7 +299,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
     if (output.result.verdict === "pass") {
       const message = await transmit(childState, output, "sent_for_observation", "passed");
       journal(input, subtaskId, "passed_pending_response", { reviewSequence: output.reviewSequence });
-      const response = await invoke(message);
+      const response = await invoke(message, "confirming");
       if (isPacket(response)) return response;
       continue;
     }
@@ -281,7 +324,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
       childWindow.correctionCycles += 1;
       const message = await transmit(childState, output, "sent_for_correction", "correction_required");
       journal(input, subtaskId, "correction_required", { reviewSequence: output.reviewSequence });
-      const correction = await invoke(message);
+      const correction = await invoke(message, "correcting");
       if (isPacket(correction)) return correction;
       continue;
     }
@@ -333,6 +376,13 @@ async function finishSuccess(input: {
   reviewDisabledReason?: SubtaskPacket["reviewDisabledReason"];
   reviewCycles: number;
 }): Promise<SubtaskPacket> {
+  reportProgress(input.input, input.subtaskId, {
+    phase: "completing",
+    message: input.kind === "accepted" ? "subtask accepted" : "subtask completed without review",
+    artifactDir: input.artifactDir,
+    adapter: input.adapterKind,
+    model: input.adapterModel,
+  });
   const after = await snapshot(input.input.cwd, input.input.config);
   checkpointReviewWindow(input.input.parentState, after);
   const retained = input.input.config.retainBundles === "always";
@@ -370,6 +420,13 @@ async function finishFailure(
   adapterKind: string,
   adapterModel?: string,
 ): Promise<SubtaskPacket> {
+  reportProgress(input, subtaskId, {
+    phase: "completing",
+    message,
+    artifactDir,
+    adapter: adapterKind,
+    model: adapterModel,
+  });
   const after = await snapshot(input.cwd, input.config);
   const changedFiles = compareSnapshots(before, after).map((change) => change.path);
   const packet: SubtaskPacket = {
@@ -479,4 +536,12 @@ function journal(input: ExecuteSubtaskControllerInput, subtaskId: string, state:
     timestamp: new Date().toISOString(),
     ...detail,
   });
+}
+
+function reportProgress(
+  input: ExecuteSubtaskControllerInput,
+  subtaskId: string,
+  update: SubtaskProgressUpdate,
+): void {
+  input.onUpdate?.({ subtaskId, ...update });
 }

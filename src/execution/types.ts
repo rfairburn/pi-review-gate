@@ -31,3 +31,23 @@ export interface ExecutorAdapter {
   readonly model?: string;
   run(request: ExecutorRequest): Promise<ExecutorTurn>;
 }
+
+export type SubtaskProgressPhase =
+  | "starting"
+  | "executing"
+  | "reviewing"
+  | "correcting"
+  | "confirming"
+  | "completing";
+
+export interface SubtaskProgressUpdate {
+  phase: SubtaskProgressPhase;
+  message: string;
+  subtaskId?: string;
+  artifactDir?: string;
+  adapter?: string;
+  model?: string;
+  executorTurn?: number;
+  reviewCycle?: number;
+  reviewers?: string[];
+}

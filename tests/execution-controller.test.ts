@@ -68,12 +68,14 @@ test("executeSubtask adopts parent workspace edits into an unreviewed child", as
 test("executeSubtask reviews adopted parent edits from the original parent baseline", async () => {
   const fixture = await executionFixture(true, { retainBundles: "always" });
   await writeFile(join(fixture.workspace, "parent.txt"), "parent edit\n", "utf8");
+  const progress: Array<{ phase: string; message: string }> = [];
 
   const packet = await executeSubtask({
     task: task(),
     cwd: fixture.workspace,
     config: fixture.config,
     parentState: fixture.parentState,
+    onUpdate: (update) => progress.push(update),
   });
 
   assert.equal(packet.kind, "accepted");
@@ -85,6 +87,9 @@ test("executeSubtask reviews adopted parent edits from the original parent basel
   assert.match(reviewedPatch, /implemented\.txt/);
   const subtaskMetadata = JSON.parse(await readFile(join(packet.bundleDir, "subtask.json"), "utf8"));
   assert.deepEqual(subtaskMetadata.adoptedParentChanges, [{ path: "parent.txt", status: "added" }]);
+  assert.deepEqual(new Set(progress.map((update) => update.phase)), new Set(["starting", "executing", "reviewing", "confirming", "completing"]));
+  assert.equal(progress.some((update) => /fake-reviewer started/.test(update.message)), true);
+  assert.equal(progress.some((update) => /fake-reviewer finished · pass/.test(update.message)), true);
 });
 
 test("failed child execution preserves the parent baseline and can be adopted by a retry", async () => {

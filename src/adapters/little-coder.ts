@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { LittleCoderDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../usage";
+import { PiJsonlActivityExtractor } from "../execution/progress";
 import {
   processFailureResult,
   reviewerArtifactPaths,
@@ -27,6 +28,7 @@ export class LittleCoderAdapter implements ModelAdapter {
     await mkdir(sessionDir, { recursive: true });
     req.onSession?.({ adapter: this.kind, id: sessionId });
     const streamExtractor = new PiJsonlReviewExtractor();
+    const activity = new PiJsonlActivityExtractor((message) => req.onUpdate?.(message));
     const args = [
       "--model",
       this.config.model,
@@ -59,8 +61,12 @@ export class LittleCoderAdapter implements ModelAdapter {
       timeoutMs: req.timeoutMs,
       env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
       signal: req.signal,
-      onStdoutChunk: (chunk) => streamExtractor.push(chunk),
+      onStdoutChunk: (chunk) => {
+        streamExtractor.push(chunk);
+        activity.push(chunk);
+      },
     });
+    activity.finish();
     const streamExtracted = streamExtractor.finish();
     const extracted = streamExtracted.text.trim() ? streamExtracted : extractReviewTextFromPiJsonl(output.stdout);
     const rawOutputText = extracted.text.trim() ? extracted.text : missingFinalTextDiagnostic(output);

@@ -381,3 +381,25 @@ test("scoped little-coder models resolve as reviewers only when currently availa
   assert.equal("thinkingLevel" in resolved.reviewers[0]! ? resolved.reviewers[0].thinkingLevel : undefined, "max");
   assert.equal(automaticReviewEnabled(config, ["openai-codex/gpt-5.6-sol"]), true);
 });
+
+test("normalizeConfig accepts execution.maxWorkers 1..4", () => {
+  for (const w of [1, 2, 3, 4]) {
+    const config = normalizeConfig({
+      enabled: true,
+      execution: { maxWorkers: w },
+    });
+    assert.equal(config.execution?.maxWorkers, w);
+  }
+});
+
+test("normalizeConfig rejects invalid execution.maxWorkers", () => {
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 0 } }), /maxWorkers must be between 1 and 4/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 5 } }), /maxWorkers must be between 1 and 4/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 2.5 } }), /maxWorkers must be an integer/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: "2" } }), /maxWorkers must be an integer/);
+});
+
+test("normalizeConfig omits execution.maxWorkers when not provided", () => {
+  const config = normalizeConfig({ enabled: true, execution: { activeExecutor: null } });
+  assert.equal(config.execution?.maxWorkers, undefined);
+});

@@ -5,7 +5,8 @@ import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, s
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
 import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
-import type { ReviewResult } from "./schema";
+import type { ChangeIdentity, ReviewResult } from "./schema";
+import { validateChangeIdentity } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
@@ -22,10 +23,25 @@ export interface ReviewRunInput {
   evidence?: EvidenceState;
   actingUsage?: TokenUsage;
   correctionAttemptCount?: number;
+  changeIdentity?: ChangeIdentity;
+  /** Exact Git-derived change data for a normalized candidate. Only valid together with changeIdentity. */
+  exactChange?: ExactChangeInput;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
   onUpdate?: (message: string) => void;
   window?: ReviewWindow;
+}
+
+/** Exact Git-derived change data for a normalized candidate commit. */
+export interface ExactChangeInput {
+  /** Deterministic list of changed paths from Git. */
+  changedPaths: string[];
+  /** The exact commit patch (may be truncated). */
+  patch: string;
+  /** Whether the patch was truncated. */
+  truncated: boolean;
+  /** Paths whose diffs were omitted due to truncation. */
+  omitted: Array<{ path: string; reason: string }>;
 }
 
 export interface ReviewRunOutput {
@@ -59,6 +75,7 @@ export interface AskReviewerInput {
   config: ReviewGateConfig;
   evidence?: EvidenceState;
   correctionAttemptCount?: number;
+  changeIdentity?: ChangeIdentity;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
   window?: ReviewWindow;
@@ -74,6 +91,64 @@ export interface AskReviewerOutput {
 }
 
 export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput> {
+  const validationError = input.changeIdentity !== undefined ? validateChangeIdentity(input.changeIdentity) : undefined;
+  if (validationError) {
+    return { changed: false, changes: [], error: `Invalid changeIdentity: ${validationError}` };
+  }
+  // exactChange requires changeIdentity and must be well-formed.
+  if (input.exactChange !== undefined) {
+    if (input.changeIdentity === undefined) {
+      return { changed: false, changes: [], error: "exactChange requires changeIdentity to be set." };
+    }
+    const ec = input.exactChange;
+    if (typeof ec !== "object" || ec === null || Array.isArray(ec)) {
+      return { changed: false, changes: [], error: "exactChange must be an object." };
+    }
+    if (!Array.isArray(ec.changedPaths)) {
+      return { changed: false, changes: [], error: "exactChange.changedPaths must be an array." };
+    }
+    if (typeof ec.patch !== "string") {
+      return { changed: false, changes: [], error: "exactChange.patch must be a string." };
+    }
+    if (typeof ec.truncated !== "boolean") {
+      return { changed: false, changes: [], error: "exactChange.truncated must be a boolean." };
+    }
+    if (!Array.isArray(ec.omitted)) {
+      return { changed: false, changes: [], error: "exactChange.omitted must be an array." };
+    }
+    // Validate changedPaths members: each must be a non-empty string.
+    const changedPathSet = new Set<string>();
+    for (const path of ec.changedPaths) {
+      if (typeof path !== "string" || path.length === 0) {
+        return { changed: false, changes: [], error: "exactChange.changedPaths must contain non-empty strings." };
+      }
+      changedPathSet.add(path);
+    }
+    // Validate omitted members: each must be an object with string path and reason;
+    // omitted paths must belong to changedPaths.
+    for (const item of ec.omitted) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) {
+        return { changed: false, changes: [], error: "exactChange.omitted entries must be objects." };
+      }
+      if (typeof (item as Record<string, unknown>).path !== "string") {
+        return { changed: false, changes: [], error: "exactChange.omitted entries must have a string path." };
+      }
+      if (typeof (item as Record<string, unknown>).reason !== "string") {
+        return { changed: false, changes: [], error: "exactChange.omitted entries must have a string reason." };
+      }
+      if (!changedPathSet.has((item as Record<string, unknown>).path as string)) {
+        return { changed: false, changes: [], error: "exactChange.omitted path not in changedPaths." };
+      }
+    }
+    // Truncation consistency: if not truncated, omitted must be empty.
+    if (!ec.truncated && ec.omitted.length > 0) {
+      return { changed: false, changes: [], error: "exactChange cannot have omitted entries when truncated is false." };
+    }
+    // Patch byte limit: patch must not exceed configured maxPatchBytes.
+    if (Buffer.byteLength(ec.patch, "utf8") > input.config.maxPatchBytes) {
+      return { changed: false, changes: [], error: "exactChange.patch exceeds maxPatchBytes." };
+    }
+  }
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
   const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
   const after = await createWorkspaceSnapshot(input.cwd, {
@@ -89,6 +164,10 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     : [];
   const split = splitReviewChanges(workspaceChanges, evidenceChanges);
   const { changes, sideEffectChanges } = split;
+
+  // When exactChange is present with nonempty changedPaths, treat as reviewable
+  // even if workspace snapshots show no content hash changes (e.g., mode-only or binary changes).
+  const hasExactChanges = input.exactChange !== undefined && input.exactChange.changedPaths.length > 0;
   const exchangeBefore = input.window?.activeExchange?.baseline;
   const exchangeSequence = input.window?.activeExchange?.sequence;
   const reviewResponseMode = input.window?.activeExchange?.reviewResponseMode;
@@ -115,7 +194,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       actingUsage: input.actingUsage,
     });
   }
-  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0;
+  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges;
   if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
     if (input.window?.bundleDir) {
       await syncReviewWindowArtifacts({
@@ -134,19 +213,26 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     };
   }
   const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
-  if (changes.length === 0 && !isCorrectionValidation) {
+  if (changes.length === 0 && !isCorrectionValidation && !hasExactChanges) {
     return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
 
-  const patchResult = workspaceChanges.length > 0
-    ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes)
-    : {
-      patch: isCorrectionValidation
-        ? "(no net submitted workspace changes; validate the current workspace against the prior review feedback)"
-        : "(no submitted workspace changes detected; review captured side effects below)",
-      truncated: false,
-      omitted: [],
-    };
+  // When exactChange is present, use the exact Git commit patch as authoritative.
+  const patchResult = input.exactChange !== undefined
+    ? {
+        patch: input.exactChange.patch,
+        truncated: input.exactChange.truncated,
+        omitted: input.exactChange.omitted,
+      }
+    : workspaceChanges.length > 0
+      ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes)
+      : {
+          patch: isCorrectionValidation
+            ? "(no net submitted workspace changes; validate the current workspace against the prior review feedback)"
+            : "(no submitted workspace changes detected; review captured side effects below)",
+          truncated: false,
+          omitted: [],
+        };
   const sideEffectPatchResult = sideEffectChanges.length > 0
     ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
     : { patch: "", truncated: false, omitted: [] };
@@ -175,6 +261,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       : undefined,
     actingUsage: input.actingUsage,
     guidanceEscalation,
+    changeIdentity: input.changeIdentity,
     metadata: {
       exchangeSequence: input.window?.exchanges.at(-1)?.sequence,
       correctionAttemptCount,
@@ -184,6 +271,12 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       omittedDiffs: patchResult.omitted,
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
+      changeIdentity: input.changeIdentity,
+      ...(input.exactChange !== undefined ? {
+        exactChangedPaths: input.exactChange.changedPaths,
+        exactPatchTruncated: input.exactChange.truncated,
+        exactOmittedDiffs: input.exactChange.omitted,
+      } : {}),
     },
   });
   registerBundleWithWindow(input.window, bundle.dir);
@@ -258,6 +351,10 @@ export async function collectPausedReviewExchange(input: PausedExchangeInput): P
 }
 
 export async function runAskReviewer(input: AskReviewerInput): Promise<AskReviewerOutput> {
+  const validationError = input.changeIdentity !== undefined ? validateChangeIdentity(input.changeIdentity) : undefined;
+  if (validationError) {
+    return { changes: [], error: `Invalid changeIdentity: ${validationError}` };
+  }
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
   const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
   const { changes, workspaceChanges, evidenceChanges, sideEffectChanges } = await collectCurrentChanges({
@@ -296,6 +393,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
     guidanceEscalation,
+    changeIdentity: input.changeIdentity,
     metadata: {
       exchangeSequence: input.window?.exchanges.at(-1)?.sequence,
       correctionAttemptCount,
@@ -305,6 +403,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       omittedDiffs: patchResult.omitted,
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
+      changeIdentity: input.changeIdentity,
     },
   });
   registerBundleWithWindow(input.window, bundle.dir);

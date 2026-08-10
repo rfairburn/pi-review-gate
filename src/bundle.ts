@@ -2,6 +2,7 @@ import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ChangedFile } from "./capture";
+import type { ChangeIdentity } from "./schema";
 import { summarizeReviewChanges } from "./change-context";
 import type { EvidenceBundle } from "./evidence";
 import {
@@ -26,6 +27,7 @@ interface ReviewBundleContext {
   evidence?: EvidenceBundle;
   actingUsage?: TokenUsage;
   guidanceEscalation?: ImplementationGuidanceEscalation;
+  changeIdentity?: ChangeIdentity;
   metadata?: Record<string, unknown>;
 }
 
@@ -70,6 +72,7 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
     bundleDir: dir,
     evidenceMarkdown: input.evidence?.markdown,
     guidanceEscalation: input.guidanceEscalation,
+    changeIdentity: input.changeIdentity,
   };
   const prompt = question
     ? buildReviewerQuestionPrompt({ ...promptContext, question: input.question })
@@ -90,13 +93,14 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
       cwd: input.cwd,
       createdAt: new Date().toISOString(),
       ...(question ? { kind: "ask-reviewer" } : {}),
+      ...(input.changeIdentity ? { changeIdentity: input.changeIdentity } : {}),
       ...input.metadata,
     }, null, 2), "utf8"),
     writeFile(join(invocationDir, "reviewer-context.md"), prompt, "utf8"),
     writeFile(join(invocationDir, "evidence.json"), JSON.stringify(input.evidence ?? null, null, 2), "utf8"),
     writeFile(join(invocationDir, "evidence.md"), input.evidence?.markdown ?? "", "utf8"),
     writeReviewArtifacts(invocationDir, input.submittedChanges, input.sideEffectChanges ?? [], input.evidence),
-    writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence),
+    writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence, input.changeIdentity),
     writeExchangeArtifacts(dir, input.dir ? (input.exchanges ?? []).slice(-1) : input.exchanges ?? []),
     writeReviewIndex(dir, input.cwd, reviewSequence, input.exchanges ?? [], question),
   ];
@@ -151,10 +155,11 @@ async function writeCurrentReviewFiles(
   sideEffectPatch: string,
   prompt: string,
   evidence: EvidenceBundle | undefined,
+  changeIdentity: ChangeIdentity | undefined,
 ): Promise<void> {
   const currentDir = join(dir, "current");
   await mkdir(currentDir, { recursive: true });
-  await Promise.all([
+  const writes: Array<Promise<void>> = [
     writeFile(join(dir, "request.md"), request, "utf8"),
     writeFile(join(currentDir, "changed-files.json"), JSON.stringify(changedFiles, null, 2), "utf8"),
     writeFile(join(currentDir, "cumulative.patch"), patch, "utf8"),
@@ -162,7 +167,13 @@ async function writeCurrentReviewFiles(
     writeFile(join(currentDir, "reviewer-context.md"), prompt, "utf8"),
     writeFile(join(currentDir, "evidence.json"), JSON.stringify(evidence ?? null, null, 2), "utf8"),
     writeFile(join(currentDir, "evidence.md"), evidence?.markdown ?? "", "utf8"),
-  ]);
+  ];
+  if (changeIdentity) {
+    writes.push(writeFile(join(currentDir, "change-identity.json"), JSON.stringify(changeIdentity, null, 2), "utf8"));
+  } else {
+    writes.push(rm(join(currentDir, "change-identity.json"), { force: true }));
+  }
+  await Promise.all(writes);
 }
 
 async function writeExchangeArtifacts(dir: string, exchanges: ReviewExchangeContext[]): Promise<void> {

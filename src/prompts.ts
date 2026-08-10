@@ -1,4 +1,5 @@
 import type { ChangedFile } from "./capture";
+import type { ChangeIdentity } from "./schema";
 import { summarizeSideEffectChanges, summarizeSubmittedChanges } from "./change-context";
 
 const REVIEW_CONTEXT_POLICY = `Review policy:
@@ -67,6 +68,7 @@ export interface ReviewerPromptContext {
   bundleDir?: string;
   evidenceMarkdown?: string;
   guidanceEscalation?: ImplementationGuidanceEscalation;
+  changeIdentity?: ChangeIdentity;
 }
 
 export interface ReviewerQuestionPromptContext extends ReviewerPromptContext {
@@ -149,6 +151,16 @@ Session evidence:
 <session_evidence>
 ${input.evidenceMarkdown || "(no session evidence captured)"}
 </session_evidence>
+
+${input.changeIdentity
+  ? `Change identity:
+<change_identity>
+base: ${input.changeIdentity.baseCommit}
+candidate: ${input.changeIdentity.candidateCommit}
+range: ${input.changeIdentity.baseCommit}..${input.changeIdentity.candidateCommit}
+</change_identity>
+This review verdict applies specifically to candidate commit ${input.changeIdentity.candidateCommit}.`
+  : ""}
 
 ${REVIEW_RESPONSE_FORMAT}
 

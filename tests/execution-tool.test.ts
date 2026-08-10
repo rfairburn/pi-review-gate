@@ -44,8 +44,10 @@ test("execute_subtask is registered only while a configured executor is active",
 
   config.execution!.activeExecutor = { source: "external", id: "fake" };
   manager.sync();
-  assert.equal(registered.length, 1);
+  assert.equal(registered.length, 2);
   assert.equal(registered[0].name, "execute_subtask");
+  assert.equal(registered[1].name, "execute_subtasks");
+  // execute_subtasks is inactive by default (requires parallelEnabled=true)
   assert.deepEqual(activeTools, ["read", "execute_subtask"]);
 
   const theme = {
@@ -114,7 +116,7 @@ test("execute_subtask is registered only while a configured executor is active",
 
   config.execution!.activeExecutor = null;
   manager.sync();
-  assert.equal(registered.length, 1);
+  assert.equal(registered.length, 2);
   assert.deepEqual(activeTools, ["read"]);
 });
 

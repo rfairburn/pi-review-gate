@@ -111,6 +111,12 @@ export interface ReviewSelectionConfig {
 export interface ExecutionConfig {
   activeExecutor?: ActiveExecutorSelection;
   externalExecutors?: ExternalExecutorConfig[];
+  maxWorkers?: number;
+  /**
+   * When true, the execute_subtasks parallel tool is active.
+   * Defaults to false (opt-in). execute_subtask activation is unchanged.
+   */
+  parallelEnabled?: boolean;
 }
 
 export interface ReviewGateConfig {
@@ -536,7 +542,22 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
   const externalExecutors = value.externalExecutors === undefined
     ? undefined
     : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
-  return { activeExecutor, externalExecutors };
+  const maxWorkers = normalizeMaxWorkers(value.maxWorkers);
+  const parallelEnabled = normalizeParallelEnabled(value.parallelEnabled);
+  return {
+    activeExecutor,
+    externalExecutors,
+    ...(maxWorkers !== undefined ? { maxWorkers } : {}),
+    ...(parallelEnabled !== undefined ? { parallelEnabled } : {}),
+  };
+}
+
+function normalizeParallelEnabled(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error("execution.parallelEnabled must be a boolean");
+  }
+  return value;
 }
 
 function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
@@ -859,6 +880,17 @@ function numberOrDefault(value: unknown, fallback: number): number {
 
 function nonNegativeIntegerOrDefault(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+function normalizeMaxWorkers(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new Error("execution.maxWorkers must be an integer");
+  }
+  if (value < 1 || value > 4) {
+    throw new Error("execution.maxWorkers must be between 1 and 4");
+  }
+  return value;
 }
 
 function isTruthy(value: string | undefined): boolean {

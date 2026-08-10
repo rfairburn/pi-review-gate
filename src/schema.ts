@@ -2,6 +2,33 @@ import type { TokenUsage } from "./usage";
 
 export type ReviewVerdict = "pass" | "needs_changes" | "error";
 
+export interface ChangeIdentity {
+  baseCommit: string;
+  candidateCommit: string;
+}
+
+const COMMIT_ID_RE = /^[0-9a-f]{40,64}$/;
+
+export function validateChangeIdentity(identity: unknown): string | undefined {
+  if (typeof identity !== "object" || identity === null || Array.isArray(identity)) {
+    return "changeIdentity must be an object with baseCommit and candidateCommit strings";
+  }
+  const obj = identity as Record<string, unknown>;
+  if (typeof obj.baseCommit !== "string") {
+    return "baseCommit must be a string";
+  }
+  if (typeof obj.candidateCommit !== "string") {
+    return "candidateCommit must be a string";
+  }
+  if (!COMMIT_ID_RE.test(obj.baseCommit)) {
+    return `baseCommit must be a 40–64 character lowercase hex string, got: ${obj.baseCommit}`;
+  }
+  if (!COMMIT_ID_RE.test(obj.candidateCommit)) {
+    return `candidateCommit must be a 40–64 character lowercase hex string, got: ${obj.candidateCommit}`;
+  }
+  return undefined;
+}
+
 export type FindingSeverity = "blocking" | "non_blocking";
 
 export interface ReviewFinding {

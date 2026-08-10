@@ -101,7 +101,7 @@ The older single `decider` field is still supported for compatibility.
 
 ### Delegated execution and runtime settings
 
-`/review-settings` opens one staged settings transaction with five sections:
+`/review-settings` opens one staged settings transaction with six sections:
 
 - **Executor** is a single-selection, `/model`-style picker over Pi-scoped
   little-coder models plus execution-capable entries from `externalAgents`.
@@ -121,6 +121,11 @@ The older single `decider` field is still supported for compatibility.
 - **Bundle retention** selects `never`, `on-failure`, or `always`. Choose
   `always` when successful executor and reviewer turns need to remain available
   for inspection.
+- **Parallel workers** sets `execution.maxWorkers` (1–4, default 2) which
+  controls the maximum concurrent workers for `execute_subtasks`.
+- **Parallel execution** toggles `execution.parallelEnabled` (default `false`).
+  When disabled, `execute_subtasks` is inactive even with a resolvable executor;
+  `execute_subtask` remains available. Enable this to opt in to parallel execution.
 
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the
 root discards all staged changes; **Save changes** atomically persists every
@@ -171,6 +176,50 @@ the executor model, artifact directory, recent native little-coder tool and test
 milestones, review cycle, reviewer models, and reviewer completion verdicts.
 Streaming activity updates are UI-only and are not copied into the controlling
 model's context; only the final subtask packet is returned as tool context.
+
+### Parallel execution with `execute_subtasks`
+
+`execute_subtasks` runs multiple independent bounded tasks in parallel. Each
+task runs in an isolated worktree with its own review lifecycle. Tasks are
+specified as an array (1–16) with the same schema as `execute_subtask`.
+
+**Concurrency**: `maxWorkers` controls the maximum concurrent workers (1–4,
+default 2). The tool-call `maxWorkers` overrides `config.execution.maxWorkers`,
+which overrides the built-in default of 2.
+
+**Integration policy**: By default all-or-nothing: any worker that is not
+accepted, completed_unreviewed, or no_changes blocks integration entirely.
+Set `integratePartial: true` to integrate eligible workers (accepted /
+completed_unreviewed) in declared order despite failed ones.
+
+**Integration order**: Workers are integrated in the declared order from the
+tasks array, regardless of completion order.
+
+**Landing**: After integration, changes are landed into the source workspace.
+The final changes are uncommitted — they appear as unstaged working-tree
+changes; the source index and staging state remain unchanged.
+
+**Snapshot and ignore policy**: The wave captures a snapshot of the source
+workspace. Non-ignored untracked files are included in the snapshot. Git-ignored
+files are excluded from the captured snapshot and landing. This means dependencies
+installed in `node_modules`, secrets in `.env`, and other ignored paths are
+not captured or landed. If your task depends on files that are git-ignored,
+the worker will not see them.
+
+**Artifacts**: Each wave produces a `waveRoot` directory containing artifacts
+for each task, a wave manifest (`wave-manifest.json`), and stable refs for
+integrated commits. The wave root path is returned in the tool result.
+
+**Conflict and recovery**: If integration encounters conflicts, the wave
+returns a `conflicted` status with details about the conflicting task, commit,
+and paths. The integration worktree is preserved for diagnosis. Landing
+conflicts are reported with per-path conflict details. Rolled-back landings
+store a recovery manifest for manual recovery.
+
+**Source preservation**: The wave never mutates the source repository through
+Git operations. Source HEAD, index, staging state, and stash are preserved.
+Worktrees are isolated from the source. Clean worktrees are removed after
+completion; dirty or conflicted worktrees are preserved for diagnosis.
 
 Pi/little-coder internal model selections use the exact canonical
 `provider/model` value and store a role-owned `thinkingLevel`. The allowed
@@ -523,3 +572,77 @@ capped JSONL stream separately as `raw-stream.jsonl`. When supported by the
 reviewer CLI, user-facing notices include a compact reviewer token summary, for
 example
 `review gate: passed (review tokens (this pass): input 1.2k (uncached 400, cached 800), out 340, total 1.6k)`.
+
+## Crash Recovery for Landing Manifests
+
+When a wave landing is in progress, a recovery manifest is written atomically
+under `<waveRoot>/landing/manifest-<txId>.json` before any filesystem mutations.
+If the process dies mid-landing, the manifest remains in `in_progress` or
+`recovery_required` state with backup artifacts preserved.
+
+### Manifest location
+
+Recovery manifests live in the wave root directory:
+
+```
+<waveRoot>/landing/manifest-<uuid>.json
+```
+
+The wave root is the parent of the private bare Git repository created during
+capture. Each manifest is scoped to a single transaction via a unique UUID.
+
+### Recovery API
+
+The `recoverLandingManifest(manifestPath)` function in
+`src/execution/wave-landing.ts` recovers a crashed landing transaction:
+
+```typescript
+import { recoverLandingManifest } from "../src/execution/wave-landing";
+
+const result = await recoverLandingManifest("/path/to/manifest.json");
+
+// result.status is one of:
+//   "recovered"       — all paths restored, manifest marked rolled_back
+//   "manual_required" — concurrent modifications detected, artifacts preserved
+//   "rejected"        — manifest invalid (wrong version, path escape, identity mismatch)
+//   "terminal"        — manifest already completed or rolled_back; stale artifacts cleaned
+```
+
+### Recovery behavior
+
+- **Source root identity**: Recovery verifies the source root's dev+ino matches
+  the manifest. If the directory was replaced or moved, recovery is rejected.
+- **Path confinement**: All destination, temp, and backup paths must reside
+  within the source root. Path-escaping manifests are rejected.
+- **Concurrent modifications**: If a destination was modified after the
+  transaction installed it, recovery preserves both the newer destination and
+  the original backup, marking the manifest `recovery_required`.
+- **Idempotency**: Running recovery twice on the same manifest is safe. The
+  first call restores paths and marks the manifest `rolled_back`; the second
+call cleans stale temps.
+- **No Git mutation**: Recovery never invokes Git staging, reset, or apply
+  commands. It only manipulates filesystem artifacts.
+- **Artifact preservation on manual_required**: When recovery detects a
+  concurrent modification and returns `manual_required`, ALL artifacts (temps,
+  backups, destinations, directories) are preserved for diagnosis. No cleanup
+  occurs until the user resolves the conflict.
+- **Created directories caveat**: Post-crash recovery never removes
+  `manifest.createdDirs` entries because the manifest is untrusted and there is
+  no durable proof an empty directory was transaction-created. Harmless empty
+  directories may remain after recovery. Live in-process rollback (during
+  `executeWaveLanding`) continues removing its trusted in-memory `createdDirs`.
+
+### Manual recovery steps
+
+When recovery returns `manual_required`:
+
+1. Inspect the manifest to identify which paths have conflicts.
+2. Compare the current destination with the backup (original content).
+3. Decide whether to keep the concurrent modification or restore the original.
+4. Remove backup artifacts (`.pi-backup-*` suffix) once resolved.
+5. Remove temp artifacts (`.pi-landing-tmp-*` prefix) if any remain.
+
+### No automatic startup recovery
+
+This module does not provide automatic crash recovery on startup. Recovery is
+an explicit operation invoked by the caller when a crashed manifest is detected.

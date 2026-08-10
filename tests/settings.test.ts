@@ -37,6 +37,8 @@ test("/review-settings stages executor and reviewer changes and saves them toget
     "Reviewers         1/2 selected",
     "two [generic-cli] ✗",
     "Back",
+    "Parallel workers  2",
+    "2  current",
     "Save changes",
   ];
 
@@ -44,6 +46,7 @@ test("/review-settings stages executor and reviewer changes and saves them toget
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.deepEqual(saved.execution.activeExecutor, { source: "external", id: "fake" });
+  assert.equal(saved.execution.maxWorkers, 2);
   assert.deepEqual(saved.review.activeReviewers, [
     { source: "external", id: "one" },
     { source: "external", id: "two" },
@@ -322,6 +325,52 @@ test("scoped model reasoning choices omit unsupported extended levels", () => {
     scopedModels: [{ model: { provider: "llamacpp", id: "local", reasoning: true } }],
   })!;
   assert.deepEqual(local.supportedThinkingLevels, ["off", "minimal", "low", "medium", "high"]);
+});
+
+test("parallel workers is staged and saved atomically", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-workers-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    execution: { activeExecutor: null },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Parallel workers  2",
+    "4",
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.execution.maxWorkers, 4);
+  assert.equal(config.execution?.maxWorkers, 4);
+});
+
+test("parallel execution toggle is staged and saved atomically", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-parallel-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    execution: { activeExecutor: null },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    "Parallel executionDisabled",
+    "Enabled",
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.execution.parallelEnabled, true);
+  assert.equal(config.execution?.parallelEnabled, true);
 });
 
 function commandHarness(): {

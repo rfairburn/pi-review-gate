@@ -18,6 +18,8 @@ export interface ReviewSettingsSelection {
   maxCorrectionCycles: number;
   implementationGuidanceAfterCorrectionAttempts: number;
   retainBundles: RetainBundles;
+  maxWorkers: number;
+  parallelEnabled: boolean;
 }
 
 export async function persistReviewSettings(
@@ -32,6 +34,8 @@ export async function persistReviewSettings(
   const catalog = externalAgentCatalog(normalizeConfig(parsed));
   const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
   execution.activeExecutor = selection.activeExecutor;
+  execution.maxWorkers = selection.maxWorkers;
+  execution.parallelEnabled = selection.parallelEnabled;
   delete execution.externalExecutors;
   parsed.execution = execution;
   const review = isRecord(parsed.review) ? { ...parsed.review } : {};

@@ -18,7 +18,9 @@
       "source": "little-coder",
       "model": "openai-codex/gpt-5.6-sol",
       "thinkingLevel": "high"
-    }
+    },
+    "maxWorkers": 2,
+    "parallelEnabled": true
   },
   "externalAgents": [
     {

@@ -596,7 +596,7 @@ test("wave-integration — conflict at second worker preserves first", async () 
   }
 });
 
-// ── Test: identical sibling patches are integrated via --empty=keep ──────────
+// ── Test: identical sibling patches retain redundant commits ─────────────────
 
 test("wave-integration — identical sibling patches integrate without conflict", async () => {
   const artifactDir = await mkTmp("pi-wi-identical-");

@@ -278,7 +278,10 @@ test("internal executor and reviewers persist independent per-model reasoning le
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-reasoning-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
-    enabled: true,
+    // This test exercises settings serialization, not executable discovery.
+    // Keep the master gate disabled so it is portable to hosts where the
+    // little-coder launcher is not installed on PATH.
+    enabled: false,
     execution: {
       activeExecutor: { source: "little-coder", model: "openai-codex/gpt-5.6-luna" },
     },
@@ -301,7 +304,7 @@ test("internal executor and reviewers persist independent per-model reasoning le
     "Executor           gpt-5.6-luna [openai-codex] · High",
     "gpt-5.6-luna [openai-codex]  current",
     "Max",
-    "Reviewers          2/2 selected",
+    "Reviewers          2/2 selected — review disabled by master setting",
     "Reasoning · gpt-5.6-luna [openai-codex]  High",
     "Max",
     "Back",

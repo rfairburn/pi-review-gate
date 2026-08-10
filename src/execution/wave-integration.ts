@@ -238,8 +238,10 @@ async function validateWorkerCommit(
  *
  * Distinguishes actual textual conflicts (unmerged paths exist) from
  * empty cherry-picks (already applied) and infrastructure failures.
- * Empty cherry-picks are kept as no-ops (--empty=keep) so the integration
- * history preserves the declared worker order.
+ * Empty cherry-picks are kept as no-ops (--keep-redundant-commits) so the
+ * integration history preserves the declared worker order. This spelling is
+ * supported by older Git releases (including Ubuntu 24.04's Git 2.43), unlike
+ * the newer --empty=keep spelling.
  */
 async function cherryPickCommit(
   worktreeRoot: string,
@@ -255,9 +257,9 @@ async function cherryPickCommit(
   };
 
   try {
-    // Use --empty=keep so that already-applied changes produce a commit
-    // rather than being silently skipped (preserves declared order).
-    await gitCmd(["cherry-pick", "--empty=keep", commitSha], worktreeRoot, commitEnv);
+    // Keep already-applied changes as an empty commit rather than silently
+    // skipping them, preserving declared worker order across Git versions.
+    await gitCmd(["cherry-pick", "--keep-redundant-commits", commitSha], worktreeRoot, commitEnv);
     const newHead = await gitOut(["rev-parse", "HEAD"], worktreeRoot);
     return { success: true, newHead };
   } catch (err) {

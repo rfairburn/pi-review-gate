@@ -20,6 +20,14 @@ async function gitSpawn(
   timeoutMs = 30_000,
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
+    const hasInput = typeof input === "string" ? input.length > 0 : input.byteLength > 0;
+    let stdinError: NodeJS.ErrnoException | undefined;
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
     const child = spawn("git", args, {
       cwd,
       env,
@@ -31,17 +39,30 @@ async function gitSpawn(
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer | string) => { stdout += chunk; });
     child.stderr.on("data", (chunk: Buffer | string) => { stderr += chunk; });
-    child.on("error", reject);
-    child.on("exit", (code, signal) => {
+    child.on("error", fail);
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      // Commands such as update-index and write-tree do not consume stdin and
+      // may close the pipe before Node finishes an empty write. That is benign.
+      // For commands that require input, retain the error and report it after
+      // the child closes so callers never receive an empty/partial object id.
+      if (error.code !== "EPIPE" || hasInput) stdinError = error;
+    });
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
       if (code !== 0 || signal) {
         reject(new Error(`git ${args.join(" ")} exited with code ${code} signal ${signal}: ${stderr.trim()}`));
+      } else if (stdinError) {
+        reject(new Error(`git ${args.join(" ")} failed while writing stdin: ${stdinError.message}`));
       } else {
         resolve(stdout.trim());
       }
     });
 
-    child.stdin.write(input);
-    child.stdin.end();
+    // A single end(input) avoids the write/end race seen on Linux when a Git
+    // command exits quickly. Waiting for "close" above also ensures all stdio
+    // events have settled before the promise completes.
+    child.stdin.end(input);
   });
 }
 

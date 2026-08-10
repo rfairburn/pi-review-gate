@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { ReviewGateConfig } from "../config";
 import type { WaveCaptureResult } from "./wave-repository";
 import { captureWaveBase, WaveCaptureError } from "./wave-repository";
@@ -684,6 +684,11 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
           worktree,
           artifactDir,
           config,
+          sourceRoot: capture.discovery.captureRoot,
+          sourceRootAliases: [resolve(
+            input.cwd,
+            relative(capture.discovery.requestedCwd, capture.discovery.captureRoot),
+          )],
           scopedModels,
           signal,
           onUpdate: (subtaskUpdate) => {

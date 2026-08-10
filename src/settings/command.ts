@@ -183,7 +183,7 @@ function retentionLabel(value: RetainBundles): string {
 }
 
 function settingsRow(label: string, value: string): string {
-  return `${label.padEnd(18)}${value}`;
+  return `${label.padEnd(19)}${value}`;
 }
 
 function policyValueRow(label: string, value: string): string {

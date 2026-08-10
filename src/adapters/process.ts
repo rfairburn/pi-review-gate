@@ -114,7 +114,7 @@ export async function runPromptProcess(input: {
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: input.env ?? process.env,
+      env: { ...(input.env ?? process.env), PWD: input.cwd },
     });
 
     let stdout = "";

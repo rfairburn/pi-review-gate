@@ -356,15 +356,28 @@ test("batch render shows live progress with per-task status", () => {
         phase: "working",
         message: "Starting 3 worker(s) with max 2 concurrent",
         taskStatuses: [
-          { subtaskId: "task-0", phase: "executing", message: "executor turn 1 running" },
-          { subtaskId: "task-1", phase: "starting", message: "wave worker starting executor" },
+          {
+            subtaskId: "task-0",
+            phase: "executing",
+            message: "executor turn 1 running",
+            executorAdapter: "little-coder-model",
+            executorModel: "ollama/deepseek-v4-flash:0731-cloud",
+          },
+          {
+            subtaskId: "task-1",
+            phase: "reviewing",
+            message: "review cycle 1",
+            executorModel: "ollama/deepseek-v4-flash:0731-cloud",
+            reviewer: "openai-codex/gpt-5.6-luna (high)",
+          },
         ],
       },
     },
   }, { expanded: true }, theme).render(120).join("\n");
   assert.match(liveText, /Working/);
-  assert.match(liveText, /task-0/);
-  assert.match(liveText, /executing/);
+  assert.match(liveText, /task-0: executing · model: ollama\/deepseek-v4-flash:0731-cloud/);
+  assert.match(liveText, /task-1: reviewing · reviewer: openai-codex\/gpt-5\.6-luna \(high\)/);
+  assert.doesNotMatch(liveText, /task-1: reviewing · model: ollama/);
 });
 
 test("batch result marks non-landed outcomes as errors", () => {

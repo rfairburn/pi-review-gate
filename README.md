@@ -218,8 +218,12 @@ store a recovery manifest for manual recovery.
 
 **Source preservation**: The wave never mutates the source repository through
 Git operations. Source HEAD, index, staging state, and stash are preserved.
-Worktrees are isolated from the source. Clean worktrees are removed after
-completion; dirty or conflicted worktrees are preserved for diagnosis.
+Absolute source-workspace paths in task and correction text are remapped to the
+worker worktree, and executor `PWD` is set to its actual isolated cwd. Clean
+worktrees are removed after completion; dirty or conflicted worktrees are
+preserved for diagnosis. This is worktree and instruction isolation, not an OS
+sandbox: a hostile custom executor process can still access paths allowed by
+the host account.
 
 Pi/little-coder internal model selections use the exact canonical
 `provider/model` value and store a role-owned `thinkingLevel`. The allowed

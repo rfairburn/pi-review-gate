@@ -134,6 +134,16 @@ function reportProgress(
  * Freeze and validate reviewer selection for this worker.
  * Returns a frozen config with materialized reviewers, or throws on blockage.
  */
+export function reviewerProgressLabel(reviewer: DeciderConfig): string {
+  if (reviewer.adapter === "little-coder-model") {
+    return reviewerDisplayLabel(reviewer);
+  }
+  if ((reviewer.adapter === "codex-cli" || reviewer.adapter === "claude-cli") && reviewer.model) {
+    return reviewer.model;
+  }
+  return reviewerDisplayLabel(reviewer);
+}
+
 function freezeReviewers(
   config: ReviewGateConfig,
   scopedModels: string[] = [],
@@ -569,7 +579,7 @@ export async function runWaveWorkerLifecycle(
       message: `review cycle ${reviewCycles.length + 1}`,
       artifactDir: resolvedArtifactDir,
       reviewCycle: reviewCycles.length + 1,
-      reviewers: frozen.frozenConfig.reviewers?.map((r) => r.id) ?? [],
+      reviewers: frozen.frozenConfig.reviewers?.map(reviewerProgressLabel) ?? [],
     });
 
     // Run review on the current candidate (with error handling).
@@ -753,6 +763,8 @@ export async function runWaveWorkerLifecycle(
           worktree,
           artifactDir,
           config,
+          sourceRoot: input.sourceRoot,
+          sourceRootAliases: input.sourceRootAliases,
           priorResult: currentResult,
           feedback,
           turn: nextExecutorTurn++,
@@ -894,6 +906,8 @@ export async function runWaveWorkerLifecycle(
         worktree,
         artifactDir,
         config,
+        sourceRoot: input.sourceRoot,
+        sourceRootAliases: input.sourceRootAliases,
         priorResult: currentResult,
         feedback: passFeedback,
         turn: nextExecutorTurn++,

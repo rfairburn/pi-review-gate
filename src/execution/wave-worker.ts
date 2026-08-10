@@ -1,5 +1,5 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { promises as fs } from "node:fs";
 import { createExecutorAdapter } from "./adapters/factory";
 import { normalizeCandidate, type CandidateCommit } from "./wave-commits";
@@ -8,6 +8,93 @@ import type { WaveCaptureResult } from "./wave-repository";
 import type { ReviewGateConfig } from "../config";
 import type { ExecutorAdapter, ExecutorSession, ExecutorTurn, SubtaskProgressUpdate } from "./types";
 import type { TokenUsage } from "../usage";
+
+// ── path rewriting for workspace isolation ───────────────────────────────────
+
+/**
+ * Rewrite absolute paths rooted at sourceRoot to equivalent paths rooted at
+ * workerRoot. Only matches the exact sourceRoot or a descendant boundary
+ * (e.g., /repo-other is NOT rewritten when sourceRoot is /repo).
+ *
+ * This prevents the executor from following absolute source paths and writing
+ * directly to the source workspace instead of the isolated worktree.
+ */
+export function rewriteSourcePaths(
+  text: string,
+  sourceRoot: string | readonly string[],
+  workerRoot: string,
+): string {
+  const trimTrailingSeparators = (value: string): string => {
+    const rootLength = parse(value).root.length;
+    return value.length > rootLength ? value.replace(/[\\/]+$/, "") : value;
+  };
+  const escapePath = (value: string): string =>
+    [...value].map((char) =>
+      char === "/" || char === "\\"
+        ? "[\\\\/]"
+        : char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+    ).join("");
+
+  const worker = trimTrailingSeparators(workerRoot);
+  const roots = [...new Set(
+    (typeof sourceRoot === "string" ? [sourceRoot] : sourceRoot)
+      .map(trimTrailingSeparators),
+  )].sort((a, b) => b.length - a.length);
+
+  return roots.reduce((rewritten, source) => {
+    const flags = process.platform === "win32" ? "gi" : "g";
+    const pattern = new RegExp(
+      `(^|[^A-Za-z0-9._~\\\\/-])${escapePath(source)}(?=$|[\\\\/])`,
+      flags,
+    );
+    return rewritten.replace(pattern, (_match, prefix: string) => `${prefix}${worker}`);
+  }, text);
+}
+
+/**
+ * Rewrite a WaveWorkerTask, translating absolute source-root paths to worker-root paths.
+ */
+export function rewriteTaskPaths(
+  task: WaveWorkerTask,
+  sourceRoot: string | readonly string[],
+  workerRoot: string,
+): WaveWorkerTask {
+  return {
+    title: rewriteSourcePaths(task.title, sourceRoot, workerRoot),
+    instructions: rewriteSourcePaths(task.instructions, sourceRoot, workerRoot),
+    acceptanceCriteria: task.acceptanceCriteria.map((c) =>
+      rewriteSourcePaths(c, sourceRoot, workerRoot),
+    ),
+    relevantContext: task.relevantContext
+      ? rewriteSourcePaths(task.relevantContext, sourceRoot, workerRoot)
+      : undefined,
+  };
+}
+
+/**
+ * Isolation directive appended to the worker prompt to reinforce that all
+ * writes must remain under the worker root. Placed AFTER task text so it
+ * cannot be overridden by later task content.
+ */
+function isolationDirective(workerRoot: string): string {
+  return [
+    "",
+    "Workspace isolation (authoritative):",
+    `All reads, writes, commands, and verification must remain under the worker root: ${workerRoot}`,
+    "The original source workspace is outside this boundary and must be treated as read-only.",
+    "Absolute source-workspace paths in the request were mapped to this worker root.",
+    "Never write outside the worker root, even if earlier task text names another absolute path.",
+  ].join("\n");
+}
+
+export function buildWaveWorkerContinuationPrompt(
+  feedback: string,
+  sourceRoot: string | readonly string[],
+  workerRoot: string,
+): string {
+  return rewriteSourcePaths(feedback, sourceRoot, workerRoot)
+    + isolationDirective(workerRoot);
+}
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -56,6 +143,10 @@ export interface WaveWorkerInput {
   artifactDir: string;
   /** Review gate configuration. */
   config: ReviewGateConfig;
+  /** Canonical source root for path rewriting. */
+  sourceRoot: string;
+  /** Lexical aliases for the source root (for example macOS /tmp vs /private/tmp). */
+  sourceRootAliases?: string[];
   /** Scoped model identifiers for reviewer resolution. Unused in the initial-turn primitive; reserved for the review/correction lifecycle. */
   scopedModels?: string[];
   /** Abort signal for cancellation. */
@@ -78,6 +169,10 @@ export interface WaveWorkerContinuationInput {
   artifactDir: string;
   /** Review gate configuration. */
   config: ReviewGateConfig;
+  /** Canonical source root for path rewriting. */
+  sourceRoot: string;
+  /** Lexical aliases for the source root (for example macOS /tmp vs /private/tmp). */
+  sourceRootAliases?: string[];
   /** Prior successful result containing session and candidate. */
   priorResult: WaveWorkerResult;
   /** Feedback / correction text to supply to the resumed session. */
@@ -268,8 +363,18 @@ async function assertEffectiveCwdInsideWorktree(effectiveCwd: string, worktreeRo
  * The prompt discloses that the isolated snapshot contains tracked and
  * non-ignored untracked files but no Git-ignored files, and tells the
  * model not to manage commits.
+ *
+ * Absolute source-root paths in the task are rewritten to worker-root paths
+ * to prevent the executor from writing directly to the source workspace.
  */
-export function buildWaveWorkerPrompt(task: WaveWorkerTask): string {
+export function buildWaveWorkerPrompt(
+  task: WaveWorkerTask,
+  sourceRoot: string | readonly string[],
+  workerRoot: string,
+): string {
+  // Rewrite absolute source-root paths to worker-root paths.
+  const rewrittenTask = rewriteTaskPaths(task, sourceRoot, workerRoot);
+
   return [
     "You are the isolated implementation executor for one bounded phase.",
     "Work directly in the current workspace. Inspect the repository, implement the requested change, and run relevant verification.",
@@ -280,9 +385,10 @@ export function buildWaveWorkerPrompt(task: WaveWorkerTask): string {
     "The isolated snapshot you are working from contains tracked files and non-ignored untracked files.",
     "Git-ignored files are not present in this snapshot.",
     "",
-    renderWaveWorkerTask(task),
+    renderWaveWorkerTask(rewrittenTask),
     "",
     "When finished, summarize changed files, verification performed, and remaining risks.",
+    isolationDirective(workerRoot),
   ].join("\n");
 }
 
@@ -328,7 +434,7 @@ function reportProgress(
  * - Implement scheduling.
  */
 export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerResult> {
-  const { taskId, task, capture, worktree, artifactDir, config, signal } = input;
+  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, signal } = input;
 
   // ── Validate artifact directory (before mkdir) ──
   const resolvedArtifactDir = resolve(artifactDir);
@@ -390,8 +496,12 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     "utf8",
   );
 
-  // ── Build prompt ──
-  const prompt = buildWaveWorkerPrompt(task);
+  // ── Build prompt with path rewriting and isolation directive ──
+  const prompt = buildWaveWorkerPrompt(
+    task,
+    [sourceRoot, ...(sourceRootAliases ?? [])],
+    worktree.worktreeRoot,
+  );
 
   // ── Run one executor turn ──
   reportProgress(input, {
@@ -620,7 +730,7 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
  * - Implement scheduling.
  */
 export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Promise<WaveWorkerResult> {
-  const { taskId, task, capture, worktree, artifactDir, config, priorResult, feedback, turn, signal } = input;
+  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, priorResult, feedback, turn, signal } = input;
 
   // ── Validate prior result ──
   if (!priorResult.session) {
@@ -670,6 +780,12 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   });
 
   // ── Resume the exact executor session ──
+  const rewrittenFeedback = buildWaveWorkerContinuationPrompt(
+    feedback,
+    [sourceRoot, ...(sourceRootAliases ?? [])],
+    worktree.worktreeRoot,
+  );
+
   reportProgress(input, {
     phase: "executing",
     message: `executor turn ${turn} running (resumed)`,
@@ -683,7 +799,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   try {
     turnResult = await adapter.run({
       cwd: worktree.effectiveCwd,
-      prompt: feedback,
+      prompt: rewrittenFeedback,
       artifactDir: resolvedArtifactDir,
       turn,
       signal,

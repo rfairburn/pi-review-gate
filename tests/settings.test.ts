@@ -32,12 +32,12 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const selections = [
-    "Executor          Disabled",
+    "Executor           Disabled",
     "fake [run-as-binary]",
-    "Reviewers         1/2 selected",
+    "Reviewers          1/2 selected",
     "two [generic-cli] ✗",
     "Back",
-    "Parallel workers  2",
+    "Parallel workers   2",
     "2  current",
     "Save changes",
   ];
@@ -70,7 +70,7 @@ test("/review-settings clear-all saves a valid review-disabled configuration", a
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Reviewers         1/1 selected",
+    "Reviewers          1/1 selected",
     "Clear all",
     "Back",
     "Save changes",
@@ -93,7 +93,7 @@ test("root Escape leaves the settings file unchanged", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Bundle retention  On failure",
+    "Bundle retention   On failure",
     "Always",
     undefined,
   ]));
@@ -115,7 +115,7 @@ test("internal executor uses the exact Pi model label and canonical value", asyn
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Executor          Disabled",
+    "Executor           Disabled",
     "gpt-5.6-sol [openai-codex]",
     "High  current",
     "Save changes",
@@ -182,7 +182,7 @@ test("reviewer picker includes scoped models and shared review-capable external 
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Reviewers         0/2 selected — review disabled by master setting",
+    "Reviewers          0/2 selected — review disabled by master setting",
     "gpt-5.6-sol [openai-codex] ✗",
     "High  current",
     "codex [codex-cli] ✗",
@@ -211,7 +211,7 @@ test("review policy values are staged and saved atomically", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Review policy     1 corrections · concrete after 1",
+    "Review policy      1 corrections · concrete after 1",
     "Automatic correction attempts  1",
     "Concrete guidance after        1",
     "Back",
@@ -237,7 +237,7 @@ test("reviewer and executor timeouts are staged and saved together", async () =>
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Timeouts          review 10m · executor 30m",
+    "Timeouts           review 10m · executor 30m",
     "Reviewer timeout               10m",
     "Executor timeout               30m",
     "Back",
@@ -264,7 +264,7 @@ test("bundle retention is staged and saved from review settings", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Bundle retention  On failure",
+    "Bundle retention   On failure",
     "Always",
     "Save changes",
   ]));
@@ -298,10 +298,10 @@ test("internal executor and reviewers persist independent per-model reasoning le
   ];
 
   await registered.handler("", contextWithSelections([
-    "Executor          gpt-5.6-luna [openai-codex] · High",
+    "Executor           gpt-5.6-luna [openai-codex] · High",
     "gpt-5.6-luna [openai-codex]  current",
     "Max",
-    "Reviewers         2/2 selected",
+    "Reviewers          2/2 selected",
     "Reasoning · gpt-5.6-luna [openai-codex]  High",
     "Max",
     "Back",
@@ -340,7 +340,7 @@ test("parallel workers is staged and saved atomically", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Parallel workers  2",
+    "Parallel workers   2",
     "4",
     "Save changes",
   ]));
@@ -363,7 +363,7 @@ test("parallel execution toggle is staged and saved atomically", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Parallel executionDisabled",
+    "Parallel execution Disabled",
     "Enabled",
     "Save changes",
   ]));

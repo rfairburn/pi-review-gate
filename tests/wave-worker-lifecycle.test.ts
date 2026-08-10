@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
 import { createWorkerWorktree, removeWorktree, workerRefName } from "../src/execution/wave-worktrees";
-import { runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "../src/execution/wave-worker-lifecycle";
+import { reviewerProgressLabel, runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "../src/execution/wave-worker-lifecycle";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import type { WaveWorkerTask } from "../src/execution/wave-worker";
 
@@ -178,6 +178,25 @@ function buildErrorReviewerConfig(executorCommand: string): ReviewGateConfig {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+test("review progress prefers model names over unique reviewer ids", () => {
+  assert.equal(reviewerProgressLabel({
+    id: "reviewer-7e86e3f2",
+    adapter: "codex-cli",
+    model: "openai-codex/gpt-5.6-luna",
+  }), "openai-codex/gpt-5.6-luna");
+  assert.equal(reviewerProgressLabel({
+    id: "little-coder-openai-codex-gpt-5-6-luna",
+    adapter: "little-coder-model",
+    model: "openai-codex/gpt-5.6-luna",
+    thinkingLevel: "high",
+  }), "openai-codex/gpt-5.6-luna (high)");
+  assert.equal(reviewerProgressLabel({
+    id: "reviewer-without-model-metadata",
+    adapter: "generic-cli",
+    command: "reviewer",
+  }), "reviewer-without-model-metadata");
+});
+
 test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", async () => {
   const root = await mkTmp("pi-wwl-pass-");
   try {
@@ -191,6 +210,7 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
     const config = buildPassingReviewerConfig(command);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-pass",
       task: testTask(),
       capture,
@@ -251,6 +271,7 @@ test("lifecycle: pass then mutation causes re-review", async () => {
     const config = buildPassingReviewerConfig(command);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-mutate",
       task: testTask(),
       capture,
@@ -307,6 +328,7 @@ test("lifecycle: needs_changes correction then pass", async () => {
     firstConfig.maxCorrectionCycles = 2;
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-correct",
       task: testTask(),
       capture,
@@ -351,6 +373,7 @@ test("lifecycle: correction cap reached", async () => {
     config.maxCorrectionCycles = 1;
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-cap",
       task: testTask(),
       capture,
@@ -381,6 +404,7 @@ test("lifecycle: review disabled returns completed_unreviewed", async () => {
     config.enabled = false; // Disable review
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-disabled",
       task: testTask(),
       capture,
@@ -430,6 +454,7 @@ test("lifecycle: mode-only candidate is reviewed", async () => {
     const config = buildPassingReviewerConfig(command);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-mode",
       task: testTask(),
       capture,
@@ -460,6 +485,7 @@ test("lifecycle: reviewer error returns review_error", async () => {
     const config = buildErrorReviewerConfig(command);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-review-err",
       task: testTask(),
       capture,
@@ -490,6 +516,7 @@ test("lifecycle: accepted ref hash matches the passed candidate", async () => {
     const config = buildPassingReviewerConfig(command);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-ref-hash",
       task: testTask(),
       capture,
@@ -533,6 +560,7 @@ test("lifecycle: no_changes executor returns no_changes", async () => {
     const config = buildPassingReviewerConfig(command);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-noc",
       task: testTask(),
       capture,
@@ -563,6 +591,7 @@ test("lifecycle: result.json written to artifact root", async () => {
     const config = buildPassingReviewerConfig(command);
 
     await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-result-json",
       task: testTask(),
       capture,
@@ -602,6 +631,7 @@ test("lifecycle: no reviewers configured returns completed_unreviewed", async ()
     config.reviewers = [];
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-no-reviewers",
       task: testTask(),
       capture,
@@ -643,6 +673,7 @@ test("lifecycle: cancelled via abort signal", async () => {
     setTimeout(() => controller.abort(), 100);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-cancel",
       task: testTask(),
       capture,
@@ -672,6 +703,7 @@ test("lifecycle: failed workers are not pinned", async () => {
     const config = buildErrorReviewerConfig(command);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-no-pin",
       task: testTask(),
       capture,
@@ -720,6 +752,7 @@ test("lifecycle: correction cap with no-progress detection", async () => {
     config.maxCorrectionCycles = 3;
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-no-progress",
       task: testTask(),
       capture,
@@ -771,6 +804,7 @@ test("lifecycle: reviewer-blocked does not create artifact directory", async () 
     ];
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-blocked",
       task: testTask(),
       capture,
@@ -835,6 +869,7 @@ test("lifecycle: reviewer receives task acceptance criteria in evidence", async 
     };
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-evidence",
       task: testTask(),
       capture,
@@ -863,6 +898,7 @@ test("lifecycle: accepted HEAD equals exact passed candidate hash", async () => 
     const config = buildPassingReviewerConfig(command);
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-head",
       task: testTask(),
       capture,
@@ -917,6 +953,7 @@ test("lifecycle: correction exchange history preserved across cycles", async () 
     config.maxCorrectionCycles = 2;
 
     const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-exchange",
       task: testTask(),
       capture,
@@ -955,6 +992,7 @@ test("lifecycle: invalid maxCorrectionCycles fails safely", async () => {
 
     // Test negative value.
     const result1 = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-invalid-cap",
       task: testTask(),
       capture,
@@ -969,6 +1007,7 @@ test("lifecycle: invalid maxCorrectionCycles fails safely", async () => {
 
     // Test non-integer value.
     const result2 = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-invalid-cap",
       task: testTask(),
       capture,
@@ -988,6 +1027,7 @@ test("lifecycle: invalid maxCorrectionCycles fails safely", async () => {
     // Use a separate artifact dir to avoid interference.
     const artifactDir2 = join(capture.waveRoot, "artifacts", "task-invalid-cap-2");
     const result3 = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-invalid-cap-2",
       task: testTask(),
       capture,

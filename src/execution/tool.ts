@@ -270,17 +270,18 @@ export class ExecutionToolManager {
             if (update.taskStatuses) {
               for (const ts of update.taskStatuses) {
                 const idx = waveProgress.taskStatuses.findIndex((s) => s.subtaskId === ts.taskId);
+                const previous = idx >= 0 ? waveProgress.taskStatuses[idx] : undefined;
                 const entry = {
                   subtaskId: ts.taskId,
                   phase: ts.phase,
-                  message: ts.phase,
-                  artifactDir: ts.artifactDir,
-                  reviewer: ts.reviewer,
-                  executorAdapter: ts.executorAdapter,
-                  executorModel: ts.executorModel,
-                  reviewCycle: ts.reviewCycle,
-                  candidateCommitSha: ts.candidateCommitSha,
-                  acceptedCommitSha: ts.acceptedCommitSha,
+                  message: previous?.phase === ts.phase ? previous.message : ts.phase,
+                  artifactDir: ts.artifactDir ?? previous?.artifactDir,
+                  reviewer: ts.reviewer ?? previous?.reviewer,
+                  executorAdapter: ts.executorAdapter ?? previous?.executorAdapter,
+                  executorModel: ts.executorModel ?? previous?.executorModel,
+                  reviewCycle: ts.reviewCycle ?? previous?.reviewCycle,
+                  candidateCommitSha: ts.candidateCommitSha ?? previous?.candidateCommitSha,
+                  acceptedCommitSha: ts.acceptedCommitSha ?? previous?.acceptedCommitSha,
                 };
                 if (idx >= 0) {
                   waveProgress.taskStatuses[idx] = entry;
@@ -292,12 +293,17 @@ export class ExecutionToolManager {
             const subtask = update.subtask;
             if (subtask) {
               const idx = waveProgress.taskStatuses.findIndex((s) => s.subtaskId === subtask.subtaskId);
+              const previous = idx >= 0 ? waveProgress.taskStatuses[idx] : undefined;
               const entry = {
+                ...previous,
                 subtaskId: subtask.subtaskId ?? "unknown",
                 phase: subtask.phase,
                 message: subtask.message,
-                artifactDir: subtask.artifactDir,
-                reviewer: subtask.reviewers?.join(", "),
+                artifactDir: subtask.artifactDir ?? previous?.artifactDir,
+                reviewer: subtask.reviewers?.join(", ") ?? previous?.reviewer,
+                executorAdapter: subtask.adapter ?? previous?.executorAdapter,
+                executorModel: subtask.model ?? previous?.executorModel,
+                reviewCycle: subtask.reviewCycle ?? previous?.reviewCycle,
               };
               if (idx >= 0) {
                 waveProgress.taskStatuses[idx] = entry;
@@ -956,8 +962,12 @@ function renderBatchResult(result: unknown, options: unknown, theme: ThemeLike) 
         if (progress.taskStatuses.length > 0) {
           lines.push("", theme.fg("toolTitle", "  Per-task status"));
           for (const ts of progress.taskStatuses.slice(-8)) {
-            const reviewerInfo = ts.reviewer ? ` · reviewer: ${ts.reviewer}` : "";
-            lines.push(`  ${theme.fg("toolOutput", clip(`${ts.subtaskId}: ${ts.phase} · ${ts.message}${reviewerInfo}`, width - 6))}`);
+            const isReviewing = ts.phase === "reviewing";
+            const executor = ts.executorModel ?? ts.executorAdapter;
+            const agentInfo = isReviewing && ts.reviewer
+              ? ` · reviewer: ${ts.reviewer}`
+              : executor ? ` · model: ${executor}` : "";
+            lines.push(`  ${theme.fg("toolOutput", clip(`${ts.subtaskId}: ${ts.phase}${agentInfo} · ${ts.message}`, width - 6))}`);
             if (ts.artifactDir) {
               lines.push(theme.fg("dim", clip(`    artifacts: ${ts.artifactDir}`, width - 8)));
             }

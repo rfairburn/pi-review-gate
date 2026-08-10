@@ -118,8 +118,13 @@ function testTask(): WaveWorkerTask {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-test("wave-worker prompt discloses snapshot contents and tells model not to commit", () => {
-  const prompt = buildWaveWorkerPrompt(testTask());
+test("wave-worker prompt discloses snapshot contents and enforces mapped isolation", () => {
+  const prompt = buildWaveWorkerPrompt({
+    ...testTask(),
+    instructions: "Edit /source/root/worker-output.txt.",
+    acceptanceCriteria: ["/source/root/worker-output.txt exists"],
+    relevantContext: "Inspect /source/root/app.js.",
+  }, "/source/root", "/worker/root");
 
   // Prompt should disclose snapshot contents.
   assert.ok(
@@ -146,9 +151,12 @@ test("wave-worker prompt discloses snapshot contents and tells model not to comm
     prompt.includes("Acceptance criteria:"),
     "prompt should include acceptance criteria header",
   );
+  assert.ok(prompt.includes("/worker/root/worker-output.txt exists"));
+  assert.ok(prompt.includes("Inspect /worker/root/app.js."));
+  assert.ok(!prompt.includes("/source/root"));
   assert.ok(
-    prompt.includes("worker-output.txt exists with content"),
-    "prompt should include acceptance criteria items",
+    prompt.lastIndexOf("Workspace isolation (authoritative)") > prompt.lastIndexOf("Acceptance criteria:"),
+    "the final isolation directive must follow task-controlled text",
   );
 });
 
@@ -188,6 +196,7 @@ test("wave-worker runs one executor turn and normalizes to candidate", async () 
     };
 
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-1",
       task: testTask(),
       capture,
@@ -267,6 +276,7 @@ test("wave-worker returns no_changes when executor makes no modifications", asyn
     });
 
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-noc",
       task: testTask(),
       capture,
@@ -312,6 +322,7 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
     });
 
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-err",
       task: testTask(),
       capture,
@@ -357,6 +368,7 @@ test("wave-worker returns timeout on executor timeout", async () => {
     });
 
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-to",
       task: testTask(),
       capture,
@@ -406,6 +418,7 @@ test("wave-worker returns cancelled on abort signal", async () => {
     setTimeout(() => controller.abort(), 100);
 
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-cancel",
       task: testTask(),
       capture,
@@ -452,6 +465,7 @@ test("wave-worker returns executor_error on empty response", async () => {
     });
 
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-empty",
       task: testTask(),
       capture,
@@ -505,6 +519,7 @@ test("wave-worker validates artifact directory is under waveRoot", async () => {
         worktree: worker,
         artifactDir: outsideArtifactDir,
         config,
+        sourceRoot: capture.discovery.captureRoot,
       }),
       /not within|not under wave root/,
     );
@@ -552,6 +567,7 @@ test("wave-worker validates artifact directory is outside worktree", async () =>
         worktree: worker,
         artifactDir: insideArtifactDir,
         config,
+        sourceRoot: capture.discovery.captureRoot,
       }),
       /must be outside the worktree/,
     );
@@ -617,6 +633,7 @@ test("wave-worker executor runs in effectiveCwd, not worktreeRoot", async () => 
     });
 
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-cwd",
       task: testTask(),
       capture,
@@ -668,6 +685,7 @@ test("wave-worker does not mutate source repository", async () => {
     });
 
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-source",
       task: testTask(),
       capture,
@@ -715,6 +733,7 @@ test("wave-worker result type carries all required fields", async () => {
     });
 
     const result: WaveWorkerResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-type",
       task: testTask(),
       capture,
@@ -766,6 +785,7 @@ test("wave-worker progress callbacks are invoked", async () => {
 
     const phases: string[] = [];
     const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-progress",
       task: testTask(),
       capture,
@@ -833,6 +853,7 @@ test("resumeWaveWorker resumes the exact prior session", async () => {
 
     // First run: initial turn.
     const firstResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume",
       task: testTask(),
       capture,
@@ -847,6 +868,7 @@ test("resumeWaveWorker resumes the exact prior session", async () => {
 
     // Resume with the prior session.
     const resumeResult = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume",
       task: testTask(),
       capture,
@@ -909,6 +931,7 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
 
     // First run.
     const firstResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume2",
       task: testTask(),
       capture,
@@ -950,6 +973,7 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
 
     // Resume with corrections.
     const resumeResult = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume2",
       task: testTask(),
       capture,
@@ -1051,6 +1075,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     });
 
     const firstResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume3",
       task: testTask(),
       capture,
@@ -1065,6 +1090,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     // The worktree is already at the first candidate state (normalizeCandidate reset HEAD).
     // The executor does not modify files, so the tree should still differ from base.
     const resumeResult = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume3",
       task: testTask(),
       capture,
@@ -1119,6 +1145,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     });
 
     const revertFirstResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume3-revert",
       task: testTask(),
       capture,
@@ -1160,6 +1187,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     });
 
     const revertResumeResult = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume3-revert",
       task: testTask(),
       capture,
@@ -1219,6 +1247,7 @@ test("resumeWaveWorker failure paths do not pin accepted refs", async () => {
     });
 
     const firstResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume4",
       task: testTask(),
       capture,
@@ -1256,6 +1285,7 @@ test("resumeWaveWorker failure paths do not pin accepted refs", async () => {
     });
 
     const failResult = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume4",
       task: testTask(),
       capture,
@@ -1321,6 +1351,7 @@ test("resumeWaveWorker returns cancelled on abort signal", async () => {
     });
 
     const firstResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume5",
       task: testTask(),
       capture,
@@ -1362,6 +1393,7 @@ test("resumeWaveWorker returns cancelled on abort signal", async () => {
     setTimeout(() => controller.abort(), 100);
 
     const cancelResult = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume5",
       task: testTask(),
       capture,
@@ -1431,6 +1463,7 @@ test("resumeWaveWorker rejects turn < 2", async () => {
         worktree: worker,
         artifactDir,
         config: dummyConfig,
+        sourceRoot: capture.discovery.captureRoot,
         priorResult: fakeResult,
         feedback: "fix",
         turn: 1,
@@ -1485,6 +1518,7 @@ test("resumeWaveWorker requires prior session and candidate", async () => {
         worktree: worker,
         artifactDir,
         config: dummyConfig7,
+        sourceRoot: capture.discovery.captureRoot,
         priorResult: noSessionResult,
         feedback: "fix",
         turn: 2,
@@ -1509,6 +1543,7 @@ test("resumeWaveWorker requires prior session and candidate", async () => {
         worktree: worker,
         artifactDir,
         config: dummyConfig7,
+        sourceRoot: capture.discovery.captureRoot,
         priorResult: noCandidateResult,
         feedback: "fix",
         turn: 2,

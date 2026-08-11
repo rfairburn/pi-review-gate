@@ -236,7 +236,10 @@ test("manifest includes snapshot policy disclosure", async () => {
     // Read the manifest
     const { readFile } = await import("node:fs/promises");
     const manifest = JSON.parse(await readFile(join(result.waveRoot, "wave-manifest.json"), "utf8"));
-    assert.equal(manifest.snapshotPolicy, "non-ignored untracked included; ignored files excluded");
+    assert.equal(
+      manifest.snapshotPolicy,
+      "tracked/indexed files always included; non-ignored untracked files size-limited; ignored files excluded",
+    );
     assert.equal(manifest.includesUntracked, true);
     assert.equal(manifest.excludesIgnored, true);
   } finally {

@@ -483,23 +483,69 @@ test("capture — parent relation for committed Git source", async () => {
 
 // ── Capture: size-limit failure ─────────────────────────────────────────────
 
-test("capture — size-limit failure rejects explicitly", async () => {
+test("capture — tracked files are always captured regardless of size limit", async () => {
   const dir = await mkTmp("pi-cb-size-");
   try {
     await git(["init", "--quiet"], dir);
-    // Create a file larger than the limit.
     const bigData = Buffer.alloc(1024, "x");
     await writeFile(join(dir, "big.bin"), bigData);
     await git(["add", "."], dir);
     await git(["commit", "--quiet", "-m", "init"], dir);
 
+    const result = await captureWaveBase({
+      cwd: dir,
+      maxSnapshotBytes: 100,
+      waveId: "test-tracked-size",
+    });
+
+    assert.equal(result.entries.find((entry) => entry.path === "big.bin")?.size, bigData.length);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("capture — staged files are always captured regardless of size limit", async () => {
+  const dir = await mkTmp("pi-cb-staged-size-");
+  try {
+    await git(["init", "--quiet"], dir);
+    await writeFile(join(dir, "base.txt"), "base\n", "utf8");
+    await git(["add", "."], dir);
+    await git(["commit", "--quiet", "-m", "init"], dir);
+
+    const bigData = Buffer.alloc(1024, "s");
+    await writeFile(join(dir, "staged.bin"), bigData);
+    await git(["add", "staged.bin"], dir);
+
+    const result = await captureWaveBase({
+      cwd: dir,
+      maxSnapshotBytes: 100,
+      waveId: "test-staged-size",
+    });
+
+    assert.equal(result.entries.find((entry) => entry.path === "staged.bin")?.size, bigData.length);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("capture — untracked size-limit failure rejects explicitly", async () => {
+  const dir = await mkTmp("pi-cb-untracked-size-");
+  try {
+    await git(["init", "--quiet"], dir);
+    await writeFile(join(dir, "tracked.txt"), "tracked\n", "utf8");
+    await git(["add", "."], dir);
+    await git(["commit", "--quiet", "-m", "init"], dir);
+
+    const bigData = Buffer.alloc(1024, "u");
+    await writeFile(join(dir, "untracked.bin"), bigData);
+
     await assert.rejects(
       captureWaveBase({
         cwd: dir,
-        maxSnapshotBytes: 100, // Very small limit.
-        waveId: "test-size",
+        maxSnapshotBytes: 100,
+        waveId: "test-untracked-size",
       }),
-      /Snapshot size limit exceeded/,
+      /Snapshot size limit exceeded for untracked files.*untracked\.bin/,
     );
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -912,11 +958,13 @@ test("capture — failure after wave-root creation cleans up wave root", async (
   const artifactDir = await mkTmp("pi-cb-cleanup-artifact-");
   try {
     await git(["init", "--quiet"], dir);
-    // Create a file larger than the limit.
-    const bigData = Buffer.alloc(1024, "x");
-    await writeFile(join(dir, "big.bin"), bigData);
+    await writeFile(join(dir, "tracked.txt"), "tracked\n", "utf8");
     await git(["add", "."], dir);
     await git(["commit", "--quiet", "-m", "init"], dir);
+
+    // Create an untracked file larger than the limit.
+    const bigData = Buffer.alloc(1024, "x");
+    await writeFile(join(dir, "big.bin"), bigData);
 
     await assert.rejects(
       captureWaveBase({
@@ -925,7 +973,7 @@ test("capture — failure after wave-root creation cleans up wave root", async (
         waveId: "test-cleanup",
         artifactDir,
       }),
-      /Snapshot size limit exceeded/,
+      /Snapshot size limit exceeded for untracked files/,
     );
 
     // Verify the wave root was cleaned up — no leftover directories in artifactDir.
@@ -1200,6 +1248,41 @@ test("capture — path-set drift detected and causes retry", async () => {
       // Should have succeeded on second attempt with the extra file.
       assert.equal(result.waveId, "test-path-drift");
       assert.ok(result.entries.find((e) => e.path === "extra.txt"));
+    } finally {
+      waveRepoMutable.__testOnly_mutateSourceBetweenCaptureAndVerify = undefined;
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
+test("capture — untracked-to-indexed classification drift causes retry", async () => {
+  const dir = await mkTmp("pi-cb-classification-drift-");
+  const artifactDir = await mkTmp("pi-cb-classification-drift-artifact-");
+  try {
+    await git(["init", "--quiet"], dir);
+    await writeFile(join(dir, "base.txt"), "base\n", "utf8");
+    await git(["add", "."], dir);
+    await git(["commit", "--quiet", "-m", "init"], dir);
+    await writeFile(join(dir, "later-staged.bin"), Buffer.alloc(64, "x"));
+
+    let attempts = 0;
+    waveRepoMutable.__testOnly_mutateSourceBetweenCaptureAndVerify = async () => {
+      attempts += 1;
+      if (attempts === 1) await git(["add", "later-staged.bin"], dir);
+    };
+
+    try {
+      const result = await captureWaveBase({
+        cwd: dir,
+        maxSnapshotBytes: 100,
+        waveId: "test-classification-drift",
+        artifactDir,
+      });
+
+      assert.equal(attempts, 2, "classification change should force a fresh capture");
+      assert.equal(result.entries.find((entry) => entry.path === "later-staged.bin")?.size, 64);
     } finally {
       waveRepoMutable.__testOnly_mutateSourceBetweenCaptureAndVerify = undefined;
     }

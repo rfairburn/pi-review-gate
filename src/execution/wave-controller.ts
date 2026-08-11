@@ -341,7 +341,7 @@ function buildManifest(
     sourceRoot: capture.discovery.captureRoot,
     includesUntracked: true,
     excludesIgnored: true,
-    snapshotPolicy: "non-ignored untracked included; ignored files excluded",
+    snapshotPolicy: "tracked/indexed files always included; non-ignored untracked files size-limited; ignored files excluded",
     totalBytes: capture.totalBytes,
     tasks: taskResults.map((tr) => {
       const executorInfo = taskExecutorInfo?.get(tr.taskId);

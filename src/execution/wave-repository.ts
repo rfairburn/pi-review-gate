@@ -235,13 +235,24 @@ function normalizeRelative(p: string): string {
  * Git metadata directories (.git) are always omitted.
  */
 export async function enumerateWaveSourcePaths(discovery: WaveSourceDiscovery): Promise<string[]> {
+  return (await enumerateWaveSourcePathSet(discovery)).paths;
+}
+
+interface EnumeratedWavePaths {
+  paths: string[];
+  /** Paths whose current contents are not represented by HEAD or the index. */
+  untrackedPaths: Set<string>;
+}
+
+async function enumerateWaveSourcePathSet(discovery: WaveSourceDiscovery): Promise<EnumeratedWavePaths> {
   if (discovery.isGit) {
     return enumerateGitPaths(discovery);
   }
-  return enumerateNonGitPaths(discovery);
+  const paths = await enumerateNonGitPaths(discovery);
+  return { paths, untrackedPaths: new Set(paths) };
 }
 
-async function enumerateGitPaths(discovery: WaveSourceDiscovery): Promise<string[]> {
+async function enumerateGitPaths(discovery: WaveSourceDiscovery): Promise<EnumeratedWavePaths> {
   const root = discovery.gitTopLevel!;
   const paths = new Set<string>();
 
@@ -259,7 +270,12 @@ async function enumerateGitPaths(discovery: WaveSourceDiscovery): Promise<string
   const untracked = await gitNulList("ls-files", ["--others", "--exclude-standard"], root);
   for (const p of untracked) paths.add(p);
 
-  return filterAndSort([...paths]);
+  const sortedPaths = filterAndSort([...paths]);
+  const includedPaths = new Set(sortedPaths);
+  return {
+    paths: sortedPaths,
+    untrackedPaths: new Set(filterAndSort(untracked).filter((path) => includedPaths.has(path))),
+  };
 }
 
 async function enumerateNonGitPaths(discovery: WaveSourceDiscovery): Promise<string[]> {
@@ -356,7 +372,7 @@ export interface WaveEntry {
 export interface WaveCaptureOptions {
   /** Working directory to capture from. */
   cwd: string;
-  /** Maximum total bytes allowed across all blobs. */
+  /** Maximum total bytes allowed across non-ignored untracked blobs. Tracked/indexed blobs are always captured. */
   maxSnapshotBytes: number;
   /** Wave identifier (generated if omitted). */
   waveId?: string;
@@ -458,7 +474,8 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     // Re-discover the source on each attempt.
     const discovery = await discoverWaveSource(cwd);
-    const allPaths = await enumerateWaveSourcePaths(discovery);
+    const enumeratedPaths = await enumerateWaveSourcePathSet(discovery);
+    const allPaths = enumeratedPaths.paths;
 
     // Containment check: reject if artifactParent is inside or equal to sourceRoot.
     const sourceRoot = await fs.realpath(discovery.captureRoot);
@@ -492,6 +509,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
         repoPath,
         discovery.captureRoot,
         allPaths,
+        enumeratedPaths.untrackedPaths,
         maxSnapshotBytes,
       );
 
@@ -504,6 +522,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
         cwd,
         discovery,
         allPaths,
+        enumeratedPaths.untrackedPaths,
         entries,
         repoPath,
       );
@@ -589,6 +608,7 @@ async function verifyCaptureConsistency(
   cwd: string,
   discovery: WaveSourceDiscovery,
   allPaths: string[],
+  untrackedPaths: Set<string>,
   capturedEntries: WaveEntry[],
   repoPath: string,
 ): Promise<{ consistent: true } | { consistent: false; reason: string }> {
@@ -607,13 +627,22 @@ async function verifyCaptureConsistency(
   }
 
   // Re-enumerate paths from the second discovery to detect path-set drift.
-  const reEnumeratedPaths = await enumerateWaveSourcePaths(reDiscovery);
+  const reEnumeration = await enumerateWaveSourcePathSet(reDiscovery);
+  const reEnumeratedPaths = reEnumeration.paths;
   if (reEnumeratedPaths.length !== allPaths.length) {
     return { consistent: false, reason: "path count changed" };
   }
   for (let i = 0; i < allPaths.length; i += 1) {
     if (reEnumeratedPaths[i] !== allPaths[i]) {
       return { consistent: false, reason: `path at index ${i} changed: ${allPaths[i]} -> ${reEnumeratedPaths[i]}` };
+    }
+  }
+  if (reEnumeration.untrackedPaths.size !== untrackedPaths.size) {
+    return { consistent: false, reason: "untracked path count changed" };
+  }
+  for (const path of untrackedPaths) {
+    if (!reEnumeration.untrackedPaths.has(path)) {
+      return { consistent: false, reason: `untracked path classification changed: ${path}` };
     }
   }
 
@@ -772,10 +801,12 @@ async function buildTreeFromPaths(
   repoPath: string,
   captureRoot: string,
   paths: string[],
+  untrackedPaths: Set<string>,
   maxSnapshotBytes: number,
 ): Promise<{ entries: WaveEntry[]; totalBytes: number }> {
   const entries: WaveEntry[] = [];
   let totalBytes = 0;
+  let untrackedBytes = 0;
 
   for (const relPath of paths) {
     const fullPath = join(captureRoot, relPath);
@@ -827,12 +858,13 @@ async function buildTreeFromPaths(
       }
       size = targetBuffer.length;
 
-      // Check size limit before hashing.
       totalBytes += size;
-      if (totalBytes > maxSnapshotBytes) {
+      if (untrackedPaths.has(relPath)) untrackedBytes += size;
+      if (untrackedBytes > maxSnapshotBytes) {
         throw new Error(
-          `Snapshot size limit exceeded: ${totalBytes} bytes exceeds maxSnapshotBytes of ${maxSnapshotBytes}. ` +
-          `The file "${relPath}" (${size} bytes) pushed the total over the limit.`,
+          `Snapshot size limit exceeded for untracked files: ${untrackedBytes} bytes exceeds ` +
+          `maxSnapshotBytes of ${maxSnapshotBytes}. The untracked file "${relPath}" ` +
+          `(${size} bytes) pushed the untracked total over the limit.`,
         );
       }
 
@@ -843,12 +875,13 @@ async function buildTreeFromPaths(
       const data = await fs.readFile(fullPath);
       size = data.length;
 
-      // Check size limit using actual bytes read.
       totalBytes += size;
-      if (totalBytes > maxSnapshotBytes) {
+      if (untrackedPaths.has(relPath)) untrackedBytes += size;
+      if (untrackedBytes > maxSnapshotBytes) {
         throw new Error(
-          `Snapshot size limit exceeded: ${totalBytes} bytes exceeds maxSnapshotBytes of ${maxSnapshotBytes}. ` +
-          `The file "${relPath}" (${size} bytes) pushed the total over the limit.`,
+          `Snapshot size limit exceeded for untracked files: ${untrackedBytes} bytes exceeds ` +
+          `maxSnapshotBytes of ${maxSnapshotBytes}. The untracked file "${relPath}" ` +
+          `(${size} bytes) pushed the untracked total over the limit.`,
         );
       }
 

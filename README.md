@@ -204,7 +204,11 @@ workspace. Non-ignored untracked files are included in the snapshot. Git-ignored
 files are excluded from the captured snapshot and landing. This means dependencies
 installed in `node_modules`, secrets in `.env`, and other ignored paths are
 not captured or landed. If your task depends on files that are git-ignored,
-the worker will not see them.
+the worker will not see them. Files known to Git through `HEAD` or the index are
+always captured regardless of repository size. During parallel wave capture,
+`maxSnapshotBytes` limits only the cumulative size of non-ignored untracked
+files (50 MiB by default). For ordinary serial review snapshots, the same
+setting continues to bound the textual file content retained for diffing.
 
 **Artifacts**: Each wave produces a `waveRoot` directory containing artifacts
 for each task, a wave manifest (`wave-manifest.json`), and stable refs for

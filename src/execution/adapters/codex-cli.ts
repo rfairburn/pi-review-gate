@@ -25,7 +25,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
     ];
     const args = request.session
       ? ["exec", "resume", ...shared, request.session.id, "-"]
-      : ["exec", ...shared, "--sandbox", "workspace-write", "--approve-for-me", "-"];
+      : ["exec", ...shared, "--approve-for-me", "-"];
     const output = await runPromptProcess({
       command: this.config.command ?? "codex",
       args,

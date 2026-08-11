@@ -29,7 +29,7 @@ test("little-coder executor uses the canonical model, isolated session, and nest
   assert.equal(captured.disabled, "1");
 });
 
-test("Codex executor starts workspace-write and resumes the exact thread", async () => {
+test("Codex executor starts with automatic workspace-write approval and resumes the exact thread", async () => {
   const fixture = await harnessFixture("codex");
   const adapter = new CodexExecutorAdapter({
     id: "codex",
@@ -44,7 +44,7 @@ test("Codex executor starts workspace-write and resumes the exact thread", async
   assert.equal(first.session.id, "11111111-1111-4111-8111-111111111111");
   const start = JSON.parse(await readFile(fixture.capture, "utf8"));
   assert.ok(start.argv.includes("--approve-for-me"));
-  assert.equal(valueAfter(start.argv, "--sandbox"), "workspace-write");
+  assert.ok(!start.argv.includes("--sandbox"));
   assert.equal(valueAfter(start.argv, "--model"), "gpt-5.6-sol");
   assert.equal(start.disabled, "1");
 

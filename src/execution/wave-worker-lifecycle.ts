@@ -19,6 +19,7 @@ async function gitResetHard(worktreeRoot: string, commitSha: string): Promise<vo
   );
 }
 import {
+  rewriteTaskPaths,
   runWaveWorker,
   resumeWaveWorker,
   validateArtifactPath,
@@ -550,6 +551,15 @@ export async function runWaveWorkerLifecycle(
   // Set the baseline snapshot for the review window.
   setReviewWindowBaseline(reviewState, baseSnapshot);
   const reviewCycles: ReviewCycle[] = [];
+  // Give reviewers the same isolated task definition that the executor sees.
+  // In particular, absolute source-workspace paths (including lexical aliases)
+  // must resolve to this worker rather than inviting the reviewer to inspect the
+  // untouched source workspace before landing.
+  const reviewTask = rewriteTaskPaths(
+    task,
+    [input.sourceRoot, ...(input.sourceRootAliases ?? [])],
+    worktree.worktreeRoot,
+  );
   let currentResult: WaveWorkerResult = initialResult;
   let currentCandidate: CandidateCommit = candidate;
   let correctionCount = 0;
@@ -588,7 +598,7 @@ export async function runWaveWorkerLifecycle(
     try {
       reviewOutput = await runCandidateReview(
         frozen.frozenConfig,
-        task,
+        reviewTask,
         capture.repositoryPath,
         capture.baseCommit,
         currentCandidate.commitSha,

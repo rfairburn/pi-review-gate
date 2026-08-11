@@ -886,6 +886,72 @@ test("lifecycle: reviewer receives task acceptance criteria in evidence", async 
   }
 });
 
+test("lifecycle: reviewer receives the executor's isolated path mapping", async () => {
+  const root = await mkTmp("pi-wwl-review-paths-");
+  try {
+    const { sourceDir, capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-review-paths");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-review-paths");
+    await mkdir(artifactDir, { recursive: true });
+
+    const { command } = await createFakeExecutor(root, "absolute-output.txt");
+    const aliasRoot = sourceDir + "-lexical-alias";
+    const expectedWorkerPath = join(worker.worktreeRoot, "absolute-output.txt");
+    const config: ReviewGateConfig = {
+      ...buildConfig(command),
+      enabled: true,
+      decider: {
+        id: "path-mapping-checker",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "process.stdin.resume();",
+            "let s='';",
+            "process.stdin.on('data',c=>s+=c);",
+            "process.stdin.on('end',()=>{",
+            `const sourceRoot=${JSON.stringify(sourceDir)};`,
+            `const aliasRoot=${JSON.stringify(aliasRoot)};`,
+            `const workerPath=${JSON.stringify(expectedWorkerPath)};`,
+            "const ok=!s.includes(sourceRoot)&&!s.includes(aliasRoot)&&s.includes(workerPath);",
+            "process.stdout.write(JSON.stringify(ok",
+            "?{verdict:'pass',summary:'review paths are isolated',findings:[]}",
+            ":{verdict:'needs_changes',summary:'review received source paths',findings:[{severity:'blocking',file:'session',line:null,issue:'source path leaked',recommendation:'rewrite it'}]}));",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 5000,
+      },
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: sourceDir,
+      sourceRootAliases: [aliasRoot],
+      taskId: "task-review-paths",
+      task: {
+        title: `Create ${sourceDir}/absolute-output.txt`,
+        instructions: `Create ${sourceDir}/absolute-output.txt and verify it via ${aliasRoot}/absolute-output.txt.`,
+        acceptanceCriteria: [
+          `${sourceDir}/absolute-output.txt exists`,
+          `${aliasRoot}/absolute-output.txt has the requested content`,
+        ],
+        relevantContext: `The requested file is ${sourceDir}/absolute-output.txt.`,
+      },
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("lifecycle: accepted HEAD equals exact passed candidate hash", async () => {
   const root = await mkTmp("pi-wwl-head-");
   try {

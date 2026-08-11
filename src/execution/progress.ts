@@ -202,33 +202,34 @@ export class CodexJsonlActivityExtractor {
 }
 
 function formatToolStart(toolName: string, args: unknown): string {
+  const name = toolName.toLowerCase();
   const values = isRecord(args) ? args : {};
-  if (toolName === "bash" && typeof values.command === "string") {
+  if (name === "bash" && typeof values.command === "string") {
     return `bash · ${singleLine(values.command)}`;
   }
-  if ((toolName === "read" || toolName === "edit" || toolName === "write" || toolName === "ls") && typeof values.path === "string") {
-    return `${toolName} · ${values.path}`;
+  const filePath = typeof values.path === "string"
+    ? values.path
+    : typeof values.file_path === "string"
+      ? values.file_path
+      : undefined;
+  if ((name === "read" || name === "edit" || name === "write" || name === "ls") && filePath) {
+    return `${name} · ${singleLine(filePath)}`;
   }
-  if (toolName === "grep") {
-    const pattern = typeof values.pattern === "string" ? values.pattern : "";
-    const path = typeof values.path === "string" ? ` · ${values.path}` : "";
-    return `grep · ${pattern}${path}`;
+  if (name === "grep" || name === "find" || name === "glob") {
+    const pattern = typeof values.pattern === "string" ? singleLine(values.pattern) : "";
+    const path = filePath ? ` · ${singleLine(filePath)}` : "";
+    return `${name} · ${pattern}${path}`;
   }
-  if (toolName === "find") {
-    const pattern = typeof values.pattern === "string" ? values.pattern : "";
-    const path = typeof values.path === "string" ? ` · ${values.path}` : "";
-    return `find · ${pattern}${path}`;
-  }
-  return `${toolName} started`;
+  return `${singleLine(toolName)} started`;
 }
 
 function formatToolEnd(toolName: string, result: unknown, isError: boolean): string {
-  if (isError) return `${toolName} failed${resultSummary(result)}`;
-  if (toolName === "read" || toolName === "grep" || toolName === "find" || toolName === "ls") {
-    return `${toolName} completed`;
+  const name = toolName.toLowerCase();
+  if (isError) return `${name} failed${resultSummary(result)}`;
+  if (name === "read" || name === "grep" || name === "find" || name === "glob" || name === "ls") {
+    return `${name} completed`;
   }
-  const summary = resultSummary(result);
-  return `${toolName} completed${summary}`;
+  return `${name} completed${resultSummary(result)}`;
 }
 
 function resultSummary(result: unknown): string {
@@ -293,4 +294,185 @@ function singleLine(value: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+export interface ClaudeStreamResult {
+  text: string;
+  error?: string;
+  sessionId?: string;
+  resultEnvelope?: Record<string, unknown>;
+}
+
+export class ClaudeStreamJsonParser {
+  private pending = "";
+  private assistantText = "";
+  private streamedText = "";
+  private error: string | undefined;
+  private sessionId: string | undefined;
+  private resultEnvelope: Record<string, unknown> | undefined;
+
+  push(chunk: string): void {
+    this.pending += chunk;
+    for (;;) {
+      const newline = this.pending.search(/\r?\n/);
+      if (newline === -1) return;
+      const line = this.pending.slice(0, newline);
+      this.pending = this.pending.slice(newline + (this.pending[newline] === "\r" ? 2 : 1));
+      this.processLine(line);
+    }
+  }
+
+  finish(): ClaudeStreamResult {
+    if (this.pending.trim()) this.processLine(this.pending);
+    this.pending = "";
+    const resultText = this.resultEnvelope && typeof this.resultEnvelope.result === "string"
+      ? this.resultEnvelope.result
+      : "";
+    return {
+      text: resultText || this.assistantText || this.streamedText,
+      error: this.error,
+      sessionId: this.sessionId,
+      resultEnvelope: this.resultEnvelope,
+    };
+  }
+
+  private processLine(line: string): void {
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (!isRecord(event)) return;
+    if (typeof event.session_id === "string") this.sessionId = event.session_id;
+
+    if (event.type === "result" || event.type === undefined && typeof event.result === "string") {
+      this.resultEnvelope = event;
+      if (event.is_error === true) this.error = claudeErrorSummary(event);
+      return;
+    }
+    if (event.type === "assistant" && isRecord(event.message)) {
+      const text = textFromMessageContent(event.message.content);
+      if (text.trim()) this.assistantText = text;
+      if (isRecord(event.message.usage)) this.resultEnvelope ??= { message: event.message };
+      return;
+    }
+    if (event.type === "stream_event" && isRecord(event.event) && isRecord(event.event.delta)
+      && event.event.delta.type === "text_delta" && typeof event.event.delta.text === "string") {
+      this.streamedText += event.event.delta.text;
+    }
+  }
+}
+
+export class ClaudeStreamActivityExtractor {
+  private pending = "";
+  private lastModelUpdate = "";
+  private readonly toolNames = new Map<string, string>();
+  private readonly seenToolStarts = new Set<string>();
+  private readonly seenToolResults = new Set<string>();
+
+  constructor(
+    private readonly onActivity: (message: string) => void,
+    private readonly options: { includeModelUpdates?: boolean } = {},
+  ) {}
+
+  push(chunk: string): void {
+    this.pending += chunk;
+    for (;;) {
+      const newline = this.pending.search(/\r?\n/);
+      if (newline === -1) return;
+      const line = this.pending.slice(0, newline);
+      this.pending = this.pending.slice(newline + (this.pending[newline] === "\r" ? 2 : 1));
+      this.processLine(line);
+    }
+  }
+
+  finish(): void {
+    if (this.pending.trim()) this.processLine(this.pending);
+    this.pending = "";
+  }
+
+  private processLine(line: string): void {
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (!isRecord(event)) return;
+
+    if (event.type === "system") {
+      if (event.subtype === "init") this.onActivity("model turn started");
+      if (event.subtype === "api_retry") {
+        const attempt = typeof event.attempt === "number" && typeof event.max_retries === "number"
+          ? ` ${event.attempt}/${event.max_retries}`
+          : "";
+        const reason = typeof event.error === "string" ? ` · ${singleLine(event.error)}` : "";
+        this.onActivity(`model retry${attempt}${reason}`);
+      }
+      return;
+    }
+
+    if (event.type === "stream_event" && isRecord(event.event)) {
+      const block = event.event.type === "content_block_start" && isRecord(event.event.content_block)
+        ? event.event.content_block
+        : undefined;
+      if (block?.type === "thinking") this.onActivity("model reasoning");
+      if (block?.type === "text") this.onActivity("model composing response");
+      return;
+    }
+
+    if (event.type === "assistant" && isRecord(event.message)) {
+      if (Array.isArray(event.message.content)) {
+        for (const block of event.message.content) {
+          if (!isRecord(block) || block.type !== "tool_use" || typeof block.name !== "string") continue;
+          const id = typeof block.id === "string" ? block.id : `${block.name}:${this.seenToolStarts.size}`;
+          this.toolNames.set(id, block.name);
+          if (this.seenToolStarts.has(id)) continue;
+          this.seenToolStarts.add(id);
+          this.onActivity(formatToolStart(block.name, block.input));
+        }
+      }
+      this.emitModelUpdate(textFromMessageContent(event.message.content));
+      return;
+    }
+
+    if (event.type === "user" && isRecord(event.message) && Array.isArray(event.message.content)) {
+      for (const block of event.message.content) {
+        if (!isRecord(block) || block.type !== "tool_result") continue;
+        const id = typeof block.tool_use_id === "string" ? block.tool_use_id : `result:${this.seenToolResults.size}`;
+        if (this.seenToolResults.has(id)) continue;
+        this.seenToolResults.add(id);
+        const name = this.toolNames.get(id) ?? "tool";
+        const content = typeof block.content === "string"
+          ? [{ type: "text", text: block.content }]
+          : block.content;
+        this.onActivity(formatToolEnd(name, { content }, block.is_error === true));
+      }
+      return;
+    }
+
+    if (event.type === "result") {
+      this.onActivity(event.is_error === true
+        ? `model failed · ${singleLine(claudeErrorSummary(event))}`
+        : "model turn completed");
+    }
+  }
+
+  private emitModelUpdate(text: string): void {
+    const message = text.trim();
+    if (this.options.includeModelUpdates === false || !message || message === this.lastModelUpdate) return;
+    this.lastModelUpdate = message;
+    this.onActivity(`model update · ${singleLine(message)}`);
+  }
+}
+
+function claudeErrorSummary(value: Record<string, unknown>): string {
+  const status = typeof value.api_error_status === "number" ? `Claude API ${value.api_error_status}` : "Claude API error";
+  const detail = typeof value.error === "string" && value.error.trim()
+    ? value.error
+    : typeof value.result === "string" && value.result.trim()
+      ? value.result
+      : undefined;
+  return detail ? `${status}: ${detail}` : status;
 }

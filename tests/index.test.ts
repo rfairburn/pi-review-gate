@@ -116,7 +116,13 @@ test("cap status is concise while reviewer results are delivered once in the tra
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
     const notices: string[] = [];
     const followUps: string[] = [];
+    const statuses: Array<[string, string | undefined]> = [];
     const pi = {
+      ui: {
+        setStatus(key: string, text: string | undefined) {
+          statuses.push([key, text]);
+        },
+      },
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
@@ -136,6 +142,8 @@ test("cap status is concise while reviewer results are delivered once in the tra
 
     const noticeText = notices.join("\n\n");
     assert.match(noticeText, /automatic correction cap reached/);
+    assert.ok(statuses.some(([, text]) => text?.includes("started")));
+    assert.deepEqual(statuses.at(-1), ["review-gate", undefined]);
     assert.match(noticeText, /Complete reviewer feedback was transmitted to the implementing model/);
     assert.match(noticeText, /Use \/review-continue to authorize/);
     assert.doesNotMatch(noticeText, /missing guard/);

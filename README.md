@@ -185,6 +185,12 @@ verdicts.
 Streaming activity updates are UI-only and are not copied into the controlling
 model's context; only the final subtask packet is returned as tool context.
 
+Claude CLI reviewers and executors also stream bounded native lifecycle and tool
+activity into these views without exposing reasoning or reviewer output.
+Foreground automatic reviews, `/review-now`, and reviewer-question commands show
+the active reviewer milestone and elapsed time in the status line until the
+review completes or is cancelled.
+
 ### Parallel execution with `execute_subtasks`
 
 `execute_subtasks` runs multiple independent bounded tasks in parallel. Each

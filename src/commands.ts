@@ -15,7 +15,7 @@ import {
   type ReviewGateState,
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
-import { extractSignal, sendNotice, sendFollowUp, sendSteeringPrompt } from "./pi";
+import { extractSignal, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { createReviewTransmissionMessage, deliverReviewTransmission, writeReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
@@ -124,17 +124,24 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, "review gate: automatic review is disabled by settings");
         return;
       }
-      const output = await runReview({
-        cwd: input.cwd(),
-        request: buildRequestContext(input.state) || "Manual /review-now request",
-        before: window.baseline,
-        config: reviewConfig,
-        evidence: window.evidence,
-        correctionAttemptCount: getCorrectionAttemptCount(window),
-        window,
-        signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
-        notify: (message) => sendCommandNotice(ctx, message),
-      });
+      const statusTracker = createStatusTracker(ctx, "review-gate", "reviewing changes");
+      let output;
+      try {
+        output = await runReview({
+          cwd: input.cwd(),
+          request: buildRequestContext(input.state) || "Manual /review-now request",
+          before: window.baseline,
+          config: reviewConfig,
+          evidence: window.evidence,
+          correctionAttemptCount: getCorrectionAttemptCount(window),
+          window,
+          signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
+          notify: (message) => sendCommandNotice(ctx, message),
+          onUpdate: (message) => statusTracker.update(message),
+        });
+      } finally {
+        statusTracker.clear();
+      }
 
       if (!isSessionActive()) {
         return;
@@ -253,18 +260,25 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const contextWindow = getReviewerQuestionWindow(input.state);
       const reviewConfig = contextWindow?.reviewConfig ?? currentConfig();
-      const output = await runAskReviewer({
-        cwd: input.cwd(),
-        question,
-        request: buildRequestContext(input.state, contextWindow),
-        before: contextWindow?.baseline,
-        config: reviewConfig,
-        evidence: contextWindow?.evidence,
-        correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
-        window: contextWindow,
-        signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
-        notify: (message) => sendCommandNotice(ctx, message),
-      });
+      const statusTracker = createStatusTracker(ctx, "review-gate", "asking reviewer");
+      let output;
+      try {
+        output = await runAskReviewer({
+          cwd: input.cwd(),
+          question,
+          request: buildRequestContext(input.state, contextWindow),
+          before: contextWindow?.baseline,
+          config: reviewConfig,
+          evidence: contextWindow?.evidence,
+          correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
+          window: contextWindow,
+          signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
+          notify: (message) => sendCommandNotice(ctx, message),
+          onUpdate: (message) => statusTracker.update(message),
+        });
+      } finally {
+        statusTracker.clear();
+      }
 
       if (!isSessionActive()) {
         return;

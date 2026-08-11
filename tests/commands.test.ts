@@ -137,6 +137,7 @@ test("/review-now requested changes reset the automatic correction budget", asyn
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const followUps: string[] = [];
     const notices: string[] = [];
+    const statuses: Array<[string, string | undefined]> = [];
     const pi = {
       registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
         commands.set(name, options.handler);
@@ -146,6 +147,11 @@ test("/review-now requested changes reset the automatic correction budget", asyn
       },
     };
     const ctx = {
+      ui: {
+        setStatus(key: string, text: string | undefined) {
+          statuses.push([key, text]);
+        },
+      },
       notify(message: string) {
         notices.push(message);
       },
@@ -164,6 +170,8 @@ test("/review-now requested changes reset the automatic correction budget", asyn
     assert.equal(followUps.length, 1);
     assert.match(followUps[0] ?? "", /missing test/);
     assert.match(notices.join("\n"), /review gate: changes requested/);
+    assert.ok(statuses.some(([, text]) => text?.includes("started")));
+    assert.deepEqual(statuses.at(-1), ["review-gate", undefined]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -560,6 +568,7 @@ test("/ask-reviewer submits the same reviewer text without opening the interacti
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const userMessages: Array<{ message: string; options: unknown }> = [];
     const preparedCommands: string[] = [];
+    const statuses: Array<[string, string | undefined]> = [];
     let editorCalls = 0;
     const pi = {
       registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
@@ -572,6 +581,9 @@ test("/ask-reviewer submits the same reviewer text without opening the interacti
     const ctx = {
       ui: {
         notify() {},
+        setStatus(key: string, text: string | undefined) {
+          statuses.push([key, text]);
+        },
         async editor(_title: string, prefill: string) {
           editorCalls += 1;
           return prefill;
@@ -601,6 +613,8 @@ test("/ask-reviewer submits the same reviewer text without opening the interacti
     assert.equal(userMessages[1]?.message, userMessages[0]?.message);
     assert.deepEqual(preparedCommands, ["ask-reviewer-interactive", "ask-reviewer"]);
     assert.equal(state.reviewWindow?.evidence.acceptedReviewerQuestions.length, 2);
+    assert.ok(statuses.some(([, text]) => text?.includes("started")));
+    assert.equal(statuses.filter(([, text]) => text === undefined).length, 2);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

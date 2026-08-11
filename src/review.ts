@@ -78,6 +78,7 @@ export interface AskReviewerInput {
   changeIdentity?: ChangeIdentity;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
+  onUpdate?: (message: string) => void;
   window?: ReviewWindow;
 }
 
@@ -417,6 +418,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     reviewSequence,
     kind: "reviewer question",
     notify: input.notify,
+    onUpdate: input.onUpdate,
   });
   if (invocation.aborted) {
     return {

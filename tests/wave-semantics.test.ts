@@ -476,13 +476,13 @@ test("executeWaveLanding respects abort signal before source mutation", async ()
     const controller = new AbortController();
     controller.abort();
 
-    const landingResult = await executeWaveLanding(plan, capture, controller.signal);
-
-    // Should fail due to abort.
-    assert.ok(
-      landingResult.status === "rolled_back" || landingResult.status === "recovery_required",
-      `Expected rolled_back or recovery_required, got ${landingResult.status}`,
+    await assert.rejects(
+      executeWaveLanding(plan, capture, controller.signal),
+      (error: unknown) => error instanceof Error && error.name === "AbortError",
     );
+
+    assert.equal(await readFile(join(sourceDir, "readme.md"), "utf8"), "# hello\n");
+    await assert.rejects(readFile(join(sourceDir, "new-file.txt")), { code: "ENOENT" });
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

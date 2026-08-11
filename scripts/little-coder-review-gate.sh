@@ -3,6 +3,7 @@ set -euo pipefail
 
 REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
+ORCHESTRATOR_PROMPT="$REVIEW_GATE_ROOT/scripts/orchestrator-system-prompt.md"
 
 unset PI_REVIEW_GATE_CONFIG
 unset LITTLE_CODER_REVIEW_CONFIG
@@ -40,4 +41,4 @@ esac
 echo "pi-review-gate config: $REVIEW_GATE_CONFIG"
 echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"
 
-exec little-coder "$@"
+exec little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT" "$@"

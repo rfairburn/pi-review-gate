@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ORCHESTRATOR_PROMPT="$ROOT/scripts/orchestrator-system-prompt.md"
 PRESET="${1:-}"
 if [[ -z "$PRESET" ]]; then
   echo "usage: $0 <codex|claude|glm-5.2|little-coder-deepseek-v4-flash|double|double-deepseek-v4-flash|triple|fake> [little-coder args...]" >&2
@@ -124,7 +125,7 @@ export PI_REVIEW_GATE_CONFIG="$CONFIG"
 export LITTLE_CODER_EXTRA_EXTENSIONS="$ROOT/dist/src/index.js${LITTLE_CODER_EXTRA_EXTENSIONS:+:$LITTLE_CODER_EXTRA_EXTENSIONS}"
 echo "LITTLE_CODER_EXTRA_EXTENSIONS=$LITTLE_CODER_EXTRA_EXTENSIONS"
 if ((${#LITTLE_CODER_ARGS[@]})); then
-  exec little-coder "${LITTLE_CODER_ARGS[@]}"
+  exec little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT" "${LITTLE_CODER_ARGS[@]}"
 else
-  exec little-coder
+  exec little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT"
 fi

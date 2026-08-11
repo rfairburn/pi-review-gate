@@ -10,6 +10,13 @@ npm install
 npm test
 ```
 
+The default test run executes up to two test files concurrently. For diagnosing
+resource-sensitive or ordering-sensitive failures, use the serial fallback:
+
+```bash
+npm run test:serial
+```
+
 ## Configuration
 
 Point the extension at a JSON config file:

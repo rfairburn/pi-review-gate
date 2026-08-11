@@ -20,7 +20,10 @@ import { withLittleCoderThinkingBudget } from "../little-coder-thinking";
 export class LittleCoderAdapter implements ModelAdapter {
   readonly kind = "little-coder-model";
 
-  constructor(private readonly config: LittleCoderDeciderConfig) {}
+  constructor(
+    private readonly config: LittleCoderDeciderConfig,
+    private readonly dependencies: { runPromptProcess?: typeof runPromptProcess } = {},
+  ) {}
 
   async run(req: ModelAdapterRequest): Promise<ReviewResult> {
     const thinkingLevel = this.config.thinkingLevel ?? "high";
@@ -61,7 +64,7 @@ export class LittleCoderAdapter implements ModelAdapter {
       readOnlyReviewerSystemPrompt(),
     ];
 
-    const output = await runPromptProcess({
+    const output = await (this.dependencies.runPromptProcess ?? runPromptProcess)({
       command: this.config.command ?? "little-coder",
       args,
       cwd: req.cwd,

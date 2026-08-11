@@ -22,7 +22,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
   try {
     const argvPath = join(dir, "argv.json");
     const commandPath = join(dir, "fake-codex.mjs");
-    const reviewJson = JSON.stringify({ verdict: "pass", summary: "codex ok", findings: [] });
+    const reviewJson = JSON.stringify({ verdict: "pass", summary: "codex ok", guidance: null, findings: [], error: null });
     await writeFile(commandPath, [
       "#!/usr/bin/env node",
       "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
@@ -72,6 +72,11 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
     const outputSchemaPath = argv[argv.indexOf("--output-schema") + 1];
     const outputSchema = JSON.parse(await readFile(outputSchemaPath, "utf8"));
     assert.deepEqual(outputSchema.properties.verdict.enum, ["pass", "needs_changes", "error"]);
+    assert.deepEqual(outputSchema.required, ["verdict", "summary", "guidance", "findings", "error"]);
+    assert.deepEqual(
+      outputSchema.properties.findings.items.required,
+      ["severity", "file", "line", "issue", "recommendation"],
+    );
     assert.equal(argv.includes("--ephemeral"), false);
     assert.deepEqual(resumedArgv.slice(0, 2), ["exec", "resume"]);
     assert.equal(resumedArgv.includes("codex-session-1"), true);
@@ -162,7 +167,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
   try {
     const argvPath = join(dir, "argv.json");
     const commandPath = join(dir, "fake-claude.mjs");
-    const reviewJson = JSON.stringify({ verdict: "pass", summary: "claude ok", findings: [] });
+    const reviewJson = JSON.stringify({ verdict: "pass", summary: "claude ok", guidance: null, findings: [], error: null });
     await writeFile(commandPath, [
       "#!/usr/bin/env node",
       "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
@@ -207,6 +212,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
     assert.deepEqual(argv.includes("--add-dir"), true);
     assert.equal(argv[argv.indexOf("--add-dir") + 1], dir);
     assert.deepEqual(argv.includes("--append-system-prompt"), true);
+    assert.equal(argv.includes("--output-schema"), false);
     assert.equal(argv.includes("--no-session-persistence"), false);
     const sessionId = argv[argv.indexOf("--session-id") + 1];
     assert.equal(typeof sessionId, "string");

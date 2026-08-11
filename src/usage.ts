@@ -63,47 +63,63 @@ export function extractCodexReviewFromJsonl(stdout: string): {
   usage?: TokenUsage;
   sessionId?: string;
 } {
-  let lastUsage: unknown;
-  let text = "";
-  let sessionId: string | undefined;
-  for (const line of stdout.split(/\r?\n/)) {
+  const extractor = new CodexJsonlReviewExtractor();
+  extractor.push(stdout);
+  return extractor.finish();
+}
+
+export class CodexJsonlReviewExtractor {
+  private lastUsage: unknown;
+  private text = "";
+  private sessionId: string | undefined;
+  private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
+
+  push(chunk: string): void {
+    this.decoder.push(chunk);
+  }
+
+  finish(): { text: string; usage?: TokenUsage; sessionId?: string } {
+    this.decoder.finish();
+    let usage: TokenUsage | undefined;
+    if (isRecord(this.lastUsage)) {
+      const lastTokenUsage = isRecord(this.lastUsage.last_token_usage) ? this.lastUsage.last_token_usage : undefined;
+      const totalTokenUsage = isRecord(this.lastUsage.total_token_usage) ? this.lastUsage.total_token_usage : undefined;
+      const raw = lastTokenUsage ?? totalTokenUsage;
+      usage = normalizeOpenAiStyleUsage(raw ?? this.lastUsage, this.lastUsage);
+    }
+    return { text: this.text, usage, sessionId: this.sessionId };
+  }
+
+  private processLine(line: string): void {
     if (!line.trim()) {
-      continue;
+      return;
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
     } catch {
-      continue;
+      return;
     }
     if (!isRecord(parsed)) {
-      continue;
+      return;
     }
     if (parsed.type === "turn.completed" && isRecord(parsed.usage)) {
-      lastUsage = parsed.usage;
+      this.lastUsage = parsed.usage;
     } else if (isRecord(parsed.payload) && parsed.payload.type === "token_count") {
-      lastUsage = parsed.payload.info;
+      this.lastUsage = parsed.payload.info;
     }
     if (isRecord(parsed.item) && parsed.item.type === "agent_message" && typeof parsed.item.text === "string" && parsed.item.text.trim()) {
-      text = parsed.item.text;
+      this.text = boundedText(parsed.item.text);
     } else if (parsed.type === "message" && isRecord(parsed.message) && parsed.message.role === "assistant") {
       const messageText = textFromContent(parsed.message.content);
       if (messageText.trim()) {
-        text = messageText;
+        this.text = boundedText(messageText);
       }
     }
     if (parsed.type === "thread.started" && typeof parsed.thread_id === "string") {
-      sessionId = parsed.thread_id;
+      this.sessionId = parsed.thread_id;
     }
   }
-  let usage: TokenUsage | undefined;
-  if (isRecord(lastUsage)) {
-    const lastTokenUsage = isRecord(lastUsage.last_token_usage) ? lastUsage.last_token_usage : undefined;
-    const totalTokenUsage = isRecord(lastUsage.total_token_usage) ? lastUsage.total_token_usage : undefined;
-    const raw = lastTokenUsage ?? totalTokenUsage;
-    usage = normalizeOpenAiStyleUsage(raw ?? lastUsage, lastUsage);
-  }
-  return { text, usage, sessionId };
 }
 
 export function parseClaudeUsage(value: unknown): TokenUsage | undefined {
@@ -239,38 +255,25 @@ export function extractReviewTextFromPiJsonl(stdout: string): PiJsonlReviewExtra
 }
 
 export class PiJsonlReviewExtractor {
-  private pending = "";
   private finalText = "";
-  private currentDeltaText = "";
+  private readonly currentDeltaText = new BoundedTextAccumulator(MAX_AGENT_TEXT_BYTES);
   private partialText = "";
   private usage: TokenUsage | undefined;
   private terminalError = "";
+  private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
 
   push(chunk: string): void {
-    this.pending += chunk;
-    while (true) {
-      const newlineIndex = this.pending.search(/\r?\n/);
-      if (newlineIndex === -1) {
-        return;
-      }
-      const line = this.pending.slice(0, newlineIndex);
-      const newlineLength = this.pending[newlineIndex] === "\r" && this.pending[newlineIndex + 1] === "\n" ? 2 : 1;
-      this.pending = this.pending.slice(newlineIndex + newlineLength);
-      this.processLine(line);
-    }
+    this.decoder.push(chunk);
   }
 
   finish(): PiJsonlReviewExtraction {
-    if (this.pending.trim()) {
-      this.processLine(this.pending);
-    }
-    this.pending = "";
+    this.decoder.finish();
     return this.result();
   }
 
   result(): PiJsonlReviewExtraction {
     return {
-      text: this.finalText || this.currentDeltaText || this.partialText,
+      text: this.finalText || this.currentDeltaText.value || this.partialText,
       usage: this.usage,
       terminalError: this.terminalError || undefined,
     };
@@ -304,7 +307,7 @@ export class PiJsonlReviewExtractor {
     }
 
     if (parsed.type === "message_start" && isAssistantMessage(parsed.message)) {
-      this.currentDeltaText = "";
+      this.currentDeltaText.clear();
       this.partialText = "";
       return;
     }
@@ -322,7 +325,7 @@ export class PiJsonlReviewExtractor {
   private applyMessageUpdate(parsed: Record<string, unknown>): void {
     const event = isRecord(parsed.assistantMessageEvent) ? parsed.assistantMessageEvent : undefined;
     if (event?.type === "text_delta" && typeof event.delta === "string") {
-      this.currentDeltaText += event.delta;
+      this.currentDeltaText.append(event.delta);
     }
     const partial = isRecord(event?.partial)
       ? event.partial
@@ -332,7 +335,7 @@ export class PiJsonlReviewExtractor {
     if (isAssistantMessage(partial)) {
       const text = textFromContent(partial.content);
       if (text.trim()) {
-        this.partialText = text;
+        this.partialText = boundedText(text);
       }
     }
   }
@@ -340,9 +343,10 @@ export class PiJsonlReviewExtractor {
   private captureAssistantText(content: unknown): void {
     const text = textFromContent(content);
     if (text.trim()) {
-      this.finalText = text;
-      this.currentDeltaText = text;
-      this.partialText = text;
+      const bounded = boundedText(text);
+      this.finalText = bounded;
+      this.currentDeltaText.set(bounded);
+      this.partialText = bounded;
       this.terminalError = "";
     }
   }
@@ -372,6 +376,10 @@ function piStreamError(event: Record<string, unknown>): string | undefined {
 function boundedError(value: string): string {
   const normalized = value.trim();
   return normalized.length <= 2_000 ? normalized : normalized.slice(normalized.length - 2_000);
+}
+
+function boundedText(value: string): string {
+  return utf8Prefix(value, MAX_AGENT_TEXT_BYTES);
 }
 
 function normalizeOpenAiStyleUsage(value: Record<string, unknown>, raw: unknown): TokenUsage {
@@ -455,3 +463,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isAssistantMessage(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && value.role === "assistant";
 }
+import { BoundedJsonlDecoder, BoundedTextAccumulator, MEBIBYTE, utf8Prefix } from "./jsonl";
+
+const MAX_AGENT_TEXT_BYTES = 16 * MEBIBYTE;

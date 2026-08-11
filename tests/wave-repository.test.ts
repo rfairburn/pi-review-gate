@@ -1,17 +1,32 @@
 import assert from "node:assert/strict";
 import { execFile, execSync } from "node:child_process";
-import { chmod, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import {
-  captureWaveBase,
+  captureWaveBase as captureWaveBaseImpl,
   discoverWaveSource,
   enumerateWaveSourcePaths,
+  pruneCompletedWaveRoots,
+  WaveCaptureError,
+  type WaveCaptureOptions,
+  type WaveEntry,
+  type WaveSourceDiscovery,
 } from "../src/execution/wave-repository";
 
 const execFileAsync = promisify(execFile);
+
+let captureMutationHook: ((discovery: WaveSourceDiscovery, entries: WaveEntry[]) => Promise<void> | void) | undefined;
+function captureWaveBase(options: WaveCaptureOptions) {
+  return captureWaveBaseImpl({
+    ...options,
+    hooks: captureMutationHook
+      ? { mutateSourceBetweenCaptureAndVerify: captureMutationHook }
+      : undefined,
+  });
+}
 
 const GIT_ENV = {
   GIT_OPTIONAL_LOCKS: "0",
@@ -20,6 +35,37 @@ const GIT_ENV = {
   GIT_COMMITTER_NAME: "Test",
   GIT_COMMITTER_EMAIL: "test@test.com",
 };
+
+test("wave artifact GC removes expired successes but preserves recovery roots", async () => {
+  const parent = await mkTmp("pi-wave-gc-");
+  try {
+    const expired = join(parent, "wave-expired");
+    const recovery = join(parent, "wave-recovery");
+    for (const root of [expired, recovery]) {
+      await mkdir(join(root, "wave-repo.git"), { recursive: true });
+    }
+    await writeFile(join(expired, "wave-manifest.json"), JSON.stringify({
+      version: 1,
+      phase: "completed",
+      repositoryPath: join(expired, "wave-repo.git"),
+      landingStatus: "landed",
+    }));
+    await writeFile(join(recovery, "wave-manifest.json"), JSON.stringify({
+      version: 1,
+      phase: "completed",
+      repositoryPath: join(recovery, "wave-repo.git"),
+      landingStatus: "recovery_required",
+    }));
+    const old = new Date(Date.now() - 10_000);
+    await utimes(expired, old, old);
+    await utimes(recovery, old, old);
+    assert.deepEqual(await pruneCompletedWaveRoots(parent, 1_000), [expired]);
+    await assert.rejects(access(expired), /ENOENT/);
+    await access(recovery);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
 
 async function git(args: string[], cwd: string): Promise<string> {
   const { stdout } = await execFileAsync("git", args, {
@@ -80,6 +126,17 @@ test("discoverWaveSource — unborn repo", async () => {
     assert.equal(result.isGit, true);
     assert.equal(result.headUnborn, true);
     assert.equal(result.headCommit, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("discoverWaveSource propagates a corrupt HEAD instead of treating it as unborn", async () => {
+  const dir = await mkTmp("pi-wg-corrupt-head-");
+  try {
+    await git(["init", "--quiet"], dir);
+    await writeFile(join(dir, ".git", "HEAD"), "not a valid ref\n", "utf8");
+    await assert.rejects(discoverWaveSource(dir), /Git discovery failed|not a git repository/i);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1084,11 +1141,10 @@ test("capture — rejects artifactDir symlink pointing inside source tree", asyn
 
 // ── Torn-snapshot detection: retry on mid-capture mutation ──────────────────
 
-// Import the test seam and error class.
-import * as waveRepo from "../src/execution/wave-repository";
-const WaveCaptureError = waveRepo.WaveCaptureError;
-// Cast to allow mutation of the test seam (TypeScript treats namespace imports as read-only).
-const waveRepoMutable = waveRepo as unknown as { __testOnly_mutateSourceBetweenCaptureAndVerify: ((d: any, e: any) => Promise<void> | void) | undefined };
+const waveRepoMutable = {
+  get __testOnly_mutateSourceBetweenCaptureAndVerify() { return captureMutationHook; },
+  set __testOnly_mutateSourceBetweenCaptureAndVerify(value: typeof captureMutationHook) { captureMutationHook = value; },
+};
 
 test("capture — one-time mid-capture mutation causes retry and succeeds", async () => {
   const dir = await mkTmp("pi-cb-retry-");
@@ -1162,8 +1218,8 @@ test("capture — continuous mutation exhausts retries with classified error", a
           maxCaptureAttempts: 2,
         }),
         (err: unknown) => {
-          assert.ok(err instanceof waveRepo.WaveCaptureError, "should be WaveCaptureError");
-          assert.equal((err as waveRepo.WaveCaptureError).code, "workspace_changing_during_capture");
+          assert.ok(err instanceof WaveCaptureError, "should be WaveCaptureError");
+          assert.equal((err as WaveCaptureError).code, "workspace_changing_during_capture");
           return true;
         },
       );
@@ -1438,8 +1494,8 @@ test("capture — default maxCaptureAttempts is 3", async () => {
           artifactDir,
         }),
         (err: unknown) => {
-          assert.ok(err instanceof waveRepo.WaveCaptureError);
-          assert.equal((err as waveRepo.WaveCaptureError).code, "workspace_changing_during_capture");
+          assert.ok(err instanceof WaveCaptureError);
+          assert.equal((err as WaveCaptureError).code, "workspace_changing_during_capture");
           // Should have tried 3 times.
           assert.equal(mutationCount, 3, "should have attempted 3 times");
           return true;

@@ -37,6 +37,8 @@ test("review process telemetry counts repeated lifecycle representations as one 
     { type: "message_end", message: { role: "assistant", content: [call] } },
     { type: "tool_execution_start", toolCallId: "call-1", toolName: "read" },
     { type: "tool_execution_end", toolCallId: "call-1", toolName: "read" },
+    { type: "message", message: { role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: "payload" }] } },
+    { type: "message", message: { role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: "payload" }] } },
   ];
   const script = `for(const event of ${JSON.stringify(events)})process.stdout.write(JSON.stringify(event)+'\\n')`;
   const output = await runPromptProcess({
@@ -49,4 +51,36 @@ test("review process telemetry counts repeated lifecycle representations as one 
 
   assert.equal(output.code, 0);
   assert.equal(processTelemetry(output).toolCalls, 1);
+  const oneResult = events[4]?.message;
+  assert.equal(processTelemetry(output).toolResultBytes, Buffer.byteLength(JSON.stringify(oneResult)));
+});
+
+test("runPromptProcess reports early stdin closure instead of crashing the host", async () => {
+  const output = await runPromptProcess({
+    command: process.execPath,
+    args: ["-e", "process.stdin.destroy();process.exitCode=7"],
+    cwd: process.cwd(),
+    prompt: "x".repeat(2_000_000),
+    timeoutMs: 15_000,
+  });
+
+  assert.equal(output.aborted, false);
+  assert.equal(output.timedOut, false);
+  assert.ok(output.code !== 0 || output.stdinError);
+});
+
+test("runPromptProcess remains abortable while a large prompt is being written", async () => {
+  const controller = new AbortController();
+  const running = runPromptProcess({
+    command: process.execPath,
+    args: ["-e", "process.stdin.pause();setInterval(()=>{},1000)"],
+    cwd: process.cwd(),
+    prompt: "x".repeat(8 * 1024 * 1024),
+    timeoutMs: 15_000,
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(), 25);
+  const output = await running;
+  assert.equal(output.aborted, true);
+  assert.equal(output.timedOut, false);
 });

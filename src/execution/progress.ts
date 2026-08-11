@@ -1,5 +1,9 @@
+import { BoundedJsonlDecoder, BoundedTextAccumulator, MEBIBYTE, utf8Prefix } from "../jsonl";
+
+const MAX_STREAMED_TEXT_BYTES = 16 * MEBIBYTE;
+
 export class PiJsonlActivityExtractor {
-  private pending = "";
+  private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
   private lastModelUpdate = "";
 
   constructor(
@@ -8,20 +12,11 @@ export class PiJsonlActivityExtractor {
   ) {}
 
   push(chunk: string): void {
-    this.pending += chunk;
-    while (true) {
-      const newlineIndex = this.pending.search(/\r?\n/);
-      if (newlineIndex === -1) return;
-      const line = this.pending.slice(0, newlineIndex);
-      const newlineLength = this.pending[newlineIndex] === "\r" && this.pending[newlineIndex + 1] === "\n" ? 2 : 1;
-      this.pending = this.pending.slice(newlineIndex + newlineLength);
-      this.processLine(line);
-    }
+    this.decoder.push(chunk);
   }
 
   finish(): void {
-    if (this.pending.trim()) this.processLine(this.pending);
-    this.pending = "";
+    this.decoder.finish();
   }
 
   private processLine(line: string): void {
@@ -94,7 +89,7 @@ export class PiJsonlActivityExtractor {
   private emitModelUpdate(text: string): void {
     const message = text.trim();
     if (this.options.includeModelUpdates === false || !message || message === this.lastModelUpdate) return;
-    this.lastModelUpdate = message;
+    this.lastModelUpdate = singleLine(message);
     this.onActivity(`model update · ${singleLine(message)}`);
   }
 }
@@ -105,25 +100,16 @@ export class PiJsonlActivityExtractor {
  * the tool card only receives bounded lifecycle and result summaries.
  */
 export class CodexJsonlActivityExtractor {
-  private pending = "";
+  private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
 
   constructor(private readonly onActivity: (message: string) => void) {}
 
   push(chunk: string): void {
-    this.pending += chunk;
-    while (true) {
-      const newlineIndex = this.pending.search(/\r?\n/);
-      if (newlineIndex === -1) return;
-      const line = this.pending.slice(0, newlineIndex);
-      const newlineLength = this.pending[newlineIndex] === "\r" && this.pending[newlineIndex + 1] === "\n" ? 2 : 1;
-      this.pending = this.pending.slice(newlineIndex + newlineLength);
-      this.processLine(line);
-    }
+    this.decoder.push(chunk);
   }
 
   finish(): void {
-    if (this.pending.trim()) this.processLine(this.pending);
-    this.pending = "";
+    this.decoder.finish();
   }
 
   private processLine(line: string): void {
@@ -304,32 +290,24 @@ export interface ClaudeStreamResult {
 }
 
 export class ClaudeStreamJsonParser {
-  private pending = "";
+  private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
   private assistantText = "";
-  private streamedText = "";
+  private readonly streamedText = new BoundedTextAccumulator(MAX_STREAMED_TEXT_BYTES);
   private error: string | undefined;
   private sessionId: string | undefined;
   private resultEnvelope: Record<string, unknown> | undefined;
 
   push(chunk: string): void {
-    this.pending += chunk;
-    for (;;) {
-      const newline = this.pending.search(/\r?\n/);
-      if (newline === -1) return;
-      const line = this.pending.slice(0, newline);
-      this.pending = this.pending.slice(newline + (this.pending[newline] === "\r" ? 2 : 1));
-      this.processLine(line);
-    }
+    this.decoder.push(chunk);
   }
 
   finish(): ClaudeStreamResult {
-    if (this.pending.trim()) this.processLine(this.pending);
-    this.pending = "";
+    this.decoder.finish();
     const resultText = this.resultEnvelope && typeof this.resultEnvelope.result === "string"
       ? this.resultEnvelope.result
       : "";
     return {
-      text: resultText || this.assistantText || this.streamedText,
+      text: resultText || this.assistantText || this.streamedText.value,
       error: this.error,
       sessionId: this.sessionId,
       resultEnvelope: this.resultEnvelope,
@@ -353,19 +331,19 @@ export class ClaudeStreamJsonParser {
     }
     if (event.type === "assistant" && isRecord(event.message)) {
       const text = textFromMessageContent(event.message.content);
-      if (text.trim()) this.assistantText = text;
+      if (text.trim()) this.assistantText = boundedText(text);
       if (isRecord(event.message.usage)) this.resultEnvelope ??= { message: event.message };
       return;
     }
     if (event.type === "stream_event" && isRecord(event.event) && isRecord(event.event.delta)
       && event.event.delta.type === "text_delta" && typeof event.event.delta.text === "string") {
-      this.streamedText += event.event.delta.text;
+      this.streamedText.append(event.event.delta.text);
     }
   }
 }
 
 export class ClaudeStreamActivityExtractor {
-  private pending = "";
+  private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
   private lastModelUpdate = "";
   private readonly toolNames = new Map<string, string>();
   private readonly seenToolStarts = new Set<string>();
@@ -377,19 +355,11 @@ export class ClaudeStreamActivityExtractor {
   ) {}
 
   push(chunk: string): void {
-    this.pending += chunk;
-    for (;;) {
-      const newline = this.pending.search(/\r?\n/);
-      if (newline === -1) return;
-      const line = this.pending.slice(0, newline);
-      this.pending = this.pending.slice(newline + (this.pending[newline] === "\r" ? 2 : 1));
-      this.processLine(line);
-    }
+    this.decoder.push(chunk);
   }
 
   finish(): void {
-    if (this.pending.trim()) this.processLine(this.pending);
-    this.pending = "";
+    this.decoder.finish();
   }
 
   private processLine(line: string): void {
@@ -462,7 +432,7 @@ export class ClaudeStreamActivityExtractor {
   private emitModelUpdate(text: string): void {
     const message = text.trim();
     if (this.options.includeModelUpdates === false || !message || message === this.lastModelUpdate) return;
-    this.lastModelUpdate = message;
+    this.lastModelUpdate = singleLine(message);
     this.onActivity(`model update · ${singleLine(message)}`);
   }
 }
@@ -475,4 +445,8 @@ function claudeErrorSummary(value: Record<string, unknown>): string {
       ? value.result
       : undefined;
   return detail ? `${status}: ${detail}` : status;
+}
+
+function boundedText(value: string): string {
+  return utf8Prefix(value, MAX_STREAMED_TEXT_BYTES);
 }

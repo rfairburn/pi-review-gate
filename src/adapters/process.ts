@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ReviewerInvocationTelemetry, ReviewResult } from "../schema";
+import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
 
 export interface ProcessRunResult {
   stdout: string;
@@ -17,6 +18,7 @@ export interface ProcessRunResult {
   code: number | null;
   timedOut: boolean;
   aborted: boolean;
+  stdinError?: string;
 }
 
 export interface ReviewerArtifactPaths {
@@ -26,7 +28,9 @@ export interface ReviewerArtifactPaths {
   processResult: string;
 }
 
-const MAX_OUTPUT_BYTES = 1_000_000;
+// Retained output is diagnostic evidence, not a protocol transport. Protocol
+// adapters parse incrementally and remain correct even if this limit is hit.
+export const MAX_RETAINED_OUTPUT_BYTES = 100 * MEBIBYTE;
 
 export function reviewerArtifactPaths(bundleDir: string): ReviewerArtifactPaths {
   return {
@@ -52,6 +56,7 @@ export async function writeReviewerProcessArtifacts(input: {
       code: input.output.code,
       timedOut: input.output.timedOut,
       aborted: input.output.aborted,
+      stdinError: input.output.stdinError,
       stdoutTruncated: input.output.stdoutTruncated,
       stderrTruncated: input.output.stderrTruncated,
       stdoutBytes: input.output.stdoutBytes,
@@ -95,6 +100,19 @@ export function processFailureResult(input: {
       input.usage,
     ), telemetry };
   }
+  if (input.output.stdinError) {
+    return {
+      ...reviewerErrorResult(
+        input.reviewerId,
+        "Reviewer could not receive its prompt.",
+        input.rawOutputPath,
+        "stdin_error",
+        input.usage,
+      ),
+      telemetry,
+      diagnostic: input.output.stdinError,
+    };
+  }
   if (input.output.code !== 0) {
     return { ...reviewerErrorResult(
       input.reviewerId,
@@ -123,7 +141,13 @@ export async function runPromptProcess(input: {
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
   onStdoutChunk?: (chunk: string) => void;
+  /** Internal/test override; production adapters use MAX_RETAINED_OUTPUT_BYTES. */
+  maxRetainedOutputBytes?: number;
 }): Promise<ProcessRunResult> {
+  const maxRetainedOutputBytes = input.maxRetainedOutputBytes ?? MAX_RETAINED_OUTPUT_BYTES;
+  if (!Number.isSafeInteger(maxRetainedOutputBytes) || maxRetainedOutputBytes < 0) {
+    throw new RangeError("maxRetainedOutputBytes must be a non-negative safe integer");
+  }
   if (input.signal?.aborted) {
     return emptyProcessResult({ aborted: true });
   }
@@ -143,10 +167,13 @@ export async function runPromptProcess(input: {
     let stderrTruncated = false;
     let stdoutBytes = 0;
     let stderrBytes = 0;
+    let stdoutCapturedBytes = 0;
+    let stderrCapturedBytes = 0;
     const streamMetrics = new JsonlStreamMetrics();
     let settled = false;
     let timedOut = false;
     let aborted = false;
+    let stdinError: string | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
 
     const finish = (result: ProcessRunResult) => {
@@ -197,15 +224,17 @@ export async function runPromptProcess(input: {
       input.onStdoutChunk?.(chunk);
       stdoutBytes += Buffer.byteLength(chunk);
       streamMetrics.push(chunk);
-      const captured = appendCapped(stdout, chunk, MAX_OUTPUT_BYTES);
-      stdout = captured.value;
+      const captured = cappedChunk(chunk, maxRetainedOutputBytes - stdoutCapturedBytes);
+      stdout += captured.value;
+      stdoutCapturedBytes += captured.bytes;
       stdoutTruncated = stdoutTruncated || captured.truncated;
     });
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (chunk: string) => {
       stderrBytes += Buffer.byteLength(chunk);
-      const captured = appendCapped(stderr, chunk, MAX_OUTPUT_BYTES);
-      stderr = captured.value;
+      const captured = cappedChunk(chunk, maxRetainedOutputBytes - stderrCapturedBytes);
+      stderr += captured.value;
+      stderrCapturedBytes += captured.bytes;
       stderrTruncated = stderrTruncated || captured.truncated;
     });
     proc.on("close", (code) => {
@@ -222,7 +251,15 @@ export async function runPromptProcess(input: {
         code,
         timedOut,
         aborted,
+        stdinError,
       });
+    });
+    proc.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      // A child may exit or close stdin before a large prompt has been fully
+      // written. Without this listener Node treats EPIPE as an uncaught event
+      // and terminates the host process.
+      stdinError ??= boundedDiagnostic(error.message || error.code || "stdin write failed");
+      if (!settled && !timedOut && !aborted) terminate();
     });
     proc.stdin.end(input.prompt);
 
@@ -262,31 +299,26 @@ function emptyProcessResult(overrides: Partial<ProcessRunResult> = {}): ProcessR
     code: null,
     timedOut: false,
     aborted: false,
+    stdinError: undefined,
     ...overrides,
   };
 }
 
 class JsonlStreamMetrics {
-  private pending = "";
+  private readonly decoder = new BoundedJsonlDecoder((line) => this.consume(line));
   private streamEvents = 0;
   private toolCallIds = new Set<string>();
   private anonymousToolCalls = 0;
+  private toolResultIds = new Set<string>();
   private toolResultBytes = 0;
   private compactions = 0;
 
   push(chunk: string): void {
-    this.pending += chunk;
-    while (true) {
-      const newline = this.pending.indexOf("\n");
-      if (newline < 0) return;
-      this.consume(this.pending.slice(0, newline));
-      this.pending = this.pending.slice(newline + 1);
-    }
+    this.decoder.push(chunk);
   }
 
   finish(): void {
-    if (this.pending.trim()) this.consume(this.pending);
-    this.pending = "";
+    this.decoder.finish();
   }
 
   snapshot(): Pick<ProcessRunResult, "streamEvents" | "toolCalls" | "toolResultBytes" | "compactions"> {
@@ -312,8 +344,19 @@ class JsonlStreamMetrics {
     const calls = collectToolCalls(event);
     for (const id of calls.ids) this.toolCallIds.add(id);
     this.anonymousToolCalls += calls.anonymous;
-    this.toolResultBytes += toolResultPayloadBytes(event);
+    for (const result of collectToolResults(event)) {
+      if (result.id) {
+        if (this.toolResultIds.has(result.id)) continue;
+        this.toolResultIds.add(result.id);
+      }
+      this.toolResultBytes += result.bytes;
+    }
   }
+}
+
+function boundedDiagnostic(value: string): string {
+  const normalized = value.trim();
+  return normalized.length <= 2_000 ? normalized : normalized.slice(normalized.length - 2_000);
 }
 
 function collectToolCalls(event: Record<string, unknown>): { ids: Set<string>; anonymous: number } {
@@ -345,8 +388,8 @@ function toolCallIdentity(value: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-function toolResultPayloadBytes(event: Record<string, unknown>): number {
-  let bytes = 0;
+function collectToolResults(event: Record<string, unknown>): Array<{ id?: string; bytes: number }> {
+  const results: Array<{ id?: string; bytes: number }> = [];
   const visit = (value: unknown): void => {
     if (Array.isArray(value)) {
       for (const item of value) visit(item);
@@ -356,13 +399,13 @@ function toolResultPayloadBytes(event: Record<string, unknown>): number {
     const role = typeof value.role === "string" ? value.role : "";
     const type = typeof value.type === "string" ? value.type : "";
     if (role === "toolResult" || type === "toolResult" || type === "tool_result") {
-      bytes += Buffer.byteLength(JSON.stringify(value));
+      results.push({ id: toolCallIdentity(value), bytes: Buffer.byteLength(JSON.stringify(value)) });
       return;
     }
     for (const key of ["message", "content", "item", "event"]) visit(value[key]);
   };
   visit(event);
-  return bytes;
+  return results;
 }
 
 function isCompactionEvent(event: Record<string, unknown>): boolean {
@@ -374,20 +417,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function appendCapped(current: string, chunk: string, maxBytes: number): { value: string; truncated: boolean } {
-  const currentBytes = Buffer.byteLength(current);
-  if (currentBytes >= maxBytes) {
-    return { value: current, truncated: chunk.length > 0 };
+function cappedChunk(chunk: string, remainingBytes: number): { value: string; bytes: number; truncated: boolean } {
+  if (remainingBytes <= 0) {
+    return { value: "", bytes: 0, truncated: chunk.length > 0 };
   }
-  const remaining = maxBytes - currentBytes;
   const chunkBytes = Buffer.byteLength(chunk);
-  if (chunkBytes <= remaining) {
-    return { value: current + chunk, truncated: false };
+  if (chunkBytes <= remainingBytes) {
+    return { value: chunk, bytes: chunkBytes, truncated: false };
   }
-  return {
-    value: current + Buffer.from(chunk).subarray(0, remaining).toString("utf8"),
-    truncated: true,
-  };
+  const value = utf8Prefix(chunk, remainingBytes);
+  return { value, bytes: Buffer.byteLength(value), truncated: true };
 }
 
 export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
@@ -402,7 +441,10 @@ export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals)
   proc.kill(signal);
 }
 
-export function reviewerEnv(env: NodeJS.ProcessEnv, evidenceBundleDir?: string): NodeJS.ProcessEnv {
+export function reviewerEnv(
+  env: NodeJS.ProcessEnv,
+  evidenceBundleDir?: string,
+): NodeJS.ProcessEnv {
   const next = { ...env };
   next.PI_REVIEW_GATE_DISABLED = "1";
   next.LITTLE_CODER_REVIEW_GATE_DISABLED = "1";

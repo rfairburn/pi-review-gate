@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -32,6 +32,29 @@ test("little-coder executor uses the canonical model, isolated session, and nest
   assert.equal(captured.thinkingBudget, "0");
   assert.deepEqual(valueAfter(captured.argv, "--session-id"), first.session.id);
   assert.equal(captured.disabled, "1");
+});
+
+test("little-coder executor preserves terminal provider errors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-little-provider-error-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    await mkdir(artifactDir);
+    const command = join(root, "provider-error.cjs");
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "process.stdin.resume();",
+      "process.stdin.on('end',()=>{",
+      "console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[],errorMessage:'Provider capacity exhausted'}}));",
+      "console.log(JSON.stringify({type:'auto_retry_end',success:false,finalError:'Provider capacity exhausted'}));",
+      "});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const adapter = new LittleCoderExecutorAdapter({ model: "provider/model", command });
+    const result = await adapter.run({ cwd: root, prompt: "work", artifactDir, turn: 1 });
+    assert.deepEqual(result.failure, { category: "provider", message: "Provider capacity exhausted" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Codex executor starts with automatic workspace-write approval and resumes the exact thread", async () => {

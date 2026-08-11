@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -372,9 +373,11 @@ async function writeArtifact(dir: string, relativePath: string, content: string)
 function safeArtifactPath(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   const withoutRoot = normalized.startsWith("/") ? `__absolute__/${normalized.slice(1)}` : normalized;
-  return withoutRoot
+  const readable = withoutRoot
     .split("/")
     .filter((part) => part && part !== "." && part !== "..")
     .map((part) => part.replace(/[^a-zA-Z0-9._-]+/g, "_"))
     .join("/") || "unnamed";
+  const digest = createHash("sha256").update(path).digest("hex").slice(0, 12);
+  return `${readable}--${digest}`;
 }

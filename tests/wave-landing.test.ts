@@ -17,6 +17,7 @@ import {
   type WaveIntegrationSuccess,
 } from "../src/execution/wave-integration";
 import {
+  executeWaveLanding,
   planWaveLanding,
   validatePathSafe,
   type LandingPlan,
@@ -107,6 +108,43 @@ async function setupLanding(
     integration: result as WaveIntegrationSuccess,
   };
 }
+
+test("wave landing supports SHA-256 object-format repositories", async (t) => {
+  const sourceDir = await mkTmp("pi-wl-sha256-src-");
+  const artifactDir = await mkTmp("pi-wl-sha256-artifact-");
+  try {
+    try {
+      await git(["init", "--quiet", "--object-format=sha256"], sourceDir);
+    } catch {
+      t.skip("installed Git does not support SHA-256 repositories");
+      return;
+    }
+    await writeFile(join(sourceDir, "base.txt"), "base\n", "utf8");
+    await git(["add", "."], sourceDir);
+    await git(["commit", "--quiet", "-m", "base"], sourceDir);
+    const capture = await captureWaveBase({
+      cwd: sourceDir,
+      maxSnapshotBytes: 1_000_000,
+      artifactDir,
+      waveId: "sha256-wave",
+    });
+    assert.equal(capture.baseCommit.length, 64);
+    const worker = await createWorkerWorktree(capture, "task-sha256");
+    await writeFile(join(worker.worktreeRoot, "result.txt"), "result\n", "utf8");
+    const candidate = await normalizeCandidate(capture, worker.worktreeRoot, "task-sha256", "SHA-256 task");
+    await pinCommit(capture, candidate.commitSha, { type: "worker", taskId: "task-sha256" });
+    const integrated = await integrateWave(capture, [{ taskId: "task-sha256", commitSha: candidate.commitSha }]);
+    assert.equal(integrated.status, "integrated");
+    if (integrated.status !== "integrated") return;
+    const plan = await planWaveLanding(capture, integrated.finalCommitSha, sourceDir);
+    const landed = await executeWaveLanding(plan, capture);
+    assert.equal(landed.status, "landed");
+    assert.equal(await readFile(join(sourceDir, "result.txt"), "utf8"), "result\n");
+  } finally {
+    await rm(sourceDir, { recursive: true, force: true });
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
 
 // ── Test: modify action (current == base) ────────────────────────────────────
 
@@ -1719,15 +1757,9 @@ test("wave-landing execute — injected failure causes full rollback", async () 
 
     const plan = await planWaveLanding(capture, integration.finalCommitSha, sourceDir);
 
-    // Inject failure after 1 path.
-    (waveLanding as any).__testOnly_failAfterNPaths = 1;
-    try {
-      const execResult = await waveLanding.executeWaveLanding(plan, capture);
-      assert.equal(execResult.status, "rolled_back");
-      assert.ok(execResult.appliedPaths.length >= 1, "should have applied at least 1 path before failure");
-    } finally {
-      (waveLanding as any).__testOnly_failAfterNPaths = undefined;
-    }
+    const execResult = await waveLanding.executeWaveLanding(plan, capture, undefined, { failAfterNPaths: 1 });
+    assert.equal(execResult.status, "rolled_back");
+    assert.ok(execResult.appliedPaths.length >= 1, "should have applied at least 1 path before failure");
 
     // Verify all files are restored to original state.
     const aContent = await readFile(join(sourceDir, "file-a.txt"), "utf8");
@@ -1737,7 +1769,6 @@ test("wave-landing execute — injected failure causes full rollback", async () 
     assert.equal(bContent, "b\n", "file-b.txt should be restored");
     assert.equal(cContent, "c\n", "file-c.txt should be restored");
   } finally {
-    (waveLanding as any).__testOnly_failAfterNPaths = undefined;
     await rm(artifactDir, { recursive: true, force: true });
   }
 });
@@ -1780,13 +1811,8 @@ test("wave-landing execute — mid-mutation failure after backup rename causes f
 
     // Inject failure after backup rename of the second path (file-y.txt).
     // This tests the mid-mutation rollback gap: backup is done but temp rename hasn't happened.
-    (waveLanding as any).__testOnly_failAfterBackupOf = "file-y.txt";
-    try {
-      const execResult = await waveLanding.executeWaveLanding(plan, capture);
-      assert.equal(execResult.status, "rolled_back");
-    } finally {
-      (waveLanding as any).__testOnly_failAfterBackupOf = undefined;
-    }
+    const execResult = await waveLanding.executeWaveLanding(plan, capture, undefined, { failAfterBackupOf: "file-y.txt" });
+    assert.equal(execResult.status, "rolled_back");
 
     // Verify ALL files are restored to original state, including file-x.txt
     // which had its backup rename succeed before the failure.
@@ -1797,7 +1823,6 @@ test("wave-landing execute — mid-mutation failure after backup rename causes f
     assert.equal(yContent, "y\n", "file-y.txt should be restored despite backup rename succeeding");
     assert.equal(zContent, "z\n", "file-z.txt should be unchanged");
   } finally {
-    (waveLanding as any).__testOnly_failAfterBackupOf = undefined;
     await rm(artifactDir, { recursive: true, force: true });
   }
 });
@@ -1941,14 +1966,12 @@ test("wave-landing execute — concurrent destination modification triggers reco
 
     // After the first path is applied, simulate a concurrent modification of the destination.
     // This should cause the rollback to detect the concurrent modification and return recovery_required.
-    (waveLanding as any).__testOnly_afterApplyPath = async (_relPath: string, destPath: string) => {
-      // Modify the destination to something different from both base and result.
-      await writeFile(destPath, "concurrent modification\n", "utf8");
-    };
-    (waveLanding as any).__testOnly_failAfterNPaths = 1;
-
-    try {
-      const execResult = await waveLanding.executeWaveLanding(plan, capture);
+    const execResult = await waveLanding.executeWaveLanding(plan, capture, undefined, {
+      afterApplyPath: async (_relPath: string, destPath: string) => {
+        await writeFile(destPath, "concurrent modification\n", "utf8");
+      },
+      failAfterNPaths: 1,
+    });
 
       // Should get recovery_required, not rolled_back.
       assert.equal(execResult.status, "recovery_required");
@@ -1973,13 +1996,7 @@ test("wave-landing execute — concurrent destination modification triggers reco
       assert.ok(fileAEntry.backup, "manifest entry should have a backup path");
       const backupContent = await readFile(fileAEntry.backup, "utf8");
       assert.equal(backupContent, "a\n", "original backup should be preserved");
-    } finally {
-      (waveLanding as any).__testOnly_afterApplyPath = undefined;
-      (waveLanding as any).__testOnly_failAfterNPaths = undefined;
-    }
   } finally {
-    (waveLanding as any).__testOnly_afterApplyPath = undefined;
-    (waveLanding as any).__testOnly_failAfterNPaths = undefined;
     await rm(artifactDir, { recursive: true, force: true });
   }
 });
@@ -2088,16 +2105,12 @@ test("wave-landing execute — late abort after final path application rolls bac
     let applyCount = 0;
     const totalApplyPaths = plan.paths.filter((p) => p.action === "apply").length;
 
-    (waveLanding as any).__testOnly_afterApplyPath = async () => {
-      applyCount++;
-      // Abort after the last path application, before durable completion.
-      if (applyCount >= totalApplyPaths) {
-        controller.abort();
-      }
-    };
-
-    try {
-      const execResult = await waveLanding.executeWaveLanding(plan, capture, controller.signal);
+    const execResult = await waveLanding.executeWaveLanding(plan, capture, controller.signal, {
+      afterApplyPath: async () => {
+        applyCount++;
+        if (applyCount >= totalApplyPaths) controller.abort();
+      },
+    });
 
       // Must NOT be landed — should be rolled_back or recovery_required.
       assert.ok(
@@ -2110,11 +2123,7 @@ test("wave-landing execute — late abort after final path application rolls bac
       const bContent = await readFile(join(sourceDir, "file-b.txt"), "utf8");
       assert.equal(aContent, "a\n", "file-a.txt should be restored after late abort");
       assert.equal(bContent, "b\n", "file-b.txt should be restored after late abort");
-    } finally {
-      (waveLanding as any).__testOnly_afterApplyPath = undefined;
-    }
   } finally {
-    (waveLanding as any).__testOnly_afterApplyPath = undefined;
     await rm(artifactDir, { recursive: true, force: true });
   }
 });

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
   externalAgentCatalog,
@@ -52,12 +52,34 @@ export async function persistReviewSettings(
   delete parsed.enabledReviewerIds;
 
   const normalized = normalizeConfig(parsed);
+  const existing = await stat(configPath);
+  const mode = existing.mode & 0o777;
+  const targetMode = mode !== 0 && (mode & 0o077) === 0 ? mode : 0o600;
   const tempPath = join(
     dirname(configPath),
     `.${basename(configPath)}.${process.pid}.${randomUUID()}.tmp`,
   );
-  await writeFile(tempPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
-  await rename(tempPath, configPath);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(tempPath, "wx", targetMode);
+    await handle.writeFile(`${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+    await handle.chmod(targetMode);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(tempPath, configPath);
+
+    // Make the rename durable where directory fsync is supported.
+    const directory = await open(dirname(configPath), "r").catch(() => undefined);
+    if (directory) {
+      await directory.sync().catch(() => undefined);
+      await directory.close();
+    }
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
   return normalized;
 }
 

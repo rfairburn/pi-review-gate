@@ -10,11 +10,16 @@ npm install
 npm test
 ```
 
-The default test run executes up to two test files concurrently. For diagnosing
-resource-sensitive or ordering-sensitive failures, use the serial fallback:
+The complete test run executes up to four test files concurrently. Use
+`npm run test:fast` for the short pure/unit development loop. Use `npm test`
+(or `npm run test:integration`) for the process, Git, filesystem, and end-to-end
+suite before finalizing a phase. For diagnosing resource-sensitive or
+ordering-sensitive failures, use the serial fallback:
 
 ```bash
 npm run test:serial
+npm run check:static
+npm run test:package
 ```
 
 ## Configuration
@@ -47,6 +52,7 @@ Example config using Codex as the reviewer:
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,
   "maxSnapshotBytes": 52428800,
+  "waveArtifactTtlMs": 2592000000,
   "retainBundles": "on-failure",
   "decider": {
     "id": "codex",
@@ -81,9 +87,15 @@ when the shell is their only filesystem interface. Codex starts in its
 local no-op sandbox preflight detects platform sandbox startup failures before
 a model turn is spent.
 Reviewer output is parsed strictly first; a narrow fallback recovers the same
-schema when a model emits otherwise-valid fields with unescaped multiline
-Markdown. Sandbox startup failures remain explicit reviewer errors rather than
+schema when a model emits an actionable non-passing result with unescaped
+multiline Markdown. A passing verdict is never accepted through repair.
+Sandbox startup failures remain explicit reviewer errors rather than
 being mislabeled as verdict-schema failures.
+
+Reviewer/executor stdout and stderr are retained up to 100 MiB
+per stream for diagnostics; JSONL protocols are decoded incrementally with
+separate bounded records, so protocol correctness does not depend on display
+capture truncation.
 
 The reviewer treats orchestrator-provided task direction as authorized and
 reviews concrete logic, regressions, security, API behavior, tests, and explicit
@@ -168,7 +180,8 @@ the configured harness/model cannot be changed in tool arguments. Calls are
 serial. The primary model waits for the returned packet before planning the next
 phase. If review is enabled, the child receives corrections in its own session
 and is accepted only after reviewer pass followed by an unchanged child
-response. Child changes are checkpointed so an unchanged parent turn is not
+response. This post-pass turn lets the child consider noncritical reviewer
+suggestions; any resulting tree change is reviewed again. Child changes are checkpointed so an unchanged parent turn is not
 reviewed again; later parent edits remain parent-owned and follow the ordinary
 gate.
 
@@ -236,7 +249,11 @@ setting continues to bound the textual file content retained for diffing.
 
 **Artifacts**: Each wave produces a `waveRoot` directory containing artifacts
 for each task, a wave manifest (`wave-manifest.json`), and stable refs for
-integrated commits. The wave root path is returned in the tool result.
+integrated commits. The wave root path is returned in the tool result. On later
+wave starts, completed non-recovery roots older than `waveArtifactTtlMs` are
+garbage-collected (30 days by default; `0` disables collection). Conflict,
+integration-error, and recovery-required roots are never removed by this GC,
+and `retainBundles: "always"` disables wave GC.
 
 **Conflict and recovery**: If integration encounters conflicts, the wave
 returns a `conflicted` status with details about the conflicting task, commit,

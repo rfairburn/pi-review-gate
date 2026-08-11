@@ -70,6 +70,11 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       code: parsed.error && output.code === 0 ? 1 : output.code,
       timedOut: output.timedOut,
       aborted: output.aborted,
+      failure: parsed.error
+        ? { category: "provider", message: parsed.error }
+        : output.stdinError
+          ? { category: "stdin", message: output.stdinError }
+          : undefined,
     };
   }
 }

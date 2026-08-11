@@ -32,7 +32,7 @@ test("executeSubtask runs a fake binary through pass and unchanged acceptance", 
 });
 
 test("executeSubtask returns accepted_with_warnings and structured evidence for pass plus reviewer error", async () => {
-  const fixture = await executionFixture(true, { mixedReviewerError: true });
+  const fixture = await executionFixture(true, { mixedReviewerError: true, retainBundles: "on-failure" });
   const packet = await executeSubtask({
     task: task(),
     cwd: fixture.workspace,

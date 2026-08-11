@@ -2,14 +2,13 @@ import { randomBytes } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promises as fs, readlink as fsReadlink, Stats } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import { GIT_NO_LOCKS_ENV as GIT_ENV, isAbortError, validateSafeId } from "./wave-validation";
 
 const readlinkBuffer = promisify(fsReadlink);
 
 const execFileAsync = promisify(execFile);
-
-const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0" };
 
 /** Spawn a git command with stdin input and capture stdout. */
 async function gitSpawn(
@@ -197,7 +196,7 @@ async function probeGit(cwd: string, signal?: AbortSignal): Promise<GitProbeResu
     // Malformed/inaccessible Git metadata/config and other git probe errors
     // must fail capture, never fall back to filesystem enumeration.
     const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("not a git repository")) {
+    if (message.includes("not a git repository") && !(await hasGitMarker(cwd))) {
       return null;
     }
     // Re-throw for non-"not a git repository" errors (malformed config, etc.)
@@ -205,19 +204,67 @@ async function probeGit(cwd: string, signal?: AbortSignal): Promise<GitProbeResu
   }
 }
 
+async function hasGitMarker(cwd: string): Promise<boolean> {
+  let current = resolve(cwd);
+  for (;;) {
+    if (await fs.lstat(join(current, ".git")).then(() => true, () => false)) return true;
+    const parent = dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
 async function probeHead(topLevel: string, signal?: AbortSignal): Promise<HeadInfo> {
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["rev-parse", "HEAD"],
+      ["rev-parse", "--verify", "HEAD^{commit}"],
       { cwd: topLevel, env: { ...process.env, ...GIT_ENV }, timeout: 10_000, signal },
     );
     return { commit: stdout.trim(), unborn: false };
   } catch (error) {
     if (signal?.aborted || isAbortError(error)) throw error;
-    // HEAD resolution failure in a valid repo is treated as unborn.
-    return { commit: undefined, unborn: true };
+    // A repository is unborn only when HEAD is a valid symbolic ref whose
+    // target does not exist. Detached/corrupt/inaccessible HEAD failures must
+    // not be reclassified as an empty repository.
+    let headRef: string;
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["symbolic-ref", "-q", "HEAD"],
+        { cwd: topLevel, env: { ...process.env, ...GIT_ENV }, timeout: 10_000, signal },
+      );
+      headRef = stdout.trim();
+    } catch {
+      throw error;
+    }
+    if (!headRef) throw error;
+    try {
+      await execFileAsync(
+        "git",
+        ["check-ref-format", headRef],
+        { cwd: topLevel, env: { ...process.env, ...GIT_ENV }, timeout: 10_000, signal },
+      );
+    } catch {
+      throw error;
+    }
+    try {
+      await execFileAsync(
+        "git",
+        ["show-ref", "--verify", "--quiet", headRef],
+        { cwd: topLevel, env: { ...process.env, ...GIT_ENV }, timeout: 10_000, signal },
+      );
+    } catch (showRefError) {
+      if (signal?.aborted || isAbortError(showRefError)) throw showRefError;
+      if (isExitCode(showRefError, 1)) return { commit: undefined, unborn: true };
+      throw showRefError;
+    }
+    throw error;
   }
+}
+
+function isExitCode(error: unknown, code: number): boolean {
+  return error instanceof Error && "code" in error && error.code === code;
 }
 
 function normalizeRelative(p: string): string {
@@ -410,8 +457,20 @@ export interface WaveCaptureOptions {
   artifactDir?: string;
   /** Maximum number of capture attempts before giving up on consistency. Default 3. */
   maxCaptureAttempts?: number;
+  /** Garbage-collect completed non-recovery wave roots older than this age. Zero disables GC. */
+  artifactTtlMs?: number;
   /** Abort signal used to cancel discovery, staging, verification, and checkout preparation. */
   signal?: AbortSignal;
+  /** @internal Per-invocation capture fault hooks used by regression tests. */
+  hooks?: WaveCaptureHooks;
+}
+
+/** @internal Per-invocation capture fault hooks used by regression tests. */
+export interface WaveCaptureHooks {
+  mutateSourceBetweenCaptureAndVerify?: (
+    discovery: WaveSourceDiscovery,
+    entries: WaveEntry[],
+  ) => Promise<void> | void;
 }
 
 /** Immutable identity of the source capture root (dev + ino). */
@@ -465,10 +524,16 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     waveId: givenWaveId,
     artifactDir,
     maxCaptureAttempts: givenMaxAttempts,
+    artifactTtlMs = 30 * 24 * 60 * 60 * 1000,
     signal,
+    hooks,
   } = options;
   if (signal?.aborted) {
     throw new WaveCaptureError("Wave capture cancelled.", "cancelled", givenWaveId, "capturing");
+  }
+
+  if (!Number.isSafeInteger(artifactTtlMs) || artifactTtlMs < 0) {
+    throw new Error(`Invalid artifactTtlMs: ${artifactTtlMs}. Must be a non-negative safe integer.`);
   }
 
   // Validate maxSnapshotBytes: must be a non-negative finite integer.
@@ -509,6 +574,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     artifactParent = await fs.realpath(resolve(tmpdir()));
   }
   throwIfAborted(signal);
+  await pruneCompletedWaveRoots(artifactParent, artifactTtlMs, Date.now(), signal);
 
   // 4. Retry loop with torn-snapshot detection.
   //    Discovery and path enumeration happen inside the loop so each retry
@@ -519,8 +585,6 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     // Re-discover the source on each attempt.
     const discovery = await discoverWaveSource(cwd, signal);
     const enumeratedPaths = await enumerateWaveSourcePathSet(discovery, signal);
-    const allPaths = enumeratedPaths.paths;
-
     // Containment check: reject if artifactParent is inside or equal to sourceRoot.
     const sourceRoot = await fs.realpath(discovery.captureRoot);
     const sourceRelative = relative(sourceRoot, artifactParent);
@@ -585,7 +649,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
       );
 
       // ── Test seam: allow injection of mutations between capture and verify ──
-      await __testOnly_mutateSourceBetweenCaptureAndVerify?.(discovery, staged.entries);
+      await hooks?.mutateSourceBetweenCaptureAndVerify?.(discovery, staged.entries);
       // ────────────────────────────────────────────────────────────────────────
       throwIfAborted(signal);
 
@@ -674,6 +738,44 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
   );
 }
 
+/** Remove only old, terminal wave roots that are not needed for conflict recovery. */
+export async function pruneCompletedWaveRoots(
+  artifactParent: string,
+  ttlMs: number,
+  nowMs = Date.now(),
+  signal?: AbortSignal,
+): Promise<string[]> {
+  if (ttlMs === 0) return [];
+  if (!Number.isSafeInteger(ttlMs) || ttlMs < 0) {
+    throw new Error("ttlMs must be a non-negative safe integer");
+  }
+  const removed: string[] = [];
+  const entries = await fs.readdir(artifactParent, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    throwIfAborted(signal);
+    if (!entry.isDirectory() || !entry.name.startsWith("wave-")) continue;
+    const root = join(artifactParent, entry.name);
+    const stat = await fs.lstat(root).catch(() => undefined);
+    if (!stat?.isDirectory() || stat.isSymbolicLink() || nowMs - stat.mtimeMs < ttlMs) continue;
+    const manifestPath = join(root, "wave-manifest.json");
+    const manifestStat = await fs.lstat(manifestPath).catch(() => undefined);
+    if (!manifestStat?.isFile() || manifestStat.size > 1024 * 1024) continue;
+    let manifest: Record<string, unknown>;
+    try {
+      manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (manifest.version !== 1 || manifest.repositoryPath !== join(root, "wave-repo.git")) continue;
+    if (manifest.phase !== "completed" && manifest.phase !== "aborted") continue;
+    if (manifest.landingStatus === "recovery_required" || manifest.landingStatus === "conflicted") continue;
+    if (manifest.integrationStatus === "conflicted" || manifest.integrationStatus === "error") continue;
+    await fs.rm(root, { recursive: true, force: true });
+    removed.push(root);
+  }
+  return removed;
+}
+
 // ── internal: consistency verification ───────────────────────────────────────
 
 /**
@@ -758,18 +860,6 @@ async function verifyCaptureConsistency(
 }
 
 const DEFAULT_MAX_CAPTURE_ATTEMPTS = 3;
-
-// ── test seam: internal / test-only ──────────────────────────────────────────
-
-/**
- * INTERNAL / TEST-ONLY: Inject a mutation between capture and verification.
- * Set this function from tests to mutate source files between the two
- * observations. Clear it (set to undefined) to disable.
- */
-export let __testOnly_mutateSourceBetweenCaptureAndVerify: (
-  discovery: WaveSourceDiscovery,
-  entries: WaveEntry[],
-) => Promise<void> | void | undefined;
 
 // ── internal: tree construction ──────────────────────────────────────────────
 
@@ -1144,12 +1234,6 @@ function throwIfAborted(signal?: AbortSignal): void {
   throw error;
 }
 
-function isAbortError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const code = (error as NodeJS.ErrnoException).code;
-  return error.name === "AbortError" || code === "ABORT_ERR";
-}
-
 // ── internal: wave ID generation ─────────────────────────────────────────────
 
 function generateWaveId(): string {
@@ -1158,21 +1242,5 @@ function generateWaveId(): string {
 
 /** Validate that a waveId is a single safe ref/path segment. */
 function validateWaveId(waveId: string): void {
-  if (typeof waveId !== "string" || waveId.length === 0) {
-    throw new Error(`Invalid waveId: must be a non-empty string.`);
-  }
-  // Reject characters git check-ref-format forbids in a ref component:
-  // control chars, space, slash, ~ ^ : ? * [ \ @{ and dot forms git rejects.
-  if (
-    /[~^:?*[\\@{}\/]/.test(waveId) ||
-    /[\x00-\x20\x7F]/.test(waveId) ||
-    waveId === "." || waveId === ".." || waveId === "@" ||
-    waveId.startsWith(".") || waveId.endsWith(".") ||
-    waveId.endsWith(".lock") || waveId.includes("..") ||
-    waveId.includes("@{")
-  ) {
-    throw new Error(
-      `Invalid waveId: "${waveId}". Must be a single safe ref/path segment.`,
-    );
-  }
+  validateSafeId(waveId, "waveId");
 }

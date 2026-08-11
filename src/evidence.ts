@@ -6,6 +6,7 @@ import {
   type FileSnapshot,
   type SnapshotOptions,
 } from "./capture";
+import { redactSensitiveText, redactSensitiveValue } from "./redaction";
 
 export interface EvidenceState {
   nextSequence: number;
@@ -199,7 +200,7 @@ export function buildEvidenceBundle(
 export function rememberFinalAssistantSummary(state: EvidenceState, args: unknown[]): void {
   const summary = extractFinalAssistantText(args);
   if (summary) {
-    const truncated = truncate(summary, 4000);
+    const truncated = truncate(redactSensitiveText(summary), 4000);
     state.finalAssistantSummaries.push(truncated);
   }
 }
@@ -383,16 +384,16 @@ function summarizeToolInput(input?: Record<string, unknown>): string {
   }
   const command = commandText(input);
   if (command) {
-    return truncate(command.replace(/\s+/g, " ").trim(), 1000);
+    return truncate(redactSensitiveText(command).replace(/\s+/g, " ").trim(), 1000);
   }
-  const compact = JSON.stringify(redactLargeValues(input));
+  const compact = JSON.stringify(redactLargeValues(redactSensitiveValue(input)));
   return truncate(compact, 1000);
 }
 
 function summarizeToolResult(result: unknown, isError: boolean | undefined): string {
   const prefix = isError ? "error: " : "";
   if (typeof result === "string") {
-    return prefix + truncate(result.replace(/\s+/g, " ").trim(), 1000);
+    return prefix + truncate(redactSensitiveText(result).replace(/\s+/g, " ").trim(), 1000);
   }
   if (isRecord(result)) {
     const content = result.content;
@@ -402,11 +403,11 @@ function summarizeToolResult(result: unknown, isError: boolean | undefined): str
         .filter(Boolean)
         .join("\n");
       if (text) {
-        return prefix + truncate(text.replace(/\s+/g, " ").trim(), 1000);
+        return prefix + truncate(redactSensitiveText(text).replace(/\s+/g, " ").trim(), 1000);
       }
     }
   }
-  return prefix + truncate(JSON.stringify(redactLargeValues(result)), 1000);
+  return prefix + truncate(JSON.stringify(redactLargeValues(redactSensitiveValue(result))), 1000);
 }
 
 function detailedToolInput(input?: Record<string, unknown>): string | undefined {
@@ -415,14 +416,14 @@ function detailedToolInput(input?: Record<string, unknown>): string | undefined 
   }
   const command = commandText(input);
   if (command) {
-    return truncate(command, 20_000);
+    return truncate(redactSensitiveText(command), 20_000);
   }
-  return truncate(JSON.stringify(input, null, 2), 20_000);
+  return truncate(JSON.stringify(redactSensitiveValue(input), null, 2), 20_000);
 }
 
 function detailedToolResult(result: unknown): string | undefined {
   if (typeof result === "string") {
-    return truncate(result, 50_000);
+    return truncate(redactSensitiveText(result), 50_000);
   }
   if (isRecord(result)) {
     const content = result.content;
@@ -432,11 +433,11 @@ function detailedToolResult(result: unknown): string | undefined {
         .filter(Boolean)
         .join("\n");
       if (text) {
-        return truncate(text, 50_000);
+        return truncate(redactSensitiveText(text), 50_000);
       }
     }
   }
-  const encoded = JSON.stringify(result, null, 2);
+  const encoded = JSON.stringify(redactSensitiveValue(result), null, 2);
   return encoded ? truncate(encoded, 50_000) : undefined;
 }
 

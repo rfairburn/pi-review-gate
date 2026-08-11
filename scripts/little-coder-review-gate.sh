@@ -31,7 +31,12 @@ if [[ -z "$REVIEW_GATE_CONFIG" ]]; then
   exit 2
 fi
 
-npm --prefix "$REVIEW_GATE_ROOT" run build
+if [[ -f "$REVIEW_GATE_ROOT/src/index.ts" ]]; then
+  npm --prefix "$REVIEW_GATE_ROOT" run build
+elif [[ ! -f "$REVIEW_GATE_EXTENSION" ]]; then
+  echo "pi-review-gate: packaged extension is missing: $REVIEW_GATE_EXTENSION" >&2
+  exit 2
+fi
 
 case ":${LITTLE_CODER_EXTRA_EXTENSIONS:-}:" in
   *":$REVIEW_GATE_EXTENSION:"*) ;;

@@ -8,6 +8,9 @@ export interface ChangeIdentity {
 }
 
 const COMMIT_ID_RE = /^[0-9a-f]{40,64}$/;
+const REVIEW_RESULT_KEYS = new Set(["verdict", "summary", "guidance", "findings", "error"]);
+const REQUIRED_REVIEW_RESULT_KEYS = new Set(["verdict", "summary", "findings"]);
+const REVIEW_FINDING_KEYS = new Set(["severity", "file", "line", "issue", "recommendation"]);
 
 export function validateChangeIdentity(identity: unknown): string | undefined {
   if (typeof identity !== "object" || identity === null || Array.isArray(identity)) {
@@ -74,6 +77,8 @@ export interface ReviewerInvocationTelemetry {
 export const REVIEW_OUTPUT_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
+  // Codex Structured Outputs requires every declared property to be listed in
+  // `required`. Semantically optional fields remain required-but-nullable.
   required: ["verdict", "summary", "guidance", "findings", "error"],
   properties: {
     verdict: { type: "string", enum: ["pass", "needs_changes", "error"] },
@@ -107,10 +112,10 @@ export function parseReviewResult(reviewerId: string, rawOutput: string, rawOutp
   for (const candidate of candidates) {
     let parsed: unknown;
     try {
-      parsed = JSON.parse(candidate);
+      parsed = JSON.parse(candidate.value);
     } catch (error) {
       firstParseError ??= error;
-      if (/['\"]verdict['\"]\s*:/.test(candidate)) {
+      if (/['\"]verdict['\"]\s*:/.test(candidate.value)) {
         firstReviewParseError ??= error;
       }
       continue;
@@ -121,21 +126,13 @@ export function parseReviewResult(reviewerId: string, rawOutput: string, rawOutp
       firstSchemaError ??= validated;
       continue;
     }
+    // Recovery of literal control characters is useful for actionable
+    // correction guidance, but a pass must come from syntactically valid JSON.
+    if (candidate.repaired && validated.verdict === "pass") continue;
     if (validated.verdict !== "error" && validated.findings.some((finding) => finding.severity === "blocking")) {
       validated.verdict = "needs_changes";
     }
     return validated;
-  }
-
-  const loose = extractLooseReviewResult(rawOutput);
-  if (loose) {
-    const validated = normalizeReviewResult(reviewerId, loose, rawOutputPath);
-    if (validated.error !== "schema_error") {
-      if (validated.verdict !== "error" && validated.findings.some((finding) => finding.severity === "blocking")) {
-        validated.verdict = "needs_changes";
-      }
-      return validated;
-    }
   }
 
   if (firstReviewParseError) {
@@ -179,6 +176,9 @@ export function normalizeReviewResult(
   if (!isRecord(value)) {
     return schemaError(reviewerId, "Reviewer JSON must be an object.", rawOutputPath);
   }
+  if (!hasAllowedKeys(value, REVIEW_RESULT_KEYS, REQUIRED_REVIEW_RESULT_KEYS)) {
+    return schemaError(reviewerId, "Reviewer JSON contains missing or unsupported fields.", rawOutputPath);
+  }
 
   const verdict = value.verdict;
   if (verdict !== "pass" && verdict !== "needs_changes" && verdict !== "error") {
@@ -190,7 +190,7 @@ export function normalizeReviewResult(
     return schemaError(reviewerId, "Reviewer JSON must include a summary string.", rawOutputPath);
   }
   if (value.guidance !== undefined && value.guidance !== null && typeof value.guidance !== "string") {
-    return schemaError(reviewerId, "Reviewer JSON guidance must be a string when supplied.", rawOutputPath);
+    return schemaError(reviewerId, "Reviewer JSON guidance must be a string or null when supplied.", rawOutputPath);
   }
   const guidance = typeof value.guidance === "string" ? value.guidance.trim() : "";
 
@@ -202,6 +202,9 @@ export function normalizeReviewResult(
   for (const item of value.findings) {
     if (!isRecord(item)) {
       return schemaError(reviewerId, "Each finding must be an object.", rawOutputPath);
+    }
+    if (!hasExactKeys(item, REVIEW_FINDING_KEYS)) {
+      return schemaError(reviewerId, "Each finding must contain exactly severity, file, line, issue, and recommendation.", rawOutputPath);
     }
     const severity = item.severity;
     if (severity !== "blocking" && severity !== "non_blocking") {
@@ -223,6 +226,17 @@ export function normalizeReviewResult(
     });
   }
 
+  if (value.error !== undefined && value.error !== null && typeof value.error !== "string") {
+    return schemaError(reviewerId, "Reviewer JSON error must be a string or null when supplied.", rawOutputPath);
+  }
+  const error = typeof value.error === "string" ? value.error.trim() : "";
+  if (verdict === "error" && !error) {
+    return schemaError(reviewerId, "An error verdict must include a non-empty error string.", rawOutputPath);
+  }
+  if (verdict !== "error" && error) {
+    return schemaError(reviewerId, "A non-error verdict must set error to null.", rawOutputPath);
+  }
+
   return {
     reviewerId,
     verdict,
@@ -230,7 +244,7 @@ export function normalizeReviewResult(
     guidance: guidance || undefined,
     findings,
     rawOutputPath,
-    error: typeof value.error === "string" ? value.error : undefined,
+    error: error || undefined,
   };
 }
 
@@ -238,19 +252,19 @@ export function extractJsonObject(text: string): string | null {
   return extractBalancedJsonObjects(text)[0] ?? null;
 }
 
-function extractJsonCandidates(text: string): string[] {
-  const candidates: string[] = [];
+function extractJsonCandidates(text: string): Array<{ value: string; repaired: boolean }> {
+  const candidates: Array<{ value: string; repaired: boolean }> = [];
   const seen = new Set<string>();
   const add = (candidate: string): void => {
     const trimmed = candidate.trim();
     if (trimmed && !seen.has(trimmed)) {
       seen.add(trimmed);
-      candidates.push(trimmed);
+      candidates.push({ value: trimmed, repaired: false });
     }
     const repaired = escapeControlCharactersInJsonStrings(trimmed);
     if (repaired && repaired !== trimmed && !seen.has(repaired)) {
       seen.add(repaired);
-      candidates.push(repaired);
+      candidates.push({ value: repaired, repaired: true });
     }
   };
 
@@ -318,103 +332,13 @@ function escapeControlCharactersInJsonStrings(value: string): string {
   return output;
 }
 
-function extractLooseReviewResult(text: string): Record<string, unknown> | undefined {
-  const verdictMatches = [...text.matchAll(/"verdict"\s*:\s*"(pass|needs_changes|error)"/g)];
-  const verdictMatch = verdictMatches.at(-1);
-  if (!verdictMatch || verdictMatch.index === undefined) {
-    return undefined;
-  }
-  const candidate = text.slice(verdictMatch.index);
-  const summaryMatch = /"summary"\s*:\s*"([\s\S]*?)"\s*,\s*"(?:guidance|findings)"\s*:/.exec(candidate);
-  if (!summaryMatch) {
-    return undefined;
-  }
-  const guidanceNull = /"guidance"\s*:\s*null\s*,\s*"findings"\s*:/.test(candidate);
-  const guidanceMatch = /"guidance"\s*:\s*"([\s\S]*?)"\s*,\s*"findings"\s*:/.exec(candidate);
-  const findingsMarker = /"findings"\s*:\s*\[/.exec(candidate);
-  if (!findingsMarker) {
-    return undefined;
-  }
-  const findingsText = candidate.slice(findingsMarker.index + findingsMarker[0].length);
-  const findingPattern = /\{\s*"severity"\s*:\s*"(blocking|non_blocking)"\s*,\s*"file"\s*:\s*(null|"([^"\\]*(?:\\.[^"\\]*)*)")\s*,\s*"line"\s*:\s*(null|\d+)\s*,\s*"issue"\s*:\s*"([\s\S]*?)"\s*,\s*"recommendation"\s*:\s*"([\s\S]*?)"\s*\}/g;
-  const findings: Record<string, unknown>[] = [];
-  for (const match of findingsText.matchAll(findingPattern)) {
-    findings.push({
-      severity: match[1],
-      file: match[2] === "null" ? null : decodeLooseJsonString(match[3] ?? ""),
-      line: match[4] === "null" ? null : Number(match[4]),
-      issue: decodeLooseJsonString(match[5] ?? ""),
-      recommendation: decodeLooseJsonString(match[6] ?? ""),
-    });
-  }
-  if (findings.length === 0 && !/"findings"\s*:\s*\[\s*\]/.test(candidate)) {
-    return undefined;
-  }
-  const errorNull = /"error"\s*:\s*null/.test(candidate);
-  const errorMatch = /"error"\s*:\s*"([\s\S]*?)"\s*[,}]/.exec(candidate);
-  return {
-    verdict: verdictMatch[1],
-    summary: decodeLooseJsonString(summaryMatch[1] ?? ""),
-    guidance: guidanceMatch ? decodeLooseJsonString(guidanceMatch[1] ?? "") : guidanceNull ? null : undefined,
-    findings,
-    error: errorMatch ? decodeLooseJsonString(errorMatch[1] ?? "") : errorNull ? null : undefined,
-  };
-}
-
-function decodeLooseJsonString(value: string): string {
-  let quoted = "\"";
-  let escaped = false;
-  for (const char of value) {
-    if (char === "\n") {
-      quoted += "\\n";
-      escaped = false;
-      continue;
-    }
-    if (char === "\r") {
-      quoted += "\\r";
-      escaped = false;
-      continue;
-    }
-    if (char === "\t") {
-      quoted += "\\t";
-      escaped = false;
-      continue;
-    }
-    if (char === "\"" && !escaped) {
-      quoted += "\\\"";
-    } else {
-      quoted += char;
-    }
-    if (char === "\\") {
-      escaped = !escaped;
-    } else {
-      escaped = false;
-    }
-  }
-  quoted += "\"";
-  try {
-    return JSON.parse(quoted) as string;
-  } catch {
-    return value;
-  }
-}
-
 function extractBalancedJsonObjects(text: string): string[] {
   const candidates: string[] = [];
-  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
-    const candidate = extractBalancedJsonObjectAt(text, start);
-    if (candidate) {
-      candidates.push(candidate);
-    }
-  }
-  return candidates;
-}
-
-function extractBalancedJsonObjectAt(text: string, start: number): string | null {
   let depth = 0;
   let inString = false;
   let escaped = false;
-  for (let index = start; index < text.length; index += 1) {
+  let start = -1;
+  for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
     if (inString) {
       if (escaped) {
@@ -430,16 +354,17 @@ function extractBalancedJsonObjectAt(text: string, start: number): string | null
     if (char === "\"") {
       inString = true;
     } else if (char === "{") {
+      if (depth === 0) start = index;
       depth += 1;
     } else if (char === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        return text.slice(start, index + 1);
+      if (depth > 0) depth -= 1;
+      if (depth === 0 && start >= 0) {
+        candidates.push(text.slice(start, index + 1));
+        start = -1;
       }
     }
   }
-
-  return null;
+  return candidates;
 }
 
 function normalizeFindingFile(value: unknown): string {
@@ -463,4 +388,18 @@ function schemaError(reviewerId: string, summary: string, rawOutputPath?: string
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: ReadonlySet<string>): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.size && keys.every((key) => expected.has(key));
+}
+
+function hasAllowedKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  required: ReadonlySet<string>,
+): boolean {
+  const keys = Object.keys(value);
+  return keys.every((key) => allowed.has(key)) && [...required].every((key) => key in value);
 }

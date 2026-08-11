@@ -5,11 +5,10 @@ import { join, sep, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { WaveCaptureResult } from "./wave-repository";
 import { integrationRefName } from "./wave-worktrees";
+import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
 
 const execFileAsync = promisify(execFile);
 const readlinkBuffer = promisify(fsReadlink);
-
-const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0" };
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -266,27 +265,6 @@ export type RecoveryResult =
   | RecoveryResultRejected
   | RecoveryResultTerminal;
 
-// ── validation ───────────────────────────────────────────────────────────────
-
-/** Validate that an ID is a single safe ref/path segment. */
-function validateSafeId(id: string, label: string): void {
-  if (typeof id !== "string" || id.length === 0) {
-    throw new Error(`Invalid ${label}: must be a non-empty string.`);
-  }
-  if (
-    /[~^:?*[\\@{}\/]/.test(id) ||
-    /[\x00-\x20\x7F]/.test(id) ||
-    id === "." || id === ".." || id === "@" ||
-    id.startsWith(".") || id.endsWith(".") ||
-    id.endsWith(".lock") || id.includes("..") ||
-    id.includes("@{")
-  ) {
-    throw new Error(
-      `Invalid ${label}: "${id}". Must be a single safe ref/path segment.`,
-    );
-  }
-}
-
 // ── git helpers ──────────────────────────────────────────────────────────────
 
 async function gitOut(args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
@@ -320,10 +298,16 @@ async function gitOutBuffer(args: string[], cwd: string, signal?: AbortSignal): 
   return stdout;
 }
 
-/** Hash a blob using Node crypto (SHA-1, matching Git's object format). */
-function hashBlob(data: Buffer): string {
+/** Hash a blob using the repository's Git object format. */
+function hashBlob(data: Buffer, algorithm: "sha1" | "sha256"): string {
   const header = `blob ${data.length}\0`;
-  return createHash("sha1").update(header).update(data).digest("hex");
+  return createHash(algorithm).update(header).update(data).digest("hex");
+}
+
+function objectHashForOid(oid: string): "sha1" | "sha256" {
+  if (/^[0-9a-f]{40}$/.test(oid)) return "sha1";
+  if (/^[0-9a-f]{64}$/.test(oid)) return "sha256";
+  throw new Error(`Unsupported Git object ID: ${oid}`);
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -374,7 +358,7 @@ async function lookupTreeEntry(
 
   const metaPart = trimmed.slice(0, tabIdx);
   // Parse the metadata: "mode type sha"
-  const metaMatch = metaPart.match(/^(\d+)\s+(\w+)\s+([0-9a-f]{40})$/);
+  const metaMatch = metaPart.match(/^(\d+)\s+(\w+)\s+([0-9a-f]{40}|[0-9a-f]{64})$/);
   if (!metaMatch) {
     return null;
   }
@@ -412,6 +396,7 @@ async function lookupTreeEntry(
 async function inspectSourceFile(
   sourceRoot: string,
   relPath: string,
+  objectHash: "sha1" | "sha256",
   signal?: AbortSignal,
 ): Promise<{ blobId: string; mode: string } | null> {
   throwIfAborted(signal);
@@ -481,7 +466,7 @@ async function inspectSourceFile(
     // Symlink: hash the raw target without resolving (avoids dangling/external
     // symlink failures and allows exact comparison with Git tree entries).
     const targetBuffer = (await readlinkBuffer(fullPath, { encoding: null })) as unknown as Buffer;
-    const blobId = hashBlob(targetBuffer);
+    const blobId = hashBlob(targetBuffer, objectHash);
     return { blobId, mode: "120000" };
   } else {
     // Regular file: verify the resolved path stays under sourceRoot.
@@ -492,7 +477,7 @@ async function inspectSourceFile(
       );
     }
     const data = await fs.readFile(fullPath, { signal });
-    const blobId = hashBlob(data);
+    const blobId = hashBlob(data, objectHash);
     const isExecutable = (lstat.mode & 0o111) !== 0;
     const mode = isExecutable ? "100755" : "100644";
     return { blobId, mode };
@@ -646,7 +631,7 @@ export async function planWaveLanding(
     // Inspect the current source filesystem.
     let current: { blobId: string; mode: string } | null;
     try {
-      current = await inspectSourceFile(resolvedSourceRoot, path, signal);
+      current = await inspectSourceFile(resolvedSourceRoot, path, objectHashForOid(baseCommit), signal);
     } catch (err) {
       if (err instanceof Error && (
         err.message.includes("directory") ||
@@ -798,26 +783,12 @@ export async function planWaveLanding(
 
 // ── transactional execution ──────────────────────────────────────────────────
 
-/**
- * INTERNAL / TEST-ONLY: Inject a failure after a specific number of successful
- * path applications during executeWaveLanding. Set from tests to simulate
- * mid-transaction I/O failures. Clear (set to undefined) to disable.
- */
-export let __testOnly_failAfterNPaths: number | undefined;
-
-/**
- * INTERNAL / TEST-ONLY: Inject a failure after the backup rename of a specific
- * path during executeWaveLanding. Set from tests to simulate mid-mutation I/O
- * failures. Clear (set to undefined) to disable.
- */
-export let __testOnly_failAfterBackupOf: string | undefined;
-
-/**
- * INTERNAL / TEST-ONLY: Callback invoked after a path is applied but before
- * the next path is processed. Used by tests to simulate concurrent destination
- * modification. Clear (set to undefined) to disable.
- */
-export let __testOnly_afterApplyPath: ((relPath: string, destPath: string) => Promise<void> | void) | undefined;
+/** @internal Per-invocation fault hooks used by landing regression tests. */
+export interface WaveLandingHooks {
+  failAfterNPaths?: number;
+  failAfterBackupOf?: string;
+  afterApplyPath?: (relPath: string, destPath: string) => Promise<void> | void;
+}
 
 /**
  * Unlink a file, ignoring ENOENT but rethrowing other errors.
@@ -994,6 +965,7 @@ export async function executeWaveLanding(
   plan: LandingPlan,
   capture: WaveCaptureResult,
   signal?: AbortSignal,
+  hooks: WaveLandingHooks = {},
 ): Promise<LandingExecutionResult> {
   const { sourceRoot, baseCommit, integratedCommitSha, integratedRef } = plan;
   const { repositoryPath, waveRoot } = capture;
@@ -1121,7 +1093,7 @@ export async function executeWaveLanding(
   for (const lp of [...applyPaths, ...alreadyAppliedPaths]) {
     let current: { blobId: string; mode: string } | null;
     try {
-      current = await inspectSourceFile(resolvedSourceRoot, lp.path, signal);
+      current = await inspectSourceFile(resolvedSourceRoot, lp.path, objectHashForOid(freshPlan.baseCommit), signal);
     } catch (err) {
       if (err instanceof Error && (
         err.message.includes("directory") ||
@@ -1371,7 +1343,7 @@ export async function executeWaveLanding(
         // Just-in-time state revalidation before mutation.
         let current: { blobId: string; mode: string } | null;
         try {
-          current = await inspectSourceFile(resolvedSourceRoot, lp.path, signal);
+          current = await inspectSourceFile(resolvedSourceRoot, lp.path, objectHashForOid(freshPlan.baseCommit), signal);
         } catch (err) {
           if (err instanceof Error && (
             err.message.includes("directory") ||
@@ -1403,8 +1375,8 @@ export async function executeWaveLanding(
         }
 
         // ── Test seam: inject failure after N paths ──
-        if (__testOnly_failAfterNPaths !== undefined && journal.length >= __testOnly_failAfterNPaths) {
-          throw new Error(`__testOnly_failAfterNPaths: injected failure after ${__testOnly_failAfterNPaths} paths`);
+        if (hooks.failAfterNPaths !== undefined && journal.length >= hooks.failAfterNPaths) {
+          throw new Error(`failAfterNPaths: injected failure after ${hooks.failAfterNPaths} paths`);
         }
 
         // Perform the actual mutation.
@@ -1432,8 +1404,8 @@ export async function executeWaveLanding(
           }
 
           // ── Test seam: inject failure after backup rename ──
-          if (__testOnly_failAfterBackupOf === lp.path) {
-            throw new Error(`__testOnly_failAfterBackupOf: injected failure after backup of ${lp.path}`);
+          if (hooks.failAfterBackupOf === lp.path) {
+            throw new Error(`failAfterBackupOf: injected failure after backup of ${lp.path}`);
           }
 
           const tempPath = tempFiles.get(lp.path);
@@ -1455,8 +1427,8 @@ export async function executeWaveLanding(
           }
 
           // ── Test seam: inject failure after backup rename ──
-          if (__testOnly_failAfterBackupOf === lp.path) {
-            throw new Error(`__testOnly_failAfterBackupOf: injected failure after backup of ${lp.path}`);
+          if (hooks.failAfterBackupOf === lp.path) {
+            throw new Error(`failAfterBackupOf: injected failure after backup of ${lp.path}`);
           }
 
           const tempPath = tempFiles.get(lp.path);
@@ -1467,8 +1439,8 @@ export async function executeWaveLanding(
         }
 
         // ── Test seam: simulate concurrent modification after apply ──
-        if (__testOnly_afterApplyPath !== undefined) {
-          await __testOnly_afterApplyPath(lp.path, destPath);
+        if (hooks.afterApplyPath !== undefined) {
+          await hooks.afterApplyPath(lp.path, destPath);
         }
 
         // ── Check abort signal after each applied-path callback ──
@@ -1549,7 +1521,7 @@ export async function executeWaveLanding(
           // Inspect the current destination state.
           let currentDest: { blobId: string; mode: string } | null;
           try {
-            currentDest = await inspectSourceFile(resolvedSourceRoot, entry.path);
+            currentDest = await inspectSourceFile(resolvedSourceRoot, entry.path, objectHashForOid(plan.baseCommit));
           } catch (inspectErr) {
             const inspectErrNode = inspectErr as NodeJS.ErrnoException;
             if (inspectErrNode?.code === "ENOENT") {
@@ -2049,11 +2021,11 @@ export async function recoverLandingManifest(
   // ── Step 4: Handle terminal states ──
   if (manifest.state === "completed") {
     // Clean stale backups/temps after verifying transaction completion.
-    return await cleanupCompletedManifest(manifest, manifestPath, resolvedSourceRoot);
+    return await cleanupCompletedManifest(manifest, manifestPath);
   }
   if (manifest.state === "rolled_back") {
     // Clean stale temps only — never delete user files.
-    return await cleanupRolledBackManifest(manifest, manifestPath, resolvedSourceRoot);
+    return await cleanupRolledBackManifest(manifest, manifestPath);
   }
 
   // ── Step 5: Recover in_progress or recovery_required ──
@@ -2076,7 +2048,7 @@ export async function recoverLandingManifest(
     try {
       const detail = await recoverSinglePath(
         entry, currentPhase, destPath, backupPath, tempPath,
-        resolvedSourceRoot, manifest,
+        resolvedSourceRoot,
       );
       pathDetails.push(detail);
 
@@ -2179,12 +2151,11 @@ async function recoverSinglePath(
   backupPath: string | null,
   tempPath: string,
   resolvedSourceRoot: string,
-  manifest: RecoveryManifest,
 ): Promise<RecoveryPathDetail> {
   // Inspect current destination state.
   let currentDest: { blobId: string; mode: string } | null;
   try {
-    currentDest = await inspectSourceFile(resolvedSourceRoot, entry.path);
+    currentDest = await inspectSourceFile(resolvedSourceRoot, entry.path, objectHashForOid(entry.blobId));
   } catch (err) {
     const nodeErr = err as NodeJS.ErrnoException;
     if (nodeErr?.code === "ENOENT") {
@@ -2430,7 +2401,6 @@ async function recoverSinglePath(
 async function cleanupCompletedManifest(
   manifest: RecoveryManifest,
   manifestPath: string,
-  resolvedSourceRoot: string,
 ): Promise<RecoveryResultTerminal> {
   const cleanedPaths: string[] = [];
 
@@ -2475,7 +2445,6 @@ async function cleanupCompletedManifest(
 async function cleanupRolledBackManifest(
   manifest: RecoveryManifest,
   manifestPath: string,
-  resolvedSourceRoot: string,
 ): Promise<RecoveryResultTerminal> {
   const cleanedPaths: string[] = [];
 

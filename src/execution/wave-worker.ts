@@ -8,6 +8,7 @@ import type { WaveCaptureResult } from "./wave-repository";
 import type { ReviewGateConfig } from "../config";
 import type { ExecutorAdapter, ExecutorSession, ExecutorTurn, SubtaskProgressUpdate } from "./types";
 import type { TokenUsage } from "../usage";
+import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
 
 // ── path rewriting for workspace isolation ───────────────────────────────────
 
@@ -305,8 +306,6 @@ async function assertWorktreeBelongsToRepo(worktreeRoot: string, capture: WaveCa
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
-  const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0" };
-
   const gitOut = async (args: string[]) => (await execFileAsync("git", args, {
     cwd: worktreeRoot,
     env: { ...process.env, ...GIT_ENV },
@@ -583,6 +582,22 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       model: adapter.model,
       usage: turn.usage,
       error: "Executor timed out.",
+    };
+  }
+
+  if (turn.failure) {
+    const message = `Executor ${turn.failure.category} error: ${turn.failure.message}`;
+    return {
+      status: "executor_error",
+      taskId,
+      title: task.title,
+      summary: message,
+      session: turn.session,
+      turn,
+      adapter: adapter.kind,
+      model: adapter.model,
+      usage: turn.usage,
+      error: message,
     };
   }
 
@@ -865,6 +880,22 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       model: adapter.model,
       usage: turnResult.usage,
       error: "Executor timed out.",
+    };
+  }
+
+  if (turnResult.failure) {
+    const message = `Executor ${turnResult.failure.category} error: ${turnResult.failure.message}`;
+    return {
+      status: "executor_error",
+      taskId,
+      title: task.title,
+      summary: message,
+      session: turnResult.session,
+      turn: turnResult,
+      adapter: adapter.kind,
+      model: adapter.model,
+      usage: turnResult.usage,
+      error: message,
     };
   }
 

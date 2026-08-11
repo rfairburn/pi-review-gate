@@ -447,9 +447,17 @@ test("runReview writes changed file artifacts into retained bundles", async () =
     });
 
     assert.equal(output.bundleRetained, true);
-    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "submitted", "before", "index.ts"));
-    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "submitted", "after", "index.ts"));
-    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "index.json"));
+    const artifactRoot = join(output.bundleDir ?? "", "reviews", "0001", "artifacts");
+    const artifactIndex = JSON.parse(await readFile(join(artifactRoot, "index.json"), "utf8")) as Array<{
+      kind: string;
+      artifactPath: string;
+    }>;
+    const beforeArtifact = artifactIndex.find((entry) => entry.kind === "submitted-before")?.artifactPath;
+    const afterArtifact = artifactIndex.find((entry) => entry.kind === "submitted-after")?.artifactPath;
+    assert.ok(beforeArtifact);
+    assert.ok(afterArtifact);
+    await access(join(output.bundleDir ?? "", "reviews", "0001", beforeArtifact));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", afterArtifact));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

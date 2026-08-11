@@ -3,7 +3,8 @@ import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { syncReviewWindowArtifacts } from "../src/bundle";
+import { createReviewBundle, syncReviewWindowArtifacts } from "../src/bundle";
+import type { EvidenceBundle } from "../src/evidence";
 import type { ReviewExchangeContext } from "../src/state";
 
 test("completed exchange artifacts are not rewritten during later synchronization", async () => {
@@ -36,3 +37,49 @@ test("completed exchange artifacts are not rewritten during later synchronizatio
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("artifact publication keeps colliding sanitized paths distinct", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-bundle-collision-"));
+  const evidence: EvidenceBundle = {
+    events: [],
+    finalAssistantSummaries: [],
+    acceptedReviewerQuestions: [],
+    changedCandidatePaths: [],
+    markdown: "",
+    candidates: [
+      { path: "a+b", absolutePath: join(dir, "a+b"), sources: ["test"], baseline: "captured", baselineSnapshot: snapshot(join(dir, "a+b"), "plus") },
+      { path: "a=b", absolutePath: join(dir, "a=b"), sources: ["test"], baseline: "captured", baselineSnapshot: snapshot(join(dir, "a=b"), "equals") },
+    ],
+  };
+  try {
+    const bundle = await createReviewBundle({
+      dir,
+      cwd: dir,
+      request: "test",
+      submittedChanges: [],
+      patch: "",
+      evidence,
+    });
+    const index = JSON.parse(await readFile(join(bundle.invocationDir, "artifacts", "index.json"), "utf8"));
+    const paths = index.filter((entry: { kind: string }) => entry.kind === "evidence-baseline")
+      .map((entry: { artifactPath: string }) => entry.artifactPath);
+    assert.equal(new Set(paths).size, 2);
+    const contents = await Promise.all(paths.map((path: string) => readFile(join(bundle.invocationDir, path), "utf8")));
+    assert.deepEqual(contents.sort(), ["equals", "plus"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+function snapshot(absolutePath: string, content: string) {
+  return {
+    relativePath: absolutePath,
+    absolutePath,
+    exists: true,
+    size: content.length,
+    mtimeMs: 0,
+    sha256: "a".repeat(64),
+    isBinary: false,
+    content,
+  };
+}

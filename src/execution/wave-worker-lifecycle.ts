@@ -2,9 +2,9 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
 
 const execFileAsync = promisify(execFile);
-const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0" };
 
 /** Reset a worktree HEAD to a specific commit. */
 async function gitResetHard(worktreeRoot: string, commitSha: string): Promise<void> {
@@ -263,7 +263,6 @@ async function runCandidateReview(
   repoPath: string,
   baseCommit: string,
   candidateCommit: string,
-  candidateTreeSha: string,
   window: ReviewWindow,
   evidence: EvidenceState,
   worktreeRoot: string,
@@ -614,7 +613,6 @@ export async function runWaveWorkerLifecycle(
         capture.repositoryPath,
         capture.baseCommit,
         currentCandidate.commitSha,
-        currentCandidate.treeSha,
         window,
         window.evidence,
         worktree.worktreeRoot,

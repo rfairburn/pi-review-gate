@@ -75,6 +75,11 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       code: output.code,
       timedOut: output.timedOut,
       aborted: output.aborted,
+      failure: extracted.terminalError
+        ? { category: "provider", message: extracted.terminalError }
+        : output.stdinError
+          ? { category: "stdin", message: output.stdinError }
+          : undefined,
     };
   }
 }

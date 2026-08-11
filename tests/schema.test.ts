@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extractJsonObject, parseReviewResult } from "../src/schema";
+import { extractJsonObject, parseReviewResult, REVIEW_OUTPUT_JSON_SCHEMA } from "../src/schema";
+
+test("structured-output schema requires every declared object property", () => {
+  assertStrictObjectRequirements(REVIEW_OUTPUT_JSON_SCHEMA);
+});
 
 test("extractJsonObject extracts the first complete object with strings", () => {
-  const raw = 'prefix {"verdict":"pass","summary":"ok { still string }","findings":[]} suffix';
-  assert.equal(extractJsonObject(raw), '{"verdict":"pass","summary":"ok { still string }","findings":[]}');
+  const raw = 'prefix {"verdict":"pass","summary":"ok { still string }","guidance":null,"findings":[],"error":null} suffix';
+  assert.equal(extractJsonObject(raw), '{"verdict":"pass","summary":"ok { still string }","guidance":null,"findings":[],"error":null}');
 });
 
 test("parseReviewResult accepts clean JSON", () => {
-  const result = parseReviewResult("reviewer", '{"verdict":"pass","summary":"ok","findings":[]}');
+  const result = parseReviewResult("reviewer", '{"verdict":"pass","summary":"ok","guidance":null,"findings":[],"error":null}');
   assert.equal(result.verdict, "pass");
   assert.equal(result.summary, "ok");
 });
@@ -19,6 +23,7 @@ test("parseReviewResult preserves Markdown implementation guidance", () => {
     summary: "Use the guarded branch.",
     guidance: "Apply this:\n\n```diff\n-old\n+new\n```",
     findings: [],
+    error: null,
   }));
 
   assert.equal(result.guidance, "Apply this:\n\n```diff\n-old\n+new\n```");
@@ -36,7 +41,7 @@ test("parseReviewResult repairs literal newlines inside reviewer JSON strings", 
       '  "guidance": "Apply this:',
       "```diff",
       "-old",
-      '+const mode = "safe";',
+      "+const mode = safe;",
       '```",',
       '  "findings": [{"severity":"blocking","file":"index.ts","line":1,"issue":"old remains","recommendation":"use new"}],',
       '  "error": null',
@@ -46,12 +51,21 @@ test("parseReviewResult repairs literal newlines inside reviewer JSON strings", 
   );
 
   assert.equal(result.verdict, "needs_changes");
-  assert.match(result.guidance ?? "", /```diff\n-old\n\+const mode = "safe";\n```/);
+  assert.match(result.guidance ?? "", /```diff\n-old\n\+const mode = safe;\n```/);
   assert.equal(result.findings.length, 1);
 });
 
+test("parseReviewResult never accepts a pass that required JSON repair", () => {
+  const result = parseReviewResult(
+    "reviewer",
+    '{"verdict":"pass","summary":"line one\nline two","guidance":null,"findings":[],"error":null}',
+  );
+  assert.equal(result.verdict, "error");
+  assert.equal(result.error, "invalid_json");
+});
+
 test("parseReviewResult reports malformed review-shaped JSON as invalid JSON", () => {
-  const result = parseReviewResult("reviewer", '{"verdict":"pass","summary":"unterminated,"findings":[]}');
+  const result = parseReviewResult("reviewer", '{"verdict":"pass","summary":"unterminated,"guidance":null,"findings":[],"error":null}');
   assert.equal(result.verdict, "error");
   assert.equal(result.error, "invalid_json");
   assert.equal(result.summary, "Reviewer returned invalid JSON.");
@@ -69,7 +83,9 @@ test("parseReviewResult accepts a fenced JSON review after prose containing brac
       JSON.stringify({
         verdict: "pass",
         summary: "All blocking issues were fixed.",
+        guidance: null,
         findings: [],
+        error: null,
       }),
       "```",
     ].join("\n"),
@@ -87,14 +103,18 @@ test("parseReviewResult prefers a JSON fence over earlier balanced review-shaped
       JSON.stringify({
         verdict: "needs_changes",
         summary: "stale example",
+        guidance: null,
         findings: [],
+        error: null,
       }),
       "",
       "```json",
       JSON.stringify({
         verdict: "pass",
         summary: "authoritative fenced result",
+        guidance: null,
         findings: [],
+        error: null,
       }),
       "```",
     ].join("\n"),
@@ -113,7 +133,9 @@ test("parseReviewResult scans later balanced objects for a schema-valid review",
       JSON.stringify({
         verdict: "pass",
         summary: "later object accepted",
+        guidance: null,
         findings: [],
+        error: null,
       }),
     ].join("\n"),
   );
@@ -128,6 +150,7 @@ test("parseReviewResult treats blocking findings as needs_changes", () => {
     JSON.stringify({
       verdict: "pass",
       summary: "has issue",
+      guidance: null,
       findings: [
         {
           severity: "blocking",
@@ -137,6 +160,7 @@ test("parseReviewResult treats blocking findings as needs_changes", () => {
           recommendation: "fix it",
         },
       ],
+      error: null,
     }),
   );
   assert.equal(result.verdict, "needs_changes");
@@ -148,6 +172,7 @@ test("parseReviewResult normalizes null finding files to session", () => {
     JSON.stringify({
       verdict: "needs_changes",
       summary: "missing command",
+      guidance: null,
       findings: [
         {
           severity: "blocking",
@@ -157,6 +182,7 @@ test("parseReviewResult normalizes null finding files to session", () => {
           recommendation: "run npm test",
         },
       ],
+      error: null,
     }),
   );
 
@@ -171,6 +197,7 @@ test("parseReviewResult accepts session-level missing acceptance verification fi
     JSON.stringify({
       verdict: "needs_changes",
       summary: "The implementation appears to address the build_chess_mjs.js finding itself, and updating ../outsidefiles/review.md was explicitly requested. However, the submitted session does not include the required acceptance verification for code changes.",
+      guidance: null,
       findings: [
         {
           severity: "blocking",
@@ -180,6 +207,7 @@ test("parseReviewResult accepts session-level missing acceptance verification fi
           recommendation: "Run `npm run lint`, `npm run format:check`, and `npm test` successfully, or document the exact environmental reason if any required command cannot complete.",
         },
       ],
+      error: null,
     }),
   );
 
@@ -195,3 +223,39 @@ test("parseReviewResult rejects invalid output safely", () => {
   assert.equal(result.verdict, "error");
   assert.equal(result.error, "missing_json");
 });
+
+test("parseReviewResult fails closed on a truncated pass object", () => {
+  const result = parseReviewResult(
+    "reviewer",
+    '{"verdict":"pass","summary":"ok","guidance":null,"findings":[],"error":null',
+  );
+  assert.equal(result.verdict, "error");
+  assert.equal(result.error, "invalid_json");
+});
+
+test("parseReviewResult enforces required and supported top-level fields", () => {
+  const missing = parseReviewResult("reviewer", '{"verdict":"pass","summary":"ok"}');
+  assert.equal(missing.verdict, "error");
+  assert.equal(missing.error, "schema_error");
+
+  const extra = parseReviewResult(
+    "reviewer",
+    '{"verdict":"pass","summary":"ok","guidance":null,"findings":[],"error":null,"extra":true}',
+  );
+  assert.equal(extra.verdict, "error");
+  assert.equal(extra.error, "schema_error");
+});
+
+function assertStrictObjectRequirements(schema: unknown): void {
+  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) return;
+  const value = schema as Record<string, unknown>;
+  if (value.type === "object") {
+    assert.equal(value.additionalProperties, false);
+    assert.ok(typeof value.properties === "object" && value.properties !== null && !Array.isArray(value.properties));
+    const properties = value.properties as Record<string, unknown>;
+    assert.ok(Array.isArray(value.required));
+    assert.deepEqual(new Set(value.required), new Set(Object.keys(properties)));
+    for (const child of Object.values(properties)) assertStrictObjectRequirements(child);
+  }
+  if (value.type === "array") assertStrictObjectRequirements(value.items);
+}

@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { redactSensitiveText } from "./redaction";
 import type { ReviewFinding, ReviewResult } from "./schema";
 
 export type ReviewTransmissionAction = "correction_required" | "passed" | "deferred" | "review_error";
@@ -148,7 +149,7 @@ function renderTransmission(envelope: ReviewTransmissionEnvelope, bundleDir: str
       lines.push("", `Reviewer error: ${reviewer.result.error}`);
     }
     if (reviewer.result.diagnostic) {
-      lines.push("", "Reviewer diagnostic:", reviewer.result.diagnostic);
+      lines.push("", "Reviewer diagnostic:", redactSensitiveText(reviewer.result.diagnostic));
     }
     if (reviewer.findings.length === 0) {
       lines.push("", "Findings: none.");

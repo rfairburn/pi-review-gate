@@ -193,6 +193,19 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
     if (turn.timedOut) {
       return finishFailure(input, subtaskId, artifactDir, "executor_error", "Executor timed out.", childState, parentBaseline, adapter.kind, adapter.model);
     }
+    if (turn.failure) {
+      return finishFailure(
+        input,
+        subtaskId,
+        artifactDir,
+        "executor_error",
+        `Executor ${turn.failure.category} error: ${turn.failure.message}`,
+        childState,
+        parentBaseline,
+        adapter.kind,
+        adapter.model,
+      );
+    }
     if (turn.code !== 0) {
       return finishFailure(input, subtaskId, artifactDir, "executor_error", `Executor exited with status ${turn.code}.`, childState, parentBaseline, adapter.kind, adapter.model);
     }
@@ -405,7 +418,8 @@ async function finishSuccess(input: {
   });
   const after = await snapshot(input.input.cwd, input.input.config, input.input.signal);
   checkpointReviewWindow(input.input.parentState, after);
-  const retained = input.input.config.retainBundles === "always" || reviewReport?.aggregate === "pass_with_warnings";
+  const retained = input.input.config.retainBundles === "always"
+    || (input.input.config.retainBundles === "on-failure" && reviewReport?.aggregate === "pass_with_warnings");
   if (reviewReport && !retained) reviewReport.artifactDir = undefined;
   const packet: SubtaskPacket = {
     subtaskId: input.subtaskId,
@@ -478,6 +492,7 @@ async function finishFailure(
   if (input.config.retainBundles === "never") {
     await rm(artifactDir, { recursive: true, force: true });
     packet.bundleDir = undefined;
+    if (packet.reviewReport) packet.reviewReport.artifactDir = undefined;
   }
   return packet;
 }
@@ -557,6 +572,12 @@ function snapshotDigest(value: WorkspaceSnapshot): string {
     hash.update(path);
     hash.update("\0");
     hash.update(file.sha256 ?? "missing");
+    hash.update("\0");
+    hash.update(file.entryType ?? "missing");
+    hash.update("\0");
+    hash.update(String(file.mode ?? 0));
+    hash.update("\0");
+    hash.update(file.linkTarget ?? "");
     hash.update("\0");
   }
   return hash.digest("hex");

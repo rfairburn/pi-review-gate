@@ -1,6 +1,6 @@
 import { cp, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, join } from "node:path";
 import { resolveReviewers, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
@@ -526,10 +526,25 @@ async function executeReviewerInvocation(input: {
   // Publish reviewer outputs as one completed set. Until this point each
   // reviewer writes outside the evidence bundle, so concurrently running
   // reviewers cannot inspect sibling results or runtime session streams.
-  await Promise.all(stagedReviewers.map(publishStagedReviewer));
+  try {
+    await publishStagedReviewerSet(stagedReviewers, input.bundle.invocationDir);
+  } catch (error) {
+    await cleanupStagedReviewers(stagedReviewers);
+    const message = error instanceof Error ? error.message : "Reviewer artifact publication failed.";
+    const publicationFailure: ReviewResult = {
+      reviewerId: "gate",
+      verdict: "error",
+      summary: "Reviewer results could not be published atomically.",
+      findings: [],
+      error: "artifact_publication_failed",
+      diagnostic: message,
+    };
+    if (input.window) input.window.retainBundleAfterClose = true;
+    return { aborted: false, result: publicationFailure, reviewerResults: [publicationFailure], bundleRetained: true };
+  }
 
   const result = decideReviewResults(reviewerResults);
-  await Promise.all([
+  const telemetryPublications = await Promise.allSettled([
     writeFile(join(input.bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
     writeFile(join(input.bundle.invocationDir, "review-telemetry.json"), JSON.stringify({
       version: 1,
@@ -546,9 +561,18 @@ async function executeReviewerInvocation(input: {
       null,
       2,
     ), "utf8"),
-  ]).catch(() => undefined);
+  ]);
+  const telemetryFailures = telemetryPublications
+    .filter((publication): publication is PromiseRejectedResult => publication.status === "rejected")
+    .map((publication) => publication.reason instanceof Error ? publication.reason.message : String(publication.reason));
+  if (telemetryFailures.length > 0) {
+    result.diagnostic = [result.diagnostic, `Artifact telemetry publication failed: ${telemetryFailures.join("; ")}`]
+      .filter(Boolean)
+      .join("\n");
+    if (input.window) input.window.retainBundleAfterClose = true;
+  }
 
-  const bundleRetained = shouldRetainBundle(input.config, result, reviewerResults);
+  const bundleRetained = telemetryFailures.length > 0 || shouldRetainBundle(input.config, result, reviewerResults);
   if (input.window) {
     input.window.retainBundleAfterClose ||= bundleRetained;
   } else if (!bundleRetained) {
@@ -574,6 +598,7 @@ async function runSingleReviewer(input: {
   const startedAtIso = new Date(startedAt).toISOString();
   let session: ReviewerSession | undefined;
   let result: ReviewResult;
+  let artifactError: string | undefined;
   try {
     const adapter = createAdapter(input.reviewer);
     result = await adapter.run({
@@ -589,6 +614,7 @@ async function runSingleReviewer(input: {
       onUpdate: input.onUpdate,
     });
   } catch (error) {
+    artifactError = error instanceof Error ? error.message : "artifact write failed";
     result = {
       reviewerId: input.reviewer.id,
       verdict: "error",
@@ -612,38 +638,71 @@ async function runSingleReviewer(input: {
   // Review passes are fresh, so runtime session history is neither needed for
   // continuation nor valid evidence for this or later reviewers.
   await rm(join(reviewerDir, "session"), { recursive: true, force: true });
-  await Promise.all([
-    writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-    writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
-    writeFile(join(reviewerDir, "invocation.json"), JSON.stringify({
+  try {
+    await Promise.all([
+      writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
+      writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+      writeFile(join(reviewerDir, "invocation.json"), JSON.stringify({
+        reviewerId: input.reviewer.id,
+        adapter: input.reviewer.adapter,
+        resumed: false,
+        restartedAfterResumeFailure: false,
+        durationMs,
+        promptBytes: result.telemetry.promptBytes,
+        telemetry: result.telemetry,
+        session: session ?? null,
+      }, null, 2), "utf8"),
+    ]);
+  } catch (error) {
+    result = {
       reviewerId: input.reviewer.id,
-      adapter: input.reviewer.adapter,
-      resumed: false,
-      restartedAfterResumeFailure: false,
-      durationMs,
-      promptBytes: result.telemetry.promptBytes,
+      verdict: "error",
+      summary: "Reviewer artifacts could not be written completely.",
+      findings: [],
+      error: "artifact_write_failed",
+      diagnostic: artifactError,
       telemetry: result.telemetry,
-      session: session ?? null,
-    }, null, 2), "utf8"),
-  ]).catch(() => undefined);
-  return { result, stagingDir: reviewerDir, finalDir: finalReviewerDir };
+    };
+    await writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8").catch(() => undefined);
+  }
+  return { result, stagingDir: reviewerDir, finalDir: finalReviewerDir, artifactError };
 }
 
 interface StagedReviewerResult {
   result: ReviewResult;
   stagingDir: string;
   finalDir: string;
+  artifactError?: string;
 }
 
-async function publishStagedReviewer(staged: StagedReviewerResult): Promise<void> {
-  await mkdir(dirname(staged.finalDir), { recursive: true });
-  await rm(staged.finalDir, { recursive: true, force: true });
+async function publishStagedReviewerSet(
+  stagedReviewers: StagedReviewerResult[],
+  invocationDir: string,
+): Promise<void> {
+  const incomplete = stagedReviewers.filter((reviewer) => reviewer.artifactError);
+  if (incomplete.length > 0) {
+    throw new Error(incomplete.map((reviewer) =>
+      `${reviewer.result.reviewerId}: ${reviewer.artifactError}`).join("; "));
+  }
+  const finalRoot = join(invocationDir, "reviewers");
+  const stagedRoot = await mkdtemp(join(invocationDir, ".reviewers-"));
   try {
-    await rename(staged.stagingDir, staged.finalDir);
+    for (const staged of stagedReviewers) {
+      const target = join(stagedRoot, basename(staged.finalDir));
+      try {
+        await rename(staged.stagingDir, target);
+      } catch (error) {
+        if (!isCrossDeviceRename(error)) throw error;
+        await cp(staged.stagingDir, target, { recursive: true });
+        await rm(staged.stagingDir, { recursive: true, force: true });
+      }
+    }
+    await writeFile(join(stagedRoot, ".complete"), "complete\n", "utf8");
+    await rm(finalRoot, { recursive: true, force: true });
+    await rename(stagedRoot, finalRoot);
   } catch (error) {
-    if (!isCrossDeviceRename(error)) throw error;
-    await cp(staged.stagingDir, staged.finalDir, { recursive: true });
-    await rm(staged.stagingDir, { recursive: true, force: true });
+    await rm(stagedRoot, { recursive: true, force: true });
+    throw error;
   }
 }
 

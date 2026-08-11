@@ -17,6 +17,7 @@ process.stdin.on("end", () => {
     writeJson({
       verdict: "needs_changes",
       summary: "Fake reviewer requested changes.",
+      guidance: null,
       findings: [
         {
           severity: "blocking",
@@ -26,6 +27,7 @@ process.stdin.on("end", () => {
           recommendation: findingRecommendation,
         },
       ],
+      error: null,
     });
     return;
   }
@@ -33,7 +35,9 @@ process.stdin.on("end", () => {
   writeJson({
     verdict: "pass",
     summary: "Fake reviewer approved the changes.",
+    guidance: null,
     findings: [],
+    error: null,
   });
 });
 

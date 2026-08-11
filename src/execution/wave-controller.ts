@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import type { ReviewGateConfig } from "../config";
-import type { WaveCaptureResult } from "./wave-repository";
+import type { WaveCaptureHooks, WaveCaptureResult } from "./wave-repository";
 import { captureWaveBase, WaveCaptureError } from "./wave-repository";
 import {
   createWorkerWorktree,
@@ -19,6 +19,7 @@ import type {
   WaveIntegrationResult,
   WaveIntegrationSuccess,
   SelectedWorker,
+  WaveIntegrationHooks,
 } from "./wave-integration";
 import { integrateWave } from "./wave-integration";
 import type {
@@ -28,6 +29,7 @@ import type {
 import { planWaveLanding, executeWaveLanding } from "./wave-landing";
 import type { SubtaskProgressUpdate } from "./types";
 import type { SubtaskReviewReport } from "../review-report";
+import { SerialWriter } from "./serial-writer";
 
 // ── public input / result contract ───────────────────────────────────────────
 
@@ -160,6 +162,8 @@ export interface WaveResult {
   integration?: WaveIntegrationOutcome;
   /** Landing outcome (if landing was attempted). */
   landing?: WaveLandingOutcome;
+  /** Non-fatal infrastructure failures that occurred after later state was published. */
+  infrastructureWarnings?: string[];
 }
 
 /** Input for the bounded wave controller. */
@@ -188,6 +192,10 @@ export interface WaveControllerInput {
    * Default is false (all-or-nothing: any non-eligible worker blocks integration).
    */
   integratePartial?: boolean;
+  /** @internal Per-invocation integration fault hooks used by regression tests. */
+  integrationHooks?: WaveIntegrationHooks;
+  /** @internal Per-invocation capture fault hooks used by regression tests. */
+  captureHooks?: WaveCaptureHooks;
 }
 
 // ── manifest types ───────────────────────────────────────────────────────────
@@ -229,6 +237,8 @@ export interface WaveManifestTask {
 /** The wave manifest written atomically under waveRoot. */
 export interface WaveManifest {
   version: 1;
+  /** Monotonically increasing publication sequence within this wave. */
+  revision: number;
   waveId: string;
   phase: WavePhase;
   /** Base capture provenance. */
@@ -336,6 +346,7 @@ function buildManifest(
 ): WaveManifest {
   return {
     version: 1,
+    revision: 0,
     waveId,
     phase,
     baseCommit: capture.baseCommit,
@@ -621,6 +632,8 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     capture = await captureWaveBase({
       cwd,
       maxSnapshotBytes: config.maxSnapshotBytes,
+      artifactTtlMs: config.retainBundles === "always" ? 0 : config.waveArtifactTtlMs,
+      hooks: input.captureHooks,
       waveId,
       artifactDir,
       signal,
@@ -653,16 +666,22 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     activity: [`Starting ${taskItems.length} worker(s) with max ${maxWorkers} concurrent`],
   });
 
-  // Serialize manifest writes to avoid stale write races.
-  let manifestWriteQueue: Promise<void> = Promise.resolve();
-  const queueManifestWrite = async (manifest: WaveManifest): Promise<void> => {
-    const prev = manifestWriteQueue;
-    manifestWriteQueue = prev.then(
-      () => writeWaveManifest(waveRoot, manifest),
-      () => writeWaveManifest(waveRoot, manifest),
-    );
-    return manifestWriteQueue;
+  // Serialize every post-capture manifest write. Keep the queue itself
+  // fulfilled after a failure so a later terminal write still gets a chance
+  // to publish authoritative state; callers that await their own write still
+  // receive that write's error.
+  const manifestWriter = new SerialWriter<WaveManifest>((manifest) => writeWaveManifest(waveRoot, manifest));
+  let nextManifestRevision = 1;
+  let manifestPersistenceWarning: string | undefined;
+  const queueManifestWrite = (manifest: WaveManifest): Promise<void> => {
+    const publication = manifestWriter.write({ ...manifest, revision: nextManifestRevision++ });
+    void publication.catch((error: unknown) => {
+      manifestPersistenceWarning ??= `Wave manifest publication failed: ${error instanceof Error ? error.message : String(error)}`;
+    });
+    return publication;
   };
+  const infrastructureWarnings = (): Pick<WaveResult, "infrastructureWarnings"> =>
+    manifestPersistenceWarning ? { infrastructureWarnings: [manifestPersistenceWarning] } : {};
 
   const startWorker = async (taskIndex: number): Promise<void> => {
     if (signal?.aborted) return;
@@ -753,7 +772,10 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
                   summary: "Queued for execution.",
                 };
               });
-              queueManifestWrite(buildManifest(waveId, "working", capture, taskResults, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+              void queueManifestWrite(buildManifest(waveId, "working", capture, taskResults, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits)).catch(() => {
+                // A later awaited lifecycle write will retry publication. Never
+                // leave a fire-and-forget progress rejection unhandled.
+              });
             }
           },
         }),
@@ -857,7 +879,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
           summary: "Queued for execution.",
         };
       });
-      await writeWaveManifest(waveRoot, buildManifest(waveId, "working", capture, taskResults, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+      await queueManifestWrite(buildManifest(waveId, "working", capture, taskResults, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
     } catch (err) {
       // Worker threw unexpectedly — record as executor_error.
       const result: WaveWorkerLifecycleResult = {
@@ -991,12 +1013,13 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     });
 
     // Update manifest.
-    await writeWaveManifest(waveRoot, buildManifest(waveId, "aborted", capture, taskResultsArray, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+    await queueManifestWrite(buildManifest(waveId, "aborted", capture, taskResultsArray, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
 
     // Cleanup clean worktrees.
     await cleanupWorktrees(handles, capture);
 
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1014,12 +1037,13 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       activity: ["Integration skipped: failed worker(s) present (all-or-nothing policy)"],
     });
 
-    await writeWaveManifest(waveRoot, buildManifest(waveId, "completed", capture, taskResultsArray, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
 
     // Cleanup clean worktrees.
     await cleanupWorktrees(handles, capture);
 
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1041,12 +1065,13 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       status: "worker_failure",
     };
 
-    await writeWaveManifest(waveRoot, buildManifest(waveId, "completed", capture, taskResultsArray, "worker_failure", undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, "worker_failure", undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
 
     // Cleanup clean worktrees.
     await cleanupWorktrees(handles, capture);
 
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1068,7 +1093,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   let integrationResult: WaveIntegrationResult | undefined;
 
   try {
-    integrationResult = await integrateWave(capture, eligibleWorkers, signal);
+    integrationResult = await integrateWave(capture, eligibleWorkers, signal, input.integrationHooks);
 
     if (integrationResult.status === "integrated") {
       integrationOutcome = {
@@ -1129,7 +1154,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   }
 
   // Update manifest with integration status.
-  await writeWaveManifest(waveRoot, buildManifest(
+  await queueManifestWrite(buildManifest(
     waveId, "integrating", capture, taskResultsArray,
     integrationResult?.status,
     undefined,
@@ -1151,7 +1176,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     });
 
     const abortIntegrationStatus = integrationOutcome?.status ?? integrationResult?.status;
-    await writeWaveManifest(waveRoot, buildManifest(waveId, "aborted", capture, taskResultsArray,
+    await queueManifestWrite(buildManifest(waveId, "aborted", capture, taskResultsArray,
       abortIntegrationStatus,
       undefined,
       integrationOutcome,
@@ -1166,6 +1191,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     await cleanupWorktrees(handles, capture, integrationResult?.worktree);
 
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1190,7 +1216,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       activity: [message],
     });
 
-    await writeWaveManifest(waveRoot, buildManifest(
+    await queueManifestWrite(buildManifest(
       waveId, "completed", capture, taskResultsArray,
       integrationStatusLabel,
       undefined,
@@ -1206,6 +1232,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     await cleanupWorktrees(handles, capture);
 
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1221,6 +1248,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     // Should not be reached, but handle defensively.
     await cleanupWorktrees(handles, capture);
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1259,7 +1287,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
         activity: ["Wave aborted during landing planning"],
       });
-      await writeWaveManifest(waveRoot, buildManifest(
+      await queueManifestWrite(buildManifest(
         waveId, "aborted", capture, taskResultsArray,
         integrationResult.status,
         "aborted",
@@ -1272,6 +1300,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       ));
       await cleanupWorktrees(handles, capture, integrationWorktree);
       return {
+        ...infrastructureWarnings(),
         waveId,
         waveRoot,
         sourceRoot: capture.discovery.captureRoot,
@@ -1288,7 +1317,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       activity: [`Landing planning failed: ${err instanceof Error ? err.message : "unknown"}`],
     });
 
-    await writeWaveManifest(waveRoot, buildManifest(
+    await queueManifestWrite(buildManifest(
       waveId, "completed", capture, taskResultsArray,
       integrationResult.status,
       undefined,
@@ -1303,6 +1332,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     await cleanupWorktrees(handles, capture, integrationWorktree);
 
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1321,7 +1351,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       activity: ["Wave aborted after planning — skipping landing"],
     });
 
-    await writeWaveManifest(waveRoot, buildManifest(waveId, "aborted", capture, taskResultsArray,
+    await queueManifestWrite(buildManifest(waveId, "aborted", capture, taskResultsArray,
       integrationResult?.status,
       "aborted",
       integrationOutcome,
@@ -1335,6 +1365,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     await cleanupWorktrees(handles, capture, integrationWorktree);
 
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1354,7 +1385,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       activity: [`Landing planning found ${landingPlan.conflicts.length} conflict(s)`],
     });
 
-    await writeWaveManifest(waveRoot, buildManifest(
+    await queueManifestWrite(buildManifest(
       waveId, "completed", capture, taskResultsArray,
       integrationResult.status,
       undefined,
@@ -1369,6 +1400,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     await cleanupWorktrees(handles, capture, integrationWorktree);
 
     return {
+      ...infrastructureWarnings(),
       waveId,
       waveRoot,
       sourceRoot: capture.discovery.captureRoot,
@@ -1405,11 +1437,8 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   // Build landing outcome with HEAD drift provenance.
   const landingOutcome: WaveLandingOutcome = buildLandingOutcome(landingResult, landingPlan.headDrift);
 
-  // Await queued writes before terminal write.
-  await manifestWriteQueue;
-
   // Update manifest with landing status.
-  await writeWaveManifest(waveRoot, buildManifest(
+  await queueManifestWrite(buildManifest(
     waveId, "completed", capture, taskResultsArray,
     integrationResult.status,
     landingResult.status,
@@ -1432,6 +1461,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   });
 
   return {
+    ...infrastructureWarnings(),
     waveId,
     waveRoot,
     sourceRoot: capture.discovery.captureRoot,

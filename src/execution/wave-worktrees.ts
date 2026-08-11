@@ -3,10 +3,9 @@ import { promises as fs } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { WaveCaptureResult } from "./wave-repository";
+import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
 
 const execFileAsync = promisify(execFile);
-
-const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0" };
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -36,28 +35,6 @@ export interface ManagedWorktree {
   taskId: string;
   /** Whether this is a worker or integration worktree. */
   type: "worker" | "integration";
-}
-
-// ── validation ───────────────────────────────────────────────────────────────
-
-/** Validate that an ID is a single safe ref/path segment (used for waveId and taskId). */
-function validateSafeId(id: string, label: string): void {
-  if (typeof id !== "string" || id.length === 0) {
-    throw new Error(`Invalid ${label}: must be a non-empty string.`);
-  }
-  // Reject git ref-injection characters.
-  if (
-    /[~^:?*[\\@{}\/]/.test(id) ||
-    /[\x00-\x20\x7F]/.test(id) ||
-    id === "." || id === ".." || id === "@" ||
-    id.startsWith(".") || id.endsWith(".") ||
-    id.endsWith(".lock") || id.includes("..") ||
-    id.includes("@{")
-  ) {
-    throw new Error(
-      `Invalid ${label}: "${id}". Must be a single safe ref/path segment.`,
-    );
-  }
 }
 
 /** Validate that a path stays under the wave root (using resolved real paths). */

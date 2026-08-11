@@ -459,6 +459,7 @@ test("writes atomic wave manifest with provenance and phase", async () => {
     const manifestData = JSON.parse(await readFile(manifestPath, "utf8"));
 
     assert.equal(manifestData.version, 1);
+    assert.ok(Number.isInteger(manifestData.revision) && manifestData.revision > 0);
     assert.equal(manifestData.waveId, "wc-manifest");
     assert.ok(["completed", "aborted"].includes(manifestData.phase));
     assert.ok(manifestData.baseCommit);
@@ -1344,15 +1345,9 @@ test("conflict result retains successfullyIntegrated mappings and worktree", asy
 // ── Regression: integration infrastructure error preserves worktree path ─────
 
 test("integration infrastructure error after worktree creation preserves worktree path via executeWave", async () => {
-  const { setIntegrationErrorSeam, clearIntegrationErrorSeam } = await import("../src/execution/wave-integration");
   let artifactDir: string | undefined;
   let sourceDir: string | undefined;
   try {
-    // Inject an error after worktree creation in integrateWave.
-    setIntegrationErrorSeam(() => {
-      throw new Error("simulated infrastructure failure after worktree creation");
-    });
-
     artifactDir = await mkTmp("pi-wc-integration-error-");
     sourceDir = await mkTmp("pi-wc-integration-error-src-");
     await git(["init", "--quiet"], sourceDir);
@@ -1373,6 +1368,9 @@ test("integration infrastructure error after worktree creation preserves worktre
       maxWorkers: 1,
       artifactDir,
       waveId: "wc-integration-error",
+      integrationHooks: { afterWorktree: () => {
+        throw new Error("simulated infrastructure failure after worktree creation");
+      } },
     });
 
     // Verify the controller caught the error and returned status: error.
@@ -1387,22 +1385,15 @@ test("integration infrastructure error after worktree creation preserves worktre
     const { access } = await import("node:fs/promises");
     await access(expectedWorktreePath);
   } finally {
-    clearIntegrationErrorSeam();
     if (artifactDir) await rm(artifactDir, { recursive: true, force: true });
     if (sourceDir) await rm(sourceDir, { recursive: true, force: true });
   }
 });
 
 test("integration error before worktree creation omits worktree path via executeWave", async () => {
-  const { setIntegrationErrorBeforeWorktreeSeam, clearIntegrationErrorBeforeWorktreeSeam } =
-    await import("../src/execution/wave-integration");
   let artifactDir: string | undefined;
   let sourceDir: string | undefined;
   try {
-    setIntegrationErrorBeforeWorktreeSeam(() => {
-      throw new Error("simulated infrastructure failure before worktree creation");
-    });
-
     artifactDir = await mkTmp("pi-wc-integration-error-pre-");
     sourceDir = await mkTmp("pi-wc-integration-error-pre-src-");
     await git(["init", "--quiet"], sourceDir);
@@ -1423,6 +1414,9 @@ test("integration error before worktree creation omits worktree path via execute
       maxWorkers: 1,
       artifactDir,
       waveId: "wc-integration-error-pre",
+      integrationHooks: { beforeWorktree: () => {
+        throw new Error("simulated infrastructure failure before worktree creation");
+      } },
     });
 
     // The controller caught the pre-worktree error and omitted the worktree path.
@@ -1430,7 +1424,6 @@ test("integration error before worktree creation omits worktree path via execute
     assert.match(result.integration?.error ?? "", /simulated infrastructure failure before worktree creation/);
     assert.equal(result.integration?.worktree, undefined);
   } finally {
-    clearIntegrationErrorBeforeWorktreeSeam();
     if (artifactDir) await rm(artifactDir, { recursive: true, force: true });
     if (sourceDir) await rm(sourceDir, { recursive: true, force: true });
   }
@@ -1448,30 +1441,19 @@ test("capture consistency exhaustion throws WaveCaptureError with workspace_chan
   await git(["commit", "--quiet", "-m", "init"], sourceDir);
 
   try {
-    // Inject a mutation between capture and verify to force consistency failures.
-    const waveRepo = await import("../src/execution/wave-repository");
-    const waveRepoMutable = waveRepo as unknown as { __testOnly_mutateSourceBetweenCaptureAndVerify: ((d: unknown, e: Array<{ path: string }>) => Promise<void> | void) | undefined };
-    const orig = waveRepoMutable.__testOnly_mutateSourceBetweenCaptureAndVerify;
-    waveRepoMutable.__testOnly_mutateSourceBetweenCaptureAndVerify = async (_discovery: unknown, entries: Array<{ path: string }>) => {
-      // Mutate a captured file so every attempt fails consistency.
-      for (const entry of entries) {
-        const fullPath = join(sourceDir, entry.path);
-        try {
-          await writeFile(fullPath, `mutated at ${Date.now()}\n`, "utf8");
-        } catch {
-          // ignore if file doesn't exist
-        }
-      }
-    };
-
-    try {
-      await assert.rejects(
-        async () => executeWave({
+    await assert.rejects(
+      async () => executeWave({
           cwd: sourceDir,
           tasks: [{ title: "Test", instructions: "noop", acceptanceCriteria: [] }],
           config: makeConfigWithWritingExecutor(),
           artifactDir,
           waveId: "wc-capture-exhaust",
+          captureHooks: { mutateSourceBetweenCaptureAndVerify: async (_discovery, entries) => {
+            for (const entry of entries) {
+              const fullPath = join(sourceDir, entry.path);
+              await writeFile(fullPath, `mutated at ${Date.now()}\n`, "utf8").catch(() => undefined);
+            }
+          } },
         }),
         (err: unknown) => {
           if (!(err instanceof Error)) return false;
@@ -1481,10 +1463,7 @@ test("capture consistency exhaustion throws WaveCaptureError with workspace_chan
           assert.ok(wce.message.includes("Workspace changed during capture"));
           return true;
         },
-      );
-    } finally {
-      waveRepoMutable.__testOnly_mutateSourceBetweenCaptureAndVerify = orig;
-    }
+    );
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { WaveCaptureResult } from "./wave-repository";
+import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
 import {
   createIntegrationWorktree,
   pinCommit,
@@ -10,43 +11,10 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0" };
-
-// ── regression seam: inject infrastructure error after worktree creation ─────
-let injectIntegrationErrorAfterWorktree: (() => void | Promise<void>) | undefined;
-
-/**
- * Set a callback that will be invoked after the integration worktree is created
- * but before any git operations. Use only in tests to simulate infrastructure
- * failures after worktree creation.
- */
-export function setIntegrationErrorSeam(
-  cb: (() => void | Promise<void>) | undefined,
-): void {
-  injectIntegrationErrorAfterWorktree = cb;
-}
-
-/** Reset the seam (for test isolation). */
-export function clearIntegrationErrorSeam(): void {
-  injectIntegrationErrorAfterWorktree = undefined;
-}
-
-// ── regression seam: inject infrastructure error before worktree creation ────
-let injectIntegrationErrorBeforeWorktree: (() => void | Promise<void>) | undefined;
-
-/**
- * Set a callback that will be invoked before the integration worktree is created.
- * Use only in tests to simulate infrastructure failures before worktree creation.
- */
-export function setIntegrationErrorBeforeWorktreeSeam(
-  cb: (() => void | Promise<void>) | undefined,
-): void {
-  injectIntegrationErrorBeforeWorktree = cb;
-}
-
-/** Reset the pre-worktree seam (for test isolation). */
-export function clearIntegrationErrorBeforeWorktreeSeam(): void {
-  injectIntegrationErrorBeforeWorktree = undefined;
+/** @internal Per-invocation integration fault hooks used by regression tests. */
+export interface WaveIntegrationHooks {
+  beforeWorktree?: () => void | Promise<void>;
+  afterWorktree?: () => void | Promise<void>;
 }
 
 // ── types ────────────────────────────────────────────────────────────────────
@@ -126,27 +94,6 @@ export type WaveIntegrationResult =
   | WaveIntegrationSuccess
   | WaveIntegrationConflict
   | WaveIntegrationNoChanges;
-
-// ── validation ───────────────────────────────────────────────────────────────
-
-/** Validate that an ID is a single safe ref/path segment. */
-function validateSafeId(id: string, label: string): void {
-  if (typeof id !== "string" || id.length === 0) {
-    throw new Error(`Invalid ${label}: must be a non-empty string.`);
-  }
-  if (
-    /[~^:?*[\\@{}\/]/.test(id) ||
-    /[\x00-\x20\x7F]/.test(id) ||
-    id === "." || id === ".." || id === "@" ||
-    id.startsWith(".") || id.endsWith(".") ||
-    id.endsWith(".lock") || id.includes("..") ||
-    id.includes("@{")
-  ) {
-    throw new Error(
-      `Invalid ${label}: "${id}". Must be a single safe ref/path segment.`,
-    );
-  }
-}
 
 // ── git helpers ──────────────────────────────────────────────────────────────
 
@@ -404,8 +351,9 @@ export async function integrateWave(
   capture: WaveCaptureResult,
   selectedWorkers: SelectedWorker[],
   signal?: AbortSignal,
+  hooks: WaveIntegrationHooks = {},
 ): Promise<WaveIntegrationResult> {
-  const { waveId, repositoryPath, baseCommit } = capture;
+  const { waveId, baseCommit } = capture;
 
   // Validate waveId.
   validateSafeId(waveId, "waveId");
@@ -432,8 +380,8 @@ export async function integrateWave(
   }
 
   // Regression seam: allow tests to inject errors before worktree creation.
-  if (injectIntegrationErrorBeforeWorktree) {
-    await injectIntegrationErrorBeforeWorktree();
+  if (hooks.beforeWorktree) {
+    await hooks.beforeWorktree();
   }
 
   // ── Create the integration worktree at the base ──
@@ -441,8 +389,8 @@ export async function integrateWave(
   const worktreeRoot = worktree.worktreeRoot;
 
   // Regression seam: allow tests to inject errors after worktree creation.
-  if (injectIntegrationErrorAfterWorktree) {
-    await injectIntegrationErrorAfterWorktree();
+  if (hooks.afterWorktree) {
+    await hooks.afterWorktree();
   }
 
   // ── Fast-forward to the first selected worker ──

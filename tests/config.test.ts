@@ -146,17 +146,25 @@ test("normalizeConfig validates implementation guidance escalation thresholds", 
       adapter: "codex-cli",
     },
   });
-  const invalid = normalizeConfig({
+  assert.equal(configured.implementationGuidanceAfterCorrectionAttempts, 0);
+  assert.throws(() => normalizeConfig({
     enabled: true,
     implementationGuidanceAfterCorrectionAttempts: 1.5,
     decider: {
       id: "codex",
       adapter: "codex-cli",
     },
-  });
+  }), /implementationGuidanceAfterCorrectionAttempts/);
+});
 
-  assert.equal(configured.implementationGuidanceAfterCorrectionAttempts, 0);
-  assert.equal(invalid.implementationGuidanceAfterCorrectionAttempts, 1);
+test("normalizeConfig rejects coercible booleans and invalid retention values", () => {
+  assert.throws(() => normalizeConfig({ enabled: "false" }), /enabled must be a boolean/);
+  assert.throws(() => normalizeConfig({ retainBundles: "sometimes" }), /retainBundles/);
+  assert.throws(() => normalizeConfig({ reviewerTimeoutMs: 0 }), /reviewerTimeoutMs/);
+  assert.throws(() => normalizeConfig({ waveArtifactTtlMs: -1 }), /waveArtifactTtlMs/);
+  assert.throws(() => normalizeConfig({
+    decider: { id: "bad", adapter: "codex-cli", args: ["ok", 1] },
+  }), /args must be an array of strings/);
 });
 
 test("normalizeConfig keeps little-coder model selection generic", () => {

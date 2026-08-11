@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { WaveCaptureResult } from "./wave-repository";
+import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
 
 // ── review patch types ───────────────────────────────────────────────────────
 
@@ -22,8 +23,6 @@ export interface CandidateReviewPatch {
 
 const execFileAsync = promisify(execFile);
 
-const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0" };
-
 // ── types ────────────────────────────────────────────────────────────────────
 
 /** Result of normalizing a worker worktree into a candidate commit. */
@@ -42,27 +41,6 @@ export interface CandidateCommit {
 export interface PriorCandidate {
   /** SHA of the previous candidate commit. */
   commitSha: string;
-}
-
-// ── validation ───────────────────────────────────────────────────────────────
-
-/** Validate that an ID is a single safe ref/path segment. */
-function validateSafeId(id: string, label: string): void {
-  if (typeof id !== "string" || id.length === 0) {
-    throw new Error(`Invalid ${label}: must be a non-empty string.`);
-  }
-  if (
-    /[~^:?*[\\@{}\/]/.test(id) ||
-    /[\x00-\x20\x7F]/.test(id) ||
-    id === "." || id === ".." || id === "@" ||
-    id.startsWith(".") || id.endsWith(".") ||
-    id.endsWith(".lock") || id.includes("..") ||
-    id.includes("@{")
-  ) {
-    throw new Error(
-      `Invalid ${label}: "${id}". Must be a single safe ref/path segment.`,
-    );
-  }
 }
 
 /** Validate that a path stays under the wave root. */

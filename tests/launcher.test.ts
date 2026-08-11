@@ -68,6 +68,8 @@ test("preset launcher appends the orchestrator prompt and preserves forwarded ar
   await writeFile(littleCoderPath, [
     "#!/usr/bin/env bash",
     "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
+    "printf '%s' \"$PI_REVIEW_GATE_CONFIG\" > \"$CAPTURE_DIR/config-path\"",
+    "node -e 'const fs=require(\"node:fs\");process.stdout.write((fs.statSync(process.argv[1]).mode & 0o777).toString(8))' \"$PI_REVIEW_GATE_CONFIG\" > \"$CAPTURE_DIR/config-mode\"",
   ].join("\n"), "utf8");
   await Promise.all([chmod(npmPath, 0o755), chmod(littleCoderPath, 0o755)]);
 
@@ -84,6 +86,10 @@ test("preset launcher appends the orchestrator prompt and preserves forwarded ar
     await readFile(join(capture, "args"), "utf8"),
     `--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
   );
+  const temporaryConfig = await readFile(join(capture, "config-path"), "utf8");
+  assert.match(temporaryConfig, /pi-review-gate\.[^/]+\/review\.json$/);
+  assert.equal(await readFile(join(capture, "config-mode"), "utf8"), "600");
+  await assert.rejects(readFile(temporaryConfig, "utf8"), /ENOENT/);
 });
 
 test("persistent launcher fails clearly when no fallback config exists", async () => {

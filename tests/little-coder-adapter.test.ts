@@ -4,6 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LittleCoderAdapter } from "../src/adapters/little-coder";
+import { runPromptProcess } from "../src/adapters/process";
+
+const ONE_MEGABYTE_RETAINED_PROCESS = (input: Parameters<typeof runPromptProcess>[0]) => runPromptProcess({
+  ...input,
+  maxRetainedOutputBytes: 1_000_000,
+});
 
 test("LittleCoderAdapter disables tools and reports missing final assistant text", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-little-coder-adapter-"));
@@ -58,6 +64,7 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
     assert.deepEqual(argv.includes("--tools"), true);
     assert.deepEqual(argv.includes("read,grep,find,ls"), true);
     assert.deepEqual(argv.includes("--system-prompt"), true);
+    assert.equal(argv.includes("--output-schema"), false);
     assert.equal(argv[argv.indexOf("--thinking") + 1], "max");
     assert.equal(firstRun.budget, "16384");
     assert.equal(argv.includes("--no-session"), false);
@@ -130,7 +137,7 @@ test("LittleCoderAdapter reports truncated output before final assistant text", 
       model: "ollama/glm-5.2",
       command: commandPath,
       timeoutMs: 15000,
-    });
+    }, { runPromptProcess: ONE_MEGABYTE_RETAINED_PROCESS });
 
     const result = await adapter.run({
       id: "glm",
@@ -177,7 +184,7 @@ test("LittleCoderAdapter captures final assistant text after retained stdout cap
       model: "ollama/glm-5.2",
       command: commandPath,
       timeoutMs: 15000,
-    });
+    }, { runPromptProcess: ONE_MEGABYTE_RETAINED_PROCESS });
 
     const result = await adapter.run({
       id: "glm",

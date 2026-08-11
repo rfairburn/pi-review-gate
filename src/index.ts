@@ -107,6 +107,7 @@ export async function activate(pi: unknown): Promise<void> {
     const expiredQuestionWindow = state.reviewWindow ? undefined : state.lastQuestionWindow;
     rememberUserRequest(state, text);
     await removeTransientWindowBundle(expiredQuestionWindow);
+    return undefined;
   });
 
   registerHook(pi, "before_agent_start", async (...args) => {

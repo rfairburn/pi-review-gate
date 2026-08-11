@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { RunAsBinaryExecutorConfig } from "../../config";
 import { reviewerEnv, runPromptProcess } from "../../adapters/process";
 import type { TokenUsage } from "../../usage";
+import { BoundedJsonlDecoder } from "../../jsonl";
 import { writeExecutorArtifacts } from "../artifacts";
 import type { ExecutorAdapter, ExecutorRequest, ExecutorTurn } from "../types";
 
@@ -12,6 +13,7 @@ export class RunAsBinaryExecutorAdapter implements ExecutorAdapter {
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
     const requestedSessionId = request.session?.id ?? randomUUID();
+    const protocol = new RunAsBinaryProtocolParser();
     const output = await runPromptProcess({
       command: this.config.command,
       args: this.config.args ?? [],
@@ -26,9 +28,12 @@ export class RunAsBinaryExecutorAdapter implements ExecutorAdapter {
         PI_REVIEW_EXECUTOR_TURN: String(request.turn),
       },
       signal: request.signal,
-      onStdoutChunk: () => request.onUpdate?.("binary executor running"),
+      onStdoutChunk: (chunk) => {
+        protocol.push(chunk);
+        request.onUpdate?.("binary executor running");
+      },
     });
-    const parsed = parseProtocol(output.stdout);
+    const parsed = protocol.finish();
     const sessionId = parsed.sessionId ?? requestedSessionId;
     const artifacts = await writeExecutorArtifacts({
       artifactDir: request.artifactDir,
@@ -47,34 +52,45 @@ export class RunAsBinaryExecutorAdapter implements ExecutorAdapter {
       code: output.code,
       timedOut: output.timedOut,
       aborted: output.aborted,
+      failure: output.stdinError ? { category: "stdin", message: output.stdinError } : undefined,
     };
   }
 }
 
-function parseProtocol(stdout: string): { text: string; sessionId?: string; usage?: TokenUsage } {
-  let text = "";
-  let sessionId: string | undefined;
-  let usage: TokenUsage | undefined;
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) continue;
+class RunAsBinaryProtocolParser {
+  private text = "";
+  private sessionId: string | undefined;
+  private usage: TokenUsage | undefined;
+  private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
+
+  push(chunk: string): void {
+    this.decoder.push(chunk);
+  }
+
+  finish(): { text: string; sessionId?: string; usage?: TokenUsage } {
+    this.decoder.finish();
+    return { text: this.text, sessionId: this.sessionId, usage: this.usage };
+  }
+
+  private processLine(line: string): void {
+    if (!line.trim()) return;
     let value: unknown;
     try {
       value = JSON.parse(line);
     } catch {
-      continue;
+      return;
     }
-    if (!isRecord(value)) continue;
+    if (!isRecord(value)) return;
     if (value.type === "session" && typeof value.sessionId === "string") {
-      sessionId = value.sessionId;
+      this.sessionId = value.sessionId;
     }
     if (value.type === "assistant" && typeof value.text === "string") {
-      text = value.text;
+      this.text = value.text;
     }
     if (value.type === "usage" && isRecord(value.usage)) {
-      usage = { scope: "invocation", raw: value.usage };
+      this.usage = { scope: "invocation", raw: value.usage };
     }
   }
-  return { text, sessionId, usage };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

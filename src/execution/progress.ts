@@ -87,10 +87,10 @@ export class PiJsonlActivityExtractor {
   }
 
   private emitModelUpdate(text: string): void {
-    const message = text.trim();
+    const message = singleLine(text);
     if (this.options.includeModelUpdates === false || !message || message === this.lastModelUpdate) return;
-    this.lastModelUpdate = singleLine(message);
-    this.onActivity(`model update · ${singleLine(message)}`);
+    this.lastModelUpdate = message;
+    this.onActivity(`model update · ${message}`);
   }
 }
 
@@ -101,6 +101,7 @@ export class PiJsonlActivityExtractor {
  */
 export class CodexJsonlActivityExtractor {
   private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
+  private lastModelUpdate = "";
 
   constructor(private readonly onActivity: (message: string) => void) {}
 
@@ -122,6 +123,7 @@ export class CodexJsonlActivityExtractor {
     if (!isRecord(parsed)) return;
 
     if (parsed.type === "turn.started") {
+      this.lastModelUpdate = "";
       this.onActivity("model turn started");
       return;
     }
@@ -148,9 +150,7 @@ export class CodexJsonlActivityExtractor {
       return;
     }
     if (item.type === "agent_message") {
-      if (!started && typeof item.text === "string" && item.text.trim()) {
-        this.onActivity(`model update · ${singleLine(item.text)}`);
-      }
+      if (!started && typeof item.text === "string") this.emitModelUpdate(item.text);
       return;
     }
     if (item.type === "command_execution") {
@@ -184,6 +184,13 @@ export class CodexJsonlActivityExtractor {
         : "";
       this.onActivity(`web search ${started ? "started" : "completed"}${query}`);
     }
+  }
+
+  private emitModelUpdate(text: string): void {
+    const message = singleLine(text);
+    if (!message || message === this.lastModelUpdate) return;
+    this.lastModelUpdate = message;
+    this.onActivity(`model update · ${message}`);
   }
 }
 
@@ -372,7 +379,10 @@ export class ClaudeStreamActivityExtractor {
     if (!isRecord(event)) return;
 
     if (event.type === "system") {
-      if (event.subtype === "init") this.onActivity("model turn started");
+      if (event.subtype === "init") {
+        this.lastModelUpdate = "";
+        this.onActivity("model turn started");
+      }
       if (event.subtype === "api_retry") {
         const attempt = typeof event.attempt === "number" && typeof event.max_retries === "number"
           ? ` ${event.attempt}/${event.max_retries}`
@@ -430,10 +440,10 @@ export class ClaudeStreamActivityExtractor {
   }
 
   private emitModelUpdate(text: string): void {
-    const message = text.trim();
+    const message = singleLine(text);
     if (this.options.includeModelUpdates === false || !message || message === this.lastModelUpdate) return;
-    this.lastModelUpdate = singleLine(message);
-    this.onActivity(`model update · ${singleLine(message)}`);
+    this.lastModelUpdate = message;
+    this.onActivity(`model update · ${message}`);
   }
 }
 

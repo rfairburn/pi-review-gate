@@ -176,7 +176,7 @@ export function normalizeReviewResult(
   if (!isRecord(value)) {
     return schemaError(reviewerId, "Reviewer JSON must be an object.", rawOutputPath);
   }
-  if (!hasAllowedKeys(value, REVIEW_RESULT_KEYS, REQUIRED_REVIEW_RESULT_KEYS)) {
+  if (!hasAllowedKeysOrNullExtras(value, REVIEW_RESULT_KEYS, REQUIRED_REVIEW_RESULT_KEYS)) {
     return schemaError(reviewerId, "Reviewer JSON contains missing or unsupported fields.", rawOutputPath);
   }
 
@@ -203,7 +203,7 @@ export function normalizeReviewResult(
     if (!isRecord(item)) {
       return schemaError(reviewerId, "Each finding must be an object.", rawOutputPath);
     }
-    if (!hasExactKeys(item, REVIEW_FINDING_KEYS)) {
+    if (!hasAllowedKeysOrNullExtras(item, REVIEW_FINDING_KEYS, REVIEW_FINDING_KEYS)) {
       return schemaError(reviewerId, "Each finding must contain exactly severity, file, line, issue, and recommendation.", rawOutputPath);
     }
     const severity = item.severity;
@@ -390,16 +390,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasExactKeys(value: Record<string, unknown>, expected: ReadonlySet<string>): boolean {
-  const keys = Object.keys(value);
-  return keys.length === expected.size && keys.every((key) => expected.has(key));
-}
-
-function hasAllowedKeys(
+function hasAllowedKeysOrNullExtras(
   value: Record<string, unknown>,
   allowed: ReadonlySet<string>,
   required: ReadonlySet<string>,
 ): boolean {
   const keys = Object.keys(value);
-  return keys.every((key) => allowed.has(key)) && [...required].every((key) => key in value);
+  return keys.every((key) => allowed.has(key) || value[key] === null)
+    && [...required].every((key) => key in value);
 }

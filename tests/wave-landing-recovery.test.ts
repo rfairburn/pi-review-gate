@@ -483,7 +483,7 @@ test("wave-landing recovery — death after replacement install recovers all cas
       "target.txt should be removed",
     );
 
-    assert.equal(recoveryResult.status, "recovered");
+    assert.equal(recoveryResult.status, "recovered", JSON.stringify(recoveryResult, null, 2));
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
   }

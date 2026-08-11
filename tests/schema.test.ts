@@ -246,6 +246,40 @@ test("parseReviewResult enforces required and supported top-level fields", () =>
   assert.equal(extra.error, "schema_error");
 });
 
+test("parseReviewResult treats unsupported null properties as absent", () => {
+  const topLevel = parseReviewResult(
+    "reviewer",
+    '{"verdict":"pass","summary":"ok","guidance":null,"guidance_note":null,"findings":[],"error":null}',
+  );
+  assert.equal(topLevel.verdict, "pass");
+  assert.equal(topLevel.error, undefined);
+
+  const finding = parseReviewResult("reviewer", JSON.stringify({
+    verdict: "needs_changes",
+    summary: "fix it",
+    guidance: null,
+    findings: [{
+      severity: "blocking",
+      file: "src/index.ts",
+      line: 1,
+      issue: "broken",
+      recommendation: "repair it",
+      guidance_note: null,
+    }],
+    error: null,
+  }));
+  assert.equal(finding.verdict, "needs_changes");
+  assert.equal(finding.error, undefined);
+  assert.equal(finding.findings.length, 1);
+
+  const substantiveExtra = parseReviewResult(
+    "reviewer",
+    '{"verdict":"pass","summary":"ok","guidance":null,"guidance_note":"consider this","findings":[],"error":null}',
+  );
+  assert.equal(substantiveExtra.verdict, "error");
+  assert.equal(substantiveExtra.error, "schema_error");
+});
+
 function assertStrictObjectRequirements(schema: unknown): void {
   if (typeof schema !== "object" || schema === null || Array.isArray(schema)) return;
   const value = schema as Record<string, unknown>;

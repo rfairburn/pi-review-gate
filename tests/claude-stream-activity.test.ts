@@ -39,6 +39,9 @@ test("ClaudeStreamActivityExtractor emits native Claude lifecycle and tool miles
     { type: "assistant", message: { role: "assistant", content: [
       { type: "tool_use", id: "read-1", name: "Read", input: { file_path: "/repo/src/index.ts" } },
       { type: "tool_use", id: "bash-1", name: "Bash", input: { command: "npm test" } },
+      { type: "text", text: "Checking the\nimplementation." },
+    ] } },
+    { type: "assistant", message: { role: "assistant", content: [
       { type: "text", text: "Checking the implementation." },
     ] } },
     { type: "user", message: { role: "user", content: [

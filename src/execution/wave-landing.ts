@@ -2152,10 +2152,19 @@ async function recoverSinglePath(
   tempPath: string,
   resolvedSourceRoot: string,
 ): Promise<RecoveryPathDetail> {
+  // Deletions have no result blob. Inspect an existing destination using the
+  // base object's hash format so recovery can determine whether deletion had
+  // happened before the crash.
+  const isDeletion = !entry.blobId;
+  const comparisonOid = isDeletion ? entry.baseBlobId : entry.blobId;
+  if (!comparisonOid) {
+    throw new Error(`Recovery entry for "${entry.path}" has no blob ID for filesystem comparison.`);
+  }
+
   // Inspect current destination state.
   let currentDest: { blobId: string; mode: string } | null;
   try {
-    currentDest = await inspectSourceFile(resolvedSourceRoot, entry.path, objectHashForOid(entry.blobId));
+    currentDest = await inspectSourceFile(resolvedSourceRoot, entry.path, objectHashForOid(comparisonOid));
   } catch (err) {
     const nodeErr = err as NodeJS.ErrnoException;
     if (nodeErr?.code === "ENOENT") {
@@ -2164,9 +2173,6 @@ async function recoverSinglePath(
       throw err;
     }
   }
-
-  // Determine if this was a deletion (result is null means the wave wanted to delete).
-  const isDeletion = !entry.blobId || entry.blobId === "";
 
   // Check if backup exists.
   let backupExists = false;

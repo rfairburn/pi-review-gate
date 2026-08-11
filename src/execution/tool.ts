@@ -251,6 +251,7 @@ export class ExecutionToolManager {
           taskStatuses: [],
           activity: [],
         };
+        const lastActivityByScope = new Map<string, string>();
 
         const publishWave = (update?: WaveProgressUpdate) => {
           if (update) {
@@ -262,7 +263,13 @@ export class ExecutionToolManager {
             if (update.maxWorkers) waveProgress.maxWorkers = update.maxWorkers;
             if (update.counts) waveProgress.counts = update.counts;
             if (update.activity) {
-              waveProgress.activity.push(...update.activity);
+              for (const message of update.activity) {
+                const taskPrefix = /^([^:\s]+):\s/.exec(message)?.[1];
+                const scope = taskPrefix ?? "__wave__";
+                if (lastActivityByScope.get(scope) === message) continue;
+                lastActivityByScope.set(scope, message);
+                waveProgress.activity.push(message);
+              }
               if (waveProgress.activity.length > 40) waveProgress.activity.splice(0, waveProgress.activity.length - 40);
             }
             // Merge controller-emitted taskStatuses (taskId/phase/reviewer/artifactDir)

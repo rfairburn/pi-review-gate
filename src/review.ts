@@ -1,11 +1,13 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { cp, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { resolveReviewers, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
 import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
-import type { ReviewResult } from "./schema";
+import type { ChangeIdentity, ReviewResult } from "./schema";
+import { validateChangeIdentity } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
@@ -13,6 +15,7 @@ import { LittleCoderAdapter } from "./adapters/little-coder";
 import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, type ReviewWindow } from "./state";
+import { aggregateReviewDisposition } from "./review-report";
 
 export interface ReviewRunInput {
   cwd: string;
@@ -22,10 +25,25 @@ export interface ReviewRunInput {
   evidence?: EvidenceState;
   actingUsage?: TokenUsage;
   correctionAttemptCount?: number;
+  changeIdentity?: ChangeIdentity;
+  /** Exact Git-derived change data for a normalized candidate. Only valid together with changeIdentity. */
+  exactChange?: ExactChangeInput;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
   onUpdate?: (message: string) => void;
   window?: ReviewWindow;
+}
+
+/** Exact Git-derived change data for a normalized candidate commit. */
+export interface ExactChangeInput {
+  /** Deterministic list of changed paths from Git. */
+  changedPaths: string[];
+  /** The exact commit patch (may be truncated). */
+  patch: string;
+  /** Whether the patch was truncated. */
+  truncated: boolean;
+  /** Paths whose diffs were omitted due to truncation. */
+  omitted: Array<{ path: string; reason: string }>;
 }
 
 export interface ReviewRunOutput {
@@ -59,8 +77,10 @@ export interface AskReviewerInput {
   config: ReviewGateConfig;
   evidence?: EvidenceState;
   correctionAttemptCount?: number;
+  changeIdentity?: ChangeIdentity;
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
+  onUpdate?: (message: string) => void;
   window?: ReviewWindow;
 }
 
@@ -74,6 +94,64 @@ export interface AskReviewerOutput {
 }
 
 export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput> {
+  const validationError = input.changeIdentity !== undefined ? validateChangeIdentity(input.changeIdentity) : undefined;
+  if (validationError) {
+    return { changed: false, changes: [], error: `Invalid changeIdentity: ${validationError}` };
+  }
+  // exactChange requires changeIdentity and must be well-formed.
+  if (input.exactChange !== undefined) {
+    if (input.changeIdentity === undefined) {
+      return { changed: false, changes: [], error: "exactChange requires changeIdentity to be set." };
+    }
+    const ec = input.exactChange;
+    if (typeof ec !== "object" || ec === null || Array.isArray(ec)) {
+      return { changed: false, changes: [], error: "exactChange must be an object." };
+    }
+    if (!Array.isArray(ec.changedPaths)) {
+      return { changed: false, changes: [], error: "exactChange.changedPaths must be an array." };
+    }
+    if (typeof ec.patch !== "string") {
+      return { changed: false, changes: [], error: "exactChange.patch must be a string." };
+    }
+    if (typeof ec.truncated !== "boolean") {
+      return { changed: false, changes: [], error: "exactChange.truncated must be a boolean." };
+    }
+    if (!Array.isArray(ec.omitted)) {
+      return { changed: false, changes: [], error: "exactChange.omitted must be an array." };
+    }
+    // Validate changedPaths members: each must be a non-empty string.
+    const changedPathSet = new Set<string>();
+    for (const path of ec.changedPaths) {
+      if (typeof path !== "string" || path.length === 0) {
+        return { changed: false, changes: [], error: "exactChange.changedPaths must contain non-empty strings." };
+      }
+      changedPathSet.add(path);
+    }
+    // Validate omitted members: each must be an object with string path and reason;
+    // omitted paths must belong to changedPaths.
+    for (const item of ec.omitted) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) {
+        return { changed: false, changes: [], error: "exactChange.omitted entries must be objects." };
+      }
+      if (typeof (item as Record<string, unknown>).path !== "string") {
+        return { changed: false, changes: [], error: "exactChange.omitted entries must have a string path." };
+      }
+      if (typeof (item as Record<string, unknown>).reason !== "string") {
+        return { changed: false, changes: [], error: "exactChange.omitted entries must have a string reason." };
+      }
+      if (!changedPathSet.has((item as Record<string, unknown>).path as string)) {
+        return { changed: false, changes: [], error: "exactChange.omitted path not in changedPaths." };
+      }
+    }
+    // Truncation consistency: if not truncated, omitted must be empty.
+    if (!ec.truncated && ec.omitted.length > 0) {
+      return { changed: false, changes: [], error: "exactChange cannot have omitted entries when truncated is false." };
+    }
+    // Patch byte limit: patch must not exceed configured maxPatchBytes.
+    if (Buffer.byteLength(ec.patch, "utf8") > input.config.maxPatchBytes) {
+      return { changed: false, changes: [], error: "exactChange.patch exceeds maxPatchBytes." };
+    }
+  }
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
   const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
   const after = await createWorkspaceSnapshot(input.cwd, {
@@ -89,6 +167,10 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     : [];
   const split = splitReviewChanges(workspaceChanges, evidenceChanges);
   const { changes, sideEffectChanges } = split;
+
+  // When exactChange is present with nonempty changedPaths, treat as reviewable
+  // even if workspace snapshots show no content hash changes (e.g., mode-only or binary changes).
+  const hasExactChanges = input.exactChange !== undefined && input.exactChange.changedPaths.length > 0;
   const exchangeBefore = input.window?.activeExchange?.baseline;
   const exchangeSequence = input.window?.activeExchange?.sequence;
   const reviewResponseMode = input.window?.activeExchange?.reviewResponseMode;
@@ -106,16 +188,16 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   const exchangeSideEffectPatch = exchangeSplit.sideEffectChanges.length > 0
     ? buildUnifiedPatch(exchangeSplit.sideEffectChanges, input.config.maxPatchBytes).patch
     : "";
-  if (input.window) {
-    completeActiveExchange(input.window, {
+  const completedExchange = input.window
+    ? completeActiveExchange(input.window, {
       workspaceChanges: exchangeWorkspaceChanges,
       sideEffectChanges: exchangeSplit.sideEffectChanges,
       workspacePatch: exchangeWorkspacePatch,
       sideEffectPatch: exchangeSideEffectPatch,
       actingUsage: input.actingUsage,
-    });
-  }
-  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0;
+    })
+    : undefined;
+  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges;
   if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
     if (input.window?.bundleDir) {
       await syncReviewWindowArtifacts({
@@ -134,19 +216,26 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     };
   }
   const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
-  if (changes.length === 0 && !isCorrectionValidation) {
+  if (changes.length === 0 && !isCorrectionValidation && !hasExactChanges) {
     return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
 
-  const patchResult = workspaceChanges.length > 0
-    ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes)
-    : {
-      patch: isCorrectionValidation
-        ? "(no net submitted workspace changes; validate the current workspace against the prior review feedback)"
-        : "(no submitted workspace changes detected; review captured side effects below)",
-      truncated: false,
-      omitted: [],
-    };
+  // When exactChange is present, use the exact Git commit patch as authoritative.
+  const patchResult = input.exactChange !== undefined
+    ? {
+        patch: input.exactChange.patch,
+        truncated: input.exactChange.truncated,
+        omitted: input.exactChange.omitted,
+      }
+    : workspaceChanges.length > 0
+      ? buildUnifiedPatch(workspaceChanges, input.config.maxPatchBytes)
+      : {
+          patch: isCorrectionValidation
+            ? "(no net submitted workspace changes; validate the current workspace against the prior review feedback)"
+            : "(no submitted workspace changes detected; review captured side effects below)",
+          truncated: false,
+          omitted: [],
+        };
   const sideEffectPatchResult = sideEffectChanges.length > 0
     ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
     : { patch: "", truncated: false, omitted: [] };
@@ -171,10 +260,29 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     patch: patchResult.patch,
     sideEffectPatch: sideEffectPatchResult.patch,
     evidence: input.evidence
-      ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
+      ? buildEvidenceBundle(
+        input.evidence,
+        evidenceChanges.map((change) => change.path),
+        isCorrectionValidation && completedExchange
+          ? {
+              // Preserve the task-origin evidence plus the latest correction
+              // exchange. Intermediate cycles remain available on disk, but do
+              // not grow every correction prompt without bound.
+              events: focusedCorrectionEvidence(
+                input.window?.exchanges[0]?.evidenceEvents,
+                completedExchange.evidenceEvents,
+              ),
+              finalAssistantSummaries: focusedCorrectionEvidence(
+                input.window?.exchanges[0]?.assistantSummaries,
+                completedExchange.assistantSummaries,
+              ),
+            }
+          : undefined,
+      )
       : undefined,
     actingUsage: input.actingUsage,
     guidanceEscalation,
+    changeIdentity: input.changeIdentity,
     metadata: {
       exchangeSequence: input.window?.exchanges.at(-1)?.sequence,
       correctionAttemptCount,
@@ -184,6 +292,12 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       omittedDiffs: patchResult.omitted,
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
+      changeIdentity: input.changeIdentity,
+      ...(input.exactChange !== undefined ? {
+        exactChangedPaths: input.exactChange.changedPaths,
+        exactPatchTruncated: input.exactChange.truncated,
+        exactOmittedDiffs: input.exactChange.omitted,
+      } : {}),
     },
   });
   registerBundleWithWindow(input.window, bundle.dir);
@@ -258,6 +372,10 @@ export async function collectPausedReviewExchange(input: PausedExchangeInput): P
 }
 
 export async function runAskReviewer(input: AskReviewerInput): Promise<AskReviewerOutput> {
+  const validationError = input.changeIdentity !== undefined ? validateChangeIdentity(input.changeIdentity) : undefined;
+  if (validationError) {
+    return { changes: [], error: `Invalid changeIdentity: ${validationError}` };
+  }
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
   const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
   const { changes, workspaceChanges, evidenceChanges, sideEffectChanges } = await collectCurrentChanges({
@@ -296,6 +414,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
     guidanceEscalation,
+    changeIdentity: input.changeIdentity,
     metadata: {
       exchangeSequence: input.window?.exchanges.at(-1)?.sequence,
       correctionAttemptCount,
@@ -305,6 +424,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       omittedDiffs: patchResult.omitted,
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
+      changeIdentity: input.changeIdentity,
     },
   });
   registerBundleWithWindow(input.window, bundle.dir);
@@ -318,6 +438,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     reviewSequence,
     kind: "reviewer question",
     notify: input.notify,
+    onUpdate: input.onUpdate,
   });
   if (invocation.aborted) {
     return {
@@ -344,6 +465,11 @@ function registerBundleWithWindow(window: ReviewWindow | undefined, bundleDir: s
   }
 }
 
+function focusedCorrectionEvidence<T>(initial: T[] | undefined, latest: T[]): T[] {
+  if (!initial || initial === latest) return [...latest];
+  return [...initial, ...latest];
+}
+
 async function executeReviewerInvocation(input: {
   reviewers: DeciderConfig[];
   bundle: ReviewBundle;
@@ -362,7 +488,11 @@ async function executeReviewerInvocation(input: {
   const verb = input.kind === "review" ? "reviewing changes with" : "asking reviewers";
   await input.notify?.(`review gate: ${verb} ${input.reviewers.map(reviewerDisplayLabel).join(", ")}`);
   const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
-  const reviewerResults = await Promise.all(input.reviewers.map(async (reviewer) => {
+  // Reviewer passes are intentionally stateless. Complete prior evidence remains
+  // available in the immutable bundle, without carrying model/tool history into
+  // the next pass and forcing compaction.
+  input.window?.reviewerSessions.clear();
+  const stagedReviewers = await Promise.all(input.reviewers.map(async (reviewer) => {
     const label = reviewerDisplayLabel(reviewer);
     input.onUpdate?.(`${label} started`);
     const result = await runSingleReviewer({
@@ -376,10 +506,12 @@ async function executeReviewerInvocation(input: {
       signal: input.signal,
       onUpdate: (message) => input.onUpdate?.(`${label} · ${message}`),
     });
-    input.onUpdate?.(`${label} finished · ${result.verdict}`);
+    input.onUpdate?.(`${label} finished · ${result.result.verdict}`);
     return result;
   }));
+  const reviewerResults = stagedReviewers.map((reviewer) => reviewer.result);
   if (reviewWasAborted(input.signal, reviewerResults)) {
+    await cleanupStagedReviewers(stagedReviewers);
     await recordCanceledInvocation(
       input.bundle.invocationDir,
       input.window,
@@ -391,17 +523,56 @@ async function executeReviewerInvocation(input: {
     return { aborted: true, bundleRetained: false };
   }
 
+  // Publish reviewer outputs as one completed set. Until this point each
+  // reviewer writes outside the evidence bundle, so concurrently running
+  // reviewers cannot inspect sibling results or runtime session streams.
+  try {
+    await publishStagedReviewerSet(stagedReviewers, input.bundle.invocationDir);
+  } catch (error) {
+    await cleanupStagedReviewers(stagedReviewers);
+    const message = error instanceof Error ? error.message : "Reviewer artifact publication failed.";
+    const publicationFailure: ReviewResult = {
+      reviewerId: "gate",
+      verdict: "error",
+      summary: "Reviewer results could not be published atomically.",
+      findings: [],
+      error: "artifact_publication_failed",
+      diagnostic: message,
+    };
+    if (input.window) input.window.retainBundleAfterClose = true;
+    return { aborted: false, result: publicationFailure, reviewerResults: [publicationFailure], bundleRetained: true };
+  }
+
   const result = decideReviewResults(reviewerResults);
-  await Promise.all([
+  const telemetryPublications = await Promise.allSettled([
     writeFile(join(input.bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    writeFile(join(input.bundle.invocationDir, "review-telemetry.json"), JSON.stringify({
+      version: 1,
+      reviewSequence: input.reviewSequence,
+      reviewers: reviewerResults.map((reviewerResult) => ({
+        reviewerId: reviewerResult.reviewerId,
+        verdict: reviewerResult.verdict,
+        usage: reviewerResult.usage ? omitRawUsage(reviewerResult.usage) : undefined,
+        telemetry: reviewerResult.telemetry,
+      })),
+    }, null, 2), "utf8"),
     writeFile(join(input.bundle.dir, "sessions.json"), JSON.stringify(
       Object.fromEntries(input.window?.reviewerSessions ?? []),
       null,
       2,
     ), "utf8"),
-  ]).catch(() => undefined);
+  ]);
+  const telemetryFailures = telemetryPublications
+    .filter((publication): publication is PromiseRejectedResult => publication.status === "rejected")
+    .map((publication) => publication.reason instanceof Error ? publication.reason.message : String(publication.reason));
+  if (telemetryFailures.length > 0) {
+    result.diagnostic = [result.diagnostic, `Artifact telemetry publication failed: ${telemetryFailures.join("; ")}`]
+      .filter(Boolean)
+      .join("\n");
+    if (input.window) input.window.retainBundleAfterClose = true;
+  }
 
-  const bundleRetained = shouldRetainBundle(input.config, result, reviewerResults);
+  const bundleRetained = telemetryFailures.length > 0 || shouldRetainBundle(input.config, result, reviewerResults);
   if (input.window) {
     input.window.retainBundleAfterClose ||= bundleRetained;
   } else if (!bundleRetained) {
@@ -420,19 +591,17 @@ async function runSingleReviewer(input: {
   window?: ReviewWindow;
   signal?: AbortSignal;
   onUpdate?: (message: string) => void;
-}): Promise<ReviewResult> {
-  const reviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
-  await mkdir(reviewerDir, { recursive: true });
+}): Promise<StagedReviewerResult> {
+  const finalReviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
+  const reviewerDir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-"));
   const startedAt = Date.now();
-  let resumed = false;
-  let restartedAfterResumeFailure = false;
+  const startedAtIso = new Date(startedAt).toISOString();
+  let session: ReviewerSession | undefined;
   let result: ReviewResult;
+  let artifactError: string | undefined;
   try {
     const adapter = createAdapter(input.reviewer);
-    const previousSession = input.window?.reviewerSessions.get(input.reviewer.id);
-    const usableSession = previousSession?.adapter === adapter.kind ? previousSession : undefined;
-    resumed = Boolean(usableSession);
-    const invoke = (session = usableSession) => adapter.run({
+    result = await adapter.run({
       id: input.reviewer.id,
       cwd: input.cwd,
       prompt: input.reviewer.adapter === "generic-cli" ? input.prompt : input.bundlePrompt,
@@ -440,17 +609,12 @@ async function runSingleReviewer(input: {
       bundleDir: reviewerDir,
       timeoutMs: input.reviewer.timeoutMs ?? 300_000,
       signal: input.signal,
-      session,
-      onSession: (nextSession) => input.window?.reviewerSessions.set(input.reviewer.id, nextSession),
+      session: undefined,
+      onSession: (nextSession) => { session = nextSession; },
       onUpdate: input.onUpdate,
     });
-    result = await invoke();
-    if (usableSession && isResumeFailure(result)) {
-      input.window?.reviewerSessions.delete(input.reviewer.id);
-      restartedAfterResumeFailure = true;
-      result = await invoke(undefined);
-    }
   } catch (error) {
+    artifactError = error instanceof Error ? error.message : "artifact write failed";
     result = {
       reviewerId: input.reviewer.id,
       verdict: "error",
@@ -459,23 +623,96 @@ async function runSingleReviewer(input: {
       error: error instanceof Error ? error.message : "review_failed",
     };
   }
-  await Promise.all([
-    writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
-    writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
-    writeFile(join(reviewerDir, "invocation.json"), JSON.stringify({
+  const durationMs = Date.now() - startedAt;
+  result.telemetry = {
+    ...result.telemetry,
+    startedAt: startedAtIso,
+    durationMs,
+    promptBytes: Buffer.byteLength(input.reviewer.adapter === "generic-cli" ? input.prompt : input.bundlePrompt, "utf8"),
+    sessionResumed: false,
+    restartedAfterResumeFailure: false,
+  };
+  if (result.rawOutputPath) {
+    result.rawOutputPath = join(finalReviewerDir, basename(result.rawOutputPath));
+  }
+  // Review passes are fresh, so runtime session history is neither needed for
+  // continuation nor valid evidence for this or later reviewers.
+  await rm(join(reviewerDir, "session"), { recursive: true, force: true });
+  try {
+    await Promise.all([
+      writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
+      writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+      writeFile(join(reviewerDir, "invocation.json"), JSON.stringify({
+        reviewerId: input.reviewer.id,
+        adapter: input.reviewer.adapter,
+        resumed: false,
+        restartedAfterResumeFailure: false,
+        durationMs,
+        promptBytes: result.telemetry.promptBytes,
+        telemetry: result.telemetry,
+        session: session ?? null,
+      }, null, 2), "utf8"),
+    ]);
+  } catch (error) {
+    result = {
       reviewerId: input.reviewer.id,
-      adapter: input.reviewer.adapter,
-      resumed,
-      restartedAfterResumeFailure,
-      durationMs: Date.now() - startedAt,
-      session: input.window?.reviewerSessions.get(input.reviewer.id) ?? null,
-    }, null, 2), "utf8"),
-  ]).catch(() => undefined);
-  return result;
+      verdict: "error",
+      summary: "Reviewer artifacts could not be written completely.",
+      findings: [],
+      error: "artifact_write_failed",
+      diagnostic: artifactError,
+      telemetry: result.telemetry,
+    };
+    await writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8").catch(() => undefined);
+  }
+  return { result, stagingDir: reviewerDir, finalDir: finalReviewerDir, artifactError };
 }
 
-function isResumeFailure(result: ReviewResult): boolean {
-  return result.verdict === "error" && Boolean(result.error?.startsWith("exit_"));
+interface StagedReviewerResult {
+  result: ReviewResult;
+  stagingDir: string;
+  finalDir: string;
+  artifactError?: string;
+}
+
+async function publishStagedReviewerSet(
+  stagedReviewers: StagedReviewerResult[],
+  invocationDir: string,
+): Promise<void> {
+  const incomplete = stagedReviewers.filter((reviewer) => reviewer.artifactError);
+  if (incomplete.length > 0) {
+    throw new Error(incomplete.map((reviewer) =>
+      `${reviewer.result.reviewerId}: ${reviewer.artifactError}`).join("; "));
+  }
+  const finalRoot = join(invocationDir, "reviewers");
+  const stagedRoot = await mkdtemp(join(invocationDir, ".reviewers-"));
+  try {
+    for (const staged of stagedReviewers) {
+      const target = join(stagedRoot, basename(staged.finalDir));
+      try {
+        await rename(staged.stagingDir, target);
+      } catch (error) {
+        if (!isCrossDeviceRename(error)) throw error;
+        await cp(staged.stagingDir, target, { recursive: true });
+        await rm(staged.stagingDir, { recursive: true, force: true });
+      }
+    }
+    await writeFile(join(stagedRoot, ".complete"), "complete\n", "utf8");
+    await rm(finalRoot, { recursive: true, force: true });
+    await rename(stagedRoot, finalRoot);
+  } catch (error) {
+    await rm(stagedRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function cleanupStagedReviewers(stagedReviewers: StagedReviewerResult[]): Promise<void> {
+  await Promise.all(stagedReviewers.map((staged) =>
+    rm(staged.stagingDir, { recursive: true, force: true })));
+}
+
+function isCrossDeviceRename(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "EXDEV";
 }
 
 function decideReviewResults(results: ReviewResult[]): ReviewResult {
@@ -498,6 +735,18 @@ function decideReviewResults(results: ReviewResult[]): ReviewResult {
       error: errors.length > 0 ? "partial_reviewer_error" : undefined,
     };
   }
+  const aggregate = aggregateReviewDisposition(results);
+  if (aggregate === "pass" || aggregate === "pass_with_warnings") {
+    return {
+      reviewerId: "gate",
+      verdict: "pass",
+      summary: reviewerVerdictSummary(results),
+      findings: results.filter((result) => result.verdict === "pass").flatMap((result) =>
+        result.findings.map((finding) => ({ ...finding, reviewerId: result.reviewerId }))),
+      usage,
+      error: aggregate === "pass_with_warnings" ? "partial_reviewer_error" : undefined,
+    };
+  }
   if (errors.length > 0) {
     return {
       reviewerId: "gate",
@@ -508,13 +757,7 @@ function decideReviewResults(results: ReviewResult[]): ReviewResult {
       error: errors.every((result) => result.error === "aborted") ? "aborted" : "reviewer_error",
     };
   }
-  return {
-    reviewerId: "gate",
-    verdict: "pass",
-    summary: reviewerVerdictSummary(results),
-    findings: [],
-    usage,
-  };
+  throw new Error("review aggregation produced no disposition");
 }
 
 function shouldRetainBundle(
@@ -540,6 +783,11 @@ function reviewerVerdictSummary(results: ReviewResult[]): string {
     .filter((verdict) => counts.has(verdict))
     .map((verdict) => `${counts.get(verdict)} ${verdict}`)
     .join(", ");
+}
+
+function omitRawUsage(usage: TokenUsage): Omit<TokenUsage, "raw"> {
+  const { raw: _raw, ...summary } = usage;
+  return summary;
 }
 
 function reviewWasAborted(signal: AbortSignal | undefined, results: ReviewResult[]): boolean {

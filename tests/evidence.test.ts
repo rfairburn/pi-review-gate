@@ -51,7 +51,8 @@ test("evidence pre-captures a missing outside-worktree file before creation", as
     assert.equal(changes.length, 1);
     assert.equal(changes[0]?.path, outside);
     assert.equal(changes[0]?.status, "added");
-    assert.equal(changes[0]?.newContent, "created\n");
+    assert.equal(changes[0]?.newContent, undefined);
+    assert.equal(changes[0]?.diffOmittedReason, "outside_workspace");
   } finally {
     await rm(cwd, { recursive: true, force: true });
     await rm(outside, { force: true });
@@ -78,8 +79,9 @@ test("evidence pre-captures an existing outside-worktree file before modificatio
     assert.equal(changes.length, 1);
     assert.equal(changes[0]?.path, outside);
     assert.equal(changes[0]?.status, "modified");
-    assert.equal(changes[0]?.oldContent, "before\n");
-    assert.equal(changes[0]?.newContent, "after\n");
+    assert.equal(changes[0]?.oldContent, undefined);
+    assert.equal(changes[0]?.newContent, undefined);
+    assert.equal(changes[0]?.diffOmittedReason, "outside_workspace");
   } finally {
     await rm(cwd, { recursive: true, force: true });
     await rm(outside, { force: true });
@@ -117,8 +119,8 @@ test("outside-worktree evidence keeps an independent baseline for each exchange"
 
     assert.equal(cumulative.length, 0);
     assert.equal(correction.length, 1);
-    assert.equal(correction[0]?.oldContent, "incorrect\n");
-    assert.equal(correction[0]?.newContent, "original\n");
+    assert.equal(correction[0]?.oldContent, undefined);
+    assert.equal(correction[0]?.newContent, undefined);
     assert.equal(state.events[0]?.exchangeSequence, 1);
     assert.equal(state.events[1]?.exchangeSequence, 2);
   } finally {

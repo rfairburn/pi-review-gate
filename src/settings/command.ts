@@ -61,6 +61,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let maxCorrectionCycles = input.config.maxCorrectionCycles;
   let guidanceThreshold = input.config.implementationGuidanceAfterCorrectionAttempts;
   let retainBundles = input.config.retainBundles;
+  let maxWorkers = input.config.execution?.maxWorkers ?? 2;
+  let parallelEnabled = input.config.execution?.parallelEnabled === true;
 
   while (true) {
     const executorRow = settingsRow("Executor", executorSummary(activeExecutor, agents, input.scoped));
@@ -72,12 +74,16 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     const timeoutsRow = settingsRow("Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`);
     const policyRow = settingsRow("Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`);
     const retentionRow = settingsRow("Bundle retention", retentionLabel(retainBundles));
+    const workersRow = settingsRow("Parallel workers", String(maxWorkers));
+    const parallelRow = settingsRow("Parallel execution", parallelEnabled ? "Enabled" : "Disabled");
     const choice = await input.ui.select("Review settings", [
       executorRow,
       reviewersRow,
       timeoutsRow,
       policyRow,
       retentionRow,
+      workersRow,
+      parallelRow,
       "Save changes",
       "Cancel",
     ]);
@@ -110,6 +116,14 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retainBundles = await selectBundleRetention(input.ui, retainBundles);
       continue;
     }
+    if (choice === workersRow) {
+      maxWorkers = await selectMaxWorkers(input.ui, maxWorkers);
+      continue;
+    }
+    if (choice === parallelRow) {
+      parallelEnabled = await selectParallelEnabled(input.ui, parallelEnabled);
+      continue;
+    }
     const error = await validateSelection(activeExecutor, activeReviewers, agents, input.config, input.scoped);
     if (error) {
       await notify(input.ui, error, "error");
@@ -123,6 +137,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       maxCorrectionCycles,
       implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
       retainBundles,
+      maxWorkers,
+      parallelEnabled,
     });
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config);
@@ -142,6 +158,24 @@ async function selectBundleRetention(ui: UiContext, current: RetainBundles): Pro
   return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
 }
 
+async function selectMaxWorkers(ui: UiContext, current: number): Promise<number> {
+  const options = ["1", "2", "3", "4"].map((v) => `${v}${v === String(current) ? "  current" : ""}`);
+  const selected = await ui.select("Parallel workers (1–4)", options);
+  const parsed = Number(selected?.split(" ")[0]);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 4 ? parsed : current;
+}
+
+async function selectParallelEnabled(ui: UiContext, current: boolean): Promise<boolean> {
+  const options = [
+    `Enabled${current ? "  current" : ""}`,
+    `Disabled${!current ? "  current" : ""}`,
+  ];
+  const selected = await ui.select("Parallel execution", options);
+  if (selected === `Enabled${current ? "  current" : ""}`) return true;
+  if (selected === `Disabled${!current ? "  current" : ""}`) return false;
+  return current;
+}
+
 function retentionLabel(value: RetainBundles): string {
   if (value === "on-failure") return "On failure";
   if (value === "always") return "Always";
@@ -149,7 +183,7 @@ function retentionLabel(value: RetainBundles): string {
 }
 
 function settingsRow(label: string, value: string): string {
-  return `${label.padEnd(18)}${value}`;
+  return `${label.padEnd(19)}${value}`;
 }
 
 function policyValueRow(label: string, value: string): string {

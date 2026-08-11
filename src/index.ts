@@ -4,7 +4,7 @@ import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt } from "./pi";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, createStatusTracker, setStatus } from "./pi";
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
   activeExchangeHasBaseline,
@@ -49,6 +49,7 @@ export async function activate(pi: unknown): Promise<void> {
   let currentScopedModels: string[] = [];
   let sessionActive = true;
   let activeReviewAbort: ReviewAbortHandle | undefined;
+  let activeStatusTracker: ReturnType<typeof createStatusTracker> | undefined;
   let agentRunActive = false;
   let reviewerQuestionPausePending = false;
   const reviewerQuestionPauseWaiters = new Set<() => void>();
@@ -68,12 +69,15 @@ export async function activate(pi: unknown): Promise<void> {
     reviewerQuestionPauseWaiters.clear();
   };
 
-  registerHook(pi, "session_shutdown", async () => {
+  registerHook(pi, "session_shutdown", async (...args) => {
     sessionActive = false;
+    setStatus(extractContext(args) ?? pi, "review-gate", undefined);
     sessionAbortController.abort();
     const reviewWasActive = Boolean(activeReviewAbort);
     activeReviewAbort?.shutdown();
     activeReviewAbort = undefined;
+    activeStatusTracker?.clear();
+    activeStatusTracker = undefined;
     agentRunActive = false;
     reviewerQuestionPausePending = false;
     releaseReviewerQuestionPauseWaiters();
@@ -103,6 +107,7 @@ export async function activate(pi: unknown): Promise<void> {
     const expiredQuestionWindow = state.reviewWindow ? undefined : state.lastQuestionWindow;
     rememberUserRequest(state, text);
     await removeTransientWindowBundle(expiredQuestionWindow);
+    return undefined;
   });
 
   registerHook(pi, "before_agent_start", async (...args) => {
@@ -232,11 +237,13 @@ export async function activate(pi: unknown): Promise<void> {
       isSessionActive: () => sessionActive,
     });
     activeReviewAbort = reviewAbort;
+    const statusTracker = createStatusTracker(noticeTarget, "review-gate", "reviewing changes");
+    activeStatusTracker = statusTracker;
     let output: ReviewRunOutput;
     try {
       output = await runReview({
         cwd: currentCwd,
-        request: buildRequestContext(state),
+        request: buildRequestContext(state, state.reviewWindow, { priorFeedback: "latest" }),
         before: window.baseline,
         config: reviewConfig,
         evidence: window.evidence,
@@ -245,6 +252,7 @@ export async function activate(pi: unknown): Promise<void> {
         window,
         signal: reviewAbort.signal,
         notify: (message) => sendNoticeWhileSessionActive(noticeTarget, message, () => sessionActive),
+        onUpdate: (message) => statusTracker.update(message),
       });
     } catch (error) {
       if (!sessionActive) {
@@ -253,6 +261,10 @@ export async function activate(pi: unknown): Promise<void> {
       await releaseQueuedUserInputs(pi, state, () => sessionActive);
       throw error;
     } finally {
+      statusTracker.clear();
+      if (activeStatusTracker === statusTracker) {
+        activeStatusTracker = undefined;
+      }
       reviewAbort.cleanup();
       if (activeReviewAbort === reviewAbort) {
         activeReviewAbort = undefined;
@@ -295,7 +307,7 @@ export async function activate(pi: unknown): Promise<void> {
       });
       await sendNoticeWhileSessionActive(
         noticeTarget,
-        `review gate: passed (${formatTokenUsage(output.result.usage)})`,
+        `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
       await deliverAutomaticTransmission(pi, output, "passed", transmission, () => sessionActive);

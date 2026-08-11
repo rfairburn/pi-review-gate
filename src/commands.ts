@@ -15,7 +15,7 @@ import {
   type ReviewGateState,
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
-import { extractSignal, sendNotice, sendFollowUp, sendSteeringPrompt } from "./pi";
+import { extractSignal, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { createReviewTransmissionMessage, deliverReviewTransmission, writeReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
@@ -124,17 +124,24 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, "review gate: automatic review is disabled by settings");
         return;
       }
-      const output = await runReview({
-        cwd: input.cwd(),
-        request: buildRequestContext(input.state) || "Manual /review-now request",
-        before: window.baseline,
-        config: reviewConfig,
-        evidence: window.evidence,
-        correctionAttemptCount: getCorrectionAttemptCount(window),
-        window,
-        signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
-        notify: (message) => sendCommandNotice(ctx, message),
-      });
+      const statusTracker = createStatusTracker(ctx, "review-gate", "reviewing changes");
+      let output;
+      try {
+        output = await runReview({
+          cwd: input.cwd(),
+          request: buildRequestContext(input.state) || "Manual /review-now request",
+          before: window.baseline,
+          config: reviewConfig,
+          evidence: window.evidence,
+          correctionAttemptCount: getCorrectionAttemptCount(window),
+          window,
+          signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
+          notify: (message) => sendCommandNotice(ctx, message),
+          onUpdate: (message) => statusTracker.update(message),
+        });
+      } finally {
+        statusTracker.clear();
+      }
 
       if (!isSessionActive()) {
         return;
@@ -158,7 +165,10 @@ export function registerCommands(input: RegisterCommandsInput): void {
           disposition: "sent_for_observation",
           reviewedSnapshot: output.reviewedSnapshot!,
         });
-        await sendCommandNotice(ctx, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
+        await sendCommandNotice(
+          ctx,
+          `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
+        );
         await deliverCommandTransmission(input.pi, output, "passed", transmission, isSessionActive);
       } else if (output.result?.verdict === "needs_changes") {
         const transmission = await createCommandTransmission(output, "correction_required");
@@ -253,18 +263,25 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const contextWindow = getReviewerQuestionWindow(input.state);
       const reviewConfig = contextWindow?.reviewConfig ?? currentConfig();
-      const output = await runAskReviewer({
-        cwd: input.cwd(),
-        question,
-        request: buildRequestContext(input.state, contextWindow),
-        before: contextWindow?.baseline,
-        config: reviewConfig,
-        evidence: contextWindow?.evidence,
-        correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
-        window: contextWindow,
-        signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
-        notify: (message) => sendCommandNotice(ctx, message),
-      });
+      const statusTracker = createStatusTracker(ctx, "review-gate", "asking reviewer");
+      let output;
+      try {
+        output = await runAskReviewer({
+          cwd: input.cwd(),
+          question,
+          request: buildRequestContext(input.state, contextWindow),
+          before: contextWindow?.baseline,
+          config: reviewConfig,
+          evidence: contextWindow?.evidence,
+          correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
+          window: contextWindow,
+          signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
+          notify: (message) => sendCommandNotice(ctx, message),
+          onUpdate: (message) => statusTracker.update(message),
+        });
+      } finally {
+        statusTracker.clear();
+      }
 
       if (!isSessionActive()) {
         return;

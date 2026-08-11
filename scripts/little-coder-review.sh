@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ORCHESTRATOR_PROMPT="$ROOT/scripts/orchestrator-system-prompt.md"
 PRESET="${1:-}"
 if [[ -z "$PRESET" ]]; then
   echo "usage: $0 <codex|claude|glm-5.2|little-coder-deepseek-v4-flash|double|double-deepseek-v4-flash|triple|fake> [little-coder args...]" >&2
@@ -9,7 +10,15 @@ if [[ -z "$PRESET" ]]; then
 fi
 shift
 
-CONFIG="${TMPDIR:-/tmp}/pi-review-gate-${PRESET//[^a-zA-Z0-9_.-]/_}-review.json"
+CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-review-gate.XXXXXXXX")"
+chmod 700 "$CONFIG_DIR"
+CONFIG="$CONFIG_DIR/review.json"
+cleanup() {
+  rm -f -- "$CONFIG"
+  rmdir -- "$CONFIG_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+umask 077
 RETAIN_BUNDLES="${PI_REVIEW_GATE_RETAIN_BUNDLES:-on-failure}"
 MAX_CORRECTION_CYCLES=30
 LITTLE_CODER_ARGS=()
@@ -80,7 +89,9 @@ write_reviewer_config() {
       ;;
     fake)
       MAX_CORRECTION_CYCLES=1
-      echo "  \"decider\": {\"id\":\"fake-reviewer\",\"adapter\":\"generic-cli\",\"command\":\"node\",\"args\":[\"$ROOT/scripts/fake-reviewer.cjs\"],\"timeoutMs\":5000}"
+      local fake_reviewer
+      fake_reviewer="$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$ROOT/scripts/fake-reviewer.cjs")"
+      printf '  "decider": {"id":"fake-reviewer","adapter":"generic-cli","command":"node","args":[%s],"timeoutMs":5000}\n' "$fake_reviewer"
       ;;
     *)
       echo "unknown reviewer preset: $PRESET" >&2
@@ -101,7 +112,12 @@ if [[ "$PRESET" == "fake" ]]; then
   MAX_CORRECTION_CYCLES=1
 fi
 
-npm --prefix "$ROOT" run build
+if [[ -f "$ROOT/src/index.ts" ]]; then
+  npm --prefix "$ROOT" run build
+elif [[ ! -f "$ROOT/dist/src/index.js" ]]; then
+  echo "pi-review-gate: packaged extension is missing: $ROOT/dist/src/index.js" >&2
+  exit 2
+fi
 
 {
   echo '{'
@@ -124,7 +140,7 @@ export PI_REVIEW_GATE_CONFIG="$CONFIG"
 export LITTLE_CODER_EXTRA_EXTENSIONS="$ROOT/dist/src/index.js${LITTLE_CODER_EXTRA_EXTENSIONS:+:$LITTLE_CODER_EXTRA_EXTENSIONS}"
 echo "LITTLE_CODER_EXTRA_EXTENSIONS=$LITTLE_CODER_EXTRA_EXTENSIONS"
 if ((${#LITTLE_CODER_ARGS[@]})); then
-  exec little-coder "${LITTLE_CODER_ARGS[@]}"
+  little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT" "${LITTLE_CODER_ARGS[@]}"
 else
-  exec little-coder
+  little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT"
 fi

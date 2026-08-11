@@ -179,6 +179,19 @@ test("extractReviewTextFromPiJsonl reads assistant text and little-coder usage",
   assert.equal(extracted.usage?.totalTokens, 1150);
 });
 
+test("extractReviewTextFromPiJsonl preserves a terminal provider error after retries", () => {
+  const output = [
+    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], errorMessage: "provider overloaded" } }),
+    JSON.stringify({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, errorMessage: "provider overloaded" }),
+    JSON.stringify({ type: "auto_retry_end", success: false, attempt: 3, finalError: "Codex error: servers currently overloaded" }),
+  ].join("\n");
+
+  const extracted = extractReviewTextFromPiJsonl(output);
+
+  assert.equal(extracted.text, "");
+  assert.equal(extracted.terminalError, "Codex error: servers currently overloaded");
+});
+
 test("extractPiUsageFromMessages sums acting model usage from agent_end args", () => {
   const usage = extractPiUsageFromMessages([
     {

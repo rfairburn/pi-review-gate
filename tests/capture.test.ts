@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { compareSnapshots, createWorkspaceSnapshot } from "../src/capture";
+
+const execFileAsync = promisify(execFile);
 
 const snapshotOptions = {
   maxFileBytes: 1024 * 1024,
@@ -51,6 +55,140 @@ test("snapshot omits binary content but still detects changes", async () => {
     assert.equal(change.path, "nested/blob.bin");
     assert.equal(change.binary, true);
     assert.equal(change.diffOmittedReason, "binary");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot reuses unchanged file hashes and content from a prior snapshot", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-"));
+  try {
+    await writeFile(join(dir, "unchanged.txt"), "unchanged\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const after = await createWorkspaceSnapshot(dir, {
+      ...snapshotOptions,
+      reuseUnchangedFrom: before,
+    });
+
+    assert.equal(after.files.get("unchanged.txt"), before.files.get("unchanged.txt"));
+    assert.deepEqual(compareSnapshots(before, after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot cache does not miss a same-size rewrite with restored mtime", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-identity-"));
+  try {
+    const path = join(dir, "value.txt");
+    await writeFile(path, "before\n", "utf8");
+    const beforeStat = await stat(path);
+    const before = await createWorkspaceSnapshot(dir, snapshotOptions);
+    await writeFile(path, "after!\n", "utf8");
+    await utimes(path, beforeStat.atime, beforeStat.mtime);
+    const after = await createWorkspaceSnapshot(dir, {
+      ...snapshotOptions,
+      reuseUnchangedFrom: before,
+    });
+    assert.deepEqual(compareSnapshots(before, after).map((change) => change.path), ["value.txt"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot honors an already-aborted signal before discovery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-abort-"));
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    await assert.rejects(
+      createWorkspaceSnapshot(dir, { ...snapshotOptions, signal: controller.signal }),
+      /abort|cancel/i,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot records a tracked symlink target without reading the external file", async (t) => {
+  if (process.platform === "win32") t.skip("symlink permissions vary on Windows");
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-symlink-"));
+  const outside = join(dir, "..", `outside-${Date.now()}.txt`);
+  try {
+    await writeFile(outside, "outside secret\n", "utf8");
+    await symlink(outside, join(dir, "link"));
+    const snapshot = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const link = snapshot.files.get("link");
+    assert.equal(link?.entryType, "symlink");
+    assert.equal(link?.linkTarget, outside);
+    assert.equal(link?.content, undefined);
+    assert.ok(!JSON.stringify(link).includes("outside secret"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { force: true });
+  }
+});
+
+test("snapshot comparison detects symlink retargeting and executable-mode changes", async (t) => {
+  if (process.platform === "win32") t.skip("Unix modes and symlinks are required");
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-entry-metadata-"));
+  try {
+    await writeFile(join(dir, "a"), "a", "utf8");
+    await writeFile(join(dir, "b"), "b", "utf8");
+    await writeFile(join(dir, "script.sh"), "#!/bin/sh\n", "utf8");
+    await chmod(join(dir, "script.sh"), 0o644);
+    await symlink("a", join(dir, "link"));
+    const before = await createWorkspaceSnapshot(dir, snapshotOptions);
+
+    await rm(join(dir, "link"));
+    await symlink("b", join(dir, "link"));
+    await chmod(join(dir, "script.sh"), 0o755);
+    const after = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const changes = compareSnapshots(before, after);
+
+    assert.deepEqual(changes.map((change) => change.path), ["link", "script.sh"]);
+    assert.equal(changes[0]?.oldContent, "a");
+    assert.equal(changes[0]?.newContent, "b");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot represents tracked gitlinks without traversing their directory", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-gitlink-"));
+  const git = (args: string[]) => execFileAsync("git", args, {
+    cwd: dir,
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    },
+  });
+  try {
+    await git(["init", "--quiet"]);
+    await writeFile(join(dir, "base.txt"), "one\n", "utf8");
+    await git(["add", "base.txt"]);
+    await git(["commit", "--quiet", "-m", "one"]);
+    const first = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    await mkdir(join(dir, "submodule"));
+    await writeFile(join(dir, "submodule", "secret.txt"), "must not be traversed\n", "utf8");
+    await git(["update-index", "--add", "--cacheinfo", `160000,${first},submodule`]);
+
+    const before = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const gitlink = before.files.get("submodule");
+    assert.equal(gitlink?.entryType, "gitlink");
+    assert.equal(gitlink?.gitObjectId, first);
+    assert.equal(before.files.has("submodule/secret.txt"), false);
+
+    await writeFile(join(dir, "base.txt"), "two\n", "utf8");
+    await git(["add", "base.txt"]);
+    await git(["commit", "--quiet", "-m", "two"]);
+    const second = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    await git(["update-index", "--cacheinfo", `160000,${second},submodule`]);
+    const after = await createWorkspaceSnapshot(dir, snapshotOptions);
+    assert.deepEqual(compareSnapshots(before, after).map((change) => change.path), ["base.txt", "submodule"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

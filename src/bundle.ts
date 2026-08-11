@@ -1,13 +1,18 @@
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ChangedFile } from "./capture";
+import type { ChangeIdentity } from "./schema";
 import { summarizeReviewChanges } from "./change-context";
 import type { EvidenceBundle } from "./evidence";
 import {
   buildReviewerPrompt,
   buildReviewerQuestionPrompt,
+  buildReviewerInstructions,
+  REVIEW_AUTHORIZATION_POLICY,
   REVIEW_RESPONSE_FORMAT,
+  REVIEW_TEST_POLICY,
   type ImplementationGuidanceEscalation,
 } from "./prompts";
 import type { ReviewExchangeContext } from "./state";
@@ -26,6 +31,7 @@ interface ReviewBundleContext {
   evidence?: EvidenceBundle;
   actingUsage?: TokenUsage;
   guidanceEscalation?: ImplementationGuidanceEscalation;
+  changeIdentity?: ChangeIdentity;
   metadata?: Record<string, unknown>;
 }
 
@@ -70,6 +76,7 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
     bundleDir: dir,
     evidenceMarkdown: input.evidence?.markdown,
     guidanceEscalation: input.guidanceEscalation,
+    changeIdentity: input.changeIdentity,
   };
   const prompt = question
     ? buildReviewerQuestionPrompt({ ...promptContext, question: input.question })
@@ -90,13 +97,15 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
       cwd: input.cwd,
       createdAt: new Date().toISOString(),
       ...(question ? { kind: "ask-reviewer" } : {}),
+      ...(input.changeIdentity ? { changeIdentity: input.changeIdentity } : {}),
       ...input.metadata,
     }, null, 2), "utf8"),
     writeFile(join(invocationDir, "reviewer-context.md"), prompt, "utf8"),
+    writeFile(join(invocationDir, "reviewer-instructions.md"), buildReviewerInstructions(input.guidanceEscalation), "utf8"),
     writeFile(join(invocationDir, "evidence.json"), JSON.stringify(input.evidence ?? null, null, 2), "utf8"),
     writeFile(join(invocationDir, "evidence.md"), input.evidence?.markdown ?? "", "utf8"),
     writeReviewArtifacts(invocationDir, input.submittedChanges, input.sideEffectChanges ?? [], input.evidence),
-    writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence),
+    writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence, input.changeIdentity),
     writeExchangeArtifacts(dir, input.dir ? (input.exchanges ?? []).slice(-1) : input.exchanges ?? []),
     writeReviewIndex(dir, input.cwd, reviewSequence, input.exchanges ?? [], question),
   ];
@@ -151,10 +160,11 @@ async function writeCurrentReviewFiles(
   sideEffectPatch: string,
   prompt: string,
   evidence: EvidenceBundle | undefined,
+  changeIdentity: ChangeIdentity | undefined,
 ): Promise<void> {
   const currentDir = join(dir, "current");
   await mkdir(currentDir, { recursive: true });
-  await Promise.all([
+  const writes: Array<Promise<void>> = [
     writeFile(join(dir, "request.md"), request, "utf8"),
     writeFile(join(currentDir, "changed-files.json"), JSON.stringify(changedFiles, null, 2), "utf8"),
     writeFile(join(currentDir, "cumulative.patch"), patch, "utf8"),
@@ -162,7 +172,13 @@ async function writeCurrentReviewFiles(
     writeFile(join(currentDir, "reviewer-context.md"), prompt, "utf8"),
     writeFile(join(currentDir, "evidence.json"), JSON.stringify(evidence ?? null, null, 2), "utf8"),
     writeFile(join(currentDir, "evidence.md"), evidence?.markdown ?? "", "utf8"),
-  ]);
+  ];
+  if (changeIdentity) {
+    writes.push(writeFile(join(currentDir, "change-identity.json"), JSON.stringify(changeIdentity, null, 2), "utf8"));
+  } else {
+    writes.push(rm(join(currentDir, "change-identity.json"), { force: true }));
+  }
+  await Promise.all(writes);
 }
 
 async function writeExchangeArtifacts(dir: string, exchanges: ReviewExchangeContext[]): Promise<void> {
@@ -229,10 +245,12 @@ async function writeReviewIndex(
     `Current ${question ? "question" : "review"}: ${reviewSequence}`,
     `Latest completed exchange: ${latestExchange ?? "none"}`,
     "",
-    "Read `request.md`, `current/reviewer-context.md`, and the current workspace before deciding.",
-    "For correction reviews, read the latest `exchanges/<sequence>/submitted.patch`, tool events, and assistant summary.",
+    "Read `request.md`, `current/changed-files.json`, and the current workspace before deciding.",
+    "On the first review, start with `current/cumulative.patch`. For correction reviews, start with the latest `exchanges/<sequence>/submitted.patch`, tool events, and assistant summary, plus the immediately preceding review transmission that caused that exchange.",
+    "`current/reviewer-context.md` contains the complete inlined fallback context. Do not read it by default during a correction review; use it only when the targeted artifacts and current files are insufficient.",
     "Earlier exchange directories and review results are historical evidence; the current workspace is ground truth.",
-    "For every completed prior pass, read `reviews/<sequence>/implementing-model-transmission.md` and `delivery.json`. Those files record exactly what the implementing model was told and whether it was a required correction, passing observation, deferred finding, or review error.",
+    "Do not read every earlier review pass by default. Consult older `implementing-model-transmission.md` and `delivery.json` files only when the latest correction evidence identifies a concrete unresolved dependency or contradiction.",
+    "Do not inspect `sessions/`, raw model streams, invocation diagnostics, or any `reviews/<sequence>/reviewers/` and `questions/<sequence>/reviewers/` directories. Those are runtime/output artifacts, not review evidence; official prior results are in `implementing-model-transmission.md`.",
     "A numbered invocation containing `CANCELED.md` is a cancellation tombstone, not a completed reviewer result. It preserves sequence history but contributes no verdict or findings.",
     "",
     "## Exchanges",
@@ -261,8 +279,11 @@ async function writeReviewIndex(
 function buildBundlePrompt(dir: string, invocationDir: string, question: boolean): string {
   return [
     `You are an independent read-only ${question ? "reviewer answering a question" : "code reviewer"}.`,
+    REVIEW_AUTHORIZATION_POLICY,
+    REVIEW_TEST_POLICY,
     `The authoritative evidence bundle is ${dir}.`,
-    `Read ${join(dir, "REVIEW.md")} first, then ${join(invocationDir, "reviewer-context.md")}, the latest exchange files it references, and the current workspace.`,
+    `Read ${join(dir, "REVIEW.md")} and ${join(invocationDir, "reviewer-instructions.md")} first, then follow the targeted evidence routing. Inspect the current workspace and the latest exchange files before expanding into historical or complete fallback context.`,
+    "Do not inspect session/runtime streams or reviewer output directories. They are deliberately excluded from review evidence so each reviewer remains independent.",
     "Use read-only filesystem tools to inspect the evidence. If shell execution is the only filesystem interface, strictly read-only commands such as pwd, ls, find, rg, grep, sed, cat, and git status/diff/show are allowed.",
     "Never modify files, run commands with persistent side effects, use network access, or ask the primary agent for more context.",
     REVIEW_RESPONSE_FORMAT,
@@ -352,9 +373,11 @@ async function writeArtifact(dir: string, relativePath: string, content: string)
 function safeArtifactPath(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   const withoutRoot = normalized.startsWith("/") ? `__absolute__/${normalized.slice(1)}` : normalized;
-  return withoutRoot
+  const readable = withoutRoot
     .split("/")
     .filter((part) => part && part !== "." && part !== "..")
     .map((part) => part.replace(/[^a-zA-Z0-9._-]+/g, "_"))
     .join("/") || "unnamed";
+  const digest = createHash("sha256").update(path).digest("hex").slice(0, 12);
+  return `${readable}--${digest}`;
 }

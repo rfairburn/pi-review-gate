@@ -14,6 +14,10 @@ export interface ExecutorTurn {
   code: number | null;
   timedOut: boolean;
   aborted: boolean;
+  failure?: {
+    category: "provider" | "stdin" | "protocol" | "process";
+    message: string;
+  };
 }
 
 export interface ExecutorRequest {

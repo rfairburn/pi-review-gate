@@ -348,7 +348,11 @@ export function markCappedFeedbackSent(
   return feedback;
 }
 
-export function buildRequestContext(state: ReviewGateState, window = state.reviewWindow): string {
+export function buildRequestContext(
+  state: ReviewGateState,
+  window = state.reviewWindow,
+  options: { priorFeedback?: "all" | "latest" } = {},
+): string {
   if (!window) {
     return "No active review window or original request captured.";
   }
@@ -366,7 +370,10 @@ export function buildRequestContext(state: ReviewGateState, window = state.revie
       "Historical prior review feedback from this same review window:",
       "These findings describe earlier workspace states. Do not assume they remain unresolved; reconcile each one against the current workspace.",
     );
-    for (const feedback of window.reviewHistory) {
+    const feedbackHistory = options.priorFeedback === "latest"
+      ? window.reviewHistory.slice(-1)
+      : window.reviewHistory;
+    for (const feedback of feedbackHistory) {
       lines.push(
         "",
         `Review ${feedback.sequence} (${feedback.source}; ${feedback.verdict}; ${formatDisposition(feedback.disposition)}):`,

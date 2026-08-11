@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,6 +17,24 @@ test("reviewer prompt treats sentinel-only flags as terminal notes", () => {
   assert.match(prompt, /Return "needs_changes" only when the primary agent can take a concrete follow-up action/);
   assert.match(prompt, /sentinel\/status flag/);
   assert.match(prompt, /return "pass" with a non_blocking finding/);
+});
+
+test("reviewer prompt treats orchestrator direction as authorized and forbids user-intent false positives", () => {
+  const prompt = buildReviewerPrompt({
+    request: "implement the orchestrator-approved change",
+    submittedChanges: [],
+    patch: "",
+    cwd: "/tmp/project",
+  });
+
+  assert.match(prompt, /orchestrator owns task direction, scope, and authorization/);
+  assert.match(prompt, /Treat the task and implementation direction recorded in the evidence as authorized/);
+  assert.match(prompt, /Never refuse, abort, or return "needs_changes" merely because a change was not explicitly requested/);
+  assert.match(prompt, /"The user did not ask for this" is not, by itself, a review finding/);
+  assert.match(prompt, /demonstrable technical harm or a direct violation of an explicit acceptance criterion/);
+  assert.match(prompt, /Targeted tests are the expected verification inside delegated implementation and correction loops/);
+  assert.match(prompt, /Do not return "needs_changes" merely because the full repository test suite was not run/);
+  assert.match(prompt, /full-suite final orchestration run only as a non_blocking observation/);
 });
 
 test("every review prompt requests implementation-ready Markdown guidance", () => {
@@ -112,6 +130,16 @@ test("agentic reviewer bundle prompt permits only read-only filesystem commands 
     assert.match(bundle.bundlePrompt, /Never modify files, run commands with persistent side effects/);
     assert.doesNotMatch(bundle.bundlePrompt, /Do not modify files, run shell commands/);
     assert.match(bundle.bundlePrompt, /"verdict": "pass" \| "needs_changes" \| "error"/);
+    assert.match(bundle.bundlePrompt, /targeted evidence routing/);
+    assert.match(bundle.bundlePrompt, /Do not inspect session\/runtime streams or reviewer output directories/);
+    assert.doesNotMatch(bundle.bundlePrompt, /reviewer-context\.md/);
+    const index = await readFile(join(dir, "REVIEW.md"), "utf8");
+    assert.match(index, /Do not read every earlier review pass by default/);
+    assert.match(index, /complete inlined fallback context/);
+    assert.match(index, /Do not inspect `sessions\/`/);
+    const instructions = await readFile(join(bundle.invocationDir, "reviewer-instructions.md"), "utf8");
+    assert.match(instructions, /Runtime and reviewer-output artifacts are not review evidence/);
+    assert.match(instructions, /implementing-model-transmission\.md/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

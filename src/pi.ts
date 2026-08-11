@@ -178,3 +178,60 @@ function terminalInputTargets(pi: unknown): unknown[] {
   }
   return [pi];
 }
+
+export function setStatus(pi: unknown, key: string, text: string | undefined): void {
+  try {
+    if (!isRecord(pi) || !isRecord(pi.ui) || typeof pi.ui.setStatus !== "function") return;
+    pi.ui.setStatus(key, text);
+  } catch {
+    // The UI context may have gone stale during shutdown.
+  }
+}
+
+export function createStatusTracker(pi: unknown, key: string, initialText: string): StatusTracker {
+  let currentText = initialText;
+  let lastText = "";
+  const startedAt = Date.now();
+  let disposed = false;
+
+  const refresh = () => {
+    if (disposed) return;
+    const elapsed = formatElapsed(Date.now() - startedAt);
+    const text = currentText ? `${currentText} (${elapsed})` : `(${elapsed})`;
+    if (text !== lastText) {
+      lastText = text;
+      setStatus(pi, key, text);
+    }
+  };
+
+  refresh();
+  const interval = setInterval(refresh, 2_000);
+  interval.unref?.();
+
+  return {
+    update(text: string) {
+      if (disposed) return;
+      currentText = text;
+      refresh();
+    },
+    clear() {
+      if (disposed) return;
+      disposed = true;
+      clearInterval(interval);
+      setStatus(pi, key, undefined);
+    },
+  };
+}
+
+export interface StatusTracker {
+  update(text: string): void;
+  clear(): void;
+}
+
+function formatElapsed(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  return `${min}m ${sec}s`;
+}

@@ -1,10 +1,11 @@
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CodexExecutorConfig } from "../../config";
-import { reviewerEnv, runPromptProcess } from "../../adapters/process";
-import { extractCodexReviewFromJsonl } from "../../usage";
+import { MAX_RETAINED_OUTPUT_BYTES, reviewerEnv, runPromptProcess } from "../../adapters/process";
+import { CodexJsonlReviewExtractor, extractCodexReviewFromJsonl } from "../../usage";
 import { writeExecutorArtifacts } from "../artifacts";
+import { CodexJsonlActivityExtractor } from "../progress";
 import type { ExecutorAdapter, ExecutorRequest, ExecutorTurn } from "../types";
+import { readBoundedTextFile } from "../../bounded-file";
 
 export class CodexExecutorAdapter implements ExecutorAdapter {
   readonly kind = "codex-cli";
@@ -15,6 +16,8 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    const activity = new CodexJsonlActivityExtractor((message) => request.onUpdate?.(message));
+    const streamExtractor = new CodexJsonlReviewExtractor();
     const finalPath = join(request.artifactDir, `codex-final-${String(request.turn).padStart(4, "0")}.txt`);
     const shared = [
       "--json",
@@ -25,7 +28,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
     ];
     const args = request.session
       ? ["exec", "resume", ...shared, request.session.id, "-"]
-      : ["exec", ...shared, "--sandbox", "workspace-write", "--approve-for-me", "-"];
+      : ["exec", ...shared, "--approve-for-me", "-"];
     const output = await runPromptProcess({
       command: this.config.command ?? "codex",
       args,
@@ -34,11 +37,19 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       timeoutMs: this.config.timeoutMs ?? 1_800_000,
       env: reviewerEnv({ ...process.env, ...this.config.env }),
       signal: request.signal,
-      onStdoutChunk: () => request.onUpdate?.("Codex executor running"),
+      onStdoutChunk: (chunk) => {
+        streamExtractor.push(chunk);
+        activity.push(chunk);
+      },
     });
-    const extracted = extractCodexReviewFromJsonl(output.stdout);
-    const fileText = await readFile(finalPath, "utf8").catch(() => "");
-    const text = fileText.trim() ? fileText : extracted.text;
+    activity.finish();
+    const streamed = streamExtractor.finish();
+    const extracted = streamed.text || streamed.sessionId || streamed.usage
+      ? streamed
+      : extractCodexReviewFromJsonl(output.stdout);
+    const finalFile = await readBoundedTextFile(finalPath, MAX_RETAINED_OUTPUT_BYTES)
+      .catch(() => ({ text: "", truncated: false }));
+    const text = finalFile.text.trim() ? finalFile.text : extracted.text;
     const sessionId = extracted.sessionId ?? request.session?.id ?? "missing";
     const artifacts = await writeExecutorArtifacts({
       artifactDir: request.artifactDir,
@@ -57,6 +68,11 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       code: output.code,
       timedOut: output.timedOut,
       aborted: output.aborted,
+      failure: finalFile.truncated
+        ? { category: "protocol", message: "Codex executor final output exceeded the 100 MiB limit." }
+        : output.stdinError
+          ? { category: "stdin", message: output.stdinError }
+          : undefined,
     };
   }
 }

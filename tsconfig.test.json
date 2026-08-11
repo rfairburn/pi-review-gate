@@ -3,7 +3,9 @@
   "compilerOptions": {
     "outDir": "dist-test",
     "declaration": false,
-    "sourceMap": false
+    "sourceMap": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
   },
   "include": ["src/**/*.ts", "tests/**/*.ts"]
 }

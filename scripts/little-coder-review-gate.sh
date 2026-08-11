@@ -3,6 +3,7 @@ set -euo pipefail
 
 REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
+ORCHESTRATOR_PROMPT="$REVIEW_GATE_ROOT/scripts/orchestrator-system-prompt.md"
 
 unset PI_REVIEW_GATE_CONFIG
 unset LITTLE_CODER_REVIEW_CONFIG
@@ -30,7 +31,12 @@ if [[ -z "$REVIEW_GATE_CONFIG" ]]; then
   exit 2
 fi
 
-npm --prefix "$REVIEW_GATE_ROOT" run build
+if [[ -f "$REVIEW_GATE_ROOT/src/index.ts" ]]; then
+  npm --prefix "$REVIEW_GATE_ROOT" run build
+elif [[ ! -f "$REVIEW_GATE_EXTENSION" ]]; then
+  echo "pi-review-gate: packaged extension is missing: $REVIEW_GATE_EXTENSION" >&2
+  exit 2
+fi
 
 case ":${LITTLE_CODER_EXTRA_EXTENSIONS:-}:" in
   *":$REVIEW_GATE_EXTENSION:"*) ;;
@@ -40,4 +46,4 @@ esac
 echo "pi-review-gate config: $REVIEW_GATE_CONFIG"
 echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"
 
-exec little-coder "$@"
+exec little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT" "$@"

@@ -50,7 +50,46 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
   const extensions = await readFile(join(capture, "extensions"), "utf8");
   assert.match(extensions, /dist\/src\/index\.js/);
   assert.match(extensions, /\/other\/extension\.js/);
-  assert.equal(await readFile(join(capture, "args"), "utf8"), "--model\nexample\n");
+  assert.equal(
+    await readFile(join(capture, "args"), "utf8"),
+    `--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
+  );
+});
+
+test("preset launcher appends the orchestrator prompt and preserves forwarded arguments", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-preset-launcher-"));
+  const bin = join(root, "bin");
+  const capture = join(root, "capture");
+  await Promise.all([mkdir(bin), mkdir(capture)]);
+
+  const npmPath = join(bin, "npm");
+  const littleCoderPath = join(bin, "little-coder");
+  await writeFile(npmPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  await writeFile(littleCoderPath, [
+    "#!/usr/bin/env bash",
+    "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
+    "printf '%s' \"$PI_REVIEW_GATE_CONFIG\" > \"$CAPTURE_DIR/config-path\"",
+    "node -e 'const fs=require(\"node:fs\");process.stdout.write((fs.statSync(process.argv[1]).mode & 0o777).toString(8))' \"$PI_REVIEW_GATE_CONFIG\" > \"$CAPTURE_DIR/config-mode\"",
+  ].join("\n"), "utf8");
+  await Promise.all([chmod(npmPath, 0o755), chmod(littleCoderPath, 0o755)]);
+
+  await execFileAsync(resolve("scripts/little-coder-review.sh"), ["codex", "--model", "example"], {
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      CAPTURE_DIR: capture,
+      TMPDIR: root,
+    },
+  });
+
+  assert.equal(
+    await readFile(join(capture, "args"), "utf8"),
+    `--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
+  );
+  const temporaryConfig = await readFile(join(capture, "config-path"), "utf8");
+  assert.match(temporaryConfig, /pi-review-gate\.[^/]+\/review\.json$/);
+  assert.equal(await readFile(join(capture, "config-mode"), "utf8"), "600");
+  await assert.rejects(readFile(temporaryConfig, "utf8"), /ENOENT/);
 });
 
 test("persistent launcher fails clearly when no fallback config exists", async () => {

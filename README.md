@@ -10,6 +10,18 @@ npm install
 npm test
 ```
 
+The complete test run executes up to four test files concurrently. Use
+`npm run test:fast` for the short pure/unit development loop. Use `npm test`
+(or `npm run test:integration`) for the process, Git, filesystem, and end-to-end
+suite before finalizing a phase. For diagnosing resource-sensitive or
+ordering-sensitive failures, use the serial fallback:
+
+```bash
+npm run test:serial
+npm run check:static
+npm run test:package
+```
+
 ## Configuration
 
 Point the extension at a JSON config file:
@@ -40,6 +52,7 @@ Example config using Codex as the reviewer:
   "maxPatchBytes": 200000,
   "maxFileBytes": 1048576,
   "maxSnapshotBytes": 52428800,
+  "waveArtifactTtlMs": 2592000000,
   "retainBundles": "on-failure",
   "decider": {
     "id": "codex",
@@ -51,11 +64,13 @@ Example config using Codex as the reviewer:
 
 Multiple reviewers can be configured with `reviewers`. They run in parallel
 against the same review bundle. Review-gate waits for every reviewer and applies
-a simple gate: any `needs_changes` verdict means changes are required, all
-reviewers must pass for the gate to pass, and reviewer errors prevent a silent
-pass. Each reviewer appears once in the implementing-model transmission, and
-review decisions are stored per reviewer rather than as an additional combined
-result. There is no separate aggregate summary, guidance, or finding set.
+a simple gate: any `needs_changes` verdict means changes are required; when no
+reviewer requests changes, at least one completed `pass` is accepted even if
+another reviewer has an infrastructure error; and the gate errors only when no
+reviewer completes a usable review. Mixed pass/error results are classified as
+`pass_with_warnings`, retain their evidence, and return every reviewer result to
+the orchestrator. Each reviewer also appears once in the implementing-model
+transmission.
 Results from every reviewer are transmitted, including passing assessments,
 non-blocking observations, guidance, disagreements, and reviewer errors.
 Blocking findings are identified as required corrections; passing and
@@ -72,9 +87,22 @@ when the shell is their only filesystem interface. Codex starts in its
 local no-op sandbox preflight detects platform sandbox startup failures before
 a model turn is spent.
 Reviewer output is parsed strictly first; a narrow fallback recovers the same
-schema when a model emits otherwise-valid fields with unescaped multiline
-Markdown. Sandbox startup failures remain explicit reviewer errors rather than
+schema when a model emits an actionable non-passing result with unescaped
+multiline Markdown. A passing verdict is never accepted through repair.
+Sandbox startup failures remain explicit reviewer errors rather than
 being mislabeled as verdict-schema failures.
+
+Reviewer/executor stdout and stderr are retained up to 100 MiB
+per stream for diagnostics; JSONL protocols are decoded incrementally with
+separate bounded records, so protocol correctness does not depend on display
+capture truncation.
+
+The reviewer treats orchestrator-provided task direction as authorized and
+reviews concrete logic, regressions, security, API behavior, tests, and explicit
+acceptance criteria. It must not request changes merely because an implementation
+choice was not separately requested by the user. Targeted tests are expected in
+delegated correction loops; absent an explicit task criterion or a concrete
+cross-cutting risk, a full-suite run is a non-blocking final-orchestration note.
 
 ```json
 {
@@ -101,7 +129,7 @@ The older single `decider` field is still supported for compatibility.
 
 ### Delegated execution and runtime settings
 
-`/review-settings` opens one staged settings transaction with five sections:
+`/review-settings` opens one staged settings transaction with six sections:
 
 - **Executor** is a single-selection, `/model`-style picker over Pi-scoped
   little-coder models plus execution-capable entries from `externalAgents`.
@@ -121,6 +149,11 @@ The older single `decider` field is still supported for compatibility.
 - **Bundle retention** selects `never`, `on-failure`, or `always`. Choose
   `always` when successful executor and reviewer turns need to remain available
   for inspection.
+- **Parallel workers** sets `execution.maxWorkers` (1–4, default 2) which
+  controls the maximum concurrent workers for `execute_subtasks`.
+- **Parallel execution** toggles `execution.parallelEnabled` (default `false`).
+  When disabled, `execute_subtasks` is inactive even with a resolvable executor;
+  `execute_subtask` remains available. Enable this to opt in to parallel execution.
 
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the
 root discards all staged changes; **Save changes** atomically persists every
@@ -147,7 +180,8 @@ the configured harness/model cannot be changed in tool arguments. Calls are
 serial. The primary model waits for the returned packet before planning the next
 phase. If review is enabled, the child receives corrections in its own session
 and is accepted only after reviewer pass followed by an unchanged child
-response. Child changes are checkpointed so an unchanged parent turn is not
+response. This post-pass turn lets the child consider noncritical reviewer
+suggestions; any resulting tree change is reviewed again. Child changes are checkpointed so an unchanged parent turn is not
 reviewed again; later parent edits remain parent-owned and follow the ordinary
 gate.
 
@@ -167,10 +201,74 @@ the normal bundle policy, and never treats the partial work as accepted.
 
 While `execute_subtask` is active, its tool card shows the current lifecycle
 phase and elapsed time. Press Ctrl+O to expand a bounded live activity view with
-the executor model, artifact directory, recent native little-coder tool and test
-milestones, review cycle, reviewer models, and reviewer completion verdicts.
+the executor model, artifact directory, recent native little-coder or Codex CLI
+tool and test milestones, review cycle, reviewer models, and reviewer completion
+verdicts.
 Streaming activity updates are UI-only and are not copied into the controlling
 model's context; only the final subtask packet is returned as tool context.
+
+Claude CLI reviewers and executors also stream bounded native lifecycle and tool
+activity into these views without exposing reasoning or reviewer output.
+Foreground automatic reviews, `/review-now`, and reviewer-question commands show
+the active reviewer milestone and elapsed time in the status line until the
+review completes or is cancelled.
+
+### Parallel execution with `execute_subtasks`
+
+`execute_subtasks` runs multiple independent bounded tasks in parallel. Each
+task runs in an isolated worktree with its own review lifecycle. Tasks are
+specified as an array (1–16) with the same schema as `execute_subtask`.
+
+**Concurrency**: `maxWorkers` controls the maximum concurrent workers (1–4,
+default 2). The tool-call `maxWorkers` overrides `config.execution.maxWorkers`,
+which overrides the built-in default of 2.
+
+**Integration policy**: By default all-or-nothing: any worker that is not
+accepted, accepted_with_warnings, completed_unreviewed, or no_changes blocks
+integration entirely. Set `integratePartial: true` to integrate eligible workers
+(accepted / accepted_with_warnings / completed_unreviewed) in declared order
+despite failed ones.
+
+**Integration order**: Workers are integrated in the declared order from the
+tasks array, regardless of completion order.
+
+**Landing**: After integration, changes are landed into the source workspace.
+The final changes are uncommitted — they appear as unstaged working-tree
+changes; the source index and staging state remain unchanged.
+
+**Snapshot and ignore policy**: The wave captures a snapshot of the source
+workspace. Non-ignored untracked files are included in the snapshot. Git-ignored
+files are excluded from the captured snapshot and landing. This means dependencies
+installed in `node_modules`, secrets in `.env`, and other ignored paths are
+not captured or landed. If your task depends on files that are git-ignored,
+the worker will not see them. Files known to Git through `HEAD` or the index are
+always captured regardless of repository size. During parallel wave capture,
+`maxSnapshotBytes` limits only the cumulative size of non-ignored untracked
+files (50 MiB by default). For ordinary serial review snapshots, the same
+setting continues to bound the textual file content retained for diffing.
+
+**Artifacts**: Each wave produces a `waveRoot` directory containing artifacts
+for each task, a wave manifest (`wave-manifest.json`), and stable refs for
+integrated commits. The wave root path is returned in the tool result. On later
+wave starts, completed non-recovery roots older than `waveArtifactTtlMs` are
+garbage-collected (30 days by default; `0` disables collection). Conflict,
+integration-error, and recovery-required roots are never removed by this GC,
+and `retainBundles: "always"` disables wave GC.
+
+**Conflict and recovery**: If integration encounters conflicts, the wave
+returns a `conflicted` status with details about the conflicting task, commit,
+and paths. The integration worktree is preserved for diagnosis. Landing
+conflicts are reported with per-path conflict details. Rolled-back landings
+store a recovery manifest for manual recovery.
+
+**Source preservation**: The wave never mutates the source repository through
+Git operations. Source HEAD, index, staging state, and stash are preserved.
+Absolute source-workspace paths in task and correction text are remapped to the
+worker worktree, and executor `PWD` is set to its actual isolated cwd. Clean
+worktrees are removed after completion; dirty or conflicted worktrees are
+preserved for diagnosis. This is worktree and instruction isolation, not an OS
+sandbox: a hostile custom executor process can still access paths allowed by
+the host account.
 
 Pi/little-coder internal model selections use the exact canonical
 `provider/model` value and store a role-owned `thinkingLevel`. The allowed
@@ -370,21 +468,19 @@ The wrapper flag also accepts explicit modes:
 --retain-review-bundles=always
 ```
 
-Built-in Codex, Claude, and little-coder reviewers use one explicit CLI session
-per reviewer for the lifetime of a review window. Correction reviews,
-continuations made after a passing transmission, and `/ask-reviewer` resume that
-same reviewer session against the same evidence bundle. A new review window
-always starts new reviewer sessions. The bundle is
-still authoritative: if a saved session cannot be resumed, the reviewer can be
-restarted from the complete bundle without losing review context.
+Every built-in Codex, Claude, and little-coder review pass starts a fresh CLI
+session. Correction context comes from the stable evidence bundle rather than
+accumulated model/tool history, avoiding reviewer compaction across passes.
+Correction reviewers begin with the original task evidence, latest correction
+exchange, immediately preceding findings, and current files. Complete earlier
+history remains available for targeted inspection but is not read by default.
 
 Canceling a running review with Escape cancels the whole parallel review, even
 if one reviewer has already completed. Partial results are discarded and are
 not transmitted. The numbered invocation remains as a `CANCELED.md` tombstone
 stating that a review would have run there but was canceled by the user, so pass
-order remains unambiguous. Cancellation restores the reviewer-session handles
-from before that invocation; the next review keeps the same evidence bundle and
-resumes from the last successful sessions instead of starting a new window.
+order remains unambiguous. The next review keeps the same evidence bundle but
+starts fresh reviewer sessions.
 
 ## Temporary fake reviewer
 
@@ -423,8 +519,8 @@ Exact `write` / `edit` paths and easy shell targets are pre-captured before
 execution, including absolute paths outside the current worktree.
 
 Repository baselines, per-exchange snapshots, pre-captured outside-file
-baselines, user guidance, tool evidence, assistant summaries, reviewer feedback,
-and reviewer sessions belong to one review window. A requested correction keeps
+baselines, user guidance, tool evidence, assistant summaries, and reviewer
+feedback belong to one review window. A requested correction keeps
 that window open. Even when a correction exactly restores the original baseline,
 the next reviewer sees the inverse exchange diff and validates the correction.
 A passing review is transmitted to the implementing model as a final review
@@ -445,8 +541,8 @@ correction feedback, and queued user input. The next ordinary prompt starts a
 fresh window from the workspace's current contents. It does not revert files or
 override bundle retention: bundles continue to be retained or removed by the
 configured `retainBundles` policy (`never`, `on-failure`, or `always`).
-Already-retained bundles remain governed by that policy. Reviewer sessions from
-the cleared window are never reused. If a review is currently running, cancel it
+Already-retained bundles remain governed by that policy. Reviewer sessions are
+never reused between passes. If a review is currently running, cancel it
 first and then run `/review-clear`.
 
 `/review-now` reruns the configured reviewer or reviewers against the active
@@ -508,18 +604,97 @@ reviewer note without reusing the already-checkpointed file baseline.
 Retained review bundles include `REVIEW.md`, `manifest.json`, `request.md`, a
 `current/` cumulative view, immutable `exchanges/<sequence>/` evidence,
 numbered `reviews/<sequence>/` and `questions/<sequence>/` invocations,
-`sessions.json`, and captured before/after artifacts. Reviewer outputs remain
+`sessions.json`, per-pass `review-telemetry.json`, and captured before/after
+artifacts. Reviewer outputs remain
 isolated under each invocation's `reviewers/<id>/` directory. Each completed
 review pass also stores `implementing-model-transmission.md`, its structured
 JSON envelope, and additive `delivery.json` receipts recording exactly what the
 implementing model was told and whether the transmission required correction,
 reported a pass, deferred action, or disclosed a review error. Later reviewers
-are directed to read these records before judging a continuation. The envelope
+start with the immediately preceding record and consult older records only when
+the latest correction evidence requires it. The envelope
 contains the gate verdict and the individual reviewer results; no unsent
-aggregate result is persisted. A canceled numbered invocation contains
+aggregate result is persisted. Telemetry records prompt and stream bytes,
+tool-call and tool-result volume, wall time, token usage, compaction events, and
+whether session reuse occurred; it measures behavior without imposing a token
+budget. A canceled numbered invocation contains
 `CANCELED.md` and `canceled.json` rather than reviewer results. The little-coder
 model adapter stores the extracted final review in `raw-output.txt` and the
 capped JSONL stream separately as `raw-stream.jsonl`. When supported by the
 reviewer CLI, user-facing notices include a compact reviewer token summary, for
 example
 `review gate: passed (review tokens (this pass): input 1.2k (uncached 400, cached 800), out 340, total 1.6k)`.
+
+## Crash Recovery for Landing Manifests
+
+When a wave landing is in progress, a recovery manifest is written atomically
+under `<waveRoot>/landing/manifest-<txId>.json` before any filesystem mutations.
+If the process dies mid-landing, the manifest remains in `in_progress` or
+`recovery_required` state with backup artifacts preserved.
+
+### Manifest location
+
+Recovery manifests live in the wave root directory:
+
+```
+<waveRoot>/landing/manifest-<uuid>.json
+```
+
+The wave root is the parent of the private bare Git repository created during
+capture. Each manifest is scoped to a single transaction via a unique UUID.
+
+### Recovery API
+
+The `recoverLandingManifest(manifestPath)` function in
+`src/execution/wave-landing.ts` recovers a crashed landing transaction:
+
+```typescript
+import { recoverLandingManifest } from "../src/execution/wave-landing";
+
+const result = await recoverLandingManifest("/path/to/manifest.json");
+
+// result.status is one of:
+//   "recovered"       — all paths restored, manifest marked rolled_back
+//   "manual_required" — concurrent modifications detected, artifacts preserved
+//   "rejected"        — manifest invalid (wrong version, path escape, identity mismatch)
+//   "terminal"        — manifest already completed or rolled_back; stale artifacts cleaned
+```
+
+### Recovery behavior
+
+- **Source root identity**: Recovery verifies the source root's dev+ino matches
+  the manifest. If the directory was replaced or moved, recovery is rejected.
+- **Path confinement**: All destination, temp, and backup paths must reside
+  within the source root. Path-escaping manifests are rejected.
+- **Concurrent modifications**: If a destination was modified after the
+  transaction installed it, recovery preserves both the newer destination and
+  the original backup, marking the manifest `recovery_required`.
+- **Idempotency**: Running recovery twice on the same manifest is safe. The
+  first call restores paths and marks the manifest `rolled_back`; the second
+call cleans stale temps.
+- **No Git mutation**: Recovery never invokes Git staging, reset, or apply
+  commands. It only manipulates filesystem artifacts.
+- **Artifact preservation on manual_required**: When recovery detects a
+  concurrent modification and returns `manual_required`, ALL artifacts (temps,
+  backups, destinations, directories) are preserved for diagnosis. No cleanup
+  occurs until the user resolves the conflict.
+- **Created directories caveat**: Post-crash recovery never removes
+  `manifest.createdDirs` entries because the manifest is untrusted and there is
+  no durable proof an empty directory was transaction-created. Harmless empty
+  directories may remain after recovery. Live in-process rollback (during
+  `executeWaveLanding`) continues removing its trusted in-memory `createdDirs`.
+
+### Manual recovery steps
+
+When recovery returns `manual_required`:
+
+1. Inspect the manifest to identify which paths have conflicts.
+2. Compare the current destination with the backup (original content).
+3. Decide whether to keep the concurrent modification or restore the original.
+4. Remove backup artifacts (`.pi-backup-*` suffix) once resolved.
+5. Remove temp artifacts (`.pi-landing-tmp-*` prefix) if any remain.
+
+### No automatic startup recovery
+
+This module does not provide automatic crash recovery on startup. Recovery is
+an explicit operation invoked by the caller when a crashed manifest is detected.

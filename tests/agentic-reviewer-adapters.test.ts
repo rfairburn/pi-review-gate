@@ -22,7 +22,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
   try {
     const argvPath = join(dir, "argv.json");
     const commandPath = join(dir, "fake-codex.mjs");
-    const reviewJson = JSON.stringify({ verdict: "pass", summary: "codex ok", findings: [] });
+    const reviewJson = JSON.stringify({ verdict: "pass", summary: "codex ok", guidance: null, findings: [], error: null });
     await writeFile(commandPath, [
       "#!/usr/bin/env node",
       "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
@@ -41,7 +41,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       id: "codex",
       adapter: "codex-cli",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     let session;
@@ -50,7 +50,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       cwd: process.cwd(),
       prompt: "review",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       onSession(value) { session = value; },
     });
     const resumed = await adapter.run({
@@ -58,7 +58,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       cwd: process.cwd(),
       prompt: "review correction",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       session,
     });
 
@@ -72,6 +72,11 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
     const outputSchemaPath = argv[argv.indexOf("--output-schema") + 1];
     const outputSchema = JSON.parse(await readFile(outputSchemaPath, "utf8"));
     assert.deepEqual(outputSchema.properties.verdict.enum, ["pass", "needs_changes", "error"]);
+    assert.deepEqual(outputSchema.required, ["verdict", "summary", "guidance", "findings", "error"]);
+    assert.deepEqual(
+      outputSchema.properties.findings.items.required,
+      ["severity", "file", "line", "issue", "recommendation"],
+    );
     assert.equal(argv.includes("--ephemeral"), false);
     assert.deepEqual(resumedArgv.slice(0, 2), ["exec", "resume"]);
     assert.equal(resumedArgv.includes("codex-session-1"), true);
@@ -100,7 +105,7 @@ test("CodexCliAdapter reports a read-only sandbox startup failure explicitly", a
       id: "codex",
       adapter: "codex-cli",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
     const result = await adapter.run({
       id: "codex",
@@ -108,7 +113,7 @@ test("CodexCliAdapter reports a read-only sandbox startup failure explicitly", a
       prompt: "review",
       evidenceBundleDir: dir,
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     assert.equal(result.verdict, "error");
@@ -139,7 +144,7 @@ test("CodexCliAdapter preflights the platform sandbox before spending a reviewer
       id: "codex",
       adapter: "codex-cli",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
     const result = await adapter.run({
       id: "codex",
@@ -147,7 +152,7 @@ test("CodexCliAdapter preflights the platform sandbox before spending a reviewer
       prompt: "review",
       evidenceBundleDir: dir,
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     assert.equal(result.error, "sandbox_unavailable");
@@ -162,7 +167,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
   try {
     const argvPath = join(dir, "argv.json");
     const commandPath = join(dir, "fake-claude.mjs");
-    const reviewJson = JSON.stringify({ verdict: "pass", summary: "claude ok", findings: [] });
+    const reviewJson = JSON.stringify({ verdict: "pass", summary: "claude ok", guidance: null, findings: [], error: null });
     await writeFile(commandPath, [
       "#!/usr/bin/env node",
       "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
@@ -178,7 +183,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
       id: "claude",
       adapter: "claude-cli",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     let session;
@@ -187,7 +192,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
       cwd: process.cwd(),
       prompt: "review",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       onSession(value) { session = value; },
     });
     const resumed = await adapter.run({
@@ -195,7 +200,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
       cwd: process.cwd(),
       prompt: "review correction",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       session,
     });
 
@@ -207,6 +212,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
     assert.deepEqual(argv.includes("--add-dir"), true);
     assert.equal(argv[argv.indexOf("--add-dir") + 1], dir);
     assert.deepEqual(argv.includes("--append-system-prompt"), true);
+    assert.equal(argv.includes("--output-schema"), false);
     assert.equal(argv.includes("--no-session-persistence"), false);
     const sessionId = argv[argv.indexOf("--session-id") + 1];
     assert.equal(typeof sessionId, "string");

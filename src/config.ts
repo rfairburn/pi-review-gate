@@ -111,6 +111,12 @@ export interface ReviewSelectionConfig {
 export interface ExecutionConfig {
   activeExecutor?: ActiveExecutorSelection;
   externalExecutors?: ExternalExecutorConfig[];
+  maxWorkers?: number;
+  /**
+   * When true, the execute_subtasks parallel tool is active.
+   * Defaults to false (opt-in). execute_subtask activation is unchanged.
+   */
+  parallelEnabled?: boolean;
 }
 
 export interface ReviewGateConfig {
@@ -122,6 +128,8 @@ export interface ReviewGateConfig {
   maxPatchBytes: number;
   maxFileBytes: number;
   maxSnapshotBytes: number;
+  /** Age after which completed, non-recovery wave roots may be garbage-collected. Zero disables GC. */
+  waveArtifactTtlMs?: number;
   retainBundles: RetainBundles;
   decider?: DeciderConfig;
   reviewers?: DeciderConfig[];
@@ -147,6 +155,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   maxPatchBytes: 200_000,
   maxFileBytes: 1_048_576,
   maxSnapshotBytes: 52_428_800,
+  waveArtifactTtlMs: 30 * 24 * 60 * 60 * 1000,
   retainBundles: "on-failure",
 };
 
@@ -184,21 +193,33 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     throw new Error("review gate config must be a JSON object");
   }
 
-  const reviewerTimeoutMs = numberOrDefault(value.reviewerTimeoutMs, DEFAULT_CONFIG.reviewerTimeoutMs);
-  const executorTimeoutMs = numberOrDefault(value.executorTimeoutMs, DEFAULT_CONFIG.executorTimeoutMs);
+  const reviewerTimeoutMs = positiveIntegerOrDefault(value.reviewerTimeoutMs, DEFAULT_CONFIG.reviewerTimeoutMs, "reviewerTimeoutMs");
+  const executorTimeoutMs = positiveIntegerOrDefault(value.executorTimeoutMs, DEFAULT_CONFIG.executorTimeoutMs, "executorTimeoutMs");
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new Error("enabled must be a boolean");
+  }
+  if (value.reviewers !== undefined && !Array.isArray(value.reviewers)) {
+    throw new Error("reviewers must be an array");
+  }
   const config: ReviewGateConfig = {
     ...DEFAULT_CONFIG,
-    enabled: value.enabled === undefined ? DEFAULT_CONFIG.enabled : Boolean(value.enabled),
+    enabled: value.enabled ?? DEFAULT_CONFIG.enabled,
     reviewerTimeoutMs,
     executorTimeoutMs,
-    maxCorrectionCycles: nonNegativeIntegerOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles),
+    maxCorrectionCycles: nonNegativeIntegerOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles, "maxCorrectionCycles"),
     implementationGuidanceAfterCorrectionAttempts: nonNegativeIntegerOrDefault(
       value.implementationGuidanceAfterCorrectionAttempts,
       DEFAULT_CONFIG.implementationGuidanceAfterCorrectionAttempts,
+      "implementationGuidanceAfterCorrectionAttempts",
     ),
-    maxPatchBytes: numberOrDefault(value.maxPatchBytes, DEFAULT_CONFIG.maxPatchBytes),
-    maxFileBytes: numberOrDefault(value.maxFileBytes, DEFAULT_CONFIG.maxFileBytes),
-    maxSnapshotBytes: numberOrDefault(value.maxSnapshotBytes, DEFAULT_CONFIG.maxSnapshotBytes),
+    maxPatchBytes: nonNegativeIntegerOrDefault(value.maxPatchBytes, DEFAULT_CONFIG.maxPatchBytes, "maxPatchBytes"),
+    maxFileBytes: nonNegativeIntegerOrDefault(value.maxFileBytes, DEFAULT_CONFIG.maxFileBytes, "maxFileBytes"),
+    maxSnapshotBytes: nonNegativeIntegerOrDefault(value.maxSnapshotBytes, DEFAULT_CONFIG.maxSnapshotBytes, "maxSnapshotBytes"),
+    waveArtifactTtlMs: nonNegativeIntegerOrDefault(
+      value.waveArtifactTtlMs,
+      DEFAULT_CONFIG.waveArtifactTtlMs ?? 0,
+      "waveArtifactTtlMs",
+    ),
     retainBundles: normalizeRetainBundles(value.retainBundles),
     decider: value.decider === undefined ? undefined : normalizeDecider(value.decider, reviewerTimeoutMs),
     reviewers: Array.isArray(value.reviewers) ? value.reviewers.map((reviewer) => normalizeDecider(reviewer, reviewerTimeoutMs)) : undefined,
@@ -356,9 +377,9 @@ function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TI
       id: value.id,
       adapter: "generic-cli",
       command: value.command,
-      args: Array.isArray(value.args) ? value.args.map(String) : [],
+      args: normalizeStringArray(value.args, "generic-cli reviewer args"),
       ...(env ? { env } : {}),
-      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
+      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "generic-cli reviewer timeoutMs"),
     };
   }
   if (value.adapter === "codex-cli") {
@@ -366,11 +387,11 @@ function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TI
     return {
       id: value.id,
       adapter: "codex-cli",
-      command: typeof value.command === "string" ? value.command : "codex",
-      args: Array.isArray(value.args) ? value.args.map(String) : [],
+      command: normalizeOptionalNonEmptyString(value.command, "codex reviewer command") ?? "codex",
+      args: normalizeStringArray(value.args, "codex reviewer args"),
       ...(env ? { env } : {}),
-      model: typeof value.model === "string" ? value.model : undefined,
-      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
+      model: normalizeOptionalNonEmptyString(value.model, "codex reviewer model"),
+      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "codex reviewer timeoutMs"),
     };
   }
   if (value.adapter === "claude-cli") {
@@ -378,11 +399,11 @@ function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TI
     return {
       id: value.id,
       adapter: "claude-cli",
-      command: typeof value.command === "string" ? value.command : "claude",
-      args: Array.isArray(value.args) ? value.args.map(String) : [],
+      command: normalizeOptionalNonEmptyString(value.command, "claude reviewer command") ?? "claude",
+      args: normalizeStringArray(value.args, "claude reviewer args"),
       ...(env ? { env } : {}),
-      model: typeof value.model === "string" ? value.model : undefined,
-      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
+      model: normalizeOptionalNonEmptyString(value.model, "claude reviewer model"),
+      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "claude reviewer timeoutMs"),
     };
   }
   if (value.adapter === "little-coder-model") {
@@ -396,10 +417,10 @@ function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TI
       adapter: "little-coder-model",
       model: value.model,
       ...(thinkingLevel ? { thinkingLevel } : {}),
-      command: typeof value.command === "string" ? value.command : "little-coder",
-      args: Array.isArray(value.args) ? value.args.map(String) : [],
+      command: normalizeOptionalNonEmptyString(value.command, "little-coder reviewer command") ?? "little-coder",
+      args: normalizeStringArray(value.args, "little-coder reviewer args"),
       ...(env ? { env } : {}),
-      timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
+      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "little-coder reviewer timeoutMs"),
     };
   }
   throw new Error("unsupported decider adapter");
@@ -463,13 +484,13 @@ function normalizeExternalAgent(value: unknown): ExternalAgentConfig {
     throw new Error("external agent requires id");
   }
   validateConfiguredId(value.id, "external agent");
-  if (!["codex-cli", "claude-cli", "generic-cli", "run-as-binary"].includes(String(value.adapter))) {
+  if (typeof value.adapter !== "string" || !["codex-cli", "claude-cli", "generic-cli", "run-as-binary"].includes(value.adapter)) {
     throw new Error("unsupported external agent adapter");
   }
   const adapter = value.adapter as ExternalAgentAdapter;
-  const command = typeof value.command === "string" && value.command.trim()
-    ? value.command
-    : adapter === "codex-cli" ? "codex" : adapter === "claude-cli" ? "claude" : undefined;
+  const configuredCommand = normalizeOptionalNonEmptyString(value.command, "external agent command");
+  const command = configuredCommand
+    ?? (adapter === "codex-cli" ? "codex" : adapter === "claude-cli" ? "claude" : undefined);
   if (!command) {
     throw new Error(`${adapter} external agent requires command`);
   }
@@ -493,9 +514,9 @@ function normalizeExternalAgent(value: unknown): ExternalAgentConfig {
     id: value.id,
     adapter,
     command,
-    args: Array.isArray(value.args) ? value.args.map(String) : [],
+    args: normalizeStringArray(value.args, "external agent args"),
     env: normalizeStringRecord(value.env, "external agent env"),
-    model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
+    model: normalizeOptionalNonEmptyString(value.model, "external agent model"),
     review,
     execution,
   };
@@ -513,13 +534,14 @@ function normalizeExternalAgentRole(value: unknown, role: "review" | "execution"
     throw new Error(`unsupported external agent ${role} protocol`);
   }
   return {
-    args: Array.isArray(value.args) ? value.args.map(String) : [],
+    args: normalizeStringArray(value.args, `external agent ${role} args`),
     env: normalizeStringRecord(value.env, `external agent ${role} env`),
-    model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
+    model: normalizeOptionalNonEmptyString(value.model, `external agent ${role} model`),
     ...(value.timeoutMs === undefined ? {} : {
-      timeoutMs: nonNegativeIntegerOrDefault(
+      timeoutMs: positiveIntegerOrDefault(
         value.timeoutMs,
         role === "review" ? DEFAULT_REVIEWER_TIMEOUT_MS : DEFAULT_CONFIG.executorTimeoutMs,
+        `external agent ${role} timeoutMs`,
       ),
     }),
     protocol,
@@ -536,7 +558,22 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
   const externalExecutors = value.externalExecutors === undefined
     ? undefined
     : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
-  return { activeExecutor, externalExecutors };
+  const maxWorkers = normalizeMaxWorkers(value.maxWorkers);
+  const parallelEnabled = normalizeParallelEnabled(value.parallelEnabled);
+  return {
+    activeExecutor,
+    externalExecutors,
+    ...(maxWorkers !== undefined ? { maxWorkers } : {}),
+    ...(parallelEnabled !== undefined ? { parallelEnabled } : {}),
+  };
+}
+
+function normalizeParallelEnabled(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error("execution.parallelEnabled must be a boolean");
+  }
+  return value;
 }
 
 function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
@@ -586,24 +623,24 @@ function normalizeExternalExecutor(value: unknown, defaultTimeoutMs: number): Ex
   validateConfiguredId(value.id, "external executor");
   const common = {
     id: value.id,
-    args: Array.isArray(value.args) ? value.args.map(String) : [],
+    args: normalizeStringArray(value.args, "external executor args"),
     env: normalizeStringRecord(value.env, "external executor env"),
-    timeoutMs: numberOrDefault(value.timeoutMs, defaultTimeoutMs),
+    timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "external executor timeoutMs"),
   };
   if (value.adapter === "codex-cli") {
     return {
       ...common,
       adapter: "codex-cli",
-      command: typeof value.command === "string" && value.command.trim() ? value.command : "codex",
-      model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
+      command: normalizeOptionalNonEmptyString(value.command, "codex executor command") ?? "codex",
+      model: normalizeOptionalNonEmptyString(value.model, "codex executor model"),
     };
   }
   if (value.adapter === "claude-cli") {
     return {
       ...common,
       adapter: "claude-cli",
-      command: typeof value.command === "string" && value.command.trim() ? value.command : "claude",
-      model: typeof value.model === "string" && value.model.trim() ? value.model : undefined,
+      command: normalizeOptionalNonEmptyString(value.command, "claude executor command") ?? "claude",
+      model: normalizeOptionalNonEmptyString(value.model, "claude executor model"),
     };
   }
   if (value.adapter === "run-as-binary") {
@@ -807,6 +844,22 @@ function normalizeStringRecord(value: unknown, field: string): Record<string, st
   }));
 }
 
+function normalizeStringArray(value: unknown, field: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`${field} must be an array of strings`);
+  }
+  return [...value];
+}
+
+function normalizeOptionalNonEmptyString(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
 function validateConfiguredId(id: string, label: string): void {
   if (!REVIEWER_ID_PATTERN.test(id) || id === "." || id === "..") {
     throw new Error(`${label} id may contain only letters, numbers, underscores, periods, and hyphens`);
@@ -832,7 +885,9 @@ function cloneDecider(decider: DeciderConfig): DeciderConfig {
 }
 
 function normalizeRetainBundles(value: unknown): RetainBundles {
-  return value === "never" || value === "always" || value === "on-failure" ? value : DEFAULT_CONFIG.retainBundles;
+  if (value === undefined) return DEFAULT_CONFIG.retainBundles;
+  if (value === "never" || value === "always" || value === "on-failure") return value;
+  throw new Error("retainBundles must be one of: never, on-failure, always");
 }
 
 function normalizeOptionalThinkingLevel(value: unknown, field: string): ThinkingLevel | undefined {
@@ -853,12 +908,31 @@ function validateUniqueReviewerIds(reviewers: DeciderConfig[]): void {
   }
 }
 
-function numberOrDefault(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+function positiveIntegerOrDefault(value: unknown, fallback: number, field: string): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${field} must be a positive safe integer`);
+  }
+  return value;
 }
 
-function nonNegativeIntegerOrDefault(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : fallback;
+function nonNegativeIntegerOrDefault(value: unknown, fallback: number, field: string): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function normalizeMaxWorkers(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new Error("execution.maxWorkers must be an integer");
+  }
+  if (value < 1 || value > 4) {
+    throw new Error("execution.maxWorkers must be between 1 and 4");
+  }
+  return value;
 }
 
 function isTruthy(value: string | undefined): boolean {

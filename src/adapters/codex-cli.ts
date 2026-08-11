@@ -1,10 +1,12 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { CodexCliDeciderConfig } from "../config";
 import { parseReviewResult, REVIEW_OUTPUT_JSON_SCHEMA, type ReviewResult } from "../schema";
-import { extractCodexReviewFromJsonl } from "../usage";
+import { CodexJsonlReviewExtractor, extractCodexReviewFromJsonl } from "../usage";
 import {
   processFailureResult,
+  processTelemetry,
+  MAX_RETAINED_OUTPUT_BYTES,
   reviewerArtifactPaths,
   reviewerEnv,
   reviewerErrorResult,
@@ -12,6 +14,7 @@ import {
   writeReviewerProcessArtifacts,
 } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
+import { readBoundedTextFile } from "../bounded-file";
 
 export class CodexCliAdapter implements ModelAdapter {
   readonly kind = "codex-cli";
@@ -36,13 +39,16 @@ export class CodexCliAdapter implements ModelAdapter {
       });
       if (codexSandboxFailed(preflight.stderr)) {
         await writeReviewerProcessArtifacts({ paths: artifacts, output: preflight });
-        return reviewerErrorResult(
+        return {
+          ...reviewerErrorResult(
           req.id,
           "Codex reviewer could not inspect the evidence because its read-only filesystem sandbox failed to start.",
           artifacts.rawOutput,
           "sandbox_unavailable",
           undefined,
-        );
+          ),
+          telemetry: processTelemetry(preflight),
+        };
       }
     }
     const args = req.session
@@ -73,6 +79,7 @@ export class CodexCliAdapter implements ModelAdapter {
         "-",
       ];
 
+    const streamExtractor = new CodexJsonlReviewExtractor();
     const output = await runPromptProcess({
       command,
       args,
@@ -81,8 +88,12 @@ export class CodexCliAdapter implements ModelAdapter {
       timeoutMs: req.timeoutMs,
       env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
       signal: req.signal,
+      onStdoutChunk: (chunk) => streamExtractor.push(chunk),
     });
-    const extracted = extractCodexReviewFromJsonl(output.stdout);
+    const streamed = streamExtractor.finish();
+    const extracted = streamed.text || streamed.sessionId || streamed.usage
+      ? streamed
+      : extractCodexReviewFromJsonl(output.stdout);
     const usage = extracted.usage;
     const sessionId = extracted.sessionId ?? req.session?.id;
     if (sessionId) {
@@ -98,18 +109,29 @@ export class CodexCliAdapter implements ModelAdapter {
     });
     if (failure) return failure;
 
-    const finalTextFromFile = await readFile(finalPath, "utf8").catch(() => "");
-    const finalText = finalTextFromFile.trim() ? finalTextFromFile : extracted.text || output.stdout;
+    const finalFile = await readBoundedTextFile(finalPath, MAX_RETAINED_OUTPUT_BYTES)
+      .catch(() => ({ text: "", truncated: false }));
+    if (finalFile.truncated) {
+      return {
+        ...reviewerErrorResult(req.id, "Codex reviewer final output exceeded the 100 MiB limit.", artifacts.rawOutput, "output_truncated", usage),
+        telemetry: processTelemetry(output),
+      };
+    }
+    const finalText = finalFile.text.trim() ? finalFile.text : extracted.text || output.stdout;
     const result = parseReviewResult(req.id, finalText, artifacts.rawOutput);
     result.usage = usage;
+    result.telemetry = processTelemetry(output);
     if (result.verdict === "error" && codexSandboxFailed(output.stderr)) {
-      return reviewerErrorResult(
+      return {
+        ...reviewerErrorResult(
         req.id,
         "Codex reviewer could not inspect the evidence because its read-only filesystem sandbox failed to start.",
         artifacts.rawOutput,
         "sandbox_unavailable",
         usage,
-      );
+        ),
+        telemetry: processTelemetry(output),
+      };
     }
     return result;
   }

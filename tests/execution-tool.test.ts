@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
-import { ExecutionToolManager } from "../src/execution/tool";
+import { ExecutionToolManager, renderSubtaskPacketForModel } from "../src/execution/tool";
 import { createState } from "../src/state";
 
 test("execute_subtask is registered only while a configured executor is active", () => {
@@ -44,8 +44,10 @@ test("execute_subtask is registered only while a configured executor is active",
 
   config.execution!.activeExecutor = { source: "external", id: "fake" };
   manager.sync();
-  assert.equal(registered.length, 1);
+  assert.equal(registered.length, 2);
   assert.equal(registered[0].name, "execute_subtask");
+  assert.equal(registered[1].name, "execute_subtasks");
+  // execute_subtasks is inactive by default (requires parallelEnabled=true)
   assert.deepEqual(activeTools, ["read", "execute_subtask"]);
 
   const theme = {
@@ -114,8 +116,45 @@ test("execute_subtask is registered only while a configured executor is active",
 
   config.execution!.activeExecutor = null;
   manager.sync();
-  assert.equal(registered.length, 1);
+  assert.equal(registered.length, 2);
   assert.deepEqual(activeTools, ["read"]);
+});
+
+test("orchestrator-facing subtask text includes mixed reviewer evidence", () => {
+  const text = renderSubtaskPacketForModel({
+    kind: "accepted_with_warnings",
+    summary: "Implementation completed.",
+    reviewStatus: "accepted_with_warnings",
+    reviewReport: {
+      aggregate: "pass_with_warnings",
+      summary: "1 pass, 1 error",
+      reviewCycles: 2,
+      latestReviewSequence: 2,
+      artifactDir: "/tmp/review-evidence",
+      history: [],
+      reviewers: [{
+        reviewerId: "deepseek",
+        displayLabel: "deepseek (high)",
+        verdict: "pass",
+        summary: "Logic and acceptance criteria pass.",
+        findings: [],
+      }, {
+        reviewerId: "luna",
+        displayLabel: "luna (max)",
+        verdict: "error",
+        summary: "Reviewer exited with status 1.",
+        findings: [],
+        error: "exit_1",
+        errorCategory: "process_exit",
+      }],
+    },
+  });
+
+  assert.match(text, /Subtask outcome: accepted_with_warnings/);
+  assert.match(text, /Review aggregate: pass_with_warnings \(1 pass, 1 error\)/);
+  assert.match(text, /deepseek \(high\): pass — Logic and acceptance criteria pass/);
+  assert.match(text, /luna \(max\): error — Reviewer exited with status 1/);
+  assert.match(text, /Infrastructure warning \(process_exit\): exit_1/);
 });
 
 function testVisibleWidth(value: string): number {

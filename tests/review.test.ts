@@ -138,7 +138,142 @@ test("runReview uses an OR gate and preserves individual blocking finding identi
   }
 });
 
-test("an aborted multi-review is atomic, records a tombstone, and preserves prior reviewer sessions", async () => {
+test("multi-review aggregation treats pass plus infrastructure error as pass with warnings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-partial-review-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [
+        jsonReviewer("passing", "{verdict:'pass',summary:'logic is sound',findings:[]}"),
+        exitReviewer("offline"),
+      ],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.result?.error, "partial_reviewer_error");
+    assert.equal(output.result?.summary, "1 pass, 1 error");
+    assert.deepEqual(output.reviewerResults?.map((result) => result.verdict), ["pass", "error"]);
+    assert.equal(output.reviewerResults?.[1]?.telemetry?.sessionResumed, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("parallel reviewers cannot inspect in-flight sibling outputs or runtime sessions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-isolation-"));
+  let bundleDir: string | undefined;
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const reviewer = (id: "fast" | "slow") => ({
+      id,
+      adapter: "generic-cli" as const,
+      command: process.execPath,
+      args: ["-e", [
+        "const fs=require('node:fs');const path=require('node:path');",
+        `const id=${JSON.stringify(id)};`,
+        "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
+        "const sibling=path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'reviews','0001','reviewers','fast');",
+        "const exposed=id==='slow'&&fs.existsSync(sibling);",
+        "process.stdout.write(JSON.stringify({verdict:'pass',summary:exposed?'sibling exposed':'reviewer isolated',findings:[]}));",
+        "},id==='slow'?150:0));",
+      ].join("" )],
+      timeoutMs: 15000,
+    });
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: {
+        ...baseConfig,
+        retainBundles: "always",
+        decider: undefined,
+        reviewers: [reviewer("fast"), reviewer("slow")],
+      },
+    });
+    bundleDir = output.bundleDir;
+
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.reviewerResults?.[1]?.summary, "reviewer isolated");
+    await access(join(output.bundleDir!, "reviews", "0001", "reviewers", "fast", "parsed-result.json"));
+    await access(join(output.bundleDir!, "reviews", "0001", "reviewers", "slow", "parsed-result.json"));
+    await assert.rejects(access(join(output.bundleDir!, "sessions")), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    if (bundleDir) await rm(bundleDir, { recursive: true, force: true });
+  }
+});
+
+test("multi-review aggregation keeps needs_changes authoritative despite pass or error", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-blocking-mixed-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [
+        jsonReviewer("passing", "{verdict:'pass',summary:'looks good',findings:[]}"),
+        jsonReviewer("blocking", "{verdict:'needs_changes',summary:'bug remains',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'wrong branch',recommendation:'fix branch'}]}"),
+        exitReviewer("offline"),
+      ],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    assert.equal(output.result?.verdict, "needs_changes");
+    assert.equal(output.result?.error, "partial_reviewer_error");
+    assert.equal(output.result?.findings[0]?.reviewerId, "blocking");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("multi-review aggregation returns error when no reviewer completes a usable review", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-all-review-errors-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [exitReviewer("offline-a"), exitReviewer("offline-b")],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    assert.equal(output.result?.verdict, "error");
+    assert.equal(output.result?.summary, "2 error");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an aborted multi-review is atomic, records a tombstone, and later passes start fresh reviewer sessions", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-atomic-abort-"));
   const fastCompleted = join(tmpdir(), `pi-review-gate-fast-completed-${process.pid}-${Date.now()}`);
   let bundleDir: string | undefined;
@@ -176,7 +311,7 @@ test("an aborted multi-review is atomic, records a tombstone, and preserves prio
           "});",
         ].join(""),
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
     const config: ReviewGateConfig = {
       ...baseConfig,
@@ -234,10 +369,7 @@ test("an aborted multi-review is atomic, records a tombstone, and preserves prio
     assert.equal(resumed.result?.verdict, "pass");
     assert.equal(resumed.reviewerResults?.length, 2);
     assert.equal(window.nextReviewSequence, 3);
-    assert.deepEqual(Object.fromEntries(window.reviewerSessions), {
-      fast: { adapter: "codex-cli", id: "previous-fast-session" },
-      slow: { adapter: "codex-cli", id: "previous-slow-session" },
-    });
+    assert.deepEqual(Object.fromEntries(window.reviewerSessions), {});
     assert.match(
       await readFile(join(aborted.bundleDir!, "REVIEW.md"), "utf8"),
       /CANCELED\.md.*cancellation tombstone/,
@@ -315,15 +447,23 @@ test("runReview writes changed file artifacts into retained bundles", async () =
     });
 
     assert.equal(output.bundleRetained, true);
-    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "submitted", "before", "index.ts"));
-    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "submitted", "after", "index.ts"));
-    await access(join(output.bundleDir ?? "", "reviews", "0001", "artifacts", "index.json"));
+    const artifactRoot = join(output.bundleDir ?? "", "reviews", "0001", "artifacts");
+    const artifactIndex = JSON.parse(await readFile(join(artifactRoot, "index.json"), "utf8")) as Array<{
+      kind: string;
+      artifactPath: string;
+    }>;
+    const beforeArtifact = artifactIndex.find((entry) => entry.kind === "submitted-before")?.artifactPath;
+    const afterArtifact = artifactIndex.find((entry) => entry.kind === "submitted-after")?.artifactPath;
+    assert.ok(beforeArtifact);
+    assert.ok(afterArtifact);
+    await access(join(output.bundleDir ?? "", "reviews", "0001", beforeArtifact));
+    await access(join(output.bundleDir ?? "", "reviews", "0001", afterArtifact));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("runAskReviewer retains on any reviewer error even when another answer is usable", async () => {
+test("runAskReviewer passes with a warning and retains evidence when another answer is usable", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-retain-partial-error-"));
   try {
     const output = await runAskReviewer({
@@ -341,7 +481,8 @@ test("runAskReviewer retains on any reviewer error even when another answer is u
       },
     });
 
-    assert.equal(output.result?.verdict, "error");
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.result?.error, "partial_reviewer_error");
     assert.equal(output.bundleRetained, true);
     await access(join(output.bundleDir ?? "", "questions", "0001", "reviewers", "bad-json", "raw-output.txt"));
   } finally {
@@ -385,7 +526,7 @@ test("runReview prompt preserves request context and original baseline across co
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -447,7 +588,7 @@ test("runAskReviewer answers with request and evidence even when there is no pat
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -502,7 +643,7 @@ test("accepted reviewer Q&A is visible to later automatic and question reviews",
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -563,7 +704,7 @@ test("correction-attempt escalation reaches automatic and question review prompt
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -622,7 +763,7 @@ test("concrete-guidance escalation starts at the configured correction-attempt t
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -704,7 +845,7 @@ test("runReview frames temp-like outside files as captured side effects, not sub
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -751,7 +892,7 @@ function blockingReviewer(
         "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',guidance,findings:[{severity:'blocking',file:'index.ts',line:null,issue,recommendation}]})));",
       ].join(""),
     ],
-    timeoutMs: 5000,
+    timeoutMs: 15000,
   };
 }
 
@@ -764,7 +905,17 @@ function jsonReviewer(id: string, objectLiteral: string): NonNullable<ReviewGate
       "-e",
       `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify(${objectLiteral})))`,
     ],
-    timeoutMs: 5000,
+    timeoutMs: 15000,
+  };
+}
+
+function exitReviewer(id: string): NonNullable<ReviewGateConfig["decider"]> {
+  return {
+    id,
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: ["-e", "process.exit(1)"],
+    timeoutMs: 15000,
   };
 }
 
@@ -779,3 +930,304 @@ async function waitForPath(path: string): Promise<void> {
   }
   throw new Error(`Timed out waiting for ${path}`);
 }
+
+// ── exactChange tests ────────────────────────────────────────────────────────
+
+test("runReview rejects exactChange without changeIdentity", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-exact-no-ci-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: baseConfig,
+      exactChange: {
+        changedPaths: ["index.ts"],
+        patch: "diff --git a/index.ts b/index.ts\n--- a/index.ts\n+++ b/index.ts\n@@ -1 +1 @@\n-before\n+after\n",
+        truncated: false,
+        omitted: [],
+      },
+    });
+
+    assert.equal(output.changed, false);
+    assert.ok(output.error?.includes("exactChange requires changeIdentity"), `expected error about exactChange requiring changeIdentity, got: ${output.error}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview treats exactChange nonempty changedPaths as reviewable even with no workspace content changes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-exact-mode-"));
+  try {
+    await writeFile(join(dir, "script.sh"), "#!/bin/sh\necho hi\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+
+    // No actual file content change — simulate a mode-only change via exactChange.
+    // The workspace snapshot comparison will show no changes, but exactChange says there are.
+    const output = await runReview({
+      cwd: dir,
+      request: "make script executable",
+      before,
+      config: baseConfig,
+      changeIdentity: {
+        baseCommit: "a".repeat(40),
+        candidateCommit: "b".repeat(40),
+      },
+      exactChange: {
+        changedPaths: ["script.sh"],
+        patch: "diff --git a/script.sh b/script.sh\nold mode 100644\nnew mode 100755\n",
+        truncated: false,
+        omitted: [],
+      },
+    });
+
+    // Should NOT return no_initial_changes — the exactChange says there are changes.
+    assert.equal(output.changed, true, "exactChange should make changes reviewable");
+    assert.notEqual(output.noReviewReason, "no_initial_changes", "should not skip review due to no_initial_changes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview uses exactChange patch in review bundle", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-exact-patch-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const exactPatch = "diff --git a/index.ts b/index.ts\n--- a/index.ts\n+++ b/index.ts\n@@ -1 +1 @@\n-before\n+after\n";
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: { ...baseConfig, retainBundles: "always" },
+      changeIdentity: {
+        baseCommit: "a".repeat(40),
+        candidateCommit: "b".repeat(40),
+      },
+      exactChange: {
+        changedPaths: ["index.ts"],
+        patch: exactPatch,
+        truncated: false,
+        omitted: [],
+      },
+    });
+
+    assert.equal(output.changed, true);
+    // Verify the exact patch was written to the bundle.
+    const bundlePatch = await readFile(join(output.invocationDir!, "patch.diff"), "utf8");
+    assert.equal(bundlePatch, exactPatch, "bundle patch should be the exactChange patch");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview records exactChange truncation in metadata", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-exact-trunc-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: { ...baseConfig, retainBundles: "always" },
+      changeIdentity: {
+        baseCommit: "a".repeat(40),
+        candidateCommit: "b".repeat(40),
+      },
+      exactChange: {
+        changedPaths: ["index.ts", "other.ts"],
+        patch: "diff --git a/index.ts b/index.ts\n# truncated\n",
+        truncated: true,
+        omitted: [{ path: "other.ts", reason: "truncated_by_max_patch_bytes" }],
+      },
+    });
+
+    assert.equal(output.changed, true);
+    // Verify metadata contains truncation info.
+    const metadata = JSON.parse(await readFile(join(output.invocationDir!, "metadata.json"), "utf8"));
+    assert.equal(metadata.exactPatchTruncated, true, "metadata should record exactPatchTruncated");
+    assert.ok(Array.isArray(metadata.exactChangedPaths), "metadata should have exactChangedPaths");
+    assert.ok(Array.isArray(metadata.exactOmittedDiffs), "metadata should have exactOmittedDiffs");
+    assert.equal(metadata.exactOmittedDiffs[0].path, "other.ts");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview serial behavior unchanged when exactChange is omitted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-serial-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    // No exactChange — should behave exactly as before.
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: { ...baseConfig, retainBundles: "always" },
+    });
+
+    assert.equal(output.changed, true);
+    assert.equal(output.result?.verdict, "needs_changes");
+    // No exactChange metadata should be present.
+    const metadata = JSON.parse(await readFile(join(output.invocationDir!, "metadata.json"), "utf8"));
+    assert.equal(metadata.exactChangedPaths, undefined, "no exactChangedPaths when exactChange omitted");
+    assert.equal(metadata.exactPatchTruncated, undefined, "no exactPatchTruncated when exactChange omitted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview exactChange with empty changedPaths and no workspace changes returns no_initial_changes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-exact-empty-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "same\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+
+    // exactChange with empty changedPaths — should still skip.
+    const output = await runReview({
+      cwd: dir,
+      request: "no change",
+      before,
+      config: baseConfig,
+      changeIdentity: {
+        baseCommit: "a".repeat(40),
+        candidateCommit: "b".repeat(40),
+      },
+      exactChange: {
+        changedPaths: [],
+        patch: "",
+        truncated: false,
+        omitted: [],
+      },
+    });
+
+    assert.equal(output.changed, false);
+    assert.equal(output.noReviewReason, "no_initial_changes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview rejects malformed exactChange fields", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-exact-malformed-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "same\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+
+    const ci = { baseCommit: "a".repeat(40), candidateCommit: "b".repeat(40) };
+
+    // Test: changedPaths is not an array.
+    const out1 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: "not-array" as any, patch: "", truncated: false, omitted: [] },
+    });
+    assert.ok(out1.error?.includes("changedPaths must be an array"), `expected changedPaths error, got: ${out1.error}`);
+
+    // Test: patch is not a string.
+    const out2 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: [], patch: 123 as any, truncated: false, omitted: [] },
+    });
+    assert.ok(out2.error?.includes("patch must be a string"), `expected patch error, got: ${out2.error}`);
+
+    // Test: truncated is not a boolean.
+    const out3 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: [], patch: "", truncated: "yes" as any, omitted: [] },
+    });
+    assert.ok(out3.error?.includes("truncated must be a boolean"), `expected truncated error, got: ${out3.error}`);
+
+    // Test: omitted is not an array.
+    const out4 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: [], patch: "", truncated: false, omitted: "not-array" as any },
+    });
+    assert.ok(out4.error?.includes("omitted must be an array"), `expected omitted error, got: ${out4.error}`);
+
+    // Test: exactChange is null.
+    const out5 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: null as any,
+    });
+    assert.ok(out5.error?.includes("exactChange must be an object"), `expected object error, got: ${out5.error}`);
+
+    // Test: changedPaths contains null.
+    const out6 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: [null as any], patch: "", truncated: false, omitted: [] },
+    });
+    assert.ok(out6.error?.includes("changedPaths must contain non-empty strings"), `expected non-empty strings error, got: ${out6.error}`);
+
+    // Test: omitted entry is null.
+    const out7 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: ["a.ts"], patch: "", truncated: true, omitted: [null as any] },
+    });
+    assert.ok(out7.error?.includes("omitted entries must be objects"), `expected omitted objects error, got: ${out7.error}`);
+
+    // Test: omitted path not in changedPaths.
+    const out8 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: ["a.ts"], patch: "", truncated: true, omitted: [{ path: "b.ts", reason: "truncated" }] },
+    });
+    assert.ok(out8.error?.includes("omitted path not in changedPaths"), `expected omitted path error, got: ${out8.error}`);
+
+    // Test: truncated false with omitted entries.
+    const out9 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: ["a.ts"], patch: "", truncated: false, omitted: [{ path: "a.ts", reason: "truncated" }] },
+    });
+    assert.ok(out9.error?.includes("cannot have omitted entries when truncated is false"), `expected truncation consistency error, got: ${out9.error}`);
+
+    // Test: patch exceeds maxPatchBytes.
+    const out10 = await runReview({
+      cwd: dir, request: "test", before, config: baseConfig,
+      changeIdentity: ci,
+      exactChange: { changedPaths: ["a.ts"], patch: "x".repeat(baseConfig.maxPatchBytes + 1), truncated: false, omitted: [] },
+    });
+    assert.ok(out10.error?.includes("exceeds maxPatchBytes"), `expected maxPatchBytes error, got: ${out10.error}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

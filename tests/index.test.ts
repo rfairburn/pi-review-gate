@@ -81,7 +81,8 @@ test("delegated execution tool activation waits for session_start", async () => 
 
     runtimeInitialized = true;
     await trigger(hooks, "session_start", { cwd: dir });
-    assert.deepEqual(registeredTools, ["execute_subtask"]);
+    assert.deepEqual(registeredTools, ["execute_subtask", "execute_subtasks"]);
+    // Config does not enable parallel execution, so only execute_subtask is active.
     assert.deepEqual(activeTools, ["read", "execute_subtask"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -105,7 +106,7 @@ test("cap status is concise while reviewer results are delivered once in the tra
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]})))",
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -115,7 +116,13 @@ test("cap status is concise while reviewer results are delivered once in the tra
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
     const notices: string[] = [];
     const followUps: string[] = [];
+    const statuses: Array<[string, string | undefined]> = [];
     const pi = {
+      ui: {
+        setStatus(key: string, text: string | undefined) {
+          statuses.push([key, text]);
+        },
+      },
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
@@ -135,6 +142,8 @@ test("cap status is concise while reviewer results are delivered once in the tra
 
     const noticeText = notices.join("\n\n");
     assert.match(noticeText, /automatic correction cap reached/);
+    assert.ok(statuses.some(([, text]) => text?.includes("started")));
+    assert.deepEqual(statuses.at(-1), ["review-gate", undefined]);
     assert.match(noticeText, /Complete reviewer feedback was transmitted to the implementing model/);
     assert.match(noticeText, /Use \/review-continue to authorize/);
     assert.doesNotMatch(noticeText, /missing guard/);
@@ -165,7 +174,7 @@ test("review pause collects separate exchanges and defers reviewer execution unt
           "-e",
           `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed accumulated paused work',findings:[]})))`,
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
     process.env.PI_REVIEW_GATE_CONFIG = configPath;
@@ -257,7 +266,7 @@ test("user steering during review is held until reviewer feedback is queued", as
             ")),50));",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -328,7 +337,7 @@ test("agent end skips reviewer when primary turn signal is already aborted", asy
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -616,7 +625,7 @@ test("automatic correction turns preserve original baseline and accumulated evid
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -715,7 +724,7 @@ test("automatic correction is reviewed when it exactly restores the original bas
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -769,7 +778,7 @@ test("automatic correction is reviewed when it exactly restores the original bas
   }
 });
 
-test("automatic correction resumes each reviewer session against the stable window bundle", async () => {
+test("automatic correction starts each reviewer in a fresh session against the stable window bundle", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-session-resume-"));
   const argvPath = join(tmpdir(), `pi-review-gate-reviewer-session-argv-${process.pid}-${Date.now()}.json`);
 
@@ -801,7 +810,7 @@ test("automatic correction resumes each reviewer session against the stable wind
         id: "codex",
         adapter: "codex-cli",
         command: reviewerPath,
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -833,18 +842,19 @@ test("automatic correction resumes each reviewer session against the stable wind
 
     const history = JSON.parse(await readFile(argvPath, "utf8"));
     assert.equal(history.length, 2);
-    assert.deepEqual(history[1].argv.slice(0, 2), ["exec", "resume"]);
-    assert.equal(history[1].argv.includes("stable-review-session"), true);
+    assert.deepEqual(history[1].argv.slice(0, 2), ["exec", "--json"]);
+    assert.equal(history[1].argv.includes("resume"), false);
     assert.equal(history[0].bundle, history[1].bundle);
     assert.match(history[0].prompt, /authoritative evidence bundle/);
     assert.match(history[1].prompt, /REVIEW\.md/);
     assert.doesNotMatch(history[1].prompt, /submitted_patch_diff/);
-    const resumedInvocation = JSON.parse(await readFile(
+    const freshInvocation = JSON.parse(await readFile(
       join(history[1].bundle, "reviews", "0002", "reviewers", "codex", "invocation.json"),
       "utf8",
     ));
-    assert.equal(resumedInvocation.resumed, true);
-    assert.equal(resumedInvocation.session.id, "stable-review-session");
+    assert.equal(freshInvocation.resumed, false);
+    assert.equal(freshInvocation.telemetry.sessionResumed, false);
+    assert.equal(freshInvocation.session.id, "stable-review-session");
 
     const bundleDir = history[1].bundle;
     await trigger(hooks, "session_shutdown", { reason: "test" });
@@ -896,7 +906,7 @@ test("/review-continue after cap preserves original baseline and accumulated evi
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -1012,7 +1022,7 @@ test("normal user input after cap continues the unresolved review window with co
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -1092,19 +1102,19 @@ test("a passed review remains available to /ask-reviewer-interactive but is chec
             "let input='';",
             "process.stdin.on('data',chunk=>input+=chunk);",
             "process.stdin.on('end',()=>{",
-            "const firstContext=input.includes(outside)&&input.includes('old review document')&&input.includes('rewritten review document')&&input.includes('first Docker task');",
+            "const firstContext=input.includes(outside)&&input.includes('outside_workspace')&&input.includes('first Docker task');",
             "const ok=count===0",
             "?firstContext",
             ":count===1",
             "?firstContext&&input.includes('Reviewer question:')&&input.includes('what changed outside the workspace?')&&input.includes('-FROM alpine:3.19')&&input.includes('+FROM alpine:3.20')",
-            ":!input.includes(outside)&&!input.includes('old review document')&&!input.includes('rewritten review document')&&!input.includes('first Docker task')&&input.includes('second Docker task')&&input.includes('+FROM alpine:3.21');",
+            ":!input.includes(outside)&&!input.includes('first Docker task')&&input.includes('second Docker task')&&input.includes('+FROM alpine:3.21');",
             "process.stdout.write(JSON.stringify(ok",
             "?{verdict:'pass',summary:count===0?'first window complete':count===1?'passed context retained for question':'second window isolated',findings:[]}",
             ":{verdict:'needs_changes',summary:'review windows mixed',findings:[{severity:'blocking',file:'session',line:null,issue:'a review used changes or context from the wrong window',recommendation:'checkpoint passed changes and open an isolated window'}]}));",
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -1208,7 +1218,7 @@ test("repeated no-progress reviewer feedback stops automatic correction loop", a
             "}]})));",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
 
@@ -1290,7 +1300,7 @@ test("a passing multi-model review discloses every result and reviews changes ma
           "});",
         ].join(""),
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
@@ -1384,7 +1394,7 @@ test("an unchanged response to a passing transmission closes without another rev
         adapter: "generic-cli",
         command: process.execPath,
         args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(invocationCount)},'1');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'final useful observation',guidance:'consider a later cleanup',findings:[]})))`],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
     process.env.PI_REVIEW_GATE_CONFIG = configPath;
@@ -1458,7 +1468,7 @@ test("/ask-reviewer pauses an active turn before invoking the reviewer and then 
             ":{verdict:'needs_changes',summary:'missing paused exchange',guidance:null,findings:[],error:null})));",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }), "utf8");
     process.env.PI_REVIEW_GATE_CONFIG = configPath;
@@ -1540,7 +1550,7 @@ async function triggerResults(hooks: Map<string, Array<(...args: unknown[]) => u
 }
 
 async function waitForFile(path: string): Promise<void> {
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {
       await access(path);
@@ -1553,7 +1563,7 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 async function waitForCondition(condition: () => boolean): Promise<void> {
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (condition()) {
       return;

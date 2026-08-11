@@ -1,6 +1,6 @@
 import type { GenericCliDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
-import { processFailureResult, reviewerArtifactPaths, reviewerEnv, runPromptProcess, writeReviewerProcessArtifacts } from "./process";
+import { processFailureResult, processTelemetry, reviewerArtifactPaths, reviewerEnv, runPromptProcess, writeReviewerProcessArtifacts } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 
 export class GenericCliAdapter implements ModelAdapter {
@@ -28,6 +28,9 @@ export class GenericCliAdapter implements ModelAdapter {
       rawOutputPath: artifacts.rawOutput,
       timeoutMs,
     });
-    return failure ?? parseReviewResult(req.id, output.stdout, artifacts.rawOutput);
+    if (failure) return failure;
+    const result = parseReviewResult(req.id, output.stdout, artifacts.rawOutput);
+    result.telemetry = processTelemetry(output);
+    return result;
   }
 }

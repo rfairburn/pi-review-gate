@@ -35,3 +35,26 @@ test("review transmissions preserve formatted findings and fenced implementation
   assert.match(transmission.message, /Issue: A null value reaches run\(\)\./);
   assert.match(transmission.message, /Recommendation: Apply the guard shown above at the call site\./);
 });
+
+test("review transmissions disclose provider diagnostics to the implementing model", () => {
+  const transmission = buildReviewTransmission({
+    reviewSequence: 1,
+    gateVerdict: "pass",
+    bundleDir: "/tmp/review-bundle",
+    action: "passed",
+    reviewerResults: [
+      { reviewerId: "passing", verdict: "pass", summary: "No defect found.", findings: [] },
+      {
+        reviewerId: "luna",
+        verdict: "error",
+        summary: "Reviewer provider failed before producing a final response.",
+        findings: [],
+        error: "provider_error",
+        diagnostic: "Codex error: servers currently overloaded.",
+      },
+    ],
+  });
+
+  assert.match(transmission.message, /Reviewer error: provider_error/);
+  assert.match(transmission.message, /Reviewer diagnostic:\nCodex error: servers currently overloaded\./);
+});

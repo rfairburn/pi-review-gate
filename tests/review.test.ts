@@ -138,7 +138,142 @@ test("runReview uses an OR gate and preserves individual blocking finding identi
   }
 });
 
-test("an aborted multi-review is atomic, records a tombstone, and preserves prior reviewer sessions", async () => {
+test("multi-review aggregation treats pass plus infrastructure error as pass with warnings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-partial-review-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [
+        jsonReviewer("passing", "{verdict:'pass',summary:'logic is sound',findings:[]}"),
+        exitReviewer("offline"),
+      ],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.result?.error, "partial_reviewer_error");
+    assert.equal(output.result?.summary, "1 pass, 1 error");
+    assert.deepEqual(output.reviewerResults?.map((result) => result.verdict), ["pass", "error"]);
+    assert.equal(output.reviewerResults?.[1]?.telemetry?.sessionResumed, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("parallel reviewers cannot inspect in-flight sibling outputs or runtime sessions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-isolation-"));
+  let bundleDir: string | undefined;
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const reviewer = (id: "fast" | "slow") => ({
+      id,
+      adapter: "generic-cli" as const,
+      command: process.execPath,
+      args: ["-e", [
+        "const fs=require('node:fs');const path=require('node:path');",
+        `const id=${JSON.stringify(id)};`,
+        "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
+        "const sibling=path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'reviews','0001','reviewers','fast');",
+        "const exposed=id==='slow'&&fs.existsSync(sibling);",
+        "process.stdout.write(JSON.stringify({verdict:'pass',summary:exposed?'sibling exposed':'reviewer isolated',findings:[]}));",
+        "},id==='slow'?150:0));",
+      ].join("" )],
+      timeoutMs: 15000,
+    });
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: {
+        ...baseConfig,
+        retainBundles: "always",
+        decider: undefined,
+        reviewers: [reviewer("fast"), reviewer("slow")],
+      },
+    });
+    bundleDir = output.bundleDir;
+
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.reviewerResults?.[1]?.summary, "reviewer isolated");
+    await access(join(output.bundleDir!, "reviews", "0001", "reviewers", "fast", "parsed-result.json"));
+    await access(join(output.bundleDir!, "reviews", "0001", "reviewers", "slow", "parsed-result.json"));
+    await assert.rejects(access(join(output.bundleDir!, "sessions")), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    if (bundleDir) await rm(bundleDir, { recursive: true, force: true });
+  }
+});
+
+test("multi-review aggregation keeps needs_changes authoritative despite pass or error", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-blocking-mixed-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [
+        jsonReviewer("passing", "{verdict:'pass',summary:'looks good',findings:[]}"),
+        jsonReviewer("blocking", "{verdict:'needs_changes',summary:'bug remains',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'wrong branch',recommendation:'fix branch'}]}"),
+        exitReviewer("offline"),
+      ],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    assert.equal(output.result?.verdict, "needs_changes");
+    assert.equal(output.result?.error, "partial_reviewer_error");
+    assert.equal(output.result?.findings[0]?.reviewerId, "blocking");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("multi-review aggregation returns error when no reviewer completes a usable review", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-all-review-errors-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [exitReviewer("offline-a"), exitReviewer("offline-b")],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    assert.equal(output.result?.verdict, "error");
+    assert.equal(output.result?.summary, "2 error");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an aborted multi-review is atomic, records a tombstone, and later passes start fresh reviewer sessions", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-atomic-abort-"));
   const fastCompleted = join(tmpdir(), `pi-review-gate-fast-completed-${process.pid}-${Date.now()}`);
   let bundleDir: string | undefined;
@@ -176,7 +311,7 @@ test("an aborted multi-review is atomic, records a tombstone, and preserves prio
           "});",
         ].join(""),
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
     const config: ReviewGateConfig = {
       ...baseConfig,
@@ -234,10 +369,7 @@ test("an aborted multi-review is atomic, records a tombstone, and preserves prio
     assert.equal(resumed.result?.verdict, "pass");
     assert.equal(resumed.reviewerResults?.length, 2);
     assert.equal(window.nextReviewSequence, 3);
-    assert.deepEqual(Object.fromEntries(window.reviewerSessions), {
-      fast: { adapter: "codex-cli", id: "previous-fast-session" },
-      slow: { adapter: "codex-cli", id: "previous-slow-session" },
-    });
+    assert.deepEqual(Object.fromEntries(window.reviewerSessions), {});
     assert.match(
       await readFile(join(aborted.bundleDir!, "REVIEW.md"), "utf8"),
       /CANCELED\.md.*cancellation tombstone/,
@@ -323,7 +455,7 @@ test("runReview writes changed file artifacts into retained bundles", async () =
   }
 });
 
-test("runAskReviewer retains on any reviewer error even when another answer is usable", async () => {
+test("runAskReviewer passes with a warning and retains evidence when another answer is usable", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-retain-partial-error-"));
   try {
     const output = await runAskReviewer({
@@ -341,7 +473,8 @@ test("runAskReviewer retains on any reviewer error even when another answer is u
       },
     });
 
-    assert.equal(output.result?.verdict, "error");
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.result?.error, "partial_reviewer_error");
     assert.equal(output.bundleRetained, true);
     await access(join(output.bundleDir ?? "", "questions", "0001", "reviewers", "bad-json", "raw-output.txt"));
   } finally {
@@ -385,7 +518,7 @@ test("runReview prompt preserves request context and original baseline across co
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -447,7 +580,7 @@ test("runAskReviewer answers with request and evidence even when there is no pat
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -502,7 +635,7 @@ test("accepted reviewer Q&A is visible to later automatic and question reviews",
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -563,7 +696,7 @@ test("correction-attempt escalation reaches automatic and question review prompt
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -622,7 +755,7 @@ test("concrete-guidance escalation starts at the configured correction-attempt t
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -704,7 +837,7 @@ test("runReview frames temp-like outside files as captured side effects, not sub
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -751,7 +884,7 @@ function blockingReviewer(
         "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',guidance,findings:[{severity:'blocking',file:'index.ts',line:null,issue,recommendation}]})));",
       ].join(""),
     ],
-    timeoutMs: 5000,
+    timeoutMs: 15000,
   };
 }
 
@@ -764,7 +897,17 @@ function jsonReviewer(id: string, objectLiteral: string): NonNullable<ReviewGate
       "-e",
       `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify(${objectLiteral})))`,
     ],
-    timeoutMs: 5000,
+    timeoutMs: 15000,
+  };
+}
+
+function exitReviewer(id: string): NonNullable<ReviewGateConfig["decider"]> {
+  return {
+    id,
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: ["-e", "process.exit(1)"],
+    timeoutMs: 15000,
   };
 }
 

@@ -58,11 +58,13 @@ Example config using Codex as the reviewer:
 
 Multiple reviewers can be configured with `reviewers`. They run in parallel
 against the same review bundle. Review-gate waits for every reviewer and applies
-a simple gate: any `needs_changes` verdict means changes are required, all
-reviewers must pass for the gate to pass, and reviewer errors prevent a silent
-pass. Each reviewer appears once in the implementing-model transmission, and
-review decisions are stored per reviewer rather than as an additional combined
-result. There is no separate aggregate summary, guidance, or finding set.
+a simple gate: any `needs_changes` verdict means changes are required; when no
+reviewer requests changes, at least one completed `pass` is accepted even if
+another reviewer has an infrastructure error; and the gate errors only when no
+reviewer completes a usable review. Mixed pass/error results are classified as
+`pass_with_warnings`, retain their evidence, and return every reviewer result to
+the orchestrator. Each reviewer also appears once in the implementing-model
+transmission.
 Results from every reviewer are transmitted, including passing assessments,
 non-blocking observations, guidance, disagreements, and reviewer errors.
 Blocking findings are identified as required corrections; passing and
@@ -82,6 +84,13 @@ Reviewer output is parsed strictly first; a narrow fallback recovers the same
 schema when a model emits otherwise-valid fields with unescaped multiline
 Markdown. Sandbox startup failures remain explicit reviewer errors rather than
 being mislabeled as verdict-schema failures.
+
+The reviewer treats orchestrator-provided task direction as authorized and
+reviews concrete logic, regressions, security, API behavior, tests, and explicit
+acceptance criteria. It must not request changes merely because an implementation
+choice was not separately requested by the user. Targeted tests are expected in
+delegated correction loops; absent an explicit task criterion or a concrete
+cross-cutting risk, a full-suite run is a non-blocking final-orchestration note.
 
 ```json
 {
@@ -202,9 +211,10 @@ default 2). The tool-call `maxWorkers` overrides `config.execution.maxWorkers`,
 which overrides the built-in default of 2.
 
 **Integration policy**: By default all-or-nothing: any worker that is not
-accepted, completed_unreviewed, or no_changes blocks integration entirely.
-Set `integratePartial: true` to integrate eligible workers (accepted /
-completed_unreviewed) in declared order despite failed ones.
+accepted, accepted_with_warnings, completed_unreviewed, or no_changes blocks
+integration entirely. Set `integratePartial: true` to integrate eligible workers
+(accepted / accepted_with_warnings / completed_unreviewed) in declared order
+despite failed ones.
 
 **Integration order**: Workers are integrated in the declared order from the
 tasks array, regardless of completion order.
@@ -441,21 +451,19 @@ The wrapper flag also accepts explicit modes:
 --retain-review-bundles=always
 ```
 
-Built-in Codex, Claude, and little-coder reviewers use one explicit CLI session
-per reviewer for the lifetime of a review window. Correction reviews,
-continuations made after a passing transmission, and `/ask-reviewer` resume that
-same reviewer session against the same evidence bundle. A new review window
-always starts new reviewer sessions. The bundle is
-still authoritative: if a saved session cannot be resumed, the reviewer can be
-restarted from the complete bundle without losing review context.
+Every built-in Codex, Claude, and little-coder review pass starts a fresh CLI
+session. Correction context comes from the stable evidence bundle rather than
+accumulated model/tool history, avoiding reviewer compaction across passes.
+Correction reviewers begin with the original task evidence, latest correction
+exchange, immediately preceding findings, and current files. Complete earlier
+history remains available for targeted inspection but is not read by default.
 
 Canceling a running review with Escape cancels the whole parallel review, even
 if one reviewer has already completed. Partial results are discarded and are
 not transmitted. The numbered invocation remains as a `CANCELED.md` tombstone
 stating that a review would have run there but was canceled by the user, so pass
-order remains unambiguous. Cancellation restores the reviewer-session handles
-from before that invocation; the next review keeps the same evidence bundle and
-resumes from the last successful sessions instead of starting a new window.
+order remains unambiguous. The next review keeps the same evidence bundle but
+starts fresh reviewer sessions.
 
 ## Temporary fake reviewer
 
@@ -494,8 +502,8 @@ Exact `write` / `edit` paths and easy shell targets are pre-captured before
 execution, including absolute paths outside the current worktree.
 
 Repository baselines, per-exchange snapshots, pre-captured outside-file
-baselines, user guidance, tool evidence, assistant summaries, reviewer feedback,
-and reviewer sessions belong to one review window. A requested correction keeps
+baselines, user guidance, tool evidence, assistant summaries, and reviewer
+feedback belong to one review window. A requested correction keeps
 that window open. Even when a correction exactly restores the original baseline,
 the next reviewer sees the inverse exchange diff and validates the correction.
 A passing review is transmitted to the implementing model as a final review
@@ -516,8 +524,8 @@ correction feedback, and queued user input. The next ordinary prompt starts a
 fresh window from the workspace's current contents. It does not revert files or
 override bundle retention: bundles continue to be retained or removed by the
 configured `retainBundles` policy (`never`, `on-failure`, or `always`).
-Already-retained bundles remain governed by that policy. Reviewer sessions from
-the cleared window are never reused. If a review is currently running, cancel it
+Already-retained bundles remain governed by that policy. Reviewer sessions are
+never reused between passes. If a review is currently running, cancel it
 first and then run `/review-clear`.
 
 `/review-now` reruns the configured reviewer or reviewers against the active
@@ -579,15 +587,20 @@ reviewer note without reusing the already-checkpointed file baseline.
 Retained review bundles include `REVIEW.md`, `manifest.json`, `request.md`, a
 `current/` cumulative view, immutable `exchanges/<sequence>/` evidence,
 numbered `reviews/<sequence>/` and `questions/<sequence>/` invocations,
-`sessions.json`, and captured before/after artifacts. Reviewer outputs remain
+`sessions.json`, per-pass `review-telemetry.json`, and captured before/after
+artifacts. Reviewer outputs remain
 isolated under each invocation's `reviewers/<id>/` directory. Each completed
 review pass also stores `implementing-model-transmission.md`, its structured
 JSON envelope, and additive `delivery.json` receipts recording exactly what the
 implementing model was told and whether the transmission required correction,
 reported a pass, deferred action, or disclosed a review error. Later reviewers
-are directed to read these records before judging a continuation. The envelope
+start with the immediately preceding record and consult older records only when
+the latest correction evidence requires it. The envelope
 contains the gate verdict and the individual reviewer results; no unsent
-aggregate result is persisted. A canceled numbered invocation contains
+aggregate result is persisted. Telemetry records prompt and stream bytes,
+tool-call and tool-result volume, wall time, token usage, compaction events, and
+whether session reuse occurred; it measures behavior without imposing a token
+budget. A canceled numbered invocation contains
 `CANCELED.md` and `canceled.json` rather than reviewer results. The little-coder
 model adapter stores the extracted final review in `raw-output.txt` and the
 capped JSONL stream separately as `raw-stream.jsonl`. When supported by the

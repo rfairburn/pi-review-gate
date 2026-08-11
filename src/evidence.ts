@@ -165,7 +165,11 @@ export async function collectEvidenceChanges(
   return changes;
 }
 
-export function buildEvidenceBundle(state: EvidenceState, changedCandidatePaths: string[]): EvidenceBundle {
+export function buildEvidenceBundle(
+  state: EvidenceState,
+  changedCandidatePaths: string[],
+  focus?: { events?: EvidenceEvent[]; finalAssistantSummaries?: string[] },
+): EvidenceBundle {
   const candidates = [...state.candidates.values()].map((candidate) => ({
     path: candidate.path,
     absolutePath: candidate.absolutePath,
@@ -179,9 +183,9 @@ export function buildEvidenceBundle(state: EvidenceState, changedCandidatePaths:
   }));
 
   const bundle: Omit<EvidenceBundle, "markdown"> = {
-    events: state.events,
+    events: focus?.events ?? state.events,
     candidates,
-    finalAssistantSummaries: state.finalAssistantSummaries,
+    finalAssistantSummaries: focus?.finalAssistantSummaries ?? state.finalAssistantSummaries,
     acceptedReviewerQuestions: state.acceptedReviewerQuestions,
     changedCandidatePaths,
   };

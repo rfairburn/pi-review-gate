@@ -5,6 +5,7 @@ import { parseClaudeUsage } from "../usage";
 import { ClaudeStreamJsonParser, ClaudeStreamActivityExtractor } from "../execution/progress";
 import {
   processFailureResult,
+  processTelemetry,
   reviewerArtifactPaths,
   reviewerEnv,
   reviewerErrorResult,
@@ -77,11 +78,15 @@ export class ClaudeCliAdapter implements ModelAdapter {
       return parsed.error ? { ...failure, summary: parsed.error } : failure;
     }
     if (parsed.error) {
-      return reviewerErrorResult(req.id, parsed.error, artifacts.rawOutput, "claude_error", usage);
+      return {
+        ...reviewerErrorResult(req.id, parsed.error, artifacts.rawOutput, "claude_error", usage),
+        telemetry: processTelemetry(output),
+      };
     }
 
     const result = parseReviewResult(req.id, parsed.text, artifacts.rawOutput);
     result.usage = usage;
+    result.telemetry = processTelemetry(output);
     return result;
   }
 }

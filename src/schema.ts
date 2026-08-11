@@ -49,6 +49,26 @@ export interface ReviewResult {
   rawOutputPath?: string;
   usage?: TokenUsage;
   error?: string;
+  diagnostic?: string;
+  telemetry?: ReviewerInvocationTelemetry;
+}
+
+export interface ReviewerInvocationTelemetry {
+  startedAt?: string;
+  durationMs?: number;
+  promptBytes?: number;
+  stdoutBytes?: number;
+  stderrBytes?: number;
+  stdoutBytesCaptured?: number;
+  stderrBytesCaptured?: number;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
+  streamEvents?: number;
+  toolCalls?: number;
+  toolResultBytes?: number;
+  compactions?: number;
+  sessionResumed?: boolean;
+  restartedAfterResumeFailure?: boolean;
 }
 
 export const REVIEW_OUTPUT_JSON_SCHEMA = {

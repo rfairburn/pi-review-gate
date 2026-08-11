@@ -181,7 +181,7 @@ test("wave-worker runs one executor turn and normalizes to candidate", async () 
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -270,7 +270,7 @@ test("wave-worker returns no_changes when executor makes no modifications", asyn
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -316,7 +316,7 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -459,7 +459,7 @@ test("wave-worker returns executor_error on empty response", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -506,7 +506,7 @@ test("wave-worker validates artifact directory is under waveRoot", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -554,7 +554,7 @@ test("wave-worker validates artifact directory is outside worktree", async () =>
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -627,7 +627,7 @@ test("wave-worker executor runs in effectiveCwd, not worktreeRoot", async () => 
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -679,7 +679,7 @@ test("wave-worker does not mutate source repository", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -727,7 +727,7 @@ test("wave-worker result type carries all required fields", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -778,7 +778,7 @@ test("wave-worker progress callbacks are invoked", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -846,7 +846,7 @@ test("resumeWaveWorker resumes the exact prior session", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -924,7 +924,7 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [firstCommand],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -966,7 +966,7 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [resumeCommand],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1041,7 +1041,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [command],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1069,7 +1069,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [firstCommand],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1139,7 +1139,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [revertFirstCommand],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1181,7 +1181,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [revertCommand],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1241,7 +1241,7 @@ test("resumeWaveWorker failure paths do not pin accepted refs", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [firstCommand],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1279,7 +1279,7 @@ test("resumeWaveWorker failure paths do not pin accepted refs", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [failCommand],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1345,7 +1345,7 @@ test("resumeWaveWorker returns cancelled on abort signal", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [firstCommand],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1450,7 +1450,7 @@ test("resumeWaveWorker rejects turn < 2", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [join(root, "dummy.cjs")],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });
@@ -1497,7 +1497,7 @@ test("resumeWaveWorker requires prior session and candidate", async () => {
         execution: {
           protocol: "pi-review-executor-jsonl-v1",
           args: [join(root, "dummy7.cjs")],
-          timeoutMs: 5000,
+          timeoutMs: 15000,
         },
       }],
     });

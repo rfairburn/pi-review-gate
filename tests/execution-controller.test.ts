@@ -31,6 +31,23 @@ test("executeSubtask runs a fake binary through pass and unchanged acceptance", 
   assert.deepEqual(compareSnapshots(activeExchangeBaseline(fixture.parentState)!, current), []);
 });
 
+test("executeSubtask returns accepted_with_warnings and structured evidence for pass plus reviewer error", async () => {
+  const fixture = await executionFixture(true, { mixedReviewerError: true });
+  const packet = await executeSubtask({
+    task: task(),
+    cwd: fixture.workspace,
+    config: fixture.config,
+    parentState: fixture.parentState,
+  });
+
+  assert.equal(packet.kind, "accepted_with_warnings");
+  assert.equal(packet.reviewStatus, "accepted_with_warnings");
+  assert.equal(packet.reviewReport?.aggregate, "pass_with_warnings");
+  assert.deepEqual(packet.reviewReport?.reviewers.map((reviewer) => reviewer.verdict), ["pass", "error"]);
+  assert.equal(packet.reviewReport?.reviewers[1]?.errorCategory, "process_exit");
+  assert.ok(packet.bundleDir, "warning evidence should be retained for orchestrator inspection");
+});
+
 test("executeSubtask can complete explicitly without review", async () => {
   const fixture = await executionFixture(false);
   const packet = await executeSubtask({
@@ -141,6 +158,7 @@ test("executeSubtask does not mistake an invalid reviewer selection for review d
 async function executionFixture(reviewed: boolean, options: {
   failFirst?: boolean;
   retainBundles?: "always" | "on-failure" | "never";
+  mixedReviewerError?: boolean;
 } = {}): Promise<{
   workspace: string;
   config: ReviewGateConfig;
@@ -174,7 +192,12 @@ async function executionFixture(reviewed: boolean, options: {
     maxCorrectionCycles: 2,
     retainBundles: options.retainBundles ?? "never",
     review: {
-      activeReviewers: reviewed ? [{ source: "external", id: "fake-reviewer" }] : [],
+      activeReviewers: reviewed
+        ? [
+            { source: "external" as const, id: "fake-reviewer" },
+            ...(options.mixedReviewerError ? [{ source: "external" as const, id: "broken-reviewer" }] : []),
+          ]
+        : [],
     },
     externalAgents: [{
       id: "fake-reviewer",
@@ -183,7 +206,16 @@ async function executionFixture(reviewed: boolean, options: {
       review: {
         protocol: "pi-reviewer-json-v1",
         args: [resolve("scripts/fake-reviewer.cjs")],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
+      },
+    }, {
+      id: "broken-reviewer",
+      adapter: "generic-cli",
+      command: process.execPath,
+      review: {
+        protocol: "pi-reviewer-json-v1",
+        args: ["-e", "process.exit(1)"],
+        timeoutMs: 15000,
       },
     }, {
       id: "fake-executor",
@@ -192,7 +224,7 @@ async function executionFixture(reviewed: boolean, options: {
       execution: {
         protocol: "pi-review-executor-jsonl-v1",
         args: [executorPath],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }],
     execution: {

@@ -242,7 +242,7 @@ export async function activate(pi: unknown): Promise<void> {
     try {
       output = await runReview({
         cwd: currentCwd,
-        request: buildRequestContext(state),
+        request: buildRequestContext(state, state.reviewWindow, { priorFeedback: "latest" }),
         before: window.baseline,
         config: reviewConfig,
         evidence: window.evidence,
@@ -306,7 +306,7 @@ export async function activate(pi: unknown): Promise<void> {
       });
       await sendNoticeWhileSessionActive(
         noticeTarget,
-        `review gate: passed (${formatTokenUsage(output.result.usage)})`,
+        `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
       await deliverAutomaticTransmission(pi, output, "passed", transmission, () => sessionActive);

@@ -5,6 +5,7 @@ import { parseReviewResult, REVIEW_OUTPUT_JSON_SCHEMA, type ReviewResult } from 
 import { extractCodexReviewFromJsonl } from "../usage";
 import {
   processFailureResult,
+  processTelemetry,
   reviewerArtifactPaths,
   reviewerEnv,
   reviewerErrorResult,
@@ -36,13 +37,16 @@ export class CodexCliAdapter implements ModelAdapter {
       });
       if (codexSandboxFailed(preflight.stderr)) {
         await writeReviewerProcessArtifacts({ paths: artifacts, output: preflight });
-        return reviewerErrorResult(
+        return {
+          ...reviewerErrorResult(
           req.id,
           "Codex reviewer could not inspect the evidence because its read-only filesystem sandbox failed to start.",
           artifacts.rawOutput,
           "sandbox_unavailable",
           undefined,
-        );
+          ),
+          telemetry: processTelemetry(preflight),
+        };
       }
     }
     const args = req.session
@@ -102,14 +106,18 @@ export class CodexCliAdapter implements ModelAdapter {
     const finalText = finalTextFromFile.trim() ? finalTextFromFile : extracted.text || output.stdout;
     const result = parseReviewResult(req.id, finalText, artifacts.rawOutput);
     result.usage = usage;
+    result.telemetry = processTelemetry(output);
     if (result.verdict === "error" && codexSandboxFailed(output.stderr)) {
-      return reviewerErrorResult(
+      return {
+        ...reviewerErrorResult(
         req.id,
         "Codex reviewer could not inspect the evidence because its read-only filesystem sandbox failed to start.",
         artifacts.rawOutput,
         "sandbox_unavailable",
         usage,
-      );
+        ),
+        telemetry: processTelemetry(output),
+      };
     }
     return result;
   }

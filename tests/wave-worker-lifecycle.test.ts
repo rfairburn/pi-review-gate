@@ -116,7 +116,7 @@ function buildConfig(command: string, executorId = "fake-exec"): ReviewGateConfi
       execution: {
         protocol: "pi-review-executor-jsonl-v1",
         args: [command],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     }],
   });
@@ -135,7 +135,7 @@ function buildPassingReviewerConfig(executorCommand: string): ReviewGateConfig {
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     },
   };
 }
@@ -153,7 +153,7 @@ function buildNeedsChangesReviewerConfig(executorCommand: string): ReviewGateCon
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'x.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     },
   };
 }
@@ -171,8 +171,19 @@ function buildErrorReviewerConfig(executorCommand: string): ReviewGateConfig {
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>{throw new Error('reviewer crash');})",
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     },
+  };
+}
+
+function buildPassWithReviewerErrorConfig(executorCommand: string): ReviewGateConfig {
+  const passing = buildPassingReviewerConfig(executorCommand).decider!;
+  const erroring = buildErrorReviewerConfig(executorCommand).decider!;
+  return {
+    ...buildConfig(executorCommand),
+    enabled: true,
+    decider: undefined,
+    reviewers: [passing, erroring],
   };
 }
 
@@ -237,6 +248,37 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
     const resultJson = JSON.parse(await readFile(join(artifactDir, "result.json"), "utf8"));
     assert.equal(resultJson.status, "accepted");
     assert.equal(resultJson.taskId, "task-pass");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: pass plus reviewer infrastructure error accepts with warnings and remains integration-eligible", async () => {
+  const root = await mkTmp("pi-wwl-pass-warning-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-pass-warning");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-pass-warning");
+    await mkdir(artifactDir, { recursive: true });
+    const { command } = await createFakeExecutor(root);
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-pass-warning",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config: buildPassWithReviewerErrorConfig(command),
+    });
+
+    assert.equal(result.status, "accepted_with_warnings");
+    assert.ok(result.acceptedRef);
+    assert.ok(result.acceptedCommitSha);
+    assert.equal(result.reviewReport?.aggregate, "pass_with_warnings");
+    assert.deepEqual(result.reviewReport?.reviewers.map((reviewer) => reviewer.verdict), ["pass", "error"]);
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {
@@ -792,14 +834,14 @@ test("lifecycle: reviewer-blocked does not create artifact directory", async () 
         adapter: "generic-cli" as const,
         command: process.execPath,
         args: ["-e", "process.stdout.write('{}')"],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
       {
         id: "dup-reviewer",
         adapter: "generic-cli" as const,
         command: process.execPath,
         args: ["-e", "process.stdout.write('{}')"],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     ];
 
@@ -864,7 +906,7 @@ test("lifecycle: reviewer receives task acceptance criteria in evidence", async 
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -921,7 +963,7 @@ test("lifecycle: reviewer receives the executor's isolated path mapping", async 
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 

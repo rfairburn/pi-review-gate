@@ -165,7 +165,10 @@ export function registerCommands(input: RegisterCommandsInput): void {
           disposition: "sent_for_observation",
           reviewedSnapshot: output.reviewedSnapshot!,
         });
-        await sendCommandNotice(ctx, `review gate: passed (${formatTokenUsage(output.result.usage)})`);
+        await sendCommandNotice(
+          ctx,
+          `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
+        );
         await deliverCommandTransmission(input.pi, output, "passed", transmission, isSessionActive);
       } else if (output.result?.verdict === "needs_changes") {
         const transmission = await createCommandTransmission(output, "correction_required");

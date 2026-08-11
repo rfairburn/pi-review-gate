@@ -127,7 +127,7 @@ function renderTransmission(envelope: ReviewTransmissionEnvelope, bundleDir: str
     `Review pass ${envelope.reviewSequence} transmission for the implementing model.`,
     "",
     `Gate verdict: ${envelope.gateVerdict}`,
-    actionText(envelope.action),
+    actionText(envelope.action, envelope.reviewerResults.some((reviewer) => reviewer.result.verdict === "error")),
     "",
     "Every official reviewer result from this pass is included below. Passing assessments and non-blocking notes are informational; they are not hidden and do not become required corrections unless explicitly identified as required.",
     "",
@@ -146,6 +146,9 @@ function renderTransmission(envelope: ReviewTransmissionEnvelope, bundleDir: str
     }
     if (reviewer.result.error) {
       lines.push("", `Reviewer error: ${reviewer.result.error}`);
+    }
+    if (reviewer.result.diagnostic) {
+      lines.push("", "Reviewer diagnostic:", reviewer.result.diagnostic);
     }
     if (reviewer.findings.length === 0) {
       lines.push("", "Findings: none.");
@@ -188,12 +191,14 @@ export function buildReviewAuthorizationMessage(input: {
   ].join("\n");
 }
 
-function actionText(action: ReviewTransmissionAction): string {
+function actionText(action: ReviewTransmissionAction, hasReviewerErrors = false): string {
   if (action === "correction_required") {
     return "Action: Review found blocking issues. Address the blocking findings from this pass, then run relevant tests and report the result.";
   }
   if (action === "passed") {
-    return "Action: No correction is required. Review the observations below; you may respond or make a useful follow-up change, but any new change will be reviewed again.";
+    return hasReviewerErrors
+      ? "Action: No correction is required because at least one reviewer passed and none requested changes. Treat the failed reviewer invocation as an infrastructure warning, review the evidence below, and note that any new change will be reviewed again."
+      : "Action: No correction is required. Review the observations below; you may respond or make a useful follow-up change, but any new change will be reviewed again.";
   }
   if (action === "deferred") {
     return "Action: The findings are disclosed for context, but automatic correction is deferred. Do not make a correction solely from this transmission unless continuation is authorized.";

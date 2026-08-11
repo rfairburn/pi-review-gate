@@ -226,7 +226,13 @@ export function extractReviewTextFromClaudeJson(value: unknown): string {
   return textFromContent(value.content);
 }
 
-export function extractReviewTextFromPiJsonl(stdout: string): { text: string; usage?: TokenUsage } {
+export interface PiJsonlReviewExtraction {
+  text: string;
+  usage?: TokenUsage;
+  terminalError?: string;
+}
+
+export function extractReviewTextFromPiJsonl(stdout: string): PiJsonlReviewExtraction {
   const extractor = new PiJsonlReviewExtractor();
   extractor.push(stdout);
   return extractor.finish();
@@ -238,6 +244,7 @@ export class PiJsonlReviewExtractor {
   private currentDeltaText = "";
   private partialText = "";
   private usage: TokenUsage | undefined;
+  private terminalError = "";
 
   push(chunk: string): void {
     this.pending += chunk;
@@ -253,7 +260,7 @@ export class PiJsonlReviewExtractor {
     }
   }
 
-  finish(): { text: string; usage?: TokenUsage } {
+  finish(): PiJsonlReviewExtraction {
     if (this.pending.trim()) {
       this.processLine(this.pending);
     }
@@ -261,10 +268,11 @@ export class PiJsonlReviewExtractor {
     return this.result();
   }
 
-  result(): { text: string; usage?: TokenUsage } {
+  result(): PiJsonlReviewExtraction {
     return {
       text: this.finalText || this.currentDeltaText || this.partialText,
       usage: this.usage,
+      terminalError: this.terminalError || undefined,
     };
   }
 
@@ -285,6 +293,14 @@ export class PiJsonlReviewExtractor {
     }
     if (!isRecord(parsed)) {
       return;
+    }
+
+    const terminalError = piStreamError(parsed);
+    if (terminalError) {
+      this.terminalError = terminalError;
+    }
+    if (parsed.type === "auto_retry_end" && parsed.success === true) {
+      this.terminalError = "";
     }
 
     if (parsed.type === "message_start" && isAssistantMessage(parsed.message)) {
@@ -327,8 +343,35 @@ export class PiJsonlReviewExtractor {
       this.finalText = text;
       this.currentDeltaText = text;
       this.partialText = text;
+      this.terminalError = "";
     }
   }
+}
+
+function piStreamError(event: Record<string, unknown>): string | undefined {
+  if (event.type === "auto_retry_end" && event.success === false && typeof event.finalError === "string") {
+    return boundedError(event.finalError);
+  }
+  if (typeof event.errorMessage === "string" && event.errorMessage.trim()) {
+    return boundedError(event.errorMessage);
+  }
+  if (isRecord(event.message) && typeof event.message.errorMessage === "string" && event.message.errorMessage.trim()) {
+    return boundedError(event.message.errorMessage);
+  }
+  if (Array.isArray(event.messages)) {
+    for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+      const message = event.messages[index];
+      if (isRecord(message) && typeof message.errorMessage === "string" && message.errorMessage.trim()) {
+        return boundedError(message.errorMessage);
+      }
+    }
+  }
+  return undefined;
+}
+
+function boundedError(value: string): string {
+  const normalized = value.trim();
+  return normalized.length <= 2_000 ? normalized : normalized.slice(normalized.length - 2_000);
 }
 
 function normalizeOpenAiStyleUsage(value: Record<string, unknown>, raw: unknown): TokenUsage {

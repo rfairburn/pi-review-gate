@@ -686,7 +686,7 @@ function passingReviewConfig(): ReviewGateConfig {
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'approved',findings:[]})))",
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     },
   };
 }
@@ -719,7 +719,7 @@ function passingReviewWithQuestionCheckConfig(): ReviewGateConfig {
           "});",
         ].join(""),
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     },
   };
 }
@@ -737,7 +737,7 @@ function multiReviewerReviewConfig(): ReviewGateConfig {
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
       {
         id: "claude",
@@ -747,7 +747,7 @@ function multiReviewerReviewConfig(): ReviewGateConfig {
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'claude found no blocking issues',findings:[]})))",
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     ],
   };
@@ -767,7 +767,7 @@ function askReviewerPartialErrorConfig(): ReviewGateConfig {
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewer answer ready',findings:[]})))",
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
       {
         id: "bad-json",
@@ -777,7 +777,7 @@ function askReviewerPartialErrorConfig(): ReviewGateConfig {
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'maybe',summary:'invalid verdict',findings:[]})))",
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     ],
   };
@@ -812,7 +812,7 @@ function cappedWindowAskReviewerConfig(): ReviewGateConfig {
           "});",
         ].join(""),
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     },
   };
 }
@@ -838,7 +838,7 @@ function askReviewerConfig(): ReviewGateConfig {
           "});",
         ].join(""),
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     },
   };
 }

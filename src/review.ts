@@ -1,5 +1,6 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { cp, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { resolveReviewers, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
@@ -14,6 +15,7 @@ import { LittleCoderAdapter } from "./adapters/little-coder";
 import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, type ReviewWindow } from "./state";
+import { aggregateReviewDisposition } from "./review-report";
 
 export interface ReviewRunInput {
   cwd: string;
@@ -186,15 +188,15 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   const exchangeSideEffectPatch = exchangeSplit.sideEffectChanges.length > 0
     ? buildUnifiedPatch(exchangeSplit.sideEffectChanges, input.config.maxPatchBytes).patch
     : "";
-  if (input.window) {
-    completeActiveExchange(input.window, {
+  const completedExchange = input.window
+    ? completeActiveExchange(input.window, {
       workspaceChanges: exchangeWorkspaceChanges,
       sideEffectChanges: exchangeSplit.sideEffectChanges,
       workspacePatch: exchangeWorkspacePatch,
       sideEffectPatch: exchangeSideEffectPatch,
       actingUsage: input.actingUsage,
-    });
-  }
+    })
+    : undefined;
   const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges;
   if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
     if (input.window?.bundleDir) {
@@ -258,7 +260,25 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     patch: patchResult.patch,
     sideEffectPatch: sideEffectPatchResult.patch,
     evidence: input.evidence
-      ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
+      ? buildEvidenceBundle(
+        input.evidence,
+        evidenceChanges.map((change) => change.path),
+        isCorrectionValidation && completedExchange
+          ? {
+              // Preserve the task-origin evidence plus the latest correction
+              // exchange. Intermediate cycles remain available on disk, but do
+              // not grow every correction prompt without bound.
+              events: focusedCorrectionEvidence(
+                input.window?.exchanges[0]?.evidenceEvents,
+                completedExchange.evidenceEvents,
+              ),
+              finalAssistantSummaries: focusedCorrectionEvidence(
+                input.window?.exchanges[0]?.assistantSummaries,
+                completedExchange.assistantSummaries,
+              ),
+            }
+          : undefined,
+      )
       : undefined,
     actingUsage: input.actingUsage,
     guidanceEscalation,
@@ -445,6 +465,11 @@ function registerBundleWithWindow(window: ReviewWindow | undefined, bundleDir: s
   }
 }
 
+function focusedCorrectionEvidence<T>(initial: T[] | undefined, latest: T[]): T[] {
+  if (!initial || initial === latest) return [...latest];
+  return [...initial, ...latest];
+}
+
 async function executeReviewerInvocation(input: {
   reviewers: DeciderConfig[];
   bundle: ReviewBundle;
@@ -463,7 +488,11 @@ async function executeReviewerInvocation(input: {
   const verb = input.kind === "review" ? "reviewing changes with" : "asking reviewers";
   await input.notify?.(`review gate: ${verb} ${input.reviewers.map(reviewerDisplayLabel).join(", ")}`);
   const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
-  const reviewerResults = await Promise.all(input.reviewers.map(async (reviewer) => {
+  // Reviewer passes are intentionally stateless. Complete prior evidence remains
+  // available in the immutable bundle, without carrying model/tool history into
+  // the next pass and forcing compaction.
+  input.window?.reviewerSessions.clear();
+  const stagedReviewers = await Promise.all(input.reviewers.map(async (reviewer) => {
     const label = reviewerDisplayLabel(reviewer);
     input.onUpdate?.(`${label} started`);
     const result = await runSingleReviewer({
@@ -477,10 +506,12 @@ async function executeReviewerInvocation(input: {
       signal: input.signal,
       onUpdate: (message) => input.onUpdate?.(`${label} · ${message}`),
     });
-    input.onUpdate?.(`${label} finished · ${result.verdict}`);
+    input.onUpdate?.(`${label} finished · ${result.result.verdict}`);
     return result;
   }));
+  const reviewerResults = stagedReviewers.map((reviewer) => reviewer.result);
   if (reviewWasAborted(input.signal, reviewerResults)) {
+    await cleanupStagedReviewers(stagedReviewers);
     await recordCanceledInvocation(
       input.bundle.invocationDir,
       input.window,
@@ -492,9 +523,24 @@ async function executeReviewerInvocation(input: {
     return { aborted: true, bundleRetained: false };
   }
 
+  // Publish reviewer outputs as one completed set. Until this point each
+  // reviewer writes outside the evidence bundle, so concurrently running
+  // reviewers cannot inspect sibling results or runtime session streams.
+  await Promise.all(stagedReviewers.map(publishStagedReviewer));
+
   const result = decideReviewResults(reviewerResults);
   await Promise.all([
     writeFile(join(input.bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
+    writeFile(join(input.bundle.invocationDir, "review-telemetry.json"), JSON.stringify({
+      version: 1,
+      reviewSequence: input.reviewSequence,
+      reviewers: reviewerResults.map((reviewerResult) => ({
+        reviewerId: reviewerResult.reviewerId,
+        verdict: reviewerResult.verdict,
+        usage: reviewerResult.usage ? omitRawUsage(reviewerResult.usage) : undefined,
+        telemetry: reviewerResult.telemetry,
+      })),
+    }, null, 2), "utf8"),
     writeFile(join(input.bundle.dir, "sessions.json"), JSON.stringify(
       Object.fromEntries(input.window?.reviewerSessions ?? []),
       null,
@@ -521,19 +567,16 @@ async function runSingleReviewer(input: {
   window?: ReviewWindow;
   signal?: AbortSignal;
   onUpdate?: (message: string) => void;
-}): Promise<ReviewResult> {
-  const reviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
-  await mkdir(reviewerDir, { recursive: true });
+}): Promise<StagedReviewerResult> {
+  const finalReviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
+  const reviewerDir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-"));
   const startedAt = Date.now();
-  let resumed = false;
-  let restartedAfterResumeFailure = false;
+  const startedAtIso = new Date(startedAt).toISOString();
+  let session: ReviewerSession | undefined;
   let result: ReviewResult;
   try {
     const adapter = createAdapter(input.reviewer);
-    const previousSession = input.window?.reviewerSessions.get(input.reviewer.id);
-    const usableSession = previousSession?.adapter === adapter.kind ? previousSession : undefined;
-    resumed = Boolean(usableSession);
-    const invoke = (session = usableSession) => adapter.run({
+    result = await adapter.run({
       id: input.reviewer.id,
       cwd: input.cwd,
       prompt: input.reviewer.adapter === "generic-cli" ? input.prompt : input.bundlePrompt,
@@ -541,16 +584,10 @@ async function runSingleReviewer(input: {
       bundleDir: reviewerDir,
       timeoutMs: input.reviewer.timeoutMs ?? 300_000,
       signal: input.signal,
-      session,
-      onSession: (nextSession) => input.window?.reviewerSessions.set(input.reviewer.id, nextSession),
+      session: undefined,
+      onSession: (nextSession) => { session = nextSession; },
       onUpdate: input.onUpdate,
     });
-    result = await invoke();
-    if (usableSession && isResumeFailure(result)) {
-      input.window?.reviewerSessions.delete(input.reviewer.id);
-      restartedAfterResumeFailure = true;
-      result = await invoke(undefined);
-    }
   } catch (error) {
     result = {
       reviewerId: input.reviewer.id,
@@ -560,23 +597,63 @@ async function runSingleReviewer(input: {
       error: error instanceof Error ? error.message : "review_failed",
     };
   }
+  const durationMs = Date.now() - startedAt;
+  result.telemetry = {
+    ...result.telemetry,
+    startedAt: startedAtIso,
+    durationMs,
+    promptBytes: Buffer.byteLength(input.reviewer.adapter === "generic-cli" ? input.prompt : input.bundlePrompt, "utf8"),
+    sessionResumed: false,
+    restartedAfterResumeFailure: false,
+  };
+  if (result.rawOutputPath) {
+    result.rawOutputPath = join(finalReviewerDir, basename(result.rawOutputPath));
+  }
+  // Review passes are fresh, so runtime session history is neither needed for
+  // continuation nor valid evidence for this or later reviewers.
+  await rm(join(reviewerDir, "session"), { recursive: true, force: true });
   await Promise.all([
     writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
     writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
     writeFile(join(reviewerDir, "invocation.json"), JSON.stringify({
       reviewerId: input.reviewer.id,
       adapter: input.reviewer.adapter,
-      resumed,
-      restartedAfterResumeFailure,
-      durationMs: Date.now() - startedAt,
-      session: input.window?.reviewerSessions.get(input.reviewer.id) ?? null,
+      resumed: false,
+      restartedAfterResumeFailure: false,
+      durationMs,
+      promptBytes: result.telemetry.promptBytes,
+      telemetry: result.telemetry,
+      session: session ?? null,
     }, null, 2), "utf8"),
   ]).catch(() => undefined);
-  return result;
+  return { result, stagingDir: reviewerDir, finalDir: finalReviewerDir };
 }
 
-function isResumeFailure(result: ReviewResult): boolean {
-  return result.verdict === "error" && Boolean(result.error?.startsWith("exit_"));
+interface StagedReviewerResult {
+  result: ReviewResult;
+  stagingDir: string;
+  finalDir: string;
+}
+
+async function publishStagedReviewer(staged: StagedReviewerResult): Promise<void> {
+  await mkdir(dirname(staged.finalDir), { recursive: true });
+  await rm(staged.finalDir, { recursive: true, force: true });
+  try {
+    await rename(staged.stagingDir, staged.finalDir);
+  } catch (error) {
+    if (!isCrossDeviceRename(error)) throw error;
+    await cp(staged.stagingDir, staged.finalDir, { recursive: true });
+    await rm(staged.stagingDir, { recursive: true, force: true });
+  }
+}
+
+async function cleanupStagedReviewers(stagedReviewers: StagedReviewerResult[]): Promise<void> {
+  await Promise.all(stagedReviewers.map((staged) =>
+    rm(staged.stagingDir, { recursive: true, force: true })));
+}
+
+function isCrossDeviceRename(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "EXDEV";
 }
 
 function decideReviewResults(results: ReviewResult[]): ReviewResult {
@@ -599,6 +676,18 @@ function decideReviewResults(results: ReviewResult[]): ReviewResult {
       error: errors.length > 0 ? "partial_reviewer_error" : undefined,
     };
   }
+  const aggregate = aggregateReviewDisposition(results);
+  if (aggregate === "pass" || aggregate === "pass_with_warnings") {
+    return {
+      reviewerId: "gate",
+      verdict: "pass",
+      summary: reviewerVerdictSummary(results),
+      findings: results.filter((result) => result.verdict === "pass").flatMap((result) =>
+        result.findings.map((finding) => ({ ...finding, reviewerId: result.reviewerId }))),
+      usage,
+      error: aggregate === "pass_with_warnings" ? "partial_reviewer_error" : undefined,
+    };
+  }
   if (errors.length > 0) {
     return {
       reviewerId: "gate",
@@ -609,13 +698,7 @@ function decideReviewResults(results: ReviewResult[]): ReviewResult {
       error: errors.every((result) => result.error === "aborted") ? "aborted" : "reviewer_error",
     };
   }
-  return {
-    reviewerId: "gate",
-    verdict: "pass",
-    summary: reviewerVerdictSummary(results),
-    findings: [],
-    usage,
-  };
+  throw new Error("review aggregation produced no disposition");
 }
 
 function shouldRetainBundle(
@@ -641,6 +724,11 @@ function reviewerVerdictSummary(results: ReviewResult[]): string {
     .filter((verdict) => counts.has(verdict))
     .map((verdict) => `${counts.get(verdict)} ${verdict}`)
     .join(", ");
+}
+
+function omitRawUsage(usage: TokenUsage): Omit<TokenUsage, "raw"> {
+  const { raw: _raw, ...summary } = usage;
+  return summary;
 }
 
 function reviewWasAborted(signal: AbortSignal | undefined, results: ReviewResult[]): boolean {

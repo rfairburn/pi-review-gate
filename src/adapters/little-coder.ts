@@ -7,6 +7,7 @@ import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../usage";
 import { PiJsonlActivityExtractor } from "../execution/progress";
 import {
   processFailureResult,
+  processTelemetry,
   reviewerArtifactPaths,
   reviewerEnv,
   reviewerErrorResult,
@@ -26,7 +27,9 @@ export class LittleCoderAdapter implements ModelAdapter {
     const artifacts = reviewerArtifactPaths(req.bundleDir);
     const rawStreamPath = join(req.bundleDir, "raw-stream.jsonl");
     const sessionId = req.session?.id ?? randomUUID();
-    const sessionDir = join(req.evidenceBundleDir ?? req.bundleDir, "sessions", safePathSegment(req.id));
+    // Keep runtime session history with the private reviewer staging directory,
+    // never in the evidence bundle where this or a sibling reviewer can inspect it.
+    const sessionDir = join(req.bundleDir, "session");
     await mkdir(sessionDir, { recursive: true });
     req.onSession?.({ adapter: this.kind, id: sessionId });
     const streamExtractor = new PiJsonlReviewExtractor();
@@ -78,7 +81,11 @@ export class LittleCoderAdapter implements ModelAdapter {
     activity.finish();
     const streamExtracted = streamExtractor.finish();
     const extracted = streamExtracted.text.trim() ? streamExtracted : extractReviewTextFromPiJsonl(output.stdout);
-    const rawOutputText = extracted.text.trim() ? extracted.text : missingFinalTextDiagnostic(output);
+    const rawOutputText = extracted.text.trim()
+      ? extracted.text
+      : extracted.terminalError
+        ? providerFailureDiagnostic(extracted.terminalError, output)
+        : missingFinalTextDiagnostic(output);
     await Promise.all([
       writeFile(rawStreamPath, output.stdout, "utf8"),
       writeReviewerProcessArtifacts({
@@ -87,10 +94,11 @@ export class LittleCoderAdapter implements ModelAdapter {
         rawOutput: rawOutputText,
         usage: extracted.usage,
         metadata: {
-        finalTextCaptured: extracted.text.trim().length > 0,
-        stdoutBytesCaptured: Buffer.byteLength(output.stdout),
-        rawOutputContainsStream: false,
-        rawStreamPath,
+          finalTextCaptured: extracted.text.trim().length > 0,
+          terminalProviderError: extracted.terminalError,
+          stdoutBytesCaptured: Buffer.byteLength(output.stdout),
+          rawOutputContainsStream: false,
+          rawStreamPath: "raw-stream.jsonl",
         },
       }),
     ]);
@@ -103,27 +111,40 @@ export class LittleCoderAdapter implements ModelAdapter {
       usage: extracted.usage,
     });
     if (failure) return failure;
+    if (extracted.terminalError) {
+      return {
+        ...reviewerErrorResult(
+          req.id,
+          "Reviewer provider failed before producing a final response.",
+          artifacts.rawOutput,
+          "provider_error",
+          extracted.usage,
+        ),
+        diagnostic: extracted.terminalError,
+        telemetry: processTelemetry(output),
+      };
+    }
     if (!extracted.text.trim()) {
       const summary = output.stdoutTruncated
         ? "Reviewer output was truncated before a final assistant text was captured."
         : "Reviewer did not produce final assistant text.";
-      return reviewerErrorResult(
+      return {
+        ...reviewerErrorResult(
         req.id,
         summary,
         artifacts.rawOutput,
         output.stdoutTruncated ? "output_truncated" : "missing_final_text",
         extracted.usage,
-      );
+        ),
+        telemetry: processTelemetry(output),
+      };
     }
 
     const result = parseReviewResult(req.id, extracted.text, artifacts.rawOutput);
     result.usage = extracted.usage;
+    result.telemetry = processTelemetry(output);
     return result;
   }
-}
-
-function safePathSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_.-]+/g, "_") || "reviewer";
 }
 
 function missingFinalTextDiagnostic(output: {
@@ -143,11 +164,26 @@ function missingFinalTextDiagnostic(output: {
   ].join("\n");
 }
 
+function providerFailureDiagnostic(error: string, output: {
+  code: number | null;
+  timedOut: boolean;
+  aborted: boolean;
+}): string {
+  return [
+    "The little-coder stream ended with a provider error before final assistant text was produced.",
+    `providerError: ${error}`,
+    `exitCode: ${output.code === null ? "null" : output.code}`,
+    `timedOut: ${output.timedOut}`,
+    `aborted: ${output.aborted}`,
+  ].join("\n");
+}
+
 function readOnlyReviewerSystemPrompt(): string {
   return [
     "You are an independent read-only code reviewer.",
     "You have exactly these tools available: read, grep, find, and ls.",
     "Use those tools as needed to inspect the current workspace and the supplied review bundle.",
+    "Do not inspect session/runtime streams or reviewer output directories; they are not review evidence.",
     "Do not modify files, run shell commands, use network access, or ask the primary agent for more context.",
     "Return only valid JSON matching the requested schema.",
   ].join(" ");

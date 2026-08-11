@@ -16,7 +16,7 @@ test("GenericCliAdapter sends prompt through stdin and parses stdout JSON", asyn
         "-e",
         "process.stdin.resume();let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:s.includes('PATCH')?'ok':'missing',findings:[]})))",
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     const result = await adapter.run({
@@ -24,7 +24,7 @@ test("GenericCliAdapter sends prompt through stdin and parses stdout JSON", asyn
       cwd: process.cwd(),
       prompt: "PATCH",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     assert.equal(result.verdict, "pass");

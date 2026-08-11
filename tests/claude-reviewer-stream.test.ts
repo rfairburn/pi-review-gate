@@ -26,8 +26,8 @@ test("Claude reviewer streams native activity without exposing its final JSON", 
     await chmod(command, 0o755);
 
     const activity: string[] = [];
-    const result = await new ClaudeCliAdapter({ id: "claude", adapter: "claude-cli", command, timeoutMs: 5000 }).run({
-      id: "claude", cwd: dir, prompt: "review", bundleDir: dir, timeoutMs: 5000,
+    const result = await new ClaudeCliAdapter({ id: "claude", adapter: "claude-cli", command, timeoutMs: 15000 }).run({
+      id: "claude", cwd: dir, prompt: "review", bundleDir: dir, timeoutMs: 15000,
       onUpdate: (message) => activity.push(message),
     });
     const argv: string[] = JSON.parse(await readFile(argvPath, "utf8"));

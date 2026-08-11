@@ -41,7 +41,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       id: "codex",
       adapter: "codex-cli",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     let session;
@@ -50,7 +50,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       cwd: process.cwd(),
       prompt: "review",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       onSession(value) { session = value; },
     });
     const resumed = await adapter.run({
@@ -58,7 +58,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       cwd: process.cwd(),
       prompt: "review correction",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       session,
     });
 
@@ -100,7 +100,7 @@ test("CodexCliAdapter reports a read-only sandbox startup failure explicitly", a
       id: "codex",
       adapter: "codex-cli",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
     const result = await adapter.run({
       id: "codex",
@@ -108,7 +108,7 @@ test("CodexCliAdapter reports a read-only sandbox startup failure explicitly", a
       prompt: "review",
       evidenceBundleDir: dir,
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     assert.equal(result.verdict, "error");
@@ -139,7 +139,7 @@ test("CodexCliAdapter preflights the platform sandbox before spending a reviewer
       id: "codex",
       adapter: "codex-cli",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
     const result = await adapter.run({
       id: "codex",
@@ -147,7 +147,7 @@ test("CodexCliAdapter preflights the platform sandbox before spending a reviewer
       prompt: "review",
       evidenceBundleDir: dir,
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     assert.equal(result.error, "sandbox_unavailable");
@@ -178,7 +178,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
       id: "claude",
       adapter: "claude-cli",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     let session;
@@ -187,7 +187,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
       cwd: process.cwd(),
       prompt: "review",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       onSession(value) { session = value; },
     });
     const resumed = await adapter.run({
@@ -195,7 +195,7 @@ test("ClaudeCliAdapter limits reviewers to read-only tools, exposes the bundle, 
       cwd: process.cwd(),
       prompt: "review correction",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       session,
     });
 

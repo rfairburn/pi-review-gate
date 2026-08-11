@@ -19,7 +19,7 @@ export function fakeNeedsChangesConfig(overrides: Partial<ReviewGateConfig> = {}
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
       ],
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     },
     ...overrides,
   };

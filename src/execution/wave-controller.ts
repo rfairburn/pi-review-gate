@@ -27,6 +27,7 @@ import type {
 } from "./wave-landing";
 import { planWaveLanding, executeWaveLanding } from "./wave-landing";
 import type { SubtaskProgressUpdate } from "./types";
+import type { SubtaskReviewReport } from "../review-report";
 
 // ── public input / result contract ───────────────────────────────────────────
 
@@ -93,6 +94,8 @@ export interface WaveTaskResult {
   acceptedCommitSha?: string;
   /** Whether explicitly unreviewed. */
   unreviewed?: boolean;
+  /** Structured reviewer evidence for the orchestrator. */
+  reviewReport?: SubtaskReviewReport;
 }
 
 /** Integration result embedded in the wave result. */
@@ -208,6 +211,7 @@ export interface WaveManifestTask {
   acceptedRef?: string;
   acceptedCommitSha?: string;
   unreviewed?: boolean;
+  reviewReport?: SubtaskReviewReport;
   /** Executor adapter used (when known). */
   executorAdapter?: string;
   /** Executor model used (when known). */
@@ -357,6 +361,7 @@ function buildManifest(
         acceptedRef: tr.acceptedRef,
         acceptedCommitSha: tr.acceptedCommitSha,
         unreviewed: tr.unreviewed,
+        reviewReport: tr.reviewReport,
         executorAdapter: executorInfo?.adapter,
         executorModel: executorInfo?.model,
         reviewCycle,
@@ -426,7 +431,7 @@ function computeCounts(
   let failed = 0;
   let completed = 0;
   for (const r of results.values()) {
-    if (r.status === "accepted") { accepted++; completed++; }
+    if (r.status === "accepted" || r.status === "accepted_with_warnings") { accepted++; completed++; }
     else if (r.status === "completed_unreviewed") { accepted++; completed++; }
     else if (r.status === "no_changes") { accepted++; completed++; }
     else failed++;
@@ -531,7 +536,7 @@ interface WorkerHandle {
  */
 function isEligibleForIntegration(result: WaveTaskResult): boolean {
   return (
-    (result.status === "accepted" || result.status === "completed_unreviewed") &&
+    (result.status === "accepted" || result.status === "accepted_with_warnings" || result.status === "completed_unreviewed") &&
     !!result.acceptedCommitSha &&
     !!result.acceptedRef
   );
@@ -728,6 +733,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
                     acceptedRef: r.acceptedRef,
                     acceptedCommitSha: r.acceptedCommitSha,
                     unreviewed: r.unreviewed,
+                    reviewReport: r.reviewReport,
                   };
                 }
                 const activeHandle = handles.find((h) => h.taskId === ti.taskId && !h.settled);
@@ -769,6 +775,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
             acceptedRef: r.acceptedRef,
             acceptedCommitSha: r.acceptedCommitSha,
             unreviewed: r.unreviewed,
+            reviewReport: r.reviewReport,
           };
         }
         const activeHandle = handles.find((h) => h.taskId === ti.taskId && !h.settled);
@@ -826,6 +833,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
             acceptedRef: r.acceptedRef,
             acceptedCommitSha: r.acceptedCommitSha,
             unreviewed: r.unreviewed,
+            reviewReport: r.reviewReport,
           };
         }
         // Check if this task is currently running in an active slot.
@@ -939,6 +947,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         acceptedRef: r.acceptedRef,
         acceptedCommitSha: r.acceptedCommitSha,
         unreviewed: r.unreviewed,
+        reviewReport: r.reviewReport,
       };
     }
     const activeHandle = handles.find((h) => h.taskId === ti.taskId && !h.settled);

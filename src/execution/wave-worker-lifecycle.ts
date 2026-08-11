@@ -55,6 +55,11 @@ import {
 } from "../state";
 import type { ReviewResult } from "../schema";
 import type { TokenUsage } from "../usage";
+import {
+  buildReviewReportFromOutputs,
+  hasPartialReviewerFailure,
+  type SubtaskReviewReport,
+} from "../review-report";
 import type { SubtaskProgressUpdate } from "./types";
 import { createWorkspaceSnapshot, type WorkspaceSnapshot } from "../capture";
 import {
@@ -67,6 +72,7 @@ import {
 /** Status of a complete wave worker lifecycle. */
 export type WaveWorkerLifecycleStatus =
   | "accepted"
+  | "accepted_with_warnings"
   | "completed_unreviewed"
   | "no_changes"
   | "review_error"
@@ -112,6 +118,7 @@ export interface WaveWorkerLifecycleResult {
   unreviewed?: boolean;
   /** Worker artifact directory. */
   artifactDir: string;
+  reviewReport?: SubtaskReviewReport;
 }
 
 /** Input for the lifecycle. Extends WaveWorkerInput with review-specific options. */
@@ -298,6 +305,10 @@ async function runCandidateReview(
 
 /** Write result.json to the worker artifact root. */
 async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResult): Promise<void> {
+  result.reviewReport ??= buildReviewReportFromOutputs({
+    outputs: result.reviewCycles,
+    artifactDir,
+  });
   await writeFile(
     join(artifactDir, "result.json"),
     JSON.stringify({
@@ -318,6 +329,7 @@ async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResul
         candidateTreeSha: c.candidateTreeSha,
         verdict: c.verdict,
       })),
+      reviewReport: result.reviewReport,
       error: result.error,
       completedAt: new Date().toISOString(),
     }, null, 2),
@@ -1015,11 +1027,14 @@ export async function runWaveWorkerLifecycle(
       // Restore the clean worker HEAD/index to the exact passed candidate before pinning.
       await gitResetHard(worktree.worktreeRoot, passedCommitSha);
       const workerRef = await pinCommit(capture, passedCommitSha, { type: "worker", taskId }, signal);
+      const acceptedWithWarnings = hasPartialReviewerFailure(reviewOutput.reviewerResults);
       const result: WaveWorkerLifecycleResult = {
-        status: "accepted",
+        status: acceptedWithWarnings ? "accepted_with_warnings" : "accepted",
         taskId,
         title: task.title,
-        summary: "Review passed and confirmed unchanged.",
+        summary: acceptedWithWarnings
+          ? "Review passed and confirmed unchanged, with reviewer infrastructure warnings."
+          : "Review passed and confirmed unchanged.",
         adapter: confirmResult.adapter,
         model: confirmResult.model,
         usage: confirmResult.usage,

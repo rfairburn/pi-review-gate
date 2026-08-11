@@ -20,6 +20,10 @@ import {
 } from "../state";
 import { createReviewTransmissionMessage, type ReviewTransmissionAction } from "../transmission";
 import type { TokenUsage } from "../usage";
+import {
+  buildReviewReportFromHistory,
+  type SubtaskReviewReport,
+} from "../review-report";
 import { createExecutorAdapter } from "./adapters/factory";
 import type { ExecutorSession, ExecutorTurn, SubtaskProgressPhase, SubtaskProgressUpdate } from "./types";
 
@@ -32,6 +36,7 @@ export interface ExecuteSubtaskInput {
 
 export type SubtaskOutcomeKind =
   | "accepted"
+  | "accepted_with_warnings"
   | "completed_unreviewed"
   | "blocked"
   | "deferred"
@@ -46,7 +51,7 @@ export interface SubtaskPacket {
   summary: string;
   finalSnapshot: string;
   changedFiles: string[];
-  reviewStatus: "accepted" | "not_run" | "failed";
+  reviewStatus: "accepted" | "accepted_with_warnings" | "not_run" | "failed";
   reviewDisabledReason?: "no_enabled_reviewers" | "review_master_disabled" | "no_reviewable_changes";
   reviewCycles: number;
   executorAdapter: string;
@@ -54,6 +59,7 @@ export interface SubtaskPacket {
   usage?: TokenUsage;
   bundleDir?: string;
   error?: string;
+  reviewReport?: SubtaskReviewReport;
 }
 
 export interface ExecuteSubtaskControllerInput {
@@ -234,7 +240,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
     journal(input, subtaskId, "reviewing", { turn: turnNumber });
     const output = await runReview({
       cwd: input.cwd,
-      request: buildRequestContext(childState),
+      request: buildRequestContext(childState, childState.reviewWindow, { priorFeedback: "latest" }),
       before: childWindow.baseline!,
       config: frozenConfig,
       evidence: childWindow.evidence,
@@ -311,7 +317,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
         changes: output.changes,
         evidenceEventCount: childWindow.evidence.events.length,
       })) {
-        return finishFailure(input, subtaskId, artifactDir, "deferred", "Reviewer repeated the same blocking feedback without new correction evidence.", childState, parentBaseline, adapter.kind, adapter.model);
+        return finishFailure(input, subtaskId, artifactDir, "deferred", "Reviewer repeated the same blocking feedback without new correction evidence.", childState, parentBaseline, adapter.kind, adapter.model, output);
       }
       childWindow.lastCorrectionFeedback = createCorrectionFeedbackMarker({
         result: output.result,
@@ -319,7 +325,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
         evidenceEventCount: childWindow.evidence.events.length,
       });
       if (childWindow.correctionCycles >= frozenConfig.maxCorrectionCycles) {
-        return finishFailure(input, subtaskId, artifactDir, "deferred", "Automatic correction cap reached.", childState, parentBaseline, adapter.kind, adapter.model);
+        return finishFailure(input, subtaskId, artifactDir, "deferred", "Automatic correction cap reached.", childState, parentBaseline, adapter.kind, adapter.model, output);
       }
       childWindow.correctionCycles += 1;
       const message = await transmit(childState, output, "sent_for_correction", "correction_required");
@@ -329,7 +335,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
       continue;
     }
 
-    return finishFailure(input, subtaskId, artifactDir, "review_error", output.result.summary, childState, parentBaseline, adapter.kind, adapter.model);
+    return finishFailure(input, subtaskId, artifactDir, "review_error", output.result.summary, childState, parentBaseline, adapter.kind, adapter.model, output);
   }
 }
 
@@ -377,33 +383,48 @@ async function finishSuccess(input: {
   reviewDisabledReason?: SubtaskPacket["reviewDisabledReason"];
   reviewCycles: number;
 }): Promise<SubtaskPacket> {
+  const reviewers = resolveReviewers(input.input.config, input.input.scopedModels).reviewers;
+  const reviewReport = buildReviewReportFromHistory({
+    history: input.childState.reviewWindow?.reviewHistory ?? [],
+    reviewers,
+    artifactDir: input.artifactDir,
+  });
+  const kind: "accepted" | "accepted_with_warnings" | "completed_unreviewed" =
+    input.kind === "accepted" && reviewReport?.aggregate === "pass_with_warnings"
+      ? "accepted_with_warnings"
+      : input.kind;
+  const reviewStatus = kind === "accepted_with_warnings" ? "accepted_with_warnings" : input.reviewStatus;
   reportProgress(input.input, input.subtaskId, {
     phase: "completing",
-    message: input.kind === "accepted" ? "subtask accepted" : "subtask completed without review",
+    message: kind === "accepted_with_warnings"
+      ? "subtask accepted with reviewer infrastructure warnings"
+      : kind === "accepted" ? "subtask accepted" : "subtask completed without review",
     artifactDir: input.artifactDir,
     adapter: input.adapterKind,
     model: input.adapterModel,
   });
   const after = await snapshot(input.input.cwd, input.input.config, input.input.signal);
   checkpointReviewWindow(input.input.parentState, after);
-  const retained = input.input.config.retainBundles === "always";
+  const retained = input.input.config.retainBundles === "always" || reviewReport?.aggregate === "pass_with_warnings";
+  if (reviewReport && !retained) reviewReport.artifactDir = undefined;
   const packet: SubtaskPacket = {
     subtaskId: input.subtaskId,
     title: input.input.task.title,
-    kind: input.kind,
+    kind,
     summary: input.summary,
     finalSnapshot: snapshotDigest(after),
     changedFiles: compareSnapshots(input.before, after).map((change) => change.path),
-    reviewStatus: input.reviewStatus,
+    reviewStatus,
     reviewDisabledReason: input.reviewDisabledReason,
     reviewCycles: input.reviewCycles,
     executorAdapter: input.adapterKind,
     executorModel: input.adapterModel,
     usage: input.usage,
     bundleDir: retained ? input.artifactDir : undefined,
+    reviewReport,
   };
   await writeFile(join(input.artifactDir, "completion.json"), JSON.stringify(packet, null, 2), "utf8");
-  journal(input.input, input.subtaskId, input.kind, { reviewStatus: input.reviewStatus });
+  journal(input.input, input.subtaskId, kind, { reviewStatus });
   if (!retained) {
     await rm(input.artifactDir, { recursive: true, force: true });
   }
@@ -414,12 +435,13 @@ async function finishFailure(
   input: ExecuteSubtaskControllerInput,
   subtaskId: string,
   artifactDir: string,
-  kind: Exclude<SubtaskOutcomeKind, "accepted" | "completed_unreviewed" | "blocked">,
+  kind: Exclude<SubtaskOutcomeKind, "accepted" | "accepted_with_warnings" | "completed_unreviewed" | "blocked">,
   message: string,
   childState: ReviewGateState,
   before: WorkspaceSnapshot,
   adapterKind: string,
   adapterModel?: string,
+  currentReviewOutput?: ReviewRunOutput,
 ): Promise<SubtaskPacket> {
   reportProgress(input, subtaskId, {
     phase: "completing",
@@ -430,6 +452,12 @@ async function finishFailure(
   });
   const after = await snapshot(input.cwd, input.config, input.signal);
   const changedFiles = compareSnapshots(before, after).map((change) => change.path);
+  const reviewReport = buildReviewReportFromHistory({
+    history: childState.reviewWindow?.reviewHistory ?? [],
+    reviewers: resolveReviewers(input.config, input.scopedModels).reviewers,
+    artifactDir,
+    currentOutput: currentReviewOutput,
+  });
   const packet: SubtaskPacket = {
     subtaskId,
     title: input.task.title,
@@ -443,6 +471,7 @@ async function finishFailure(
     executorModel: adapterModel,
     bundleDir: artifactDir,
     error: message,
+    reviewReport,
   };
   await writeFile(join(artifactDir, "failure.json"), JSON.stringify(packet, null, 2), "utf8");
   journal(input, subtaskId, kind, { error: message });

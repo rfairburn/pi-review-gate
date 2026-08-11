@@ -205,6 +205,29 @@ test("buildRequestContext preserves user guidance and prior capped reviewer feed
   assert.match(buildRequestContext(state), /feedback held at the correction cap, then sent by \/review-continue/);
 });
 
+test("buildRequestContext can focus correction prompts on only the latest prior review", () => {
+  const state = createState();
+  rememberUserRequest(state, "implement the authorized task");
+  for (const [sequence, summary] of [[1, "old intermediate finding"], [2, "latest unresolved finding"]] as const) {
+    recordReviewerFeedback(state, {
+      reviewSequence: sequence,
+      source: "automatic",
+      disposition: "sent_for_correction",
+      result: {
+        reviewerId: "reviewer",
+        verdict: "needs_changes",
+        summary,
+        findings: [],
+      },
+    });
+  }
+
+  const focused = buildRequestContext(state, state.reviewWindow, { priorFeedback: "latest" });
+  assert.match(focused, /implement the authorized task/);
+  assert.match(focused, /latest unresolved finding/);
+  assert.doesNotMatch(focused, /old intermediate finding/);
+});
+
 test("beginAgentRun preserves the review-window baseline and evidence across continuations", () => {
   const state = createState();
 

@@ -506,7 +506,7 @@ function renderSubtaskResult(result: unknown, options: unknown, theme: ThemeLike
   }
 
   const kind = typeof details.kind === "string" ? details.kind : "completed";
-  const failed = value.isError === true || !["accepted", "completed_unreviewed"].includes(kind);
+  const failed = value.isError === true || !["accepted", "accepted_with_warnings", "completed_unreviewed"].includes(kind);
   return textComponent((width) => {
     const lines = [
       `${theme.fg(failed ? "error" : "success", failed ? "✗" : "✓")} ${theme.fg("accent", kind)}`,
@@ -515,6 +515,12 @@ function renderSubtaskResult(result: unknown, options: unknown, theme: ThemeLike
     const summaryLines = summary.trim().split(/\r?\n/).filter(Boolean);
     const shown = expanded ? summaryLines : summaryLines.slice(0, 2);
     for (const line of shown) lines.push(`  ${theme.fg("toolOutput", clip(line, width - 4))}`);
+    if (isRecord(details.reviewReport) && typeof details.reviewReport.aggregate === "string") {
+      lines.push(theme.fg(
+        details.reviewReport.aggregate === "pass_with_warnings" ? "warning" : "dim",
+        clip(`  review: ${details.reviewReport.aggregate}`, width),
+      ));
+    }
     if (expanded && Array.isArray(details.changedFiles) && details.changedFiles.length > 0) {
       lines.push("", theme.fg("dim", clip(`  changed: ${details.changedFiles.join(", ")}`, width)));
     }
@@ -632,22 +638,50 @@ function textContent(value: unknown): string {
 }
 
 function toolResult(packet: Partial<SubtaskPacket> & { kind: string; summary: string }, isError: boolean): Record<string, unknown> {
+  const text = renderSubtaskPacketForModel(packet);
+  return {
+    content: [{ type: "text", text }],
+    details: packet,
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+export function renderSubtaskPacketForModel(packet: Partial<SubtaskPacket> & { kind: string; summary: string }): string {
   const lines = [
     `Subtask outcome: ${packet.kind}`,
     packet.summary,
     ...(packet.reviewStatus ? [`Review status: ${packet.reviewStatus}`] : []),
     ...(packet.changedFiles?.length ? [`Changed files: ${packet.changedFiles.join(", ")}`] : []),
     ...(packet.bundleDir ? [`Artifacts: ${packet.bundleDir}`] : []),
+    ...renderReviewReportForModel(packet.reviewReport),
   ];
-  return {
-    content: [{ type: "text", text: lines.join("\n") }],
-    details: packet,
-    ...(isError ? { isError: true } : {}),
-  };
+  return lines.join("\n");
 }
 
 function isFailure(packet: SubtaskPacket): boolean {
-  return !["accepted", "completed_unreviewed"].includes(packet.kind);
+  return !["accepted", "accepted_with_warnings", "completed_unreviewed"].includes(packet.kind);
+}
+
+function renderReviewReportForModel(report: SubtaskPacket["reviewReport"]): string[] {
+  if (!report) return [];
+  const lines = [
+    "",
+    `Review aggregate: ${report.aggregate} (${report.summary})`,
+    `Review cycles: ${report.reviewCycles}`,
+    "Latest reviewer evidence:",
+  ];
+  for (const reviewer of report.reviewers) {
+    lines.push(`- ${reviewer.displayLabel}: ${reviewer.verdict} — ${reviewer.summary}`);
+    if (reviewer.error) {
+      lines.push(`  Infrastructure warning (${reviewer.errorCategory ?? "infrastructure"}): ${reviewer.error}`);
+      if (reviewer.diagnostic) lines.push(`  Diagnostic: ${reviewer.diagnostic}`);
+    }
+    for (const finding of reviewer.findings) {
+      const location = finding.line === null ? finding.file : `${finding.file}:${finding.line}`;
+      lines.push(`  ${finding.severity} ${location}: ${finding.issue} Recommendation: ${finding.recommendation}`);
+    }
+  }
+  return lines;
 }
 
 function normalizeTask(value: unknown): ExecuteSubtaskInput | undefined {
@@ -816,7 +850,7 @@ function normalizeBatchInput(value: unknown): NormalizedBatchInput | undefined {
 }
 
 function isWaveTaskSuccess(status: string): boolean {
-  return status === "accepted" || status === "completed_unreviewed" || status === "no_changes";
+  return status === "accepted" || status === "accepted_with_warnings" || status === "completed_unreviewed" || status === "no_changes";
 }
 
 function wavePhaseLabel(phase: string): string {
@@ -846,6 +880,7 @@ function batchToolResult(input: {
     summary: string;
     error?: string;
     acceptedCommitSha?: string;
+    reviewReport?: SubtaskPacket["reviewReport"];
   }>;
   integration?: {
     status: string;
@@ -885,6 +920,11 @@ function batchToolResult(input: {
       const icon = isWaveTaskSuccess(tr.status) ? "✓" : "✗";
       lines.push(`  ${icon} ${tr.taskId} (${tr.status}): ${tr.title}`);
       if (tr.error) lines.push(`    error: ${tr.error}`);
+      if (tr.reviewReport) {
+        for (const line of renderReviewReportForModel(tr.reviewReport)) {
+          lines.push(line ? `    ${line}` : "");
+        }
+      }
     }
   }
 
@@ -1007,6 +1047,12 @@ function renderBatchResult(result: unknown, options: unknown, theme: ThemeLike) 
       for (const tr of details.taskResults) {
         const icon = isWaveTaskSuccess(tr.status) ? "✓" : "✗";
         lines.push(clip(`  ${icon} ${theme.fg("toolOutput", `${tr.taskId} (${tr.status}): ${tr.title}`)}`, width));
+        if (isRecord(tr.reviewReport) && typeof tr.reviewReport.aggregate === "string") {
+          lines.push(clip(theme.fg(
+            tr.reviewReport.aggregate === "pass_with_warnings" ? "warning" : "dim",
+            `    review: ${tr.reviewReport.aggregate}`,
+          ), width));
+        }
       }
     }
 

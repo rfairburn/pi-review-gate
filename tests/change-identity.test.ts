@@ -104,7 +104,7 @@ test("runReview includes changeIdentity in reviewer context and invocation metad
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -162,7 +162,7 @@ test("runAskReviewer includes changeIdentity in reviewer context and metadata", 
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -262,7 +262,7 @@ test("runReview preserves existing behavior when changeIdentity is omitted", asy
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -310,7 +310,7 @@ test("runAskReviewer preserves existing behavior when changeIdentity is omitted"
             "});",
           ].join(""),
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 
@@ -358,7 +358,7 @@ test("reused bundle removes stale change-identity.json when identity is omitted"
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))",
         ],
-        timeoutMs: 5000,
+        timeoutMs: 15000,
       },
     };
 

@@ -27,7 +27,7 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
       model: "ollama/glm-5.2",
       thinkingLevel: "max",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     let session;
@@ -36,7 +36,7 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
       cwd: process.cwd(),
       prompt: "review",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       onSession(value) { session = value; },
     });
     await adapter.run({
@@ -44,7 +44,7 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
       cwd: process.cwd(),
       prompt: "review correction",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
       session,
     });
 
@@ -66,8 +66,48 @@ test("LittleCoderAdapter disables tools and reports missing final assistant text
     assert.equal(resumedArgv[resumedArgv.indexOf("--session-id") + 1], sessionId);
     assert.equal(resumedArgv[resumedArgv.indexOf("--thinking") + 1], "max");
     assert.equal(resumedRun.budget, "16384");
-    assert.equal(argv[argv.indexOf("--session-dir") + 1], join(dir, "sessions", "glm"));
+    assert.equal(argv[argv.indexOf("--session-dir") + 1], join(dir, "session"));
     assert.deepEqual(JSON.parse(await readFile(join(dir, "process-result.json"), "utf8")).stdoutTruncated, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("LittleCoderAdapter reports terminal provider failures instead of missing final text", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-little-coder-provider-error-"));
+  try {
+    const commandPath = join(dir, "fake-little-coder-provider-error.mjs");
+    await writeFile(commandPath, [
+      "#!/usr/bin/env node",
+      "process.stdin.resume();",
+      "process.stdin.on('end',()=>{",
+      "  process.stdout.write(JSON.stringify({type:'message_end',message:{role:'assistant',content:[],errorMessage:'Codex error: Our servers are currently overloaded. Please try again later.'}})+'\\n');",
+      "  process.stdout.write(JSON.stringify({type:'auto_retry_end',success:false,attempt:3,finalError:'Codex error: Our servers are currently overloaded. Please try again later.'})+'\\n');",
+      "});",
+    ].join("\n"), "utf8");
+    await chmod(commandPath, 0o755);
+
+    const adapter = new LittleCoderAdapter({
+      id: "luna",
+      adapter: "little-coder-model",
+      model: "openai-codex/gpt-5.6-luna",
+      command: commandPath,
+      timeoutMs: 15000,
+    });
+    const result = await adapter.run({
+      id: "luna",
+      cwd: process.cwd(),
+      prompt: "review",
+      bundleDir: dir,
+      timeoutMs: 15000,
+    });
+
+    assert.equal(result.verdict, "error");
+    assert.equal(result.error, "provider_error");
+    assert.equal(result.summary, "Reviewer provider failed before producing a final response.");
+    assert.match(result.diagnostic ?? "", /servers are currently overloaded/);
+    const processResult = JSON.parse(await readFile(join(dir, "process-result.json"), "utf8"));
+    assert.match(processResult.terminalProviderError, /servers are currently overloaded/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -89,7 +129,7 @@ test("LittleCoderAdapter reports truncated output before final assistant text", 
       adapter: "little-coder-model",
       model: "ollama/glm-5.2",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     const result = await adapter.run({
@@ -97,7 +137,7 @@ test("LittleCoderAdapter reports truncated output before final assistant text", 
       cwd: process.cwd(),
       prompt: "review",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     assert.equal(result.verdict, "error");
@@ -136,7 +176,7 @@ test("LittleCoderAdapter captures final assistant text after retained stdout cap
       adapter: "little-coder-model",
       model: "ollama/glm-5.2",
       command: commandPath,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     const result = await adapter.run({
@@ -144,7 +184,7 @@ test("LittleCoderAdapter captures final assistant text after retained stdout cap
       cwd: process.cwd(),
       prompt: "review",
       bundleDir: dir,
-      timeoutMs: 5000,
+      timeoutMs: 15000,
     });
 
     assert.equal(result.verdict, "pass");

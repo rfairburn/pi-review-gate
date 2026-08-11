@@ -179,8 +179,9 @@ the normal bundle policy, and never treats the partial work as accepted.
 
 While `execute_subtask` is active, its tool card shows the current lifecycle
 phase and elapsed time. Press Ctrl+O to expand a bounded live activity view with
-the executor model, artifact directory, recent native little-coder tool and test
-milestones, review cycle, reviewer models, and reviewer completion verdicts.
+the executor model, artifact directory, recent native little-coder or Codex CLI
+tool and test milestones, review cycle, reviewer models, and reviewer completion
+verdicts.
 Streaming activity updates are UI-only and are not copied into the controlling
 model's context; only the final subtask packet is returned as tool context.
 

@@ -30,7 +30,10 @@ export class LittleCoderAdapter implements ModelAdapter {
     await mkdir(sessionDir, { recursive: true });
     req.onSession?.({ adapter: this.kind, id: sessionId });
     const streamExtractor = new PiJsonlReviewExtractor();
-    const activity = new PiJsonlActivityExtractor((message) => req.onUpdate?.(message));
+    const activity = new PiJsonlActivityExtractor(
+      (message) => req.onUpdate?.(message),
+      { includeModelUpdates: false },
+    );
     const args = [
       "--model",
       this.config.model,

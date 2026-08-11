@@ -16,10 +16,15 @@ test("little-coder executor uses the canonical model, isolated session, and nest
     args: [fixture.capture],
   });
 
-  const first = await adapter.run(request(fixture, 1));
+  const activity: string[] = [];
+  const first = await adapter.run({
+    ...request(fixture, 1),
+    onUpdate: (message) => activity.push(message),
+  });
   const second = await adapter.run(request(fixture, 2, first.session));
 
   assert.equal(first.text, "little complete");
+  assert.deepEqual(activity, ["model turn started", "model update · little complete", "model turn completed"]);
   assert.equal(second.session.id, first.session.id);
   const captured = JSON.parse(await readFile(fixture.capture, "utf8"));
   assert.deepEqual(valueAfter(captured.argv, "--model"), "openai-codex/gpt-5.6-sol");
@@ -40,8 +45,13 @@ test("Codex executor starts with automatic workspace-write approval and resumes 
     env: { CAPTURE_PATH: fixture.capture, PI_REVIEW_GATE_DISABLED: "0" },
   });
 
-  const first = await adapter.run(request(fixture, 1));
+  const activity: string[] = [];
+  const first = await adapter.run({
+    ...request(fixture, 1),
+    onUpdate: (message) => activity.push(message),
+  });
   assert.equal(first.session.id, "11111111-1111-4111-8111-111111111111");
+  assert.deepEqual(activity, ["model turn started", "model update · codex complete", "model turn completed"]);
   const start = JSON.parse(await readFile(fixture.capture, "utf8"));
   assert.ok(start.argv.includes("--approve-for-me"));
   assert.ok(!start.argv.includes("--sandbox"));
@@ -96,10 +106,14 @@ async function harnessFixture(mode: "little" | "codex" | "claude"): Promise<{
     "const capture = process.env.CAPTURE_PATH || argv.at(-1);",
     "fs.writeFileSync(capture, JSON.stringify({ argv, disabled: process.env.PI_REVIEW_GATE_DISABLED, thinkingBudget: process.env.LITTLE_CODER_THINKING_BUDGET }));",
     "if (mode === 'little') {",
+    "  console.log(JSON.stringify({ type: 'turn_start' }));",
     "  console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'little complete' }] } }));",
+    "  console.log(JSON.stringify({ type: 'turn_end', message: { role: 'assistant' }, toolResults: [] }));",
     "} else if (mode === 'codex') {",
     "  console.log(JSON.stringify({ type: 'thread.started', thread_id: '11111111-1111-4111-8111-111111111111' }));",
+    "  console.log(JSON.stringify({ type: 'turn.started' }));",
     "  console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'codex complete' } }));",
+    "  console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }));",
     "} else {",
     "  console.log(JSON.stringify({ result: 'claude complete', usage: { input_tokens: 10, output_tokens: 2 } }));",
     "}",

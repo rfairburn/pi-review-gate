@@ -4,6 +4,7 @@ import type { CodexExecutorConfig } from "../../config";
 import { reviewerEnv, runPromptProcess } from "../../adapters/process";
 import { extractCodexReviewFromJsonl } from "../../usage";
 import { writeExecutorArtifacts } from "../artifacts";
+import { CodexJsonlActivityExtractor } from "../progress";
 import type { ExecutorAdapter, ExecutorRequest, ExecutorTurn } from "../types";
 
 export class CodexExecutorAdapter implements ExecutorAdapter {
@@ -15,6 +16,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    const activity = new CodexJsonlActivityExtractor((message) => request.onUpdate?.(message));
     const finalPath = join(request.artifactDir, `codex-final-${String(request.turn).padStart(4, "0")}.txt`);
     const shared = [
       "--json",
@@ -34,8 +36,9 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       timeoutMs: this.config.timeoutMs ?? 1_800_000,
       env: reviewerEnv({ ...process.env, ...this.config.env }),
       signal: request.signal,
-      onStdoutChunk: () => request.onUpdate?.("Codex executor running"),
+      onStdoutChunk: (chunk) => activity.push(chunk),
     });
+    activity.finish();
     const extracted = extractCodexReviewFromJsonl(output.stdout);
     const fileText = await readFile(finalPath, "utf8").catch(() => "");
     const text = fileText.trim() ? fileText : extracted.text;

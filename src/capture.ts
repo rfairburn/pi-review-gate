@@ -10,6 +10,9 @@ const execFileAsync = promisify(execFile);
 export interface SnapshotOptions {
   maxFileBytes: number;
   maxSnapshotBytes: number;
+  signal?: AbortSignal;
+  /** Reuse content and hashes when path, size, and mtime are unchanged. */
+  reuseUnchangedFrom?: WorkspaceSnapshot;
 }
 
 export interface FileSnapshot {
@@ -58,19 +61,33 @@ const IGNORED_DIRS = new Set([
 ]);
 
 export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOptions): Promise<WorkspaceSnapshot> {
+  throwIfAborted(options.signal);
   const root = resolve(cwd);
-  const candidates = await discoverFiles(root);
+  const candidates = await discoverFiles(root, options.signal);
   let capturedBytes = 0;
   const files = new Map<string, FileSnapshot>();
 
   for (const relativePath of candidates.sort()) {
+    throwIfAborted(options.signal);
     const absolutePath = resolve(root, relativePath);
     const fileStat = await stat(absolutePath).catch(() => undefined);
     if (!fileStat?.isFile()) {
       continue;
     }
 
-    const sha256 = await hashFile(absolutePath);
+    const reusable = options.reuseUnchangedFrom?.files.get(relativePath);
+    if (
+      reusable?.exists
+      && reusable.absolutePath === absolutePath
+      && reusable.size === fileStat.size
+      && reusable.mtimeMs === fileStat.mtimeMs
+    ) {
+      files.set(relativePath, reusable);
+      if (reusable.content !== undefined) capturedBytes += reusable.size;
+      continue;
+    }
+
+    const sha256 = await hashFile(absolutePath, options.signal);
     const base: FileSnapshot = {
       relativePath,
       absolutePath,
@@ -91,7 +108,7 @@ export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOpti
       continue;
     }
 
-    const buffer = await readFile(absolutePath);
+    const buffer = await readFile(absolutePath, { signal: options.signal });
     const isBinary = looksBinary(buffer);
     if (isBinary) {
       files.set(relativePath, { ...base, isBinary: true, omittedReason: "binary" });
@@ -113,6 +130,7 @@ export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOpti
 }
 
 export async function createPathSnapshot(cwd: string, pathLike: string, options: SnapshotOptions): Promise<FileSnapshot> {
+  throwIfAborted(options.signal);
   const root = resolve(cwd);
   const absolutePath = isAbsolute(pathLike) ? resolve(pathLike) : resolve(root, pathLike);
   const relativePath = pathLabel(root, absolutePath);
@@ -130,7 +148,7 @@ export async function createPathSnapshot(cwd: string, pathLike: string, options:
     };
   }
 
-  const sha256 = await hashFile(absolutePath);
+  const sha256 = await hashFile(absolutePath, options.signal);
   const base: FileSnapshot = {
     relativePath,
     absolutePath,
@@ -145,7 +163,7 @@ export async function createPathSnapshot(cwd: string, pathLike: string, options:
     return { ...base, omittedReason: "oversized" };
   }
 
-  const buffer = await readFile(absolutePath);
+  const buffer = await readFile(absolutePath, { signal: options.signal });
   const isBinary = looksBinary(buffer);
   if (isBinary) {
     return { ...base, isBinary: true, omittedReason: "binary" };
@@ -190,37 +208,42 @@ export function compareFileSnapshots(before: FileSnapshot, after: FileSnapshot):
   return null;
 }
 
-export async function discoverFiles(cwd: string): Promise<string[]> {
-  const gitFiles = await discoverGitFiles(cwd);
+export async function discoverFiles(cwd: string, signal?: AbortSignal): Promise<string[]> {
+  throwIfAborted(signal);
+  const gitFiles = await discoverGitFiles(cwd, signal);
   if (gitFiles) {
     return gitFiles;
   }
-  return discoverFilesystemFiles(cwd);
+  return discoverFilesystemFiles(cwd, signal);
 }
 
-async function discoverGitFiles(cwd: string): Promise<string[] | null> {
+async function discoverGitFiles(cwd: string, signal?: AbortSignal): Promise<string[] | null> {
   try {
     const { stdout } = await execFileAsync("git", ["ls-files", "-co", "--exclude-standard", "-z"], {
       cwd,
       encoding: "buffer",
       maxBuffer: 20 * 1024 * 1024,
+      signal,
     });
     return stdout
       .toString("utf8")
       .split("\0")
       .filter(Boolean)
       .map(normalizeRelativePath);
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
 }
 
-async function discoverFilesystemFiles(cwd: string): Promise<string[]> {
+async function discoverFilesystemFiles(cwd: string, signal?: AbortSignal): Promise<string[]> {
   const result: string[] = [];
 
   async function walk(dir: string): Promise<void> {
+    throwIfAborted(signal);
     const entries = await readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      throwIfAborted(signal);
       if (entry.isDirectory() && IGNORED_DIRS.has(entry.name)) {
         continue;
       }
@@ -259,15 +282,36 @@ function fileChange(
   };
 }
 
-async function hashFile(path: string): Promise<string> {
+async function hashFile(path: string, signal?: AbortSignal): Promise<string> {
+  throwIfAborted(signal);
   const hash = createHash("sha256");
   await new Promise<void>((resolvePromise, reject) => {
     const stream = createReadStream(path);
+    const onAbort = () => stream.destroy(abortError(signal));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
     stream.on("data", (chunk) => hash.update(chunk));
-    stream.on("error", reject);
-    stream.on("end", resolvePromise);
+    stream.on("error", (error) => {
+      cleanup();
+      reject(error);
+    });
+    stream.on("end", () => {
+      cleanup();
+      resolvePromise();
+    });
   });
   return hash.digest("hex");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+function abortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error("Operation cancelled.");
+  error.name = "AbortError";
+  return error;
 }
 
 function looksBinary(buffer: Buffer): boolean {

@@ -150,7 +150,12 @@ function validateSafeId(id: string, label: string): void {
 
 // ── git helpers ──────────────────────────────────────────────────────────────
 
-async function gitCmd(args: string[], cwd: string, envOverrides: Record<string, string> = {}): Promise<void> {
+async function gitCmd(
+  args: string[],
+  cwd: string,
+  envOverrides: Record<string, string> = {},
+  signal?: AbortSignal,
+): Promise<void> {
   await execFileAsync(
     "git",
     args,
@@ -158,11 +163,17 @@ async function gitCmd(args: string[], cwd: string, envOverrides: Record<string, 
       cwd,
       env: { ...process.env, ...GIT_ENV, ...envOverrides },
       timeout: 30_000,
+      signal,
     },
   );
 }
 
-async function gitOut(args: string[], cwd: string, envOverrides: Record<string, string> = {}): Promise<string> {
+async function gitOut(
+  args: string[],
+  cwd: string,
+  envOverrides: Record<string, string> = {},
+  signal?: AbortSignal,
+): Promise<string> {
   const { stdout } = await execFileAsync(
     "git",
     args,
@@ -170,6 +181,7 @@ async function gitOut(args: string[], cwd: string, envOverrides: Record<string, 
       cwd,
       env: { ...process.env, ...GIT_ENV, ...envOverrides },
       timeout: 30_000,
+      signal,
     },
   );
   return stdout.trim();
@@ -184,6 +196,7 @@ async function gitOut(args: string[], cwd: string, envOverrides: Record<string, 
 async function validateWorkerCommit(
   capture: WaveCaptureResult,
   worker: SelectedWorker,
+  signal?: AbortSignal,
 ): Promise<void> {
   const { waveId, repositoryPath, baseCommit } = capture;
   const { taskId, commitSha } = worker;
@@ -196,7 +209,11 @@ async function validateWorkerCommit(
   const workerRef = workerRefName(waveId, taskId);
 
   // Check that the ref exists and points to the expected commit.
-  const pinnedSha = await gitOut(["rev-parse", "--verify", workerRef], repositoryPath).catch(() => null);
+  const pinnedSha = await gitOut(["rev-parse", "--verify", workerRef], repositoryPath, {}, signal)
+    .catch((error) => {
+      if (signal?.aborted) throw error;
+      return null;
+    });
   if (!pinnedSha) {
     throw new Error(
       `Worker commit for task "${taskId}" is not pinned under ${workerRef}. ` +
@@ -214,6 +231,8 @@ async function validateWorkerCommit(
   const parentLine = await gitOut(
     ["rev-list", "--parents", "-n", "1", commitSha],
     repositoryPath,
+    {},
+    signal,
   );
   const tokens = parentLine.split(/\s+/);
   const parentShas = tokens.slice(1);
@@ -246,6 +265,7 @@ async function validateWorkerCommit(
 async function cherryPickCommit(
   worktreeRoot: string,
   commitSha: string,
+  signal?: AbortSignal,
 ): Promise<{ success: true; newHead: string } | { success: false; conflictingPaths: string[]; gitDiagnostics: string }> {
   const commitEnv = {
     ...process.env,
@@ -259,15 +279,16 @@ async function cherryPickCommit(
   try {
     // Keep already-applied changes as an empty commit rather than silently
     // skipping them, preserving declared worker order across Git versions.
-    await gitCmd(["cherry-pick", "--keep-redundant-commits", commitSha], worktreeRoot, commitEnv);
-    const newHead = await gitOut(["rev-parse", "HEAD"], worktreeRoot);
+    await gitCmd(["cherry-pick", "--keep-redundant-commits", commitSha], worktreeRoot, commitEnv, signal);
+    const newHead = await gitOut(["rev-parse", "HEAD"], worktreeRoot, {}, signal);
     return { success: true, newHead };
   } catch (err) {
     // Distinguish actual textual conflicts from other failures.
-    const conflictingPaths = await getConflictingPaths(worktreeRoot);
+    if (signal?.aborted) throw err;
+    const conflictingPaths = await getConflictingPaths(worktreeRoot, signal);
     if (conflictingPaths.length > 0) {
       // Real textual conflict — return structured diagnostics.
-      const gitDiagnostics = await getConflictDiagnostics(worktreeRoot, err);
+      const gitDiagnostics = await getConflictDiagnostics(worktreeRoot, err, signal);
       return { success: false, conflictingPaths, gitDiagnostics };
     }
     // No unmerged paths — this is not a textual conflict.
@@ -277,17 +298,19 @@ async function cherryPickCommit(
 }
 
 /** Get NUL-safe list of conflicting file paths. */
-async function getConflictingPaths(worktreeRoot: string): Promise<string[]> {
+async function getConflictingPaths(worktreeRoot: string, signal?: AbortSignal): Promise<string[]> {
   try {
     const rawOutput = await gitOutBuffer(
       ["diff", "--name-only", "-z", "--diff-filter=U"],
       worktreeRoot,
+      signal,
     );
     return rawOutput.split("\0").filter(Boolean).sort();
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     // Fallback: parse git status output.
     try {
-      const status = await gitOut(["status", "--porcelain"], worktreeRoot);
+      const status = await gitOut(["status", "--porcelain"], worktreeRoot, {}, signal);
       const paths: string[] = [];
       for (const line of status.split("\n")) {
         // Conflicted files show as "UU <path>" or "UU\t<path>".
@@ -297,14 +320,19 @@ async function getConflictingPaths(worktreeRoot: string): Promise<string[]> {
         }
       }
       return paths.sort();
-    } catch {
+    } catch (fallbackError) {
+      if (signal?.aborted) throw fallbackError;
       return [];
     }
   }
 }
 
 /** Get Git diagnostics for the conflict. */
-async function getConflictDiagnostics(worktreeRoot: string, originalError?: unknown): Promise<string> {
+async function getConflictDiagnostics(
+  worktreeRoot: string,
+  originalError?: unknown,
+  signal?: AbortSignal,
+): Promise<string> {
   const parts: string[] = [];
 
   if (originalError instanceof Error) {
@@ -312,16 +340,18 @@ async function getConflictDiagnostics(worktreeRoot: string, originalError?: unkn
   }
 
   try {
-    const status = await gitOut(["status", "--short"], worktreeRoot);
+    const status = await gitOut(["status", "--short"], worktreeRoot, {}, signal);
     parts.push(`git status:\n${status}`);
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     parts.push("git status: unavailable");
   }
 
   try {
-    const diff = await gitOut(["diff", "--name-only", "--diff-filter=U"], worktreeRoot);
+    const diff = await gitOut(["diff", "--name-only", "--diff-filter=U"], worktreeRoot, {}, signal);
     parts.push(`conflicted files:\n${diff}`);
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     parts.push("conflicted files: unavailable");
   }
 
@@ -329,7 +359,7 @@ async function getConflictDiagnostics(worktreeRoot: string, originalError?: unkn
 }
 
 /** Like gitOut but returns raw buffer output (for NUL-safe parsing). */
-async function gitOutBuffer(args: string[], cwd: string): Promise<string> {
+async function gitOutBuffer(args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
   const { stdout } = await execFileAsync(
     "git",
     args,
@@ -338,6 +368,7 @@ async function gitOutBuffer(args: string[], cwd: string): Promise<string> {
       env: { ...process.env, ...GIT_ENV },
       timeout: 30_000,
       encoding: "utf8",
+      signal,
       maxBuffer: 64 * 1024 * 1024,
     },
   );
@@ -372,6 +403,7 @@ async function gitOutBuffer(args: string[], cwd: string): Promise<string> {
 export async function integrateWave(
   capture: WaveCaptureResult,
   selectedWorkers: SelectedWorker[],
+  signal?: AbortSignal,
 ): Promise<WaveIntegrationResult> {
   const { waveId, repositoryPath, baseCommit } = capture;
 
@@ -380,9 +412,9 @@ export async function integrateWave(
 
   // ── Handle empty selection ──
   if (selectedWorkers.length === 0) {
-    const worktree = await createIntegrationWorktree(capture);
+    const worktree = await createIntegrationWorktree(capture, signal);
     const integratedRef = integrationRefName(waveId);
-    await pinCommit(capture, baseCommit, { type: "integration" });
+    await pinCommit(capture, baseCommit, { type: "integration" }, signal);
 
     return {
       status: "no_changes",
@@ -396,7 +428,7 @@ export async function integrateWave(
 
   // ── Validate all worker commits before touching any worktree ──
   for (const worker of selectedWorkers) {
-    await validateWorkerCommit(capture, worker);
+    await validateWorkerCommit(capture, worker, signal);
   }
 
   // Regression seam: allow tests to inject errors before worktree creation.
@@ -405,7 +437,7 @@ export async function integrateWave(
   }
 
   // ── Create the integration worktree at the base ──
-  const worktree = await createIntegrationWorktree(capture);
+  const worktree = await createIntegrationWorktree(capture, signal);
   const worktreeRoot = worktree.worktreeRoot;
 
   // Regression seam: allow tests to inject errors after worktree creation.
@@ -415,10 +447,10 @@ export async function integrateWave(
 
   // ── Fast-forward to the first selected worker ──
   const firstWorker = selectedWorkers[0];
-  await gitCmd(["reset", "--hard", firstWorker.commitSha], worktreeRoot);
+  await gitCmd(["reset", "--hard", firstWorker.commitSha], worktreeRoot, {}, signal);
 
   // Verify the fast-forward preserved the original commit hash.
-  const firstHead = await gitOut(["rev-parse", "HEAD"], worktreeRoot);
+  const firstHead = await gitOut(["rev-parse", "HEAD"], worktreeRoot, {}, signal);
   if (firstHead !== firstWorker.commitSha) {
     throw new Error(
       `Fast-forward to first worker ${firstWorker.taskId} did not preserve commit hash. ` +
@@ -438,7 +470,7 @@ export async function integrateWave(
   // ── Cherry-pick remaining workers in declared order ──
   for (let i = 1; i < selectedWorkers.length; i++) {
     const worker = selectedWorkers[i];
-    const result = await cherryPickCommit(worktreeRoot, worker.commitSha);
+    const result = await cherryPickCommit(worktreeRoot, worker.commitSha, signal);
 
     if (!result.success) {
       // Conflict — return structured diagnostics without pinning.
@@ -462,9 +494,9 @@ export async function integrateWave(
   }
 
   // ── Pin the final integrated HEAD ──
-  const finalHead = await gitOut(["rev-parse", "HEAD"], worktreeRoot);
+  const finalHead = await gitOut(["rev-parse", "HEAD"], worktreeRoot, {}, signal);
   const integratedRef = integrationRefName(waveId);
-  await pinCommit(capture, finalHead, { type: "integration" });
+  await pinCommit(capture, finalHead, { type: "integration" }, signal);
 
   return {
     status: "integrated",

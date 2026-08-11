@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:test": "tsc -p tsconfig.test.json",
-    "test": "npm run build && npm run build:test && node --test dist-test/tests/*.test.js"
+    "test": "npm run build && npm run build:test && node --test --test-concurrency=1 dist-test/tests/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

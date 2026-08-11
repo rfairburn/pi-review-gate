@@ -342,6 +342,8 @@ export class ExecutionToolManager {
           const preWaveSnapshot = await createWorkspaceSnapshot(cwd, {
             maxFileBytes: this.input.config.maxFileBytes,
             maxSnapshotBytes: this.input.config.maxSnapshotBytes,
+            signal,
+            reuseUnchangedFrom: parentBaseline,
           });
 
           let waveResult: WaveResult;
@@ -361,7 +363,9 @@ export class ExecutionToolManager {
                 timestamp: new Date().toISOString(),
               });
               return batchToolResult({
-                summary: `Wave capture failed [${err.code}]: ${err.message}`,
+                summary: err.code === "cancelled"
+                  ? `Wave cancelled during capture: ${err.message}`
+                  : `Wave capture failed [${err.code}]: ${err.message}`,
                 waveId: err.waveId,
                 phase: err.phase,
                 errorCode: err.code,
@@ -384,6 +388,8 @@ export class ExecutionToolManager {
             const afterSnapshot = await createWorkspaceSnapshot(cwd, {
               maxFileBytes: this.input.config.maxFileBytes,
               maxSnapshotBytes: this.input.config.maxSnapshotBytes,
+              signal,
+              reuseUnchangedFrom: preWaveSnapshot,
             });
             // Build selective checkpoint: pre-wave baseline + only landed wave paths.
             // Use sourceRoot (Git top-level) for path resolution, not cwd.

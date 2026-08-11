@@ -289,7 +289,7 @@ function validateSafeId(id: string, label: string): void {
 
 // ── git helpers ──────────────────────────────────────────────────────────────
 
-async function gitOut(args: string[], cwd: string): Promise<string> {
+async function gitOut(args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
   const { stdout } = await execFileAsync(
     "git",
     args,
@@ -297,13 +297,14 @@ async function gitOut(args: string[], cwd: string): Promise<string> {
       cwd,
       env: { ...process.env, ...GIT_ENV },
       timeout: 30_000,
+      signal,
     },
   );
   return stdout.trim();
 }
 
 /** Like gitOut but returns raw buffer output (for NUL-safe parsing). */
-async function gitOutBuffer(args: string[], cwd: string): Promise<string> {
+async function gitOutBuffer(args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
   const { stdout } = await execFileAsync(
     "git",
     args,
@@ -313,6 +314,7 @@ async function gitOutBuffer(args: string[], cwd: string): Promise<string> {
       timeout: 30_000,
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
+      signal,
     },
   );
   return stdout;
@@ -322,6 +324,14 @@ async function gitOutBuffer(args: string[], cwd: string): Promise<string> {
 function hashBlob(data: Buffer): string {
   const header = `blob ${data.length}\0`;
   return createHash("sha1").update(header).update(data).digest("hex");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error("Operation cancelled.");
+  error.name = "AbortError";
+  throw error;
 }
 
 // ── tree entry lookup ────────────────────────────────────────────────────────
@@ -338,6 +348,7 @@ async function lookupTreeEntry(
   repoPath: string,
   treeSha: string,
   path: string,
+  signal?: AbortSignal,
 ): Promise<TreeEntry | null> {
   // Use :(literal) path magic so filenames with glob metacharacters (*, ?, [)
   // are treated as literal paths, not patterns. Use -z for NUL-delimited output
@@ -345,6 +356,7 @@ async function lookupTreeEntry(
   const output = await gitOutBuffer(
     ["ls-tree", "-z", treeSha, `:(literal)${path}`],
     repoPath,
+    signal,
   );
 
   if (!output) {
@@ -400,7 +412,9 @@ async function lookupTreeEntry(
 async function inspectSourceFile(
   sourceRoot: string,
   relPath: string,
+  signal?: AbortSignal,
 ): Promise<{ blobId: string; mode: string } | null> {
+  throwIfAborted(signal);
   const fullPath = join(sourceRoot, relPath);
 
   // Validate ancestor directories: reject symlinked or special ancestors
@@ -409,6 +423,7 @@ async function inspectSourceFile(
   const segments = relPath.split("/");
   const ancestorCount = segments.length - 1;
   for (let i = 0; i < ancestorCount; i++) {
+    throwIfAborted(signal);
     const ancestor = segments[i];
     if (!ancestor) continue;
     const ancestorPath = join(sourceRoot, ...segments.slice(0, i + 1));
@@ -476,7 +491,7 @@ async function inspectSourceFile(
         `Path "${relPath}" resolves outside source root via symlink traversal.`,
       );
     }
-    const data = await fs.readFile(fullPath);
+    const data = await fs.readFile(fullPath, { signal });
     const blobId = hashBlob(data);
     const isExecutable = (lstat.mode & 0o111) !== 0;
     const mode = isExecutable ? "100755" : "100644";
@@ -531,7 +546,9 @@ export async function planWaveLanding(
   capture: WaveCaptureResult,
   integratedCommitSha: string,
   sourceRoot: string,
+  signal?: AbortSignal,
 ): Promise<LandingPlan> {
+  throwIfAborted(signal);
   const { waveId, repositoryPath, baseCommit } = capture;
 
   // Validate IDs.
@@ -557,7 +574,11 @@ export async function planWaveLanding(
   const refSha = await gitOut(
     ["rev-parse", "--verify", integratedRef],
     repositoryPath,
-  ).catch(() => null);
+    signal,
+  ).catch((error) => {
+    if (signal?.aborted) throw error;
+    return null;
+  });
 
   if (!refSha) {
     throw new Error(
@@ -576,6 +597,7 @@ export async function planWaveLanding(
   const rawPaths = await gitOutBuffer(
     ["diff", "--name-only", "-z", "--no-renames", baseCommit, integratedCommitSha],
     repositoryPath,
+    signal,
   );
   const changedPaths = rawPaths
     .split("\0")
@@ -584,6 +606,7 @@ export async function planWaveLanding(
 
   // Validate all paths are safe.
   for (const path of changedPaths) {
+    throwIfAborted(signal);
     validatePathSafe(path);
   }
 
@@ -591,18 +614,21 @@ export async function planWaveLanding(
   const baseTreeSha = await gitOut(
     ["rev-parse", `${baseCommit}^{tree}`],
     repositoryPath,
+    signal,
   );
   const resultTreeSha = await gitOut(
     ["rev-parse", `${integratedCommitSha}^{tree}`],
     repositoryPath,
+    signal,
   );
 
   const baseEntries = new Map<string, TreeEntry | null>();
   const resultEntries = new Map<string, TreeEntry | null>();
 
   for (const path of changedPaths) {
-    const baseEntry = await lookupTreeEntry(repositoryPath, baseTreeSha, path);
-    const resultEntry = await lookupTreeEntry(repositoryPath, resultTreeSha, path);
+    throwIfAborted(signal);
+    const baseEntry = await lookupTreeEntry(repositoryPath, baseTreeSha, path, signal);
+    const resultEntry = await lookupTreeEntry(repositoryPath, resultTreeSha, path, signal);
     baseEntries.set(path, baseEntry);
     resultEntries.set(path, resultEntry);
   }
@@ -613,13 +639,14 @@ export async function planWaveLanding(
   const changedPathsList: string[] = [];
 
   for (const path of changedPaths) {
+    throwIfAborted(signal);
     const baseEntry = baseEntries.get(path)!;
     const resultEntry = resultEntries.get(path)!;
 
     // Inspect the current source filesystem.
     let current: { blobId: string; mode: string } | null;
     try {
-      current = await inspectSourceFile(resolvedSourceRoot, path);
+      current = await inspectSourceFile(resolvedSourceRoot, path, signal);
     } catch (err) {
       if (err instanceof Error && (
         err.message.includes("directory") ||
@@ -744,8 +771,9 @@ export async function planWaveLanding(
   const capturedHead = capture.discovery.headCommit;
   let currentHead: string | undefined;
   try {
-    currentHead = await gitOut(["rev-parse", "HEAD"], resolvedSourceRoot);
-  } catch {
+    currentHead = await gitOut(["rev-parse", "HEAD"], resolvedSourceRoot, signal);
+  } catch (error) {
+    if (signal?.aborted) throw error;
     // Source may not be a Git repo or HEAD may be unborn.
     currentHead = undefined;
   }
@@ -1001,7 +1029,11 @@ export async function executeWaveLanding(
   const refSha = await gitOut(
     ["rev-parse", "--verify", integratedRef],
     repositoryPath,
-  ).catch(() => null);
+    signal,
+  ).catch((error) => {
+    if (signal?.aborted) throw error;
+    return null;
+  });
 
   if (!refSha) {
     return {
@@ -1044,7 +1076,7 @@ export async function executeWaveLanding(
 
   // ── Step 2.5: Re-derive the tree delta from Git and compare ──
   // This prevents a mutable plan from landing a different blob/path delta.
-  const freshPlan = await planWaveLanding(capture, integratedCommitSha, resolvedSourceRoot);
+  const freshPlan = await planWaveLanding(capture, integratedCommitSha, resolvedSourceRoot, signal);
   if (freshPlan.conflicts.length > 0) {
     return {
       status: "conflicted",
@@ -1089,7 +1121,7 @@ export async function executeWaveLanding(
   for (const lp of [...applyPaths, ...alreadyAppliedPaths]) {
     let current: { blobId: string; mode: string } | null;
     try {
-      current = await inspectSourceFile(resolvedSourceRoot, lp.path);
+      current = await inspectSourceFile(resolvedSourceRoot, lp.path, signal);
     } catch (err) {
       if (err instanceof Error && (
         err.message.includes("directory") ||
@@ -1227,7 +1259,7 @@ export async function executeWaveLanding(
 
       if (lp.result.mode === "120000") {
         // Symlink: validate target is confined to source root before creating.
-        const blobData = await gitCatFileBlob(repositoryPath, lp.result.blobId!);
+        const blobData = await gitCatFileBlob(repositoryPath, lp.result.blobId!, signal);
         const symlinkTarget = blobData.toString("utf8");
         if (!isSymlinkTargetSafe(symlinkTarget, dir, resolvedSourceRoot)) {
           // Clean up temp files and directories created so far.
@@ -1248,7 +1280,7 @@ export async function executeWaveLanding(
         await fs.symlink(symlinkTarget, tempPath);
       } else {
         // Regular file: materialize blob content with exclusive write.
-        const blobData = await gitCatFileBlob(repositoryPath, lp.result.blobId!);
+        const blobData = await gitCatFileBlob(repositoryPath, lp.result.blobId!, signal);
         await fs.writeFile(tempPath, blobData, { flag: "wx" });
         // Set the correct mode.
         if (lp.result.mode === "100755") {
@@ -1339,7 +1371,7 @@ export async function executeWaveLanding(
         // Just-in-time state revalidation before mutation.
         let current: { blobId: string; mode: string } | null;
         try {
-          current = await inspectSourceFile(resolvedSourceRoot, lp.path);
+          current = await inspectSourceFile(resolvedSourceRoot, lp.path, signal);
         } catch (err) {
           if (err instanceof Error && (
             err.message.includes("directory") ||
@@ -1704,12 +1736,17 @@ export async function executeWaveLanding(
 /**
  * Read a blob's raw content from the Git repository.
  */
-async function gitCatFileBlob(repoPath: string, blobId: string): Promise<Buffer> {
+async function gitCatFileBlob(
+  repoPath: string,
+  blobId: string,
+  abortSignal?: AbortSignal,
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", ["cat-file", "-p", blobId], {
       cwd: repoPath,
       env: { ...process.env, ...GIT_ENV },
       timeout: 30_000,
+      signal: abortSignal,
     });
 
     const chunks: Buffer[] = [];

@@ -410,6 +410,7 @@ export async function runWaveWorkerLifecycle(
   const baseSnapshot = await createWorkspaceSnapshot(worktree.worktreeRoot, {
     maxFileBytes: config.maxFileBytes,
     maxSnapshotBytes: config.maxSnapshotBytes,
+    signal,
   });
 
   // ── 3. Run initial executor turn ──
@@ -525,7 +526,7 @@ export async function runWaveWorkerLifecycle(
 
   // Review disabled or no reviewers — pin and return completed_unreviewed.
   if (!frozen.enabled) {
-    const workerRef = await pinCommit(capture, candidate.commitSha, { type: "worker", taskId });
+    const workerRef = await pinCommit(capture, candidate.commitSha, { type: "worker", taskId }, signal);
     const result: WaveWorkerLifecycleResult = {
       status: "completed_unreviewed",
       taskId,
@@ -1003,7 +1004,7 @@ export async function runWaveWorkerLifecycle(
     if (confirmCandidate.treeSha === passedTreeSha) {
       // Restore the clean worker HEAD/index to the exact passed candidate before pinning.
       await gitResetHard(worktree.worktreeRoot, passedCommitSha);
-      const workerRef = await pinCommit(capture, passedCommitSha, { type: "worker", taskId });
+      const workerRef = await pinCommit(capture, passedCommitSha, { type: "worker", taskId }, signal);
       const result: WaveWorkerLifecycleResult = {
         status: "accepted",
         taskId,
@@ -1028,5 +1029,3 @@ export async function runWaveWorkerLifecycle(
     continue;
   }
 }
-
-

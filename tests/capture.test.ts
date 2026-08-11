@@ -55,3 +55,34 @@ test("snapshot omits binary content but still detects changes", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("snapshot reuses unchanged file hashes and content from a prior snapshot", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-"));
+  try {
+    await writeFile(join(dir, "unchanged.txt"), "unchanged\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const after = await createWorkspaceSnapshot(dir, {
+      ...snapshotOptions,
+      reuseUnchangedFrom: before,
+    });
+
+    assert.equal(after.files.get("unchanged.txt"), before.files.get("unchanged.txt"));
+    assert.deepEqual(compareSnapshots(before, after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot honors an already-aborted signal before discovery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-abort-"));
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    await assert.rejects(
+      createWorkspaceSnapshot(dir, { ...snapshotOptions, signal: controller.signal }),
+      /abort|cancel/i,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

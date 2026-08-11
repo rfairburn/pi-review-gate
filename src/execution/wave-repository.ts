@@ -18,6 +18,7 @@ async function gitSpawn(
   env: NodeJS.ProcessEnv,
   input: string | Buffer,
   timeoutMs = 30_000,
+  signal?: AbortSignal,
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const hasInput = typeof input === "string" ? input.length > 0 : input.byteLength > 0;
@@ -32,6 +33,7 @@ async function gitSpawn(
       cwd,
       env,
       timeout: timeoutMs,
+      signal,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -70,7 +72,7 @@ export type WaveSourceType = "git-committed" | "git-unborn" | "non-git";
 
 // ── typed capture errors ─────────────────────────────────────────────────────
 
-export type WaveCaptureErrorCode = "workspace_changing_during_capture" | "capture_failed";
+export type WaveCaptureErrorCode = "workspace_changing_during_capture" | "capture_failed" | "cancelled";
 
 export class WaveCaptureError extends Error {
   constructor(
@@ -112,12 +114,13 @@ export interface WaveSourceDiscovery {
  *
  * Performs only read-only Git invocations (no writes to source, index, HEAD, or metadata).
  */
-export async function discoverWaveSource(cwd: string): Promise<WaveSourceDiscovery> {
+export async function discoverWaveSource(cwd: string, signal?: AbortSignal): Promise<WaveSourceDiscovery> {
+  throwIfAborted(signal);
   const resolvedCwd = await fs.realpath(cwd);
 
   let gitResult: GitProbeResult | null;
   try {
-    gitResult = await probeGit(resolvedCwd);
+    gitResult = await probeGit(resolvedCwd, signal);
   } catch (err) {
     // Git probe error that is not "not a git repository" — fail capture.
     throw new WaveCaptureError(
@@ -138,7 +141,7 @@ export async function discoverWaveSource(cwd: string): Promise<WaveSourceDiscove
   }
 
   const { topLevel, commonDir, gitDir } = gitResult;
-  const headInfo = await probeHead(topLevel);
+  const headInfo = await probeHead(topLevel, signal);
 
   const relativeCwd = normalizeRelative(relative(topLevel, resolvedCwd));
 
@@ -171,12 +174,12 @@ interface HeadInfo {
   unborn: boolean;
 }
 
-async function probeGit(cwd: string): Promise<GitProbeResult | null> {
+async function probeGit(cwd: string, signal?: AbortSignal): Promise<GitProbeResult | null> {
   try {
     const { stdout } = await execFileAsync(
       "git",
       ["rev-parse", "--show-toplevel", "--git-common-dir", "--git-dir"],
-      { cwd, env: { ...process.env, ...GIT_ENV }, timeout: 10_000 },
+      { cwd, env: { ...process.env, ...GIT_ENV }, timeout: 10_000, signal },
     );
 
     const lines = stdout.trim().split(/\r?\n/);
@@ -202,15 +205,16 @@ async function probeGit(cwd: string): Promise<GitProbeResult | null> {
   }
 }
 
-async function probeHead(topLevel: string): Promise<HeadInfo> {
+async function probeHead(topLevel: string, signal?: AbortSignal): Promise<HeadInfo> {
   try {
     const { stdout } = await execFileAsync(
       "git",
       ["rev-parse", "HEAD"],
-      { cwd: topLevel, env: { ...process.env, ...GIT_ENV }, timeout: 10_000 },
+      { cwd: topLevel, env: { ...process.env, ...GIT_ENV }, timeout: 10_000, signal },
     );
     return { commit: stdout.trim(), unborn: false };
-  } catch {
+  } catch (error) {
+    if (signal?.aborted || isAbortError(error)) throw error;
     // HEAD resolution failure in a valid repo is treated as unborn.
     return { commit: undefined, unborn: true };
   }
@@ -234,40 +238,56 @@ function normalizeRelative(p: string): string {
  * Git index to honour nested .gitignore files and global exclusions.
  * Git metadata directories (.git) are always omitted.
  */
-export async function enumerateWaveSourcePaths(discovery: WaveSourceDiscovery): Promise<string[]> {
-  return (await enumerateWaveSourcePathSet(discovery)).paths;
+export async function enumerateWaveSourcePaths(
+  discovery: WaveSourceDiscovery,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  return (await enumerateWaveSourcePathSet(discovery, signal)).paths;
 }
 
 interface EnumeratedWavePaths {
   paths: string[];
   /** Paths whose current contents are not represented by HEAD or the index. */
   untrackedPaths: Set<string>;
+  /** Paths represented by the captured HEAD tree. */
+  headPaths: Set<string>;
 }
 
-async function enumerateWaveSourcePathSet(discovery: WaveSourceDiscovery): Promise<EnumeratedWavePaths> {
+async function enumerateWaveSourcePathSet(
+  discovery: WaveSourceDiscovery,
+  signal?: AbortSignal,
+): Promise<EnumeratedWavePaths> {
+  throwIfAborted(signal);
   if (discovery.isGit) {
-    return enumerateGitPaths(discovery);
+    return enumerateGitPaths(discovery, signal);
   }
-  const paths = await enumerateNonGitPaths(discovery);
-  return { paths, untrackedPaths: new Set(paths) };
+  const paths = await enumerateNonGitPaths(discovery, signal);
+  return { paths, untrackedPaths: new Set(paths), headPaths: new Set() };
 }
 
-async function enumerateGitPaths(discovery: WaveSourceDiscovery): Promise<EnumeratedWavePaths> {
+async function enumerateGitPaths(
+  discovery: WaveSourceDiscovery,
+  signal?: AbortSignal,
+): Promise<EnumeratedWavePaths> {
   const root = discovery.gitTopLevel!;
   const paths = new Set<string>();
+  const headPaths = new Set<string>();
 
   // 1. Paths from HEAD (if born)
   if (discovery.headCommit) {
-    const headPaths = await gitNulList("ls-tree", ["-r", "--name-only", "HEAD"], root);
-    for (const p of headPaths) paths.add(p);
+    const listedHeadPaths = await gitNulList("ls-tree", ["-r", "--name-only", "HEAD"], root, signal);
+    for (const p of listedHeadPaths) {
+      paths.add(p);
+      headPaths.add(p);
+    }
   }
 
   // 2. Paths from the real index
-  const indexPaths = await gitNulList("ls-files", ["--cached"], root);
+  const indexPaths = await gitNulList("ls-files", ["--cached"], root, signal);
   for (const p of indexPaths) paths.add(p);
 
   // 3. Non-ignored untracked paths
-  const untracked = await gitNulList("ls-files", ["--others", "--exclude-standard"], root);
+  const untracked = await gitNulList("ls-files", ["--others", "--exclude-standard"], root, signal);
   for (const p of untracked) paths.add(p);
 
   const sortedPaths = filterAndSort([...paths]);
@@ -275,11 +295,16 @@ async function enumerateGitPaths(discovery: WaveSourceDiscovery): Promise<Enumer
   return {
     paths: sortedPaths,
     untrackedPaths: new Set(filterAndSort(untracked).filter((path) => includedPaths.has(path))),
+    headPaths,
   };
 }
 
-async function enumerateNonGitPaths(discovery: WaveSourceDiscovery): Promise<string[]> {
+async function enumerateNonGitPaths(
+  discovery: WaveSourceDiscovery,
+  signal?: AbortSignal,
+): Promise<string[]> {
   const root = discovery.captureRoot;
+  throwIfAborted(signal);
   const tmpDir = await fs.mkdtemp(join(tmpdir(), "pi-wave-enum-"));
 
   try {
@@ -287,14 +312,14 @@ async function enumerateNonGitPaths(discovery: WaveSourceDiscovery): Promise<str
     await execFileAsync(
       "git",
       ["init", "--quiet"],
-      { cwd: tmpDir, env: { ...process.env, ...GIT_ENV }, timeout: 10_000 },
+      { cwd: tmpDir, env: { ...process.env, ...GIT_ENV }, timeout: 10_000, signal },
     );
 
     // Configure the worktree so Git can find .gitignore files in the source.
     await execFileAsync(
       "git",
       ["config", "core.worktree", root],
-      { cwd: tmpDir, env: { ...process.env, ...GIT_ENV }, timeout: 10_000 },
+      { cwd: tmpDir, env: { ...process.env, ...GIT_ENV }, timeout: 10_000, signal },
     );
 
     // Use the temp repo env: empty index means --others lists every non-ignored
@@ -309,7 +334,7 @@ async function enumerateNonGitPaths(discovery: WaveSourceDiscovery): Promise<str
     const { stdout } = await execFileAsync(
       "git",
       ["ls-files", "--others", "--exclude-standard", "-z"],
-      { cwd: root, env, timeout: 15_000, maxBuffer: 64 * 1024 * 1024 },
+      { cwd: root, env, timeout: 15_000, maxBuffer: 64 * 1024 * 1024, signal },
     );
 
     return filterAndSort(stdout.split("\0").filter(Boolean).map(normalizeRelative));
@@ -319,7 +344,12 @@ async function enumerateNonGitPaths(discovery: WaveSourceDiscovery): Promise<str
 }
 
 /** Run a git command that outputs NUL-delimited paths. */
-async function gitNulList(cmd: string, args: string[], cwd: string): Promise<string[]> {
+async function gitNulList(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
   // For ls-tree and ls-files, -z goes before the rest.
   const orderedArgs = cmd === "ls-tree"
     ? [cmd, "-z", ...args]
@@ -328,7 +358,7 @@ async function gitNulList(cmd: string, args: string[], cwd: string): Promise<str
   const { stdout } = await execFileAsync(
     "git",
     orderedArgs,
-    { cwd, env: { ...process.env, ...GIT_ENV }, timeout: 15_000, maxBuffer: 64 * 1024 * 1024 },
+    { cwd, env: { ...process.env, ...GIT_ENV }, timeout: 15_000, maxBuffer: 64 * 1024 * 1024, signal },
   );
   return stdout.split("\0").filter(Boolean).map(normalizeRelative);
 }
@@ -380,6 +410,8 @@ export interface WaveCaptureOptions {
   artifactDir?: string;
   /** Maximum number of capture attempts before giving up on consistency. Default 3. */
   maxCaptureAttempts?: number;
+  /** Abort signal used to cancel discovery, staging, verification, and checkout preparation. */
+  signal?: AbortSignal;
 }
 
 /** Immutable identity of the source capture root (dev + ino). */
@@ -427,7 +459,17 @@ export interface WaveCaptureResult {
  * mismatch up to maxCaptureAttempts.
  */
 export async function captureWaveBase(options: WaveCaptureOptions): Promise<WaveCaptureResult> {
-  const { cwd, maxSnapshotBytes, waveId: givenWaveId, artifactDir, maxCaptureAttempts: givenMaxAttempts } = options;
+  const {
+    cwd,
+    maxSnapshotBytes,
+    waveId: givenWaveId,
+    artifactDir,
+    maxCaptureAttempts: givenMaxAttempts,
+    signal,
+  } = options;
+  if (signal?.aborted) {
+    throw new WaveCaptureError("Wave capture cancelled.", "cancelled", givenWaveId, "capturing");
+  }
 
   // Validate maxSnapshotBytes: must be a non-negative finite integer.
   if (!Number.isFinite(maxSnapshotBytes) || maxSnapshotBytes < 0 || !Number.isInteger(maxSnapshotBytes)) {
@@ -466,15 +508,17 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
   } else {
     artifactParent = await fs.realpath(resolve(tmpdir()));
   }
+  throwIfAborted(signal);
 
   // 4. Retry loop with torn-snapshot detection.
   //    Discovery and path enumeration happen inside the loop so each retry
   //    sees the current source state.
   const waveId = givenWaveId ?? generateWaveId();
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    throwIfAborted(signal);
     // Re-discover the source on each attempt.
-    const discovery = await discoverWaveSource(cwd);
-    const enumeratedPaths = await enumerateWaveSourcePathSet(discovery);
+    const discovery = await discoverWaveSource(cwd, signal);
+    const enumeratedPaths = await enumerateWaveSourcePathSet(discovery, signal);
     const allPaths = enumeratedPaths.paths;
 
     // Containment check: reject if artifactParent is inside or equal to sourceRoot.
@@ -494,49 +538,78 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     try {
       waveRoot = await fs.mkdtemp(join(artifactParent, "wave-"));
       const repoPath = join(waveRoot, "wave-repo.git");
-      await fs.mkdir(repoPath, { recursive: true });
-      await gitCmd("init", ["--bare", "--quiet"], repoPath);
-
-      // For committed Git sources, import the HEAD commit object so we can
-      // use it as the parent of our synthetic base commit.
-      let parentCommit: string | undefined;
-      if (discovery.sourceType === "git-committed" && discovery.headCommit && discovery.gitDir) {
-        parentCommit = await importCommitObject(discovery.gitDir, repoPath, discovery.headCommit);
+      if (discovery.isGit) {
+        // Local clone lets Git reuse immutable object storage through hardlinks
+        // instead of repacking the entire reachable history through fetch.
+        // The clone is private: refs/index/worktrees are still independent.
+        try {
+          await gitCmd(
+            "clone",
+            ["--bare", "--local", "--quiet", discovery.captureRoot, repoPath],
+            waveRoot,
+            signal,
+            120_000,
+          );
+        } catch (error) {
+          if (signal?.aborted || isAbortError(error)) throw error;
+          // Hardlinks can be prohibited across filesystems or by a sandbox.
+          // Fall back to Git's direct local object copy, which remains much
+          // cheaper than fetch/repack and keeps the wave repository standalone.
+          await fs.rm(repoPath, { recursive: true, force: true }).catch(() => {});
+          await gitCmd(
+            "clone",
+            ["--bare", "--no-hardlinks", "--quiet", discovery.captureRoot, repoPath],
+            waveRoot,
+            signal,
+            120_000,
+          );
+        }
+      } else {
+        await fs.mkdir(repoPath, { recursive: true });
+        await gitCmd("init", ["--bare", "--quiet"], repoPath, signal);
       }
+      const parentCommit = discovery.sourceType === "git-committed"
+        ? discovery.headCommit
+        : undefined;
 
-      // Build the tree from current filesystem state (first observation).
-      const { entries, totalBytes } = await buildTreeFromPaths(
+      // Build the current filesystem tree through one private Git index. HEAD
+      // entries are reused, while current-different and eligible new paths are
+      // handed to one native `git add -A` operation.
+      const staged = await buildTreeWithGitIndex(
         repoPath,
-        discovery.captureRoot,
-        allPaths,
-        enumeratedPaths.untrackedPaths,
+        discovery,
+        enumeratedPaths,
         maxSnapshotBytes,
+        parentCommit,
+        signal,
       );
 
       // ── Test seam: allow injection of mutations between capture and verify ──
-      await __testOnly_mutateSourceBetweenCaptureAndVerify?.(discovery, entries);
+      await __testOnly_mutateSourceBetweenCaptureAndVerify?.(discovery, staged.entries);
       // ────────────────────────────────────────────────────────────────────────
+      throwIfAborted(signal);
 
       // Verify consistency with a second observation before pinning.
       const verification = await verifyCaptureConsistency(
         cwd,
         discovery,
-        allPaths,
-        enumeratedPaths.untrackedPaths,
-        entries,
+        enumeratedPaths,
         repoPath,
+        maxSnapshotBytes,
+        parentCommit,
+        staged.treeSha,
+        signal,
       );
       if (!verification.consistent) {
         // Consistency mismatch — clean up and retry.
         throw new Error(`Capture consistency check failed: ${verification.reason}`);
       }
 
-      // 6. Create the synthetic base commit.
-      const baseCommit = await createCommit(repoPath, entries, parentCommit);
-
-      // 7. Pin the ref.
+      // Pin the already-created synthetic commit only after consistency passes.
+      const baseCommit = staged.commitSha;
       const baseRef = `refs/pi-review-gate/waves/${waveId}/base`;
-      await gitCmd("update-ref", [baseRef, baseCommit], repoPath);
+      await gitCmd("update-ref", [baseRef, baseCommit], repoPath, signal);
+      await fs.rm(staged.indexFile, { force: true }).catch(() => {});
 
       // 8. Capture the immutable source identity (dev+ino).
       const rootStat = await fs.stat(discovery.captureRoot);
@@ -561,15 +634,19 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
         baseCommit,
         baseRef,
         discovery,
-        entries,
-        totalBytes,
-        paths: entries.map((e) => e.path),
+        entries: staged.entries,
+        totalBytes: staged.totalBytes,
+        paths: staged.entries.map((e) => e.path),
         sourceIdentity,
       };
     } catch (err) {
       // Clean up wave root on any failure after creation.
       if (waveRoot) {
         await fs.rm(waveRoot, { recursive: true, force: true }).catch(() => {});
+      }
+
+      if (signal?.aborted || isAbortError(err)) {
+        throw new WaveCaptureError("Wave capture cancelled.", "cancelled", waveId, "capturing");
       }
 
       // If this was a consistency mismatch and we have retries left, continue.
@@ -607,15 +684,17 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
 async function verifyCaptureConsistency(
   cwd: string,
   discovery: WaveSourceDiscovery,
-  allPaths: string[],
-  untrackedPaths: Set<string>,
-  capturedEntries: WaveEntry[],
+  enumeration: EnumeratedWavePaths,
   repoPath: string,
+  maxSnapshotBytes: number,
+  parentCommit: string | undefined,
+  capturedTreeSha: string,
+  signal?: AbortSignal,
 ): Promise<{ consistent: true } | { consistent: false; reason: string }> {
-  const captureRoot = discovery.captureRoot;
+  throwIfAborted(signal);
 
   // Re-discover the source to detect identity drift.
-  const reDiscovery = await discoverWaveSource(cwd);
+  const reDiscovery = await discoverWaveSource(cwd, signal);
   // Compare all identity fields — any difference means the source changed.
   for (const key of [
     "requestedCwd", "captureRoot", "isGit", "gitTopLevel", "gitCommonDir", "gitDir",
@@ -627,90 +706,54 @@ async function verifyCaptureConsistency(
   }
 
   // Re-enumerate paths from the second discovery to detect path-set drift.
-  const reEnumeration = await enumerateWaveSourcePathSet(reDiscovery);
+  const reEnumeration = await enumerateWaveSourcePathSet(reDiscovery, signal);
   const reEnumeratedPaths = reEnumeration.paths;
-  if (reEnumeratedPaths.length !== allPaths.length) {
+  if (reEnumeratedPaths.length !== enumeration.paths.length) {
     return { consistent: false, reason: "path count changed" };
   }
-  for (let i = 0; i < allPaths.length; i += 1) {
-    if (reEnumeratedPaths[i] !== allPaths[i]) {
-      return { consistent: false, reason: `path at index ${i} changed: ${allPaths[i]} -> ${reEnumeratedPaths[i]}` };
+  for (let i = 0; i < enumeration.paths.length; i += 1) {
+    if (reEnumeratedPaths[i] !== enumeration.paths[i]) {
+      return { consistent: false, reason: `path at index ${i} changed: ${enumeration.paths[i]} -> ${reEnumeratedPaths[i]}` };
     }
   }
-  if (reEnumeration.untrackedPaths.size !== untrackedPaths.size) {
+  if (reEnumeration.untrackedPaths.size !== enumeration.untrackedPaths.size) {
     return { consistent: false, reason: "untracked path count changed" };
   }
-  for (const path of untrackedPaths) {
+  for (const path of enumeration.untrackedPaths) {
     if (!reEnumeration.untrackedPaths.has(path)) {
       return { consistent: false, reason: `untracked path classification changed: ${path}` };
     }
   }
 
-  // Re-read each captured entry and compare.
-  const capturedMap = new Map(capturedEntries.map((e) => [e.path, e]));
-  for (const relPath of allPaths) {
-    // ── Symlinked-ancestor check before reading/verifying any bytes ──
-    await assertNoSymlinkedAncestors(captureRoot, relPath);
-
-    const fullPath = join(captureRoot, relPath);
-
-    // Check existence.
-    let lstat: Stats;
-    try {
-      lstat = await fs.lstat(fullPath);
-    } catch (err) {
-      const nodeErr = err as NodeJS.ErrnoException;
-      if (nodeErr?.code === "ENOENT" || nodeErr?.code === "ENOTDIR") {
-        // File disappeared — if it was in captured entries, inconsistent.
-        if (capturedMap.has(relPath)) {
-          return { consistent: false, reason: `file disappeared: ${relPath}` };
-        }
-        continue;
-      }
-      throw err;
-    }
-
-    // Any unsupported entry type (directory, special file) is a mismatch.
-    if (!lstat.isFile() && !lstat.isSymbolicLink()) {
-      return { consistent: false, reason: `unsupported entry type at ${relPath}` };
-    }
-
-    const captured = capturedMap.get(relPath);
-
-    if (lstat.isSymbolicLink()) {
-      // Verify symlink target.
-      const targetBuffer = (await readlinkBuffer(fullPath, { encoding: null })) as unknown as Buffer;
-      if (!captured) {
-        return { consistent: false, reason: `symlink appeared: ${relPath}` };
-      }
-      if (captured.mode !== "120000") {
-        return { consistent: false, reason: `mode changed for ${relPath}: ${captured.mode} -> 120000` };
-      }
-      // Re-hash to verify content.
-      const newBlobId = await hashObject(repoPath, targetBuffer);
-      if (newBlobId !== captured.blobId) {
-        return { consistent: false, reason: `symlink target changed: ${relPath}` };
-      }
-    } else {
-      // Regular file: verify bytes and mode.
-      const data = await fs.readFile(fullPath);
-      if (!captured) {
-        return { consistent: false, reason: `file appeared: ${relPath}` };
-      }
-      // Re-hash to verify content.
-      const newBlobId = await hashObject(repoPath, data);
-      if (newBlobId !== captured.blobId) {
-        return { consistent: false, reason: `file content changed: ${relPath}` };
-      }
-      // Verify mode.
-      const isExecutable = (lstat.mode & 0o111) !== 0;
-      const newMode = isExecutable ? "100755" : "100644";
-      if (newMode !== captured.mode) {
-        return { consistent: false, reason: `mode changed for ${relPath}: ${captured.mode} -> ${newMode}` };
-      }
-    }
+  try {
+    await validateEligiblePaths(
+      reDiscovery.captureRoot,
+      reEnumeration.paths,
+      reEnumeration.untrackedPaths,
+      maxSnapshotBytes,
+      signal,
+    );
+  } catch (error) {
+    if (signal?.aborted || isAbortError(error)) throw error;
+    return { consistent: false, reason: error instanceof Error ? error.message : String(error) };
   }
 
+  const verificationIndex = join(repoPath, ".wave-verify-index.tmp");
+  try {
+    const verifiedTreeSha = await stageFilesystemTree(
+      repoPath,
+      reDiscovery,
+      reEnumeration,
+      parentCommit,
+      verificationIndex,
+      signal,
+    );
+    if (verifiedTreeSha !== capturedTreeSha) {
+      return { consistent: false, reason: "captured filesystem contents changed" };
+    }
+  } finally {
+    await fs.rm(verificationIndex, { force: true }).catch(() => {});
+  }
   return { consistent: true };
 }
 
@@ -728,33 +771,6 @@ export let __testOnly_mutateSourceBetweenCaptureAndVerify: (
   entries: WaveEntry[],
 ) => Promise<void> | void | undefined;
 
-// ── internal: object import ──────────────────────────────────────────────────
-
-/**
- * Import a commit object (and its reachable tree/blob objects) from the
- * source Git directory into the private bare repository.
- * Returns the SHA of the imported commit (same as source SHA).
- */
-async function importCommitObject(
-  sourceGitDir: string,
-  targetRepoPath: string,
-  commitSha: string,
-): Promise<string> {
-  // Import only the objects reachable from the given commit using git fetch.
-  // This avoids bundling the entire repository history.
-  await execFileAsync(
-    "git",
-    ["fetch", sourceGitDir, commitSha],
-    {
-      cwd: targetRepoPath,
-      env: { ...process.env, ...GIT_ENV, GIT_DIR: targetRepoPath },
-      timeout: 60_000,
-    },
-  );
-
-  return commitSha;
-}
-
 // ── internal: tree construction ──────────────────────────────────────────────
 
 /**
@@ -762,24 +778,34 @@ async function importCommitObject(
  * This prevents following symlinked ancestors that could resolve outside
  * the capture root. Called before reading any file bytes.
  */
-async function assertNoSymlinkedAncestors(captureRoot: string, relPath: string): Promise<void> {
+async function assertNoSymlinkedAncestors(
+  captureRoot: string,
+  relPath: string,
+  ancestorCache: Map<string, Stats | null>,
+  signal?: AbortSignal,
+): Promise<void> {
   const segments = relPath.split("/");
   const ancestorCount = segments.length - 1;
   for (let i = 0; i < ancestorCount; i++) {
+    throwIfAborted(signal);
     const ancestor = segments[i];
     if (!ancestor) continue;
     const ancestorPath = join(captureRoot, ...segments.slice(0, i + 1));
-    let st: Stats;
-    try {
-      st = await fs.lstat(ancestorPath);
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException;
-      if (e?.code === "ENOENT" || e?.code === "ENOTDIR") {
-        // Ancestor doesn't exist — the file can't exist either.
-        return;
+    let st = ancestorCache.get(ancestorPath);
+    if (st === undefined) {
+      try {
+        st = await fs.lstat(ancestorPath);
+        ancestorCache.set(ancestorPath, st);
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        if (e?.code === "ENOENT" || e?.code === "ENOTDIR") {
+          ancestorCache.set(ancestorPath, null);
+          return;
+        }
+        throw err;
       }
-      throw err;
     }
+    if (st === null) return;
     if (st.isSymbolicLink()) {
       throw new Error(
         `Ancestor "${ancestor}" is a symbolic link; refusing to follow symlinks outside capture root.`,
@@ -794,25 +820,25 @@ async function assertNoSymlinkedAncestors(captureRoot: string, relPath: string):
 }
 
 /**
- * Hash files into the private repo and build a tree.
- * Returns entries and total bytes.
+ * Validate eligible filesystem entries without reading regular-file contents.
+ * This protects the capture boundary and enforces only the untracked budget;
+ * Git performs the actual content reads in one bulk staging operation.
  */
-async function buildTreeFromPaths(
-  repoPath: string,
+async function validateEligiblePaths(
   captureRoot: string,
   paths: string[],
   untrackedPaths: Set<string>,
   maxSnapshotBytes: number,
-): Promise<{ entries: WaveEntry[]; totalBytes: number }> {
-  const entries: WaveEntry[] = [];
-  let totalBytes = 0;
+  signal?: AbortSignal,
+): Promise<void> {
   let untrackedBytes = 0;
+  const ancestorCache = new Map<string, Stats | null>();
 
   for (const relPath of paths) {
+    throwIfAborted(signal);
     const fullPath = join(captureRoot, relPath);
 
-    // ── Symlinked-ancestor check: lstat every ancestor from captureRoot ──
-    await assertNoSymlinkedAncestors(captureRoot, relPath);
+    await assertNoSymlinkedAncestors(captureRoot, relPath, ancestorCache, signal);
 
     // Check existence — omit paths absent from the filesystem (tracked deletions).
     let lstat: Stats;
@@ -835,8 +861,6 @@ async function buildTreeFromPaths(
       );
     }
 
-    let blobId: string;
-    let mode: string;
     let size: number;
 
     if (lstat.isSymbolicLink()) {
@@ -858,125 +882,272 @@ async function buildTreeFromPaths(
       }
       size = targetBuffer.length;
 
-      totalBytes += size;
-      if (untrackedPaths.has(relPath)) untrackedBytes += size;
-      if (untrackedBytes > maxSnapshotBytes) {
-        throw new Error(
-          `Snapshot size limit exceeded for untracked files: ${untrackedBytes} bytes exceeds ` +
-          `maxSnapshotBytes of ${maxSnapshotBytes}. The untracked file "${relPath}" ` +
-          `(${size} bytes) pushed the untracked total over the limit.`,
-        );
-      }
-
-      blobId = await hashObject(repoPath, targetBuffer);
-      mode = "120000";
     } else {
-      // Regular file: read the data and count actual bytes.
-      const data = await fs.readFile(fullPath);
-      size = data.length;
-
-      totalBytes += size;
-      if (untrackedPaths.has(relPath)) untrackedBytes += size;
-      if (untrackedBytes > maxSnapshotBytes) {
-        throw new Error(
-          `Snapshot size limit exceeded for untracked files: ${untrackedBytes} bytes exceeds ` +
-          `maxSnapshotBytes of ${maxSnapshotBytes}. The untracked file "${relPath}" ` +
-          `(${size} bytes) pushed the untracked total over the limit.`,
-        );
-      }
-
-      blobId = await hashObject(repoPath, data);
-
-      // Determine mode: check executable bit.
-      const isExecutable = (lstat.mode & 0o111) !== 0;
-      mode = isExecutable ? "100755" : "100644";
+      size = lstat.size;
     }
 
-    entries.push({ path: relPath, mode, blobId, size });
+    if (untrackedPaths.has(relPath)) {
+      untrackedBytes += size;
+      if (untrackedBytes > maxSnapshotBytes) {
+        throw new Error(
+          `Snapshot size limit exceeded for untracked files: ${untrackedBytes} bytes exceeds ` +
+          `maxSnapshotBytes of ${maxSnapshotBytes}. The untracked file "${relPath}" ` +
+          `(${size} bytes) pushed the untracked total over the limit.`,
+        );
+      }
+    }
   }
-
-  return { entries, totalBytes };
 }
 
-/** Hash a blob into the repository and return its SHA. */
-async function hashObject(repoPath: string, data: Buffer): Promise<string> {
-  return gitSpawn(
-    ["hash-object", "--stdin", "--literal", "-w"],
-    repoPath,
-    { ...process.env, ...GIT_ENV, GIT_DIR: repoPath },
-    data,
-  );
+interface StagedWaveTree {
+  indexFile: string;
+  treeSha: string;
+  commitSha: string;
+  entries: WaveEntry[];
+  totalBytes: number;
 }
-
-// ── internal: commit creation ────────────────────────────────────────────────
 
 /**
- * Create a commit object with a tree built through a private temporary index.
+ * Build the synthetic tree with Git-native bulk operations. A committed source
+ * starts from HEAD, so unchanged tracked blobs are reused without being read.
  */
-async function createCommit(
+async function buildTreeWithGitIndex(
   repoPath: string,
-  entries: WaveEntry[],
-  parentCommit?: string,
-): Promise<string> {
-  // Use a private temporary index file under the wave root.
+  discovery: WaveSourceDiscovery,
+  enumeration: EnumeratedWavePaths,
+  maxSnapshotBytes: number,
+  parentCommit: string | undefined,
+  signal?: AbortSignal,
+): Promise<StagedWaveTree> {
+  await validateEligiblePaths(
+    discovery.captureRoot,
+    enumeration.paths,
+    enumeration.untrackedPaths,
+    maxSnapshotBytes,
+    signal,
+  );
+
   const indexFile = join(repoPath, ".wave-index.tmp");
+  const treeSha = await stageFilesystemTree(
+    repoPath,
+    discovery,
+    enumeration,
+    parentCommit,
+    indexFile,
+    signal,
+  );
+  const commitSha = await createCommitFromTree(repoPath, indexFile, treeSha, parentCommit, signal);
+  const entries = await readTreeEntries(repoPath, commitSha, signal);
+  return {
+    indexFile,
+    treeSha,
+    commitSha,
+    entries,
+    totalBytes: entries.reduce((sum, entry) => sum + entry.size, 0),
+  };
+}
+
+async function stageFilesystemTree(
+  repoPath: string,
+  discovery: WaveSourceDiscovery,
+  enumeration: EnumeratedWavePaths,
+  parentCommit: string | undefined,
+  indexFile: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  throwIfAborted(signal);
+  await fs.rm(indexFile, { force: true }).catch(() => {});
+  const env = captureIndexEnv(repoPath, indexFile, discovery.captureRoot);
+
+  if (parentCommit) {
+    await gitSpawn(["read-tree", parentCommit], repoPath, env, "", 30_000, signal);
+  } else {
+    await gitSpawn(["read-tree", "--empty"], repoPath, env, "", 30_000, signal);
+  }
+
+  const overlayPaths = await determineOverlayPaths(discovery, enumeration, signal);
+  if (overlayPaths.length > 0) {
+    const pathspec = Buffer.from(`${overlayPaths.join("\0")}\0`, "utf8");
+    await gitSpawn(
+      [
+        "--literal-pathspecs",
+        "-c", "core.filemode=true",
+        "add", "-A", "-f",
+        "--pathspec-from-file=-",
+        "--pathspec-file-nul",
+      ],
+      repoPath,
+      env,
+      pathspec,
+      120_000,
+      signal,
+    );
+  }
+
+  return gitSpawn(["write-tree"], repoPath, env, "", 30_000, signal);
+}
+
+async function determineOverlayPaths(
+  discovery: WaveSourceDiscovery,
+  enumeration: EnumeratedWavePaths,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  if (!discovery.headCommit || !discovery.gitTopLevel) {
+    return enumeration.paths;
+  }
+
+  const changed = await gitNulOutput(
+    [
+      "-c", "core.filemode=true",
+      "diff", "--no-ext-diff", "--ignore-submodules=none",
+      "--name-only", "-z", "HEAD", "--",
+    ],
+    discovery.gitTopLevel,
+    { ...process.env, ...GIT_ENV },
+    signal,
+  );
+  const overlay = new Set(changed);
+
+  // New indexed and nonignored untracked files cannot appear in `git diff
+  // HEAD` until they are represented by HEAD, so include them explicitly.
+  for (const path of enumeration.paths) {
+    if (!enumeration.headPaths.has(path)) overlay.add(path);
+  }
+
+  // Git intentionally hides assume-unchanged/skip-worktree content from normal
+  // diff discovery. Capture current filesystem bytes for those paths anyway.
+  const flagged = await gitNulOutput(
+    ["ls-files", "-v", "-z"],
+    discovery.gitTopLevel,
+    { ...process.env, ...GIT_ENV },
+    signal,
+  );
+  for (const record of flagged) {
+    if (record.length < 3 || record[1] !== " ") continue;
+    const tag = record[0];
+    if (tag === "S" || tag === tag.toLowerCase()) {
+      overlay.add(record.slice(2));
+    }
+  }
+
+  return filterAndSort([...overlay]);
+}
+
+async function createCommitFromTree(
+  repoPath: string,
+  indexFile: string,
+  treeSha: string,
+  parentCommit: string | undefined,
+  signal?: AbortSignal,
+): Promise<string> {
   const env = {
+    ...captureIndexEnv(repoPath, indexFile),
+    GIT_AUTHOR_NAME: "pi-review-gate",
+    GIT_AUTHOR_EMAIL: "pi-review-gate@local",
+    GIT_COMMITTER_NAME: "pi-review-gate",
+    GIT_COMMITTER_EMAIL: "pi-review-gate@local",
+  };
+  const args = ["commit-tree", treeSha];
+  if (parentCommit) args.push("-p", parentCommit);
+  return gitSpawn(args, repoPath, env, "Synthetic wave base commit\n", 30_000, signal);
+}
+
+async function readTreeEntries(
+  repoPath: string,
+  treeish: string,
+  signal?: AbortSignal,
+): Promise<WaveEntry[]> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["ls-tree", "-r", "-l", "-z", treeish],
+    {
+      cwd: repoPath,
+      env: { ...process.env, ...GIT_ENV, GIT_DIR: repoPath },
+      timeout: 30_000,
+      maxBuffer: 64 * 1024 * 1024,
+      signal,
+    },
+  );
+  const entries: WaveEntry[] = [];
+  for (const record of stdout.split("\0")) {
+    if (!record) continue;
+    const match = /^(\d{6}) (\S+) ([0-9a-f]+)\s+([0-9]+|-)\t([\s\S]*)$/.exec(record);
+    if (!match || match[2] !== "blob" || match[4] === "-") {
+      throw new Error(`Unsupported Git tree entry in wave capture: ${record}`);
+    }
+    entries.push({
+      mode: match[1],
+      blobId: match[3],
+      size: Number(match[4]),
+      path: normalizeRelative(match[5]),
+    });
+  }
+  return entries;
+}
+
+function captureIndexEnv(
+  repoPath: string,
+  indexFile: string,
+  workTree?: string,
+): NodeJS.ProcessEnv {
+  return {
     ...process.env,
     ...GIT_ENV,
     GIT_DIR: repoPath,
     GIT_INDEX_FILE: indexFile,
+    ...(workTree ? { GIT_WORK_TREE: workTree } : {}),
   };
+}
 
-  try {
-    // Populate the index with entries using --cacheinfo (path-safe, no mktree parsing).
-    for (const entry of entries) {
-      await gitSpawn(
-        ["update-index", "--add", "--cacheinfo", entry.mode, entry.blobId, entry.path],
-        repoPath,
-        env,
-        "",
-      );
-    }
-
-    // Write the tree from the temporary index.
-    const treeSha = await gitSpawn(["write-tree"], repoPath, env, "");
-
-    // Build commit message.
-    const message = "Synthetic wave base commit";
-
-    // Create the commit.
-    const args: string[] = ["commit-tree", treeSha];
-    if (parentCommit) {
-      args.push("-p", parentCommit);
-    }
-
-    const commitEnv = {
-      ...env,
-      GIT_AUTHOR_NAME: "pi-review-gate",
-      GIT_AUTHOR_EMAIL: "pi-review-gate@local",
-      GIT_COMMITTER_NAME: "pi-review-gate",
-      GIT_COMMITTER_EMAIL: "pi-review-gate@local",
-    };
-
-    const commitSha = await gitSpawn(args, repoPath, commitEnv, message);
-    return commitSha;
-  } finally {
-    await fs.rm(indexFile, { force: true }).catch(() => {});
-  }
+async function gitNulOutput(
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd,
+    env,
+    timeout: 30_000,
+    maxBuffer: 64 * 1024 * 1024,
+    signal,
+  });
+  return stdout.split("\0").filter(Boolean).map(normalizeRelative);
 }
 
 // ── internal: git command helper ─────────────────────────────────────────────
 
-async function gitCmd(cmd: string, args: string[], cwd: string): Promise<void> {
+async function gitCmd(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  signal?: AbortSignal,
+  timeout = 30_000,
+): Promise<void> {
   await execFileAsync(
     "git",
     [cmd, ...args],
     {
       cwd,
       env: { ...process.env, ...GIT_ENV },
-      timeout: 30_000,
+      timeout,
+      signal,
     },
   );
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error("Operation cancelled.");
+  error.name = "AbortError";
+  throw error;
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return error.name === "AbortError" || code === "ABORT_ERR";
 }
 
 // ── internal: wave ID generation ─────────────────────────────────────────────

@@ -110,7 +110,12 @@ async function assertCreationPathUnderWaveRoot(path: string, waveRoot: string): 
 // ── git helpers ──────────────────────────────────────────────────────────────
 
 /** Run a git command (shell-free, via execFile). */
-async function gitCmd(args: string[], cwd: string, envOverrides: Record<string, string> = {}): Promise<void> {
+async function gitCmd(
+  args: string[],
+  cwd: string,
+  envOverrides: Record<string, string> = {},
+  signal?: AbortSignal,
+): Promise<void> {
   await execFileAsync(
     "git",
     args,
@@ -118,12 +123,18 @@ async function gitCmd(args: string[], cwd: string, envOverrides: Record<string, 
       cwd,
       env: { ...process.env, ...GIT_ENV, ...envOverrides },
       timeout: 30_000,
+      signal,
     },
   );
 }
 
 /** Run a git command and return stdout. */
-async function gitOut(args: string[], cwd: string, envOverrides: Record<string, string> = {}): Promise<string> {
+async function gitOut(
+  args: string[],
+  cwd: string,
+  envOverrides: Record<string, string> = {},
+  signal?: AbortSignal,
+): Promise<string> {
   const { stdout } = await execFileAsync(
     "git",
     args,
@@ -131,6 +142,7 @@ async function gitOut(args: string[], cwd: string, envOverrides: Record<string, 
       cwd,
       env: { ...process.env, ...GIT_ENV, ...envOverrides },
       timeout: 30_000,
+      signal,
     },
   );
   return stdout.trim();
@@ -148,7 +160,9 @@ async function gitOut(args: string[], cwd: string, envOverrides: Record<string, 
 export async function createWorkerWorktree(
   capture: WaveCaptureResult,
   taskId: string,
+  signal?: AbortSignal,
 ): Promise<WorkerWorktree> {
+  throwIfAborted(signal);
   validateSafeId(taskId, "taskId");
 
   const waveRoot = capture.waveRoot;
@@ -170,25 +184,30 @@ export async function createWorkerWorktree(
   await assertUnderWaveRoot(worktreeRoot, waveRoot);
 
   // Create a detached worktree at the base commit.
-  await gitCmd(
-    ["worktree", "add", "--detach", worktreeRoot, baseCommit],
-    repoPath,
-  );
+  try {
+    await gitCmd(
+      ["worktree", "add", "--detach", worktreeRoot, baseCommit],
+      repoPath,
+      {},
+      signal,
+    );
+    throwIfAborted(signal);
 
-  // Resolve and create the effective cwd.
-  const effectiveCwd = relativeCwd !== "."
-    ? join(worktreeRoot, relativeCwd)
-    : worktreeRoot;
-  // Lexical containment check before mkdir.
-  assertPathWithin(effectiveCwd, worktreeRoot);
-  assertPathWithin(effectiveCwd, waveRoot);
-  // Preflight: verify existing path components stay under waveRoot.
-  await assertCreationPathUnderWaveRoot(effectiveCwd, waveRoot);
-  await fs.mkdir(effectiveCwd, { recursive: true });
-  // Realpath containment check after mkdir.
-  await assertUnderWaveRoot(effectiveCwd, waveRoot);
-
-  return { worktreeRoot, effectiveCwd };
+    // Resolve and create the effective cwd.
+    const effectiveCwd = relativeCwd !== "."
+      ? join(worktreeRoot, relativeCwd)
+      : worktreeRoot;
+    assertPathWithin(effectiveCwd, worktreeRoot);
+    assertPathWithin(effectiveCwd, waveRoot);
+    await assertCreationPathUnderWaveRoot(effectiveCwd, waveRoot);
+    await fs.mkdir(effectiveCwd, { recursive: true });
+    throwIfAborted(signal);
+    await assertUnderWaveRoot(effectiveCwd, waveRoot);
+    return { worktreeRoot, effectiveCwd };
+  } catch (error) {
+    await cleanupIncompleteWorktree(repoPath, worktreeRoot);
+    throw error;
+  }
 }
 
 /**
@@ -198,7 +217,9 @@ export async function createWorkerWorktree(
  */
 export async function createIntegrationWorktree(
   capture: WaveCaptureResult,
+  signal?: AbortSignal,
 ): Promise<IntegrationWorktree> {
+  throwIfAborted(signal);
   const waveRoot = capture.waveRoot;
   const repoPath = capture.repositoryPath;
   const baseCommit = capture.baseCommit;
@@ -218,25 +239,43 @@ export async function createIntegrationWorktree(
   await assertUnderWaveRoot(worktreeRoot, waveRoot);
 
   // Create a detached worktree at the base commit.
-  await gitCmd(
-    ["worktree", "add", "--detach", worktreeRoot, baseCommit],
-    repoPath,
-  );
+  try {
+    await gitCmd(
+      ["worktree", "add", "--detach", worktreeRoot, baseCommit],
+      repoPath,
+      {},
+      signal,
+    );
+    throwIfAborted(signal);
 
-  // Resolve and create the effective cwd.
-  const effectiveCwd = relativeCwd !== "."
-    ? join(worktreeRoot, relativeCwd)
-    : worktreeRoot;
-  // Lexical containment check before mkdir.
-  assertPathWithin(effectiveCwd, worktreeRoot);
-  assertPathWithin(effectiveCwd, waveRoot);
-  // Preflight: verify existing path components stay under waveRoot.
-  await assertCreationPathUnderWaveRoot(effectiveCwd, waveRoot);
-  await fs.mkdir(effectiveCwd, { recursive: true });
-  // Realpath containment check after mkdir.
-  await assertUnderWaveRoot(effectiveCwd, waveRoot);
+    const effectiveCwd = relativeCwd !== "."
+      ? join(worktreeRoot, relativeCwd)
+      : worktreeRoot;
+    assertPathWithin(effectiveCwd, worktreeRoot);
+    assertPathWithin(effectiveCwd, waveRoot);
+    await assertCreationPathUnderWaveRoot(effectiveCwd, waveRoot);
+    await fs.mkdir(effectiveCwd, { recursive: true });
+    throwIfAborted(signal);
+    await assertUnderWaveRoot(effectiveCwd, waveRoot);
+    return { worktreeRoot, effectiveCwd };
+  } catch (error) {
+    await cleanupIncompleteWorktree(repoPath, worktreeRoot);
+    throw error;
+  }
+}
 
-  return { worktreeRoot, effectiveCwd };
+async function cleanupIncompleteWorktree(repoPath: string, worktreeRoot: string): Promise<void> {
+  await gitCmd(["worktree", "remove", "--force", worktreeRoot], repoPath).catch(() => {});
+  await fs.rm(worktreeRoot, { recursive: true, force: true }).catch(() => {});
+  await gitCmd(["worktree", "prune"], repoPath).catch(() => {});
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error("Operation cancelled.");
+  error.name = "AbortError";
+  throw error;
 }
 
 // ── worktree inspection ──────────────────────────────────────────────────────
@@ -297,6 +336,7 @@ export async function pinCommit(
   capture: WaveCaptureResult,
   commitSha: string,
   options: { type: "worker"; taskId: string } | { type: "integration" },
+  signal?: AbortSignal,
 ): Promise<string> {
   const waveId = capture.waveId;
   const repoPath = capture.repositoryPath;
@@ -308,6 +348,8 @@ export async function pinCommit(
   const objectType = await gitOut(
     ["cat-file", "-t", commitSha],
     repoPath,
+    {},
+    signal,
   );
   if (objectType !== "commit") {
     throw new Error(
@@ -328,6 +370,8 @@ export async function pinCommit(
   const existingSha = await gitOut(
     ["rev-parse", "--verify", refName],
     repoPath,
+    {},
+    signal,
   ).catch(() => "");
   if (existingSha !== "") {
     if (existingSha === commitSha) {
@@ -341,7 +385,7 @@ export async function pinCommit(
   }
 
   // Update the ref.
-  await gitCmd(["update-ref", refName, commitSha], repoPath);
+  await gitCmd(["update-ref", refName, commitSha], repoPath, {}, signal);
 
   return refName;
 }

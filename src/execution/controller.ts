@@ -74,7 +74,7 @@ export async function executeSubtask(input: ExecuteSubtaskControllerInput): Prom
   if (!parentBaseline) {
     return failurePacket(input, subtaskId, "blocked", "No clean parent ownership baseline is available.", "missing_parent_baseline");
   }
-  const preflight = await snapshot(input.cwd, input.config);
+  const preflight = await snapshot(input.cwd, input.config, input.signal);
   const adoptedParentChanges = compareSnapshots(parentBaseline, preflight);
   const adoptedParentChangedFiles = adoptedParentChanges.map((change) => change.path);
 
@@ -384,7 +384,7 @@ async function finishSuccess(input: {
     adapter: input.adapterKind,
     model: input.adapterModel,
   });
-  const after = await snapshot(input.input.cwd, input.input.config);
+  const after = await snapshot(input.input.cwd, input.input.config, input.input.signal);
   checkpointReviewWindow(input.input.parentState, after);
   const retained = input.input.config.retainBundles === "always";
   const packet: SubtaskPacket = {
@@ -428,7 +428,7 @@ async function finishFailure(
     adapter: adapterKind,
     model: adapterModel,
   });
-  const after = await snapshot(input.cwd, input.config);
+  const after = await snapshot(input.cwd, input.config, input.signal);
   const changedFiles = compareSnapshots(before, after).map((change) => change.path);
   const packet: SubtaskPacket = {
     subtaskId,
@@ -506,10 +506,15 @@ function renderTaskRequest(task: ExecuteSubtaskInput, adoptedParentChangedFiles:
   ].join("\n");
 }
 
-async function snapshot(cwd: string, config: ReviewGateConfig): Promise<WorkspaceSnapshot> {
+async function snapshot(
+  cwd: string,
+  config: ReviewGateConfig,
+  signal?: AbortSignal,
+): Promise<WorkspaceSnapshot> {
   return createWorkspaceSnapshot(cwd, {
     maxFileBytes: config.maxFileBytes,
     maxSnapshotBytes: config.maxSnapshotBytes,
+    signal,
   });
 }
 

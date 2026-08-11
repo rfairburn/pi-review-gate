@@ -1180,6 +1180,45 @@ test("capture — continuous mutation exhausts retries with classified error", a
   }
 });
 
+test("capture — abort during verification cancels immediately and removes artifacts", async () => {
+  const dir = await mkTmp("pi-cb-abort-");
+  const artifactDir = await mkTmp("pi-cb-abort-artifact-");
+  const controller = new AbortController();
+  try {
+    await git(["init", "--quiet"], dir);
+    await writeFile(join(dir, "file.txt"), "content\n", "utf8");
+    await git(["add", "."], dir);
+    await git(["commit", "--quiet", "-m", "init"], dir);
+
+    waveRepoMutable.__testOnly_mutateSourceBetweenCaptureAndVerify = () => {
+      controller.abort();
+    };
+    try {
+      await assert.rejects(
+        captureWaveBase({
+          cwd: dir,
+          maxSnapshotBytes: 1_000_000,
+          waveId: "test-abort",
+          artifactDir,
+          signal: controller.signal,
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof WaveCaptureError);
+          assert.equal((error as InstanceType<typeof WaveCaptureError>).code, "cancelled");
+          return true;
+        },
+      );
+      const entries = await import("node:fs/promises").then((fs) => fs.readdir(artifactDir));
+      assert.deepEqual(entries, [], "cancelled capture should not leak a wave root");
+    } finally {
+      waveRepoMutable.__testOnly_mutateSourceBetweenCaptureAndVerify = undefined;
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
 test("capture — HEAD drift detected and causes retry", async () => {
   const dir = await mkTmp("pi-cb-head-drift-");
   const artifactDir = await mkTmp("pi-cb-head-drift-artifact-");

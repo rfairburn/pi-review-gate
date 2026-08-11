@@ -618,6 +618,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       maxSnapshotBytes: config.maxSnapshotBytes,
       waveId,
       artifactDir,
+      signal,
     });
   } catch (err) {
     // Preserve typed WaveCaptureError; wrap other errors as capture_failed.
@@ -669,7 +670,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
     try {
       // Create isolated worktree.
-      const worktree = await createWorkerWorktree(capture, item.taskId);
+      const worktree = await createWorkerWorktree(capture, item.taskId, signal);
       const artifactDir = join(waveRoot, "artifacts", item.taskId);
 
       const handle: WorkerHandle = {
@@ -1058,7 +1059,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   let integrationResult: WaveIntegrationResult | undefined;
 
   try {
-    integrationResult = await integrateWave(capture, eligibleWorkers);
+    integrationResult = await integrateWave(capture, eligibleWorkers, signal);
 
     if (integrationResult.status === "integrated") {
       integrationOutcome = {
@@ -1239,8 +1240,38 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       capture,
       landingCommitSha,
       capture.discovery.captureRoot,
+      signal,
     );
   } catch (err) {
+    if (signal?.aborted) {
+      emitProgress(onProgress, "aborted", "Wave aborted during landing planning", undefined, {
+        waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
+        counts: computeCounts(taskItems, results, activeSlots, taskPhases),
+        taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
+        activity: ["Wave aborted during landing planning"],
+      });
+      await writeWaveManifest(waveRoot, buildManifest(
+        waveId, "aborted", capture, taskResultsArray,
+        integrationResult.status,
+        "aborted",
+        integrationOutcome,
+        { status: "aborted" },
+        handles,
+        taskExecutorInfo,
+        taskReviewCycles,
+        taskCandidateCommits,
+      ));
+      await cleanupWorktrees(handles, capture, integrationWorktree);
+      return {
+        waveId,
+        waveRoot,
+        sourceRoot: capture.discovery.captureRoot,
+        phase: "aborted",
+        taskResults: taskResultsArray,
+        integration: integrationOutcome,
+        landing: { status: "aborted" },
+      };
+    }
     emitProgress(onProgress, "completed", `Landing planning failed: ${err instanceof Error ? err.message : "unknown"}`, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),

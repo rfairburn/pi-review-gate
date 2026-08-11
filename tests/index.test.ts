@@ -1541,7 +1541,7 @@ async function triggerResults(hooks: Map<string, Array<(...args: unknown[]) => u
 }
 
 async function waitForFile(path: string): Promise<void> {
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {
       await access(path);
@@ -1554,7 +1554,7 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 async function waitForCondition(condition: () => boolean): Promise<void> {
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (condition()) {
       return;

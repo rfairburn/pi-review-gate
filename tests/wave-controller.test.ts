@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
+import { captureWaveBase, WaveCaptureError, WaveCaptureResult } from "../src/execution/wave-repository";
 import {
   createWorkerWorktree,
   removeWorktree,
@@ -33,6 +33,10 @@ const GIT_ENV = {
   GIT_COMMITTER_NAME: "Test",
   GIT_COMMITTER_EMAIL: "test@test.com",
 };
+
+// Process startup can be several seconds on loaded CI/Linux hosts. These are
+// behavioral controller tests, not executor-timeout tests, so keep ample room.
+const TEST_EXECUTOR_TIMEOUT_MS = 30_000;
 
 async function git(args: string[], cwd: string): Promise<string> {
   const { stdout } = await execFileAsync("git", args, {
@@ -93,7 +97,7 @@ function makeConfigWithWritingExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 5000,
+          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
         },
       ],
     },
@@ -135,7 +139,7 @@ function makeConfigWithFailingExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 5000,
+          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
         },
       ],
     },
@@ -184,7 +188,7 @@ function makeConfigWithMixedExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 5000,
+          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
         },
       ],
     },
@@ -227,7 +231,7 @@ function makeConfigWithSlowExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 10000,
+          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
         },
       ],
     },
@@ -269,7 +273,7 @@ function makeConfigWithNoopExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 5000,
+          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
         },
       ],
     },
@@ -503,18 +507,26 @@ test("abort mid-flight stops new starts, settles active workers, skips integrati
       signal: controller.signal,
     });
     setTimeout(() => controller.abort(), 150);
-    const result = await resultPromise;
+    let result: WaveResult | undefined;
+    try {
+      result = await resultPromise;
+    } catch (error) {
+      assert.ok(error instanceof WaveCaptureError);
+      assert.equal(error.code, "cancelled");
+    }
 
-    assert.equal(result.phase, "aborted");
-    assert.equal(result.integration, undefined);
-    assert.equal(result.landing, undefined);
-    assert.equal(result.taskResults.length, 3);
-    // First worker may have completed or been cancelled; rest should be cancelled.
-    for (const tr of result.taskResults) {
-      assert.ok(
-        tr.status === "cancelled" || tr.status === "completed_unreviewed" || tr.status === "accepted",
-        `Unexpected status ${tr.status}`,
-      );
+    if (result) {
+      assert.equal(result.phase, "aborted");
+      assert.equal(result.integration, undefined);
+      assert.equal(result.landing, undefined);
+      assert.equal(result.taskResults.length, 3);
+      // First worker may have completed or been cancelled; rest should be cancelled.
+      for (const tr of result.taskResults) {
+        assert.ok(
+          tr.status === "cancelled" || tr.status === "completed_unreviewed" || tr.status === "accepted",
+          `Unexpected status ${tr.status}`,
+        );
+      }
     }
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
@@ -533,23 +545,23 @@ test("abort signal passed to workers prevents integration/landing", async () => 
   const controller = new AbortController();
   controller.abort();
 
-  const result = await executeWave({
-    cwd: sourceDir,
-    tasks: [
-      { title: "T1", instructions: "noop", acceptanceCriteria: [] },
-    ],
-    config: makeConfigWithWritingExecutor(),
-    artifactDir,
-    waveId: "wc-abort-immediate",
-    signal: controller.signal,
-  });
-
-  // With immediate abort, no workers should start.
-  assert.equal(result.phase, "aborted");
-  // No workers started because abort was checked before dispatch.
-  assert.ok(result.taskResults.length <= 1);
-  assert.equal(result.integration, undefined);
-  assert.equal(result.landing, undefined);
+  await assert.rejects(
+    executeWave({
+      cwd: sourceDir,
+      tasks: [
+        { title: "T1", instructions: "noop", acceptanceCriteria: [] },
+      ],
+      config: makeConfigWithWritingExecutor(),
+      artifactDir,
+      waveId: "wc-abort-immediate",
+      signal: controller.signal,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof WaveCaptureError);
+      assert.equal((error as WaveCaptureError).code, "cancelled");
+      return true;
+    },
+  );
 
   await rm(artifactDir, { recursive: true, force: true });
   await rm(sourceDir, { recursive: true, force: true });
@@ -1092,7 +1104,6 @@ test("unstarted tasks are reported as cancelled, not no_changes", async () => {
   await git(["commit", "--quiet", "-m", "init"], sourceDir);
 
   const controller = new AbortController();
-  controller.abort();
 
   const result = await executeWave({
     cwd: sourceDir,
@@ -1104,9 +1115,12 @@ test("unstarted tasks are reported as cancelled, not no_changes", async () => {
     artifactDir,
     waveId: "wc-cancelled",
     signal: controller.signal,
+    onProgress: (update) => {
+      if (update.phase === "working") controller.abort();
+    },
   });
 
-  // With immediate abort, tasks should be reported as cancelled.
+  // Abort after capture but before dispatch: tasks should be reported as cancelled.
   assert.equal(result.phase, "aborted");
   for (const tr of result.taskResults) {
     assert.equal(tr.status, "cancelled", `Expected cancelled, got ${tr.status}`);

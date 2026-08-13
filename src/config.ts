@@ -342,6 +342,24 @@ export function internalReviewerId(model: string): string {
   return `little-coder-${Buffer.from(model).toString("base64url")}`;
 }
 
+export function reviewerDisplayLabel(reviewer: DeciderConfig): string {
+  if (reviewer.adapter === "little-coder-model") {
+    return reviewer.thinkingLevel
+      ? `${reviewer.model} (${reviewer.thinkingLevel})`
+      : reviewer.model;
+  }
+  if ((reviewer.adapter === "codex-cli" || reviewer.adapter === "claude-cli") && reviewer.model) {
+    return `${reviewer.id} [${reviewer.adapter}/${reviewer.model}]`;
+  }
+  return reviewer.id;
+}
+
+export function reviewerDisplayLabels(reviewers: DeciderConfig[]): Record<string, string> {
+  return Object.fromEntries(
+    reviewers.map((reviewer) => [reviewer.id, reviewerDisplayLabel(reviewer)]),
+  );
+}
+
 function findConfigPath(env: NodeJS.ProcessEnv): string | undefined {
   if (env.PI_REVIEW_GATE_CONFIG) {
     return env.PI_REVIEW_GATE_CONFIG;

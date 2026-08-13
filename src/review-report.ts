@@ -1,4 +1,4 @@
-import type { DeciderConfig } from "./config";
+import { reviewerDisplayLabels, type DeciderConfig } from "./config";
 import type { ReviewRunOutput } from "./review";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import type { ReviewFeedbackContext } from "./state";
@@ -70,7 +70,7 @@ export function buildReviewReportFromHistory(input: {
   artifactDir?: string;
   currentOutput?: ReviewRunOutput;
 }): SubtaskReviewReport | undefined {
-  const labels = new Map(input.reviewers.map((reviewer) => [reviewer.id, reviewerLabel(reviewer)]));
+  const labels = new Map(Object.entries(reviewerDisplayLabels(input.reviewers)));
   const cycles = input.history.map((feedback) => buildCycleEvidence({
     sequence: feedback.sequence,
     gateSummary: verdictSummary(feedback.reviewerResults),
@@ -173,14 +173,4 @@ function verdictSummary(results: ReviewResult[]): string {
 function withoutRawUsage(usage: NonNullable<ReviewResult["usage"]>): Omit<NonNullable<ReviewResult["usage"]>, "raw"> {
   const { raw: _raw, ...summary } = usage;
   return summary;
-}
-
-function reviewerLabel(reviewer: DeciderConfig): string {
-  if (reviewer.adapter === "little-coder-model") {
-    return reviewer.thinkingLevel ? `${reviewer.model} (${reviewer.thinkingLevel})` : reviewer.model;
-  }
-  if ((reviewer.adapter === "codex-cli" || reviewer.adapter === "claude-cli") && reviewer.model) {
-    return `${reviewer.id} [${reviewer.adapter}/${reviewer.model}]`;
-  }
-  return reviewer.id;
 }

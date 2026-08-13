@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWorkspaceSnapshot, compareSnapshots, type WorkspaceSnapshot } from "../capture";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "../correction-feedback";
-import { automaticReviewEnabled, configWithReviewers, resolveReviewers, type ReviewGateConfig } from "../config";
-import { reviewerDisplayLabel, runReview, type ReviewRunOutput } from "../review";
+import { automaticReviewEnabled, configWithReviewers, resolveReviewers, reviewerDisplayLabel, type ReviewGateConfig } from "../config";
+import { runReview, type ReviewRunOutput } from "../review";
 import {
   activeExchangeBaseline,
   beginAgentRun,

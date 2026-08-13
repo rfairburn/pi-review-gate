@@ -294,6 +294,37 @@ test("a review window materializes and freezes scoped little-coder reviewers", (
   assert.equal(freezeReviewWindowConfig(state, config, []), frozen);
 });
 
+test("historical review context shows internal model labels instead of encoded reviewer ids", () => {
+  const state = createState();
+  beginAgentRun(state);
+  const frozen = freezeReviewWindowConfig(state, normalizeConfig({
+    enabled: true,
+    review: {
+      activeReviewers: [{
+        source: "little-coder",
+        model: "ollama/deepseek-v4-flash:0731-cloud",
+        thinkingLevel: "high",
+      }],
+    },
+  }), ["ollama/deepseek-v4-flash:0731-cloud"]);
+  const reviewer = frozen.reviewers?.[0];
+  assert.ok(reviewer);
+  recordReviewerFeedback(state, {
+    source: "automatic",
+    disposition: "sent_for_observation",
+    result: {
+      reviewerId: reviewer.id,
+      verdict: "pass",
+      summary: "No issue found.",
+      findings: [],
+    },
+  });
+
+  const context = buildRequestContext(state);
+  assert.match(context, /ollama\/deepseek-v4-flash:0731-cloud \(high\) \(pass\)/);
+  assert.doesNotMatch(context, new RegExp(reviewer.id));
+});
+
 test("an accepted answer after a passed review seeds the next review window evidence", () => {
   const state = createState();
   rememberUserRequest(state, "first task");

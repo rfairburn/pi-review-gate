@@ -46,4 +46,4 @@ esac
 echo "pi-review-gate config: $REVIEW_GATE_CONFIG"
 echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"
 
-exec little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT" "$@"
+exec little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT" "$@"

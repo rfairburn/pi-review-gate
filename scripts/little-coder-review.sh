@@ -140,7 +140,7 @@ export PI_REVIEW_GATE_CONFIG="$CONFIG"
 export LITTLE_CODER_EXTRA_EXTENSIONS="$ROOT/dist/src/index.js${LITTLE_CODER_EXTRA_EXTENSIONS:+:$LITTLE_CODER_EXTRA_EXTENSIONS}"
 echo "LITTLE_CODER_EXTRA_EXTENSIONS=$LITTLE_CODER_EXTRA_EXTENSIONS"
 if ((${#LITTLE_CODER_ARGS[@]})); then
-  little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT" "${LITTLE_CODER_ARGS[@]}"
+  little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT" "${LITTLE_CODER_ARGS[@]}"
 else
-  little-coder --append-system-prompt "$ORCHESTRATOR_PROMPT"
+  little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT"
 fi

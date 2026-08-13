@@ -14,6 +14,7 @@ import {
   automaticReviewEnabled,
   configWithReviewers,
   resolveReviewers,
+  reviewerDisplayLabels,
   type ReviewGateConfig,
 } from "./config";
 
@@ -363,6 +364,11 @@ export function buildRequestContext(
     "",
     ...renderUserRequestContext(window),
   ];
+  const displayLabels = new Map(
+    Object.entries(reviewerDisplayLabels(
+      window.reviewConfig ? resolveReviewers(window.reviewConfig).reviewers : [],
+    )),
+  );
 
   if (window.reviewHistory.length > 0) {
     lines.push(
@@ -381,7 +387,8 @@ export function buildRequestContext(
       if (feedback.reviewerResults.length > 0) {
         lines.push("Complete individual reviewer results delivered to the implementing model:");
         for (const reviewer of feedback.reviewerResults) {
-          lines.push(`- ${reviewer.reviewerId} (${reviewer.verdict}): ${reviewer.summary}`);
+          const displayLabel = displayLabels.get(reviewer.reviewerId) ?? reviewer.reviewerId;
+          lines.push(`- ${displayLabel} (${reviewer.verdict}): ${reviewer.summary}`);
           if (reviewer.guidance) {
             lines.push(`  Guidance: ${reviewer.guidance}`);
           }

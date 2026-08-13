@@ -1,7 +1,7 @@
 import { cp, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { resolveReviewers, type DeciderConfig, type ReviewGateConfig } from "./config";
+import { resolveReviewers, reviewerDisplayLabel, reviewerDisplayLabels, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
@@ -88,6 +88,7 @@ export interface AskReviewerOutput {
   changes: ChangedFile[];
   result?: ReviewResult;
   reviewerResults?: ReviewResult[];
+  reviewerDisplayLabels?: Record<string, string>;
   bundleDir?: string;
   bundleRetained?: boolean;
   error?: string;
@@ -247,6 +248,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       error: "No reviewers configured.",
     };
   }
+  const displayLabels = reviewerDisplayLabels(reviewers);
 
   const reviewSequence = input.window?.nextReviewSequence ?? 1;
   const bundle = await createReviewBundle({
@@ -322,9 +324,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     changes,
     result: invocation.result,
     reviewerResults: invocation.reviewerResults,
-    reviewerDisplayLabels: Object.fromEntries(
-      reviewers.map((reviewer) => [reviewer.id, reviewerDisplayLabel(reviewer)]),
-    ),
+    reviewerDisplayLabels: displayLabels,
     bundleDir: bundle.dir,
     invocationDir: bundle.invocationDir,
     reviewSequence,
@@ -397,6 +397,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       error: "No reviewers configured.",
     };
   }
+  const displayLabels = reviewerDisplayLabels(reviewers);
 
   const reviewSequence = input.window?.nextReviewSequence ?? 1;
   const bundle = await createReviewerQuestionBundle({
@@ -444,6 +445,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     return {
       changes,
       result: abortedResult(),
+      reviewerDisplayLabels: displayLabels,
       bundleDir: bundle.dir,
       bundleRetained: false,
     };
@@ -453,6 +455,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     changes,
     result: invocation.result,
     reviewerResults: invocation.reviewerResults,
+    reviewerDisplayLabels: displayLabels,
     bundleDir: bundle.dir,
     bundleRetained: invocation.bundleRetained,
   };
@@ -527,7 +530,11 @@ async function executeReviewerInvocation(input: {
   // reviewer writes outside the evidence bundle, so concurrently running
   // reviewers cannot inspect sibling results or runtime session streams.
   try {
-    await publishStagedReviewerSet(stagedReviewers, input.bundle.invocationDir);
+    await publishStagedReviewerSet(
+      stagedReviewers,
+      input.bundle.invocationDir,
+      reviewerDisplayLabels(input.reviewers),
+    );
   } catch (error) {
     await cleanupStagedReviewers(stagedReviewers);
     const message = error instanceof Error ? error.message : "Reviewer artifact publication failed.";
@@ -678,11 +685,12 @@ interface StagedReviewerResult {
 async function publishStagedReviewerSet(
   stagedReviewers: StagedReviewerResult[],
   invocationDir: string,
+  displayLabels: Record<string, string>,
 ): Promise<void> {
   const incomplete = stagedReviewers.filter((reviewer) => reviewer.artifactError);
   if (incomplete.length > 0) {
     throw new Error(incomplete.map((reviewer) =>
-      `${reviewer.result.reviewerId}: ${reviewer.artifactError}`).join("; "));
+      `${displayLabels[reviewer.result.reviewerId] ?? reviewer.result.reviewerId}: ${reviewer.artifactError}`).join("; "));
   }
   const finalRoot = join(invocationDir, "reviewers");
   const stagedRoot = await mkdtemp(join(invocationDir, ".reviewers-"));
@@ -893,18 +901,6 @@ function getReviewers(config: ReviewGateConfig): DeciderConfig[] {
   return resolution.unknownIds.length === 0 && resolution.duplicateEnabledIds.length === 0
     ? resolution.reviewers
     : [];
-}
-
-export function reviewerDisplayLabel(reviewer: DeciderConfig): string {
-  if (reviewer.adapter === "little-coder-model") {
-    return reviewer.thinkingLevel
-      ? `${reviewer.model} (${reviewer.thinkingLevel})`
-      : reviewer.model;
-  }
-  if ((reviewer.adapter === "codex-cli" || reviewer.adapter === "claude-cli") && reviewer.model) {
-    return `${reviewer.id} [${reviewer.adapter}/${reviewer.model}]`;
-  }
-  return reviewer.id;
 }
 
 function safePathSegment(value: string): string {

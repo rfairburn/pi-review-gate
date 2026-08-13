@@ -4,10 +4,49 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createWorkspaceSnapshot } from "../src/capture";
-import { registerCommands } from "../src/commands";
+import { formatReviewerAnswer, registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
 import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest } from "../src/state";
 import { fakeNeedsChangesConfig } from "./helpers";
+
+test("reviewer command output shows internal model labels instead of encoded reviewer ids", async () => {
+  const reviewerId = "little-coder-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ";
+  const displayLabel = "ollama/deepseek-v4-flash:0731-cloud";
+  const answer = formatReviewerAnswer("is this safe?", [{
+    reviewerId,
+    verdict: "pass",
+    summary: "Looks safe.",
+    findings: [],
+  }], { [reviewerId]: displayLabel });
+
+  assert.match(answer, /## ollama\/deepseek-v4-flash:0731-cloud — pass/);
+  assert.doesNotMatch(answer, /little-coder-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ/);
+
+  const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+  const notices: string[] = [];
+  registerCommands({
+    pi: {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+    },
+    cwd: () => process.cwd(),
+    config: {
+      ...fakeNeedsChangesConfig(),
+      decider: {
+        id: reviewerId,
+        adapter: "little-coder-model",
+        model: displayLabel,
+        timeoutMs: 15000,
+      },
+    },
+    state: createState(),
+  });
+  await commands.get("review-gate-ping")?.("", { notify(message: string) { notices.push(message); } });
+
+  assert.match(notices[0] ?? "", /reviewers=ollama\/deepseek-v4-flash:0731-cloud/);
+  assert.doesNotMatch(notices[0] ?? "", /little-coder-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ/);
+});
 
 test("/review-pause and /review-unpause gate explicit reviewer commands", async () => {
   const state = createState();

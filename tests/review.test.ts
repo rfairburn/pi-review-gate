@@ -3,10 +3,10 @@ import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ReviewGateConfig } from "../src/config";
+import { reviewerDisplayLabel, type ReviewGateConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { createEvidenceState, recordAcceptedReviewerQuestion, recordToolCallEvidence } from "../src/evidence";
-import { reviewerDisplayLabel, runAskReviewer, runReview } from "../src/review";
+import { runAskReviewer, runReview } from "../src/review";
 import { beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
 import { fakeNeedsChangesConfig } from "./helpers";
 
@@ -602,6 +602,7 @@ test("runAskReviewer answers with request and evidence even when there is no pat
 
     assert.equal(output.result?.verdict, "pass");
     assert.match(output.result?.summary ?? "", /reviewable from evidence/);
+    assert.deepEqual(output.reviewerDisplayLabels, { "prompt-checker": "prompt-checker" });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

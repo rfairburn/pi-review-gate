@@ -1,4 +1,4 @@
-import { automaticReviewEnabled, resolveReviewers, type ReviewGateConfig } from "./config";
+import { automaticReviewEnabled, resolveReviewers, reviewerDisplayLabel, type ReviewGateConfig } from "./config";
 import { join } from "node:path";
 import { removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
@@ -47,7 +47,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       if (!isSessionActive()) {
         return;
       }
-      const reviewers = resolveReviewers(currentConfig()).reviewers.map((reviewer) => reviewer.id).join(", ") || "none";
+      const reviewers = resolveReviewers(currentConfig()).reviewers.map(reviewerDisplayLabel).join(", ") || "none";
       await sendCommandNotice(ctx, `review gate: loaded; reviewers=${reviewers}; paused=${input.state.reviewsPaused}`);
     },
   });
@@ -301,7 +301,12 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
 
-      const payload = formatReviewerAnswer(question, output.reviewerResults ?? [], output.bundleRetained ? output.bundleDir : undefined);
+      const payload = formatReviewerAnswer(
+        question,
+        output.reviewerResults ?? [],
+        output.reviewerDisplayLabels,
+        output.bundleRetained ? output.bundleDir : undefined,
+      );
       const submittedPayload = autoSubmit ? payload : await showPrivateReviewerAnswer(ctx, payload);
       if (!isSessionActive()) {
         return;
@@ -381,14 +386,20 @@ function getRegisterCommand(pi: unknown): RegisterCommand | undefined {
   return undefined;
 }
 
-function formatReviewerAnswer(question: string, results: ReviewResult[], bundleDir?: string): string {
+export function formatReviewerAnswer(
+  question: string,
+  results: ReviewResult[],
+  reviewerDisplayLabels?: Record<string, string>,
+  bundleDir?: string,
+): string {
   const lines = [
     "Reviewer note from /ask-reviewer:",
     "",
     `Question: ${question}`,
   ];
   for (const result of results) {
-    lines.push("", `## ${result.reviewerId} — ${result.verdict}`, "", `Answer: ${result.summary}`);
+    const displayLabel = reviewerDisplayLabels?.[result.reviewerId] ?? result.reviewerId;
+    lines.push("", `## ${displayLabel} — ${result.verdict}`, "", `Answer: ${result.summary}`);
     if (result.guidance) {
       lines.push("", "Implementation guidance:", result.guidance);
     }

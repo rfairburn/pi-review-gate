@@ -35,11 +35,11 @@ import { pinCommit } from "./wave-worktrees";
 import {
   configWithReviewers,
   resolveReviewers,
+  reviewerDisplayLabel,
   type DeciderConfig,
   type ReviewGateConfig,
 } from "../config";
 import {
-  reviewerDisplayLabel,
   runReview,
   type ExactChangeInput,
   type ReviewRunOutput,

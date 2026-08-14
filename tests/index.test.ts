@@ -142,7 +142,7 @@ test("cap status is concise while reviewer results are delivered once in the tra
 
     const noticeText = notices.join("\n\n");
     assert.match(noticeText, /automatic correction cap reached/);
-    assert.ok(statuses.some(([, text]) => text?.includes("started")));
+    assert.ok(statuses.some(([, text]) => text?.includes("reviewing changes")));
     assert.deepEqual(statuses.at(-1), ["review-gate", undefined]);
     assert.match(noticeText, /Complete reviewer feedback was transmitted to the implementing model/);
     assert.match(noticeText, /Use \/review-continue to authorize/);

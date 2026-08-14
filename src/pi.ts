@@ -86,6 +86,22 @@ export function onTerminalInput(pi: unknown, handler: TerminalInputHandler): (()
   return undefined;
 }
 
+export function isEscapeTerminalInput(input: unknown): boolean {
+  if (input === "\x1b" || input === "Escape" || input === "escape") {
+    return true;
+  }
+  if (!isRecord(input)) {
+    return false;
+  }
+  if (input.name === "escape" || input.key === "Escape" || input.key === "escape") {
+    return true;
+  }
+  if (isRecord(input.key) && input.key.name === "escape") {
+    return true;
+  }
+  return input.sequence === "\x1b";
+}
+
 export function extractCwd(args: unknown[], fallback: string = process.cwd()): string {
   for (const arg of args) {
     if (isRecord(arg) && typeof arg.cwd === "string") {
@@ -188,10 +204,25 @@ export function setStatus(pi: unknown, key: string, text: string | undefined): v
   }
 }
 
-export function createStatusTracker(pi: unknown, key: string, initialText: string): StatusTracker {
+export function createStatusTracker(
+  pi: unknown,
+  key: string,
+  initialText: string,
+  options: { minimumDisplayMs?: number } = {},
+): StatusTracker {
+  const statusAvailable = isRecord(pi) && isRecord(pi.ui) && typeof pi.ui.setStatus === "function";
+  const minimumDisplayMs = statusAvailable ? Math.max(0, options.minimumDisplayMs ?? 400) : 0;
   let currentText = initialText;
   let lastText = "";
   const startedAt = Date.now();
+  let displayedAt = startedAt;
+  const pendingTexts: string[] = [];
+  let ambientText: string | undefined;
+  let advanceTimer: ReturnType<typeof setTimeout> | undefined;
+  let clearRequested = false;
+  let clearPromise: Promise<void> | undefined;
+  let resolveClear: (() => void) | undefined;
+  let clearSignal: AbortSignal | undefined;
   let disposed = false;
 
   const refresh = () => {
@@ -208,24 +239,98 @@ export function createStatusTracker(pi: unknown, key: string, initialText: strin
   const interval = setInterval(refresh, 2_000);
   interval.unref?.();
 
+  const finishClear = () => {
+    if (disposed) return;
+    disposed = true;
+    if (advanceTimer) clearTimeout(advanceTimer);
+    clearInterval(interval);
+    clearSignal?.removeEventListener("abort", abortClear);
+    clearSignal = undefined;
+    setStatus(pi, key, undefined);
+    resolveClear?.();
+    resolveClear = undefined;
+  };
+
+  function abortClear(): void {
+    finishClear();
+  }
+
+  const advance = () => {
+    advanceTimer = undefined;
+    if (disposed) return;
+    const queuedText = pendingTexts.shift();
+    const nextText = queuedText ?? ambientText;
+    if (nextText !== undefined) {
+      if (queuedText === undefined) ambientText = undefined;
+      currentText = nextText;
+      displayedAt = Date.now();
+      refresh();
+    } else if (clearRequested) {
+      finishClear();
+      return;
+    }
+    scheduleAdvance();
+  };
+
+  function scheduleAdvance(): void {
+    if (disposed || advanceTimer || (pendingTexts.length === 0 && ambientText === undefined && !clearRequested)) return;
+    const remaining = Math.max(0, minimumDisplayMs - (Date.now() - displayedAt));
+    if (remaining === 0) {
+      advance();
+      return;
+    }
+    advanceTimer = setTimeout(advance, remaining);
+  }
+
   return {
     update(text: string) {
-      if (disposed) return;
-      currentText = text;
-      refresh();
+      if (disposed || clearRequested || text === currentText) return;
+      if (isAmbientStatus(text)) {
+        ambientText = text;
+      } else {
+        if (text === pendingTexts.at(-1)) return;
+        pendingTexts.push(text);
+        ambientText = undefined;
+      }
+      scheduleAdvance();
     },
-    clear() {
-      if (disposed) return;
-      disposed = true;
-      clearInterval(interval);
-      setStatus(pi, key, undefined);
+    clear(clearOptions = {}) {
+      if (disposed) return Promise.resolve();
+      if (clearOptions.immediate) {
+        finishClear();
+        return Promise.resolve();
+      }
+      if (clearPromise) return clearPromise;
+      clearSignal = clearOptions.signal;
+      if (clearSignal?.aborted) {
+        finishClear();
+        return Promise.resolve();
+      }
+      clearSignal?.addEventListener("abort", abortClear, { once: true });
+      clearRequested = true;
+      pendingTexts.splice(0);
+      ambientText = undefined;
+      if (advanceTimer) {
+        clearTimeout(advanceTimer);
+        advanceTimer = undefined;
+      }
+      clearPromise = new Promise<void>((resolve) => {
+        resolveClear = resolve;
+      });
+      scheduleAdvance();
+      return clearPromise;
     },
   };
 }
 
+function isAmbientStatus(text: string): boolean {
+  return /(?:^| · )model (?:turn started|reasoning|composing response|turn completed)$/.test(text)
+    || /(?:^| · )(?:read|grep|find|glob|ls) completed$/.test(text);
+}
+
 export interface StatusTracker {
   update(text: string): void;
-  clear(): void;
+  clear(options?: { immediate?: boolean; signal?: AbortSignal }): Promise<void>;
 }
 
 function formatElapsed(ms: number): string {

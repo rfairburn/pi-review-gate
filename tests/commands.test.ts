@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -209,8 +209,80 @@ test("/review-now requested changes reset the automatic correction budget", asyn
     assert.equal(followUps.length, 1);
     assert.match(followUps[0] ?? "", /missing test/);
     assert.match(notices.join("\n"), /review gate: changes requested/);
-    assert.ok(statuses.some(([, text]) => text?.includes("started")));
+    assert.ok(statuses.some(([, text]) => text?.includes("reviewing changes")));
     assert.deepEqual(statuses.at(-1), ["review-gate", undefined]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Escape immediately aborts an active /review-now", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-now-escape-"));
+  try {
+    const markerPath = join(dir, "reviewer-started.txt");
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "change index");
+    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: 1_048_576,
+      maxSnapshotBytes: 52_428_800,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const terminalHandlers: Array<(input: unknown) => unknown> = [];
+    const notices: string[] = [];
+    const followUps: string[] = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        setStatus() {},
+        onTerminalInput(handler: (input: unknown) => unknown) {
+          terminalHandlers.push(handler);
+          return () => {
+            const index = terminalHandlers.indexOf(handler);
+            if (index >= 0) terminalHandlers.splice(index, 1);
+          };
+        },
+      },
+    };
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: {
+        ...reviewConfig(),
+        decider: {
+          id: "slow",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [
+            "-e",
+            `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
+          ],
+          timeoutMs: 300_000,
+        },
+      },
+      state,
+    });
+
+    const pending = commands.get("review-now")?.("", ctx);
+    await waitForPath(markerPath);
+    assert.equal(terminalHandlers.length, 1);
+    assert.deepEqual(terminalHandlers[0]?.({ key: "Escape" }), { action: "handled", consume: true });
+    await pending;
+
+    assert.match(notices.join("\n"), /review gate: review cancelled/);
+    assert.equal(terminalHandlers.length, 0);
+    assert.equal(followUps.length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -540,6 +612,76 @@ test("/ask-reviewer-interactive opens the reviewer answer in the editor when can
   }
 });
 
+test("Escape immediately aborts an active /ask-reviewer and clears its terminal handler", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-escape-"));
+  try {
+    const markerPath = join(dir, "reviewer-started.txt");
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const terminalHandlers: Array<(input: unknown) => unknown> = [];
+    const notices: string[] = [];
+    const statuses: Array<string | undefined> = [];
+    const userMessages: string[] = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage(message: string) {
+        userMessages.push(message);
+      },
+    };
+    const ctx = {
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        setStatus(_key: string, text: string | undefined) {
+          statuses.push(text);
+        },
+        onTerminalInput(handler: (input: unknown) => unknown) {
+          terminalHandlers.push(handler);
+          return () => {
+            const index = terminalHandlers.indexOf(handler);
+            if (index >= 0) terminalHandlers.splice(index, 1);
+          };
+        },
+      },
+    };
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      config: {
+        ...reviewConfig(),
+        decider: {
+          id: "slow",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [
+            "-e",
+            `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
+          ],
+          timeoutMs: 300_000,
+        },
+      },
+      state: createState(),
+    });
+
+    const pending = commands.get("ask-reviewer")?.("should this stop?", ctx);
+    await waitForPath(markerPath);
+    assert.equal(terminalHandlers.length, 1);
+    const escapedAt = Date.now();
+    assert.deepEqual(terminalHandlers[0]?.("\x1b"), { action: "handled", consume: true });
+    await pending;
+
+    assert.equal(Date.now() - escapedAt < 1_000, true);
+    assert.match(notices.join("\n"), /reviewer question cancelled/);
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(terminalHandlers.length, 0);
+    assert.equal(userMessages.length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("/ask-reviewer-interactive submits edited reviewer text when the editor is submitted", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-submit-"));
   try {
@@ -652,7 +794,7 @@ test("/ask-reviewer submits the same reviewer text without opening the interacti
     assert.equal(userMessages[1]?.message, userMessages[0]?.message);
     assert.deepEqual(preparedCommands, ["ask-reviewer-interactive", "ask-reviewer"]);
     assert.equal(state.reviewWindow?.evidence.acceptedReviewerQuestions.length, 2);
-    assert.ok(statuses.some(([, text]) => text?.includes("started")));
+    assert.ok(statuses.some(([, text]) => text?.includes("asking reviewer")));
     assert.equal(statuses.filter(([, text]) => text === undefined).length, 2);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -880,4 +1022,16 @@ function askReviewerConfig(): ReviewGateConfig {
       timeoutMs: 15000,
     },
   };
+}
+
+async function waitForPath(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`Timed out waiting for ${path}`);
 }

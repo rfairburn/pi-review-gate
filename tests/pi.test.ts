@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extractInputSource, extractInputText, extractSignal } from "../src/pi";
+import { extractInputSource, extractInputText, extractSignal, isEscapeTerminalInput } from "../src/pi";
 import { createState, rememberUserRequest } from "../src/state";
 
 test("extractInputSource reads pi input event source", () => {
@@ -14,6 +14,16 @@ test("extractSignal reads pi event context signal", () => {
   const controller = new AbortController();
   assert.equal(extractSignal([{ cwd: process.cwd(), signal: controller.signal }]), controller.signal);
   assert.equal(extractSignal([{ ctx: { signal: controller.signal } }]), controller.signal);
+});
+
+test("isEscapeTerminalInput recognizes supported terminal event shapes", () => {
+  assert.equal(isEscapeTerminalInput("\x1b"), true);
+  assert.equal(isEscapeTerminalInput("Escape"), true);
+  assert.equal(isEscapeTerminalInput({ name: "escape" }), true);
+  assert.equal(isEscapeTerminalInput({ key: "Escape" }), true);
+  assert.equal(isEscapeTerminalInput({ key: { name: "escape" } }), true);
+  assert.equal(isEscapeTerminalInput({ sequence: "\x1b" }), true);
+  assert.equal(isEscapeTerminalInput("enter"), false);
 });
 
 test("extension follow-up input should not reset correction cycle state", () => {

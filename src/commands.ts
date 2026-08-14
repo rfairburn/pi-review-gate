@@ -15,7 +15,7 @@ import {
   type ReviewGateState,
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
-import { extractSignal, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
+import { extractSignal, isEscapeTerminalInput, onTerminalInput, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { createReviewTransmissionMessage, deliverReviewTransmission, writeReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
@@ -125,6 +125,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       const statusTracker = createStatusTracker(ctx, "review-gate", "reviewing changes");
+      const reviewAbort = createCommandReviewAbort(ctx, input.sessionSignal);
+      const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
       let output;
       try {
         output = await runReview({
@@ -135,12 +137,13 @@ export function registerCommands(input: RegisterCommandsInput): void {
           evidence: window.evidence,
           correctionAttemptCount: getCorrectionAttemptCount(window),
           window,
-          signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
+          signal: reviewSignal,
           notify: (message) => sendCommandNotice(ctx, message),
           onUpdate: (message) => statusTracker.update(message),
         });
       } finally {
-        statusTracker.clear();
+        await statusTracker.clear({ immediate: reviewSignal?.aborted, signal: reviewSignal });
+        reviewAbort.cleanup();
       }
 
       if (!isSessionActive()) {
@@ -151,7 +154,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         closeReviewWindow(input.state, true);
         return;
       }
-      if (output.result?.error === "aborted") {
+      if (reviewSignal?.aborted || output.result?.error === "aborted") {
         await sendCommandNotice(ctx, "review gate: review cancelled");
         return;
       }
@@ -264,6 +267,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const contextWindow = getReviewerQuestionWindow(input.state);
       const reviewConfig = contextWindow?.reviewConfig ?? currentConfig();
       const statusTracker = createStatusTracker(ctx, "review-gate", "asking reviewer");
+      const reviewAbort = createCommandReviewAbort(ctx, input.sessionSignal);
+      const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
       let output;
       try {
         output = await runAskReviewer({
@@ -275,12 +280,13 @@ export function registerCommands(input: RegisterCommandsInput): void {
           evidence: contextWindow?.evidence,
           correctionAttemptCount: getCorrectionAttemptCount(contextWindow),
           window: contextWindow,
-          signal: combineAbortSignals(extractSignal([ctx]), input.sessionSignal),
+          signal: reviewSignal,
           notify: (message) => sendCommandNotice(ctx, message),
           onUpdate: (message) => statusTracker.update(message),
         });
       } finally {
-        statusTracker.clear();
+        await statusTracker.clear({ immediate: reviewSignal?.aborted, signal: reviewSignal });
+        reviewAbort.cleanup();
       }
 
       if (!isSessionActive()) {
@@ -290,7 +296,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, output.error ?? "review gate: reviewer failed");
         return;
       }
-      if (output.result.error === "aborted") {
+      if (reviewSignal?.aborted || output.result.error === "aborted") {
         await sendCommandNotice(ctx, "review gate: reviewer question cancelled");
         return;
       }
@@ -441,6 +447,30 @@ function combineAbortSignals(...signals: Array<AbortSignal | undefined>): AbortS
     return activeSignals[0];
   }
   return AbortSignal.any(activeSignals);
+}
+
+function createCommandReviewAbort(
+  ctx: unknown,
+  sessionSignal: AbortSignal | undefined,
+): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const abortFromSession = () => {
+    if (!controller.signal.aborted) controller.abort(sessionSignal?.reason ?? "session_shutdown");
+  };
+  if (sessionSignal?.aborted) abortFromSession();
+  sessionSignal?.addEventListener("abort", abortFromSession, { once: true });
+  const unsubscribeTerminalInput = onTerminalInput(ctx, (terminalInput) => {
+    if (!isEscapeTerminalInput(terminalInput)) return undefined;
+    if (!controller.signal.aborted) controller.abort("escape");
+    return { action: "handled", consume: true };
+  });
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      sessionSignal?.removeEventListener("abort", abortFromSession);
+      unsubscribeTerminalInput?.();
+    },
+  };
 }
 
 async function showPrivateReviewerAnswer(ctx: unknown, message: string): Promise<string | undefined> {

@@ -4,7 +4,7 @@ import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, createStatusTracker, setStatus } from "./pi";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, isEscapeTerminalInput, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, createStatusTracker, setStatus } from "./pi";
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
   activeExchangeHasBaseline,
@@ -76,7 +76,7 @@ export async function activate(pi: unknown): Promise<void> {
     const reviewWasActive = Boolean(activeReviewAbort);
     activeReviewAbort?.shutdown();
     activeReviewAbort = undefined;
-    activeStatusTracker?.clear();
+    await activeStatusTracker?.clear({ immediate: true });
     activeStatusTracker = undefined;
     agentRunActive = false;
     reviewerQuestionPausePending = false;
@@ -261,7 +261,7 @@ export async function activate(pi: unknown): Promise<void> {
       await releaseQueuedUserInputs(pi, state, () => sessionActive);
       throw error;
     } finally {
-      statusTracker.clear();
+      await statusTracker.clear({ immediate: reviewAbort.signal.aborted, signal: reviewAbort.signal });
       if (activeStatusTracker === statusTracker) {
         activeStatusTracker = undefined;
       }
@@ -288,7 +288,7 @@ export async function activate(pi: unknown): Promise<void> {
       return;
     }
 
-    if (output.result?.error === "aborted") {
+    if (reviewAbort.signal.aborted || output.result?.error === "aborted") {
       if (reviewAbort.getReason() === "escape") {
         await reviewAbort.notifyCancellation();
       }
@@ -622,24 +622,4 @@ function discardSessionState(state: ReviewGateState): void {
   state.reviewWindow = undefined;
   state.lastQuestionWindow = undefined;
   state.pendingAcceptedReviewerQuestions.splice(0);
-}
-
-function isEscapeTerminalInput(input: unknown): boolean {
-  if (input === "\x1b" || input === "Escape" || input === "escape") {
-    return true;
-  }
-  if (!isRecord(input)) {
-    return false;
-  }
-  if (input.name === "escape" || input.key === "Escape" || input.key === "escape") {
-    return true;
-  }
-  if (isRecord(input.key) && input.key.name === "escape") {
-    return true;
-  }
-  return input.sequence === "\x1b";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }

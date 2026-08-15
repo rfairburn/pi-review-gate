@@ -395,7 +395,8 @@ launcher:
 ```
 
 It builds and explicitly enables this extension, forwards all arguments to
-little-coder, and leaves config resolution on the established fallback order:
+little-coder, sets the foreground model's `LITTLE_CODER_THINKING_BUDGET` to
+16,384 tokens, and leaves config resolution on the established fallback order:
 `~/.config/pi-review-gate/config.json`, `~/.config/pi/review-gate.json`, then
 `~/.config/little-coder/review-gate.json`. It fails clearly if none exists and
 does not generate or rewrite configuration.
@@ -452,7 +453,8 @@ used directly with `codex`, `claude`, `glm-5.2`, `double`,
 ./scripts/little-coder-review.sh double
 ```
 
-The development wrappers pass all ordinary arguments through to `little-coder`.
+The development wrappers pass all ordinary arguments through to `little-coder`
+and set the foreground model's `LITTLE_CODER_THINKING_BUDGET` to 16,384 tokens.
 By default they retain review temp bundles on reviewer failure. To keep every
 review bundle, pass:
 

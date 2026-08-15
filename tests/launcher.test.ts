@@ -27,6 +27,7 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
     "#!/usr/bin/env bash",
     "printf '%s' \"${PI_REVIEW_GATE_CONFIG:-unset}\" > \"$CAPTURE_DIR/config-env\"",
     "printf '%s' \"${PI_REVIEW_GATE_DISABLED:-unset}\" > \"$CAPTURE_DIR/disabled-env\"",
+    "printf '%s' \"${LITTLE_CODER_THINKING_BUDGET:-unset}\" > \"$CAPTURE_DIR/thinking-budget\"",
     "printf '%s' \"${LITTLE_CODER_EXTRA_EXTENSIONS:-}\" > \"$CAPTURE_DIR/extensions\"",
     "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
   ].join("\n"), "utf8");
@@ -40,6 +41,7 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
       CAPTURE_DIR: capture,
       PI_REVIEW_GATE_CONFIG: "/wrong/config.json",
       PI_REVIEW_GATE_DISABLED: "1",
+      LITTLE_CODER_THINKING_BUDGET: "4096",
       LITTLE_CODER_EXTRA_EXTENSIONS: "/other/extension.js",
     },
   });
@@ -47,6 +49,7 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
   assert.match(result.stdout, new RegExp(escapeRegExp(configPath)));
   assert.equal(await readFile(join(capture, "config-env"), "utf8"), "unset");
   assert.equal(await readFile(join(capture, "disabled-env"), "utf8"), "unset");
+  assert.equal(await readFile(join(capture, "thinking-budget"), "utf8"), "16384");
   const extensions = await readFile(join(capture, "extensions"), "utf8");
   assert.match(extensions, /dist\/src\/index\.js/);
   assert.match(extensions, /\/other\/extension\.js/);
@@ -69,6 +72,7 @@ test("preset launcher appends the orchestrator prompt and preserves forwarded ar
     "#!/usr/bin/env bash",
     "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
     "printf '%s' \"$PI_REVIEW_GATE_CONFIG\" > \"$CAPTURE_DIR/config-path\"",
+    "printf '%s' \"${LITTLE_CODER_THINKING_BUDGET:-unset}\" > \"$CAPTURE_DIR/thinking-budget\"",
     "node -e 'const fs=require(\"node:fs\");process.stdout.write((fs.statSync(process.argv[1]).mode & 0o777).toString(8))' \"$PI_REVIEW_GATE_CONFIG\" > \"$CAPTURE_DIR/config-mode\"",
   ].join("\n"), "utf8");
   await Promise.all([chmod(npmPath, 0o755), chmod(littleCoderPath, 0o755)]);
@@ -79,6 +83,7 @@ test("preset launcher appends the orchestrator prompt and preserves forwarded ar
       PATH: `${bin}:${process.env.PATH ?? ""}`,
       CAPTURE_DIR: capture,
       TMPDIR: root,
+      LITTLE_CODER_THINKING_BUDGET: "4096",
     },
   });
 
@@ -89,6 +94,7 @@ test("preset launcher appends the orchestrator prompt and preserves forwarded ar
   const temporaryConfig = await readFile(join(capture, "config-path"), "utf8");
   assert.match(temporaryConfig, /pi-review-gate\.[^/]+\/review\.json$/);
   assert.equal(await readFile(join(capture, "config-mode"), "utf8"), "600");
+  assert.equal(await readFile(join(capture, "thinking-budget"), "utf8"), "16384");
   await assert.rejects(readFile(temporaryConfig, "utf8"), /ENOENT/);
 });
 

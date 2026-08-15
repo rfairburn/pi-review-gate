@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ORCHESTRATOR_PROMPT="$ROOT/scripts/orchestrator-system-prompt.md"
+export LITTLE_CODER_THINKING_BUDGET=16384
 PRESET="${1:-}"
 if [[ -z "$PRESET" ]]; then
   echo "usage: $0 <codex|claude|glm-5.2|little-coder-deepseek-v4-flash|double|double-deepseek-v4-flash|triple|fake> [little-coder args...]" >&2

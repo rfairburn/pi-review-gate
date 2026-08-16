@@ -108,15 +108,29 @@ export interface ReviewSelectionConfig {
   activeReviewers?: ActiveReviewerSelection[];
 }
 
+export interface ExecutionRetryPolicy {
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitter: boolean;
+  maxSameIncidentRepeats: number;
+}
+
+export const DEFAULT_MAX_WORKERS = 4;
+export const MAX_EXECUTION_WORKERS = 16;
+export const DEFAULT_EXECUTION_RETRY_POLICY: ExecutionRetryPolicy = {
+  maxRetries: 2,
+  baseDelayMs: 1_000,
+  maxDelayMs: 15_000,
+  jitter: true,
+  maxSameIncidentRepeats: 2,
+};
+
 export interface ExecutionConfig {
   activeExecutor?: ActiveExecutorSelection;
   externalExecutors?: ExternalExecutorConfig[];
   maxWorkers?: number;
-  /**
-   * When true, the execute_subtasks parallel tool is active.
-   * Defaults to false (opt-in). execute_subtask activation is unchanged.
-   */
-  parallelEnabled?: boolean;
+  retryPolicy?: ExecutionRetryPolicy;
 }
 
 export interface ReviewGateConfig {
@@ -577,21 +591,50 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
     ? undefined
     : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
   const maxWorkers = normalizeMaxWorkers(value.maxWorkers);
-  const parallelEnabled = normalizeParallelEnabled(value.parallelEnabled);
+  const retryPolicy = normalizeExecutionRetryPolicy(value.retryPolicy);
   return {
     activeExecutor,
     externalExecutors,
     ...(maxWorkers !== undefined ? { maxWorkers } : {}),
-    ...(parallelEnabled !== undefined ? { parallelEnabled } : {}),
+    retryPolicy,
   };
 }
 
-function normalizeParallelEnabled(value: unknown): boolean | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "boolean") {
-    throw new Error("execution.parallelEnabled must be a boolean");
+function normalizeExecutionRetryPolicy(value: unknown): ExecutionRetryPolicy {
+  if (value === undefined) return { ...DEFAULT_EXECUTION_RETRY_POLICY };
+  if (!isRecord(value)) throw new Error("execution.retryPolicy must be an object");
+  const maxRetries = nonNegativeIntegerOrDefault(
+    value.maxRetries,
+    DEFAULT_EXECUTION_RETRY_POLICY.maxRetries,
+    "execution.retryPolicy.maxRetries",
+  );
+  const baseDelayMs = nonNegativeIntegerOrDefault(
+    value.baseDelayMs,
+    DEFAULT_EXECUTION_RETRY_POLICY.baseDelayMs,
+    "execution.retryPolicy.baseDelayMs",
+  );
+  const maxDelayMs = nonNegativeIntegerOrDefault(
+    value.maxDelayMs,
+    DEFAULT_EXECUTION_RETRY_POLICY.maxDelayMs,
+    "execution.retryPolicy.maxDelayMs",
+  );
+  if (maxDelayMs < baseDelayMs) {
+    throw new Error("execution.retryPolicy.maxDelayMs must be greater than or equal to baseDelayMs");
   }
-  return value;
+  if (value.jitter !== undefined && typeof value.jitter !== "boolean") {
+    throw new Error("execution.retryPolicy.jitter must be a boolean");
+  }
+  return {
+    maxRetries,
+    baseDelayMs,
+    maxDelayMs,
+    jitter: value.jitter ?? DEFAULT_EXECUTION_RETRY_POLICY.jitter,
+    maxSameIncidentRepeats: nonNegativeIntegerOrDefault(
+      value.maxSameIncidentRepeats,
+      DEFAULT_EXECUTION_RETRY_POLICY.maxSameIncidentRepeats,
+      "execution.retryPolicy.maxSameIncidentRepeats",
+    ),
+  };
 }
 
 function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
@@ -947,8 +990,8 @@ function normalizeMaxWorkers(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isInteger(value)) {
     throw new Error("execution.maxWorkers must be an integer");
   }
-  if (value < 1 || value > 4) {
-    throw new Error("execution.maxWorkers must be between 1 and 4");
+  if (value < 1 || value > MAX_EXECUTION_WORKERS) {
+    throw new Error(`execution.maxWorkers must be between 1 and ${MAX_EXECUTION_WORKERS}`);
   }
   return value;
 }

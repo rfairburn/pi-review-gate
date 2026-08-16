@@ -55,7 +55,7 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
   assert.match(extensions, /\/other\/extension\.js/);
   assert.equal(
     await readFile(join(capture, "args"), "utf8"),
-    `--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
+    `--tui-mode\nfullscreen\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
   );
 });
 
@@ -89,7 +89,7 @@ test("preset launcher appends the orchestrator prompt and preserves forwarded ar
 
   assert.equal(
     await readFile(join(capture, "args"), "utf8"),
-    `--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
+    `--tui-mode\nfullscreen\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
   );
   const temporaryConfig = await readFile(join(capture, "config-path"), "utf8");
   assert.match(temporaryConfig, /pi-review-gate\.[^/]+\/review\.json$/);

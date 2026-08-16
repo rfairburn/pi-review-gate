@@ -14,7 +14,13 @@ const selection: ReviewSettingsSelection = {
   implementationGuidanceAfterCorrectionAttempts: 1,
   retainBundles: "on-failure",
   maxWorkers: 2,
-  parallelEnabled: false,
+  retryPolicy: {
+    maxRetries: 2,
+    baseDelayMs: 1_000,
+    maxDelayMs: 15_000,
+    jitter: true,
+    maxSameIncidentRepeats: 2,
+  },
 };
 
 test("persistReviewSettings preserves restrictive configuration permissions", async (t) => {

@@ -282,7 +282,7 @@ function makeConfigWithNoopExecutor(): ReviewGateConfig {
 
 // ── maxWorkers validation ────────────────────────────────────────────────────
 
-test("maxWorkers defaults to 2", async () => {
+test("maxWorkers defaults to 4", async () => {
   const artifactDir = await mkTmp("pi-wc-art-");
   const sourceDir = await mkTmp("pi-wc-src-");
   await git(["init", "--quiet"], sourceDir);
@@ -313,19 +313,19 @@ test("maxWorkers rejects 0", async () => {
       config: makeConfigWithWritingExecutor(),
       maxWorkers: 0,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 4/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
   );
 });
 
-test("maxWorkers rejects 5", async () => {
+test("maxWorkers rejects 17", async () => {
   await assert.rejects(
     async () => executeWave({
       cwd: "/tmp",
       tasks: [{ title: "T", instructions: "i", acceptanceCriteria: [] }],
       config: makeConfigWithWritingExecutor(),
-      maxWorkers: 5,
+      maxWorkers: 17,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 4/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
   );
 });
 
@@ -337,7 +337,7 @@ test("maxWorkers rejects non-integer", async () => {
       config: makeConfigWithWritingExecutor(),
       maxWorkers: 2.5,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 4/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
   );
 });
 
@@ -365,7 +365,7 @@ test("maxWorkers accepts 1", async () => {
   }
 });
 
-test("maxWorkers accepts 4", async () => {
+test("maxWorkers accepts 16", async () => {
   const artifactDir = await mkTmp("pi-wc-art-");
   const sourceDir = await mkTmp("pi-wc-src-");
   await git(["init", "--quiet"], sourceDir);
@@ -378,11 +378,11 @@ test("maxWorkers accepts 4", async () => {
       cwd: sourceDir,
       tasks: [{ title: "Test", instructions: "noop", acceptanceCriteria: [] }],
       config: makeConfigWithWritingExecutor(),
-      maxWorkers: 4,
+      maxWorkers: 16,
       artifactDir,
-      waveId: "wc-4",
+      waveId: "wc-16",
     });
-    assert.equal(result.waveId, "wc-4");
+    assert.equal(result.waveId, "wc-16");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

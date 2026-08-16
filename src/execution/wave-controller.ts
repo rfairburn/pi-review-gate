@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import type { ReviewGateConfig } from "../config";
+import { DEFAULT_EXECUTION_RETRY_POLICY, type ReviewGateConfig } from "../config";
 import type { WaveCaptureHooks, WaveCaptureResult } from "./wave-repository";
 import { captureWaveBase, WaveCaptureError } from "./wave-repository";
 import {
@@ -30,6 +30,7 @@ import { planWaveLanding, executeWaveLanding } from "./wave-landing";
 import type { SubtaskProgressUpdate } from "./types";
 import type { SubtaskReviewReport } from "../review-report";
 import { SerialWriter } from "./serial-writer";
+import type { ExecutionIncident, OperationDiagnostics, ReattachmentBundle, RecoveryCheckpoint } from "./operation-record";
 
 // ── public input / result contract ───────────────────────────────────────────
 
@@ -98,6 +99,14 @@ export interface WaveTaskResult {
   unreviewed?: boolean;
   /** Structured reviewer evidence for the orchestrator. */
   reviewReport?: SubtaskReviewReport;
+  operationRecord?: string;
+  bundle?: ReattachmentBundle;
+  incidents?: ExecutionIncident[];
+  checkpoint?: RecoveryCheckpoint;
+  attempts?: number;
+  diagnostics?: OperationDiagnostics;
+  worktree?: string;
+  artifactDir?: string;
 }
 
 /** Integration result embedded in the wave result. */
@@ -176,7 +185,7 @@ export interface WaveControllerInput {
   config: ReviewGateConfig;
   /** Scoped model identifiers for reviewer resolution in every worker lifecycle. */
   scopedModels?: string[];
-  /** Maximum concurrent workers (1..4, default 2). */
+  /** Maximum concurrent workers (1..16, default 4). */
   maxWorkers?: number;
   /** Abort signal. */
   signal?: AbortSignal;
@@ -220,6 +229,11 @@ export interface WaveManifestTask {
   acceptedCommitSha?: string;
   unreviewed?: boolean;
   reviewReport?: SubtaskReviewReport;
+  operationRecord?: string;
+  bundle?: ReattachmentBundle;
+  incidents?: ExecutionIncident[];
+  checkpoint?: RecoveryCheckpoint;
+  attempts?: number;
   /** Executor adapter used (when known). */
   executorAdapter?: string;
   /** Executor model used (when known). */
@@ -299,8 +313,8 @@ export interface WaveManifest {
 // ── validation ───────────────────────────────────────────────────────────────
 
 const MIN_WORKERS = 1;
-const MAX_WORKERS = 4;
-const DEFAULT_WORKERS = 2;
+const MAX_WORKERS = 16;
+const DEFAULT_WORKERS = 4;
 
 function validateMaxWorkers(value: number | undefined): number {
   if (value === undefined) {
@@ -312,6 +326,47 @@ function validateMaxWorkers(value: number | undefined): number {
     );
   }
   return value;
+}
+
+async function retryInfrastructure<T>(
+  config: ReviewGateConfig,
+  invoke: (attempt: number) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  const policy = config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY;
+  let retries = 0;
+  let priorMessage: string | undefined;
+  let repeats = 0;
+  for (;;) {
+    try {
+      return await invoke(retries);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      repeats = priorMessage === message ? repeats + 1 : 1;
+      priorMessage = message;
+      if (retries >= policy.maxRetries || repeats > policy.maxSameIncidentRepeats) throw error;
+      retries += 1;
+      const ceiling = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, retries - 1));
+      const delay = policy.jitter ? Math.floor(ceiling * (0.5 + Math.random() * 0.5)) : ceiling;
+      if (delay > 0) {
+        await new Promise<void>((resolvePromise, reject) => {
+          const finish = () => {
+            signal?.removeEventListener("abort", abort);
+            resolvePromise();
+          };
+          const timer = setTimeout(finish, delay);
+          const abort = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+            reject(signal?.reason instanceof Error ? signal.reason : new Error("Infrastructure retry cancelled."));
+          };
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+    }
+  }
 }
 
 // ── manifest helpers ─────────────────────────────────────────────────────────
@@ -373,6 +428,12 @@ function buildManifest(
         acceptedCommitSha: tr.acceptedCommitSha,
         unreviewed: tr.unreviewed,
         reviewReport: tr.reviewReport,
+        operationRecord: tr.operationRecord,
+        bundle: tr.bundle,
+        incidents: tr.incidents,
+        checkpoint: tr.checkpoint,
+        attempts: tr.attempts,
+        diagnostics: tr.diagnostics,
         executorAdapter: executorInfo?.adapter,
         executorModel: executorInfo?.model,
         reviewCycle,
@@ -560,7 +621,7 @@ function isEligibleForIntegration(result: WaveTaskResult): boolean {
  * (up to maxWorkers), integrate eligible results, plan and execute landing.
  *
  * This is the controller-owned orchestrator. It:
- * 1. Validates input (maxWorkers 1..4, tasks >= 1).
+ * 1. Validates input (maxWorkers 1..16, tasks >= 1).
  * 2. Generates deterministic task IDs (task-0, task-1, ...).
  * 3. Captures the source exactly once via captureWaveBase.
  * 4. Starts at most maxWorkers isolated worktrees/lifecycles concurrently.
@@ -970,6 +1031,14 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         acceptedCommitSha: r.acceptedCommitSha,
         unreviewed: r.unreviewed,
         reviewReport: r.reviewReport,
+        operationRecord: r.operationRecord,
+        bundle: r.bundle,
+        incidents: r.incidents,
+        checkpoint: r.checkpoint,
+        attempts: r.attempts,
+        diagnostics: r.diagnostics,
+        worktree: handles.find((handle) => handle.taskId === ti.taskId)?.worktreeRoot,
+        artifactDir: handles.find((handle) => handle.taskId === ti.taskId)?.artifactDir,
       };
     }
     const activeHandle = handles.find((h) => h.taskId === ti.taskId && !h.settled);
@@ -1093,7 +1162,12 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   let integrationResult: WaveIntegrationResult | undefined;
 
   try {
-    integrationResult = await integrateWave(capture, eligibleWorkers, signal, input.integrationHooks);
+    integrationResult = await retryInfrastructure(input.config, async (attempt) => {
+      if (attempt > 0) {
+        await removeWorktree(join(waveRoot, "integration"), capture.repositoryPath).catch(() => {});
+      }
+      return integrateWave(capture, eligibleWorkers, signal, input.integrationHooks);
+    }, signal);
 
     if (integrationResult.status === "integrated") {
       integrationOutcome = {
@@ -1273,12 +1347,12 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   let landingPlan: LandingPlan;
   try {
-    landingPlan = await planWaveLanding(
+    landingPlan = await retryInfrastructure(input.config, () => planWaveLanding(
       capture,
       landingCommitSha,
       capture.discovery.captureRoot,
       signal,
-    );
+    ), signal);
   } catch (err) {
     if (signal?.aborted) {
       emitProgress(onProgress, "aborted", "Wave aborted during landing planning", undefined, {

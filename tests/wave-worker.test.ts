@@ -116,6 +116,14 @@ function testTask(): WaveWorkerTask {
   };
 }
 
+const NO_RETRY = {
+  maxRetries: 0,
+  baseDelayMs: 0,
+  maxDelayMs: 0,
+  jitter: false,
+  maxSameIncidentRepeats: 0,
+};
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 test("wave-worker prompt discloses snapshot contents and enforces mapped isolation", () => {
@@ -308,6 +316,7 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
       enabled: true,
       execution: {
         activeExecutor: { source: "external", id: "fail-exec" },
+        retryPolicy: NO_RETRY,
       },
       externalAgents: [{
         id: "fail-exec",
@@ -341,6 +350,72 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
   }
 });
 
+test("wave-worker checkpoints partial edits and automatically recovers a failed executor", async () => {
+  const root = await mkTmp("pi-ww-retry-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-retry");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-retry");
+    await mkdir(artifactDir, { recursive: true });
+    const counter = join(root, "retry-count.txt");
+    const command = join(root, "retry-executor.cjs");
+    await writeFile(command, [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      `const counter=${JSON.stringify(counter)};`,
+      "const count=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8')):0;",
+      "fs.writeFileSync(counter,String(count+1));",
+      "console.log(JSON.stringify({type:'session',sessionId:'retry-session'}));",
+      "if(count===0){",
+      " fs.writeFileSync(path.join(process.cwd(),'partial.txt'),'preserved\\n');",
+      " console.log(JSON.stringify({type:'error',message:'temporary provider failure'}));",
+      " process.exit(1);",
+      "}",
+      "fs.writeFileSync(path.join(process.cwd(),'finished.txt'),'done\\n');",
+      "console.log(JSON.stringify({type:'assistant',text:'Recovered and completed.'}));",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      execution: {
+        activeExecutor: { source: "external", id: "retry-exec" },
+        retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 2 },
+      },
+      externalAgents: [{
+        id: "retry-exec",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: [command], timeoutMs: 15_000 },
+      }],
+    });
+
+    const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-retry",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "completed");
+    assert.equal(result.attempts, 2);
+    assert.equal(result.incidents?.length, 1);
+    assert.ok(result.checkpoint?.differsFromBase);
+    assert.equal(await git(["show", `${result.candidate!.commitSha}:partial.txt`], worker.worktreeRoot), "preserved");
+    assert.equal(await git(["show", `${result.candidate!.commitSha}:finished.txt`], worker.worktreeRoot), "done");
+    const operation = JSON.parse(await readFile(join(artifactDir, "operation.json"), "utf8"));
+    assert.equal(operation.attempts.length, 2);
+    assert.equal(operation.incidents[0].resolvedBy, undefined);
+    assert.equal(operation.incidents[0].resolution, "executor_recovered");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("wave-worker returns timeout on executor timeout", async () => {
   const root = await mkTmp("pi-ww-to-");
   try {
@@ -354,6 +429,7 @@ test("wave-worker returns timeout on executor timeout", async () => {
       enabled: true,
       execution: {
         activeExecutor: { source: "external", id: "to-exec" },
+        retryPolicy: NO_RETRY,
       },
       externalAgents: [{
         id: "to-exec",
@@ -451,6 +527,7 @@ test("wave-worker returns executor_error on empty response", async () => {
       enabled: true,
       execution: {
         activeExecutor: { source: "external", id: "empty-exec" },
+        retryPolicy: NO_RETRY,
       },
       externalAgents: [{
         id: "empty-exec",

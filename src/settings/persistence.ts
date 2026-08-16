@@ -6,6 +6,7 @@ import {
   normalizeConfig,
   type ActiveExecutorSelection,
   type ActiveReviewerSelection,
+  type ExecutionRetryPolicy,
   type RetainBundles,
   type ReviewGateConfig,
 } from "../config";
@@ -19,7 +20,7 @@ export interface ReviewSettingsSelection {
   implementationGuidanceAfterCorrectionAttempts: number;
   retainBundles: RetainBundles;
   maxWorkers: number;
-  parallelEnabled: boolean;
+  retryPolicy: ExecutionRetryPolicy;
 }
 
 export async function persistReviewSettings(
@@ -35,7 +36,8 @@ export async function persistReviewSettings(
   const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
   execution.activeExecutor = selection.activeExecutor;
   execution.maxWorkers = selection.maxWorkers;
-  execution.parallelEnabled = selection.parallelEnabled;
+  execution.retryPolicy = { ...selection.retryPolicy };
+  delete execution.parallelEnabled;
   delete execution.externalExecutors;
   parsed.execution = execution;
   const review = isRecord(parsed.review) ? { ...parsed.review } : {};

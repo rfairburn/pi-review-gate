@@ -390,8 +390,8 @@ test("scoped little-coder models resolve as reviewers only when currently availa
   assert.equal(automaticReviewEnabled(config, ["openai-codex/gpt-5.6-sol"]), true);
 });
 
-test("normalizeConfig accepts execution.maxWorkers 1..4", () => {
-  for (const w of [1, 2, 3, 4]) {
+test("normalizeConfig accepts execution.maxWorkers 1..16", () => {
+  for (const w of [1, 2, 4, 8, 12, 16]) {
     const config = normalizeConfig({
       enabled: true,
       execution: { maxWorkers: w },
@@ -401,8 +401,8 @@ test("normalizeConfig accepts execution.maxWorkers 1..4", () => {
 });
 
 test("normalizeConfig rejects invalid execution.maxWorkers", () => {
-  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 0 } }), /maxWorkers must be between 1 and 4/);
-  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 5 } }), /maxWorkers must be between 1 and 4/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 0 } }), /maxWorkers must be between 1 and 16/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 17 } }), /maxWorkers must be between 1 and 16/);
   assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 2.5 } }), /maxWorkers must be an integer/);
   assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: "2" } }), /maxWorkers must be an integer/);
 });

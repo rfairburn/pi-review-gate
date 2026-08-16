@@ -19,8 +19,14 @@
       "model": "openai-codex/gpt-5.6-sol",
       "thinkingLevel": "high"
     },
-    "maxWorkers": 2,
-    "parallelEnabled": true
+    "maxWorkers": 4,
+    "retryPolicy": {
+      "maxRetries": 2,
+      "baseDelayMs": 1000,
+      "maxDelayMs": 15000,
+      "jitter": true,
+      "maxSameIncidentRepeats": 2
+    }
   },
   "externalAgents": [
     {

@@ -4,13 +4,14 @@ import type { ReviewGateState } from "../state";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { resolve } from "node:path";
 import { scopedModelChoices } from "../settings/models";
-import { executeSubtask, type ExecuteSubtaskInput, type SubtaskPacket } from "./controller";
-import type { SubtaskProgressPhase, SubtaskProgressUpdate } from "./types";
-import { executeWave, type WaveControllerInput, type WaveResult, type WaveProgressUpdate } from "./wave-controller";
+import type { SubtaskReviewReport } from "../review-report";
+import { executeWave, type WaveControllerInput, type WaveResult, type WaveProgressUpdate, type WaveTaskResult } from "./wave-controller";
 import { WaveCaptureError } from "./wave-repository";
 import type { WaveWorkerTask } from "./wave-worker";
+import { continueOperation, inspectOperation } from "./operation-actions";
+import type { ReattachmentBundle } from "./operation-record";
+import { redactSensitiveText, redactSensitiveValue } from "../redaction";
 
-const TOOL_NAME = "execute_subtask";
 const BATCH_TOOL_NAME = "execute_subtasks";
 
 interface ExecutionToolManagerInput {
@@ -21,15 +22,10 @@ interface ExecutionToolManagerInput {
   notify?: (message: string) => void | Promise<void>;
 }
 
-interface SubtaskProgressView extends SubtaskProgressUpdate {
-  title: string;
-  startedAt: string;
-  activity: string[];
-}
-
 export class ExecutionToolManager {
   private registered = false;
   private running = false;
+  private associatedBundles: ReattachmentBundle[] = [];
 
   constructor(private readonly input: ExecutionToolManagerInput) {}
 
@@ -42,10 +38,7 @@ export class ExecutionToolManager {
       this.register();
     }
     if (this.registered) {
-      setToolActive(this.input.pi, TOOL_NAME, Boolean(resolvable));
-      // execute_subtasks is active only when parallelEnabled is true.
-      const parallelEnabled = this.input.config.execution?.parallelEnabled === true;
-      setToolActive(this.input.pi, BATCH_TOOL_NAME, Boolean(resolvable && parallelEnabled));
+      setToolActive(this.input.pi, BATCH_TOOL_NAME, Boolean(resolvable));
     }
   }
 
@@ -54,117 +47,31 @@ export class ExecutionToolManager {
       return;
     }
     this.input.pi.registerTool({
-      name: TOOL_NAME,
-      label: "Execute Subtask",
-      description: "Run one bounded implementation phase in the configured isolated executor, then apply the configured review gate before returning.",
-      promptSnippet: "Delegate one bounded implementation phase to the configured isolated executor",
-      promptGuidelines: [
-        "For multi-step implementation, use execute_subtask for one bounded serial phase at a time and wait for its result before choosing the next phase.",
-        "Do not duplicate an execute_subtask executor's completed edits; if you intervene with your own edits, they are parent-owned.",
-      ],
-      executionMode: "sequential",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        required: ["title", "instructions", "acceptanceCriteria"],
-        properties: {
-          title: { type: "string", minLength: 1, description: "Short name for this implementation phase." },
-          instructions: { type: "string", minLength: 1, description: "Complete bounded implementation instructions." },
-          acceptanceCriteria: {
-            type: "array",
-            minItems: 1,
-            items: { type: "string", minLength: 1 },
-            description: "Observable requirements for completion.",
-          },
-          relevantContext: { type: "string", description: "Optional context not evident from the repository." },
-        },
-      },
-      execute: async (
-        _toolCallId: string,
-        params: unknown,
-        signal: AbortSignal | undefined,
-        onUpdate: ((result: unknown) => void) | undefined,
-        ctx: unknown,
-      ) => {
-        if (this.running) {
-          return toolResult({
-            kind: "blocked",
-            summary: "Another execute_subtask invocation is already active. Wait for it to finish.",
-          }, true);
-        }
-        const task = normalizeTask(params);
-        if (!task) {
-          return toolResult({ kind: "blocked", summary: "Invalid execute_subtask parameters." }, true);
-        }
-        const scopedModels = (scopedModelChoices(ctx) ?? []).map((choice) => choice.model);
-        const modelError = validateInternalModel(this.input.config, scopedModels);
-        if (modelError) {
-          return toolResult({ kind: "blocked", summary: modelError }, true);
-        }
-        const progress: SubtaskProgressView = {
-          title: task.title,
-          startedAt: new Date().toISOString(),
-          phase: "starting",
-          message: "preparing delegated execution",
-          activity: ["preparing delegated execution"],
-        };
-        const publish = (update?: SubtaskProgressUpdate) => {
-          if (update) {
-            Object.assign(progress, update);
-            if (progress.activity.at(-1) !== update.message) {
-              progress.activity.push(update.message);
-              if (progress.activity.length > 40) progress.activity.splice(0, progress.activity.length - 40);
-            }
-          }
-          onUpdate?.({
-            content: [{ type: "text", text: `${phaseLabel(progress.phase)} · ${elapsed(progress.startedAt)} · ${progress.message}` }],
-            details: { state: "running", progress: { ...progress, activity: [...progress.activity] } },
-          });
-        };
-        publish();
-        const ticker = onUpdate ? setInterval(() => publish(), 5_000) : undefined;
-        ticker?.unref?.();
-        this.running = true;
-        try {
-          const packet = await executeSubtask({
-            task,
-            cwd: extractCwd(ctx) ?? this.input.cwd(),
-            config: this.input.config,
-            parentState: this.input.state,
-            scopedModels,
-            signal,
-            notify: this.input.notify,
-            onUpdate: publish,
-            appendJournal: (entry) => appendJournal(this.input.pi, entry),
-          });
-          return toolResult(packet, isFailure(packet));
-        } finally {
-          if (ticker) clearInterval(ticker);
-          this.running = false;
-        }
-      },
-      renderCall: (args: unknown, theme: ThemeLike) => renderSubtaskCall(args, theme),
-      renderResult: (result: unknown, options: unknown, theme: ThemeLike) => renderSubtaskResult(result, options, theme),
-    });
-
-    // ── Register execute_subtasks (batch parallel tool) ──
-    this.input.pi.registerTool({
       name: BATCH_TOOL_NAME,
-      label: "Execute Subtasks (Parallel)",
-      description: "Run multiple bounded implementation phases in parallel using the configured isolated executor, then integrate and land the results.",
-      promptSnippet: "Delegate multiple bounded implementation phases to run in parallel via the configured isolated executor",
+      label: "Execute Subtasks",
+      description: "Run one or more bounded implementation phases using isolated executors, then integrate and land the results.",
+      promptSnippet: "Delegate one or more bounded implementation phases to the configured isolated executor",
       promptGuidelines: [
-        "Use execute_subtasks when tasks are independent and can run concurrently.",
+        "Use execute_subtasks for delegated implementation, including a single bounded phase.",
+        "Submit independent tasks together; configured worker concurrency controls how many run at once.",
         "Each task runs in an isolated worktree with its own review lifecycle.",
         "Results are integrated in declared order and landed into the source workspace.",
         "Non-ignored untracked files are included in the captured snapshot; ignored files are excluded.",
+        "Only a landed result means executor changes reached the source workspace.",
+        "For non-landed work, read the diagnostic packet and preserve its reattachment bundle; prefer inspect then continue over recreating the task.",
+        "Steer is live-turn-only and never degrades into a continuation.",
       ],
       executionMode: "sequential",
       parameters: {
         type: "object",
         additionalProperties: false,
-        required: ["tasks"],
+        required: ["action"],
         properties: {
+          action: {
+            type: "string",
+            enum: ["start", "continue", "steer", "inspect"],
+            description: "Start new work, continue a prior operation, steer a live turn, or inspect operation state.",
+          },
           tasks: {
             type: "array",
             minItems: 1,
@@ -190,17 +97,33 @@ export class ExecutionToolManager {
           maxWorkers: {
             type: "integer",
             minimum: 1,
-            maximum: 4,
-            description: "Maximum concurrent workers (1..4, default 2).",
+            maximum: 16,
+            description: "Maximum concurrent workers (1..16, default 4).",
           },
           integratePartial: {
             type: "boolean",
             description: "When true, integrate eligible workers despite failed ones (default false).",
           },
+          bundle: {
+            type: "object",
+            additionalProperties: false,
+            required: ["version", "operationId", "waveId", "taskId", "waveRoot", "expectedRevision"],
+            properties: {
+              version: { type: "integer", enum: [1] },
+              operationId: { type: "string", minLength: 1 },
+              waveId: { type: "string", minLength: 1 },
+              taskId: { type: "string", minLength: 1 },
+              waveRoot: { type: "string", minLength: 1 },
+              expectedRevision: { type: "integer", minimum: 0 },
+            },
+            description: "Optional explicit reattachment bundle. Omit only when one associated operation is unambiguous.",
+          },
+          instructions: { type: "string", minLength: 1, description: "Instructions for continue or steer." },
+          instructionId: { type: "string", minLength: 1, description: "Optional idempotency key; defaults to the tool-call ID." },
         },
       },
       execute: async (
-        _toolCallId: string,
+        toolCallId: string,
         params: unknown,
         signal: AbortSignal | undefined,
         onUpdate: ((result: unknown) => void) | undefined,
@@ -213,13 +136,103 @@ export class ExecutionToolManager {
           });
         }
 
-        const batchInput = normalizeBatchInput(params);
-        if (!batchInput) {
+        const operationInput = normalizeExecutionInput(params);
+        if (!operationInput) {
           return batchToolResult({
-            summary: "Invalid execute_subtasks parameters. Ensure tasks is a non-empty array (1..16) with valid task objects.",
+            summary: "Invalid execute_subtasks parameters for the selected action.",
             isError: true,
           });
         }
+
+        if (operationInput.action !== "start") {
+          const bundle = operationInput.bundle ?? (this.associatedBundles.length === 1 ? this.associatedBundles[0] : undefined);
+          if (!bundle) {
+            return batchToolResult({
+              summary: this.associatedBundles.length > 1
+                ? "More than one operation is associated with this orchestrator context; supply an explicit bundle."
+                : "No associated operation is available; supply a reattachment bundle.",
+              isError: true,
+            });
+          }
+          try {
+            if (operationInput.action === "inspect") {
+              const inspection = await inspectOperation(bundle);
+              this.associatedBundles = [inspection.bundle];
+              return operationToolResult("inspect", inspection, false);
+            }
+            if (operationInput.action === "steer") {
+              const inspection = await inspectOperation(bundle);
+              this.associatedBundles = [inspection.bundle];
+              return operationToolResult("steer", {
+                ...inspection,
+                summary: "The target has no live steerable turn. Use continue to perform another turn.",
+              }, true);
+            }
+
+            const scopedModels = (scopedModelChoices(ctx) ?? []).map((choice) => choice.model);
+            const modelError = validateInternalModel(this.input.config, scopedModels);
+            if (modelError) return batchToolResult({ summary: modelError, isError: true });
+            const parentBaseline = activeExchangeBaseline(this.input.state);
+            if (!parentBaseline) {
+              return batchToolResult({
+                summary: "No clean parent ownership baseline is available. Cannot continue and land recovered work.",
+                isError: true,
+              });
+            }
+            const beforeInspection = await inspectOperation(bundle);
+            const continuationRoot = beforeInspection.manifest.sourceRoot;
+            const preContinuationSnapshot = await createWorkspaceSnapshot(continuationRoot, {
+              maxFileBytes: this.input.config.maxFileBytes,
+              maxSnapshotBytes: this.input.config.maxSnapshotBytes,
+              signal,
+              reuseUnchangedFrom: parentBaseline,
+            });
+            this.running = true;
+            const result = await continueOperation({
+              bundle,
+              instructions: operationInput.instructions,
+              instructionId: operationInput.instructionId ?? toolCallId,
+              config: this.input.config,
+              scopedModels,
+              signal,
+              onUpdate: (message) => onUpdate?.({
+                content: [{ type: "text", text: message }],
+                details: { state: "running", action: "continue", message },
+              }),
+            });
+            this.associatedBundles = [result.inspection.bundle];
+            const landed = isRecord(result.landing) && result.landing.status === "landed";
+            if (result.landing?.status === "landed") {
+              const landedPaths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
+              if (landedPaths.length > 0) {
+                const afterSnapshot = await createWorkspaceSnapshot(continuationRoot, {
+                  maxFileBytes: this.input.config.maxFileBytes,
+                  maxSnapshotBytes: this.input.config.maxSnapshotBytes,
+                  signal,
+                  reuseUnchangedFrom: preContinuationSnapshot,
+                });
+                const selective = buildSelectiveCheckpoint(
+                  parentBaseline,
+                  preContinuationSnapshot,
+                  afterSnapshot,
+                  landedPaths,
+                  continuationRoot,
+                );
+                checkpointReviewWindow(this.input.state, selective.snapshot);
+              }
+            }
+            return operationToolResult("continue", result, !landed);
+          } catch (error) {
+            return operationToolResult(operationInput.action, {
+              summary: error instanceof Error ? error.message : String(error),
+              bundle,
+            }, true);
+          } finally {
+            this.running = false;
+          }
+        }
+
+        const batchInput = operationInput;
 
         const scopedModels = (scopedModelChoices(ctx) ?? []).map((choice) => choice.model);
         const modelError = validateInternalModel(this.input.config, scopedModels);
@@ -333,7 +346,7 @@ export class ExecutionToolManager {
         try {
           const effectiveMaxWorkers = batchInput.maxWorkers
             ?? this.input.config.execution?.maxWorkers
-            ?? 2;
+            ?? 4;
           const waveInput: WaveControllerInput = {
             cwd,
             tasks,
@@ -442,6 +455,7 @@ export class ExecutionToolManager {
           const summaryLines = waveResult.taskResults
             .map((tr) => `${tr.taskId}: ${tr.status}`)
             .join(", ");
+          this.associatedBundles = waveResult.taskResults.flatMap((task) => task.bundle ? [task.bundle] : []);
           return batchToolResult({
             summary: `Wave ${waveResult.waveId} completed: ${summaryLines}`,
             waveId: waveResult.waveId,
@@ -452,6 +466,15 @@ export class ExecutionToolManager {
             landing: waveResult.landing,
             parentOwnedOverlapPaths,
             isError,
+          });
+        } catch (error) {
+          return batchToolResult({
+            summary: error instanceof Error ? error.message : String(error),
+            waveId: waveProgress.waveId,
+            waveRoot: waveProgress.waveRoot,
+            phase: waveProgress.phase,
+            errorCode: "execution_controller_error",
+            isError: true,
           });
         } finally {
           if (ticker) clearInterval(ticker);
@@ -471,107 +494,8 @@ interface ThemeLike {
   fg(color: string, text: string): string;
 }
 
-function renderSubtaskCall(args: unknown, theme: ThemeLike) {
-  const task = isRecord(args) && typeof args.title === "string" ? args.title : "delegated phase";
-  return textComponent((width) => [
-    theme.fg("toolTitle", theme.bold("execute_subtask ")) + theme.fg("accent", clip(task, width - 20)),
-  ]);
-}
-
-function renderSubtaskResult(result: unknown, options: unknown, theme: ThemeLike) {
-  const value = isRecord(result) ? result : {};
-  const details = isRecord(value.details) ? value.details : {};
-  const expanded = isRecord(options) && options.expanded === true;
-  const progress = isProgressView(details.progress) ? details.progress : undefined;
-  if (progress) {
-    return textComponent((width) => {
-      const lines = [
-        `${theme.fg("warning", "◌")} ${theme.fg("accent", phaseLabel(progress.phase))}${theme.fg("muted", ` · ${elapsed(progress.startedAt)}`)}`,
-        `  ${theme.fg("toolOutput", clip(progress.message, width - 4))}`,
-      ];
-      if (expanded) {
-        if (progress.model || progress.adapter) {
-          lines.push(theme.fg("dim", clip(
-            `  executor: ${progress.model ?? progress.adapter}${progress.adapter && progress.model ? ` [${progress.adapter}]` : ""}`,
-            width,
-          )));
-        }
-        if (progress.reviewers?.length) {
-          lines.push(theme.fg("dim", clip(`  reviewers: ${progress.reviewers.join(", ")}`, width)));
-        }
-        if (progress.subtaskId) lines.push(theme.fg("dim", clip(`  subtask: ${progress.subtaskId}`, width)));
-        if (progress.artifactDir) lines.push(theme.fg("dim", clip(`  artifacts: ${progress.artifactDir}`, width)));
-        lines.push("", theme.fg("toolTitle", "  Recent activity"));
-        for (const message of progress.activity.slice(-12)) {
-          lines.push(`  ${theme.fg("toolOutput", clip(message, width - 4))}`);
-        }
-      } else {
-        lines.push(theme.fg("muted", "  (Ctrl+O to expand live activity)"));
-      }
-      return lines;
-    });
-  }
-
-  const kind = typeof details.kind === "string" ? details.kind : "completed";
-  const failed = value.isError === true || !["accepted", "accepted_with_warnings", "completed_unreviewed"].includes(kind);
-  return textComponent((width) => {
-    const lines = [
-      `${theme.fg(failed ? "error" : "success", failed ? "✗" : "✓")} ${theme.fg("accent", kind)}`,
-    ];
-    const summary = typeof details.summary === "string" ? details.summary : textContent(value.content);
-    const summaryLines = summary.trim().split(/\r?\n/).filter(Boolean);
-    const shown = expanded ? summaryLines : summaryLines.slice(0, 2);
-    for (const line of shown) lines.push(`  ${theme.fg("toolOutput", clip(line, width - 4))}`);
-    if (isRecord(details.reviewReport) && typeof details.reviewReport.aggregate === "string") {
-      lines.push(theme.fg(
-        details.reviewReport.aggregate === "pass_with_warnings" ? "warning" : "dim",
-        clip(`  review: ${details.reviewReport.aggregate}`, width),
-      ));
-    }
-    if (expanded && Array.isArray(details.changedFiles) && details.changedFiles.length > 0) {
-      lines.push("", theme.fg("dim", clip(`  changed: ${details.changedFiles.join(", ")}`, width)));
-    }
-    if (expanded && typeof details.bundleDir === "string") {
-      lines.push(theme.fg("dim", clip(`  artifacts: ${details.bundleDir}`, width)));
-    }
-    if (!expanded && (summaryLines.length > shown.length || details.bundleDir)) {
-      lines.push(theme.fg("muted", "  (Ctrl+O to expand)"));
-    }
-    return lines;
-  });
-}
-
 function textComponent(render: (width: number) => string[]) {
   return { render: (width: number) => render(Math.max(20, width - 2)), invalidate() {} };
-}
-
-function isProgressView(value: unknown): value is SubtaskProgressView {
-  return isRecord(value)
-    && typeof value.title === "string"
-    && typeof value.startedAt === "string"
-    && isProgressPhase(value.phase)
-    && typeof value.message === "string"
-    && Array.isArray(value.activity);
-}
-
-function isProgressPhase(value: unknown): value is SubtaskProgressPhase {
-  return value === "starting"
-    || value === "executing"
-    || value === "reviewing"
-    || value === "correcting"
-    || value === "confirming"
-    || value === "completing";
-}
-
-function phaseLabel(phase: SubtaskProgressPhase): string {
-  return ({
-    starting: "Starting",
-    executing: "Executing",
-    reviewing: "Reviewing",
-    correcting: "Correcting",
-    confirming: "Confirming review",
-    completing: "Completing",
-  })[phase];
 }
 
 function elapsed(startedAt: string): string {
@@ -639,37 +563,7 @@ function isWideCodePoint(codePoint: number): boolean {
   );
 }
 
-function textContent(value: unknown): string {
-  if (!Array.isArray(value)) return "";
-  return value.map((item) => isRecord(item) && item.type === "text" && typeof item.text === "string" ? item.text : "").join("\n");
-}
-
-function toolResult(packet: Partial<SubtaskPacket> & { kind: string; summary: string }, isError: boolean): Record<string, unknown> {
-  const text = renderSubtaskPacketForModel(packet);
-  return {
-    content: [{ type: "text", text }],
-    details: packet,
-    ...(isError ? { isError: true } : {}),
-  };
-}
-
-export function renderSubtaskPacketForModel(packet: Partial<SubtaskPacket> & { kind: string; summary: string }): string {
-  const lines = [
-    `Subtask outcome: ${packet.kind}`,
-    packet.summary,
-    ...(packet.reviewStatus ? [`Review status: ${packet.reviewStatus}`] : []),
-    ...(packet.changedFiles?.length ? [`Changed files: ${packet.changedFiles.join(", ")}`] : []),
-    ...(packet.bundleDir ? [`Artifacts: ${packet.bundleDir}`] : []),
-    ...renderReviewReportForModel(packet.reviewReport),
-  ];
-  return lines.join("\n");
-}
-
-function isFailure(packet: SubtaskPacket): boolean {
-  return !["accepted", "accepted_with_warnings", "completed_unreviewed"].includes(packet.kind);
-}
-
-function renderReviewReportForModel(report: SubtaskPacket["reviewReport"]): string[] {
+function renderReviewReportForModel(report: SubtaskReviewReport | undefined): string[] {
   if (!report) return [];
   const lines = [
     "",
@@ -689,28 +583,6 @@ function renderReviewReportForModel(report: SubtaskPacket["reviewReport"]): stri
     }
   }
   return lines;
-}
-
-function normalizeTask(value: unknown): ExecuteSubtaskInput | undefined {
-  if (!isRecord(value)
-    || typeof value.title !== "string"
-    || typeof value.instructions !== "string"
-    || !Array.isArray(value.acceptanceCriteria)
-    || value.acceptanceCriteria.some((item) => typeof item !== "string")) {
-    return undefined;
-  }
-  const title = value.title.trim();
-  const instructions = value.instructions.trim();
-  const acceptanceCriteria = value.acceptanceCriteria.map((item) => String(item).trim()).filter(Boolean);
-  if (!title || !instructions || acceptanceCriteria.length === 0) {
-    return undefined;
-  }
-  return {
-    title,
-    instructions,
-    acceptanceCriteria,
-    relevantContext: typeof value.relevantContext === "string" ? value.relevantContext.trim() || undefined : undefined,
-  };
 }
 
 function validateInternalModel(config: ReviewGateConfig, scopedModels: string[]): string | undefined {
@@ -764,6 +636,7 @@ interface WaveProgressView {
 }
 
 interface NormalizedBatchInput {
+  action: "start";
   tasks: Array<{
     title: string;
     instructions: string;
@@ -774,17 +647,49 @@ interface NormalizedBatchInput {
   integratePartial?: boolean;
 }
 
-const ALLOWED_TOP_KEYS = new Set(["tasks", "maxWorkers", "integratePartial"]);
+type NormalizedExecutionInput = NormalizedBatchInput | {
+  action: "continue" | "steer";
+  bundle?: ReattachmentBundle;
+  instructions: string;
+  instructionId?: string;
+} | {
+  action: "inspect";
+  bundle?: ReattachmentBundle;
+};
+
+const ALLOWED_TOP_KEYS = new Set(["action", "tasks", "maxWorkers", "integratePartial", "bundle", "instructions", "instructionId"]);
 const ALLOWED_TASK_KEYS = new Set(["title", "instructions", "acceptanceCriteria", "relevantContext"]);
 
-function normalizeBatchInput(value: unknown): NormalizedBatchInput | undefined {
-  if (!isRecord(value) || !Array.isArray(value.tasks)) {
+function normalizeExecutionInput(value: unknown): NormalizedExecutionInput | undefined {
+  if (!isRecord(value) || !["start", "continue", "steer", "inspect"].includes(String(value.action))) {
     return undefined;
   }
 
   // Reject unknown top-level keys.
   for (const key of Object.keys(value)) {
     if (!ALLOWED_TOP_KEYS.has(key)) return undefined;
+  }
+
+  const bundle = value.bundle === undefined ? undefined : normalizeBundle(value.bundle);
+  if (value.bundle !== undefined && !bundle) return undefined;
+  if (value.action === "inspect") {
+    if (value.tasks !== undefined || value.maxWorkers !== undefined || value.integratePartial !== undefined
+      || value.instructions !== undefined || value.instructionId !== undefined) return undefined;
+    return { action: "inspect", bundle };
+  }
+  if (value.action === "continue" || value.action === "steer") {
+    if (value.tasks !== undefined || value.maxWorkers !== undefined || value.integratePartial !== undefined
+      || typeof value.instructions !== "string" || !value.instructions.trim()) return undefined;
+    if (value.instructionId !== undefined && (typeof value.instructionId !== "string" || !value.instructionId.trim())) return undefined;
+    return {
+      action: value.action,
+      bundle,
+      instructions: value.instructions.trim(),
+      instructionId: typeof value.instructionId === "string" ? value.instructionId.trim() : undefined,
+    };
+  }
+  if (!Array.isArray(value.tasks) || value.bundle !== undefined || value.instructions !== undefined || value.instructionId !== undefined) {
+    return undefined;
   }
 
   const tasks = value.tasks;
@@ -839,7 +744,7 @@ function normalizeBatchInput(value: unknown): NormalizedBatchInput | undefined {
     if (typeof value.maxWorkers !== "number" || !Number.isInteger(value.maxWorkers)) {
       return undefined;
     }
-    if (value.maxWorkers < 1 || value.maxWorkers > 4) {
+    if (value.maxWorkers < 1 || value.maxWorkers > 16) {
       return undefined;
     }
     maxWorkers = value.maxWorkers;
@@ -853,7 +758,27 @@ function normalizeBatchInput(value: unknown): NormalizedBatchInput | undefined {
     integratePartial = value.integratePartial;
   }
 
-  return { tasks: normalized, maxWorkers, integratePartial };
+  return { action: "start", tasks: normalized, maxWorkers, integratePartial };
+}
+
+function normalizeBundle(value: unknown): ReattachmentBundle | undefined {
+  if (!isRecord(value)) return undefined;
+  const keys = new Set(["version", "operationId", "waveId", "taskId", "waveRoot", "expectedRevision"]);
+  if (Object.keys(value).some((key) => !keys.has(key))) return undefined;
+  if (value.version !== 1
+    || typeof value.operationId !== "string" || !value.operationId
+    || typeof value.waveId !== "string" || !value.waveId
+    || typeof value.taskId !== "string" || !value.taskId
+    || typeof value.waveRoot !== "string" || !value.waveRoot
+    || typeof value.expectedRevision !== "number" || !Number.isInteger(value.expectedRevision) || value.expectedRevision < 0) return undefined;
+  return {
+    version: 1,
+    operationId: value.operationId,
+    waveId: value.waveId,
+    taskId: value.taskId,
+    waveRoot: value.waveRoot,
+    expectedRevision: value.expectedRevision,
+  };
 }
 
 function isWaveTaskSuccess(status: string): boolean {
@@ -880,15 +805,7 @@ function batchToolResult(input: {
   waveRoot?: string;
   phase?: string;
   errorCode?: string;
-  taskResults?: Array<{
-    taskId: string;
-    title: string;
-    status: string;
-    summary: string;
-    error?: string;
-    acceptedCommitSha?: string;
-    reviewReport?: SubtaskPacket["reviewReport"];
-  }>;
+  taskResults?: WaveTaskResult[];
   integration?: {
     status: string;
     validationStatus?: string;
@@ -927,6 +844,20 @@ function batchToolResult(input: {
       const icon = isWaveTaskSuccess(tr.status) ? "✓" : "✗";
       lines.push(`  ${icon} ${tr.taskId} (${tr.status}): ${tr.title}`);
       if (tr.error) lines.push(`    error: ${tr.error}`);
+      if (tr.attempts !== undefined) lines.push(`    attempts: ${tr.attempts}`);
+      if (tr.checkpoint) {
+        lines.push(`    recovery checkpoint: ${tr.checkpoint.commitSha} (${tr.checkpoint.ref})`);
+      }
+      if (tr.operationRecord) lines.push(`    operation record: ${tr.operationRecord}`);
+      if (tr.bundle) lines.push(`    reattachment bundle: ${JSON.stringify(tr.bundle)}`);
+      if (tr.incidents?.length) {
+        for (const incident of tr.incidents) {
+          lines.push(`    incident ${incident.incidentId}: ${incident.cause} — ${incident.message}`);
+        }
+      }
+      if (tr.diagnostics && !isWaveTaskSuccess(tr.status)) {
+        lines.push(`    recovery: ${tr.diagnostics.recovery.recommendedAction}`);
+      }
       if (tr.reviewReport) {
         for (const line of renderReviewReportForModel(tr.reviewReport)) {
           lines.push(line ? `    ${line}` : "");
@@ -968,9 +899,7 @@ function batchToolResult(input: {
   lines.push("");
   lines.push("Note: Non-ignored untracked files are included; ignored files are excluded from the captured snapshot and landing.");
 
-  return {
-    content: [{ type: "text", text: lines.join("\n") }],
-    details: {
+  const details = redactSensitiveValue({
       waveId: input.waveId,
       waveRoot: input.waveRoot,
       phase: input.phase,
@@ -980,15 +909,38 @@ function batchToolResult(input: {
       landing: input.landing,
       parentOwnedOverlapPaths: input.parentOwnedOverlapPaths,
       snapshotPolicy: "non-ignored untracked included; ignored files excluded",
-    },
+      failureDiagnostics: input.taskResults?.filter((task) => !isWaveTaskSuccess(task.status)).map((task) => task.diagnostics),
+    });
+  return {
+    content: [{ type: "text", text: redactSensitiveText(lines.join("\n")) }],
+    details,
     ...(input.isError ? { isError: true } : {}),
   };
 }
 
+function operationToolResult(action: "continue" | "steer" | "inspect", details: unknown, isError: boolean): Record<string, unknown> {
+  const record = isRecord(details) ? details : {};
+  const summary = typeof record.summary === "string"
+    ? record.summary
+    : action === "inspect"
+      ? "Operation inspection completed."
+      : action === "continue"
+        ? isError ? "Operation continuation did not land." : "Operation continuation completed and landed."
+        : "Steering was not delivered.";
+  const redactedDetails = redactSensitiveValue(details);
+  return {
+    content: [{ type: "text", text: redactSensitiveText(`${summary}\n\n${JSON.stringify(redactedDetails, null, 2)}`) }],
+    details: { action, ...(isRecord(redactedDetails) ? redactedDetails : { value: redactedDetails }) },
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
 function renderBatchCall(args: unknown, theme: ThemeLike) {
+  const action = isRecord(args) && typeof args.action === "string" ? args.action : "start";
   const count = isRecord(args) && Array.isArray(args.tasks) ? args.tasks.length : 0;
+  const detail = action === "start" ? `${count} task(s)` : action;
   return textComponent((width) => [
-    clip(theme.fg("toolTitle", theme.bold("execute_subtasks ")) + theme.fg("accent", `${count} task(s)`), width),
+    clip(theme.fg("toolTitle", theme.bold("execute_subtasks ")) + theme.fg("accent", detail), width),
   ]);
 }
 

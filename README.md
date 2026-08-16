@@ -129,7 +129,7 @@ The older single `decider` field is still supported for compatibility.
 
 ### Delegated execution and runtime settings
 
-`/review-settings` opens one staged settings transaction with six sections:
+`/review-settings` opens one staged settings transaction with seven sections:
 
 - **Executor** is a single-selection, `/model`-style picker over Pi-scoped
   little-coder models plus execution-capable entries from `externalAgents`.
@@ -149,11 +149,10 @@ The older single `decider` field is still supported for compatibility.
 - **Bundle retention** selects `never`, `on-failure`, or `always`. Choose
   `always` when successful executor and reviewer turns need to remain available
   for inspection.
-- **Parallel workers** sets `execution.maxWorkers` (1–4, default 2) which
-  controls the maximum concurrent workers for `execute_subtasks`.
-- **Parallel execution** toggles `execution.parallelEnabled` (default `false`).
-  When disabled, `execute_subtasks` is inactive even with a resolvable executor;
-  `execute_subtask` remains available. Enable this to opt in to parallel execution.
+- **Executor concurrency** sets `execution.maxWorkers` (1–16, default 4).
+  One worker is serial execution; excess tasks remain queued.
+- **Retry policy** configures bounded executor/reviewer recovery: retry count,
+  exponential-backoff bounds, jitter, and the repeated-incident guard.
 
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the
 root discards all staged changes; **Save changes** atomically persists every
@@ -174,38 +173,33 @@ Top-level `enabled: false` is the automatic-review master switch and does not
 disable an active executor. The environment kill switches disable the whole
 extension, including delegated execution.
 
-With an executor selected, the plugin exposes `execute_subtask`. The primary
-model supplies one bounded phase, its acceptance criteria, and optional context;
-the configured harness/model cannot be changed in tool arguments. Calls are
-serial. The primary model waits for the returned packet before planning the next
-phase. If review is enabled, the child receives corrections in its own session
-and is accepted only after reviewer pass followed by an unchanged child
-response. This post-pass turn lets the child consider noncritical reviewer
-suggestions; any resulting tree change is reviewed again. Child changes are checkpointed so an unchanged parent turn is not
-reviewed again; later parent edits remain parent-owned and follow the ordinary
-gate.
+With an executor selected, the plugin exposes one delegated-execution tool:
+`execute_subtasks`. It accepts 1–16 bounded tasks, so a single phase and a
+multi-worker wave use the same isolated worktree, review, retry, integration,
+and landing lifecycle. The configured harness/model cannot be changed in tool
+arguments. If review is enabled, corrections and post-pass confirmation reuse
+the child's durable session; any post-pass tree change is reviewed again.
 
-If the parent has already edited the workspace during its active exchange,
-those edits are adopted as seed work for the delegated phase rather than
-blocking delegation. The child is told which paths it inherited, and review is
-still computed from the original parent baseline so inherited and child-authored
-changes receive the same gate treatment. A successful child checkpoints the
-combined result. A failed, timed-out, or cancelled child does not move the
-parent baseline, allowing a retry to adopt all surviving partial work or the
-ordinary parent gate to review it.
+The tool has four top-level actions: `start`, `continue`, `steer`, and `inspect`.
+`start` creates a wave. `continue` performs another durable turn and completes
+review/integration/landing. `inspect` expands a reattachment bundle into current
+state and recovery diagnostics. `steer` is live-turn-only and currently reports
+that foreground adapters are not steerable; it never silently becomes a
+continuation. `continue`, `steer`, and `inspect` may omit the bundle only when
+the calling orchestrator has exactly one associated operation.
 
-Escape while the child is executing or being reviewed aborts that child flow.
-This is the "child Escape" behavior: it cancels only the active delegated
-operation, returns a `cancelled` failure packet, retains failure artifacts under
-the normal bundle policy, and never treats the partial work as accepted.
+Executor failures are checkpointed to a protected recovery ref before bounded
+retry. Compaction is a lifecycle transition: an interrupted Little Coder
+session is reopened by exact UUID, explicitly compacted through Pi RPC, and
+only then prompted to continue. Non-landed results include the worktree,
+session, attempts, incidents, changed paths, verified checkpoint, hashed
+artifact inventory, current bundle, and safe next actions. Only `landed` means
+that worker changes reached the source workspace.
 
-While `execute_subtask` is active, its tool card shows the current lifecycle
-phase and elapsed time. Press Ctrl+O to expand a bounded live activity view with
-the executor model, artifact directory, recent native little-coder or Codex CLI
-tool and test milestones, review cycle, reviewer models, and reviewer completion
-verdicts.
-Streaming activity updates are UI-only and are not copied into the controlling
-model's context; only the final subtask packet is returned as tool context.
+The tool card shows the current phase and elapsed time. Ctrl+O expands bounded
+per-task activity, executor/reviewer identity, artifacts, review cycles, and
+verdicts. Five-second UI refreshes do not slow executor turns and are not copied
+into model context; only the final result packet is returned as tool context.
 
 Claude CLI reviewers and executors also stream bounded native lifecycle and tool
 activity into these views without exposing reasoning or reviewer output.
@@ -213,15 +207,14 @@ Foreground automatic reviews, `/review-now`, and reviewer-question commands show
 the active reviewer milestone and elapsed time in the status line until the
 review completes or is cancelled.
 
-### Parallel execution with `execute_subtasks`
+### Delegated waves with `execute_subtasks`
 
-`execute_subtasks` runs multiple independent bounded tasks in parallel. Each
-task runs in an isolated worktree with its own review lifecycle. Tasks are
-specified as an array (1–16) with the same schema as `execute_subtask`.
+Each task runs in an isolated worktree with its own review lifecycle. Tasks are
+specified as an array of 1–16 items.
 
-**Concurrency**: `maxWorkers` controls the maximum concurrent workers (1–4,
-default 2). The tool-call `maxWorkers` overrides `config.execution.maxWorkers`,
-which overrides the built-in default of 2.
+**Concurrency**: `maxWorkers` controls concurrent workers (1–16, default 4).
+The tool-call value overrides `config.execution.maxWorkers`; task count is
+independent, and excess tasks queue.
 
 **Integration policy**: By default all-or-nothing: any worker that is not
 accepted, accepted_with_warnings, completed_unreviewed, or no_changes blocks

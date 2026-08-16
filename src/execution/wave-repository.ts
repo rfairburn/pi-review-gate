@@ -691,7 +691,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
         ino: rootStat.ino,
       };
 
-      return {
+      const capture: WaveCaptureResult = {
         waveId,
         repositoryPath: repoPath,
         waveRoot,
@@ -703,6 +703,8 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
         paths: staged.entries.map((e) => e.path),
         sourceIdentity,
       };
+      await fs.writeFile(join(waveRoot, "capture.json"), `${JSON.stringify(capture, null, 2)}\n`, "utf8");
+      return capture;
     } catch (err) {
       // Clean up wave root on any failure after creation.
       if (waveRoot) {
@@ -738,6 +740,33 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
   );
 }
 
+export async function readWaveCaptureRecord(waveRoot: string): Promise<WaveCaptureResult> {
+  const resolvedRoot = await fs.realpath(resolve(waveRoot));
+  const parsed = JSON.parse(await fs.readFile(join(resolvedRoot, "capture.json"), "utf8")) as unknown;
+  if (!parsed || typeof parsed !== "object") throw new Error("Invalid wave capture record.");
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.waveId !== "string"
+    || typeof record.waveRoot !== "string"
+    || typeof record.repositoryPath !== "string"
+    || typeof record.baseCommit !== "string"
+    || typeof record.baseRef !== "string"
+    || !record.discovery
+    || !Array.isArray(record.entries)
+    || !Array.isArray(record.paths)
+    || !record.sourceIdentity) {
+    throw new Error("Invalid wave capture record.");
+  }
+  if (await fs.realpath(resolve(record.waveRoot)) !== resolvedRoot) {
+    throw new Error("Wave capture record root does not match its containing directory.");
+  }
+  const repositoryPath = await fs.realpath(resolve(record.repositoryPath));
+  const relativeRepository = relative(resolvedRoot, repositoryPath);
+  if (isAbsolute(relativeRepository) || relativeRepository === ".." || relativeRepository.startsWith(`..${sep}`)) {
+    throw new Error("Wave capture repository is outside the wave root.");
+  }
+  return parsed as WaveCaptureResult;
+}
+
 /** Remove only old, terminal wave roots that are not needed for conflict recovery. */
 export async function pruneCompletedWaveRoots(
   artifactParent: string,
@@ -770,10 +799,29 @@ export async function pruneCompletedWaveRoots(
     if (manifest.phase !== "completed" && manifest.phase !== "aborted") continue;
     if (manifest.landingStatus === "recovery_required" || manifest.landingStatus === "conflicted") continue;
     if (manifest.integrationStatus === "conflicted" || manifest.integrationStatus === "error") continue;
+    if (await hasProtectedOperation(root, manifest.landingStatus === "landed")) continue;
     await fs.rm(root, { recursive: true, force: true });
     removed.push(root);
   }
   return removed;
+}
+
+async function hasProtectedOperation(waveRoot: string, waveLanded: boolean): Promise<boolean> {
+  const artifacts = join(waveRoot, "artifacts");
+  const taskEntries = await fs.readdir(artifacts, { withFileTypes: true }).catch(() => []);
+  for (const task of taskEntries) {
+    if (!task.isDirectory()) continue;
+    const path = join(artifacts, task.name, "operation.json");
+    const value = await fs.readFile(path, "utf8").then((text) => JSON.parse(text) as Record<string, unknown>).catch(() => undefined);
+    if (!value) continue;
+    if (["running", "compacting", "retrying", "reviewing", "paused_recoverable", "failed_critical"].includes(String(value.state))) {
+      return true;
+    }
+    // A verified recovery checkpoint is the only durable copy of unlanded
+    // executor work. Never let ordinary TTL pruning remove it.
+    if (!waveLanded && value.checkpoint && typeof value.checkpoint === "object") return true;
+  }
+  return false;
 }
 
 // ── internal: consistency verification ───────────────────────────────────────

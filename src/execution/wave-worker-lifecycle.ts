@@ -66,6 +66,18 @@ import {
   createReviewTransmissionMessage,
   type ReviewTransmissionAction,
 } from "../transmission";
+import {
+  createReattachmentBundle,
+  buildOperationDiagnostics,
+  createIncident,
+  readOperationRecord,
+  writeOperationRecord,
+  type ExecutionIncident,
+  type ReattachmentBundle,
+  type RecoveryCheckpoint,
+  type OperationDiagnostics,
+} from "./operation-record";
+import { DEFAULT_EXECUTION_RETRY_POLICY } from "../config";
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -119,12 +131,20 @@ export interface WaveWorkerLifecycleResult {
   /** Worker artifact directory. */
   artifactDir: string;
   reviewReport?: SubtaskReviewReport;
+  operationRecord?: string;
+  bundle?: ReattachmentBundle;
+  incidents?: ExecutionIncident[];
+  checkpoint?: RecoveryCheckpoint;
+  attempts?: number;
+  diagnostics?: OperationDiagnostics;
 }
 
 /** Input for the lifecycle. Extends WaveWorkerInput with review-specific options. */
 export interface WaveWorkerLifecycleInput extends WaveWorkerInput {
   /** Maximum correction cycles before giving up. Defaults to config.maxCorrectionCycles. */
   maxCorrectionCycles?: number;
+  /** Pre-existing continued executor result used when reattaching to a paused operation. */
+  initialResult?: WaveWorkerResult;
 }
 
 // ── progress helpers ─────────────────────────────────────────────────────────
@@ -300,10 +320,123 @@ async function runCandidateReview(
   });
 }
 
+async function runCandidateReviewWithRecovery(
+  invoke: () => Promise<ReviewRunOutput>,
+  artifactDir: string,
+  config: ReviewGateConfig,
+  signal?: AbortSignal,
+): Promise<ReviewRunOutput> {
+  const policy = config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY;
+  let retries = 0;
+  let repeated = 0;
+  let priorMessage: string | undefined;
+  let lastMessage = "Review failed.";
+  for (;;) {
+    let output: ReviewRunOutput | undefined;
+    let thrown: unknown;
+    try {
+      output = await invoke();
+    } catch (error) {
+      thrown = error;
+    }
+    if (signal?.aborted || output?.result?.error === "aborted") {
+      if (thrown) throw thrown;
+      return output!;
+    }
+    const failed = thrown !== undefined || output?.result?.verdict === "error" || Boolean(output?.error);
+    if (!failed) {
+      await resolveReviewIncidents(artifactDir);
+      return output!;
+    }
+    lastMessage = thrown instanceof Error
+      ? thrown.message
+      : output?.result?.error ?? output?.error ?? output?.result?.summary ?? "Review failed.";
+    repeated = priorMessage === lastMessage ? repeated + 1 : 1;
+    priorMessage = lastMessage;
+    await recordReviewIncident(artifactDir, lastMessage, retries + 1, retries < policy.maxRetries && repeated <= policy.maxSameIncidentRepeats);
+    if (retries >= policy.maxRetries || repeated > policy.maxSameIncidentRepeats) {
+      if (thrown) throw thrown;
+      return output!;
+    }
+    retries += 1;
+    await executionRetryDelay(policy.baseDelayMs, policy.maxDelayMs, policy.jitter, retries, signal);
+  }
+}
+
+async function resolveReviewIncidents(artifactDir: string): Promise<void> {
+  try {
+    const operation = await readOperationRecord(join(artifactDir, "operation.json"));
+    let changed = false;
+    for (const incident of operation.incidents) {
+      if (incident.cause === "review_error" && !incident.resolvedAt) {
+        incident.resolvedAt = new Date().toISOString();
+        incident.resolution = "review_recovered";
+        changed = true;
+      }
+    }
+    if (changed) await writeOperationRecord(operation);
+  } catch {
+    // Diagnostic augmentation is best effort; review output stays authoritative.
+  }
+}
+
+async function recordReviewIncident(artifactDir: string, message: string, attempt: number, retryable: boolean): Promise<void> {
+  try {
+    const operation = await readOperationRecord(join(artifactDir, "operation.json"));
+    operation.state = retryable ? "retrying" : "paused_recoverable";
+    operation.incidents.push(createIncident({
+      attempt,
+      generation: operation.generation,
+      cause: "review_error",
+      stage: "reviewing",
+      message,
+      retryable,
+    }));
+    await writeOperationRecord(operation);
+  } catch {
+    // The ordinary review result remains authoritative if diagnostics cannot
+    // be augmented (for example, a pre-operation validation failure).
+  }
+}
+
+async function executionRetryDelay(base: number, max: number, jitter: boolean, retry: number, signal?: AbortSignal): Promise<void> {
+  if (base === 0) return;
+  const ceiling = Math.min(max, base * 2 ** Math.max(0, retry - 1));
+  const delay = jitter ? Math.floor(ceiling * (0.5 + Math.random() * 0.5)) : ceiling;
+  await new Promise<void>((resolvePromise, reject) => {
+    const finish = () => {
+      signal?.removeEventListener("abort", abort);
+      resolvePromise();
+    };
+    const timer = setTimeout(finish, delay);
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("Review retry cancelled."));
+    };
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
 // ── result writing ───────────────────────────────────────────────────────────
 
 /** Write result.json to the worker artifact root. */
 async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResult): Promise<void> {
+  try {
+    const operation = await readOperationRecord(join(artifactDir, "operation.json"));
+    operation.state = lifecycleOperationState(result.status);
+    await writeOperationRecord(operation);
+    result.operationRecord = join(artifactDir, "operation.json");
+    result.bundle = createReattachmentBundle(operation, resolve(artifactDir, "..", ".."));
+    result.incidents = operation.incidents;
+    result.checkpoint = operation.checkpoint;
+    result.attempts = operation.attempts.length;
+    result.diagnostics = await buildOperationDiagnostics(operation, resolve(artifactDir, "..", ".."));
+  } catch {
+    // Preflight failures can occur before an operation record exists. The
+    // caller still receives the ordinary lifecycle result for those cases.
+  }
   result.reviewReport ??= buildReviewReportFromOutputs({
     outputs: result.reviewCycles,
     artifactDir,
@@ -329,11 +462,38 @@ async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResul
         verdict: c.verdict,
       })),
       reviewReport: result.reviewReport,
+      operationRecord: result.operationRecord,
+      bundle: result.bundle,
+      incidents: result.incidents,
+      checkpoint: result.checkpoint,
+      attempts: result.attempts,
+      diagnostics: result.diagnostics,
       error: result.error,
       completedAt: new Date().toISOString(),
     }, null, 2),
     "utf8",
   );
+}
+
+function lifecycleOperationState(status: WaveWorkerLifecycleStatus): import("./operation-record").OperationState {
+  if (status === "cancelled") return "cancelled";
+  if (status === "accepted" || status === "accepted_with_warnings" || status === "completed_unreviewed" || status === "no_changes") {
+    return "completed";
+  }
+  return "paused_recoverable";
+}
+
+function executionMetadata(result: WaveWorkerResult): Pick<
+  WaveWorkerLifecycleResult,
+  "operationRecord" | "bundle" | "incidents" | "checkpoint" | "attempts"
+> {
+  return {
+    operationRecord: result.operationRecord,
+    bundle: result.bundle,
+    incidents: result.incidents,
+    checkpoint: result.checkpoint,
+    attempts: result.attempts,
+  };
 }
 
 // ── main lifecycle ───────────────────────────────────────────────────────────
@@ -434,7 +594,7 @@ export async function runWaveWorkerLifecycle(
 
   let initialResult: WaveWorkerResult;
   try {
-    initialResult = await runWaveWorker(input);
+    initialResult = input.initialResult ?? await runWaveWorker(input);
   } catch (error) {
     const result: WaveWorkerLifecycleResult = {
       status: "executor_error",
@@ -479,6 +639,7 @@ export async function runWaveWorkerLifecycle(
       error: initialResult.error,
       reviewCycles: [],
       artifactDir: resolvedArtifactDir,
+      ...executionMetadata(initialResult),
     };
     await writeResult(resolvedArtifactDir, result);
     return result;
@@ -496,6 +657,7 @@ export async function runWaveWorkerLifecycle(
       error: initialResult.error,
       reviewCycles: [],
       artifactDir: resolvedArtifactDir,
+      ...executionMetadata(initialResult),
     };
     await writeResult(resolvedArtifactDir, result);
     return result;
@@ -513,6 +675,7 @@ export async function runWaveWorkerLifecycle(
       error: initialResult.error,
       reviewCycles: [],
       artifactDir: resolvedArtifactDir,
+      ...executionMetadata(initialResult),
     };
     await writeResult(resolvedArtifactDir, result);
     return result;
@@ -576,7 +739,7 @@ export async function runWaveWorkerLifecycle(
   let correctionCount = 0;
   let lastCandidateTreeSha: string | undefined;
   // Monotonic executor turn counter: starts at 2 (after initial turn 1).
-  let nextExecutorTurn = 2;
+  let nextExecutorTurn = (initialResult.lastExecutorTurn ?? 1) + 1;
 
   for (;;) {
     // Check cancellation before each review.
@@ -607,18 +770,23 @@ export async function runWaveWorkerLifecycle(
     // Run review on the current candidate (with error handling).
     let reviewOutput: ReviewRunOutput;
     try {
-      reviewOutput = await runCandidateReview(
-        frozen.frozenConfig,
-        reviewTask,
-        capture.repositoryPath,
-        capture.baseCommit,
-        currentCandidate.commitSha,
-        window,
-        window.evidence,
-        worktree.worktreeRoot,
-        baseSnapshot,
-        config.maxPatchBytes,
-        correctionCount,
+      reviewOutput = await runCandidateReviewWithRecovery(
+        () => runCandidateReview(
+          frozen.frozenConfig,
+          reviewTask,
+          capture.repositoryPath,
+          capture.baseCommit,
+          currentCandidate.commitSha,
+          window,
+          window.evidence,
+          worktree.worktreeRoot,
+          baseSnapshot,
+          config.maxPatchBytes,
+          correctionCount,
+          signal,
+        ),
+        resolvedArtifactDir,
+        config,
         signal,
       );
     } catch (error) {
@@ -788,7 +956,7 @@ export async function runWaveWorkerLifecycle(
           sourceRootAliases: input.sourceRootAliases,
           priorResult: currentResult,
           feedback,
-          turn: nextExecutorTurn++,
+          turn: nextExecutorTurn,
           signal,
           onUpdate: input.onUpdate,
         });
@@ -808,6 +976,8 @@ export async function runWaveWorkerLifecycle(
         return result;
       }
 
+      nextExecutorTurn = (correctionResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
+
       // Handle correction result.
       if (correctionResult.status === "executor_error") {
         const result: WaveWorkerLifecycleResult = {
@@ -820,6 +990,7 @@ export async function runWaveWorkerLifecycle(
           error: correctionResult.error,
           reviewCycles,
           artifactDir: resolvedArtifactDir,
+          ...executionMetadata(correctionResult),
         };
         await writeResult(resolvedArtifactDir, result);
         return result;
@@ -836,6 +1007,7 @@ export async function runWaveWorkerLifecycle(
           error: correctionResult.error,
           reviewCycles,
           artifactDir: resolvedArtifactDir,
+          ...executionMetadata(correctionResult),
         };
         await writeResult(resolvedArtifactDir, result);
         return result;
@@ -852,6 +1024,7 @@ export async function runWaveWorkerLifecycle(
           error: correctionResult.error,
           reviewCycles,
           artifactDir: resolvedArtifactDir,
+          ...executionMetadata(correctionResult),
         };
         await writeResult(resolvedArtifactDir, result);
         return result;
@@ -869,6 +1042,7 @@ export async function runWaveWorkerLifecycle(
           error: "No changes after correction.",
           reviewCycles,
           artifactDir: resolvedArtifactDir,
+          ...executionMetadata(correctionResult),
         };
         await writeResult(resolvedArtifactDir, result);
         return result;
@@ -931,7 +1105,7 @@ export async function runWaveWorkerLifecycle(
         sourceRootAliases: input.sourceRootAliases,
         priorResult: currentResult,
         feedback: passFeedback,
-        turn: nextExecutorTurn++,
+        turn: nextExecutorTurn,
         signal,
         onUpdate: input.onUpdate,
       });
@@ -952,6 +1126,8 @@ export async function runWaveWorkerLifecycle(
       return result;
     }
 
+    nextExecutorTurn = (confirmResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
+
     // Handle confirmation result.
     if (confirmResult.status === "cancelled") {
       const result: WaveWorkerLifecycleResult = {
@@ -964,6 +1140,7 @@ export async function runWaveWorkerLifecycle(
         error: "Cancelled.",
         reviewCycles,
         artifactDir: resolvedArtifactDir,
+        ...executionMetadata(confirmResult),
       };
       await writeResult(resolvedArtifactDir, result);
       return result;
@@ -981,6 +1158,7 @@ export async function runWaveWorkerLifecycle(
         error: confirmResult.error,
         reviewCycles,
         artifactDir: resolvedArtifactDir,
+        ...executionMetadata(confirmResult),
       };
       await writeResult(resolvedArtifactDir, result);
       return result;
@@ -997,6 +1175,7 @@ export async function runWaveWorkerLifecycle(
         error: confirmResult.error,
         reviewCycles,
         artifactDir: resolvedArtifactDir,
+        ...executionMetadata(confirmResult),
       };
       await writeResult(resolvedArtifactDir, result);
       return result;

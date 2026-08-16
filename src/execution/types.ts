@@ -1,4 +1,5 @@
 import type { TokenUsage } from "../usage";
+import type { PiLifecycleSummary } from "../usage";
 
 export interface ExecutorSession {
   adapter: string;
@@ -14,8 +15,9 @@ export interface ExecutorTurn {
   code: number | null;
   timedOut: boolean;
   aborted: boolean;
+  lifecycle?: PiLifecycleSummary;
   failure?: {
-    category: "provider" | "stdin" | "protocol" | "process";
+    category: "provider" | "stdin" | "protocol" | "process" | "interruption" | "compaction";
     message: string;
   };
 }
@@ -27,6 +29,11 @@ export interface ExecutorRequest {
   turn: number;
   signal?: AbortSignal;
   session?: ExecutorSession;
+  recovery?: {
+    kind: "retry" | "compaction";
+    /** Reopen the durable session and finish compaction before prompting. */
+    compactBeforePrompt?: boolean;
+  };
   onUpdate?: (text: string) => void;
 }
 
@@ -34,6 +41,17 @@ export interface ExecutorAdapter {
   readonly kind: string;
   readonly model?: string;
   run(request: ExecutorRequest): Promise<ExecutorTurn>;
+}
+
+export class ExecutorLifecycleError extends Error {
+  constructor(
+    readonly category: "compaction" | "interruption" | "protocol" | "process",
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "ExecutorLifecycleError";
+  }
 }
 
 export type SubtaskProgressPhase =

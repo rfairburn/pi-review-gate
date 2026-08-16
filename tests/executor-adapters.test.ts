@@ -57,6 +57,76 @@ test("little-coder executor preserves terminal provider errors", async () => {
   }
 });
 
+test("little-coder executor classifies an unfinished compaction as an interruption", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-little-compaction-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    await mkdir(artifactDir);
+    const command = join(root, "compaction.cjs");
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "process.stdin.resume();",
+      "process.stdin.on('end',()=>{",
+      "console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[],errorMessage:'This operation was aborted'}}));",
+      "console.log(JSON.stringify({type:'compaction_start',reason:'manual'}));",
+      "});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const adapter = new LittleCoderExecutorAdapter({ model: "provider/model", command });
+    const result = await adapter.run({ cwd: root, prompt: "work", artifactDir, turn: 1 });
+    assert.deepEqual(result.failure, {
+      category: "interruption",
+      message: "Executor process ended while context compaction was in progress.",
+    });
+    assert.equal(result.lifecycle?.compaction.status, "in_progress");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("little-coder executor explicitly compacts the exact durable session before resuming", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-little-compact-recovery-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    await mkdir(artifactDir);
+    const command = join(root, "compact-recovery.cjs");
+    const log = join(root, "rpc-log.jsonl");
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      "const mode=process.argv[process.argv.indexOf('--mode')+1];",
+      `const log=${JSON.stringify(log)};`,
+      "if(mode==='rpc') {",
+      " let input=''; process.stdin.setEncoding('utf8');",
+      " process.stdin.on('data',chunk=>{ input+=chunk; for(;;){ const n=input.indexOf('\\n'); if(n<0)break; const line=input.slice(0,n); input=input.slice(n+1); if(!line)continue; const command=JSON.parse(line); fs.appendFileSync(log,JSON.stringify(command)+'\\n'); if(command.type==='get_state') console.log(JSON.stringify({type:'response',id:command.id,command:'get_state',success:true,data:{sessionId:'durable-session'}})); else if(command.type==='compact') console.log(JSON.stringify({type:'response',id:command.id,command:'compact',success:true,data:{summary:'preserved'}})); } });",
+      "} else {",
+      " process.stdin.resume(); process.stdin.on('end',()=>{ console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'resumed after compact'}]}})); });",
+      "}",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const adapter = new LittleCoderExecutorAdapter({ model: "provider/model", command });
+    const updates: string[] = [];
+    const result = await adapter.run({
+      cwd: root,
+      prompt: "continue",
+      artifactDir,
+      turn: 2,
+      session: { adapter: "little-coder-model", id: "durable-session" },
+      recovery: { kind: "compaction", compactBeforePrompt: true },
+      onUpdate: (message) => updates.push(message),
+    });
+
+    assert.equal(result.text, "resumed after compact");
+    const commands = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(commands.map((entry) => entry.type), ["get_state", "compact"]);
+    assert.match(commands[1].customInstructions, /Preserve the task objective/);
+    assert.ok(updates.includes("reopening executor session for context compaction"));
+    assert.ok(updates.includes("context compaction completed; resuming executor"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex executor starts with automatic workspace-write approval and resumes the exact thread", async () => {
   const fixture = await harnessFixture("codex");
   const adapter = new CodexExecutorAdapter({

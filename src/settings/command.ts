@@ -2,6 +2,9 @@ import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import {
+  DEFAULT_EXECUTION_RETRY_POLICY,
+  DEFAULT_MAX_WORKERS,
+  MAX_EXECUTION_WORKERS,
   externalAgentCatalog,
   externalAgentSupportsExecution,
   externalAgentSupportsReview,
@@ -9,6 +12,7 @@ import {
   type ActiveExecutorSelection,
   type ActiveReviewerSelection,
   type ExternalAgentConfig,
+  type ExecutionRetryPolicy,
   type RetainBundles,
   type ReviewGateConfig,
   type ThinkingLevel,
@@ -61,21 +65,23 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let maxCorrectionCycles = input.config.maxCorrectionCycles;
   let guidanceThreshold = input.config.implementationGuidanceAfterCorrectionAttempts;
   let retainBundles = input.config.retainBundles;
-  let maxWorkers = input.config.execution?.maxWorkers ?? 2;
-  let parallelEnabled = input.config.execution?.parallelEnabled === true;
+  let maxWorkers = input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS;
+  let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
 
   while (true) {
-    const executorRow = settingsRow("Executor", executorSummary(activeExecutor, agents, input.scoped));
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const reviewersRow = settingsRow("Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`);
-    const timeoutsRow = settingsRow("Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`);
-    const policyRow = settingsRow("Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`);
-    const retentionRow = settingsRow("Bundle retention", retentionLabel(retainBundles));
-    const workersRow = settingsRow("Parallel workers", String(maxWorkers));
-    const parallelRow = settingsRow("Parallel execution", parallelEnabled ? "Enabled" : "Disabled");
+    const [executorRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow] = alignedSettingsRows([
+      ["Executor", executorSummary(activeExecutor, agents, input.scoped)],
+      ["Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`],
+      ["Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`],
+      ["Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`],
+      ["Bundle retention", retentionLabel(retainBundles)],
+      ["Executor concurrency", String(maxWorkers)],
+      ["Retry policy", `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base`],
+    ]);
     const choice = await input.ui.select("Review settings", [
       executorRow,
       reviewersRow,
@@ -83,7 +89,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       policyRow,
       retentionRow,
       workersRow,
-      parallelRow,
+      retryRow,
       "Save changes",
       "Cancel",
     ]);
@@ -120,8 +126,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       maxWorkers = await selectMaxWorkers(input.ui, maxWorkers);
       continue;
     }
-    if (choice === parallelRow) {
-      parallelEnabled = await selectParallelEnabled(input.ui, parallelEnabled);
+    if (choice === retryRow) {
+      retryPolicy = await selectRetryPolicy(input.ui, retryPolicy);
       continue;
     }
     const error = await validateSelection(activeExecutor, activeReviewers, agents, input.config, input.scoped);
@@ -138,7 +144,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
       retainBundles,
       maxWorkers,
-      parallelEnabled,
+      retryPolicy,
     });
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config);
@@ -159,21 +165,59 @@ async function selectBundleRetention(ui: UiContext, current: RetainBundles): Pro
 }
 
 async function selectMaxWorkers(ui: UiContext, current: number): Promise<number> {
-  const options = ["1", "2", "3", "4"].map((v) => `${v}${v === String(current) ? "  current" : ""}`);
-  const selected = await ui.select("Parallel workers (1–4)", options);
+  const options = Array.from({ length: MAX_EXECUTION_WORKERS }, (_, index) => String(index + 1))
+    .map((v) => `${v}${v === String(current) ? "  current" : ""}`);
+  const selected = await ui.select(`Executor concurrency (1–${MAX_EXECUTION_WORKERS})`, options);
   const parsed = Number(selected?.split(" ")[0]);
-  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 4 ? parsed : current;
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_EXECUTION_WORKERS ? parsed : current;
 }
 
-async function selectParallelEnabled(ui: UiContext, current: boolean): Promise<boolean> {
-  const options = [
-    `Enabled${current ? "  current" : ""}`,
-    `Disabled${!current ? "  current" : ""}`,
-  ];
-  const selected = await ui.select("Parallel execution", options);
-  if (selected === `Enabled${current ? "  current" : ""}`) return true;
-  if (selected === `Disabled${!current ? "  current" : ""}`) return false;
-  return current;
+async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): Promise<ExecutionRetryPolicy> {
+  let policy = { ...initial };
+  while (true) {
+    const [retriesRow, baseRow, maxRow, repeatsRow, jitterRow] = alignedSettingsRows([
+      ["Retries after initial attempt", String(policy.maxRetries)],
+      ["Base delay", formatDuration(policy.baseDelayMs)],
+      ["Maximum delay", formatDuration(policy.maxDelayMs)],
+      ["Same-incident repeat limit", String(policy.maxSameIncidentRepeats)],
+      ["Delay jitter", policy.jitter ? "Enabled" : "Disabled"],
+    ]);
+    const choice = await ui.select("Executor retry policy", [retriesRow, baseRow, maxRow, repeatsRow, jitterRow, "Back"]);
+    if (!choice || choice === "Back") return policy;
+    if (choice === jitterRow) {
+      policy.jitter = !policy.jitter;
+      continue;
+    }
+    if (!ui.input) {
+      await notify(ui, "This UI does not support numeric input.", "error");
+      continue;
+    }
+    const isDelay = choice === baseRow || choice === maxRow;
+    const current = choice === retriesRow
+      ? policy.maxRetries
+      : choice === baseRow
+        ? policy.baseDelayMs
+        : choice === maxRow
+          ? policy.maxDelayMs
+          : policy.maxSameIncidentRepeats;
+    const entered = await ui.input(isDelay ? "Delay in milliseconds" : "Retry limit", String(current));
+    if (entered === undefined) continue;
+    const parsed = Number(entered.trim());
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+      await notify(ui, "Enter a non-negative whole number.", "error");
+      continue;
+    }
+    const next = { ...policy };
+    if (choice === retriesRow) next.maxRetries = parsed;
+    else if (choice === baseRow) next.baseDelayMs = parsed;
+    else if (choice === maxRow) next.maxDelayMs = parsed;
+    else next.maxSameIncidentRepeats = parsed;
+    if (next.maxDelayMs < next.baseDelayMs) {
+      await notify(ui, "Maximum delay must be greater than or equal to base delay.", "error");
+      continue;
+    }
+    policy = next;
+  }
 }
 
 function retentionLabel(value: RetainBundles): string {
@@ -182,12 +226,9 @@ function retentionLabel(value: RetainBundles): string {
   return "Never";
 }
 
-function settingsRow(label: string, value: string): string {
-  return `${label.padEnd(19)}${value}`;
-}
-
-function policyValueRow(label: string, value: string): string {
-  return `${label.padEnd(31)}${value}`;
+function alignedSettingsRows(entries: ReadonlyArray<readonly [label: string, value: string]>): string[] {
+  const labelWidth = Math.max(0, ...entries.map(([label]) => label.length));
+  return entries.map(([label, value]) => `${label.padEnd(labelWidth)}  ${value}`);
 }
 
 async function selectExecutor(
@@ -332,8 +373,10 @@ async function selectReviewPolicy(
   let maxCorrectionCycles = initialCycles;
   let guidanceThreshold = initialThreshold;
   while (true) {
-    const cyclesRow = policyValueRow("Automatic correction attempts", String(maxCorrectionCycles));
-    const guidanceRow = policyValueRow("Concrete guidance after", String(guidanceThreshold));
+    const [cyclesRow, guidanceRow] = alignedSettingsRows([
+      ["Automatic correction attempts", String(maxCorrectionCycles)],
+      ["Concrete guidance after", String(guidanceThreshold)],
+    ]);
     const choice = await ui.select("Review policy", [cyclesRow, guidanceRow, "Back"]);
     if (!choice || choice === "Back") return { maxCorrectionCycles, guidanceThreshold };
     if (!ui.input) {
@@ -364,8 +407,10 @@ async function selectTimeouts(
   let reviewerTimeoutMs = initialReviewerTimeoutMs;
   let executorTimeoutMs = initialExecutorTimeoutMs;
   while (true) {
-    const reviewerRow = policyValueRow("Reviewer timeout", formatDuration(reviewerTimeoutMs));
-    const executorRow = policyValueRow("Executor timeout", formatDuration(executorTimeoutMs));
+    const [reviewerRow, executorRow] = alignedSettingsRows([
+      ["Reviewer timeout", formatDuration(reviewerTimeoutMs)],
+      ["Executor timeout", formatDuration(executorTimeoutMs)],
+    ]);
     const choice = await ui.select("Timeouts", [reviewerRow, executorRow, "Back"]);
     if (!choice || choice === "Back") return { reviewerTimeoutMs, executorTimeoutMs };
     if (!ui.input) {

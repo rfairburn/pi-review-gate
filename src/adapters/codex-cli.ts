@@ -15,6 +15,7 @@ import {
 } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
 import { readBoundedTextFile } from "../bounded-file";
+import { CodexJsonlActivityExtractor } from "../execution/progress";
 
 export class CodexCliAdapter implements ModelAdapter {
   readonly kind = "codex-cli";
@@ -28,6 +29,7 @@ export class CodexCliAdapter implements ModelAdapter {
     await writeFile(outputSchemaPath, JSON.stringify(REVIEW_OUTPUT_JSON_SCHEMA, null, 2), "utf8");
     const command = this.config.command ?? "codex";
     if (shouldPreflightSandbox(command, this.config.args)) {
+      req.onUpdate?.("sandbox preflight started");
       const preflight = await runPromptProcess({
         command,
         args: codexSandboxPreflightArgs(),
@@ -38,6 +40,7 @@ export class CodexCliAdapter implements ModelAdapter {
         signal: req.signal,
       });
       if (codexSandboxFailed(preflight.stderr)) {
+        req.onUpdate?.("sandbox preflight failed");
         await writeReviewerProcessArtifacts({ paths: artifacts, output: preflight });
         return {
           ...reviewerErrorResult(
@@ -50,6 +53,7 @@ export class CodexCliAdapter implements ModelAdapter {
           telemetry: processTelemetry(preflight),
         };
       }
+      req.onUpdate?.("sandbox preflight completed");
     }
     const args = req.session
       ? [
@@ -80,6 +84,10 @@ export class CodexCliAdapter implements ModelAdapter {
       ];
 
     const streamExtractor = new CodexJsonlReviewExtractor();
+    const activityExtractor = new CodexJsonlActivityExtractor(
+      (message) => req.onUpdate?.(message),
+      { includeModelUpdates: false },
+    );
     const output = await runPromptProcess({
       command,
       args,
@@ -88,8 +96,12 @@ export class CodexCliAdapter implements ModelAdapter {
       timeoutMs: req.timeoutMs,
       env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
       signal: req.signal,
-      onStdoutChunk: (chunk) => streamExtractor.push(chunk),
+      onStdoutChunk: (chunk) => {
+        streamExtractor.push(chunk);
+        activityExtractor.push(chunk);
+      },
     });
+    activityExtractor.finish();
     const streamed = streamExtractor.finish();
     const extracted = streamed.text || streamed.sessionId || streamed.usage
       ? streamed

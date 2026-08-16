@@ -602,6 +602,47 @@ test("emits progress updates via callback", async () => {
 
 // ── integration policy: all-or-nothing default ───────────────────────────────
 
+test("reviewer milestones reach execute_subtasks activity updates", async () => {
+  const artifactDir = await mkTmp("pi-wc-review-progress-art-");
+  const sourceDir = await mkTmp("pi-wc-review-progress-src-");
+  await git(["init", "--quiet"], sourceDir);
+  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
+  await git(["add", "."], sourceDir);
+  await git(["commit", "--quiet", "-m", "init"], sourceDir);
+  const config: ReviewGateConfig = {
+    ...makeConfigWithWritingExecutor(),
+    enabled: true,
+    decider: {
+      id: "passing",
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
+      ],
+      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+    },
+  };
+  const activity: string[] = [];
+
+  try {
+    await executeWave({
+      cwd: sourceDir,
+      tasks: [{ title: "Test", instructions: "noop", acceptanceCriteria: [] }],
+      config,
+      artifactDir,
+      waveId: "wc-review-progress",
+      onProgress: (update) => activity.push(...(update.activity ?? [])),
+    });
+
+    assert.ok(activity.includes("task-0: passing started"));
+    assert.ok(activity.includes("task-0: passing finished · pass"));
+  } finally {
+    await rm(artifactDir, { recursive: true, force: true });
+    await rm(sourceDir, { recursive: true, force: true });
+  }
+});
+
 test("default all-or-nothing: failed worker blocks integration", async () => {
   const artifactDir = await mkTmp("pi-wc-art-");
   const sourceDir = await mkTmp("pi-wc-src-");
@@ -782,6 +823,68 @@ test("observed concurrency never exceeds maxWorkers", async () => {
 
     assert.equal(result.taskResults.length, 4);
     assert.ok(maxActive <= 2, `observed concurrency ${maxActive} exceeded maxWorkers 2`);
+  } finally {
+    await rm(artifactDir, { recursive: true, force: true });
+    await rm(sourceDir, { recursive: true, force: true });
+  }
+});
+
+test("fresh workers overflow through the ordered executor pool by per-model capacity", async () => {
+  const artifactDir = await mkTmp("pi-wc-pool-art-");
+  const sourceDir = await mkTmp("pi-wc-pool-src-");
+  await git(["init", "--quiet"], sourceDir);
+  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
+  await git(["add", "."], sourceDir);
+  await git(["commit", "--quiet", "-m", "init"], sourceDir);
+
+  const writer = (id: string) => ({
+    id,
+    adapter: "run-as-binary" as const,
+    protocol: "pi-review-executor-jsonl-v1" as const,
+    command: process.execPath,
+    args: [
+      "-e",
+      [
+        "process.stdin.resume();",
+        "process.stdin.on('data',()=>{});",
+        "process.stdin.on('end',()=>{",
+        '  const fs=require("fs");',
+        `  fs.writeFileSync(require("path").join(process.cwd(),${JSON.stringify(`${id}.txt`)}),${JSON.stringify(`${id}\n`)});`,
+        `  process.stdout.write(JSON.stringify({type:"session",sessionId:${JSON.stringify(`${id}-session`)}})+"\\n");`,
+        '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+        "});",
+      ].join(""),
+    ],
+    timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+  });
+  const config: ReviewGateConfig = {
+    ...makeConfigWithWritingExecutor(),
+    execution: {
+      executorPool: [
+        { entryId: "primary", selection: { source: "external", id: "primary" }, maxConcurrent: 1 },
+        { entryId: "overflow", selection: { source: "external", id: "overflow" }, maxConcurrent: 1 },
+      ],
+      externalExecutors: [writer("primary"), writer("overflow")],
+    },
+  };
+
+  try {
+    const result = await executeWave({
+      cwd: sourceDir,
+      tasks: [
+        { title: "Primary task", instructions: "write output", acceptanceCriteria: [] },
+        { title: "Overflow task", instructions: "write output", acceptanceCriteria: [] },
+      ],
+      config,
+      maxWorkers: 2,
+      artifactDir,
+      waveId: "wc-pool-overflow",
+    });
+    const assignments = await Promise.all(result.taskResults.map(async (task) => {
+      const operation = JSON.parse(await readFile(join(result.waveRoot, "artifacts", task.taskId, "operation.json"), "utf8"));
+      return operation.executorEntryId;
+    }));
+    assert.deepEqual(assignments, ["primary", "overflow"]);
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

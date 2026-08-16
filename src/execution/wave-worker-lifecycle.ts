@@ -290,6 +290,7 @@ async function runCandidateReview(
   maxPatchBytes: number,
   correctionAttemptCount: number,
   signal?: AbortSignal,
+  onUpdate?: (message: string) => void,
 ): Promise<ReviewRunOutput> {
   // Build the exact patch from Git.
   const patch = await buildCandidateReviewPatch(
@@ -317,6 +318,7 @@ async function runCandidateReview(
     window,
     correctionAttemptCount,
     signal,
+    onUpdate,
   });
 }
 
@@ -759,12 +761,14 @@ export async function runWaveWorkerLifecycle(
       return result;
     }
 
+    const reviewCycle = reviewCycles.length + 1;
+    const reviewerLabels = frozen.frozenConfig.reviewers?.map(reviewerProgressLabel) ?? [];
     reportProgress(input, {
       phase: "reviewing",
-      message: `review cycle ${reviewCycles.length + 1}`,
+      message: `review cycle ${reviewCycle}`,
       artifactDir: resolvedArtifactDir,
-      reviewCycle: reviewCycles.length + 1,
-      reviewers: frozen.frozenConfig.reviewers?.map(reviewerProgressLabel) ?? [],
+      reviewCycle,
+      reviewers: reviewerLabels,
     });
 
     // Run review on the current candidate (with error handling).
@@ -784,6 +788,13 @@ export async function runWaveWorkerLifecycle(
           config.maxPatchBytes,
           correctionCount,
           signal,
+          (message) => reportProgress(input, {
+            phase: "reviewing",
+            message,
+            artifactDir: resolvedArtifactDir,
+            reviewCycle,
+            reviewers: reviewerLabels,
+          }),
         ),
         resolvedArtifactDir,
         config,

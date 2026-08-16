@@ -131,9 +131,10 @@ The older single `decider` field is still supported for compatibility.
 
 `/review-settings` opens one staged settings transaction with seven sections:
 
-- **Executor** is a single-selection, `/model`-style picker over Pi-scoped
-  little-coder models plus execution-capable entries from `externalAgents`.
-  Selecting an internal model also selects its executor reasoning level.
+- **Executor pool** is an ordered list of Pi-scoped little-coder models and
+  execution-capable entries from `externalAgents`. **Add executor** walks
+  through model, reasoning (when supported), and maximum concurrency. Existing
+  entries can be edited, moved up/down, or removed.
 - **Reviewers** is a multi-selection, `/scoped-models`-style picker over the
   same Pi-scoped models plus review-capable entries from `externalAgents`.
   Clearing every reviewer is valid and disables automatic review without
@@ -149,8 +150,9 @@ The older single `decider` field is still supported for compatibility.
 - **Bundle retention** selects `never`, `on-failure`, or `always`. Choose
   `always` when successful executor and reviewer turns need to remain available
   for inspection.
-- **Executor concurrency** sets `execution.maxWorkers` (1–16, default 4).
-  One worker is serial execution; excess tasks remain queued.
+- **Global concurrency** sets `execution.maxWorkers` (1–16, default 4). This is
+  the total worker ceiling; each executor-pool entry also has its own
+  `maxConcurrent` capacity.
 - **Retry policy** configures bounded executor/reviewer recovery: retry count,
   exponential-backoff bounds, jitter, and the repeated-incident guard.
 
@@ -160,17 +162,17 @@ section while preserving unrelated JSON keys. An inactive external definition
 does not need to be installed. Its command is checked when that definition is
 selected or run.
 
-The executor and reviewers are independent:
+The executor pool and reviewers are independent:
 
-| Reviewers | Executor | Behavior |
+| Reviewers | Executor pool | Behavior |
 | --- | --- | --- |
-| selected | selected | delegated execution with the full review/correction loop |
-| none | selected | delegated execution returns `completed_unreviewed` |
-| selected | disabled | automatic parent review only |
-| none | disabled | settings remain available; both behaviors are off |
+| selected | non-empty | delegated execution with the full review/correction loop |
+| none | non-empty | delegated execution returns `completed_unreviewed` |
+| selected | empty | automatic parent review only |
+| none | empty | settings remain available; both behaviors are off |
 
 Top-level `enabled: false` is the automatic-review master switch and does not
-disable an active executor. The environment kill switches disable the whole
+disable a configured executor pool. The environment kill switches disable the whole
 extension, including delegated execution.
 
 With an executor selected, the plugin exposes one delegated-execution tool:
@@ -191,7 +193,12 @@ the calling orchestrator has exactly one associated operation.
 Executor failures are checkpointed to a protected recovery ref before bounded
 retry. Compaction is a lifecycle transition: an interrupted Little Coder
 session is reopened by exact UUID, explicitly compacted through Pi RPC, and
-only then prompted to continue. Non-landed results include the worktree,
+only then prompted to continue. If same-executor recovery is exhausted, a
+verified checkpoint may be handed to the next lower-priority pool entry. That
+adapter starts a new native session in the same isolated worktree, so different
+providers and CLI harnesses can take over without pretending to share conversation
+state. Durable diagnostics include the complete executor assignment history.
+Non-landed results include the worktree,
 session, attempts, incidents, changed paths, verified checkpoint, hashed
 artifact inventory, current bundle, and safe next actions. Only `landed` means
 that worker changes reached the source workspace.
@@ -201,8 +208,11 @@ per-task activity, executor/reviewer identity, artifacts, review cycles, and
 verdicts. Five-second UI refreshes do not slow executor turns and are not copied
 into model context; only the final result packet is returned as tool context.
 
-Claude CLI reviewers and executors also stream bounded native lifecycle and tool
-activity into these views without exposing reasoning or reviewer output.
+Codex CLI, Claude CLI, and Little Coder reviewers stream bounded native lifecycle
+and read-only tool activity into ordinary review status and delegated-subtask
+activity views without exposing reasoning contents or reviewer output. Generic
+CLI reviewers expose start/finish status because their protocol has no structured
+intermediate event stream.
 Foreground automatic reviews, `/review-now`, and reviewer-question commands show
 the active reviewer milestone and elapsed time in the status line until the
 review completes or is cancelled.
@@ -214,7 +224,12 @@ specified as an array of 1–16 items.
 
 **Concurrency**: `maxWorkers` controls concurrent workers (1–16, default 4).
 The tool-call value overrides `config.execution.maxWorkers`; task count is
-independent, and excess tasks queue.
+independent, and excess tasks queue. Fresh tasks scan `execution.executorPool`
+in strict priority order and use the first entry with remaining
+`maxConcurrent` capacity. Thus a one-slot local primary can remain preferred
+while lower-priority cloud entries absorb overflow. The sum of pool capacities
+may exceed `maxWorkers`; it describes available fallback capacity, not the
+number of workers that must run.
 
 **Integration policy**: By default all-or-nothing: any worker that is not
 accepted, accepted_with_warnings, completed_unreviewed, or no_changes blocks

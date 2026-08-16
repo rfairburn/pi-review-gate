@@ -4,15 +4,15 @@ import { basename, dirname, join } from "node:path";
 import {
   externalAgentCatalog,
   normalizeConfig,
-  type ActiveExecutorSelection,
   type ActiveReviewerSelection,
+  type ExecutorPoolEntry,
   type ExecutionRetryPolicy,
   type RetainBundles,
   type ReviewGateConfig,
 } from "../config";
 
 export interface ReviewSettingsSelection {
-  activeExecutor: ActiveExecutorSelection;
+  executorPool: ExecutorPoolEntry[];
   activeReviewers: ActiveReviewerSelection[];
   reviewerTimeoutMs: number;
   executorTimeoutMs: number;
@@ -34,7 +34,11 @@ export async function persistReviewSettings(
 
   const catalog = externalAgentCatalog(normalizeConfig(parsed));
   const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
-  execution.activeExecutor = selection.activeExecutor;
+  execution.executorPool = selection.executorPool.map((entry) => ({
+    ...entry,
+    selection: { ...entry.selection },
+  }));
+  delete execution.activeExecutor;
   execution.maxWorkers = selection.maxWorkers;
   execution.retryPolicy = { ...selection.retryPolicy };
   delete execution.parallelEnabled;

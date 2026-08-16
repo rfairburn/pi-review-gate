@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { ExecutorSession } from "./types";
 import type { TerminalSafetyCode } from "./terminal-safety";
+import type { ExecutorSelection } from "../config";
 
 export type OperationState =
   | "running"
@@ -54,6 +55,17 @@ export interface ExecutionAttemptRecord {
   sessionId?: string;
 }
 
+export interface ExecutorAssignmentRecord {
+  entryId: string;
+  priority: number;
+  selection: ExecutorSelection;
+  generation: number;
+  reason: "initial" | "failover" | "continuation";
+  startedAt: string;
+  endedAt?: string;
+  outcome?: "completed" | "failed" | "cancelled" | "superseded";
+}
+
 export interface RecoveryCheckpoint {
   checkpointId: string;
   commitSha: string;
@@ -99,9 +111,13 @@ export interface OperationRecord {
   artifactDir: string;
   adapter?: string;
   model?: string;
+  executorEntryId?: string;
+  executorPriority?: number;
+  executorSelection?: ExecutorSelection;
   session?: ExecutorSession;
   generation: number;
   retryBudget: number;
+  assignments: ExecutorAssignmentRecord[];
   attempts: ExecutionAttemptRecord[];
   incidents: ExecutionIncident[];
   checkpoint?: RecoveryCheckpoint;
@@ -123,7 +139,14 @@ export interface OperationDiagnostics {
   retryable: boolean;
   retriesUsed: number;
   retriesRemaining: number;
-  executor: { adapter?: string; model?: string; processAlive: false };
+  executor: {
+    adapter?: string;
+    model?: string;
+    entryId?: string;
+    priority?: number;
+    selection?: ExecutorSelection;
+    processAlive: false;
+  };
   session: { id?: string; generation: number; resumable: boolean };
   workspace: {
     worktree: string;
@@ -133,6 +156,7 @@ export interface OperationDiagnostics {
   };
   checkpoint?: RecoveryCheckpoint;
   attempts: ExecutionAttemptRecord[];
+  assignments: ExecutorAssignmentRecord[];
   incidents: ExecutionIncident[];
   instructions: OperationInstruction[];
   artifacts: Array<{ path: string; sizeBytes: number; sha256?: string; hashOmitted?: string }>;
@@ -178,6 +202,7 @@ export function createOperationRecord(input: {
     artifactDir: input.artifactDir,
     generation: 0,
     retryBudget: input.retryBudget,
+    assignments: [],
     attempts: [],
     incidents: [],
     instructions: [],
@@ -208,6 +233,7 @@ export async function readOperationRecord(path: string): Promise<OperationRecord
   const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
   if (!isOperationRecord(parsed)) throw new Error(`Invalid operation record: ${path}`);
   const record = parsed as OperationRecord;
+  record.assignments ??= [];
   record.instructions ??= [];
   record.nextInstructionSequence ??= record.instructions.length + 1;
   return record;
@@ -256,7 +282,14 @@ export async function buildOperationDiagnostics(record: OperationRecord, waveRoo
     retryable: recoverable,
     retriesUsed: Math.max(0, record.attempts.length - 1),
     retriesRemaining: Math.max(0, record.retryBudget - Math.max(0, record.attempts.length - 1)),
-    executor: { adapter: record.adapter, model: record.model, processAlive: false },
+    executor: {
+      adapter: record.adapter,
+      model: record.model,
+      entryId: record.executorEntryId,
+      priority: record.executorPriority,
+      selection: record.executorSelection,
+      processAlive: false,
+    },
     session: { id: record.session?.id, generation: record.generation, resumable: Boolean(record.session) && !critical },
     workspace: {
       worktree: record.worktreeRoot,
@@ -266,6 +299,7 @@ export async function buildOperationDiagnostics(record: OperationRecord, waveRoo
     },
     checkpoint: record.checkpoint,
     attempts: record.attempts,
+    assignments: record.assignments,
     incidents: record.incidents,
     instructions: record.instructions,
     artifacts: inventory.artifacts,

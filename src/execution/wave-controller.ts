@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { DEFAULT_EXECUTION_RETRY_POLICY, type ReviewGateConfig } from "../config";
+import { DEFAULT_EXECUTION_RETRY_POLICY, resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import type { WaveCaptureHooks, WaveCaptureResult } from "./wave-repository";
 import { captureWaveBase, WaveCaptureError } from "./wave-repository";
 import {
@@ -31,6 +31,7 @@ import type { SubtaskProgressUpdate } from "./types";
 import type { SubtaskReviewReport } from "../review-report";
 import { SerialWriter } from "./serial-writer";
 import type { ExecutionIncident, OperationDiagnostics, ReattachmentBundle, RecoveryCheckpoint } from "./operation-record";
+import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 
 // ── public input / result contract ───────────────────────────────────────────
 
@@ -653,6 +654,11 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     throw new Error("Wave requires at least 1 task.");
   }
   const maxWorkers = validateMaxWorkers(input.maxWorkers);
+  const executorPoolEntries = resolvedExecutorPool(config);
+  if (executorPoolEntries.length === 0) {
+    throw new Error("Wave execution requires at least one configured executor pool entry.");
+  }
+  const executorPool = new ExecutorPoolScheduler(executorPoolEntries);
 
   // Generate deterministic task IDs.
   const taskItems = tasks.map((task, index) => ({
@@ -744,8 +750,12 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   const infrastructureWarnings = (): Pick<WaveResult, "infrastructureWarnings"> =>
     manifestPersistenceWarning ? { infrastructureWarnings: [manifestPersistenceWarning] } : {};
 
-  const startWorker = async (taskIndex: number): Promise<void> => {
-    if (signal?.aborted) return;
+  const startWorker = async (taskIndex: number, initialLease: ExecutorPoolLease): Promise<void> => {
+    let currentLease = initialLease;
+    if (signal?.aborted) {
+      currentLease.release();
+      return;
+    }
 
     const item = taskItems[taskIndex];
     if (!item) return;
@@ -777,6 +787,14 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
           )],
           scopedModels,
           signal,
+          executorAssignment: currentLease,
+          acquireFailover: async (currentPriority) => {
+            currentLease.release();
+            const nextLease = await executorPool.acquireAfter(currentPriority, signal);
+            if (!nextLease) return undefined;
+            currentLease = nextLease;
+            return nextLease;
+          },
           onUpdate: (subtaskUpdate) => {
             // Track per-task latest phase and reviewers.
             taskPhases.set(item.taskId, subtaskUpdate.phase);
@@ -955,6 +973,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       };
       results.set(item.taskId, result);
     } finally {
+      currentLease.release();
       activeSlots.delete(slot);
     }
   };
@@ -971,28 +990,26 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       break;
     }
 
-    // Wait for a slot to open if at capacity.
-    if (activeSlots.size >= maxWorkers) {
-      // Check abort while waiting.
-      if (signal?.aborted) break;
-      // Await the first worker to settle so we can refill the slot immediately.
-      // Wrap each promise with its index so we know which one settled.
-      const settledIndex = await Promise.race(
-        running.map((p, i) => p.then(() => i)),
-      );
-      if (settledIndex >= 0 && settledIndex < running.length) {
-        running.splice(settledIndex, 1);
-      }
-    }
-
-    if (signal?.aborted) break;
-
-    // Start as many workers as we have slots for.
+    // Fill global worker slots using the first executor pool entry with capacity.
     while (activeSlots.size < maxWorkers && nextTaskIndex < taskItems.length) {
       if (signal?.aborted) break;
+      const lease = executorPool.tryAcquire();
+      if (!lease) break;
       const taskIndex = nextTaskIndex++;
-      const p = startWorker(taskIndex);
+      const p = startWorker(taskIndex, lease);
       running.push(p);
+    }
+
+    if (nextTaskIndex >= taskItems.length || signal?.aborted) break;
+    if (running.length === 0) {
+      throw new Error("Executor pool has no available capacity.");
+    }
+
+    // Capacity may be constrained by either maxWorkers or a pool entry. Refill
+    // immediately when the first active lifecycle settles and releases a lease.
+    const settledIndex = await Promise.race(running.map((p, i) => p.then(() => i)));
+    if (settledIndex >= 0 && settledIndex < running.length) {
+      running.splice(settledIndex, 1);
     }
   }
 

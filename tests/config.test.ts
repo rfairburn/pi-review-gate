@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { activeExternalExecutor, automaticReviewEnabled, loadConfig, normalizeConfig, resolveReviewers } from "../src/config";
+import { activeExternalExecutor, automaticReviewEnabled, loadConfig, normalizeConfig, resolveReviewers, resolvedExecutorPool } from "../src/config";
 
 test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-config-"));
@@ -322,6 +322,61 @@ test("normalizeConfig preserves internal and external executor selections", () =
     thinkingLevel: "high",
   });
   assert.deepEqual(internal.execution?.externalExecutors?.map((executor) => executor.id), ["codex", "fake"]);
+});
+
+test("normalizeConfig preserves an ordered executor pool with per-model capacity", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    execution: {
+      executorPool: [
+        {
+          entryId: "local-primary",
+          selection: { source: "little-coder", model: "qwen/local", thinkingLevel: "high" },
+          maxConcurrent: 1,
+        },
+        {
+          entryId: "cloud-overflow",
+          selection: { source: "external", id: "deepseek" },
+          maxConcurrent: 3,
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(resolvedExecutorPool(config), [
+    {
+      entryId: "local-primary",
+      selection: { source: "little-coder", model: "qwen/local", thinkingLevel: "high" },
+      maxConcurrent: 1,
+    },
+    {
+      entryId: "cloud-overflow",
+      selection: { source: "external", id: "deepseek" },
+      maxConcurrent: 3,
+    },
+  ]);
+});
+
+test("normalizeConfig rejects invalid or duplicate executor pool entries", () => {
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    execution: {
+      executorPool: [{
+        entryId: "bad-capacity",
+        selection: { source: "external", id: "deepseek" },
+        maxConcurrent: 17,
+      }],
+    },
+  }), /maxConcurrent/);
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    execution: {
+      executorPool: [
+        { entryId: "first", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+        { entryId: "second", selection: { source: "external", id: "deepseek" }, maxConcurrent: 2 },
+      ],
+    },
+  }), /duplicate executor pool selection/);
 });
 
 test("resolveReviewers reports stale and duplicate enabled ids without rejecting config loading", () => {

@@ -328,12 +328,18 @@ test("batch render shows live progress with per-task status", () => {
             reviewer: "openai-codex/gpt-5.6-luna (high)",
           },
         ],
+        activity: [
+          "task-1: openai-codex/gpt-5.6-luna (high) started",
+          "task-1: openai-codex/gpt-5.6-luna (high) · model reasoning",
+        ],
       },
     },
   }, { expanded: true }, theme).render(120).join("\n");
   assert.match(liveText, /Working/);
   assert.match(liveText, /task-0: executing · model: ollama\/deepseek-v4-flash:0731-cloud/);
   assert.match(liveText, /task-1: reviewing · reviewer: openai-codex\/gpt-5\.6-luna \(high\)/);
+  assert.match(liveText, /Recent activity/);
+  assert.match(liveText, /task-1: openai-codex\/gpt-5\.6-luna \(high\) · model reasoning/);
   assert.doesNotMatch(liveText, /task-1: reviewing · model: ollama/);
 });
 

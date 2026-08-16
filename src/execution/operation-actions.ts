@@ -4,7 +4,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ReviewGateConfig } from "../config";
+import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import { candidateRefName } from "./wave-commits";
 import { integrateWave, type SelectedWorker, type WaveIntegrationResult } from "./wave-integration";
 import { executeWaveLanding, planWaveLanding, type LandingExecutionResult } from "./wave-landing";
@@ -24,6 +24,7 @@ import {
   type ReattachmentBundle,
 } from "./operation-record";
 import type { WaveManifest, WaveManifestTask } from "./wave-controller";
+import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 
 export interface OperationInspection {
   bundle: ReattachmentBundle;
@@ -168,6 +169,13 @@ export async function continueOperation(input: {
   instructionRecord.status = "delivered";
   instructionRecord.deliveredAt = new Date().toISOString();
   await writeOperationRecord(record);
+  const continuationPool = new ExecutorPoolScheduler(resolvedExecutorPool(input.config));
+  let failoverLease: ExecutorPoolLease | undefined;
+  const acquireFailover = async (currentPriority: number) => {
+    failoverLease?.release();
+    failoverLease = await continuationPool.acquireAfter(currentPriority, input.signal);
+    return failoverLease;
+  };
   let continued: WaveWorkerResult;
   try {
     continued = await resumeWaveWorker({
@@ -183,6 +191,7 @@ export async function continueOperation(input: {
     feedback: instruction,
     turn: nextTurn,
     signal: input.signal,
+    acquireFailover,
     onUpdate: (update) => input.onUpdate?.(update.message),
     });
   } catch (error) {
@@ -194,23 +203,30 @@ export async function continueOperation(input: {
     }
     record.state = "paused_recoverable";
     await writeOperationRecord(record);
+    failoverLease?.release();
     throw error;
   }
 
-  const lifecycle = await runWaveWorkerLifecycle({
-    taskId: record.taskId,
-    task,
-    capture: continuationCapture,
-    worktree: recoveryWorktree,
-    artifactDir: record.artifactDir,
-    config: input.config,
-    sourceRoot: capture.discovery.captureRoot,
-    sourceRootAliases: [capture.discovery.requestedCwd],
-    scopedModels: input.scopedModels,
-    signal: input.signal,
-    onUpdate: (update) => input.onUpdate?.(update.message),
-    initialResult: continued,
-  });
+  let lifecycle: WaveWorkerLifecycleResult;
+  try {
+    lifecycle = await runWaveWorkerLifecycle({
+      taskId: record.taskId,
+      task,
+      capture: continuationCapture,
+      worktree: recoveryWorktree,
+      artifactDir: record.artifactDir,
+      config: input.config,
+      sourceRoot: capture.discovery.captureRoot,
+      sourceRootAliases: [capture.discovery.requestedCwd],
+      scopedModels: input.scopedModels,
+      signal: input.signal,
+      acquireFailover,
+      onUpdate: (update) => input.onUpdate?.(update.message),
+      initialResult: continued,
+    });
+  } finally {
+    failoverLease?.release();
+  }
   record = await readOperationRecord(operationRecordPath(record.artifactDir));
   const persistedInstruction = record.instructions.find((item) => item.instructionId === input.instructionId);
   if (persistedInstruction) {

@@ -6,7 +6,7 @@ import test from "node:test";
 import { persistReviewSettings, type ReviewSettingsSelection } from "../src/settings/persistence";
 
 const selection: ReviewSettingsSelection = {
-  activeExecutor: null,
+  executorPool: [],
   activeReviewers: [],
   reviewerTimeoutMs: 600_000,
   executorTimeoutMs: 1_800_000,

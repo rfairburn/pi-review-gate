@@ -1,6 +1,34 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+function noChangeExecutorConfig(): Record<string, unknown> {
+  return {
+    externalAgents: [{
+      id: "fixture-noop",
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: {
+        protocol: "pi-review-executor-jsonl-v1",
+        args: ["-e", [
+          "process.stdin.resume();",
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          'process.stdout.write(JSON.stringify({type:"session",sessionId:"fixture"})+"\\n");',
+          'process.stdout.write(JSON.stringify({type:"assistant",text:"No changes."})+"\\n");',
+          "});",
+        ].join("")],
+      },
+    }],
+    execution: {
+      executorPool: [{
+        entryId: "fixture-noop",
+        selection: { source: "external", id: "fixture-noop" },
+        maxConcurrent: 1,
+      }],
+    },
+  };
+}
+
 // ── Settings persistence tests ───────────────────────────────────────────────
 
 test("settings persistence removes parallelEnabled and stores concurrency and retries", async () => {
@@ -18,7 +46,7 @@ test("settings persistence removes parallelEnabled and stores concurrency and re
   }), "utf8");
 
   const next = await persistReviewSettings(configPath, {
-    activeExecutor: null,
+    executorPool: [],
     activeReviewers: [],
     reviewerTimeoutMs: 600000,
     executorTimeoutMs: 1800000,
@@ -71,7 +99,7 @@ test("manifest includes snapshot policy disclosure", async () => {
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      execution: { activeExecutor: null },
+      ...noChangeExecutorConfig(),
     });
 
     const progressUpdates: Array<Record<string, any>> = [];
@@ -222,7 +250,7 @@ test("progress updates include counts and bounded activity", async () => {
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      execution: { activeExecutor: null },
+      ...noChangeExecutorConfig(),
     });
 
     const progressUpdates: Array<Record<string, any>> = [];

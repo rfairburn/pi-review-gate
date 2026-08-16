@@ -219,6 +219,7 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
     // Executor writes a file.
     const { command } = await createFakeExecutor(root);
     const config = buildPassingReviewerConfig(command);
+    const updates: Array<{ phase: string; message: string }> = [];
 
     const result = await runWaveWorkerLifecycle({
       sourceRoot: capture.discovery.captureRoot,
@@ -228,6 +229,7 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
       worktree: worker,
       artifactDir,
       config,
+      onUpdate: (update) => updates.push(update),
     });
 
     assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
@@ -236,6 +238,8 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
     assert.equal(result.unreviewed, undefined, "should not be unreviewed");
     assert.equal(result.reviewCycles.length, 1, "should have exactly one review cycle");
     assert.equal(result.reviewCycles[0].verdict, "pass");
+    assert.ok(updates.some((update) => update.phase === "reviewing" && update.message === "passing started"));
+    assert.ok(updates.some((update) => update.phase === "reviewing" && update.message === "passing finished · pass"));
 
     // Verify the worker ref points to the accepted commit.
     const refSha = await gitInRepo(

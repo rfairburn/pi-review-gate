@@ -350,6 +350,47 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
   }
 });
 
+test("wave-worker checkpoints and pauses when adapter initialization fails", async () => {
+  const root = await mkTmp("pi-ww-adapter-init-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-adapter-init");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-adapter-init");
+    const config = normalizeConfig({
+      enabled: true,
+      execution: {
+        executorPool: [{
+          entryId: "missing",
+          selection: { source: "external", id: "missing" },
+          maxConcurrent: 1,
+        }],
+        retryPolicy: NO_RETRY,
+      },
+    });
+
+    const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-adapter-init",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "executor_error");
+    assert.equal(result.checkpoint?.verified, true);
+    const operation = JSON.parse(await readFile(join(artifactDir, "operation.json"), "utf8"));
+    assert.equal(operation.state, "paused_recoverable");
+    assert.equal(operation.checkpoint.verified, true);
+    assert.equal(operation.assignments[0].outcome, "failed");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("wave-worker checkpoints partial edits and automatically recovers a failed executor", async () => {
   const root = await mkTmp("pi-ww-retry-");
   try {
@@ -409,6 +450,99 @@ test("wave-worker checkpoints partial edits and automatically recovers a failed 
     assert.equal(operation.attempts.length, 2);
     assert.equal(operation.incidents[0].resolvedBy, undefined);
     assert.equal(operation.incidents[0].resolution, "executor_recovered");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("wave-worker hands a verified checkpoint to the next executor pool entry in a new session", async () => {
+  const root = await mkTmp("pi-ww-failover-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-failover");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-failover");
+    await mkdir(artifactDir, { recursive: true });
+    const handoffCapture = join(root, "handoff-prompt.txt");
+    const primaryCommand = join(root, "primary-fail.cjs");
+    const fallbackCommand = join(root, "fallback-complete.cjs");
+    await writeFile(primaryCommand, [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      "fs.writeFileSync(path.join(process.cwd(),'partial.txt'),'preserve me\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:'qwen-session'}));",
+      "console.log(JSON.stringify({type:'error',message:'primary provider failed'}));",
+      "process.exit(1);",
+    ].join("\n"), "utf8");
+    await writeFile(fallbackCommand, [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      `fs.writeFileSync(${JSON.stringify(handoffCapture)},fs.readFileSync(0,'utf8'));`,
+      "if(!fs.existsSync(path.join(process.cwd(),'partial.txt'))) process.exit(2);",
+      "fs.writeFileSync(path.join(process.cwd(),'finished.txt'),'done\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:'deepseek-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'Completed from checkpoint.'}));",
+    ].join("\n"), "utf8");
+    await chmod(primaryCommand, 0o755);
+    await chmod(fallbackCommand, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      execution: {
+        executorPool: [
+          { entryId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+          { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+        ],
+        retryPolicy: NO_RETRY,
+      },
+      externalAgents: [
+        {
+          id: "qwen",
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [primaryCommand], timeoutMs: 15_000 },
+        },
+        {
+          id: "deepseek",
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [fallbackCommand], timeoutMs: 15_000 },
+        },
+      ],
+    });
+    const pool = config.execution!.executorPool!;
+
+    const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-failover",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      executorAssignment: { entry: pool[0]!, priority: 0 },
+      acquireFailover: async (priority) => priority === 0 ? { entry: pool[1]!, priority: 1 } : undefined,
+    });
+
+    assert.equal(result.status, "completed");
+    assert.equal(result.session?.id, "deepseek-session");
+    assert.equal(result.model, undefined);
+    assert.equal(await git(["show", `${result.candidate!.commitSha}:partial.txt`], worker.worktreeRoot), "preserve me");
+    assert.equal(await git(["show", `${result.candidate!.commitSha}:finished.txt`], worker.worktreeRoot), "done");
+    const handoff = await readFile(handoffCapture, "utf8");
+    assert.match(handoff, /Executor handoff \(authoritative\)/);
+    assert.match(handoff, /Verified checkpoint:/);
+    const operation = JSON.parse(await readFile(join(artifactDir, "operation.json"), "utf8"));
+    assert.equal(operation.generation, 1);
+    assert.deepEqual(operation.assignments.map((assignment: { entryId: string; reason: string; outcome: string }) => ({
+      entryId: assignment.entryId,
+      reason: assignment.reason,
+      outcome: assignment.outcome,
+    })), [
+      { entryId: "qwen", reason: "initial", outcome: "failed" },
+      { entryId: "deepseek", reason: "failover", outcome: "completed" },
+    ]);
+    assert.equal(operation.incidents[0].resolution, "verified_checkpoint_failover");
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {

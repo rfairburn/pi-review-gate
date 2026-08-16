@@ -5,11 +5,17 @@ import { createExecutorAdapter } from "./adapters/factory";
 import { normalizeCandidate, pinRecoveryCandidate, type CandidateCommit } from "./wave-commits";
 import type { WorkerWorktree } from "./wave-worktrees";
 import type { WaveCaptureResult } from "./wave-repository";
-import { DEFAULT_EXECUTION_RETRY_POLICY, type ReviewGateConfig } from "../config";
+import {
+  DEFAULT_EXECUTION_RETRY_POLICY,
+  executorSelectionKey,
+  resolvedExecutorPool,
+  type ReviewGateConfig,
+} from "../config";
 import type { ExecutorAdapter, ExecutorSession, ExecutorTurn, SubtaskProgressUpdate } from "./types";
 import type { TokenUsage } from "../usage";
 import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
-import { runExecutorWithRecovery } from "./executor-recovery";
+import { runExecutorWithRecovery, type RecoveredExecutorRun } from "./executor-recovery";
+import type { ExecutorPoolAssignment } from "./executor-pool";
 import {
   createOperationRecord,
   createIncident,
@@ -18,6 +24,8 @@ import {
   readOperationRecord,
   writeOperationRecord,
   type ExecutionIncident,
+  type ExecutorAssignmentRecord,
+  type OperationRecord,
   type ReattachmentBundle,
   type RecoveryCheckpoint,
 } from "./operation-record";
@@ -172,6 +180,10 @@ export interface WaveWorkerInput {
   signal?: AbortSignal;
   /** Progress callback. */
   onUpdate?: (update: SubtaskProgressUpdate) => void;
+  /** Capacity lease selected by the wave scheduler. */
+  executorAssignment?: ExecutorPoolAssignment;
+  /** Acquire the next lower-priority executor after verified recovery fails. */
+  acquireFailover?: (currentPriority: number) => Promise<ExecutorPoolAssignment | undefined>;
 }
 
 /** Input for resuming a wave worker turn (continuation). */
@@ -202,6 +214,10 @@ export interface WaveWorkerContinuationInput {
   signal?: AbortSignal;
   /** Progress callback. */
   onUpdate?: (update: SubtaskProgressUpdate) => void;
+  /** Capacity lease selected by the wave scheduler. */
+  executorAssignment?: ExecutorPoolAssignment;
+  /** Acquire the next lower-priority executor after verified recovery fails. */
+  acquireFailover?: (currentPriority: number) => Promise<ExecutorPoolAssignment | undefined>;
 }
 
 // ── validation ───────────────────────────────────────────────────────────────
@@ -432,6 +448,251 @@ function reportProgress(
 
 // ── main execution ───────────────────────────────────────────────────────────
 
+interface PoolRunResult {
+  adapter?: ExecutorAdapter;
+  recovered: RecoveredExecutorRun;
+}
+
+function configuredAssignment(config: ReviewGateConfig): ExecutorPoolAssignment | undefined {
+  const entry = resolvedExecutorPool(config)[0];
+  return entry ? { entry, priority: 0 } : undefined;
+}
+
+function assignmentFromOperation(operation: OperationRecord, config: ReviewGateConfig): ExecutorPoolAssignment | undefined {
+  if (!operation.executorSelection || operation.executorEntryId === undefined || operation.executorPriority === undefined) {
+    return undefined;
+  }
+  const configured = resolvedExecutorPool(config);
+  const configuredPriority = configured.findIndex((entry) =>
+    executorSelectionKey(entry.selection) === executorSelectionKey(operation.executorSelection!));
+  if (configuredPriority >= 0) {
+    return { entry: configured[configuredPriority]!, priority: configuredPriority };
+  }
+  return {
+    entry: {
+      entryId: operation.executorEntryId,
+      selection: operation.executorSelection,
+      maxConcurrent: 1,
+    },
+    priority: operation.executorPriority,
+  };
+}
+
+function beginAssignment(
+  operation: OperationRecord,
+  assignment: ExecutorPoolAssignment,
+  reason: ExecutorAssignmentRecord["reason"],
+): ExecutorAssignmentRecord {
+  operation.executorEntryId = assignment.entry.entryId;
+  operation.executorPriority = assignment.priority;
+  operation.executorSelection = assignment.entry.selection;
+  const record: ExecutorAssignmentRecord = {
+    entryId: assignment.entry.entryId,
+    priority: assignment.priority,
+    selection: assignment.entry.selection,
+    generation: operation.generation,
+    reason,
+    startedAt: new Date().toISOString(),
+  };
+  operation.assignments.push(record);
+  return record;
+}
+
+function finishAssignment(
+  assignment: ExecutorAssignmentRecord,
+  outcome: NonNullable<ExecutorAssignmentRecord["outcome"]>,
+): void {
+  assignment.endedAt = new Date().toISOString();
+  assignment.outcome = outcome;
+}
+
+function checkpointHandoffPrompt(
+  originalPrompt: string,
+  recovered: RecoveredExecutorRun,
+): string {
+  const checkpoint = recovered.checkpoint;
+  return [
+    "Executor handoff (authoritative):",
+    "A prior executor exhausted its recovery attempts. Continue this same task in the existing isolated worktree.",
+    "Inspect and preserve useful work already present. Do not reset, discard, or recreate changes merely because the native conversation changed.",
+    checkpoint
+      ? `Verified checkpoint: ${checkpoint.commitSha} (${checkpoint.ref}); changed paths: ${checkpoint.changedPaths.join(", ") || "none"}.`
+      : "No prior file changes were produced before executor initialization failed.",
+    `Prior executor failure: ${recovered.error ?? "unknown executor failure"}`,
+    "",
+    "Original task and current instructions:",
+    originalPrompt,
+  ].join("\n");
+}
+
+async function runWithPoolFailover(input: {
+  worker: WaveWorkerInput | WaveWorkerContinuationInput;
+  operation: OperationRecord;
+  assignment: ExecutorPoolAssignment;
+  prompt: string;
+  handoffPrompt: string;
+  startingTurn: number;
+  session?: ExecutorSession;
+  reason: ExecutorAssignmentRecord["reason"];
+  resolvedArtifactDir: string;
+}): Promise<PoolRunResult> {
+  let assignment = input.assignment;
+  let prompt = input.prompt;
+  let session = input.session;
+  let startingTurn = input.startingTurn;
+  let reason = input.reason;
+
+  for (;;) {
+    const assignmentRecord = beginAssignment(input.operation, assignment, reason);
+    let adapter: ExecutorAdapter | undefined;
+    try {
+      adapter = createExecutorAdapter(input.worker.config, assignment.entry.selection);
+      input.operation.adapter = adapter.kind;
+      input.operation.model = adapter.model;
+      await writeOperationRecord(input.operation);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to create executor adapter.";
+      const incident = createIncident({
+        attempt: input.operation.attempts.length,
+        generation: input.operation.generation,
+        cause: "provider_error",
+        stage: "adapter_initialization",
+        message,
+        retryable: true,
+      });
+      input.operation.incidents.push(incident);
+      finishAssignment(assignmentRecord, "failed");
+      let checkpoint = input.operation.checkpoint;
+      try {
+        const candidate = await normalizeCandidate(
+          input.worker.capture,
+          input.worker.worktree.worktreeRoot,
+          input.worker.taskId,
+          input.worker.task.title,
+        );
+        checkpoint = await checkpointCandidate(input.worker.capture, input.worker.taskId, candidate);
+        input.operation.checkpoint = checkpoint;
+      } catch (checkpointError) {
+        incident.retryable = false;
+        incident.terminalCode = "recovery_state_corrupt_or_unverifiable";
+        incident.message = `${message}; the recovery checkpoint could not be created or verified. ${checkpointError instanceof Error ? checkpointError.message : String(checkpointError)}`;
+        input.operation.state = "failed_critical";
+        await writeOperationRecord(input.operation);
+        return {
+          recovered: {
+            status: "critical",
+            error: incident.message,
+            lastTurnNumber: Math.max(0, startingTurn - 1),
+            checkpoint,
+            incidents: [incident],
+          },
+        };
+      }
+      await writeOperationRecord(input.operation);
+      const recovered: RecoveredExecutorRun = {
+        status: "failed",
+        error: message,
+        lastTurnNumber: Math.max(0, startingTurn - 1),
+        checkpoint,
+        incidents: [incident],
+      };
+      const next = await input.worker.acquireFailover?.(assignment.priority);
+      if (!next) {
+        input.operation.state = "paused_recoverable";
+        await writeOperationRecord(input.operation);
+        return { recovered };
+      }
+      incident.resolvedAt = new Date().toISOString();
+      incident.resolution = "executor_pool_failover";
+      input.operation.generation += 1;
+      input.operation.session = undefined;
+      assignment = next;
+      prompt = checkpointHandoffPrompt(input.handoffPrompt, recovered);
+      session = undefined;
+      reason = "failover";
+      continue;
+    }
+
+    reportProgress(input.worker, {
+      phase: "executing",
+      message: `executor turn ${startingTurn} running`,
+      artifactDir: input.resolvedArtifactDir,
+      adapter: adapter.kind,
+      model: adapter.model,
+      executorTurn: startingTurn,
+    });
+
+    const recovered = await runExecutorWithRecovery({
+      adapter,
+      request: {
+        cwd: input.worker.worktree.effectiveCwd,
+        artifactDir: input.resolvedArtifactDir,
+        signal: input.worker.signal,
+        onUpdate: (message) => reportProgress(input.worker, {
+          phase: "executing",
+          message,
+          artifactDir: input.resolvedArtifactDir,
+          adapter: adapter!.kind,
+          model: adapter!.model,
+        }),
+      },
+      prompt,
+      startingTurn,
+      session,
+      capture: input.worker.capture,
+      worktree: input.worker.worktree,
+      taskId: input.worker.taskId,
+      title: input.worker.task.title,
+      retryPolicy: input.worker.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY,
+      operation: input.operation,
+      onRetry: (message, executorTurn) => reportProgress(input.worker, {
+        phase: "executing",
+        message,
+        artifactDir: input.resolvedArtifactDir,
+        adapter: adapter!.kind,
+        model: adapter!.model,
+        executorTurn,
+      }),
+    });
+
+    if (recovered.status === "completed") {
+      finishAssignment(assignmentRecord, "completed");
+      await writeOperationRecord(input.operation);
+      return { adapter, recovered };
+    }
+    if (recovered.status === "cancelled") {
+      finishAssignment(assignmentRecord, "cancelled");
+      await writeOperationRecord(input.operation);
+      return { adapter, recovered };
+    }
+    finishAssignment(assignmentRecord, "failed");
+    if (recovered.status === "critical" || !recovered.checkpoint?.verified) {
+      await writeOperationRecord(input.operation);
+      return { adapter, recovered };
+    }
+
+    const next = await input.worker.acquireFailover?.(assignment.priority);
+    if (!next) {
+      await writeOperationRecord(input.operation);
+      return { adapter, recovered };
+    }
+    for (const incident of recovered.incidents) {
+      if (!incident.resolvedAt) {
+        incident.resolvedAt = new Date().toISOString();
+        incident.resolution = "verified_checkpoint_failover";
+      }
+    }
+    input.operation.generation += 1;
+    input.operation.session = undefined;
+    assignment = next;
+    prompt = checkpointHandoffPrompt(input.handoffPrompt, recovered);
+    session = undefined;
+    startingTurn = recovered.lastTurnNumber + 1;
+    reason = "failover";
+    await writeOperationRecord(input.operation);
+  }
+}
+
 /**
  * Run exactly one initial wave executor turn.
  *
@@ -451,7 +712,7 @@ function reportProgress(
  * - Implement scheduling.
  */
 export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerResult> {
-  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, signal } = input;
+  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases } = input;
 
   // ── Validate artifact directory (before mkdir) ──
   const resolvedArtifactDir = resolve(artifactDir);
@@ -476,18 +737,15 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
   await assertEffectiveCwdInsideWorktree(worktree.effectiveCwd, worktree.worktreeRoot);
   await assertWorktreeBelongsToRepo(worktree.worktreeRoot, capture);
 
-  // ── Create executor adapter ──
-  let adapter: ExecutorAdapter;
-  try {
-    adapter = createExecutorAdapter(config);
-  } catch (error) {
+  const assignment = input.executorAssignment ?? configuredAssignment(config);
+  if (!assignment) {
     return {
       status: "executor_error",
       taskId,
       title: task.title,
-      summary: error instanceof Error ? error.message : "Failed to create executor adapter.",
+      summary: "No executor pool is configured.",
       adapter: "none",
-      error: error instanceof Error ? error.message : "Failed to create executor adapter.",
+      error: "No executor pool is configured.",
     };
   }
 
@@ -495,8 +753,6 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     phase: "starting",
     message: "wave worker starting executor",
     artifactDir: resolvedArtifactDir,
-    adapter: adapter.kind,
-    model: adapter.model,
   });
 
   // ── Write task metadata ──
@@ -506,8 +762,9 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       version: 1,
       taskId,
       task,
-      adapter: adapter.kind,
-      model: adapter.model,
+      executorEntryId: assignment.entry.entryId,
+      executorPriority: assignment.priority,
+      executorSelection: assignment.entry.selection,
       startedAt: new Date().toISOString(),
     }, null, 2),
     "utf8",
@@ -520,16 +777,6 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     worktree.worktreeRoot,
   );
 
-  // ── Run one executor turn ──
-  reportProgress(input, {
-    phase: "executing",
-    message: "executor turn 1 running",
-    artifactDir: resolvedArtifactDir,
-    adapter: adapter.kind,
-    model: adapter.model,
-    executorTurn: 1,
-  });
-
   const operation = createOperationRecord({
     waveId: capture.waveId,
     taskId,
@@ -539,54 +786,34 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     artifactDir: resolvedArtifactDir,
     retryBudget: config.execution?.retryPolicy?.maxRetries ?? DEFAULT_EXECUTION_RETRY_POLICY.maxRetries,
   });
-  operation.adapter = adapter.kind;
-  operation.model = adapter.model;
   await writeOperationRecord(operation);
 
-  const recovered = await runExecutorWithRecovery({
-    adapter,
-    request: {
-      cwd: worktree.effectiveCwd,
-      artifactDir: resolvedArtifactDir,
-      signal,
-      onUpdate: (message) => reportProgress(input, {
-        phase: "executing",
-        message,
-        artifactDir: resolvedArtifactDir,
-        adapter: adapter.kind,
-        model: adapter.model,
-      }),
-    },
-    prompt,
-    startingTurn: 1,
-    capture,
-    worktree,
-    taskId,
-    title: task.title,
-    retryPolicy: config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY,
+  const poolRun = await runWithPoolFailover({
+    worker: input,
     operation,
-    onRetry: (message, executorTurn) => reportProgress(input, {
-      phase: "executing",
-      message,
-      artifactDir: resolvedArtifactDir,
-      adapter: adapter.kind,
-      model: adapter.model,
-      executorTurn,
-    }),
+    assignment,
+    prompt,
+    handoffPrompt: prompt,
+    startingTurn: 1,
+    reason: "initial",
+    resolvedArtifactDir,
   });
+  const { recovered } = poolRun;
+  const adapter = poolRun.adapter;
+  const adapterKind = adapter?.kind ?? "none";
   const commonFailure = {
     taskId,
     title: task.title,
     summary: recovered.error ?? "Executor failed.",
     session: recovered.turn?.session,
     turn: recovered.turn,
-    adapter: adapter.kind,
-    model: adapter.model,
+    adapter: adapterKind,
+    model: adapter?.model,
     usage: recovered.turn?.usage,
     error: recovered.error ?? "Executor failed.",
     operationRecord: operationRecordPath(resolvedArtifactDir),
     bundle: createReattachmentBundle(operation, capture.waveRoot),
-    incidents: recovered.incidents,
+    incidents: operation.incidents,
     checkpoint: recovered.checkpoint,
     attempts: operation.attempts.length,
     lastExecutorTurn: recovered.lastTurnNumber,
@@ -596,6 +823,9 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       status: recovered.status === "cancelled" ? "cancelled" : recovered.error?.includes("timed out") ? "timeout" : "executor_error",
       ...commonFailure,
     };
+  }
+  if (!adapter) {
+    return { status: "executor_error", ...commonFailure, adapter: "none", error: "Executor completed without an adapter record." };
   }
   const turn = recovered.turn;
 
@@ -746,7 +976,7 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
  * - Implement scheduling.
  */
 export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Promise<WaveWorkerResult> {
-  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, priorResult, feedback, turn, signal } = input;
+  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, priorResult, feedback, turn } = input;
 
   // ── Validate prior result ──
   if (!priorResult.session) {
@@ -773,18 +1003,19 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   await assertEffectiveCwdInsideWorktree(worktree.effectiveCwd, worktree.worktreeRoot);
   await assertWorktreeBelongsToRepo(worktree.worktreeRoot, capture);
 
-  // ── Create executor adapter ──
-  let adapter: ExecutorAdapter;
-  try {
-    adapter = createExecutorAdapter(config);
-  } catch (error) {
+  const operation = await readOperationRecord(operationRecordPath(resolvedArtifactDir));
+  operation.state = "running";
+  const assignment = config.execution?.executorPool !== undefined
+    ? assignmentFromOperation(operation, config) ?? input.executorAssignment ?? configuredAssignment(config)
+    : input.executorAssignment ?? configuredAssignment(config);
+  if (!assignment) {
     return {
       status: "executor_error",
       taskId,
       title: task.title,
-      summary: error instanceof Error ? error.message : "Failed to create executor adapter.",
+      summary: "No executor pool is configured.",
       adapter: "none",
-      error: error instanceof Error ? error.message : "Failed to create executor adapter.",
+      error: "No executor pool is configured.",
     };
   }
 
@@ -792,8 +1023,6 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     phase: "correcting",
     message: `resuming executor turn ${turn}`,
     artifactDir: resolvedArtifactDir,
-    adapter: adapter.kind,
-    model: adapter.model,
   });
 
   // ── Resume the exact executor session ──
@@ -803,49 +1032,25 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     worktree.worktreeRoot,
   );
 
-  reportProgress(input, {
-    phase: "executing",
-    message: `executor turn ${turn} running (resumed)`,
-    artifactDir: resolvedArtifactDir,
-    adapter: adapter.kind,
-    model: adapter.model,
-    executorTurn: turn,
-  });
-
-  const operation = await readOperationRecord(operationRecordPath(resolvedArtifactDir));
-  operation.state = "running";
-  const recovered = await runExecutorWithRecovery({
-    adapter,
-    request: {
-      cwd: worktree.effectiveCwd,
-      artifactDir: resolvedArtifactDir,
-      signal,
-      onUpdate: (message) => reportProgress(input, {
-        phase: "executing",
-        message,
-        artifactDir: resolvedArtifactDir,
-        adapter: adapter.kind,
-        model: adapter.model,
-      }),
-    },
+  const handoffPrompt = [
+    buildWaveWorkerPrompt(task, [sourceRoot, ...(sourceRootAliases ?? [])], worktree.worktreeRoot),
+    "",
+    "Current continuation instructions:",
+    rewrittenFeedback,
+  ].join("\n");
+  const poolRun = await runWithPoolFailover({
+    worker: input,
+    operation,
+    assignment,
     prompt: rewrittenFeedback,
+    handoffPrompt,
     startingTurn: turn,
     session: priorResult.session,
-    capture,
-    worktree,
-    taskId,
-    title: task.title,
-    retryPolicy: config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY,
-    operation,
-    onRetry: (message, executorTurn) => reportProgress(input, {
-      phase: "executing",
-      message,
-      artifactDir: resolvedArtifactDir,
-      adapter: adapter.kind,
-      model: adapter.model,
-      executorTurn,
-    }),
+    reason: "continuation",
+    resolvedArtifactDir,
   });
+  const { recovered } = poolRun;
+  const adapter = poolRun.adapter;
   if (recovered.status !== "completed" || !recovered.turn) {
     return {
       status: recovered.status === "cancelled" ? "cancelled" : recovered.error?.includes("timed out") ? "timeout" : "executor_error",
@@ -854,14 +1059,30 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       summary: recovered.error ?? "Executor continuation failed.",
       session: recovered.turn?.session ?? priorResult.session,
       turn: recovered.turn,
-      adapter: adapter.kind,
-      model: adapter.model,
+      adapter: adapter?.kind ?? "none",
+      model: adapter?.model,
       usage: recovered.turn?.usage,
       error: recovered.error ?? "Executor continuation failed.",
       operationRecord: operationRecordPath(resolvedArtifactDir),
       bundle: createReattachmentBundle(operation, capture.waveRoot),
-      incidents: recovered.incidents,
+      incidents: operation.incidents,
       checkpoint: recovered.checkpoint,
+      attempts: operation.attempts.length,
+      lastExecutorTurn: recovered.lastTurnNumber,
+    };
+  }
+  if (!adapter) {
+    return {
+      status: "executor_error",
+      taskId,
+      title: task.title,
+      summary: "Executor completed without an adapter record.",
+      adapter: "none",
+      error: "Executor completed without an adapter record.",
+      operationRecord: operationRecordPath(resolvedArtifactDir),
+      bundle: createReattachmentBundle(operation, capture.waveRoot),
+      incidents: operation.incidents,
+      checkpoint: operation.checkpoint,
       attempts: operation.attempts.length,
       lastExecutorTurn: recovered.lastTurnNumber,
     };

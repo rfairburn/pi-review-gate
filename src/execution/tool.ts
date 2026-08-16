@@ -1,4 +1,4 @@
-import { externalAgentCatalog, externalAgentSupportsExecution, type ReviewGateConfig } from "../config";
+import { externalAgentCatalog, externalAgentSupportsExecution, resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import { activeExchangeBaseline, checkpointReviewWindow } from "../state";
 import type { ReviewGateState } from "../state";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
@@ -30,10 +30,11 @@ export class ExecutionToolManager {
   constructor(private readonly input: ExecutionToolManagerInput) {}
 
   sync(): void {
-    const active = this.input.config.execution?.activeExecutor;
-    const resolvable = active?.source === "little-coder"
-      || (active?.source === "external"
-        && Boolean(externalAgentCatalog(this.input.config).some((agent) => agent.id === active.id && externalAgentSupportsExecution(agent))));
+    const pool = resolvedExecutorPool(this.input.config);
+    const agents = externalAgentCatalog(this.input.config);
+    const resolvable = pool.length > 0 && pool.every(({ selection }) =>
+      selection.source === "little-coder"
+      || agents.some((agent) => agent.id === selection.id && externalAgentSupportsExecution(agent)));
     if (resolvable && !this.registered) {
       this.register();
     }
@@ -586,13 +587,12 @@ function renderReviewReportForModel(report: SubtaskReviewReport | undefined): st
 }
 
 function validateInternalModel(config: ReviewGateConfig, scopedModels: string[]): string | undefined {
-  const active = config.execution?.activeExecutor;
-  if (active?.source !== "little-coder") {
-    return undefined;
+  for (const { selection } of resolvedExecutorPool(config)) {
+    if (selection.source === "little-coder" && !scopedModels.includes(selection.model)) {
+      return `Configured little-coder executor model is not in ctx.scopedModels: ${selection.model}. Use /review-settings.`;
+    }
   }
-  return scopedModels.includes(active.model)
-    ? undefined
-    : `Configured little-coder executor model is not in ctx.scopedModels: ${active.model}. Use /review-settings.`;
+  return undefined;
 }
 
 function setToolActive(pi: unknown, name: string, active: boolean): void {

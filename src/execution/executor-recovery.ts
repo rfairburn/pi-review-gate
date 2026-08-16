@@ -11,7 +11,6 @@ import {
   type OperationRecord,
   type RecoveryCheckpoint,
 } from "./operation-record";
-import { terminalSafetyRule } from "./terminal-safety";
 
 export interface RecoveredExecutorRun {
   status: "completed" | "failed" | "cancelled" | "critical";
@@ -155,14 +154,13 @@ export async function runExecutorWithRecovery(input: {
     } catch (error) {
       incident.retryable = false;
       incident.terminalCode = "recovery_state_corrupt_or_unverifiable";
-      const safety = terminalSafetyRule("recovery_state_corrupt_or_unverifiable");
       const checkpointError = error instanceof Error ? error.message : String(error);
       input.operation.state = "failed_critical";
       attemptRecord.outcome = "failed";
       await writeOperationRecord(input.operation);
       return {
         status: "critical",
-        error: `${failure.message}; ${safety.explanation} ${checkpointError}`,
+        error: `${failure.message}; the recovery checkpoint could not be created or verified. ${checkpointError}`,
         lastTurnNumber: turnNumber,
         checkpoint,
         incidents,

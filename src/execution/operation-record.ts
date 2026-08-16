@@ -3,6 +3,7 @@ import { readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { ExecutorSession } from "./types";
+import type { TerminalSafetyCode } from "./terminal-safety";
 
 export type OperationState =
   | "running"
@@ -36,7 +37,7 @@ export interface ExecutionIncident {
   stage: string;
   message: string;
   retryable: boolean;
-  terminalCode?: string;
+  terminalCode?: TerminalSafetyCode;
   occurredAt: string;
   resolvedAt?: string;
   resolution?: string;

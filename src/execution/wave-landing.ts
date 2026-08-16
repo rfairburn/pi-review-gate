@@ -77,13 +77,6 @@ export interface LandingPlan {
 
 // ── execution result types ───────────────────────────────────────────────────
 
-/** Status of a landing execution. */
-export type LandingExecutionStatus =
-  | "landed"
-  | "conflicted"
-  | "rolled_back"
-  | "recovery_required";
-
 /** A single path entry in the recovery manifest. */
 export interface RecoveryPathEntry {
   /** Normalized repo-relative path. */

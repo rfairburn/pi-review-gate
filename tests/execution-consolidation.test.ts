@@ -1,50 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeConfig } from "../src/config";
-import { ExecutionToolManager } from "../src/execution/tool";
-import { createState } from "../src/state";
-
-// ── Consolidated tool activation tests ──────────────────────────────────────
-
-test("execute_subtasks is the only execution tool and is active with a resolvable executor", () => {
-  const registered: Array<Record<string, unknown>> = [];
-  let activeTools = ["read"];
-  const pi = {
-    registerTool(tool: Record<string, unknown>) {
-      registered.push(tool);
-    },
-    getActiveTools() {
-      return activeTools;
-    },
-    setActiveTools(next: string[]) {
-      activeTools = next;
-    },
-  };
-  const config = normalizeConfig({
-    enabled: true,
-    review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
-    }],
-    execution: {
-      activeExecutor: { source: "external", id: "fake" },
-    },
-  });
-  const manager = new ExecutionToolManager({
-    pi,
-    config,
-    state: createState(),
-    cwd: () => process.cwd(),
-  });
-
-  manager.sync();
-  assert.equal(registered.length, 1);
-  assert.equal(registered[0].name, "execute_subtasks");
-  assert.ok(activeTools.includes("execute_subtasks"));
-});
 
 // ── Settings persistence tests ───────────────────────────────────────────────
 

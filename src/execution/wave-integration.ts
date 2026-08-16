@@ -39,9 +39,6 @@ export interface IntegratedWorkerMapping {
   order: number;
 }
 
-/** Status of a wave integration result. */
-export type WaveIntegrationStatus = "integrated" | "conflicted" | "no_changes";
-
 /** Successful integration result. */
 export interface WaveIntegrationSuccess {
   status: "integrated";

@@ -1,4 +1,3 @@
-import { reviewerDisplayLabels, type DeciderConfig } from "./config";
 import type { ReviewRunOutput } from "./review";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import type { ReviewFeedbackContext } from "./state";
@@ -62,33 +61,6 @@ export function hasPartialReviewerFailure(results: ReviewResult[] | undefined): 
   return Boolean(results?.some((result) => result.verdict === "pass")
     && results.some((result) => result.verdict === "error")
     && !results.some((result) => result.verdict === "needs_changes"));
-}
-
-export function buildReviewReportFromHistory(input: {
-  history: ReviewFeedbackContext[];
-  reviewers: DeciderConfig[];
-  artifactDir?: string;
-  currentOutput?: ReviewRunOutput;
-}): SubtaskReviewReport | undefined {
-  const labels = new Map(Object.entries(reviewerDisplayLabels(input.reviewers)));
-  const cycles = input.history.map((feedback) => buildCycleEvidence({
-    sequence: feedback.sequence,
-    gateSummary: verdictSummary(feedback.reviewerResults),
-    reviewerResults: feedback.reviewerResults,
-    labels,
-    disposition: feedback.disposition,
-  }));
-
-  if (input.currentOutput?.result && input.currentOutput.reviewerResults && input.currentOutput.reviewSequence !== undefined
-    && !cycles.some((cycle) => cycle.reviewSequence === input.currentOutput?.reviewSequence)) {
-    cycles.push(buildCycleEvidence({
-      sequence: input.currentOutput.reviewSequence,
-      gateSummary: input.currentOutput.result.summary,
-      reviewerResults: input.currentOutput.reviewerResults,
-      labels,
-    }));
-  }
-  return reportFromCycles(cycles, input.artifactDir);
 }
 
 export function buildReviewReportFromOutputs(input: {
@@ -159,15 +131,6 @@ function classifyReviewerError(result: ReviewResult): ReviewerErrorCategory {
   if (/invalid_json|missing_json|schema_error|output_truncated|missing_final_text/.test(text)) return "invalid_output";
   if (/exit_\d+|exited with status/.test(text)) return "process_exit";
   return "infrastructure";
-}
-
-function verdictSummary(results: ReviewResult[]): string {
-  const counts = new Map<ReviewResult["verdict"], number>();
-  for (const result of results) counts.set(result.verdict, (counts.get(result.verdict) ?? 0) + 1);
-  return (["needs_changes", "pass", "error"] as const)
-    .filter((verdict) => counts.has(verdict))
-    .map((verdict) => `${counts.get(verdict)} ${verdict}`)
-    .join(", ");
 }
 
 function withoutRawUsage(usage: NonNullable<ReviewResult["usage"]>): Omit<NonNullable<ReviewResult["usage"]>, "raw"> {

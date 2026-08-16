@@ -35,6 +35,8 @@ export interface ExecutorRequest {
     compactBeforePrompt?: boolean;
   };
   onUpdate?: (text: string) => void;
+  onProcessStart?: (process: { pid: number; processGroupId?: number }) => void | Promise<void>;
+  onProcessExit?: (process: { pid: number; processGroupId?: number; code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
 }
 
 export interface ExecutorAdapter {

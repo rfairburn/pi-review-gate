@@ -28,6 +28,8 @@ export class RunAsBinaryExecutorAdapter implements ExecutorAdapter {
         PI_REVIEW_EXECUTOR_TURN: String(request.turn),
       },
       signal: request.signal,
+      onProcessStart: request.onProcessStart,
+      onProcessExit: request.onProcessExit,
       onStdoutChunk: (chunk) => {
         protocol.push(chunk);
         request.onUpdate?.("binary executor running");

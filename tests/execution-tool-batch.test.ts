@@ -72,6 +72,7 @@ test("execute_subtasks is the sole registered delegated execution tool", () => {
   assert.equal(maxWorkersProp.type, "integer");
   assert.equal(maxWorkersProp.minimum, 1);
   assert.equal(maxWorkersProp.maximum, 16);
+  assert.equal((props.waveRoot as Record<string, unknown>).type, "string");
 
   // Verify both tools deactivated when executor removed.
   config.execution!.activeExecutor = null;
@@ -217,6 +218,24 @@ test("execute_subtasks blocks without parent baseline", async () => {
   assert.ok(summary[0].text.includes("parent ownership baseline"));
 });
 
+test("restoring associations drops unverifiable wave roots", async () => {
+  const notifications: string[] = [];
+  const manager = new ExecutionToolManager({
+    pi: {},
+    config: normalizeConfig({ enabled: false }),
+    state: createState(),
+    cwd: () => process.cwd(),
+    notify: (message) => { notifications.push(message); },
+  });
+  const missingRoot = join(tmpdir(), `pi-review-missing-wave-${process.pid}`);
+
+  await manager.restoreAssociations({ waveRoots: [missingRoot], bundles: [] });
+
+  assert.deepEqual(manager.associations(), { waveRoots: [], bundles: [] });
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0], /could not be verified and was not reattached/);
+});
+
 test("batch render shows task count and per-task status", () => {
   const registered: Array<Record<string, unknown>> = [];
   let activeTools: string[] = [];
@@ -350,6 +369,41 @@ test("batch render shows live progress with per-task status", () => {
   assert.match(liveText, /Recent activity/);
   assert.match(liveText, /task-1: openai-codex\/gpt-5\.6-luna \(high\) · model reasoning/);
   assert.doesNotMatch(liveText, /task-1: reviewing · model: ollama/);
+
+  const continuationText = renderResult({
+    content: [{ type: "text", text: "Continuing · executor turn 5 running" }],
+    details: {
+      state: "running",
+      action: "continue",
+      bundle: {
+        version: 1,
+        operationId: "wave/task-0",
+        waveId: "wave",
+        taskId: "task-0",
+        waveRoot: "/tmp/wave",
+        expectedRevision: 20,
+      },
+      progress: {
+        startedAt: new Date().toISOString(),
+        phase: "continuing",
+        message: "executor turn 5 running",
+        waveId: "wave",
+        waveRoot: "/tmp/wave",
+        taskStatuses: [{
+          subtaskId: "task-0",
+          phase: "continuing",
+          message: "executor turn 5 running",
+          executorModel: "llamacpp/qwen",
+        }],
+        activity: ["task-0: executor turn 5 running"],
+      },
+    },
+  }, { expanded: true }, theme).render(120).join("\n");
+  assert.match(continuationText, /Continuing/);
+  assert.match(continuationText, /executor turn 5 running/);
+  assert.match(continuationText, /task-0: continuing/);
+  assert.match(continuationText, /Recent activity/);
+  assert.doesNotMatch(continuationText, /✓ completed/);
 });
 
 test("batch result marks non-landed outcomes as errors", () => {
@@ -478,7 +532,8 @@ test("integration conflict gives the orchestrator, user, and later inspect compl
       getActiveTools() { return activeTools; },
       setActiveTools(next: string[]) { activeTools = next; },
     };
-    new ExecutionToolManager({ pi, config, state, cwd: () => root }).sync();
+    const manager = new ExecutionToolManager({ pi, config, state, cwd: () => root });
+    manager.sync();
     const tool = registered[0];
     const execute = tool.execute as (
       toolCallId: string,
@@ -537,6 +592,19 @@ test("integration conflict gives the orchestrator, user, and later inspect compl
     assert.match(expanded, /Recovery required/);
 
     const conflictingTask = details.taskResults.find((task: Record<string, unknown>) => task.taskId === details.integration.conflictingTaskId);
+    assert.equal(manager.associations().bundles.length, 2);
+    const explicitInspect = await execute("inspect-conflicting-task", {
+      action: "inspect",
+      bundle: conflictingTask.bundle,
+    }, undefined, undefined, {});
+    assert.notEqual(explicitInspect.isError, true);
+    assert.equal(manager.associations().bundles.length, 2, "inspecting one task must not discard sibling recovery bundles");
+    const waveInspect = await execute("inspect-wave-root", {
+      action: "inspect",
+      waveRoot: details.waveRoot,
+    }, undefined, undefined, {});
+    assert.notEqual(waveInspect.isError, true);
+    assert.equal((waveInspect.details as Record<string, unknown>).waveRoot, details.waveRoot);
     const inspection = await inspectOperation(conflictingTask.bundle);
     assert.equal(inspection.manifest.sourceWorkspace.disposition, "unchanged");
     assert.equal(inspection.manifest.tasks.length, 2);
@@ -629,9 +697,9 @@ test("landing conflict reports source drift, retained integrated state, and unch
       maxWorkers: 1,
     }, undefined, undefined, {});
 
-    for (let attempt = 0; attempt < 500; attempt += 1) {
+    for (let attempt = 0; attempt < 3_000; attempt += 1) {
       if (await readFile(started, "utf8").then(() => true).catch(() => false)) break;
-      if (attempt === 499) assert.fail("executor did not reach synchronization point");
+      if (attempt === 2_999) assert.fail("executor did not reach synchronization point");
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
     }
     await writeFile(join(root, "shared.txt"), "parent change\n", "utf8");

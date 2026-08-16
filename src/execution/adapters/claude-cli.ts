@@ -42,6 +42,8 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       timeoutMs: this.config.timeoutMs ?? 1_800_000,
       env: reviewerEnv({ ...process.env, ...this.config.env }),
       signal: request.signal,
+      onProcessStart: request.onProcessStart,
+      onProcessExit: request.onProcessExit,
       onStdoutChunk: (chunk) => {
         parser.push(chunk);
         activityExtractor.push(chunk);

@@ -1688,7 +1688,7 @@ test("resumeWaveWorker rejects turn < 2", async () => {
   }
 });
 
-test("resumeWaveWorker requires prior session and candidate", async () => {
+test("resumeWaveWorker requires a prior candidate checkpoint", async () => {
   const root = await mkTmp("pi-ww-resume7-");
   try {
     const { capture } = await setupCapture(root);
@@ -1712,30 +1712,6 @@ test("resumeWaveWorker requires prior session and candidate", async () => {
         },
       }],
     });
-
-    const noSessionResult: WaveWorkerResult = {
-      status: "completed",
-      taskId: "task-resume7",
-      title: "Test",
-      summary: "done",
-      adapter: "test",
-    };
-
-    await assert.rejects(
-      resumeWaveWorker({
-        taskId: "task-resume7",
-        task: testTask(),
-        capture,
-        worktree: worker,
-        artifactDir,
-        config: dummyConfig7,
-        sourceRoot: capture.discovery.captureRoot,
-        priorResult: noSessionResult,
-        feedback: "fix",
-        turn: 2,
-      }),
-      /prior result with a session/,
-    );
 
     const noCandidateResult: WaveWorkerResult = {
       status: "completed",

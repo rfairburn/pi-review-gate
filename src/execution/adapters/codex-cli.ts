@@ -37,6 +37,8 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       timeoutMs: this.config.timeoutMs ?? 1_800_000,
       env: reviewerEnv({ ...process.env, ...this.config.env }),
       signal: request.signal,
+      onProcessStart: request.onProcessStart,
+      onProcessExit: request.onProcessExit,
       onStdoutChunk: (chunk) => {
         streamExtractor.push(chunk);
         activity.push(chunk);

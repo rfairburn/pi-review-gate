@@ -106,6 +106,7 @@ test("little-coder executor explicitly compacts the exact durable session before
     await chmod(command, 0o755);
     const adapter = new LittleCoderExecutorAdapter({ model: "provider/model", command });
     const updates: string[] = [];
+    const processLifecycle: string[] = [];
     const result = await adapter.run({
       cwd: root,
       prompt: "continue",
@@ -114,6 +115,8 @@ test("little-coder executor explicitly compacts the exact durable session before
       session: { adapter: "little-coder-model", id: "durable-session" },
       recovery: { kind: "compaction", compactBeforePrompt: true },
       onUpdate: (message) => updates.push(message),
+      onProcessStart: ({ pid }) => { processLifecycle.push(`start:${pid}`); },
+      onProcessExit: ({ pid }) => { processLifecycle.push(`exit:${pid}`); },
     });
 
     assert.equal(result.text, "resumed after compact");
@@ -122,6 +125,11 @@ test("little-coder executor explicitly compacts the exact durable session before
     assert.match(commands[1].customInstructions, /Preserve the task objective/);
     assert.ok(updates.includes("reopening executor session for context compaction"));
     assert.ok(updates.includes("context compaction completed; resuming executor"));
+    assert.equal(processLifecycle.length, 4);
+    assert.match(processLifecycle[0] ?? "", /^start:/);
+    assert.equal(processLifecycle[1]?.replace("exit:", ""), processLifecycle[0]?.replace("start:", ""));
+    assert.match(processLifecycle[2] ?? "", /^start:/);
+    assert.equal(processLifecycle[3]?.replace("exit:", ""), processLifecycle[2]?.replace("start:", ""));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -28,6 +28,16 @@ export interface ReviewerArtifactPaths {
   processResult: string;
 }
 
+export interface ProcessLifecycleStart {
+  pid: number;
+  processGroupId?: number;
+}
+
+export interface ProcessLifecycleExit extends ProcessLifecycleStart {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
 // Retained output is diagnostic evidence, not a protocol transport. Protocol
 // adapters parse incrementally and remain correct even if this limit is hit.
 export const MAX_RETAINED_OUTPUT_BYTES = 100 * MEBIBYTE;
@@ -141,6 +151,8 @@ export async function runPromptProcess(input: {
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
   onStdoutChunk?: (chunk: string) => void;
+  onProcessStart?: (process: ProcessLifecycleStart) => void | Promise<void>;
+  onProcessExit?: (process: ProcessLifecycleExit) => void | Promise<void>;
   /** Internal/test override; production adapters use MAX_RETAINED_OUTPUT_BYTES. */
   maxRetainedOutputBytes?: number;
 }): Promise<ProcessRunResult> {
@@ -176,7 +188,14 @@ export async function runPromptProcess(input: {
     let stdinError: string | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
 
-    const finish = (result: ProcessRunResult) => {
+    const processIdentity = proc.pid === undefined
+      ? undefined
+      : { pid: proc.pid, processGroupId: process.platform === "win32" ? undefined : proc.pid };
+    let lifecycleStartInvoked = false;
+    let lifecycleStartError: unknown;
+    let lifecycleStart: Promise<void> | undefined;
+
+    const finish = async (result: ProcessRunResult, code: number | null, signal: NodeJS.Signals | null) => {
       if (settled) {
         return;
       }
@@ -185,7 +204,16 @@ export async function runPromptProcess(input: {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
       }
-      resolve(result);
+      try {
+        await lifecycleStart?.catch(() => undefined);
+        if (lifecycleStartInvoked && processIdentity) {
+          await input.onProcessExit?.({ ...processIdentity, code, signal });
+        }
+        if (lifecycleStartError) throw lifecycleStartError;
+        resolve(result);
+      } catch (error) {
+        reject(error);
+      }
     };
 
     const terminate = () => {
@@ -237,10 +265,10 @@ export async function runPromptProcess(input: {
       stderrCapturedBytes += captured.bytes;
       stderrTruncated = stderrTruncated || captured.truncated;
     });
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       input.signal?.removeEventListener("abort", onAbort);
       streamMetrics.finish();
-      finish({
+      void finish({
         stdout,
         stderr,
         stdoutTruncated,
@@ -252,7 +280,7 @@ export async function runPromptProcess(input: {
         timedOut,
         aborted,
         stdinError,
-      });
+      }, code, signal);
     });
     proc.stdin.on("error", (error: NodeJS.ErrnoException) => {
       // A child may exit or close stdin before a large prompt has been fully
@@ -261,11 +289,18 @@ export async function runPromptProcess(input: {
       stdinError ??= boundedDiagnostic(error.message || error.code || "stdin write failed");
       if (!settled && !timedOut && !aborted) terminate();
     });
-    proc.stdin.end(input.prompt);
-
-    if (input.signal?.aborted) {
-      onAbort();
-    }
+    lifecycleStart = (async () => {
+      if (!processIdentity) throw new Error(`Could not determine pid for ${input.command}.`);
+      lifecycleStartInvoked = true;
+      await input.onProcessStart?.(processIdentity);
+      if (settled) return;
+      proc.stdin.end(input.prompt);
+      if (input.signal?.aborted) onAbort();
+    })();
+    void lifecycleStart.catch((error) => {
+      lifecycleStartError = error;
+      terminate();
+    });
   });
 }
 

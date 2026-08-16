@@ -960,11 +960,12 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
  * Resume a wave worker turn with feedback from a prior review.
  *
  * Given the same capture/worktree/task/artifact/config plus a prior successful
- * WaveWorkerResult (session and candidate), prompt text, and turn number >= 2,
+ * WaveWorkerResult with a candidate checkpoint, prompt text, and turn number >= 2,
  * this function:
  * 1. Revalidates the isolated paths/worktree.
  * 2. Recreates the configured adapter.
- * 3. Resumes the exact executor session in worker.effectiveCwd.
+ * 3. Resumes the exact executor session when available, or hands the verified
+ *    checkpoint and full task context to a fresh executor session.
  * 4. Handles cancellation/timeout/nonzero/empty response with typed statuses.
  * 5. Re-normalizes the final tree against the immutable base using the prior candidate.
  * 6. Returns the same WaveWorkerResult shape with the new turn/session/candidate.
@@ -979,10 +980,6 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, priorResult, feedback, turn } = input;
 
   // ── Validate prior result ──
-  if (!priorResult.session) {
-    throw new Error("Continuation requires a prior result with a session.");
-  }
-
   if (!priorResult.candidate) {
     throw new Error("Continuation requires a prior result with a candidate.");
   }
@@ -1042,7 +1039,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     worker: input,
     operation,
     assignment,
-    prompt: rewrittenFeedback,
+    prompt: priorResult.session ? rewrittenFeedback : handoffPrompt,
     handoffPrompt,
     startingTurn: turn,
     session: priorResult.session,

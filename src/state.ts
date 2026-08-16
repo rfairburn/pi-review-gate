@@ -85,6 +85,21 @@ export interface ReviewGateState {
   reviewsPaused: boolean;
   reviewInProgress: boolean;
   queuedUserInputsDuringReview: string[];
+  pendingModelDeliveries: PendingModelDelivery[];
+}
+
+export interface PendingModelDelivery {
+  deliveryId: string;
+  kind: "review_transmission" | "review_authorization" | "reviewer_answer" | "queued_user_input";
+  channel: "follow_up" | "steer";
+  message: string;
+  status: "queued" | "dispatching" | "delivered" | "uncertain" | "cancelled";
+  invocationDir?: string;
+  action?: "correction_required" | "passed" | "deferred" | "review_error";
+  createdAt: string;
+  dispatchStartedAt?: string;
+  deliveredAt?: string;
+  diagnostic?: string;
 }
 
 export interface UserRequestContext {
@@ -108,6 +123,7 @@ export function createState(): ReviewGateState {
     reviewsPaused: false,
     reviewInProgress: false,
     queuedUserInputsDuringReview: [],
+    pendingModelDeliveries: [],
   };
 }
 
@@ -267,6 +283,11 @@ export function closeReviewWindow(state: ReviewGateState, preserveForReviewerQue
 }
 
 export function clearReviewState(state: ReviewGateState): void {
+  for (const delivery of state.pendingModelDeliveries) {
+    if (delivery.status !== "queued") continue;
+    delivery.status = "cancelled";
+    delivery.diagnostic = "The review state was explicitly cleared before this queued delivery was released.";
+  }
   state.reviewWindow = undefined;
   state.lastQuestionWindow = undefined;
   state.pendingAcceptedReviewerQuestions.splice(0);
@@ -287,12 +308,13 @@ export function recordAcceptedReviewerQuestion(
   state: ReviewGateState,
   contextWindow: ReviewWindow | undefined,
   input: { question: string; acceptedAnswer: string },
-): void {
+): AcceptedReviewerQuestion {
   const window = contextWindow ?? state.reviewWindow ?? openReviewWindow(state);
-  recordAcceptedQuestionEvidence(window.evidence, input);
+  const accepted = recordAcceptedQuestionEvidence(window.evidence, input);
   if (!state.reviewWindow && window === state.lastQuestionWindow) {
     state.pendingAcceptedReviewerQuestions = window.evidence.acceptedReviewerQuestions.map((entry) => ({ ...entry }));
   }
+  return accepted;
 }
 
 export function recordReviewerFeedback(

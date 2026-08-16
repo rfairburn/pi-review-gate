@@ -8,9 +8,10 @@ import type { SubtaskReviewReport } from "../review-report";
 import { executeWave, type WaveControllerInput, type WaveResult, type WaveProgressUpdate, type WaveTaskResult } from "./wave-controller";
 import { WaveCaptureError } from "./wave-repository";
 import type { WaveWorkerTask } from "./wave-worker";
-import { continueOperation, inspectOperation } from "./operation-actions";
+import { continueOperation, inspectOperation, inspectWaveRoot, reattachmentBundlesForWave } from "./operation-actions";
 import type { ReattachmentBundle } from "./operation-record";
 import { redactSensitiveText, redactSensitiveValue } from "../redaction";
+import type { ExecutionAssociationsSnapshot } from "../session-state";
 
 const BATCH_TOOL_NAME = "execute_subtasks";
 
@@ -20,6 +21,7 @@ interface ExecutionToolManagerInput {
   state: ReviewGateState;
   cwd: () => string;
   notify?: (message: string) => void | Promise<void>;
+  onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | Promise<void>;
 }
 
 type WaveFailureKind =
@@ -62,8 +64,65 @@ export class ExecutionToolManager {
   private registered = false;
   private running = false;
   private associatedBundles: ReattachmentBundle[] = [];
+  private associatedWaveRoots: string[] = [];
 
   constructor(private readonly input: ExecutionToolManagerInput) {}
+
+  associations(): ExecutionAssociationsSnapshot {
+    return {
+      waveRoots: [...this.associatedWaveRoots],
+      bundles: this.associatedBundles.map((bundle) => ({ ...bundle })),
+    };
+  }
+
+  async restoreAssociations(value: ExecutionAssociationsSnapshot): Promise<void> {
+    const requestedRoots = [...new Set(value.waveRoots)];
+    const verifiedRoots: string[] = [];
+    const bundles: ReattachmentBundle[] = [];
+    for (const waveRoot of requestedRoots) {
+      let discovered: ReattachmentBundle[];
+      try {
+        discovered = await reattachmentBundlesForWave(waveRoot);
+      } catch (error) {
+        await this.input.notify?.(`review gate: retained wave association could not be verified and was not reattached (${waveRoot}): ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
+      verifiedRoots.push(waveRoot);
+      for (const bundle of discovered) {
+        const index = bundles.findIndex((candidate) => candidate.operationId === bundle.operationId);
+        if (index >= 0) bundles[index] = bundle;
+        else bundles.push(bundle);
+      }
+    }
+    this.associatedWaveRoots = verifiedRoots;
+    this.associatedBundles = bundles;
+  }
+
+  private async rememberWaveRoot(waveRoot: string | undefined): Promise<void> {
+    if (!waveRoot || this.associatedWaveRoots.includes(waveRoot)) return;
+    this.associatedWaveRoots.push(waveRoot);
+    await this.publishAssociations();
+  }
+
+  private async mergeAssociatedBundles(bundles: ReattachmentBundle[]): Promise<void> {
+    for (const bundle of bundles) {
+      const copy = { ...bundle };
+      const index = this.associatedBundles.findIndex((candidate) => candidate.operationId === copy.operationId);
+      if (index >= 0) this.associatedBundles[index] = copy;
+      else this.associatedBundles.push(copy);
+      if (!this.associatedWaveRoots.includes(bundle.waveRoot)) this.associatedWaveRoots.push(bundle.waveRoot);
+    }
+    await this.publishAssociations();
+  }
+
+  private async publishAssociations(): Promise<void> {
+    try {
+      await this.input.onAssociationsChanged?.(this.associations());
+    } catch (error) {
+      await this.input.notify?.(`review gate: failed to persist execution association: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+  }
 
   sync(): void {
     const pool = resolvedExecutorPool(this.input.config);
@@ -98,6 +157,8 @@ export class ExecutionToolManager {
         "Treat every non-landed result as requiring an explicit recovery decision; do not report accepted task commits as source-workspace changes.",
         "For integration or landing conflicts, read the complete outcome and recovery packet, state that source is unchanged, then choose deliberately between resolving the combined change yourself and continuing a specific task by its reattachment bundle.",
         "For non-landed work, preserve the wave root and reattachment bundles; prefer inspect then continue over recreating recoverable task work.",
+        "After an application restart, inspect restored wave roots and bundles before acting: a live or uncertain owner blocks another writer, while a confirmed-dead owner may be reconciled from its retained worktree or verified checkpoint.",
+        "Inspect may target a waveRoot when no task bundle exists yet; retained wave manifests include the original task definitions needed to re-dispatch unfinished work deliberately.",
         "A recovery_required landing is the exception to the unchanged-source guarantee: inspect its recovery manifest before any further source edits.",
         "Steer is live-turn-only and never degrades into a continuation.",
       ],
@@ -158,6 +219,11 @@ export class ExecutionToolManager {
             },
             description: "Optional explicit reattachment bundle. Omit only when one associated operation is unambiguous.",
           },
+          waveRoot: {
+            type: "string",
+            minLength: 1,
+            description: "Optional explicit wave root for inspect, including waves that have not produced an operation bundle yet.",
+          },
           instructions: { type: "string", minLength: 1, description: "Instructions for continue or steer." },
           instructionId: { type: "string", minLength: 1, description: "Optional idempotency key; defaults to the tool-call ID." },
         },
@@ -185,24 +251,46 @@ export class ExecutionToolManager {
         }
 
         if (operationInput.action !== "start") {
+          if (operationInput.action === "inspect" && operationInput.waveRoot) {
+            try {
+              return operationToolResult("inspect", await inspectWaveRoot(operationInput.waveRoot), false);
+            } catch (error) {
+              return operationToolResult("inspect", {
+                summary: error instanceof Error ? error.message : String(error),
+                waveRoot: operationInput.waveRoot,
+              }, true);
+            }
+          }
           const bundle = operationInput.bundle ?? (this.associatedBundles.length === 1 ? this.associatedBundles[0] : undefined);
           if (!bundle) {
+            if (operationInput.action === "inspect" && this.associatedWaveRoots.length === 1) {
+              try {
+                return operationToolResult("inspect", await inspectWaveRoot(this.associatedWaveRoots[0]), false);
+              } catch (error) {
+                return operationToolResult("inspect", {
+                  summary: error instanceof Error ? error.message : String(error),
+                  waveRoot: this.associatedWaveRoots[0],
+                }, true);
+              }
+            }
             return batchToolResult({
               summary: this.associatedBundles.length > 1
                 ? "More than one operation is associated with this orchestrator context; supply an explicit bundle."
                 : "No associated operation is available; supply a reattachment bundle.",
+              associatedBundles: this.associatedBundles.map((associated) => ({ ...associated })),
+              associatedWaveRoots: [...this.associatedWaveRoots],
               isError: true,
             });
           }
           try {
             if (operationInput.action === "inspect") {
               const inspection = await inspectOperation(bundle);
-              this.associatedBundles = [inspection.bundle];
+              await this.mergeAssociatedBundles([inspection.bundle]);
               return operationToolResult("inspect", inspection, false);
             }
             if (operationInput.action === "steer") {
               const inspection = await inspectOperation(bundle);
-              this.associatedBundles = [inspection.bundle];
+              await this.mergeAssociatedBundles([inspection.bundle]);
               return operationToolResult("steer", {
                 ...inspection,
                 summary: "The target has no live steerable turn. Use continue to perform another turn.",
@@ -227,20 +315,72 @@ export class ExecutionToolManager {
               signal,
               reuseUnchangedFrom: parentBaseline,
             });
+            const continuationProgress: WaveProgressView = {
+              startedAt: new Date().toISOString(),
+              phase: "working",
+              message: `Resuming ${beforeInspection.record.taskId} from its durable checkpoint`,
+              waveId: beforeInspection.record.waveId,
+              waveRoot: bundle.waveRoot,
+              taskStatuses: [{
+                subtaskId: beforeInspection.record.taskId,
+                phase: "continuing",
+                message: "continuation queued",
+                artifactDir: beforeInspection.record.artifactDir,
+                executorAdapter: beforeInspection.record.adapter,
+                executorModel: beforeInspection.record.model,
+              }],
+              activity: [],
+            };
+            const publishContinuation = (message?: string) => {
+              if (message) {
+                continuationProgress.message = message;
+                continuationProgress.phase = continuationPhase(message);
+                continuationProgress.taskStatuses[0] = {
+                  ...continuationProgress.taskStatuses[0],
+                  phase: continuationProgress.phase,
+                  message,
+                };
+                if (continuationProgress.activity.at(-1) !== message) {
+                  continuationProgress.activity.push(`${beforeInspection.record.taskId}: ${message}`);
+                  if (continuationProgress.activity.length > 32) continuationProgress.activity.shift();
+                }
+              }
+              onUpdate?.({
+                content: [{
+                  type: "text",
+                  text: `${wavePhaseLabel(continuationProgress.phase)} · ${elapsed(continuationProgress.startedAt)} · ${continuationProgress.message}`,
+                }],
+                details: {
+                  state: "running",
+                  action: "continue",
+                  bundle: beforeInspection.bundle,
+                  progress: {
+                    ...continuationProgress,
+                    taskStatuses: [...continuationProgress.taskStatuses],
+                    activity: [...continuationProgress.activity],
+                  },
+                },
+              });
+            };
+            publishContinuation();
+            const continuationTicker = onUpdate ? setInterval(() => publishContinuation(), 5_000) : undefined;
+            continuationTicker?.unref?.();
             this.running = true;
-            const result = await continueOperation({
-              bundle,
-              instructions: operationInput.instructions,
-              instructionId: operationInput.instructionId ?? toolCallId,
-              config: this.input.config,
-              scopedModels,
-              signal,
-              onUpdate: (message) => onUpdate?.({
-                content: [{ type: "text", text: message }],
-                details: { state: "running", action: "continue", message },
-              }),
-            });
-            this.associatedBundles = [result.inspection.bundle];
+            let result: Awaited<ReturnType<typeof continueOperation>>;
+            try {
+              result = await continueOperation({
+                bundle,
+                instructions: operationInput.instructions,
+                instructionId: operationInput.instructionId ?? toolCallId,
+                config: this.input.config,
+                scopedModels,
+                signal,
+                onUpdate: (message) => publishContinuation(message),
+              });
+            } finally {
+              if (continuationTicker) clearInterval(continuationTicker);
+            }
+            await this.mergeAssociatedBundles([result.inspection.bundle]);
             const landed = isRecord(result.landing) && result.landing.status === "landed";
             if (result.landing?.status === "landed") {
               const landedPaths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
@@ -263,9 +403,12 @@ export class ExecutionToolManager {
             }
             return operationToolResult("continue", result, !landed);
           } catch (error) {
+            const inspection = await inspectOperation(bundle).catch(() => undefined);
+            if (inspection) await this.mergeAssociatedBundles([inspection.bundle]);
             return operationToolResult(operationInput.action, {
               summary: error instanceof Error ? error.message : String(error),
-              bundle,
+              bundle: inspection?.bundle ?? bundle,
+              inspection,
             }, true);
           } finally {
             this.running = false;
@@ -311,7 +454,9 @@ export class ExecutionToolManager {
             waveProgress.phase = update.phase;
             waveProgress.message = update.message;
             if (update.waveId) waveProgress.waveId = update.waveId;
-            if (update.waveRoot) waveProgress.waveRoot = update.waveRoot;
+            if (update.waveRoot) {
+              waveProgress.waveRoot = update.waveRoot;
+            }
             if (update.baseCommit) waveProgress.baseCommit = update.baseCommit;
             if (update.maxWorkers) waveProgress.maxWorkers = update.maxWorkers;
             if (update.counts) waveProgress.counts = update.counts;
@@ -396,6 +541,10 @@ export class ExecutionToolManager {
             integratePartial: batchInput.integratePartial,
             signal,
             onProgress: publishWave,
+            onWaveCreated: async (waveRoot) => {
+              waveProgress.waveRoot = waveRoot;
+              await this.rememberWaveRoot(waveRoot);
+            },
           };
 
           // Capture pre-wave snapshot immediately before executeWave for ownership-aware checkpoint.
@@ -495,7 +644,7 @@ export class ExecutionToolManager {
           const summaryLines = waveResult.taskResults
             .map((tr) => `${tr.taskId}: ${tr.status}`)
             .join(", ");
-          this.associatedBundles = waveResult.taskResults.flatMap((task) => task.bundle ? [task.bundle] : []);
+          await this.mergeAssociatedBundles(waveResult.taskResults.flatMap((task) => task.bundle ? [task.bundle] : []));
           return batchToolResult({
             summary: `Wave ${waveResult.waveId} completed: ${summaryLines}`,
             waveId: waveResult.waveId,
@@ -695,9 +844,10 @@ type NormalizedExecutionInput = NormalizedBatchInput | {
 } | {
   action: "inspect";
   bundle?: ReattachmentBundle;
+  waveRoot?: string;
 };
 
-const ALLOWED_TOP_KEYS = new Set(["action", "tasks", "maxWorkers", "integratePartial", "bundle", "instructions", "instructionId"]);
+const ALLOWED_TOP_KEYS = new Set(["action", "tasks", "maxWorkers", "integratePartial", "bundle", "waveRoot", "instructions", "instructionId"]);
 const ALLOWED_TASK_KEYS = new Set(["title", "instructions", "acceptanceCriteria", "relevantContext"]);
 
 function normalizeExecutionInput(value: unknown): NormalizedExecutionInput | undefined {
@@ -715,11 +865,12 @@ function normalizeExecutionInput(value: unknown): NormalizedExecutionInput | und
   if (value.action === "inspect") {
     if (value.tasks !== undefined || value.maxWorkers !== undefined || value.integratePartial !== undefined
       || value.instructions !== undefined || value.instructionId !== undefined) return undefined;
-    return { action: "inspect", bundle };
+    if (value.waveRoot !== undefined && (typeof value.waveRoot !== "string" || !value.waveRoot.trim() || bundle)) return undefined;
+    return { action: "inspect", bundle, waveRoot: typeof value.waveRoot === "string" ? value.waveRoot.trim() : undefined };
   }
   if (value.action === "continue" || value.action === "steer") {
     if (value.tasks !== undefined || value.maxWorkers !== undefined || value.integratePartial !== undefined
-      || typeof value.instructions !== "string" || !value.instructions.trim()) return undefined;
+      || value.waveRoot !== undefined || typeof value.instructions !== "string" || !value.instructions.trim()) return undefined;
     if (value.instructionId !== undefined && (typeof value.instructionId !== "string" || !value.instructionId.trim())) return undefined;
     return {
       action: value.action,
@@ -728,7 +879,7 @@ function normalizeExecutionInput(value: unknown): NormalizedExecutionInput | und
       instructionId: typeof value.instructionId === "string" ? value.instructionId.trim() : undefined,
     };
   }
-  if (!Array.isArray(value.tasks) || value.bundle !== undefined || value.instructions !== undefined || value.instructionId !== undefined) {
+  if (!Array.isArray(value.tasks) || value.bundle !== undefined || value.waveRoot !== undefined || value.instructions !== undefined || value.instructionId !== undefined) {
     return undefined;
   }
 
@@ -829,6 +980,9 @@ function wavePhaseLabel(phase: string): string {
   return ({
     capturing: "Capturing",
     working: "Working",
+    continuing: "Continuing",
+    reviewing: "Reviewing",
+    correcting: "Correcting",
     settling: "Settling",
     integrating: "Integrating",
     planning: "Planning",
@@ -836,6 +990,14 @@ function wavePhaseLabel(phase: string): string {
     completed: "Completed",
     aborted: "Aborted",
   })[phase] ?? phase;
+}
+
+function continuationPhase(message: string): string {
+  if (/\bland(?:ing)?\b/i.test(message)) return "landing";
+  if (/\bintegrat(?:e|ing|ion)\b/i.test(message)) return "integrating";
+  if (/\breview/i.test(message)) return "reviewing";
+  if (/\bcorrect(?:ing|ion)?\b/i.test(message)) return "correcting";
+  return "continuing";
 }
 
 interface BatchToolResultInput {
@@ -873,6 +1035,8 @@ interface BatchToolResultInput {
     headDrift?: { drifted: boolean; capturedHead?: string; currentHead?: string };
   };
   parentOwnedOverlapPaths?: string[];
+  associatedBundles?: ReattachmentBundle[];
+  associatedWaveRoots?: string[];
 }
 
 function buildWaveOutcomePacket(input: BatchToolResultInput): WaveOutcomePacket | undefined {
@@ -1165,6 +1329,14 @@ function batchToolResult(input: BatchToolResultInput): Record<string, unknown> {
   if (input.parentOwnedOverlapPaths?.length) {
     lines.push(`Parent-owned overlap paths (not checkpointed): ${input.parentOwnedOverlapPaths.join(", ")}`);
   }
+  if (input.associatedBundles?.length) {
+    lines.push("Associated recoverable operations:");
+    for (const bundle of input.associatedBundles) lines.push(`  - ${JSON.stringify(bundle)}`);
+  }
+  if (input.associatedWaveRoots?.length) {
+    lines.push("Associated wave roots:");
+    for (const waveRoot of input.associatedWaveRoots) lines.push(`  - ${waveRoot}`);
+  }
 
   if (outcome?.actionRequired) {
     lines.push("");
@@ -1189,6 +1361,8 @@ function batchToolResult(input: BatchToolResultInput): Record<string, unknown> {
       integration: input.integration,
       landing: input.landing,
       parentOwnedOverlapPaths: input.parentOwnedOverlapPaths,
+      associatedBundles: input.associatedBundles,
+      associatedWaveRoots: input.associatedWaveRoots,
       outcome,
       snapshotPolicy: "non-ignored untracked included; ignored files excluded",
       failureDiagnostics: input.taskResults?.filter((task) => !isWaveTaskSuccess(task.status)).map((task) => task.diagnostics),

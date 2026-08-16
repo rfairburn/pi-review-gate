@@ -31,6 +31,7 @@ export interface ReviewRunInput {
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
   onUpdate?: (message: string) => void;
+  onInvocationPrepared?: () => void | Promise<void>;
   window?: ReviewWindow;
 }
 
@@ -81,6 +82,7 @@ export interface AskReviewerInput {
   signal?: AbortSignal;
   notify?: (message: string) => void | Promise<void>;
   onUpdate?: (message: string) => void;
+  onInvocationPrepared?: () => void | Promise<void>;
   window?: ReviewWindow;
 }
 
@@ -303,6 +305,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     },
   });
   registerBundleWithWindow(input.window, bundle.dir);
+  await input.onInvocationPrepared?.();
   const invocation = await executeReviewerInvocation({
     reviewers,
     bundle,
@@ -429,6 +432,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     },
   });
   registerBundleWithWindow(input.window, bundle.dir);
+  await input.onInvocationPrepared?.();
   const invocation = await executeReviewerInvocation({
     reviewers,
     bundle,

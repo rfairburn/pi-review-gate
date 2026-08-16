@@ -32,6 +32,7 @@ import type { SubtaskReviewReport } from "../review-report";
 import { SerialWriter } from "./serial-writer";
 import type { ExecutionIncident, OperationDiagnostics, ReattachmentBundle, RecoveryCheckpoint } from "./operation-record";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
+import { acquireWaveOwner, heartbeatWaveOwner, releaseWaveOwner } from "./wave-owner";
 
 // ── public input / result contract ───────────────────────────────────────────
 
@@ -108,6 +109,8 @@ export interface WaveTaskResult {
   diagnostics?: OperationDiagnostics;
   worktree?: string;
   artifactDir?: string;
+  /** Durable original task definition for restart diagnosis/re-dispatch. */
+  taskDefinition?: WaveWorkerTask;
 }
 
 /** Integration result embedded in the wave result. */
@@ -192,6 +195,8 @@ export interface WaveControllerInput {
   signal?: AbortSignal;
   /** Progress callback. */
   onProgress?: (update: WaveProgressUpdate) => void;
+  /** Called after the durable wave manifest exists and before any worker starts. */
+  onWaveCreated?: (waveRoot: string) => void | Promise<void>;
   /** Artifact parent directory (outside source). */
   artifactDir?: string;
   /** Wave identifier (generated if omitted). */
@@ -247,6 +252,8 @@ export interface WaveManifestTask {
   artifactDir?: string;
   /** Candidate commit SHA (when executor produced changes). */
   candidateCommitSha?: string;
+  /** Durable original instructions and acceptance criteria. */
+  task?: WaveWorkerTask;
 }
 
 /** The wave manifest written atomically under waveRoot. */
@@ -382,6 +389,14 @@ async function writeWaveManifest(waveRoot: string, manifest: WaveManifest): Prom
   const manifestPath = join(waveRoot, "wave-manifest.json");
   const tmpPath = `${manifestPath}.tmp.${randomUUID()}`;
   try {
+    const previous = await fs.readFile(manifestPath, "utf8")
+      .then((text) => JSON.parse(text) as WaveManifest)
+      .catch(() => undefined);
+    if (previous?.version === 1) {
+      for (const task of manifest.tasks) {
+        task.task ??= previous.tasks.find((candidate) => candidate.taskId === task.taskId)?.task;
+      }
+    }
     await fs.writeFile(tmpPath, JSON.stringify(manifest, null, 2), "utf8");
     await fs.rename(tmpPath, manifestPath);
   } catch (err) {
@@ -446,6 +461,7 @@ function buildManifest(
         worktree: handle?.worktreeRoot,
         artifactDir: handle?.artifactDir,
         candidateCommitSha: candidateCommit,
+        task: tr.taskDefinition ?? handle?.task,
       };
     }),
     integrationStatus,
@@ -730,8 +746,17 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     title: ti.task.title,
     status: "queued" as WaveWorkerLifecycleStatus,
     summary: "Queued for execution.",
+    taskDefinition: ti.task,
   }));
   await writeWaveManifest(waveRoot, buildManifest(waveId, "capturing", capture, initialTaskResults, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+  const waveOwner = await acquireWaveOwner(waveRoot, waveId);
+  let waveHeartbeatTail: Promise<void> = Promise.resolve();
+  const waveOwnerHeartbeat = setInterval(() => {
+    waveHeartbeatTail = waveHeartbeatTail.then(() => heartbeatWaveOwner(waveRoot, waveOwner)).catch(() => undefined);
+  }, 5_000);
+  waveOwnerHeartbeat.unref?.();
+  try {
+    await input.onWaveCreated?.(waveRoot);
 
   // ── Phase: working ──
   emitProgress(onProgress, "working", `Starting ${taskItems.length} worker(s) with max ${maxWorkers} concurrent`, undefined, {
@@ -1596,6 +1621,11 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     integration: integrationOutcome,
     landing: landingOutcome,
   };
+  } finally {
+    clearInterval(waveOwnerHeartbeat);
+    await waveHeartbeatTail;
+    await releaseWaveOwner(waveRoot, waveOwner);
+  }
 }
 
 // ── landing outcome builder ──────────────────────────────────────────────────

@@ -472,6 +472,11 @@ test("writes atomic wave manifest with provenance and phase", async () => {
     assert.ok(typeof manifestData.totalBytes === "number");
     assert.equal(manifestData.tasks.length, 1);
     assert.equal(manifestData.tasks[0].taskId, "task-0");
+    assert.deepEqual(manifestData.tasks[0].task, {
+      title: "Test",
+      instructions: "noop",
+      acceptanceCriteria: [],
+    });
     assert.ok(manifestData.updatedAt);
   } finally {
     await rm(artifactDir, { recursive: true, force: true });

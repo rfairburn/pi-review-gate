@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
+import { queueModelDelivery } from "../src/durable-delivery";
+import { SessionStateStore } from "../src/session-state";
 
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
@@ -83,6 +85,100 @@ test("delegated execution tool activation waits for session_start", async () => 
     await trigger(hooks, "session_start", { cwd: dir });
     assert.deepEqual(registeredTools, ["execute_subtasks"]);
     assert.deepEqual(activeTools, ["read", "execute_subtasks"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("review state restores only when the same persisted conversation resumes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-conversation-restore-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const runtime = (sessionId: string, file: string) => {
+      const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+      const notices: string[] = [];
+      const entries: Array<{ type: string; data: unknown }> = [];
+      const sent: Array<{ message: string; options: unknown }> = [];
+      const pi = {
+        on(name: string, handler: (...args: unknown[]) => unknown) {
+          hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+        },
+        registerCommand() {},
+        appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
+        notify(message: string) { notices.push(message); },
+        sendUserMessage(message: string, options: unknown) { sent.push({ message, options }); },
+      };
+      const ctx = {
+        cwd: dir,
+        ui: { notify: (message: string) => notices.push(message) },
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getSessionFile: () => file,
+          getCwd: () => dir,
+        },
+      };
+      return { hooks, notices, entries, sent, pi, ctx };
+    };
+
+    const first = runtime("conversation-a", sessionFile);
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: dir, text: "preserve this request", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "printf evidence" } }, first.ctx);
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+    const targetStore = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const targetState = await targetStore.restore(dir);
+    assert.ok(targetState);
+    queueModelDelivery(targetState.state, {
+      kind: "review_authorization",
+      channel: "follow_up",
+      message: "durable pending message for resumed conversation",
+    });
+    await targetStore.save(targetState.state, targetState.execution);
+
+    // Model the ordinary interactive flow exactly: a later application starts
+    // in a temporary/default session, then /resume replaces that runtime with
+    // a freshly loaded extension instance for the selected conversation.
+    const bootstrapFile = join(dir, "startup-session.jsonl");
+    await writeFile(bootstrapFile, "", "utf8");
+    const bootstrap = runtime("startup-session", bootstrapFile);
+    await activate(bootstrap.pi);
+    await trigger(bootstrap.hooks, "session_start", { type: "session_start", reason: "startup" }, bootstrap.ctx);
+    await trigger(bootstrap.hooks, "input", { cwd: dir, text: "must not leak into resumed conversation", source: "user" }, bootstrap.ctx);
+    await trigger(bootstrap.hooks, "session_shutdown", {
+      type: "session_shutdown",
+      reason: "resume",
+      targetSessionFile: sessionFile,
+    }, bootstrap.ctx);
+
+    const resumed = runtime("conversation-a", sessionFile);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+    assert.match(resumed.notices.join("\n"), /restored conversation state revision/);
+    assert.deepEqual(resumed.sent, [{
+      message: "durable pending message for resumed conversation",
+      options: { deliverAs: "followUp" },
+    }]);
+    const resumedState = await readFile(`${sessionFile}.pi-review-gate-state.json`, "utf8");
+    assert.match(resumedState, /preserve this request/);
+    assert.doesNotMatch(resumedState, /must not leak into resumed conversation/);
+
+    const newSessionFile = join(dir, "conversation-b.jsonl");
+    await writeFile(newSessionFile, "", "utf8");
+    const fresh = runtime("conversation-b", newSessionFile);
+    await activate(fresh.pi);
+    await trigger(fresh.hooks, "session_start", { type: "session_start", reason: "new" }, fresh.ctx);
+    assert.doesNotMatch(fresh.notices.join("\n"), /restored conversation state revision/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -780,6 +876,7 @@ test("automatic correction is reviewed when it exactly restores the original bas
 test("automatic correction starts each reviewer in a fresh session against the stable window bundle", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-session-resume-"));
   const argvPath = join(tmpdir(), `pi-review-gate-reviewer-session-argv-${process.pid}-${Date.now()}.json`);
+  let retainedBundleDir: string | undefined;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -856,11 +953,13 @@ test("automatic correction starts each reviewer in a fresh session against the s
     assert.equal(freshInvocation.session.id, "stable-review-session");
 
     const bundleDir = history[1].bundle;
+    retainedBundleDir = bundleDir;
     await trigger(hooks, "session_shutdown", { reason: "test" });
-    await assert.rejects(access(bundleDir), /ENOENT/);
+    await access(bundleDir);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(argvPath, { force: true });
+    if (retainedBundleDir) await rm(retainedBundleDir, { recursive: true, force: true });
   }
 });
 

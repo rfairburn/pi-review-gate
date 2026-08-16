@@ -5,9 +5,9 @@ import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
-import { candidateRefName } from "./wave-commits";
+import { candidateRefName, normalizeCandidate, pinRecoveryCandidate } from "./wave-commits";
 import { integrateWave, type SelectedWorker, type WaveIntegrationResult } from "./wave-integration";
-import { executeWaveLanding, planWaveLanding, type LandingExecutionResult } from "./wave-landing";
+import { executeWaveLanding, inspectLandingRecoveryManifests, planWaveLanding, recoverLandingManifest, type LandingExecutionResult, type LandingRecoveryManifestInspection } from "./wave-landing";
 import { readWaveCaptureRecord } from "./wave-repository";
 import { runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "./wave-worker-lifecycle";
 import { resumeWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
@@ -16,8 +16,10 @@ import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
 import {
   createReattachmentBundle,
   createIncident,
+  operationOwnershipStatus,
   operationRecordPath,
   readOperationRecord,
+  releaseOperationOwner,
   writeOperationRecord,
   type OperationRecord,
   type OperationInstruction,
@@ -25,6 +27,7 @@ import {
 } from "./operation-record";
 import type { WaveManifest, WaveManifestTask } from "./wave-controller";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
+import { acquireWaveOwner, heartbeatWaveOwner, inspectWaveOwner, releaseWaveOwner } from "./wave-owner";
 
 export interface OperationInspection {
   bundle: ReattachmentBundle;
@@ -68,11 +71,16 @@ export interface OperationInspection {
       manifestPath?: string;
       rollbackError?: string;
       headDrift?: { drifted: boolean; capturedHead?: string; currentHead?: string };
+      recoveryManifests?: LandingRecoveryManifestInspection[];
     };
     tasks: WaveManifestTask[];
     task?: WaveManifestTask;
   };
-  live: false;
+  live: boolean;
+  checkpointVerification: {
+    status: "verified" | "missing" | "invalid";
+    error?: string;
+  };
   steerable: false;
   safeActions: Array<"continue" | "inspect">;
   blockedActions: Array<{ action: string; reason: string }>;
@@ -80,13 +88,33 @@ export interface OperationInspection {
 
 export async function inspectOperation(bundle: ReattachmentBundle): Promise<OperationInspection> {
   const { waveRoot, manifest, record } = await resolveOperation(bundle);
-  const canContinue = Boolean(record.session && record.checkpoint?.verified)
-    && !["cancelled", "failed_critical", "running", "compacting", "retrying"].includes(record.state);
-  const sourceDisposition = manifest.landingStatus === "landed"
+  const ownership = operationOwnershipStatus(record);
+  const waveOwnership = await inspectWaveOwner(waveRoot);
+  const landingRecoveryManifests = await inspectLandingRecoveryManifests(waveRoot);
+  const activeLandingRecovery = landingRecoveryManifests.some((recovery) =>
+    recovery.state === "in_progress" || recovery.state === "recovery_required" || !recovery.verified);
+  const legacyTerminalWave = !waveOwnership.lease && ["completed", "aborted"].includes(manifest.phase);
+  const waveProcessAlive = waveOwnership.processAlive && !legacyTerminalWave;
+  const activeState = ["running", "compacting", "retrying"].includes(record.state);
+  const checkpointVerification = record.checkpoint
+    ? await verifyRecoveryCheckpoint(waveRoot, record).then(
+        () => ({ status: "verified" as const }),
+        (error) => ({ status: "invalid" as const, error: error instanceof Error ? error.message : String(error) }),
+      )
+    : { status: "missing" as const };
+  const canReconcileAbandonedWriter = activeState
+    && Boolean(record.owner)
+    && (ownership.status === "dead" || ownership.status === "released");
+  const canContinue = !ownership.processAlive
+    && !waveProcessAlive
+    && (!activeLandingRecovery || landingRecoveryManifests.every((recovery) => recovery.verified))
+    && record.state !== "failed_critical"
+    && (checkpointVerification.status === "verified" || canReconcileAbandonedWriter);
+  const sourceDisposition = activeLandingRecovery || manifest.landingStatus === "recovery_required"
+    ? "recovery_required"
+    : manifest.landingStatus === "landed"
     ? "landed"
-    : manifest.landingStatus === "recovery_required"
-      ? "recovery_required"
-      : "unchanged";
+    : "unchanged";
   const sourceGuidance = sourceDisposition === "landed"
     ? "The wave changes were landed into the source workspace."
     : sourceDisposition === "recovery_required"
@@ -128,7 +156,7 @@ export async function inspectOperation(bundle: ReattachmentBundle): Promise<Oper
         workerMappings: manifest.integrationWorkerMappings,
         successfullyIntegrated: manifest.integrationSuccessfullyIntegrated,
       } : undefined,
-      landing: manifest.landingStatus ? {
+      landing: manifest.landingStatus || landingRecoveryManifests.length > 0 ? {
         status: manifest.landingStatus,
         appliedPaths: manifest.landingAppliedPaths,
         alreadyAppliedPaths: manifest.landingAlreadyAppliedPaths,
@@ -138,17 +166,97 @@ export async function inspectOperation(bundle: ReattachmentBundle): Promise<Oper
         manifestPath: manifest.landingManifestPath,
         rollbackError: manifest.landingRollbackError,
         headDrift: manifest.landingHeadDrift,
+        recoveryManifests: landingRecoveryManifests,
       } : undefined,
       tasks: manifest.tasks,
       task: manifest.tasks.find((task) => task.taskId === record.taskId),
     },
-    live: false,
+    live: ownership.processAlive || waveProcessAlive,
+    checkpointVerification,
     steerable: false,
     safeActions: canContinue ? ["continue", "inspect"] : ["inspect"],
     blockedActions: [
-      { action: "steer", reason: "The current executor adapters are foreground-only and this operation has no live turn." },
-      ...(!canContinue ? [{ action: "continue", reason: `Operation state ${record.state} does not currently permit an automatic continuation.` }] : []),
+      { action: "steer", reason: ownership.status === "live"
+        ? "The executor is live, but foreground adapters do not yet accept steering."
+        : "The current executor adapters are foreground-only and this operation has no live turn." },
+      ...(!canContinue ? [{ action: "continue", reason: waveProcessAlive
+        ? waveOwnership.message
+        : ownership.processAlive
+          ? ownership.message
+          : activeLandingRecovery && landingRecoveryManifests.some((recovery) => !recovery.verified)
+            ? "A landing recovery manifest is unverified; source mutation is blocked."
+          : checkpointVerification.status === "invalid"
+            ? `Recovery checkpoint verification failed: ${checkpointVerification.error}`
+          : `Operation state ${record.state} does not currently permit an automatic continuation.` }] : []),
     ],
+  };
+}
+
+export async function reattachmentBundlesForWave(inputWaveRoot: string): Promise<ReattachmentBundle[]> {
+  const waveRoot = await fs.realpath(resolve(inputWaveRoot));
+  if (!basename(waveRoot).startsWith("wave-")) throw new Error("Invalid wave root.");
+  const manifest = JSON.parse(await readFile(join(waveRoot, "wave-manifest.json"), "utf8")) as WaveManifest;
+  if (manifest.version !== 1 || typeof manifest.waveId !== "string") throw new Error("Invalid wave manifest.");
+  const bundles: ReattachmentBundle[] = [];
+  for (const task of manifest.tasks) {
+    const artifactDir = join(waveRoot, "artifacts", task.taskId);
+    const path = operationRecordPath(artifactDir);
+    const record = await readOperationRecord(path).catch(() => undefined);
+    if (!record) continue;
+    if (record.waveId !== manifest.waveId || record.taskId !== task.taskId || record.operationId !== `${manifest.waveId}/${task.taskId}`) {
+      throw new Error(`Operation identity mismatch for ${task.taskId}.`);
+    }
+    if (await fs.realpath(record.artifactDir) !== await fs.realpath(artifactDir)) {
+      throw new Error(`Operation artifact ownership mismatch for ${task.taskId}.`);
+    }
+    bundles.push(createReattachmentBundle(record, waveRoot));
+  }
+  return bundles;
+}
+
+export async function inspectWaveRoot(inputWaveRoot: string): Promise<{
+  waveRoot: string;
+  manifest: WaveManifest;
+  ownership: Awaited<ReturnType<typeof inspectWaveOwner>>;
+  bundles: ReattachmentBundle[];
+  landingRecoveryManifests: LandingRecoveryManifestInspection[];
+  recovery: {
+    sourceWorkspaceUnchanged: boolean | "unknown";
+    unfinishedTasks: Array<{ taskId: string; status: string; task?: WaveWorkerTask }>;
+    guidance: string;
+  };
+}> {
+  const waveRoot = await fs.realpath(resolve(inputWaveRoot));
+  if (!basename(waveRoot).startsWith("wave-")) throw new Error("Invalid wave root.");
+  const manifest = JSON.parse(await readFile(join(waveRoot, "wave-manifest.json"), "utf8")) as WaveManifest;
+  if (manifest.version !== 1 || typeof manifest.waveId !== "string") throw new Error("Invalid wave manifest.");
+  const ownership = await inspectWaveOwner(waveRoot);
+  const legacyTerminalWave = !ownership.lease && ["completed", "aborted"].includes(manifest.phase);
+  const controllerMayBeActive = ownership.processAlive && !legacyTerminalWave;
+  const bundles = await reattachmentBundlesForWave(waveRoot);
+  const landingRecoveryManifests = await inspectLandingRecoveryManifests(waveRoot);
+  const sourceUncertain = manifest.landingStatus === "recovery_required"
+    || landingRecoveryManifests.some((recovery) => recovery.state === "in_progress" || recovery.state === "recovery_required" || !recovery.verified);
+  const unfinishedTasks = manifest.tasks
+    .filter((task) => !["accepted", "accepted_with_warnings", "completed_unreviewed", "no_changes"].includes(task.status))
+    .map((task) => ({ taskId: task.taskId, status: task.status, task: task.task }));
+  return {
+    waveRoot,
+    manifest,
+    ownership,
+    bundles,
+    landingRecoveryManifests,
+    recovery: {
+      sourceWorkspaceUnchanged: sourceUncertain ? "unknown" : manifest.landingStatus === "landed" ? false : true,
+      unfinishedTasks,
+      guidance: controllerMayBeActive
+        ? "The existing wave controller may still be active; do not start another writer."
+        : sourceUncertain
+          ? "Resolve the authenticated landing recovery manifest before changing the source workspace."
+          : unfinishedTasks.length > 0
+            ? "Use the retained task definitions and operation bundles to inspect or deliberately re-dispatch only unfinished work."
+            : "All durable task results are available for inspection.",
+    },
   };
 }
 
@@ -182,19 +290,76 @@ export async function continueOperation(input: {
       duplicateInstruction: true,
     };
   }
-  if (!record.session || !record.checkpoint) {
-    throw new Error("Operation cannot continue because its session or verified recovery checkpoint is missing.");
+  const ownership = operationOwnershipStatus(record);
+  const waveOwnership = await inspectWaveOwner(waveRoot);
+  const legacyTerminalWave = !waveOwnership.lease && ["completed", "aborted"].includes(manifest.phase);
+  if (waveOwnership.processAlive && !legacyTerminalWave) {
+    throw new Error(`Wave still has a live or uncertain controller. ${waveOwnership.message} Inspect again before continuing.`);
   }
-  if (record.state === "cancelled" || record.state === "failed_critical") {
+  const continuationOwner = await acquireWaveOwner(waveRoot, manifest.waveId);
+  let continuationHeartbeatTail: Promise<void> = Promise.resolve();
+  const continuationHeartbeat = setInterval(() => {
+    continuationHeartbeatTail = continuationHeartbeatTail
+      .then(() => heartbeatWaveOwner(waveRoot, continuationOwner))
+      .catch(() => undefined);
+  }, 5_000);
+  continuationHeartbeat.unref?.();
+  let continuationOwnerReleased = false;
+  const releaseContinuationOwner = async () => {
+    if (continuationOwnerReleased) return;
+    continuationOwnerReleased = true;
+    clearInterval(continuationHeartbeat);
+    await continuationHeartbeatTail;
+    await releaseWaveOwner(waveRoot, continuationOwner);
+  };
+  try {
+  const landingRecoveryManifests = await inspectLandingRecoveryManifests(waveRoot);
+  for (const recovery of landingRecoveryManifests) {
+    if (recovery.state !== "in_progress" && recovery.state !== "recovery_required") continue;
+    if (!recovery.verified) {
+      throw new Error(`Landing recovery manifest is not verified; source mutation remains blocked: ${recovery.manifestPath} (${recovery.error ?? "unknown verification error"})`);
+    }
+    const result = await recoverLandingManifest(recovery.manifestPath);
+    if (result.status !== "recovered" && result.status !== "terminal") {
+      throw new Error(`Landing recovery could not complete automatically: ${JSON.stringify(result)}`);
+    }
+  }
+  if (ownership.processAlive) {
+    throw new Error(`Operation still has a live or uncertain writer. ${ownership.message} Inspect again before continuing.`);
+  }
+  if (record.state === "failed_critical") {
     throw new Error(`Operation state ${record.state} cannot be continued automatically.`);
   }
   if (record.state === "running" || record.state === "compacting" || record.state === "retrying") {
-    throw new Error("Operation may still own a live writer; inspect it before continuing.");
+    if (!record.owner) {
+      throw new Error("Operation predates durable writer ownership and may still have an unrecorded writer; automatic continuation is blocked.");
+    }
+    record = await reconcileAbandonedOperation(record, waveRoot);
+  }
+  const capture = await readWaveCaptureRecord(waveRoot);
+  if (!record.checkpoint?.verified) {
+    throw new Error("Operation cannot continue because its verified recovery checkpoint is missing.");
+  }
+  try {
+    await verifyRecoveryCheckpoint(waveRoot, record, capture);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    record.state = "failed_critical";
+    record.incidents.push(createIncident({
+      attempt: Math.max(1, record.attempts.length),
+      generation: record.generation,
+      cause: "workspace_error",
+      stage: "checkpoint_verification",
+      message,
+      retryable: false,
+      terminalCode: "recovery_state_corrupt_or_unverifiable",
+    }));
+    await writeOperationRecord(record);
+    throw new Error(`Recovery checkpoint verification failed; automatic continuation is blocked: ${message}`);
   }
   const previouslyLanded = record.state === "landed" || manifest.landingStatus === "landed";
   const continuationLandingBase = previouslyLanded ? record.checkpoint.commitSha : undefined;
 
-  const capture = await readWaveCaptureRecord(waveRoot);
   const task = await readTask(record.artifactDir);
   const recoveryWorktree = await ensureRecoveryWorktree(capture, record, input.signal);
   record.generation += 1;
@@ -226,7 +391,7 @@ export async function continueOperation(input: {
     taskId: record.taskId,
     title: record.title,
     summary: "Recovered from durable operation state.",
-    adapter: record.adapter ?? record.session.adapter,
+    adapter: record.adapter ?? record.session?.adapter ?? "unknown",
     model: record.model,
     session: record.session,
     candidate: {
@@ -320,6 +485,7 @@ export async function continueOperation(input: {
     record.state = lifecycle.status === "cancelled" ? "cancelled" : "paused_recoverable";
     await writeOperationRecord(record);
     await publishContinuationManifest(join(waveRoot, "wave-manifest.json"), manifest, lifecycle);
+    await releaseContinuationOwner();
     return { inspection: await inspectOperation(createReattachmentBundle(record, waveRoot)), lifecycle };
   }
 
@@ -334,6 +500,7 @@ export async function continueOperation(input: {
     "integrating",
     "integration_error",
     async () => {
+      input.onUpdate?.("integrating accepted task results in declared order");
       await removeWorktree(join(waveRoot, "integration"), capture.repositoryPath).catch(() => {});
       return integrateWave(continuationCapture, selected, input.signal);
     },
@@ -343,6 +510,7 @@ export async function continueOperation(input: {
     record.state = "paused_recoverable";
     await writeOperationRecord(record);
     await publishContinuationManifest(join(waveRoot, "wave-manifest.json"), manifest, lifecycle, integration);
+    await releaseContinuationOwner();
     return { inspection: await inspectOperation(createReattachmentBundle(record, waveRoot)), lifecycle, integration };
   }
   const landing = await retryOperationStage(
@@ -351,6 +519,7 @@ export async function continueOperation(input: {
     "landing",
     "landing_error",
     async () => {
+      input.onUpdate?.("landing the integrated continuation into the source workspace");
       const landingCapture = continuationLandingBase
         ? { ...continuationCapture, baseCommit: continuationLandingBase }
         : continuationCapture;
@@ -380,12 +549,16 @@ export async function continueOperation(input: {
   if (landing.status === "landed") {
     await removeWorktree(recoveryWorktree.worktreeRoot, capture.repositoryPath).catch(() => {});
   }
+  await releaseContinuationOwner();
   return {
     inspection: await inspectOperation(createReattachmentBundle(record, waveRoot)),
     lifecycle,
     integration,
     landing,
   };
+  } finally {
+    await releaseContinuationOwner();
+  }
 }
 
 async function ensureRecoveryWorktree(
@@ -409,6 +582,115 @@ async function ensureRecoveryWorktree(
   record.effectiveCwd = worktree.effectiveCwd;
   await writeOperationRecord(record);
   return worktree;
+}
+
+async function verifyRecoveryCheckpoint(
+  waveRoot: string,
+  record: OperationRecord,
+  knownCapture?: Awaited<ReturnType<typeof readWaveCaptureRecord>>,
+): Promise<void> {
+  const checkpoint = record.checkpoint;
+  if (!checkpoint?.verified) throw new Error("Recovery checkpoint is missing or is not marked verified.");
+  const capture = knownCapture ?? await readWaveCaptureRecord(waveRoot);
+  const objectType = await gitRead(["cat-file", "-t", checkpoint.commitSha], capture.repositoryPath);
+  if (objectType !== "commit") throw new Error(`Recovery object ${checkpoint.commitSha} is not a commit.`);
+  const treeSha = await gitRead(["rev-parse", `${checkpoint.commitSha}^{tree}`], capture.repositoryPath);
+  if (treeSha !== checkpoint.treeSha) {
+    throw new Error(`Recovery checkpoint tree mismatch: recorded ${checkpoint.treeSha}, actual ${treeSha}.`);
+  }
+  if (!checkpoint.ref.startsWith("refs/pi-review-gate/waves/")) {
+    throw new Error(`Recovery checkpoint ref is outside the protected namespace: ${checkpoint.ref}.`);
+  }
+  const pinnedCommit = await gitRead(["rev-parse", "--verify", checkpoint.ref], capture.repositoryPath);
+  if (pinnedCommit !== checkpoint.commitSha) {
+    throw new Error(`Recovery checkpoint ref mismatch: ${checkpoint.ref} points to ${pinnedCommit}, expected ${checkpoint.commitSha}.`);
+  }
+  const parents = (await gitRead(["show", "-s", "--format=%P", checkpoint.commitSha], capture.repositoryPath)).split(/\s+/).filter(Boolean);
+  if (parents.length !== 1 || parents[0] !== capture.baseCommit) {
+    throw new Error(`Recovery checkpoint parent mismatch: expected sole parent ${capture.baseCommit}.`);
+  }
+  const changedPaths = (await gitReadRaw(["diff", "--name-only", "-z", capture.baseCommit, checkpoint.commitSha], capture.repositoryPath))
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+  const recordedPaths = [...checkpoint.changedPaths].sort();
+  if (JSON.stringify(changedPaths) !== JSON.stringify(recordedPaths)) {
+    throw new Error("Recovery checkpoint changed-path inventory does not match the pinned commit.");
+  }
+  if (checkpoint.differsFromBase !== (changedPaths.length > 0)) {
+    throw new Error("Recovery checkpoint differs-from-base flag does not match its content.");
+  }
+}
+
+async function gitRead(args: string[], cwd: string): Promise<string> {
+  return (await gitReadRaw(args, cwd)).trim();
+}
+
+async function gitReadRaw(args: string[], cwd: string): Promise<string> {
+  const { stdout } = await promisify(execFile)("git", args, {
+    cwd,
+    env: { ...process.env, ...GIT_ENV },
+    timeout: 30_000,
+  });
+  return stdout;
+}
+
+async function reconcileAbandonedOperation(record: OperationRecord, waveRoot: string): Promise<OperationRecord> {
+  const capture = await readWaveCaptureRecord(waveRoot);
+  const worktree = await fs.lstat(record.worktreeRoot).catch(() => undefined);
+  if (!worktree?.isDirectory() || worktree.isSymbolicLink()) {
+    if (!record.checkpoint?.verified) {
+      throw new Error("The abandoned executor worktree is missing and no verified checkpoint can recover it.");
+    }
+    record.incidents.push(createIncident({
+      attempt: Math.max(1, record.attempts.length),
+      generation: record.generation,
+      cause: "interruption",
+      stage: "application_restart",
+      message: "The prior writer ended without releasing the operation; its worktree was already cleaned, so recovery will recreate it from the last verified checkpoint.",
+      retryable: true,
+    }));
+    releaseOperationOwner(record);
+    record.state = "paused_recoverable";
+    await writeOperationRecord(record);
+    return record;
+  }
+  const candidate = await normalizeCandidate(
+    capture,
+    record.worktreeRoot,
+    record.taskId,
+    record.title,
+    record.checkpoint ? { commitSha: record.checkpoint.commitSha } : undefined,
+  );
+  const changed = await promisify(execFile)("git", [
+    "diff", "--name-only", "-z", capture.baseCommit, candidate.commitSha,
+  ], {
+    cwd: capture.repositoryPath,
+    env: { ...process.env, ...GIT_ENV },
+    timeout: 30_000,
+  });
+  record.checkpoint = {
+    checkpointId: `${record.operationId}:restart:${record.revision + 1}`,
+    commitSha: candidate.commitSha,
+    treeSha: candidate.treeSha,
+    ref: await pinRecoveryCandidate(capture, record.taskId, candidate),
+    differsFromBase: candidate.differsFromBase,
+    createdAt: new Date().toISOString(),
+    verified: true,
+    changedPaths: changed.stdout.split("\0").filter(Boolean),
+  };
+  record.incidents.push(createIncident({
+    attempt: Math.max(1, record.attempts.length),
+    generation: record.generation,
+    cause: "interruption",
+    stage: "application_restart",
+    message: "The prior application/executor writer ended without releasing the operation; its retained worktree was reconciled into a verified checkpoint.",
+    retryable: true,
+  }));
+  releaseOperationOwner(record);
+  record.state = "paused_recoverable";
+  await writeOperationRecord(record);
+  return record;
 }
 
 async function retryOperationStage<T>(
@@ -595,11 +877,11 @@ function isEligible(result: WaveWorkerLifecycleResult): boolean {
 }
 
 function selectedWorkers(manifest: WaveManifest, recovered: WaveWorkerLifecycleResult): SelectedWorker[] {
-  const selected = manifest.tasks.flatMap((task) => {
-    if (task.taskId === recovered.taskId) return [];
+  return manifest.tasks.flatMap((task) => {
+    if (task.taskId === recovered.taskId) {
+      return [{ taskId: recovered.taskId, commitSha: recovered.acceptedCommitSha! }];
+    }
     if (!task.acceptedCommitSha || !["accepted", "accepted_with_warnings", "completed_unreviewed"].includes(task.status)) return [];
     return [{ taskId: task.taskId, commitSha: task.acceptedCommitSha }];
   });
-  selected.push({ taskId: recovered.taskId, commitSha: recovered.acceptedCommitSha! });
-  return selected;
 }

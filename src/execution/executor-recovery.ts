@@ -4,7 +4,12 @@ import type { WaveCaptureResult } from "./wave-repository";
 import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorRequest, type ExecutorTurn } from "./types";
 import type { WorkerWorktree } from "./wave-worktrees";
 import {
+  acquireOperationOwner,
   createIncident,
+  recordOperationChildExit,
+  recordOperationChildProcess,
+  releaseOperationOwner,
+  touchOperationOwner,
   writeOperationRecord,
   type ExecutionAttemptRecord,
   type ExecutionIncident,
@@ -47,7 +52,15 @@ export async function runExecutorWithRecovery(input: {
   const incidents: ExecutionIncident[] = [];
   const repeated = new Map<string, number>();
 
-  for (;;) {
+  acquireOperationOwner(input.operation);
+  await writeOperationRecord(input.operation);
+  const ownerHeartbeat = setInterval(() => {
+    touchOperationOwner(input.operation);
+    void writeOperationRecord(input.operation).catch(() => undefined);
+  }, 5_000);
+  ownerHeartbeat.unref?.();
+  try {
+    for (;;) {
     totalAttempts += 1;
     const turnNumber = input.startingTurn + totalAttempts - 1;
     const attemptRecord: ExecutionAttemptRecord = {
@@ -70,6 +83,16 @@ export async function runExecutorWithRecovery(input: {
         turn: turnNumber,
         session,
         recovery,
+        onProcessStart: async (process) => {
+          recordOperationChildProcess(input.operation, process.pid, process.processGroupId);
+          await writeOperationRecord(input.operation);
+          await input.request.onProcessStart?.(process);
+        },
+        onProcessExit: async (process) => {
+          recordOperationChildExit(input.operation);
+          await writeOperationRecord(input.operation);
+          await input.request.onProcessExit?.(process);
+        },
       });
     } catch (error) {
       thrown = error;
@@ -78,8 +101,37 @@ export async function runExecutorWithRecovery(input: {
     if (input.request.signal?.aborted) {
       attemptRecord.endedAt = new Date().toISOString();
       attemptRecord.outcome = "cancelled";
-      input.operation.state = "cancelled";
-      await writeOperationRecord(input.operation);
+      try {
+        const created = await createVerifiedCheckpoint(input, attemptRecord, priorCheckpointCandidate);
+        priorCheckpointCandidate = created.candidate;
+        checkpoint = created.checkpoint;
+        input.operation.checkpoint = checkpoint;
+        input.operation.state = "cancelled";
+        await writeOperationRecord(input.operation);
+      } catch (error) {
+        input.operation.state = "failed_critical";
+        attemptRecord.outcome = "failed";
+        const message = error instanceof Error ? error.message : String(error);
+        const incident = createIncident({
+          attempt: attemptRecord.attempt,
+          generation: input.operation.generation,
+          cause: "workspace_error",
+          stage: "cancellation_checkpoint",
+          message: `Executor was cancelled, but its workspace checkpoint could not be verified: ${message}`,
+          retryable: false,
+          terminalCode: "recovery_state_corrupt_or_unverifiable",
+        });
+        incidents.push(incident);
+        input.operation.incidents.push(incident);
+        await writeOperationRecord(input.operation);
+        return {
+          status: "critical",
+          error: incident.message,
+          lastTurnNumber: turnNumber,
+          checkpoint,
+          incidents,
+        };
+      }
       return {
         status: "cancelled",
         error: "Executor was cancelled.",
@@ -132,24 +184,9 @@ export async function runExecutorWithRecovery(input: {
     attemptRecord.incidentId = incident.incidentId;
 
     try {
-      const candidate = await normalizeCandidate(
-        input.capture,
-        input.worktree.worktreeRoot,
-        input.taskId,
-        input.title,
-        priorCheckpointCandidate ? { commitSha: priorCheckpointCandidate.commitSha } : undefined,
-      );
-      priorCheckpointCandidate = candidate;
-      checkpoint = {
-        checkpointId: `${input.operation.operationId}:${attemptRecord.attempt}`,
-        commitSha: candidate.commitSha,
-        treeSha: candidate.treeSha,
-        ref: await pinRecoveryCandidate(input.capture, input.taskId, candidate),
-        differsFromBase: candidate.differsFromBase,
-        createdAt: new Date().toISOString(),
-        verified: true,
-        changedPaths: await changedPaths(input.capture.repositoryPath, input.capture.baseCommit, candidate.commitSha),
-      };
+      const created = await createVerifiedCheckpoint(input, attemptRecord, priorCheckpointCandidate);
+      priorCheckpointCandidate = created.candidate;
+      checkpoint = created.checkpoint;
       input.operation.checkpoint = checkpoint;
     } catch (error) {
       incident.retryable = false;
@@ -207,7 +244,39 @@ export async function runExecutorWithRecovery(input: {
       kind: compactionIncident ? "compaction" : "retry",
       compactBeforePrompt: compactionIncident,
     };
+    }
+  } finally {
+    clearInterval(ownerHeartbeat);
+    releaseOperationOwner(input.operation);
+    await writeOperationRecord(input.operation);
   }
+}
+
+async function createVerifiedCheckpoint(
+  input: Parameters<typeof runExecutorWithRecovery>[0],
+  attemptRecord: ExecutionAttemptRecord,
+  priorCheckpointCandidate?: CandidateCommit,
+): Promise<{ candidate: CandidateCommit; checkpoint: RecoveryCheckpoint }> {
+  const candidate = await normalizeCandidate(
+    input.capture,
+    input.worktree.worktreeRoot,
+    input.taskId,
+    input.title,
+    priorCheckpointCandidate ? { commitSha: priorCheckpointCandidate.commitSha } : undefined,
+  );
+  return {
+    candidate,
+    checkpoint: {
+      checkpointId: `${input.operation.operationId}:${attemptRecord.attempt}`,
+      commitSha: candidate.commitSha,
+      treeSha: candidate.treeSha,
+      ref: await pinRecoveryCandidate(input.capture, input.taskId, candidate),
+      differsFromBase: candidate.differsFromBase,
+      createdAt: new Date().toISOString(),
+      verified: true,
+      changedPaths: await changedPaths(input.capture.repositoryPath, input.capture.baseCommit, candidate.commitSha),
+    },
+  };
 }
 
 async function changedPaths(repositoryPath: string, base: string, candidate: string): Promise<string[]> {

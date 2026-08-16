@@ -48,6 +48,8 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
           timeoutMs: Math.min(this.options.timeoutMs ?? 1_800_000, 300_000),
           env: executorEnv(this.options.model, thinkingLevel),
           signal: request.signal,
+          onProcessStart: request.onProcessStart,
+          onProcessExit: request.onProcessExit,
         });
       } catch (error) {
         if (request.signal?.aborted) throw error;
@@ -79,6 +81,8 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       timeoutMs: this.options.timeoutMs ?? 1_800_000,
       env: executorEnv(this.options.model, thinkingLevel),
       signal: request.signal,
+      onProcessStart: request.onProcessStart,
+      onProcessExit: request.onProcessExit,
       onStdoutChunk: (chunk) => {
         extractor.push(chunk);
         activity.push(chunk);
@@ -129,6 +133,8 @@ async function compactInterruptedSession(input: {
   timeoutMs: number;
   env: NodeJS.ProcessEnv;
   signal?: AbortSignal;
+  onProcessStart?: ExecutorRequest["onProcessStart"];
+  onProcessExit?: ExecutorRequest["onProcessExit"];
 }): Promise<void> {
   if (input.signal?.aborted) throw abortError(input.signal);
   const args = [
@@ -149,34 +155,64 @@ async function compactInterruptedSession(input: {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...input.env, PWD: input.cwd },
     });
+    const processIdentity = proc.pid === undefined
+      ? undefined
+      : { pid: proc.pid, processGroupId: process.platform === "win32" ? undefined : proc.pid };
+    let lifecycleStartInvoked = false;
+    let lifecycleStart: Promise<void> | undefined;
     let buffer = "";
     let stderr = "";
     let settled = false;
+    let finishing = false;
+    let completionError: Error | undefined;
+    let forceKillTimer: NodeJS.Timeout | undefined;
     let phase: "state" | "compact" = "state";
 
-    const stop = () => {
-      if (proc.exitCode === null && !proc.killed) proc.kill("SIGTERM");
+    const stop = (signal: NodeJS.Signals) => {
+      if (proc.exitCode !== null) return;
+      try {
+        if (process.platform !== "win32" && proc.pid) process.kill(-proc.pid, signal);
+        else proc.kill(signal);
+      } catch {
+        // The process may have exited between the liveness check and signal.
+      }
     };
-    const finish = (error?: Error) => {
+    const requestFinish = (error?: Error) => {
+      if (finishing || settled) return;
+      finishing = true;
+      completionError = error;
+      clearTimeout(timer);
+      input.signal?.removeEventListener("abort", onAbort);
+      stop("SIGTERM");
+      forceKillTimer = setTimeout(() => stop("SIGKILL"), 2_000);
+      forceKillTimer.unref?.();
+    };
+    const finishAfterClose = async (code: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
       input.signal?.removeEventListener("abort", onAbort);
-      stop();
-      if (error) reject(error);
-      else resolve();
+      try {
+        await lifecycleStart?.catch(() => undefined);
+        if (lifecycleStartInvoked && processIdentity) await input.onProcessExit?.({ ...processIdentity, code, signal });
+        if (completionError) reject(completionError);
+        else resolve();
+      } catch (lifecycleError) {
+        reject(lifecycleError);
+      }
     };
-    const fail = (message: string) => finish(new Error(`${message}${stderr.trim() ? ` Stderr: ${stderr.trim().slice(-2000)}` : ""}`));
+    const fail = (message: string) => requestFinish(new Error(`${message}${stderr.trim() ? ` Stderr: ${stderr.trim().slice(-2000)}` : ""}`));
     const send = (value: object) => {
       if (!proc.stdin.writable) return fail("Executor RPC stdin closed during compaction recovery.");
       proc.stdin.write(`${JSON.stringify(value)}\n`);
     };
     const timer = setTimeout(() => fail(`Executor compaction recovery timed out after ${input.timeoutMs}ms.`), input.timeoutMs);
-    const onAbort = () => finish(abortError(input.signal));
+    const onAbort = () => requestFinish(abortError(input.signal));
     input.signal?.addEventListener("abort", onAbort, { once: true });
 
-    proc.on("error", (error) => finish(error));
-    proc.stdin.on("error", (error) => finish(error));
+    proc.on("error", (error) => requestFinish(error));
+    proc.stdin.on("error", (error) => requestFinish(error));
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (chunk: string) => {
       stderr = `${stderr}${chunk}`.slice(-8_192);
@@ -206,19 +242,26 @@ async function compactInterruptedSession(input: {
           phase = "compact";
           send({ id: "review-gate-compact", type: "compact", customInstructions: recoveryCompactionInstructions });
         } else if (phase === "compact" && event.id === "review-gate-compact") {
-          if (event.success === true) return finish();
+          if (event.success === true) return requestFinish();
           const message = rpcError(event);
           // These responses prove the reopened branch is already compacted or
           // below the compaction floor; either is safe to resume.
-          if (/already compacted|nothing to compact/i.test(message)) return finish();
+          if (/already compacted|nothing to compact/i.test(message)) return requestFinish();
           return fail(`Executor context compaction failed: ${message}`);
         }
       }
     });
-    proc.on("close", (code) => {
-      if (!settled) fail(`Executor RPC exited with status ${code} during compaction recovery.`);
+    proc.on("close", (code, signal) => {
+      if (!finishing) completionError = new Error(`Executor RPC exited with status ${code} during compaction recovery.`);
+      void finishAfterClose(code, signal);
     });
-    send({ id: "review-gate-state", type: "get_state" });
+    lifecycleStart = (async () => {
+      if (!processIdentity) throw new Error(`Could not determine pid for ${input.command}.`);
+      lifecycleStartInvoked = true;
+      await input.onProcessStart?.(processIdentity);
+      if (!settled) send({ id: "review-gate-state", type: "get_state" });
+    })();
+    void lifecycleStart.catch((error) => requestFinish(error));
   });
 }
 

@@ -184,7 +184,8 @@ the child's durable session; any post-pass tree change is reviewed again.
 
 The tool has four top-level actions: `start`, `continue`, `steer`, and `inspect`.
 `start` creates a wave. `continue` performs another durable turn and completes
-review/integration/landing. `inspect` expands a reattachment bundle into current
+review/integration/landing. `inspect` expands a reattachment bundle, or an
+explicit `waveRoot` for a wave without an operation bundle yet, into current
 state and recovery diagnostics. `steer` is live-turn-only and currently reports
 that foreground adapters are not steerable; it never silently becomes a
 continuation. `continue`, `steer`, and `inspect` may omit the bundle only when
@@ -207,6 +208,20 @@ The tool card shows the current phase and elapsed time. Ctrl+O expands bounded
 per-task activity, executor/reviewer identity, artifacts, review cycles, and
 verdicts. Five-second UI refreshes do not slow executor turns and are not copied
 into model context; only the final result packet is returned as tool context.
+
+Review and execution recovery state is scoped to the exact Pi conversation.
+The normal restart flow—launching into a temporary/default session and then
+running `/resume <session>`—loads the selected conversation in a fresh extension
+runtime and restores only that conversation's integrity-checked sidecar state.
+The temporary startup session is shut down and cannot leak its review window or
+wave associations into the resumed session. Restored state includes review
+baselines/evidence, pending model deliveries, wave roots, operation bundles,
+task definitions, incidents, checkpoints, and owner leases. A live or uncertain
+owner blocks another writer; a confirmed-dead writer can be reconciled into a
+freshly reverified checkpoint before an explicit continuation. Queued inputs
+from a review interrupted by restart are not reordered automatically: use
+`/review-now` to finish the review and release them, or `/review-clear` to cancel
+them.
 
 Codex CLI, Claude CLI, and Little Coder reviewers stream bounded native lifecycle
 and read-only tool activity into ordinary review status and delegated-subtask

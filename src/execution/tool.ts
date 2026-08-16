@@ -22,6 +22,42 @@ interface ExecutionToolManagerInput {
   notify?: (message: string) => void | Promise<void>;
 }
 
+type WaveFailureKind =
+  | "capture_error"
+  | "worker_failure"
+  | "integration_conflict"
+  | "integration_error"
+  | "landing_conflict"
+  | "landing_error"
+  | "landing_rolled_back"
+  | "landing_recovery_required"
+  | "aborted"
+  | "not_landed";
+
+interface WaveRecoveryAction {
+  action: "inspect" | "self_resolve" | "continue" | "start" | "manual_recovery";
+  instruction: string;
+  taskId?: string;
+  bundle?: ReattachmentBundle;
+}
+
+interface WaveOutcomePacket {
+  landed: boolean;
+  failureKind?: WaveFailureKind;
+  actionRequired: boolean;
+  sourceWorkspace: {
+    root?: string;
+    disposition: "landed" | "unchanged" | "recovery_required";
+    changedByWave: boolean | "unknown";
+    message: string;
+  };
+  recovery: {
+    automaticRetry: "not_needed" | "skipped_deterministic" | "exhausted" | "not_attempted" | "unsafe" | "not_applicable";
+    summary: string;
+    actions: WaveRecoveryAction[];
+  };
+}
+
 export class ExecutionToolManager {
   private registered = false;
   private running = false;
@@ -59,7 +95,10 @@ export class ExecutionToolManager {
         "Results are integrated in declared order and landed into the source workspace.",
         "Non-ignored untracked files are included in the captured snapshot; ignored files are excluded.",
         "Only a landed result means executor changes reached the source workspace.",
-        "For non-landed work, read the diagnostic packet and preserve its reattachment bundle; prefer inspect then continue over recreating the task.",
+        "Treat every non-landed result as requiring an explicit recovery decision; do not report accepted task commits as source-workspace changes.",
+        "For integration or landing conflicts, read the complete outcome and recovery packet, state that source is unchanged, then choose deliberately between resolving the combined change yourself and continuing a specific task by its reattachment bundle.",
+        "For non-landed work, preserve the wave root and reattachment bundles; prefer inspect then continue over recreating recoverable task work.",
+        "A recovery_required landing is the exception to the unchanged-source guarantee: inspect its recovery manifest before any further source edits.",
         "Steer is live-turn-only and never degrades into a continuation.",
       ],
       executionMode: "sequential",
@@ -461,6 +500,7 @@ export class ExecutionToolManager {
             summary: `Wave ${waveResult.waveId} completed: ${summaryLines}`,
             waveId: waveResult.waveId,
             waveRoot: waveResult.waveRoot,
+            sourceRoot: waveResult.sourceRoot,
             phase: waveResult.phase,
             taskResults: waveResult.taskResults,
             integration: waveResult.integration,
@@ -798,20 +838,24 @@ function wavePhaseLabel(phase: string): string {
   })[phase] ?? phase;
 }
 
-function batchToolResult(input: {
+interface BatchToolResultInput {
   summary: string;
   isError: boolean;
   waveId?: string;
   waveRoot?: string;
+  sourceRoot?: string;
   phase?: string;
   errorCode?: string;
   taskResults?: WaveTaskResult[];
   integration?: {
     status: string;
     validationStatus?: string;
+    integratedRef?: string;
+    finalCommitSha?: string;
     error?: string;
     worktree?: string;
     conflictingTaskId?: string;
+    conflictingCommitSha?: string;
     conflictingPaths?: string[];
     gitDiagnostics?: string;
     workerMappings?: Array<{ taskId: string; originalCommitSha: string; integratedCommitSha: string; order: number }>;
@@ -829,13 +873,227 @@ function batchToolResult(input: {
     headDrift?: { drifted: boolean; capturedHead?: string; currentHead?: string };
   };
   parentOwnedOverlapPaths?: string[];
-}): Record<string, unknown> {
+}
+
+function buildWaveOutcomePacket(input: BatchToolResultInput): WaveOutcomePacket | undefined {
+  const hasWaveOutcome = Boolean(
+    input.waveId
+    || input.waveRoot
+    || input.sourceRoot
+    || input.phase
+    || input.errorCode
+    || input.taskResults
+    || input.integration
+    || input.landing,
+  );
+  if (!hasWaveOutcome) return undefined;
+
+  const landed = input.landing?.status === "landed";
+  const recoveryRequired = input.landing?.status === "recovery_required";
+  const rolledBack = input.landing?.status === "rolled_back";
+  const disposition = landed ? "landed" : recoveryRequired ? "recovery_required" : "unchanged";
+  const sourceMessage = landed
+    ? "LANDED — the reported executor changes were applied to the source workspace."
+    : recoveryRequired
+      ? "RECOVERY REQUIRED — landing rollback was incomplete, so the source workspace may be partially modified; inspect the recovery manifest before further edits."
+      : rolledBack
+        ? "UNCHANGED — the failed landing was fully rolled back; no executor changes from this wave remain applied."
+        : "UNCHANGED — no executor changes from this wave were applied to the source workspace.";
+
+  if (landed) {
+    return {
+      landed: true,
+      actionRequired: false,
+      sourceWorkspace: {
+        root: input.sourceRoot,
+        disposition,
+        changedByWave: true,
+        message: sourceMessage,
+      },
+      recovery: {
+        automaticRetry: "not_needed",
+        summary: "No recovery is required.",
+        actions: [],
+      },
+    };
+  }
+
+  let failureKind: WaveFailureKind;
+  if (input.errorCode) failureKind = "capture_error";
+  else if (input.integration?.status === "conflicted") failureKind = "integration_conflict";
+  else if (input.integration?.status === "error") failureKind = "integration_error";
+  else if (input.landing?.status === "conflicted") failureKind = "landing_conflict";
+  else if (input.landing?.status === "planning_error") failureKind = "landing_error";
+  else if (input.landing?.status === "rolled_back") failureKind = "landing_rolled_back";
+  else if (input.landing?.status === "recovery_required") failureKind = "landing_recovery_required";
+  else if (input.phase === "aborted" || input.landing?.status === "aborted") failureKind = "aborted";
+  else if (input.integration?.status === "worker_failure" || input.taskResults?.some((task) => !isWaveTaskSuccess(task.status))) failureKind = "worker_failure";
+  else failureKind = "not_landed";
+
+  const manifestPath = input.waveRoot ? `${input.waveRoot}/wave-manifest.json` : undefined;
+  const actions: WaveRecoveryAction[] = [];
+  if (manifestPath) {
+    actions.push({
+      action: "inspect",
+      instruction: `Inspect ${manifestPath}, the operation records, and any preserved worktree before choosing a resolution.`,
+    });
+  }
+
+  let summary: string;
+  let automaticRetry: WaveOutcomePacket["recovery"]["automaticRetry"] = "not_applicable";
+  if (failureKind === "integration_conflict") {
+    automaticRetry = "skipped_deterministic";
+    summary = "Resolve the deterministic integration conflict before any executor changes can reach the source workspace.";
+    const paths = input.integration?.conflictingPaths?.join(", ") || "the reported conflicting paths";
+    actions.push({
+      action: "self_resolve",
+      instruction: `Use the preserved integration worktree and pinned task commits to understand the overlap in ${paths}, then deliberately reproduce the combined resolution in the source workspace. The preserved worktree itself is diagnostic state, not landed work.`,
+    });
+    const target = input.taskResults?.find((task) => task.taskId === input.integration?.conflictingTaskId);
+    if (target?.bundle) {
+      actions.push({
+        action: "continue",
+        taskId: target.taskId,
+        bundle: target.bundle,
+        instruction: `Delegate resolution by continuing ${target.taskId} from its verified checkpoint. Tell it to reconcile ${paths} with the successfully integrated task changes; a successful continuation will re-run review, integration, and landing.`,
+      });
+    } else {
+      actions.push({
+        action: "continue",
+        taskId: input.integration?.conflictingTaskId,
+        instruction: "Choose the matching task reattachment bundle from Task results and continue that operation with explicit conflict-resolution instructions.",
+      });
+    }
+  } else if (failureKind === "landing_conflict") {
+    automaticRetry = "skipped_deterministic";
+    summary = "Resolve the source-workspace drift before retrying or deliberately applying the integrated result.";
+    actions.push({
+      action: "self_resolve",
+      instruction: "Compare each reported landing conflict against the integrated commit and current source path, then choose the intended combined content. No wave changes have been applied to source.",
+    });
+    actions.push({
+      action: "continue",
+      instruction: "To delegate, choose the responsible task bundle from Task results and continue it with the landing-conflict paths and current source intent; continuation will re-integrate all eligible task commits before landing.",
+    });
+  } else if (failureKind === "landing_recovery_required") {
+    automaticRetry = "unsafe";
+    summary = "Stop automatic recovery and reconcile the authenticated landing recovery manifest before further source edits.";
+    actions.push({
+      action: "manual_recovery",
+      instruction: input.landing?.manifestPath
+        ? `Inspect and recover ${input.landing.manifestPath}; preserve backups and temporary artifacts until source state is verified.`
+        : "Locate the landing recovery manifest in the wave root and reconcile it before further source edits.",
+    });
+  } else if (failureKind === "worker_failure") {
+    automaticRetry = "exhausted";
+    summary = "Inspect failed task diagnostics, then continue recoverable operations or replace the failed task deliberately.";
+    actions.push({
+      action: "self_resolve",
+      instruction: "Use the retained checkpoints and task diagnostics to implement the unfinished work directly in the source workspace under the normal review gate.",
+    });
+    for (const task of input.taskResults?.filter((item) => !isWaveTaskSuccess(item.status) && item.bundle) ?? []) {
+      actions.push({
+        action: "continue",
+        taskId: task.taskId,
+        bundle: task.bundle,
+        instruction: `Continue ${task.taskId} from its retained checkpoint after inspecting its incidents and recovery diagnostics.`,
+      });
+    }
+  } else if (failureKind === "integration_error") {
+    automaticRetry = "exhausted";
+    summary = "Integration infrastructure retries did not produce a landed result; inspect the preserved state before continuing a task or retrying deliberately.";
+    actions.push({
+      action: "self_resolve",
+      instruction: "Inspect the accepted task commits and integration diagnostics, then deliberately reproduce the intended combined result in the source workspace.",
+    }, {
+      action: "continue",
+      instruction: "Choose a recoverable task bundle from Task results and continue it; the continuation will retry integration and landing after another reviewed executor turn.",
+    });
+  } else if (failureKind === "landing_rolled_back") {
+    automaticRetry = "not_attempted";
+    summary = "The landing failed but rollback completed; inspect the failure reason before retrying or delegating a correction.";
+    actions.push({
+      action: "self_resolve",
+      instruction: "After verifying the rollback, use the retained integrated commit and failure reason to implement the intended result directly in source.",
+    }, {
+      action: "continue",
+      instruction: "Choose the responsible task bundle from Task results and continue it with the landing failure context so integration and landing are attempted again.",
+    });
+  } else if (failureKind === "landing_error") {
+    automaticRetry = "exhausted";
+    summary = "Landing planning retries did not produce a safe plan; inspect the failure and retained integrated result before retrying or delegating a correction.";
+    actions.push({
+      action: "self_resolve",
+      instruction: "Inspect the integrated commit and planning failure, then implement a safe combined result directly in the source workspace.",
+    }, {
+      action: "continue",
+      instruction: "Choose a task bundle from Task results and continue it with the planning failure context; continuation will rebuild integration and landing state.",
+    });
+  } else if (failureKind === "aborted") {
+    automaticRetry = "not_applicable";
+    summary = "The wave was interrupted before landing; inspect retained operation state and continue only recoverable tasks.";
+    actions.push({
+      action: "self_resolve",
+      instruction: "Use retained checkpoints and artifacts to determine what remains, then complete it directly in source under the normal review gate.",
+    }, {
+      action: "continue",
+      instruction: "Continue each recoverable task by its exact bundle from Task results; do not recreate work already present in a verified checkpoint.",
+    });
+  } else if (failureKind === "capture_error") {
+    automaticRetry = "exhausted";
+    summary = "Capture failed before executor work could land; correct the capture condition before starting another wave.";
+    actions.push({
+      action: "start",
+      instruction: "After correcting the reported capture condition, start a new wave; no executor task state was landed from this failed capture.",
+    });
+  } else {
+    automaticRetry = "not_applicable";
+    summary = "The wave did not land; inspect the returned statuses and retained artifacts before deciding whether to self-resolve or delegate recovery.";
+    actions.push({
+      action: "self_resolve",
+      instruction: "Use the retained task commits and diagnostics to complete the intended result directly in source under the normal review gate.",
+    }, {
+      action: "continue",
+      instruction: "Choose an appropriate reattachment bundle from Task results and continue that operation with explicit recovery instructions.",
+    });
+  }
+
+  return {
+    landed: false,
+    failureKind,
+    actionRequired: true,
+    sourceWorkspace: {
+      root: input.sourceRoot,
+      disposition,
+      changedByWave: recoveryRequired ? "unknown" : false,
+      message: sourceMessage,
+    },
+    recovery: {
+      automaticRetry,
+      summary,
+      actions,
+    },
+  };
+}
+
+function batchToolResult(input: BatchToolResultInput): Record<string, unknown> {
   const lines: string[] = [];
+  const outcome = buildWaveOutcomePacket(input);
   if (input.waveId) lines.push(`Wave: ${input.waveId}`);
   if (input.waveRoot) lines.push(`Wave root: ${input.waveRoot}`);
   if (input.phase) lines.push(`Phase: ${input.phase}`);
   if (input.errorCode) lines.push(`Error code: ${input.errorCode}`);
   lines.push(input.summary);
+
+  if (outcome) {
+    lines.push("");
+    lines.push(outcome.landed ? "Outcome: LANDED" : `Outcome: NOT LANDED (${outcome.failureKind})`);
+    lines.push(`Source workspace: ${outcome.sourceWorkspace.message}`);
+    if (outcome.actionRequired) {
+      lines.push(`Automatic retry: ${outcome.recovery.automaticRetry}`);
+      lines.push(`Action required: ${outcome.recovery.summary}`);
+    }
+  }
 
   if (input.taskResults?.length) {
     lines.push("");
@@ -869,15 +1127,27 @@ function batchToolResult(input: {
   if (input.integration) {
     lines.push(`\nIntegration: ${input.integration.status}`);
     if (input.integration.validationStatus) lines.push(`  validation: ${input.integration.validationStatus}`);
+    if (input.integration.integratedRef) lines.push(`  integrated ref: ${input.integration.integratedRef}`);
+    if (input.integration.finalCommitSha) lines.push(`  final commit: ${input.integration.finalCommitSha}`);
     if (input.integration.error) lines.push(`  error: ${input.integration.error}`);
-    if (input.integration.worktree) lines.push(`  worktree: ${input.integration.worktree}`);
+    if (input.integration.worktree) {
+      const disposition = input.integration.status === "conflicted" || input.integration.status === "error"
+        ? "preserved for diagnosis"
+        : "cleanup attempted after integration; use the retained ref/commit if this path is absent";
+      lines.push(`  worktree: ${input.integration.worktree} (${disposition})`);
+    }
     if (input.integration.conflictingTaskId) lines.push(`  conflict at: ${input.integration.conflictingTaskId}`);
+    if (input.integration.conflictingCommitSha) lines.push(`  conflicting commit: ${input.integration.conflictingCommitSha}`);
     if (input.integration.conflictingPaths?.length) lines.push(`  conflicting paths: ${input.integration.conflictingPaths.join(", ")}`);
     if (input.integration.workerMappings?.length) {
       lines.push(`  worker mappings: ${input.integration.workerMappings.map((m) => `${m.taskId}#${m.integratedCommitSha.slice(0, 8)}`).join(", ")}`);
     }
     if (input.integration.successfullyIntegrated?.length) {
       lines.push(`  successfully integrated: ${input.integration.successfullyIntegrated.map((m) => `${m.taskId}#${m.integratedCommitSha.slice(0, 8)}`).join(", ")}`);
+    }
+    if (input.integration.gitDiagnostics) {
+      lines.push("  git diagnostics:");
+      lines.push(...input.integration.gitDiagnostics.split("\n").map((line) => `    ${line}`));
     }
   }
   if (input.landing) {
@@ -896,18 +1166,30 @@ function batchToolResult(input: {
     lines.push(`Parent-owned overlap paths (not checkpointed): ${input.parentOwnedOverlapPaths.join(", ")}`);
   }
 
+  if (outcome?.actionRequired) {
+    lines.push("");
+    lines.push("Recovery guidance:");
+    for (const action of outcome.recovery.actions) {
+      lines.push(`  - ${action.action}: ${action.instruction}`);
+      if (action.taskId) lines.push(`    task: ${action.taskId}`);
+      if (action.bundle) lines.push(`    bundle: ${JSON.stringify(action.bundle)}`);
+    }
+  }
+
   lines.push("");
   lines.push("Note: Non-ignored untracked files are included; ignored files are excluded from the captured snapshot and landing.");
 
   const details = redactSensitiveValue({
       waveId: input.waveId,
       waveRoot: input.waveRoot,
+      sourceRoot: input.sourceRoot,
       phase: input.phase,
       errorCode: input.errorCode,
       taskResults: input.taskResults,
       integration: input.integration,
       landing: input.landing,
       parentOwnedOverlapPaths: input.parentOwnedOverlapPaths,
+      outcome,
       snapshotPolicy: "non-ignored untracked included; ignored files excluded",
       failureDiagnostics: input.taskResults?.filter((task) => !isWaveTaskSuccess(task.status)).map((task) => task.diagnostics),
     });
@@ -994,12 +1276,23 @@ function renderBatchResult(result: unknown, options: unknown, theme: ThemeLike) 
 
   const phase = typeof details.phase === "string" ? details.phase : "completed";
   const failed = value.isError === true;
+  const outcome = isRecord(details.outcome) ? details.outcome : undefined;
+  const failureKind = outcome && typeof outcome.failureKind === "string"
+    ? outcome.failureKind.replaceAll("_", " ")
+    : undefined;
+  const sourceWorkspace = outcome && isRecord(outcome.sourceWorkspace) ? outcome.sourceWorkspace : undefined;
+  const integration = isRecord(details.integration) ? details.integration : undefined;
+  const landing = isRecord(details.landing) ? details.landing : undefined;
+  const recovery = outcome && isRecord(outcome.recovery) ? outcome.recovery : undefined;
   return textComponent((width) => {
     const lines = [
-      clip(`${theme.fg(failed ? "error" : "success", failed ? "✗" : "✓")} ${theme.fg("accent", phase)}`, width),
+      clip(`${theme.fg(failed ? "error" : "success", failed ? "✗" : "✓")} ${theme.fg("accent", phase)}${failureKind ? theme.fg("error", ` · ${failureKind}`) : ""}`, width),
     ];
     if (details.waveId) lines.push(clip(theme.fg("dim", `  wave: ${details.waveId}`), width));
     if (details.waveRoot) lines.push(clip(theme.fg("dim", `  root: ${details.waveRoot}`), width));
+    if (sourceWorkspace && typeof sourceWorkspace.message === "string") {
+      lines.push(clip(theme.fg(failed ? "warning" : "success", `  source: ${sourceWorkspace.message}`), width));
+    }
 
     if (Array.isArray(details.taskResults)) {
       lines.push(clip(theme.fg("toolTitle", "  Tasks"), width));
@@ -1015,8 +1308,58 @@ function renderBatchResult(result: unknown, options: unknown, theme: ThemeLike) 
       }
     }
 
-    if (details.integration) lines.push(clip(theme.fg("dim", `  integration: ${details.integration.status}`), width));
-    if (details.landing) lines.push(clip(theme.fg("dim", `  landing: ${details.landing.status}`), width));
+    if (integration) {
+      lines.push(clip(theme.fg("dim", `  integration: ${integration.status}`), width));
+      if (expanded) {
+        if (integration.conflictingTaskId) lines.push(clip(theme.fg("warning", `    conflict at: ${integration.conflictingTaskId}`), width));
+        if (integration.conflictingCommitSha) lines.push(clip(theme.fg("dim", `    conflicting commit: ${integration.conflictingCommitSha}`), width));
+        if (Array.isArray(integration.conflictingPaths)) {
+          lines.push(clip(theme.fg("warning", `    conflicting paths: ${integration.conflictingPaths.join(", ")}`), width));
+        }
+        if (integration.worktree) {
+          const worktreeLabel = integration.status === "conflicted" || integration.status === "error"
+            ? "preserved worktree"
+            : "integration worktree (cleanup attempted)";
+          lines.push(clip(theme.fg("dim", `    ${worktreeLabel}: ${integration.worktree}`), width));
+        }
+        if (typeof integration.gitDiagnostics === "string") {
+          lines.push(theme.fg("toolTitle", "    Git diagnostics"));
+          for (const diagnosticLine of integration.gitDiagnostics.split("\n")) {
+            lines.push(clip(theme.fg("dim", `      ${diagnosticLine}`), width));
+          }
+        }
+      }
+    }
+    if (landing) {
+      lines.push(clip(theme.fg("dim", `  landing: ${landing.status}`), width));
+      if (expanded && Array.isArray(landing.conflicts)) {
+        for (const conflict of landing.conflicts) {
+          if (!isRecord(conflict)) continue;
+          lines.push(clip(theme.fg("warning", `    ${conflict.path}: ${conflict.reason}`), width));
+        }
+      }
+      if (expanded && landing.manifestPath) lines.push(clip(theme.fg("warning", `    recovery manifest: ${landing.manifestPath}`), width));
+    }
+    if (expanded && recovery && typeof recovery.summary === "string") {
+      lines.push(theme.fg("toolTitle", "  Recovery required"));
+      if (typeof recovery.automaticRetry === "string") {
+        lines.push(clip(theme.fg("dim", `    automatic retry: ${recovery.automaticRetry}`), width));
+      }
+      lines.push(clip(theme.fg("warning", `    ${recovery.summary}`), width));
+      if (Array.isArray(recovery.actions)) {
+        for (const item of recovery.actions) {
+          if (!isRecord(item)) continue;
+          const action = typeof item.action === "string" ? item.action : "action";
+          const task = typeof item.taskId === "string" ? ` ${item.taskId}` : "";
+          if (typeof item.instruction === "string") {
+            lines.push(clip(theme.fg("toolOutput", `    ${action}${task}: ${item.instruction}`), width));
+          }
+          if (isRecord(item.bundle)) {
+            lines.push(clip(theme.fg("dim", `      bundle: operation=${item.bundle.operationId} revision=${item.bundle.expectedRevision}`), width));
+          }
+        }
+      }
+    }
     lines.push(clip(theme.fg("muted", "  Note: non-ignored untracked included; ignored files excluded."), width));
     return lines;
   });

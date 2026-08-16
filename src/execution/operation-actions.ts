@@ -34,8 +34,42 @@ export interface OperationInspection {
     path: string;
     phase: string;
     sourceRoot: string;
+    repositoryPath: string;
+    baseCommit: string;
+    baseRef: string;
     integrationStatus?: string;
     landingStatus?: string;
+    sourceWorkspace: {
+      disposition: "unchanged" | "landed" | "recovery_required";
+      guidance: string;
+    };
+    integration?: {
+      status?: string;
+      validationStatus?: string;
+      integratedRef?: string;
+      finalCommitSha?: string;
+      worktree?: string;
+      worktreeDisposition?: "preserved_for_diagnosis" | "cleanup_attempted";
+      conflictingTaskId?: string;
+      conflictingCommitSha?: string;
+      conflictingPaths?: string[];
+      gitDiagnostics?: string;
+      error?: string;
+      workerMappings?: Array<{ taskId: string; originalCommitSha: string; integratedCommitSha: string; order: number }>;
+      successfullyIntegrated?: Array<{ taskId: string; originalCommitSha: string; integratedCommitSha: string; order: number }>;
+    };
+    landing?: {
+      status?: string;
+      appliedPaths?: string[];
+      alreadyAppliedPaths?: string[];
+      conflicts?: Array<{ path: string; reason: string }>;
+      failedAtPath?: string | null;
+      failureReason?: string;
+      manifestPath?: string;
+      rollbackError?: string;
+      headDrift?: { drifted: boolean; capturedHead?: string; currentHead?: string };
+    };
+    tasks: WaveManifestTask[];
     task?: WaveManifestTask;
   };
   live: false;
@@ -48,6 +82,16 @@ export async function inspectOperation(bundle: ReattachmentBundle): Promise<Oper
   const { waveRoot, manifest, record } = await resolveOperation(bundle);
   const canContinue = Boolean(record.session && record.checkpoint?.verified)
     && !["cancelled", "failed_critical", "running", "compacting", "retrying"].includes(record.state);
+  const sourceDisposition = manifest.landingStatus === "landed"
+    ? "landed"
+    : manifest.landingStatus === "recovery_required"
+      ? "recovery_required"
+      : "unchanged";
+  const sourceGuidance = sourceDisposition === "landed"
+    ? "The wave changes were landed into the source workspace."
+    : sourceDisposition === "recovery_required"
+      ? "Landing rollback was incomplete; inspect the recovery manifest before modifying the source workspace."
+      : "The wave did not land executor changes; the source workspace remains unchanged by this wave.";
   return {
     bundle: createReattachmentBundle(record, waveRoot),
     staleBundle: bundle.expectedRevision !== record.revision,
@@ -56,8 +100,46 @@ export async function inspectOperation(bundle: ReattachmentBundle): Promise<Oper
       path: join(waveRoot, "wave-manifest.json"),
       phase: manifest.phase,
       sourceRoot: manifest.sourceRoot,
+      repositoryPath: manifest.repositoryPath,
+      baseCommit: manifest.baseCommit,
+      baseRef: manifest.baseRef,
       integrationStatus: manifest.integrationStatus,
       landingStatus: manifest.landingStatus,
+      sourceWorkspace: {
+        disposition: sourceDisposition,
+        guidance: sourceGuidance,
+      },
+      integration: manifest.integrationStatus ? {
+        status: manifest.integrationStatus,
+        validationStatus: manifest.integrationValidationStatus,
+        integratedRef: manifest.integrationRef,
+        finalCommitSha: manifest.integrationFinalCommitSha,
+        worktree: manifest.integrationWorktree,
+        worktreeDisposition: manifest.integrationWorktree
+          ? manifest.integrationStatus === "conflicted" || manifest.integrationStatus === "error"
+            ? "preserved_for_diagnosis"
+            : "cleanup_attempted"
+          : undefined,
+        conflictingTaskId: manifest.integrationConflictingTaskId,
+        conflictingCommitSha: manifest.integrationConflictingCommitSha,
+        conflictingPaths: manifest.integrationConflictingPaths,
+        gitDiagnostics: manifest.integrationGitDiagnostics,
+        error: manifest.integrationError,
+        workerMappings: manifest.integrationWorkerMappings,
+        successfullyIntegrated: manifest.integrationSuccessfullyIntegrated,
+      } : undefined,
+      landing: manifest.landingStatus ? {
+        status: manifest.landingStatus,
+        appliedPaths: manifest.landingAppliedPaths,
+        alreadyAppliedPaths: manifest.landingAlreadyAppliedPaths,
+        conflicts: manifest.landingConflicts,
+        failedAtPath: manifest.landingFailedAtPath,
+        failureReason: manifest.landingFailureReason,
+        manifestPath: manifest.landingManifestPath,
+        rollbackError: manifest.landingRollbackError,
+        headDrift: manifest.landingHeadDrift,
+      } : undefined,
+      tasks: manifest.tasks,
       task: manifest.tasks.find((task) => task.taskId === record.taskId),
     },
     live: false,
@@ -402,16 +484,53 @@ async function publishContinuationManifest(
   }
   manifest.phase = "completed";
   if (integration) {
+    delete manifest.landingStatus;
+    delete manifest.landingAppliedPaths;
+    delete manifest.landingAlreadyAppliedPaths;
+    delete manifest.landingConflicts;
+    delete manifest.landingFailedAtPath;
+    delete manifest.landingFailureReason;
+    delete manifest.landingManifestPath;
+    delete manifest.landingRollbackError;
     manifest.integrationStatus = integration.status;
+    delete manifest.integrationConflictingTaskId;
+    delete manifest.integrationConflictingCommitSha;
+    delete manifest.integrationConflictingPaths;
+    delete manifest.integrationGitDiagnostics;
+    delete manifest.integrationError;
+    delete manifest.integrationSuccessfullyIntegrated;
+    delete manifest.integrationWorkerMappings;
+    delete manifest.integrationValidationStatus;
+    delete manifest.integrationRef;
+    delete manifest.integrationFinalCommitSha;
+    manifest.integrationWorktree = integration.worktree;
     if (integration.status === "conflicted") {
       manifest.integrationConflictingTaskId = integration.conflictingTaskId;
+      manifest.integrationConflictingCommitSha = integration.conflictingCommitSha;
       manifest.integrationConflictingPaths = integration.conflictingPaths;
       manifest.integrationGitDiagnostics = integration.gitDiagnostics;
       manifest.integrationWorktree = integration.worktree;
+    } else if (integration.status === "integrated") {
+      manifest.integrationValidationStatus = integration.validationStatus;
+      manifest.integrationRef = integration.integratedRef;
+      manifest.integrationFinalCommitSha = integration.finalCommitSha;
+      manifest.integrationWorkerMappings = integration.workerMappings;
+    } else {
+      manifest.integrationValidationStatus = integration.validationStatus;
+      manifest.integrationRef = integration.integratedRef;
+      manifest.integrationFinalCommitSha = integration.baseCommitSha;
+      manifest.integrationWorkerMappings = integration.workerMappings;
     }
   }
   if (landing) {
     manifest.landingStatus = landing.status;
+    delete manifest.landingAppliedPaths;
+    delete manifest.landingAlreadyAppliedPaths;
+    delete manifest.landingConflicts;
+    delete manifest.landingFailedAtPath;
+    delete manifest.landingFailureReason;
+    delete manifest.landingManifestPath;
+    delete manifest.landingRollbackError;
     if (landing.status === "landed") {
       manifest.landingAppliedPaths = landing.appliedPaths;
       manifest.landingAlreadyAppliedPaths = landing.alreadyAppliedPaths;

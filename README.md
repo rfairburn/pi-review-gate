@@ -269,6 +269,19 @@ and paths. The integration worktree is preserved for diagnosis. Landing
 conflicts are reported with per-path conflict details. Rolled-back landings
 store a recovery manifest for manual recovery.
 
+Every non-landed `execute_subtasks` result includes an explicit outcome and
+recovery packet for both the controlling model and the expanded activity view.
+For integration and landing conflicts it states that no executor changes were
+applied to the source workspace, identifies preserved diagnostic worktrees when
+present, retained commits, paths, Git diagnostics, and reattachment bundles,
+and explains that the orchestrator must either resolve the combined change
+itself or continue a specific retained task. Conflict wave manifests retain
+the same provenance so `inspect` can recover it after compaction or
+reattachment. A
+`recovery_required` landing is called out separately because an incomplete
+rollback means the source may be partially modified and its recovery manifest
+must be handled before further edits.
+
 **Source preservation**: The wave never mutates the source repository through
 Git operations. Source HEAD, index, staging state, and stash are preserved.
 Absolute source-workspace paths in task and correction text are remapped to the

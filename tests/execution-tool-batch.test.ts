@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
+import { createWorkspaceSnapshot } from "../src/capture";
 import { normalizeConfig } from "../src/config";
+import { inspectOperation } from "../src/execution/operation-actions";
 import { ExecutionToolManager } from "../src/execution/tool";
-import { createState } from "../src/state";
+import { beginAgentRun, createState, setReviewWindowBaseline } from "../src/state";
+
+const execFileAsync = promisify(execFile);
 
 test("execute_subtasks is the sole registered delegated execution tool", () => {
   const registered: Array<Record<string, unknown>> = [];
@@ -410,6 +419,261 @@ test("batch result marks non-landed outcomes as errors", () => {
     },
   }, { expanded: true }, theme).render(120).join("\n");
   assert.ok(landedResult.includes("✓"), "Should show success icon for landed outcome");
+});
+
+test("integration conflict gives the orchestrator, user, and later inspect complete recovery context", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-tool-conflict-"));
+  let waveRoot: string | undefined;
+  try {
+    await execFileAsync("git", ["init"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "shared.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "shared.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-m", "base"], { cwd: root });
+
+    const executorScript = [
+      "process.stdin.resume();process.stdin.on('end',()=>{",
+      "const fs=require('node:fs'),path=require('node:path');",
+      "const task=process.cwd().includes('task-0')?'first':'second';",
+      "fs.writeFileSync(path.join(process.cwd(),'shared.txt'),task+' worker\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:'conflict-'+task}));",
+      "console.log(JSON.stringify({type:'assistant',text:'changed shared.txt'}));",
+      "});",
+    ].join("");
+    const config = normalizeConfig({
+      enabled: false,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "conflicting-writer",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1",
+          args: ["-e", executorScript],
+          timeoutMs: 30_000,
+        },
+      }],
+      execution: {
+        executorPool: [{
+          entryId: "conflicting-writer",
+          selection: { source: "external", id: "conflicting-writer" },
+          maxConcurrent: 2,
+        }],
+        maxWorkers: 2,
+        retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
+      },
+    });
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, await createWorkspaceSnapshot(root, {
+      maxFileBytes: config.maxFileBytes,
+      maxSnapshotBytes: config.maxSnapshotBytes,
+    }));
+
+    const registered: Array<Record<string, unknown>> = [];
+    let activeTools: string[] = [];
+    const pi = {
+      registerTool(tool: Record<string, unknown>) { registered.push(tool); },
+      getActiveTools() { return activeTools; },
+      setActiveTools(next: string[]) { activeTools = next; },
+    };
+    new ExecutionToolManager({ pi, config, state, cwd: () => root }).sync();
+    const tool = registered[0];
+    const execute = tool.execute as (
+      toolCallId: string,
+      params: unknown,
+      signal: AbortSignal | undefined,
+      onUpdate: ((result: unknown) => void) | undefined,
+      ctx: unknown,
+    ) => Promise<Record<string, unknown>>;
+    const result = await execute("conflict-call", {
+      action: "start",
+      tasks: [
+        { title: "First", instructions: "change shared.txt", acceptanceCriteria: ["shared.txt changed"] },
+        { title: "Second", instructions: "change shared.txt differently", acceptanceCriteria: ["shared.txt changed"] },
+      ],
+      maxWorkers: 2,
+    }, undefined, undefined, {});
+
+    assert.equal(result.isError, true);
+    const details = result.details as Record<string, any>;
+    waveRoot = details.waveRoot;
+    assert.equal(details.integration.status, "conflicted");
+    assert.equal(details.outcome.failureKind, "integration_conflict");
+    assert.equal(details.outcome.sourceWorkspace.disposition, "unchanged");
+    assert.equal(details.outcome.sourceWorkspace.changedByWave, false);
+    assert.equal(details.outcome.recovery.automaticRetry, "skipped_deterministic");
+    assert.ok(details.outcome.recovery.actions.some((action: Record<string, unknown>) => action.action === "self_resolve"));
+    const continuation = details.outcome.recovery.actions.find((action: Record<string, unknown>) => action.action === "continue");
+    assert.equal(continuation.taskId, details.integration.conflictingTaskId);
+    assert.ok(continuation.bundle);
+
+    const modelText = (result.content as Array<{ type: string; text: string }>)[0].text;
+    assert.match(modelText, /Outcome: NOT LANDED \(integration_conflict\)/);
+    assert.match(modelText, /Source workspace: UNCHANGED/);
+    assert.match(modelText, /conflicting commit:/);
+    assert.match(modelText, /git diagnostics:/);
+    assert.match(modelText, /Recovery guidance:/);
+    assert.match(modelText, /self_resolve:/);
+    assert.match(modelText, /continue:/);
+    assert.match(modelText, /successful continuation will re-run review, integration, and landing/);
+
+    const theme = {
+      bold: (value: string) => value,
+      fg: (_color: string, value: string) => value,
+    };
+    const renderResult = tool.renderResult as (
+      value: unknown,
+      options: unknown,
+      themeValue: typeof theme,
+    ) => { render(width: number): string[] };
+    const expanded = renderResult(result, { expanded: true }, theme).render(180).join("\n");
+    assert.match(expanded, /integration conflict/);
+    assert.match(expanded, /source: UNCHANGED/);
+    assert.match(expanded, /conflicting commit:/);
+    assert.match(expanded, /conflicting paths:/);
+    assert.match(expanded, /Git diagnostics/);
+    assert.match(expanded, /Recovery required/);
+
+    const conflictingTask = details.taskResults.find((task: Record<string, unknown>) => task.taskId === details.integration.conflictingTaskId);
+    const inspection = await inspectOperation(conflictingTask.bundle);
+    assert.equal(inspection.manifest.sourceWorkspace.disposition, "unchanged");
+    assert.equal(inspection.manifest.tasks.length, 2);
+    assert.ok(inspection.manifest.baseCommit);
+    assert.ok(inspection.manifest.repositoryPath);
+    assert.equal(inspection.manifest.integration?.worktreeDisposition, "preserved_for_diagnosis");
+    assert.equal(inspection.manifest.integration?.conflictingCommitSha, details.integration.conflictingCommitSha);
+    assert.deepEqual(inspection.manifest.integration?.conflictingPaths, details.integration.conflictingPaths);
+    assert.equal(inspection.manifest.integration?.gitDiagnostics, details.integration.gitDiagnostics);
+
+    assert.equal(await readFile(join(root, "shared.txt"), "utf8"), "base\n");
+  } finally {
+    if (waveRoot) await rm(waveRoot, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("landing conflict reports source drift, retained integrated state, and unchanged source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-tool-landing-conflict-"));
+  const control = await mkdtemp(join(tmpdir(), "pi-review-tool-control-"));
+  let waveRoot: string | undefined;
+  try {
+    await execFileAsync("git", ["init"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "shared.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "shared.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-m", "base"], { cwd: root });
+
+    const started = join(control, "started");
+    const proceed = join(control, "proceed");
+    const executorScript = [
+      "process.stdin.resume();process.stdin.on('end',()=>{",
+      "const fs=require('node:fs'),path=require('node:path');",
+      "fs.writeFileSync(path.join(process.cwd(),'shared.txt'),'worker change\\n');",
+      `fs.writeFileSync(${JSON.stringify(started)},'ready');`,
+      "const timer=setInterval(()=>{",
+      `if(!fs.existsSync(${JSON.stringify(proceed)}))return;`,
+      "clearInterval(timer);",
+      "console.log(JSON.stringify({type:'session',sessionId:'landing-conflict'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'changed shared.txt'}));",
+      "},10);",
+      "});",
+    ].join("");
+    const config = normalizeConfig({
+      enabled: false,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "drift-writer",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", executorScript], timeoutMs: 30_000 },
+      }],
+      execution: {
+        executorPool: [{
+          entryId: "drift-writer",
+          selection: { source: "external", id: "drift-writer" },
+          maxConcurrent: 1,
+        }],
+        maxWorkers: 1,
+        retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
+      },
+    });
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, await createWorkspaceSnapshot(root, {
+      maxFileBytes: config.maxFileBytes,
+      maxSnapshotBytes: config.maxSnapshotBytes,
+    }));
+
+    const registered: Array<Record<string, unknown>> = [];
+    let activeTools: string[] = [];
+    const pi = {
+      registerTool(tool: Record<string, unknown>) { registered.push(tool); },
+      getActiveTools() { return activeTools; },
+      setActiveTools(next: string[]) { activeTools = next; },
+    };
+    new ExecutionToolManager({ pi, config, state, cwd: () => root }).sync();
+    const tool = registered[0];
+    const execute = tool.execute as (
+      toolCallId: string,
+      params: unknown,
+      signal: AbortSignal | undefined,
+      onUpdate: ((result: unknown) => void) | undefined,
+      ctx: unknown,
+    ) => Promise<Record<string, unknown>>;
+    const resultPromise = execute("landing-conflict-call", {
+      action: "start",
+      tasks: [{ title: "Worker", instructions: "change shared.txt", acceptanceCriteria: ["shared.txt changed"] }],
+      maxWorkers: 1,
+    }, undefined, undefined, {});
+
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      if (await readFile(started, "utf8").then(() => true).catch(() => false)) break;
+      if (attempt === 499) assert.fail("executor did not reach synchronization point");
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    }
+    await writeFile(join(root, "shared.txt"), "parent change\n", "utf8");
+    await writeFile(proceed, "go", "utf8");
+    const result = await resultPromise;
+
+    assert.equal(result.isError, true);
+    const details = result.details as Record<string, any>;
+    waveRoot = details.waveRoot;
+    assert.equal(details.integration.status, "integrated");
+    assert.equal(details.landing.status, "conflicted");
+    assert.equal(details.outcome.failureKind, "landing_conflict");
+    assert.equal(details.outcome.sourceWorkspace.disposition, "unchanged");
+    assert.equal(details.outcome.sourceWorkspace.changedByWave, false);
+    assert.equal(details.outcome.recovery.automaticRetry, "skipped_deterministic");
+    assert.ok(details.integration.integratedRef);
+    assert.ok(details.integration.finalCommitSha);
+    assert.ok(details.landing.conflicts.some((conflict: Record<string, unknown>) => conflict.path === "shared.txt"));
+
+    const modelText = (result.content as Array<{ type: string; text: string }>)[0].text;
+    assert.match(modelText, /Outcome: NOT LANDED \(landing_conflict\)/);
+    assert.match(modelText, /Source workspace: UNCHANGED/);
+    assert.match(modelText, /integrated ref:/);
+    assert.match(modelText, /final commit:/);
+    assert.match(modelText, /shared\.txt: Source state differs from both base and result/);
+    assert.match(modelText, /choose the responsible task bundle/);
+
+    const task = details.taskResults[0];
+    const inspection = await inspectOperation(task.bundle);
+    assert.equal(inspection.manifest.sourceWorkspace.disposition, "unchanged");
+    assert.equal(inspection.manifest.integration?.status, "integrated");
+    assert.equal(inspection.manifest.integration?.worktreeDisposition, "cleanup_attempted");
+    assert.equal(inspection.manifest.integration?.integratedRef, details.integration.integratedRef);
+    assert.equal(inspection.manifest.integration?.finalCommitSha, details.integration.finalCommitSha);
+    assert.equal(inspection.manifest.landing?.status, "conflicted");
+    assert.deepEqual(inspection.manifest.landing?.conflicts, details.landing.conflicts);
+    assert.equal(await readFile(join(root, "shared.txt"), "utf8"), "parent change\n");
+  } finally {
+    if (waveRoot) await rm(waveRoot, { recursive: true, force: true });
+    await rm(control, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("batch render fits narrow width", () => {

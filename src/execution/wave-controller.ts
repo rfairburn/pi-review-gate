@@ -138,7 +138,7 @@ export interface WaveIntegrationOutcome {
 /** Landing result embedded in the wave result. */
 export interface WaveLandingOutcome {
   /** Landing execution status. */
-  status: LandingExecutionResult["status"] | "aborted";
+  status: LandingExecutionResult["status"] | "aborted" | "planning_error";
   /** Applied paths. */
   appliedPaths?: string[];
   /** Already-applied paths. */
@@ -278,6 +278,10 @@ export interface WaveManifest {
   integrationStatus?: WaveIntegrationResult["status"] | "error" | "worker_failure";
   /** Integration validation status. */
   integrationValidationStatus?: "not_run";
+  /** Stable integrated ref, when integration completed. */
+  integrationRef?: string;
+  /** Final integrated commit, when integration completed. */
+  integrationFinalCommitSha?: string;
   /** Integration worktree path (when created/preserved). */
   integrationWorktree?: string;
   /** Worker mappings (when integrated). */
@@ -286,12 +290,13 @@ export interface WaveManifest {
   integrationSuccessfullyIntegrated?: Array<{ taskId: string; originalCommitSha: string; integratedCommitSha: string; order: number }>;
   /** Conflict details. */
   integrationConflictingTaskId?: string;
+  integrationConflictingCommitSha?: string;
   integrationConflictingPaths?: string[];
   /** Integration error diagnostics. */
   integrationError?: string;
   integrationGitDiagnostics?: string;
   /** Landing status (if attempted). */
-  landingStatus?: LandingExecutionResult["status"] | "aborted";
+  landingStatus?: LandingExecutionResult["status"] | "aborted" | "planning_error";
   /** Landing applied paths. */
   landingAppliedPaths?: string[];
   /** Landing already-applied paths. */
@@ -392,7 +397,7 @@ function buildManifest(
   capture: WaveCaptureResult,
   taskResults: WaveTaskResult[],
   integrationStatus?: WaveIntegrationResult["status"] | "error" | "worker_failure",
-  landingStatus?: LandingExecutionResult["status"] | "aborted",
+  landingStatus?: LandingExecutionResult["status"] | "aborted" | "planning_error",
   integrationOutcome?: WaveIntegrationOutcome,
   landingOutcome?: WaveLandingOutcome,
   handles?: WorkerHandle[],
@@ -445,10 +450,13 @@ function buildManifest(
     }),
     integrationStatus,
     ...(integrationOutcome?.validationStatus ? { integrationValidationStatus: integrationOutcome.validationStatus } : {}),
+    ...(integrationOutcome?.integratedRef ? { integrationRef: integrationOutcome.integratedRef } : {}),
+    ...(integrationOutcome?.finalCommitSha ? { integrationFinalCommitSha: integrationOutcome.finalCommitSha } : {}),
     ...(integrationOutcome?.worktree ? { integrationWorktree: integrationOutcome.worktree } : {}),
     ...(integrationOutcome?.workerMappings ? { integrationWorkerMappings: integrationOutcome.workerMappings } : {}),
     ...(integrationOutcome?.successfullyIntegrated ? { integrationSuccessfullyIntegrated: integrationOutcome.successfullyIntegrated } : {}),
     ...(integrationOutcome?.conflictingTaskId ? { integrationConflictingTaskId: integrationOutcome.conflictingTaskId } : {}),
+    ...(integrationOutcome?.conflictingCommitSha ? { integrationConflictingCommitSha: integrationOutcome.conflictingCommitSha } : {}),
     ...(integrationOutcome?.conflictingPaths ? { integrationConflictingPaths: integrationOutcome.conflictingPaths } : {}),
     ...(integrationOutcome?.error ? { integrationError: integrationOutcome.error } : {}),
     ...(integrationOutcome?.gitDiagnostics ? { integrationGitDiagnostics: integrationOutcome.gitDiagnostics } : {}),
@@ -1091,11 +1099,11 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   // ── Abort: skip integration/landing ──
   if (signal?.aborted) {
-    emitProgress(onProgress, "aborted", "Wave aborted — skipping integration and landing", undefined, {
+    emitProgress(onProgress, "aborted", "Wave aborted — nothing landed; source workspace unchanged by this wave", undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Wave aborted — skipping integration and landing"],
+      activity: ["Wave aborted — nothing landed; source workspace unchanged by this wave"],
     });
 
     // Update manifest.
@@ -1116,14 +1124,19 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   // ── Integration eligibility check ──
   if (!integratePartial && hasFailedWorker) {
-    emitProgress(onProgress, "completed", "Integration skipped: failed worker(s) present (all-or-nothing policy)", undefined, {
+    const workerFailureMessage = "Integration skipped: failed worker(s) present; nothing landed, source workspace unchanged by this wave, and recovery action is required";
+    emitProgress(onProgress, "completed", workerFailureMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Integration skipped: failed worker(s) present (all-or-nothing policy)"],
+      activity: [workerFailureMessage],
     });
 
-    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+    const workerFailureOutcome: WaveIntegrationOutcome = {
+      status: "worker_failure",
+    };
+
+    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, "worker_failure", undefined, workerFailureOutcome, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
 
     // Cleanup clean worktrees.
     await cleanupWorktrees(handles, capture);
@@ -1135,23 +1148,25 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       sourceRoot: capture.discovery.captureRoot,
       phase: "completed",
       taskResults: taskResultsArray,
+      integration: workerFailureOutcome,
     };
   }
 
   // ── Partial mode: all workers failed — skip integration/landing ──
   if (integratePartial && hasFailedWorker && eligibleWorkers.length === 0) {
-    emitProgress(onProgress, "completed", "Integration skipped: all workers failed (partial mode)", undefined, {
+    const workerFailureMessage = "Integration skipped: all workers failed; nothing landed, source workspace unchanged by this wave, and recovery action is required";
+    emitProgress(onProgress, "completed", workerFailureMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Integration skipped: all workers failed (partial mode)"],
+      activity: [workerFailureMessage],
     });
 
     const workerFailureOutcome: WaveIntegrationOutcome = {
       status: "worker_failure",
     };
 
-    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, "worker_failure", undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, "worker_failure", undefined, workerFailureOutcome, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
 
     // Cleanup clean worktrees.
     await cleanupWorktrees(handles, capture);
@@ -1220,6 +1235,8 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       integrationOutcome = {
         status: "no_changes",
         validationStatus: "not_run",
+        integratedRef: integrationResult.integratedRef,
+        finalCommitSha: integrationResult.baseCommitSha,
         worktree: integrationResult.worktree,
         workerMappings: [],
       };
@@ -1259,11 +1276,12 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   // ── Abort check after integration ──
   if (signal?.aborted) {
-    emitProgress(onProgress, "aborted", "Wave aborted after integration — skipping landing", undefined, {
+    const abortMessage = "Wave aborted after integration — nothing landed; source workspace unchanged by this wave";
+    emitProgress(onProgress, "aborted", abortMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Wave aborted after integration — skipping landing"],
+      activity: [abortMessage],
     });
 
     const abortIntegrationStatus = integrationOutcome?.status ?? integrationResult?.status;
@@ -1298,8 +1316,8 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       ? "error"
       : integrationResult?.status;
     const message = integrationOutcome?.status === "error"
-      ? "Integration infrastructure error — skipping landing"
-      : "Integration conflicted — skipping landing";
+      ? "Integration infrastructure error — nothing landed; source workspace unchanged by this wave and recovery action is required"
+      : "Integration conflicted — nothing landed; source workspace unchanged by this wave and conflict resolution is required";
     emitProgress(onProgress, "completed", message, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
@@ -1372,11 +1390,12 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     ), signal);
   } catch (err) {
     if (signal?.aborted) {
-      emitProgress(onProgress, "aborted", "Wave aborted during landing planning", undefined, {
+      const abortMessage = "Wave aborted during landing planning — nothing landed; source workspace unchanged by this wave";
+      emitProgress(onProgress, "aborted", abortMessage, undefined, {
         waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
         counts: computeCounts(taskItems, results, activeSlots, taskPhases),
         taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-        activity: ["Wave aborted during landing planning"],
+        activity: [abortMessage],
       });
       await queueManifestWrite(buildManifest(
         waveId, "aborted", capture, taskResultsArray,
@@ -1401,19 +1420,25 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         landing: { status: "aborted" },
       };
     }
-    emitProgress(onProgress, "completed", `Landing planning failed: ${err instanceof Error ? err.message : "unknown"}`, undefined, {
+    const planningError = err instanceof Error ? err.message : "unknown";
+    const planningErrorMessage = `Landing planning failed: ${planningError} — nothing landed; source workspace unchanged by this wave and recovery action is required`;
+    const planningErrorOutcome: WaveLandingOutcome = {
+      status: "planning_error",
+      failureReason: planningError,
+    };
+    emitProgress(onProgress, "completed", planningErrorMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: [`Landing planning failed: ${err instanceof Error ? err.message : "unknown"}`],
+      activity: [planningErrorMessage],
     });
 
     await queueManifestWrite(buildManifest(
       waveId, "completed", capture, taskResultsArray,
       integrationResult.status,
-      undefined,
+      "planning_error",
       integrationOutcome,
-      undefined,
+      planningErrorOutcome,
       handles,
       taskExecutorInfo,
       taskReviewCycles,
@@ -1430,16 +1455,18 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       phase: "completed",
       taskResults: taskResultsArray,
       integration: integrationOutcome,
+      landing: planningErrorOutcome,
     };
   }
 
   // ── Abort check after planning ──
   if (signal?.aborted) {
-    emitProgress(onProgress, "aborted", "Wave aborted after planning — skipping landing", undefined, {
+    const abortMessage = "Wave aborted after planning — nothing landed; source workspace unchanged by this wave";
+    emitProgress(onProgress, "aborted", abortMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Wave aborted after planning — skipping landing"],
+      activity: [abortMessage],
     });
 
     await queueManifestWrite(buildManifest(waveId, "aborted", capture, taskResultsArray,
@@ -1469,17 +1496,18 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   // If plan has conflicts, skip landing.
   if (landingPlan.conflicts.length > 0) {
-    emitProgress(onProgress, "completed", `Landing planning found ${landingPlan.conflicts.length} conflict(s)`, undefined, {
+    const landingConflictMessage = `Landing planning found ${landingPlan.conflicts.length} conflict(s) — nothing landed; source workspace unchanged by this wave and conflict resolution is required`;
+    emitProgress(onProgress, "completed", landingConflictMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: [`Landing planning found ${landingPlan.conflicts.length} conflict(s)`],
+      activity: [landingConflictMessage],
     });
 
     await queueManifestWrite(buildManifest(
       waveId, "completed", capture, taskResultsArray,
       integrationResult.status,
-      undefined,
+      "conflicted",
       integrationOutcome,
       { status: "conflicted", conflicts: landingPlan.conflicts },
       handles,
@@ -1544,11 +1572,18 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   // Cleanup clean worktrees including integration worktree.
   await cleanupWorktrees(handles, capture, integrationWorktree);
 
-  emitProgress(onProgress, "completed", `Wave completed: landing ${landingResult.status}`, undefined, {
+  const landingMessage = landingResult.status === "landed"
+    ? "Wave completed: executor changes landed in the source workspace"
+    : landingResult.status === "conflicted"
+      ? "Landing conflicted — nothing landed; source workspace unchanged by this wave and conflict resolution is required"
+      : landingResult.status === "rolled_back"
+        ? "Landing failed and was rolled back — source workspace restored; recovery action is required"
+        : "Landing rollback incomplete — source workspace may be partially modified; manual recovery is required";
+  emitProgress(onProgress, "completed", landingMessage, undefined, {
     waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
     counts: computeCounts(taskItems, results, activeSlots, taskPhases),
     taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-    activity: [`Wave completed: landing ${landingResult.status}`],
+    activity: [landingMessage],
   });
 
   return {

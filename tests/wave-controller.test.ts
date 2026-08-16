@@ -670,10 +670,13 @@ test("default all-or-nothing: failed worker blocks integration", async () => {
       assert.equal(tr.status, "executor_error", `Expected executor_error, got ${tr.status}`);
     }
 
-    // Integration and landing should be skipped (all-or-nothing).
-    assert.equal(result.integration, undefined);
+    // Integration and landing should be skipped (all-or-nothing), with the
+    // worker-failure reason preserved for the tool response and later inspect.
+    assert.equal(result.integration?.status, "worker_failure");
     assert.equal(result.landing, undefined);
     assert.equal(result.phase, "completed");
+    const manifest = JSON.parse(await readFile(join(result.waveRoot, "wave-manifest.json"), "utf8"));
+    assert.equal(manifest.integrationStatus, "worker_failure");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

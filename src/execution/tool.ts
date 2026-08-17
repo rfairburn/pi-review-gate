@@ -246,7 +246,7 @@ export class ExecutionToolManager {
         "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call mark_clean.",
         "Use force_merge only for a stopped task with a verified checkpoint; mergeAnyhow may intentionally materialize conflicts in main. Every force_merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
         "A request to cancel or stop without landing means interrupt_as_failure. Use interrupt_with_merge only when the user explicitly wants a mechanical checkpoint landing; it never guarantees the requested changes are present or correct, so inspect the main workspace manually afterward in every case.",
-        "Completion, failure, requested matches, and critical conflicts trigger model notifications. Use inspect whenever you need current status or diagnostics; avoid tight repetitive polling.",
+        "Completion, failure, meaningful state changes, and critical conflicts trigger model notifications. Use inspect whenever you need current status or diagnostics; avoid tight repetitive polling.",
       ],
       executionMode: "sequential",
       parameters: toolSchema(),
@@ -368,7 +368,6 @@ export class ExecutionToolManager {
     return tasks.map((task) => ({
       ...task,
       acceptanceCriteria: [...task.acceptanceCriteria],
-      wakeOn: task.wakeOn ? { ...task.wakeOn, match: task.wakeOn.match ? [...task.wakeOn.match] : undefined } : undefined,
       executorAllowedTools: allowedTools ? [...allowedTools] : undefined,
     }));
   }
@@ -384,15 +383,6 @@ function toolSchema(): Record<string, unknown> {
       instructions: { type: "string", minLength: 1 },
       acceptanceCriteria: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
       relevantContext: { type: "string" },
-      wakeOn: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          completion: { type: "string", enum: ["now", "soon", "idle"] },
-          failure: { type: "string", enum: ["now", "soon", "idle"] },
-          match: { type: "array", items: { type: "string", minLength: 1 } },
-        },
-      },
     },
   };
   return {
@@ -483,7 +473,7 @@ function normalizeTasks(value: unknown): BackgroundTaskDefinition[] {
   return value.map((candidate, index) => {
     if (!isRecord(candidate)) throw new Error(`tasks[${index}] must be an object`);
     for (const key of Object.keys(candidate)) {
-      if (!["title", "instructions", "acceptanceCriteria", "relevantContext", "wakeOn"].includes(key)) {
+      if (!["title", "instructions", "acceptanceCriteria", "relevantContext"].includes(key)) {
         throw new Error(`unsupported tasks[${index}] key ${key}`);
       }
     }
@@ -492,29 +482,8 @@ function normalizeTasks(value: unknown): BackgroundTaskDefinition[] {
     if (!Array.isArray(candidate.acceptanceCriteria) || candidate.acceptanceCriteria.length === 0) throw new Error(`tasks[${index}].acceptanceCriteria is required`);
     const acceptanceCriteria = candidate.acceptanceCriteria.map((entry, criterion) => requiredString(entry, `tasks[${index}].acceptanceCriteria[${criterion}]`));
     const relevantContext = optionalString(candidate.relevantContext, `tasks[${index}].relevantContext`);
-    const wakeOn = candidate.wakeOn === undefined ? undefined : normalizeWake(candidate.wakeOn, index);
-    return { title, instructions, acceptanceCriteria, relevantContext, wakeOn };
+    return { title, instructions, acceptanceCriteria, relevantContext };
   });
-}
-
-function normalizeWake(value: unknown, index: number): BackgroundTaskDefinition["wakeOn"] {
-  if (!isRecord(value)) throw new Error(`tasks[${index}].wakeOn must be an object`);
-  for (const key of Object.keys(value)) if (!["completion", "failure", "match"].includes(key)) throw new Error(`unsupported wakeOn key ${key}`);
-  const lane = (candidate: unknown, field: string) => {
-    if (candidate === undefined) return undefined;
-    if (candidate !== "now" && candidate !== "soon" && candidate !== "idle") throw new Error(`${field} must be now, soon, or idle`);
-    return candidate;
-  };
-  let match: string[] | undefined;
-  if (value.match !== undefined) {
-    if (!Array.isArray(value.match)) throw new Error(`tasks[${index}].wakeOn.match must be an array`);
-    match = value.match.map((entry, matchIndex) => requiredString(entry, `tasks[${index}].wakeOn.match[${matchIndex}]`));
-  }
-  return {
-    completion: lane(value.completion, `tasks[${index}].wakeOn.completion`),
-    failure: lane(value.failure, `tasks[${index}].wakeOn.failure`),
-    match,
-  };
 }
 
 function normalizeBundle(value: unknown): ReattachmentBundle {

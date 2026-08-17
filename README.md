@@ -224,10 +224,10 @@ escape this best-effort boundary and is not claimed as covered.
 
 The same top-level review-readiness gate covers `ExecuteSubtasks`: automatic
 review of the primary orchestrator is deferred while any task is queued,
-capturing, running, reviewing, accepted, waiting to land, or landing. A normal
-task completion/failure notification wakes the orchestrator according to its
-configured wake policy; only after no execution task remains active may that
-turn enter automatic review.
+capturing, running, reviewing, accepted, waiting to land, or landing. Normal
+task completion is delivered as a follow-up and failure is delivered
+immediately; only after no execution task remains active may that turn enter
+automatic review.
 
 `interrupt` explicitly chooses failure or merge disposition. A normal cancellation
 uses `interrupt_as_failure`; `interrupt_with_merge` must be requested explicitly.
@@ -265,9 +265,9 @@ already landed. Every model-facing
 recent activity, and full artifact paths needed for control and deeper `rg`
 inspection. A partial landing event identifies the landed paths and every
 sibling that has not landed; only the final event invites aggregate verification.
-Completion, failure, requested pattern matches, and workspace conflicts use
-event-driven wake lanes (`now`, `soon`, or `idle`); polling loops are neither
-required nor recommended, but purposeful `inspect` calls are always supported.
+Completion, failure, meaningful state changes, and workspace conflicts are
+delivered proactively; polling loops are neither required nor recommended, but
+purposeful `inspect` calls are always supported.
 User analogs are available as `/subtasks` and the `/subtask-*` commands for
 inspect, add, steer, interrupt, force-merge, and mark-clean. These commands open
 interactive execution/task and action pickers when handles are omitted; their

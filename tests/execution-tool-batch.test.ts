@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -77,6 +78,7 @@ test("ExecuteSubtasks is the sole execution tool and exposes the durable action 
   ]);
   assert.equal(parameters.properties.tasks.minItems, 1);
   assert.equal(parameters.properties.tasks.maxItems, 16);
+  assert.equal(parameters.properties.tasks.items.properties.wakeOn, undefined);
   assert.equal(parameters.properties.maxWorkers, undefined);
   assert.equal(parameters.properties.parallelism, undefined);
   assert.match(parameters.properties.interruptMode.description, /must always be inspected afterward/i);
@@ -150,6 +152,7 @@ test("saved executor settings govern queued dispatch while existing leases keep 
   });
   manager.sync();
   const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+  let executionRoot: string | undefined;
   try {
     const started = await execute("live-settings-start", {
       action: "start",
@@ -158,6 +161,7 @@ test("saved executor settings govern queued dispatch while existing leases keep 
         { title: "queued dispatch", instructions: "remain queued", acceptanceCriteria: ["eventually finish"] },
       ],
     }, undefined, undefined, {});
+    executionRoot = started.details.root as string;
     const executionId = started.details.executionId as string;
     const inspect = async () => (await execute("live-settings-inspect", { action: "inspect", executionId }, undefined, undefined, {})).details as Record<string, any>;
     await waitUntil(async () => (await inspect()).tasks[0]?.executorEntryId === "qwen");
@@ -177,6 +181,7 @@ test("saved executor settings govern queued dispatch while existing leases keep 
   } finally {
     await manager.shutdown();
     await manager.detach();
+    if (executionRoot) await rm(executionRoot, { recursive: true, force: true });
   }
 });
 
@@ -187,6 +192,7 @@ test("ExecuteSubtasks rejects malformed and obsolete requests with diagnostics",
     ["empty", { action: "start", tasks: [] }],
     ["obsolete", { action: "start", tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"] }], maxWorkers: 2 }],
     ["unknown-task-key", { action: "start", tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"], extra: true }] }],
+    ["removed-wake-policy", { action: "start", tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"], wakeOn: { completion: "now" } }] }],
     ["missing-steer-target", { action: "steer", instructions: "change direction" }],
   ] as const) {
     const result = await execute(id, request, undefined, undefined, {});

@@ -63,17 +63,7 @@ export function isForceMergeCandidateTaskState(state: BackgroundTaskState): bool
   return !isActiveTaskState(state);
 }
 
-export type WakeLane = "now" | "soon" | "idle";
-
-export interface TaskWakeRules {
-  completion?: WakeLane;
-  failure?: WakeLane;
-  match?: string[];
-}
-
-export interface BackgroundTaskDefinition extends WaveWorkerTask {
-  wakeOn?: TaskWakeRules;
-}
+export type BackgroundTaskDefinition = WaveWorkerTask;
 
 export interface BackgroundCommandRecord {
   instructionId: string;
@@ -112,7 +102,6 @@ export interface BackgroundTaskRecord {
   activity: BackgroundActivityEvent[];
   nextActivitySequence: number;
   commands: BackgroundCommandRecord[];
-  matchedWakePatterns: string[];
   pendingContinuation?: { instructions: string; instructionId: string };
   interruptionMode?: "interrupt_as_failure" | "interrupt_with_merge";
   reviewStatus?: {
@@ -1127,14 +1116,6 @@ export class BackgroundExecutionController {
     const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
     const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
     if (transition) void saved.then(() => this.wake(task, "state", transition, snapshot)).catch(() => undefined);
-    for (const pattern of task.definition.wakeOn?.match ?? []) {
-      if (task.matchedWakePatterns.includes(pattern)) continue;
-      let matched = false;
-      try { matched = new RegExp(pattern, "i").test(update.message); } catch { matched = update.message.includes(pattern); }
-      if (!matched) continue;
-      task.matchedWakePatterns.push(pattern);
-      void this.wake(task, "match", `Task ${task.taskId} matched ${JSON.stringify(pattern)}: ${update.message}`);
-    }
     this.updateIndicator();
   }
 
@@ -1320,16 +1301,14 @@ export class BackgroundExecutionController {
 
   private async wake(
     task: BackgroundTaskRecord,
-    kind: "completion" | "failure" | "match" | "state",
+    kind: "completion" | "failure" | "state",
     content: string,
     eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
   ): Promise<void> {
     const lane = kind === "state"
       ? "now"
       : kind === "completion"
-      ? task.definition.wakeOn?.completion ?? "soon"
-      : kind === "failure"
-        ? task.definition.wakeOn?.failure ?? "now"
+        ? "soon"
         : "now";
     const owner = [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
     const eventOwner = eventSnapshot?.group ?? owner;
@@ -1498,7 +1477,7 @@ function clipWidgetLine(value: string, width: number): string {
 function formatExecutionEvent(
   group: BackgroundExecutionGroup,
   task: BackgroundTaskRecord,
-  kind: "completion" | "failure" | "match" | "state",
+  kind: "completion" | "failure" | "state",
   content: string,
 ): string {
   const landed = group.tasks.filter((candidate) => candidate.state === "landed");
@@ -1587,7 +1566,6 @@ function newTask(definition: BackgroundTaskDefinition): BackgroundTaskRecord {
     activity: [],
     nextActivitySequence: 1,
     commands: [],
-    matchedWakePatterns: [],
   };
 }
 
@@ -1631,6 +1609,10 @@ async function readGroup(root: string): Promise<BackgroundExecutionGroup> {
   const { integritySha256, ...unsigned } = parsed;
   const actual = createHash("sha256").update(JSON.stringify({ ...unsigned, integritySha256: undefined })).digest("hex");
   if (!integritySha256 || integritySha256 !== actual) throw new Error("Background execution manifest failed its integrity check.");
+  for (const task of parsed.tasks) {
+    delete (task as BackgroundTaskRecord & { matchedWakePatterns?: string[] }).matchedWakePatterns;
+    delete (task.definition as BackgroundTaskDefinition & { wakeOn?: unknown }).wakeOn;
+  }
   return parsed;
 }
 

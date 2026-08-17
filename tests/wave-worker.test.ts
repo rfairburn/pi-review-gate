@@ -551,7 +551,7 @@ test("wave-worker hands a verified checkpoint to the next executor pool entry in
       artifactDir,
       config,
       executorAssignment: { entry: pool[0]!, priority: 0 },
-      acquireFailover: async (priority) => priority === 0 ? { entry: pool[1]!, priority: 1 } : undefined,
+      acquireFailover: async (assignment) => assignment.priority === 0 ? { entry: pool[1]!, priority: 1 } : undefined,
     });
 
     assert.equal(result.status, "completed");
@@ -1212,7 +1212,10 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
       }],
     });
 
-    // Resume with corrections.
+    // Resume with corrections. The changed executor selection must use a new
+    // session and the verified checkpoint handoff rather than attempting to
+    // attach the old executor's native session.
+    const updates: string[] = [];
     const resumeResult = await resumeWaveWorker({
       sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume2",
@@ -1224,9 +1227,12 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
       priorResult: firstResult,
       feedback: "Please fix the issue.",
       turn: 2,
+      onUpdate: (update) => updates.push(update.message),
     });
 
     assert.equal(resumeResult.status, "completed");
+    assert.notEqual(resumeResult.session?.id, firstResult.session?.id, "changed executor settings must start a fresh session");
+    assert.ok(updates.some((message) => /current \/review-settings changed the executor assignment/.test(message)));
     const resumeCandidate = resumeResult.candidate!;
 
     // The new candidate should have a different SHA (correction changed files).

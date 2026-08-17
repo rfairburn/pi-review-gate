@@ -46,3 +46,45 @@ test("failover only acquires a lower-priority executor", async () => {
   primary.release();
   fallback?.release();
 });
+
+test("live reconfiguration preserves running leases while new work uses current priority and capacity", () => {
+  const scheduler = new ExecutorPoolScheduler(entries);
+  const qwen = scheduler.tryAcquire()!;
+  const deepseek = scheduler.tryAcquire()!;
+
+  scheduler.reconfigure([
+    { entryId: "luna", selection: { source: "external", id: "luna" }, maxConcurrent: 1 },
+    { entryId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 2 },
+  ]);
+
+  const firstCurrent = scheduler.tryAcquire()!;
+  const secondCurrent = scheduler.tryAcquire()!;
+  assert.equal(firstCurrent.entry.entryId, "luna");
+  assert.equal(secondCurrent.entry.entryId, "qwen");
+  assert.equal(scheduler.activeCount("qwen"), 2);
+  assert.equal(scheduler.activeCount("deepseek"), 1, "removed entries retain only their running lease count");
+
+  qwen.release();
+  deepseek.release();
+  firstCurrent.release();
+  secondCurrent.release();
+});
+
+test("waiting failover recomputes from current settings by stable entry id", async () => {
+  const scheduler = new ExecutorPoolScheduler(entries.slice(0, 2));
+  const qwen = scheduler.tryAcquire()!;
+  const deepseek = scheduler.tryAcquire()!;
+  const deepseekSecond = scheduler.tryAcquire()!;
+  const waiting = scheduler.acquireAfter(qwen);
+
+  scheduler.reconfigure([
+    { entryId: "luna", selection: { source: "external", id: "luna" }, maxConcurrent: 1 },
+  ]);
+
+  const fallback = await waiting;
+  assert.equal(fallback?.entry.entryId, "luna", "removing the failed entry restarts failover at current top priority");
+  qwen.release();
+  deepseek.release();
+  deepseekSecond.release();
+  fallback?.release();
+});

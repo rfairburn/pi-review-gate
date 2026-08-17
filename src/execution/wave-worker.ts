@@ -258,7 +258,7 @@ export interface WaveWorkerInput {
   /** Capacity lease selected by the wave scheduler. */
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
-  acquireFailover?: (currentPriority: number) => Promise<ExecutorPoolAssignment | undefined>;
+  acquireFailover?: (current: ExecutorPoolAssignment) => Promise<ExecutorPoolAssignment | undefined>;
 }
 
 /** Input for resuming a wave worker turn (continuation). */
@@ -296,7 +296,7 @@ export interface WaveWorkerContinuationInput {
   /** Capacity lease selected by the wave scheduler. */
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
-  acquireFailover?: (currentPriority: number) => Promise<ExecutorPoolAssignment | undefined>;
+  acquireFailover?: (current: ExecutorPoolAssignment) => Promise<ExecutorPoolAssignment | undefined>;
 }
 
 // ── validation ───────────────────────────────────────────────────────────────
@@ -684,7 +684,7 @@ async function runWithPoolFailover(input: {
         checkpoint,
         incidents: [incident],
       };
-      const next = await input.worker.acquireFailover?.(assignment.priority);
+      const next = await input.worker.acquireFailover?.(assignment);
       if (!next) {
         input.operation.state = "paused_recoverable";
         await writeOperationRecord(input.operation);
@@ -761,7 +761,7 @@ async function runWithPoolFailover(input: {
       return { adapter, recovered };
     }
 
-    const next = await input.worker.acquireFailover?.(assignment.priority);
+    const next = await input.worker.acquireFailover?.(assignment);
     if (!next) {
       await writeOperationRecord(input.operation);
       return { adapter, recovered };
@@ -1092,6 +1092,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
 
   const operation = await readOperationRecord(operationRecordPath(resolvedArtifactDir));
   operation.state = "running";
+  const priorExecutorSelection = operation.executorSelection;
   const assignment = input.executorAssignment ?? (config.execution?.executorPool !== undefined
     ? assignmentFromOperation(operation, config) ?? configuredAssignment(config)
     : configuredAssignment(config));
@@ -1125,14 +1126,24 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     "Current continuation instructions:",
     rewrittenFeedback,
   ].join("\n");
+  const selectionChanged = priorExecutorSelection !== undefined
+    && executorSelectionKey(priorExecutorSelection) !== executorSelectionKey(assignment.entry.selection);
+  const resumableSession = selectionChanged ? undefined : priorResult.session;
+  if (priorResult.session && selectionChanged) {
+    reportProgress(input, {
+      phase: "correcting",
+      message: `current /review-settings changed the executor assignment; starting a new ${assignment.entry.entryId} session from the durable checkpoint`,
+      artifactDir: resolvedArtifactDir,
+    });
+  }
   const poolRun = await runWithPoolFailover({
     worker: input,
     operation,
     assignment,
-    prompt: priorResult.session ? rewrittenFeedback : handoffPrompt,
+    prompt: resumableSession ? rewrittenFeedback : handoffPrompt,
     handoffPrompt,
     startingTurn: turn,
-    session: priorResult.session,
+    session: resumableSession,
     reason: "continuation",
     resolvedArtifactDir,
   });

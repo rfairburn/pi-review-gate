@@ -6,7 +6,7 @@ import type { ReviewGateConfig } from "../config";
 import { externalAgentCatalog, resolvedExecutorPool } from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
-import type { ExecutionAssociationsSnapshot } from "../session-state";
+import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts, unresolvedConflictMarkers } from "./conflict-materialization";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { continueOperation, inspectOperation } from "./operation-actions";
@@ -105,6 +105,7 @@ export interface BackgroundTaskRecord {
   waveRoot?: string;
   bundle?: ReattachmentBundle;
   executorEntryId?: string;
+  lastRuntimeConfigDigest?: string;
   result?: WaveResult;
   summary?: string;
   error?: string;
@@ -190,6 +191,7 @@ export class BackgroundExecutionController {
   private active = 0;
   private shuttingDown = false;
   private pumping = false;
+  private pumpRequested = false;
   private scopedModels: string[] = [];
   private conflictGate?: BackgroundConflictGate;
   private releaseConflictBlock?: () => void;
@@ -223,8 +225,7 @@ export class BackgroundExecutionController {
   }
 
   refreshPool(): void {
-    if (this.active !== 0) return;
-    this.pool = new ExecutorPoolScheduler(resolvedExecutorPool(this.input.config));
+    this.pool.reconfigure(resolvedExecutorPool(this.input.config));
     void this.pump();
   }
 
@@ -782,6 +783,7 @@ export class BackgroundExecutionController {
     this.runtimes.clear();
     this.active = 0;
     this.shuttingDown = false;
+    this.pumpRequested = false;
     this.conflictGate = undefined;
     this.releaseConflictBlock?.();
     this.releaseConflictBlock = undefined;
@@ -789,7 +791,11 @@ export class BackgroundExecutionController {
   }
 
   private async pump(): Promise<void> {
-    if (this.pumping || this.shuttingDown) return;
+    if (this.shuttingDown) return;
+    if (this.pumping) {
+      this.pumpRequested = true;
+      return;
+    }
     this.pumping = true;
     try {
       const maxWorkers = this.input.config.execution?.maxWorkers ?? 4;
@@ -803,6 +809,23 @@ export class BackgroundExecutionController {
             ? this.pool.tryAcquireEntry(requiredEntry)
             : this.pool.tryAcquire();
           if (!lease) continue;
+          const currentConfigDigest = configDigest(this.input.config);
+          const settingsChanged = Boolean(
+            queued.task.pendingContinuation
+            && queued.task.lastRuntimeConfigDigest
+            && queued.task.lastRuntimeConfigDigest !== currentConfigDigest,
+          );
+          const executorChanged = Boolean(requiredEntry && lease.entry.entryId !== requiredEntry);
+          if (settingsChanged || executorChanged) {
+            const warning = executorChanged
+              ? `Current /review-settings no longer selects prior executor ${requiredEntry}; restarting ${queued.task.taskId} with ${lease.entry.entryId} from its durable checkpoint may change behavior.`
+              : `Current /review-settings differ from the settings used by the prior ${queued.task.taskId} run; the restart will use the current values and may behave differently.`;
+            queued.task.summary = warning;
+            addActivity(queued.task, "configuration", warning);
+            await this.save(queued.group);
+            await this.input.notify?.(`review gate: ${warning}`);
+          }
+          queued.task.lastRuntimeConfigDigest = currentConfigDigest;
           this.launch(queued.group, queued.task, lease);
           launched = true;
           break;
@@ -811,6 +834,10 @@ export class BackgroundExecutionController {
       }
     } finally {
       this.pumping = false;
+      if (this.pumpRequested && !this.shuttingDown) {
+        this.pumpRequested = false;
+        void this.pump();
+      }
     }
   }
 

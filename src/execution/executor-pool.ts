@@ -10,7 +10,7 @@ export interface ExecutorPoolLease extends ExecutorPoolAssignment {
 }
 
 interface Waiter {
-  startPriority: number;
+  after: number | string;
   resolve: (lease: ExecutorPoolLease | undefined) => void;
   signal?: AbortSignal;
   abort?: () => void;
@@ -21,7 +21,12 @@ export class ExecutorPoolScheduler {
   private readonly running = new Map<string, number>();
   private readonly waiters: Waiter[] = [];
 
-  constructor(private readonly entries: readonly ExecutorPoolEntry[]) {}
+  constructor(private entries: readonly ExecutorPoolEntry[]) {}
+
+  reconfigure(entries: readonly ExecutorPoolEntry[]): void {
+    this.entries = entries;
+    this.drainWaiters();
+  }
 
   tryAcquire(startPriority = 0): ExecutorPoolLease | undefined {
     for (let priority = Math.max(0, startPriority); priority < this.entries.length; priority += 1) {
@@ -69,14 +74,15 @@ export class ExecutorPoolScheduler {
     };
   }
 
-  acquireAfter(priority: number, signal?: AbortSignal): Promise<ExecutorPoolLease | undefined> {
-    const startPriority = priority + 1;
+  acquireAfter(current: number | ExecutorPoolAssignment, signal?: AbortSignal): Promise<ExecutorPoolLease | undefined> {
+    const after = typeof current === "number" ? current : current.entry.entryId;
+    const startPriority = this.priorityAfter(after);
     if (startPriority >= this.entries.length) return Promise.resolve(undefined);
     const immediate = this.tryAcquire(startPriority);
     if (immediate) return Promise.resolve(immediate);
     if (signal?.aborted) return Promise.resolve(undefined);
     return new Promise((resolvePromise) => {
-      const waiter: Waiter = { startPriority, resolve: resolvePromise, signal };
+      const waiter: Waiter = { after, resolve: resolvePromise, signal };
       waiter.abort = () => {
         const index = this.waiters.indexOf(waiter);
         if (index >= 0) this.waiters.splice(index, 1);
@@ -104,7 +110,14 @@ export class ExecutorPoolScheduler {
         waiter?.resolve(undefined);
         continue;
       }
-      const lease = this.tryAcquire(waiter.startPriority);
+      const startPriority = this.priorityAfter(waiter.after);
+      if (startPriority >= this.entries.length) {
+        this.waiters.splice(index, 1);
+        waiter.signal?.removeEventListener("abort", waiter.abort!);
+        waiter.resolve(undefined);
+        continue;
+      }
+      const lease = this.tryAcquire(startPriority);
       if (!lease) {
         index += 1;
         continue;
@@ -113,5 +126,11 @@ export class ExecutorPoolScheduler {
       waiter.signal?.removeEventListener("abort", waiter.abort!);
       waiter.resolve(lease);
     }
+  }
+
+  private priorityAfter(after: number | string): number {
+    if (typeof after === "number") return after + 1;
+    const currentPriority = this.entries.findIndex((entry) => entry.entryId === after);
+    return currentPriority < 0 ? 0 : currentPriority + 1;
   }
 }

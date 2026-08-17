@@ -5,6 +5,7 @@ import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
+import type { ExecutorPoolAssignment } from "./executor-pool";
 import { candidateRefName, normalizeCandidate, pinRecoveryCandidate } from "./wave-commits";
 import type { WaveIntegrationResult } from "./wave-integration";
 import { executeWaveLanding, inspectLandingRecoveryManifests, planWaveLanding, recoverLandingManifest, type LandingExecutionResult, type LandingPlan, type LandingRecoveryManifestInspection } from "./wave-landing";
@@ -429,9 +430,9 @@ export async function continueOperation(input: {
   await writeOperationRecord(record);
   const continuationPool = input.executorPool ?? new ExecutorPoolScheduler(resolvedExecutorPool(input.config));
   let failoverLease: ExecutorPoolLease | undefined;
-  const acquireFailover = async (currentPriority: number) => {
+  const acquireFailover = async (currentAssignment: ExecutorPoolAssignment) => {
     failoverLease?.release();
-    failoverLease = await continuationPool.acquireAfter(currentPriority, input.signal);
+    failoverLease = await continuationPool.acquireAfter(currentAssignment, input.signal);
     return failoverLease;
   };
   let continued: WaveWorkerResult;

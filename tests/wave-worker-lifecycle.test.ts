@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -253,6 +253,62 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
     assert.equal(resultJson.status, "accepted");
     assert.equal(resultJson.taskId, "task-pass");
 
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle resolves current review settings after executor work completes", async () => {
+  const root = await mkTmp("pi-wwl-live-review-settings-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-live-review-settings");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-live-review-settings");
+    const startedMarker = join(root, "executor-started.txt");
+    const oldReviewerMarker = join(root, "old-reviewer.txt");
+    const newReviewerMarker = join(root, "new-reviewer.txt");
+    const executor = join(root, "delayed-executor.cjs");
+    await writeFile(executor, [
+      "const fs=require('node:fs');const path=require('node:path');",
+      `fs.writeFileSync(${JSON.stringify(startedMarker)},'started');`,
+      "setTimeout(()=>{",
+      "fs.writeFileSync(path.join(process.cwd(),'worker-output.txt'),'worker done\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:'live-settings-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'Implemented the change.'}));",
+      "},250);",
+    ].join("\n"), "utf8");
+    const reviewer = (id: string, marker: string) => ({
+      id,
+      adapter: "generic-cli" as const,
+      command: process.execPath,
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'used');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))`],
+      timeoutMs: 15_000,
+    });
+    const config = buildConfig(executor);
+    config.decider = reviewer("old", oldReviewerMarker);
+
+    const running = runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-live-review-settings",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (await access(startedMarker).then(() => true, () => false)) break;
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+    }
+    await access(startedMarker);
+    config.decider = reviewer("new", newReviewerMarker);
+
+    const result = await running;
+    assert.equal(result.status, "accepted");
+    assert.equal(await readFile(newReviewerMarker, "utf8"), "used");
+    await assert.rejects(access(oldReviewerMarker), /ENOENT/);
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {
     await rm(root, { recursive: true, force: true });

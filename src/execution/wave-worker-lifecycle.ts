@@ -554,27 +554,28 @@ export async function runWaveWorkerLifecycle(
   };
 
   // Validate maxCorrectionCycles override as a non-negative integer.
-  const maxCorrectionCycles = input.maxCorrectionCycles ?? config.maxCorrectionCycles;
-  if (!Number.isInteger(maxCorrectionCycles) || maxCorrectionCycles < 0) {
+  const initialMaxCorrectionCycles = input.maxCorrectionCycles ?? config.maxCorrectionCycles;
+  if (!Number.isInteger(initialMaxCorrectionCycles) || initialMaxCorrectionCycles < 0) {
     const result: WaveWorkerLifecycleResult = {
       status: "review_error",
       taskId,
       title: task.title,
-      summary: `Invalid maxCorrectionCycles: ${maxCorrectionCycles}. Must be a non-negative integer.`,
+      summary: `Invalid maxCorrectionCycles: ${initialMaxCorrectionCycles}. Must be a non-negative integer.`,
       adapter: "none",
-      error: `Invalid maxCorrectionCycles: ${maxCorrectionCycles}`,
+      error: `Invalid maxCorrectionCycles: ${initialMaxCorrectionCycles}`,
       reviewCycles: [],
       artifactDir: resolvedArtifactDir,
     };
     return result;
   }
 
-  // ── 1. Freeze/validate reviewer selection (before artifact dir creation) ──
-  let frozen: { frozenConfig: ReviewGateConfig; enabled: boolean };
+  // Fail fast on an invalid initial selection, but do not retain it. The
+  // current /review-settings selection is resolved again when each review
+  // cycle actually begins.
   try {
-    frozen = freezeReviewers(config, scopedModels);
+    freezeReviewers(config, scopedModels);
   } catch (error) {
-    const result: WaveWorkerLifecycleResult = {
+    return {
       status: "reviewer_blocked",
       taskId,
       title: task.title,
@@ -584,7 +585,6 @@ export async function runWaveWorkerLifecycle(
       reviewCycles: [],
       artifactDir: resolvedArtifactDir,
     };
-    return result;
   }
 
   // Validate artifact path BEFORE mkdir (same canonical checks as runWaveWorker).
@@ -815,27 +815,6 @@ export async function runWaveWorkerLifecycle(
     return result;
   }
 
-  // Review disabled or no reviewers — pin and return completed_unreviewed.
-  if (!frozen.enabled) {
-    const workerRef = await pinCommit(capture, candidate.commitSha, { type: "worker", taskId }, signal);
-    const result: WaveWorkerLifecycleResult = {
-      status: "completed_unreviewed",
-      taskId,
-      title: task.title,
-      summary: initialResult.summary,
-      adapter: initialResult.adapter,
-      model: initialResult.model,
-      usage: initialResult.usage,
-      acceptedRef: workerRef,
-      acceptedCommitSha: candidate.commitSha,
-      unreviewed: true,
-      reviewCycles: [],
-      artifactDir: resolvedArtifactDir,
-    };
-    await writeResult(resolvedArtifactDir, result);
-    return result;
-  }
-
   // ── 5. Review loop ──
   const { state: reviewState, window } = createWorkerReviewState();
   // Set the baseline snapshot for the review window.
@@ -854,6 +833,44 @@ export async function runWaveWorkerLifecycle(
 
   for (;;) {
     await steeringEvidence.flush();
+    let frozen: { frozenConfig: ReviewGateConfig; enabled: boolean };
+    try {
+      frozen = freezeReviewers(config, scopedModels);
+    } catch (error) {
+      const result: WaveWorkerLifecycleResult = {
+        status: "reviewer_blocked",
+        taskId,
+        title: task.title,
+        summary: error instanceof Error ? error.message : "Reviewer selection blocked.",
+        adapter: currentResult.adapter,
+        model: currentResult.model,
+        error: error instanceof Error ? error.message : "Reviewer selection blocked.",
+        reviewCycles,
+        artifactDir: resolvedArtifactDir,
+      };
+      await writeResult(resolvedArtifactDir, result);
+      return result;
+    }
+    if (!frozen.enabled) {
+      const workerRef = await pinCommit(capture, currentCandidate.commitSha, { type: "worker", taskId }, signal);
+      const result: WaveWorkerLifecycleResult = {
+        status: "completed_unreviewed",
+        taskId,
+        title: task.title,
+        summary: currentResult.summary,
+        adapter: currentResult.adapter,
+        model: currentResult.model,
+        usage: currentResult.usage,
+        acceptedRef: workerRef,
+        acceptedCommitSha: currentCandidate.commitSha,
+        unreviewed: true,
+        reviewCycles,
+        artifactDir: resolvedArtifactDir,
+      };
+      await writeResult(resolvedArtifactDir, result);
+      return result;
+    }
+    const maxCorrectionCycles = input.maxCorrectionCycles ?? config.maxCorrectionCycles;
     const reviewTask = rewriteTaskPaths(
       task,
       [input.sourceRoot, ...(input.sourceRootAliases ?? [])],

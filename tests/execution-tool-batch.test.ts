@@ -115,6 +115,71 @@ test("execution review readiness reports every unfinished task and omits termina
   assert.deepEqual(manager.reviewReadiness(), []);
 });
 
+test("saved executor settings govern queued dispatch while existing leases keep running", async () => {
+  const tools: Array<Record<string, any>> = [];
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: ["qwen", "deepseek"].map((id) => ({
+      id,
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: {
+        protocol: "pi-review-executor-jsonl-v1",
+        args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
+      },
+    })),
+    execution: {
+      executorPool: [
+        { entryId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+        { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+      ],
+      maxWorkers: 1,
+    },
+  });
+  const manager = new ExecutionToolManager({
+    pi: {
+      registerTool(tool: Record<string, any>) { tools.push(tool); },
+      registerCommand() {},
+      setToolActive() {},
+      getActiveTools() { return ["read", "ExecuteSubtasks"]; },
+    },
+    config,
+    state: createState(),
+    cwd: () => process.cwd(),
+  });
+  manager.sync();
+  const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+  try {
+    const started = await execute("live-settings-start", {
+      action: "start",
+      tasks: [
+        { title: "existing lease", instructions: "remain active", acceptanceCriteria: ["eventually finish"] },
+        { title: "queued dispatch", instructions: "remain queued", acceptanceCriteria: ["eventually finish"] },
+      ],
+    }, undefined, undefined, {});
+    const executionId = started.details.executionId as string;
+    const inspect = async () => (await execute("live-settings-inspect", { action: "inspect", executionId }, undefined, undefined, {})).details as Record<string, any>;
+    await waitUntil(async () => (await inspect()).tasks[0]?.executorEntryId === "qwen");
+
+    config.execution!.executorPool = [
+      { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+    ];
+    config.execution!.maxWorkers = 2;
+    manager.sync();
+
+    const inspection = await waitUntil(async () => {
+      const current = await inspect();
+      return current.tasks[1]?.executorEntryId === "deepseek" ? current : undefined;
+    });
+    assert.equal(inspection.tasks[0]?.executorEntryId, "qwen");
+    assert.equal(inspection.tasks[1]?.executorEntryId, "deepseek");
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
 test("ExecuteSubtasks rejects malformed and obsolete requests with diagnostics", async () => {
   const { tools } = harness();
   const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
@@ -266,4 +331,14 @@ function renderWidget(content: unknown, width = 240): string[] {
   assert.equal(typeof content, "function");
   const component = (content as () => { render(width: number): string[] })();
   return component.render(width);
+}
+
+async function waitUntil<T>(condition: () => Promise<T | undefined | false>, timeoutMs = 5_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await condition();
+    if (value !== undefined && value !== false) return value;
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+  throw new Error(`condition was not satisfied within ${timeoutMs}ms`);
 }

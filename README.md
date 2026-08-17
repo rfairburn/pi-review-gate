@@ -131,7 +131,7 @@ The older single `decider` field is still supported for compatibility.
 
 ### Delegated execution and runtime settings
 
-`/review-settings` opens one staged settings transaction with seven sections:
+`/review-settings` opens one staged settings transaction with eight sections:
 
 - **Executor pool** is an ordered list of Pi-scoped little-coder models and
   execution-capable entries from `externalAgents`. **Add executor** walks
@@ -163,6 +163,15 @@ root discards all staged changes; **Save changes** atomically persists every
 section while preserving unrelated JSON keys. An inactive external definition
 does not need to be installed. Its command is checked when that definition is
 selected or run.
+
+Saved values are authoritative for execution stages that have not started.
+Already-running executor and reviewer processes finish with their launch
+values, while queued dispatch, waiting failover, later continuation turns, and
+later review cycles use the current pool, capacities, policies, and reviewer
+selection. Running capacity leases survive pool edits; removed entries receive
+no new work. A restarted task warns when its prior runtime configuration differs,
+and an executor-selection change starts a fresh native session from the durable
+checkpoint instead of attaching an incompatible conversation.
 
 The executor pool and reviewers are independent:
 

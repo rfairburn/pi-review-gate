@@ -6,7 +6,7 @@ import { normalizeConfig } from "../src/config";
 import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
 
-function harness(options: { slowExecutor?: boolean } = {}) {
+function harness(options: { slowExecutor?: boolean; expandedView?: boolean } = {}) {
   const tools: Array<Record<string, any>> = [];
   const commands: string[] = [];
   const commandHandlers = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
@@ -19,6 +19,7 @@ function harness(options: { slowExecutor?: boolean } = {}) {
       commandHandlers.set(name, options.handler);
     },
     setToolActive(name: string, enabled: boolean) { active.push({ name, enabled }); },
+    getActiveTools() { return ["read", "bash", "ExecuteSubtasks"]; },
   };
   const config = normalizeConfig({
     enabled: true,
@@ -35,8 +36,16 @@ function harness(options: { slowExecutor?: boolean } = {}) {
       },
     }],
     execution: { activeExecutor: { source: "external", id: "fake" } },
+    ui: { subtasksViewExpanded: options.expandedView ?? false },
   });
-  const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => process.cwd(), notify: (message) => { notices.push(message); } });
+  const manager = new ExecutionToolManager({
+    pi,
+    config,
+    state: createState(),
+    cwd: () => process.cwd(),
+    notify: (message) => { notices.push(message); },
+    onExpandedViewChanged: (expanded) => { config.ui = { ...config.ui, subtasksViewExpanded: expanded }; },
+  });
   manager.sync();
   return { tools, commands, commandHandlers, notices, active, manager, config };
 }
@@ -53,6 +62,7 @@ test("ExecuteSubtasks is the sole execution tool and exposes the durable action 
     "subtask-mark-clean",
     "subtask-steer",
     "subtasks",
+    "subtasks-view",
   ]);
   const parameters = tools[0]!.parameters as Record<string, any>;
   assert.deepEqual(parameters.required, ["action"]);
@@ -63,6 +73,11 @@ test("ExecuteSubtasks is the sole execution tool and exposes the durable action 
   assert.equal(parameters.properties.tasks.maxItems, 16);
   assert.equal(parameters.properties.maxWorkers, undefined);
   assert.equal(parameters.properties.parallelism, undefined);
+  assert.match(parameters.properties.interruptMode.description, /must always be inspected afterward/i);
+  assert.match(parameters.properties.mergeAnyhow.description, /always requires manual workspace inspection/i);
+  assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Steering wins over review/.test(guideline)));
+  assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Meaningful interaction points inject a message/.test(guideline)));
+  assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Every force_merge outcome requires manual inspection/.test(guideline)));
 });
 
 test("ExecuteSubtasks rejects malformed and obsolete requests with diagnostics", async () => {
@@ -119,6 +134,37 @@ test("ExecuteSubtasks renders action, task count, and durable task states", () =
   assert.match(rendered, /task-b conflicted Needs merge/);
 });
 
+test("/subtasks-view toggles a live multiline widget without entering model context", async () => {
+  const { commandHandlers, manager, config } = harness();
+  const widgetCalls: Array<{ key: string; content: unknown; placement?: string }> = [];
+  const ctx = {
+    ui: {
+      setWidget(key: string, content: unknown, options?: { placement?: string }) {
+        widgetCalls.push({ key, content, placement: options?.placement });
+      },
+    },
+  };
+  await commandHandlers.get("subtasks-view")!("", ctx);
+  assert.equal(widgetCalls.at(-1)?.key, "review-gate-subtasks");
+  assert.equal(widgetCalls.at(-1)?.placement, "belowEditor");
+  assert.equal(typeof widgetCalls.at(-1)?.content, "function");
+  const expanded = renderWidget(widgetCalls.at(-1)?.content).join("\n");
+  assert.match(expanded, /expanded live view/);
+  assert.match(expanded, /10 newest events across all tasks/);
+  assert.equal(config.ui?.subtasksViewExpanded, true);
+  assert.equal("subtasksViewExpanded" in manager.associations(), false);
+  const restoredHarness = harness({ expandedView: true });
+  const restoredWidgets: unknown[] = [];
+  restoredHarness.manager.setUiContext({
+    ui: { setWidget: (_key: string, content: unknown) => restoredWidgets.push(content) },
+  });
+  assert.match(renderWidget(restoredWidgets.at(-1)).join("\n"), /expanded live view/);
+  await restoredHarness.manager.shutdown();
+  await commandHandlers.get("subtasks-view")!("", ctx);
+  assert.equal(widgetCalls.at(-1)?.content, undefined);
+  assert.equal(config.ui?.subtasksViewExpanded, false);
+});
+
 test("ExecuteSubtasks start result explains that queued work may have startup delay", async () => {
   const { tools, manager } = harness();
   const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
@@ -127,9 +173,13 @@ test("ExecuteSubtasks start result explains that queued work may have startup de
     tasks: [{ title: "Waiting work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
   assert.match(result.content[0].text, /Queued tasks may wait for executor startup or available pool capacity/);
-  assert.match(result.content[0].text, /Inspect whenever you need current status or diagnostics; avoid tight repetitive polling/);
+  assert.match(result.content[0].text, /trigger an orchestrator turn at meaningful interaction points/);
+  assert.match(result.content[0].text, /CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress.*without triggering turns/);
+  assert.match(result.content[0].text, /DO NOT POLL for task-state changes/);
+  assert.match(result.content[0].text, /repeated inspect loop, or other waiting surrogate/);
   assert.match(result.content[0].text, new RegExp(result.details.tasks[0].taskId));
   assert.match(result.content[0].text, /Task handles \(retain these for steer\/interrupt\/inspect\)/);
+  assert.deepEqual(result.details.tasks[0].definition.executorAllowedTools, ["read", "bash", "ExecuteSubtasks"]);
   await manager.shutdown();
 });
 
@@ -176,3 +226,9 @@ test("slash-command interrupt selects both the task and outcome when IDs are omi
   assert.match(notices.at(-1) ?? "", /interrupted/);
   await manager.shutdown();
 });
+
+function renderWidget(content: unknown, width = 240): string[] {
+  assert.equal(typeof content, "function");
+  const component = (content as () => { render(width: number): string[] })();
+  return component.render(width);
+}

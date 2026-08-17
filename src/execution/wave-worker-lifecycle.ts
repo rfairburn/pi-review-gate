@@ -22,6 +22,7 @@ import {
   rewriteTaskPaths,
   runWaveWorker,
   resumeWaveWorker,
+  createTaskInstructionEvidenceRecorder,
   validateArtifactPath,
   type WaveWorkerInput,
   type WaveWorkerResult,
@@ -266,6 +267,14 @@ function buildReviewRequest(task: WaveWorkerTask): string {
   ];
   if (task.relevantContext) {
     lines.push("", "Relevant context:", task.relevantContext);
+  }
+  if (task.authoritativeUpdates?.length) {
+    lines.push(
+      "",
+      "Acknowledged task updates (authoritative, in delivery order):",
+      "Later updates supersede any conflicting original instruction or acceptance criterion. Review the candidate against the resulting effective request.",
+      ...task.authoritativeUpdates.map((item) => `- [${item.action}:${item.instructionId}] ${item.instruction}`),
+    );
   }
   lines.push(
     "",
@@ -539,6 +548,10 @@ export async function runWaveWorkerLifecycle(
   } = input;
 
   const resolvedArtifactDir = resolve(artifactDir);
+  const steeringEvidence = createTaskInstructionEvidenceRecorder(task, resolvedArtifactDir);
+  const publishLiveControl = (control: import("./types").ExecutorLiveControl | undefined): void => {
+    input.onLiveControl?.(steeringEvidence.wrap(control));
+  };
 
   // Validate maxCorrectionCycles override as a non-negative integer.
   const maxCorrectionCycles = input.maxCorrectionCycles ?? config.maxCorrectionCycles;
@@ -596,7 +609,8 @@ export async function runWaveWorkerLifecycle(
 
   let initialResult: WaveWorkerResult;
   try {
-    initialResult = input.initialResult ?? await runWaveWorker(input);
+    initialResult = input.initialResult ?? await runWaveWorker({ ...input, onLiveControl: publishLiveControl });
+    await steeringEvidence.flush();
   } catch (error) {
     const result: WaveWorkerLifecycleResult = {
       status: "executor_error",
@@ -683,8 +697,108 @@ export async function runWaveWorkerLifecycle(
     return result;
   }
 
+  // A transport that could not steer the live command leaves the instruction
+  // in the controller's durable queue. Before accepting or reviewing that
+  // candidate, claim those instructions and resume the same executor session.
+  let candidate = initialResult.candidate!;
+  let nextExecutorTurn = (initialResult.lastExecutorTurn ?? 1) + 1;
+  for (;;) {
+    let deferred: Array<{ instruction: string; instructionId: string }>;
+    try {
+      deferred = await input.takeDeferredSteering?.() ?? [];
+    } catch (error) {
+      const result: WaveWorkerLifecycleResult = {
+        status: "executor_error",
+        taskId,
+        title: task.title,
+        summary: error instanceof Error ? error.message : "Could not claim deferred steering.",
+        adapter: initialResult.adapter,
+        model: initialResult.model,
+        error: error instanceof Error ? error.message : "Could not claim deferred steering.",
+        reviewCycles: [],
+        artifactDir: resolvedArtifactDir,
+      };
+      await writeResult(resolvedArtifactDir, result);
+      return result;
+    }
+    if (deferred.length === 0) break;
+    for (const item of deferred) {
+      await steeringEvidence.record(item.instruction, item.instructionId);
+    }
+    reportProgress(input, {
+      phase: "correcting",
+      message: "executor turn settled — applying deferred steering before disposition",
+      artifactDir: resolvedArtifactDir,
+    });
+    const feedback = [
+      "The prior executor turn could not accept these newer steering instructions live.",
+      "Apply them now before this task is reviewed, accepted, or landed; later instructions take precedence:",
+      ...deferred.map((item) => `- [${item.instructionId}] ${item.instruction}`),
+      "Finish the revised work and report the replacement result.",
+    ].join("\n");
+    let steeredResult: WaveWorkerResult;
+    try {
+      steeredResult = await resumeWaveWorker({
+        taskId,
+        task,
+        capture,
+        worktree,
+        artifactDir,
+        config,
+        sourceRoot: input.sourceRoot,
+        sourceRootAliases: input.sourceRootAliases,
+        priorResult: initialResult,
+        feedback,
+        turn: nextExecutorTurn,
+        signal,
+        onUpdate: input.onUpdate,
+        onLiveControl: publishLiveControl,
+      });
+      await steeringEvidence.flush();
+    } catch (error) {
+      const result: WaveWorkerLifecycleResult = {
+        status: "executor_error",
+        taskId,
+        title: task.title,
+        summary: error instanceof Error ? error.message : "Deferred steering executor failed.",
+        adapter: initialResult.adapter,
+        model: initialResult.model,
+        error: error instanceof Error ? error.message : "Deferred steering executor failed.",
+        reviewCycles: [],
+        artifactDir: resolvedArtifactDir,
+      };
+      await writeResult(resolvedArtifactDir, result);
+      return result;
+    }
+    nextExecutorTurn = (steeredResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
+    if (["executor_error", "timeout", "cancelled", "no_changes"].includes(steeredResult.status)) {
+      const status: WaveWorkerLifecycleStatus = steeredResult.status === "executor_error"
+        ? "executor_error"
+        : steeredResult.status === "timeout"
+          ? "timeout"
+          : steeredResult.status === "cancelled"
+            ? "cancelled"
+            : "no_changes";
+      const result: WaveWorkerLifecycleResult = {
+        status,
+        taskId,
+        title: task.title,
+        summary: steeredResult.summary,
+        adapter: steeredResult.adapter,
+        model: steeredResult.model,
+        error: steeredResult.error,
+        reviewCycles: [],
+        artifactDir: resolvedArtifactDir,
+        ...executionMetadata(steeredResult),
+      };
+      await writeResult(resolvedArtifactDir, result);
+      return result;
+    }
+    initialResult = steeredResult;
+    candidate = steeredResult.candidate!;
+  }
+
   // ── 4. Review or skip ──
-  const candidate = initialResult.candidate!;
   if (!candidate.differsFromBase) {
     const result: WaveWorkerLifecycleResult = {
       status: "no_changes",
@@ -731,19 +845,20 @@ export async function runWaveWorkerLifecycle(
   // In particular, absolute source-workspace paths (including lexical aliases)
   // must resolve to this worker rather than inviting the reviewer to inspect the
   // untouched source workspace before landing.
-  const reviewTask = rewriteTaskPaths(
-    task,
-    [input.sourceRoot, ...(input.sourceRootAliases ?? [])],
-    worktree.worktreeRoot,
-  );
   let currentResult: WaveWorkerResult = initialResult;
   let currentCandidate: CandidateCommit = candidate;
   let correctionCount = 0;
   let lastCandidateTreeSha: string | undefined;
-  // Monotonic executor turn counter: starts at 2 (after initial turn 1).
-  let nextExecutorTurn = (initialResult.lastExecutorTurn ?? 1) + 1;
+  // Monotonic executor turn counter was initialized after the first turn and
+  // includes any deferred-steering handoff completed before review.
 
   for (;;) {
+    await steeringEvidence.flush();
+    const reviewTask = rewriteTaskPaths(
+      task,
+      [input.sourceRoot, ...(input.sourceRootAliases ?? [])],
+      worktree.worktreeRoot,
+    );
     // Check cancellation before each review.
     if (signal?.aborted) {
       const result: WaveWorkerLifecycleResult = {
@@ -771,6 +886,33 @@ export async function runWaveWorkerLifecycle(
       reviewers: reviewerLabels,
     });
 
+    // A change-request steer takes precedence over review. Expose a temporary
+    // control that aborts only this review invocation, then hands the collected
+    // instructions to the resumed executor session below.
+    const reviewAbort = new AbortController();
+    const reviewSteering: Array<{ instruction: string; instructionId: string }> = [];
+    const reviewSignal = signal
+      ? AbortSignal.any([signal, reviewAbort.signal])
+      : reviewAbort.signal;
+    publishLiveControl({
+      adapter: "review-gate",
+      generation: nextExecutorTurn,
+      protocol: "review-to-executor-handoff-v1",
+      capabilities: { steer: true, interrupt: false },
+      steer: async (instruction, instructionId) => {
+        reviewSteering.push({ instruction, instructionId });
+        if (!reviewAbort.signal.aborted) reviewAbort.abort(new Error("review_interrupted_for_steering"));
+        return {
+          status: "acknowledged",
+          message: "Review interruption requested; steering will be applied in the next executor turn before review restarts.",
+        };
+      },
+      interrupt: async () => ({
+        status: "blocked",
+        message: "Use the task interrupt action to stop the complete lifecycle, including its active review.",
+      }),
+    });
+
     // Run review on the current candidate (with error handling).
     let reviewOutput: ReviewRunOutput;
     try {
@@ -787,7 +929,7 @@ export async function runWaveWorkerLifecycle(
           baseSnapshot,
           config.maxPatchBytes,
           correctionCount,
-          signal,
+          reviewSignal,
           (message) => reportProgress(input, {
             phase: "reviewing",
             message,
@@ -798,22 +940,111 @@ export async function runWaveWorkerLifecycle(
         ),
         resolvedArtifactDir,
         config,
-        signal,
+        reviewSignal,
       );
     } catch (error) {
-      const result: WaveWorkerLifecycleResult = {
-        status: "review_error",
-        taskId,
-        title: task.title,
-        summary: error instanceof Error ? error.message : "Review infrastructure failed.",
-        adapter: currentResult.adapter,
-        model: currentResult.model,
-        error: error instanceof Error ? error.message : "review_error",
-        reviewCycles,
+      if (reviewSteering.length > 0 && !signal?.aborted) {
+        reviewOutput = {
+          changed: true,
+          changes: [],
+          result: { reviewerId: "gate", verdict: "error", summary: "Review interrupted for steering.", findings: [], error: "aborted" },
+        };
+      } else {
+        const result: WaveWorkerLifecycleResult = {
+          status: "review_error",
+          taskId,
+          title: task.title,
+          summary: error instanceof Error ? error.message : "Review infrastructure failed.",
+          adapter: currentResult.adapter,
+          model: currentResult.model,
+          error: error instanceof Error ? error.message : "review_error",
+          reviewCycles,
+          artifactDir: resolvedArtifactDir,
+        };
+        await writeResult(resolvedArtifactDir, result);
+        return result;
+      }
+    } finally {
+      publishLiveControl(undefined);
+      await steeringEvidence.flush();
+    }
+
+    if (reviewSteering.length > 0 && !signal?.aborted) {
+      reportProgress(input, {
+        phase: "correcting",
+        message: "review interrupted — applying higher-priority steering",
         artifactDir: resolvedArtifactDir,
-      };
-      await writeResult(resolvedArtifactDir, result);
-      return result;
+      });
+      const feedback = [
+        "The active review was interrupted because the user or orchestrator changed the requested work.",
+        "Apply these newer instructions now; they take precedence over the candidate that was being reviewed:",
+        ...reviewSteering.map((item) => `- [${item.instructionId}] ${item.instruction}`),
+        "Finish the revised work and report it for a fresh review.",
+      ].join("\n");
+      let steeredResult: WaveWorkerResult;
+      try {
+        steeredResult = await resumeWaveWorker({
+          taskId,
+          task,
+          capture,
+          worktree,
+          artifactDir,
+          config,
+          sourceRoot: input.sourceRoot,
+          sourceRootAliases: input.sourceRootAliases,
+          priorResult: currentResult,
+          feedback,
+          turn: nextExecutorTurn,
+          signal,
+          onUpdate: input.onUpdate,
+          onLiveControl: publishLiveControl,
+        });
+        await steeringEvidence.flush();
+      } catch (error) {
+        const result: WaveWorkerLifecycleResult = {
+          status: "executor_error",
+          taskId,
+          title: task.title,
+          summary: error instanceof Error ? error.message : "Steered executor failed.",
+          adapter: currentResult.adapter,
+          model: currentResult.model,
+          error: error instanceof Error ? error.message : "Steered executor failed.",
+          reviewCycles,
+          artifactDir: resolvedArtifactDir,
+        };
+        await writeResult(resolvedArtifactDir, result);
+        return result;
+      }
+      nextExecutorTurn = (steeredResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
+      if (["executor_error", "timeout", "cancelled", "no_changes"].includes(steeredResult.status)) {
+        const status: WaveWorkerLifecycleStatus = steeredResult.status === "no_changes"
+          ? "correction_cap"
+          : steeredResult.status === "executor_error"
+            ? "executor_error"
+            : steeredResult.status === "timeout"
+              ? "timeout"
+              : "cancelled";
+        const result: WaveWorkerLifecycleResult = {
+          status,
+          taskId,
+          title: task.title,
+          summary: steeredResult.status === "no_changes"
+            ? "Steering produced no candidate changes relative to base."
+            : steeredResult.summary,
+          adapter: steeredResult.adapter,
+          model: steeredResult.model,
+          error: steeredResult.error,
+          reviewCycles,
+          artifactDir: resolvedArtifactDir,
+          ...executionMetadata(steeredResult),
+        };
+        await writeResult(resolvedArtifactDir, result);
+        return result;
+      }
+      currentResult = steeredResult;
+      currentCandidate = steeredResult.candidate!;
+      lastCandidateTreeSha = undefined;
+      continue;
     }
 
     // Check for reviewer abort.
@@ -970,7 +1201,9 @@ export async function runWaveWorkerLifecycle(
           turn: nextExecutorTurn,
           signal,
           onUpdate: input.onUpdate,
+          onLiveControl: publishLiveControl,
         });
+        await steeringEvidence.flush();
       } catch (error) {
         const result: WaveWorkerLifecycleResult = {
           status: "executor_error",
@@ -1119,7 +1352,9 @@ export async function runWaveWorkerLifecycle(
         turn: nextExecutorTurn,
         signal,
         onUpdate: input.onUpdate,
+        onLiveControl: publishLiveControl,
       });
+      await steeringEvidence.flush();
     } catch (error) {
       // Confirmation executor threw — return executor_error without pinning.
       const result: WaveWorkerLifecycleResult = {

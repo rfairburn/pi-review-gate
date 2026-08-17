@@ -12,14 +12,17 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
   try {
     const artifactDir = join(root, "artifacts");
     const capture = join(root, "capture.json");
+    const environmentCapture = join(root, "environment.json");
     const command = join(root, "little-rpc.cjs");
     await mkdir(artifactDir);
     await writeFile(command, [
       "#!/usr/bin/env node",
       `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2)));`,
+      `fs.writeFileSync(${JSON.stringify(environmentCapture)},JSON.stringify({allowedTools:process.env.LITTLE_CODER_ALLOWED_TOOLS}));`,
       "let input=''; process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));}",
+      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:true,pendingMessageCount:0}}));",
       "else if(c.type==='steer'){console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'little complete'}]}}));console.log(JSON.stringify({type:'turn_end'}));console.log(JSON.stringify({type:'agent_settled'}));}",
       "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:'little complete'}}));",
       "else if(c.type==='abort'){console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));console.log(JSON.stringify({type:'agent_settled'}));}",
@@ -39,6 +42,7 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
       prompt: "initial task",
       artifactDir,
       turn: 1,
+      allowedTools: ["read", "bash", "ExecuteSubtasks"],
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
@@ -49,6 +53,8 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
     assert.equal(result.session.adapter, "little-coder-model");
     const argv: string[] = JSON.parse(await readFile(capture, "utf8"));
     assert.equal(argv[argv.indexOf("--mode") + 1], "rpc");
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,ExecuteSubtasks");
+    assert.deepEqual(JSON.parse(await readFile(environmentCapture, "utf8")), { allowedTools: "read,bash,ExecuteSubtasks" });
     assert.equal(argv.includes("--print"), false);
 
     let resolveInterruptControl!: (control: ExecutorLiveControl) => void;
@@ -65,6 +71,63 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
     const interrupted = await interruptedRun;
     assert.equal(interrupted.aborted, true);
     assert.equal(interrupted.failure?.category, "interruption");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Little Coder stays alive for ShellStart work and accepts steering while its agent is idle", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-little-background-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "prompts.jsonl");
+    const command = join(root, "little-background-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');const {spawn}=require('node:child_process');let input='';let bg;let prompts=0;process.stdin.setEncoding('utf8');",
+      `const capture=${JSON.stringify(capture)};`,
+      "const out=(v)=>console.log(JSON.stringify(v));",
+      "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});out({type:'agent_settled'});};",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){prompts++;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});if(prompts===1){bg=spawn(process.execPath,['-e','setTimeout(()=>{},5000)'],{detached:true,stdio:'ignore'});bg.unref();out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started \"long test\" as job1 (pid '+bg.pid+').\\nWaking you on: exit.'}]},isError:false});settle('background started');}else{if(bg){try{process.kill(-bg.pid,'SIGTERM')}catch{}}settle(prompts===2?'steering applied':'final inspection complete');}}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
+      "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'final inspection complete'}});",
+      "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});out({type:'agent_settled'});}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const updates: string[] = [];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new LittleCoderExecutorAdapter({
+      model: "provider/model",
+      command,
+      timeoutMs: 2_000,
+    });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "start background work",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => updates.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    await waitFor(() => updates.some((message) => message.includes("executor waiting")));
+    const acknowledgement = await control.steer("replace true with false", "steer-background-1");
+    assert.equal(acknowledgement.status, "acknowledged");
+    assert.match(acknowledgement.message, /resumed the idle executor/);
+    const result = await run;
+    assert.equal(result.failure, undefined);
+    assert.equal(result.text, "final inspection complete");
+    const prompts = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(prompts, [
+      "start background work",
+      "replace true with false",
+      "All ShellStart background process groups are now finished. Inspect their results and the workspace, address any failure, and finish the original task. Do not claim success from process exit alone; verify the requested outcome before responding.",
+    ]);
+    assert.ok(updates.some((message) => message.includes("final inspection before review")));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -154,3 +217,12 @@ test("Codex interrupt waits for the active turn terminal notification", async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+  assert.fail("timed out waiting for condition");
+}

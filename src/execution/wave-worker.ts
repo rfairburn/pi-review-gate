@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { promises as fs } from "node:fs";
@@ -89,6 +90,11 @@ export function rewriteTaskPaths(
     relevantContext: task.relevantContext
       ? rewriteSourcePaths(task.relevantContext, sourceRoot, workerRoot)
       : undefined,
+    executorAllowedTools: task.executorAllowedTools ? [...task.executorAllowedTools] : undefined,
+    authoritativeUpdates: task.authoritativeUpdates?.map((item) => ({
+      ...item,
+      instruction: rewriteSourcePaths(item.instruction, sourceRoot, workerRoot),
+    })),
   };
 }
 
@@ -125,6 +131,71 @@ export interface WaveWorkerTask {
   instructions: string;
   acceptanceCriteria: string[];
   relevantContext?: string;
+  /**
+   * Durable snapshot of the parent agent's active tools. Little Coder
+   * executor launches reuse this allowlist across retries, compaction, and
+   * continuation so a parent CLI restriction cannot be widened by spawning.
+   */
+  executorAllowedTools?: string[];
+  /** Acknowledged steering in delivery order. Later entries supersede conflicting earlier task text. */
+  authoritativeUpdates?: Array<{
+    instructionId: string;
+    action: "continue" | "steer";
+    instruction: string;
+    acknowledgedAt: string;
+  }>;
+}
+
+/** Persist acknowledged steering for executors, reviewers, and restart recovery. */
+export function createTaskInstructionEvidenceRecorder(
+  task: WaveWorkerTask,
+  artifactDir: string,
+): {
+  record(instruction: string, instructionId: string, action?: "continue" | "steer", acknowledgedAt?: string): Promise<void>;
+  wrap(control: ExecutorLiveControl | undefined): ExecutorLiveControl | undefined;
+  flush(): Promise<void>;
+} {
+  let tail = Promise.resolve();
+  const record = (
+    instruction: string,
+    instructionId: string,
+    action: "continue" | "steer" = "steer",
+    acknowledgedAt = new Date().toISOString(),
+  ): Promise<void> => {
+    tail = tail.then(async () => {
+      task.authoritativeUpdates ??= [];
+      if (task.authoritativeUpdates.some((item) => item.instructionId === instructionId)) return;
+      task.authoritativeUpdates.push({ instructionId, action, instruction, acknowledgedAt });
+      await persistTaskDefinition(artifactDir, task);
+    });
+    return tail;
+  };
+  const wrap = (control: ExecutorLiveControl | undefined): ExecutorLiveControl | undefined => {
+    if (!control) return undefined;
+    return {
+      ...control,
+      steer: async (instruction, instructionId) => {
+        const acknowledgement = await control.steer(instruction, instructionId);
+        if (acknowledgement.status === "acknowledged") await record(instruction, instructionId);
+        return acknowledgement;
+      },
+    };
+  };
+  return { record, wrap, flush: () => tail };
+}
+
+/** Update only the task definition while preserving executor metadata. */
+export async function persistTaskDefinition(artifactDir: string, task: WaveWorkerTask): Promise<void> {
+  const path = join(artifactDir, "task.json");
+  const metadata = JSON.parse(await fs.readFile(path, "utf8")) as Record<string, unknown>;
+  metadata.task = task;
+  const temporaryPath = `${path}.tmp.${randomUUID()}`;
+  try {
+    await fs.writeFile(temporaryPath, JSON.stringify(metadata, null, 2), "utf8");
+    await fs.rename(temporaryPath, path);
+  } finally {
+    await fs.unlink(temporaryPath).catch(() => undefined);
+  }
 }
 
 /** Status of a wave worker turn result. */
@@ -182,6 +253,8 @@ export interface WaveWorkerInput {
   onUpdate?: (update: SubtaskProgressUpdate) => void;
   /** Register live steering/interruption for the current executor turn. */
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+  /** Atomically claim steering that could not reach the completed live turn. */
+  takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
   /** Capacity lease selected by the wave scheduler. */
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
@@ -218,6 +291,8 @@ export interface WaveWorkerContinuationInput {
   onUpdate?: (update: SubtaskProgressUpdate) => void;
   /** Register live steering/interruption for the current executor turn. */
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+  /** Atomically claim steering that could not reach the completed live turn. */
+  takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
   /** Capacity lease selected by the wave scheduler. */
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
@@ -430,7 +505,7 @@ export function buildWaveWorkerPrompt(
 }
 
 function renderWaveWorkerTask(task: WaveWorkerTask): string {
-  return [
+  const lines = [
     `Subtask: ${task.title}`,
     "",
     task.instructions,
@@ -438,7 +513,16 @@ function renderWaveWorkerTask(task: WaveWorkerTask): string {
     "Acceptance criteria:",
     ...task.acceptanceCriteria.map((criterion) => `- ${criterion}`),
     ...(task.relevantContext ? ["", "Relevant context:", task.relevantContext] : []),
-  ].join("\n");
+  ];
+  if (task.authoritativeUpdates?.length) {
+    lines.push(
+      "",
+      "Acknowledged task updates (authoritative, in delivery order):",
+      "Later updates supersede any conflicting original instruction or acceptance criterion.",
+      ...task.authoritativeUpdates.map((item) => `- [${item.action}:${item.instructionId}] ${item.instruction}`),
+    );
+  }
+  return lines.join("\n");
 }
 
 // ── progress helpers ─────────────────────────────────────────────────────────
@@ -631,6 +715,7 @@ async function runWithPoolFailover(input: {
       request: {
         cwd: input.worker.worktree.effectiveCwd,
         artifactDir: input.resolvedArtifactDir,
+        allowedTools: input.worker.task.executorAllowedTools,
         signal: input.worker.signal,
         onUpdate: (message) => reportProgress(input.worker, {
           phase: "executing",

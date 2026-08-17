@@ -66,6 +66,7 @@ test("background tasks return immediately, land independently, and additions cap
     assert.equal(first.tasks.length, 1);
     await waitFor(() => controller.inspect(first.executionId).tasks[0]?.state === "landed");
     assert.equal(await readFile(join(root, "first.txt"), "utf8"), "first landed\n");
+    assert.ok(messages.some((message) => /QUEUED -> CAPTURING.*task is ACTIVE/s.test(message)));
 
     const toppedOff = await controller.add(first.executionId, [{
       title: "second",
@@ -86,6 +87,130 @@ test("background tasks return immediately, land independently, and additions cap
     assert.equal(restored.inspect(first.executionId).tasks.filter((task) => task.state === "landed").length, 2);
     await restored.shutdown();
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("background tasks wake the orchestrator when active execution enters review", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-review-state-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "executor.cjs");
+    await writeFile(executor, [
+      "const fs=require('node:fs');",
+      "fs.writeFileSync('reviewed.txt','ready\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID||'review-state-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'done'}));",
+    ].join("\n"), "utf8");
+    const config = normalizeConfig({
+      enabled: true,
+      decider: {
+        id: "passing",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})),100))"],
+        timeoutMs: 5_000,
+      },
+      externalAgents: [{
+        id: "fake",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
+      }],
+      execution: { activeExecutor: { source: "external", id: "fake" }, maxWorkers: 1 },
+    });
+    const messages: string[] = [];
+    const widgets: unknown[] = [];
+    controller = new BackgroundExecutionController({
+      pi: { sendMessage: (message: { content: string }) => messages.push(message.content) },
+      config,
+      state: createState(),
+      cwd: () => root,
+    });
+    await controller.toggleExpandedView({
+      ui: { setWidget: (_key: string, content: unknown) => widgets.push(content) },
+    });
+    const started = await controller.start([{
+      title: "review transition",
+      instructions: "write reviewed.txt",
+      acceptanceCriteria: ["reviewed.txt exists"],
+    }]);
+    await waitFor(() => controller!.inspect(started.executionId).tasks[0]?.state === "landed", 30_000);
+    assert.ok(messages.some((message) => /CAPTURING -> RUNNING.*task is ACTIVE/s.test(message)));
+    assert.ok(messages.some((message) => /(?:CAPTURING|RUNNING) -> REVIEWING.*task is REVIEWING/s.test(message)));
+    assert.ok(messages.some((message) => /NO ACTION OR ACKNOWLEDGEMENT IS NECESSARY/.test(message)));
+    assert.ok(messages.every((message) => !/-> (?:CAPTURING|ACCEPTED|WAITING_TO_LAND|LANDING)/.test(message)));
+    assert.ok(messages.every((message) => !/interaction reported a failure/.test(message)));
+    const inspection = controller.inspect(started.executionId);
+    assert.deepEqual(inspection.tasks[0]?.reviewStatus?.reviewers, ["passing"]);
+    assert.doesNotMatch(renderWidget(widgets.at(-1)).join("\n"), /reviewers passing \(accepted\)/, "inactive landed tasks leave the active summary");
+    assert.ok(widgets.some((content) => /passing (?:started|finished)/.test(renderWidget(content).join("\n"))));
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("steering unsupported by a live turn is applied after it settles even when review is disabled", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-deferred-steer-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "deferred-steer.cjs");
+    await writeFile(executor, [
+      "const fs=require('node:fs');",
+      "const turn=Number(process.env.PI_REVIEW_EXECUTOR_TURN||'1');",
+      "process.stdin.resume();process.stdin.on('end',()=>{",
+      "fs.writeFileSync('deferred.txt',turn===1?'true\\n':'false\\n');",
+      "setTimeout(()=>{",
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID||'deferred-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'turn '+turn+' complete'}));",
+      "},500);",
+      "});",
+    ].join("\n"), "utf8");
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "deferred",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
+      }],
+      execution: { activeExecutor: { source: "external", id: "deferred" }, maxWorkers: 1 },
+    });
+    controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
+    const started = await controller.start([{
+      title: "deferred steering",
+      instructions: "write true first",
+      acceptanceCriteria: ["deferred.txt reflects the latest instruction"],
+    }]);
+    const taskId = started.tasks[0]!.taskId;
+    await waitFor(() => controller!.inspect(started.executionId, taskId).tasks[0]?.state === "running");
+    const queued = await controller.steer({
+      executionId: started.executionId,
+      taskId,
+      instructions: "write false instead",
+      instructionId: "deferred-steer",
+      actor: "model",
+    });
+    assert.equal(queued.tasks[0]?.commands.at(-1)?.status, "queued");
+    await waitFor(() => controller!.inspect(started.executionId, taskId).tasks[0]?.state === "landed", 30_000);
+    assert.equal(await readFile(join(root, "deferred.txt"), "utf8"), "false\n");
+    assert.equal(controller.inspect(started.executionId, taskId).tasks[0]?.commands.at(-1)?.status, "acknowledged");
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -167,6 +292,16 @@ test("queued steering is incorporated before startup and landing events distingu
     assert.ok(messages.some((message) => message.includes(secondId) && /not landed/.test(message)));
     await waitFor(() => controller!.inspect(started.executionId).tasks.every((task) => task.state === "landed"), 60_000);
     assert.equal(await readFile(join(root, "second.txt"), "utf8"), "false");
+    for (const task of started.tasks) {
+      assert.ok(
+        messages.some((message) => message.includes(task.taskId) && /CAPTURING -> RUNNING.*task is ACTIVE/s.test(message)),
+        `${task.taskId} must independently notify when pool capacity lets it become active`,
+      );
+      assert.ok(
+        messages.some((message) => message.includes(task.taskId) && /landed independently|continuation landed|force-merged and landed/.test(message)),
+        `${task.taskId} must independently notify when landed`,
+      );
+    }
     assert.ok(messages.some((message) => /COMPLETE: 2\/2 tasks landed/.test(message)));
     assert.ok(messages.some((message) => /aggregate verification is now appropriate/.test(message)));
   } finally {
@@ -235,6 +370,7 @@ test("interrupt quiesces a writer and force-merge lands its verified checkpoint"
       actor: "user",
     });
     assert.equal(landed.tasks[0]?.state, "landed");
+    assert.match(landed.tasks[0]?.summary ?? "", /manual workspace inspection is still required/i);
     assert.equal(await readFile(join(root, "draft.txt"), "utf8"), "recover me\n");
     await controller.shutdown();
   } finally {
@@ -295,4 +431,10 @@ async function waitForAsync(predicate: () => Promise<boolean>, timeoutMs = 15_00
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
   }
   throw new Error("timed out waiting for asynchronous background task state");
+}
+
+function renderWidget(content: unknown, width = 240): string[] {
+  assert.equal(typeof content, "function");
+  const component = (content as () => { render(width: number): string[] })();
+  return component.render(width);
 }

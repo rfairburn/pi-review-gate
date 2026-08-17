@@ -21,6 +21,7 @@ export interface ReviewSettingsSelection {
   retainBundles: RetainBundles;
   maxWorkers: number;
   retryPolicy: ExecutionRetryPolicy;
+  subtasksViewExpanded: boolean;
 }
 
 export async function persistReviewSettings(
@@ -52,12 +53,36 @@ export async function persistReviewSettings(
   parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
   parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
   parsed.retainBundles = selection.retainBundles;
+  const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
+  ui.subtasksViewExpanded = selection.subtasksViewExpanded;
+  parsed.ui = ui;
   parsed.externalAgents = catalog;
   delete parsed.decider;
   delete parsed.reviewers;
   delete parsed.enabledReviewerIds;
 
   const normalized = normalizeConfig(parsed);
+  await writeConfigAtomically(configPath, parsed);
+  return normalized;
+}
+
+export async function persistSubtasksViewPreference(
+  configPath: string,
+  expanded: boolean,
+): Promise<ReviewGateConfig> {
+  const parsed = JSON.parse(await readFile(configPath, "utf8")) as unknown;
+  if (!isRecord(parsed)) {
+    throw new Error("review gate config must be a JSON object");
+  }
+  const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
+  ui.subtasksViewExpanded = expanded;
+  parsed.ui = ui;
+  const normalized = normalizeConfig(parsed);
+  await writeConfigAtomically(configPath, parsed);
+  return normalized;
+}
+
+async function writeConfigAtomically(configPath: string, parsed: Record<string, unknown>): Promise<void> {
   const existing = await stat(configPath);
   const mode = existing.mode & 0o777;
   const targetMode = mode !== 0 && (mode & 0o077) === 0 ? mode : 0o600;
@@ -86,7 +111,6 @@ export async function persistReviewSettings(
     await unlink(tempPath).catch(() => undefined);
     throw error;
   }
-  return normalized;
 }
 
 export function replaceConfig(target: ReviewGateConfig, next: ReviewGateConfig): void {

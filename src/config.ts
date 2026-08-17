@@ -144,6 +144,10 @@ export interface ExecutionConfig {
   retryPolicy?: ExecutionRetryPolicy;
 }
 
+export interface ReviewGateUiConfig {
+  subtasksViewExpanded?: boolean;
+}
+
 export interface ReviewGateConfig {
   enabled: boolean;
   reviewerTimeoutMs: number;
@@ -162,6 +166,7 @@ export interface ReviewGateConfig {
   review?: ReviewSelectionConfig;
   externalAgents?: ExternalAgentConfig[];
   execution?: ExecutionConfig;
+  ui?: ReviewGateUiConfig;
 }
 
 export interface LoadedConfig {
@@ -254,6 +259,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
     execution: value.execution === undefined ? undefined : normalizeExecution(value.execution, executorTimeoutMs),
+    ui: value.ui === undefined ? undefined : normalizeUi(value.ui),
   };
 
   if (config.reviewers) {
@@ -261,6 +267,20 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
   }
 
   return config;
+}
+
+function normalizeUi(value: unknown): ReviewGateUiConfig {
+  if (!isRecord(value)) {
+    throw new Error("ui must be an object");
+  }
+  if (value.subtasksViewExpanded !== undefined && typeof value.subtasksViewExpanded !== "boolean") {
+    throw new Error("ui.subtasksViewExpanded must be a boolean");
+  }
+  return {
+    ...(value.subtasksViewExpanded !== undefined
+      ? { subtasksViewExpanded: value.subtasksViewExpanded }
+      : {}),
+  };
 }
 
 export interface ReviewerResolution {
@@ -300,8 +320,9 @@ export function automaticReviewEnabled(config: ReviewGateConfig, scopedModels: s
 }
 
 export function configWithReviewers(config: ReviewGateConfig, reviewers: DeciderConfig[], enabled: boolean): ReviewGateConfig {
+  const { ui: _ui, ...reviewRelevantConfig } = config;
   return {
-    ...config,
+    ...reviewRelevantConfig,
     enabled,
     review: undefined,
     decider: undefined,

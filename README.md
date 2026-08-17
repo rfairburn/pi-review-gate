@@ -185,12 +185,37 @@ wave-wide shared base or all-workers integration barrier.
 The actions are `start`, `add`, `inspect`, `continue`, `steer`, `interrupt`,
 `force_merge`, and `mark_clean`. `continue` accepts either an associated task
 handle or a verified reattachment bundle. `steer` is valid while a task is
-queued, starting, or in a live executor turn: queued instructions are durably
-incorporated into the initial prompt, while live instructions use the adapter's
-acknowledged steering transport.
-`interrupt` explicitly chooses failure or merge disposition. `force_merge`
+queued, starting, in a live executor turn, or being reviewed. Queued instructions
+are durable, live instructions use the adapter's acknowledged transport, and a
+steer during review cancels that review and resumes the executor with the changed
+request before a fresh review. If the current adapter cannot steer a long-running
+command, the instruction waits for that next executor handoff instead of being
+reported as rejected. Queued-to-active and active-to-reviewing transitions wake
+the orchestrator automatically.
+
+`ShellStart` is treated as an executor-readiness boundary, not ordinary tool
+completion. Review-gate reads the returned detached process-group id and keeps
+the Little Coder RPC session and live task control open after `agent_settled`
+while that group remains alive. Steering an idle executor starts another turn
+in the same session. Once every tracked group exits, the executor receives a
+final workspace/result-inspection turn before review. The executor timeout is
+suspended while a verified group remains alive. At the top level, automatic
+review is similarly deferred and the orchestrator is triggered to inspect and
+finish the work when its tracked groups clear. Readiness is determined with a
+process-group liveness check rather than trusting a tool's “completed” label;
+an unparseable ShellStart success fails closed and visibly blocks automatic
+review. A process that deliberately creates a new session/process group can
+escape this best-effort boundary and is not claimed as covered.
+
+`interrupt` explicitly chooses failure or merge disposition. A normal cancellation
+uses `interrupt_as_failure`; `interrupt_with_merge` must be requested explicitly.
+`force_merge`
 operates only on a stopped task with an accepted commit or verified checkpoint;
 `mergeAnyhow` may deliberately install ordinary conflict markers in main.
+Both `interrupt_with_merge` and every direct `force_merge` are mechanical landing
+attempts, not verification that the requested changes are present or correct.
+The main workspace must always be inspected manually afterward, including when
+the task's authoritative state is `landed`.
 `mark_clean` validates that those markers are resolved before queued landings
 resume. No singular or snake_case compatibility tool is registered.
 
@@ -294,7 +319,9 @@ turn. After resolving the files, use `mark_clean`; it verifies that markers are
 gone, checkpoints the resolution, clears the gate, and wakes queued landings.
 Stopped tasks retain verified checkpoints and reattachment bundles for
 `continue` or `force_merge`; `force_merge` with `mergeAnyhow` deliberately
-materializes the same conflict state when a clean landing is impossible.
+materializes the same conflict state when a clean landing is impossible. A
+force-merge result describes only the mechanical landing outcome; manually
+inspect the main workspace after every attempt before claiming task success.
 
 Every failed or non-landed `ExecuteSubtasks` action returns the complete group
 and task inspection: durable handles, current source disposition, commands and
@@ -437,7 +464,14 @@ launcher:
 
 It builds and explicitly enables this extension, forwards all arguments to
 little-coder, sets the foreground model's `LITTLE_CODER_THINKING_BUDGET` to
-16,384 tokens, and leaves config resolution on the established fallback order:
+16,384 tokens, and applies a shared `LITTLE_CODER_ALLOWED_TOOLS` launch policy
+containing every tool shipped by Pi, Little Coder, and review-gate except
+`ShellSession`. Little Coder's tool gate therefore refuses `ShellSession`, and
+skill-inject omits its skill card. The environment is inherited by Little Coder
+execution subtasks; Little Coder reviewers remain more restrictive through
+their existing read-only/no-skills launch. The same policy is used by the
+preset launcher and all named wrappers. Config resolution remains on the
+established fallback order:
 `~/.config/pi-review-gate/config.json`, `~/.config/pi/review-gate.json`, then
 `~/.config/little-coder/review-gate.json`. It fails clearly if none exists and
 does not generate or rewrite configuration.

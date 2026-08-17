@@ -4,6 +4,8 @@ set -euo pipefail
 REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
 ORCHESTRATOR_PROMPT="$REVIEW_GATE_ROOT/scripts/orchestrator-system-prompt.md"
+# shellcheck source=scripts/little-coder-tool-policy.sh
+source "$REVIEW_GATE_ROOT/scripts/little-coder-tool-policy.sh"
 
 export LITTLE_CODER_THINKING_BUDGET=16384
 
@@ -48,4 +50,4 @@ esac
 echo "pi-review-gate config: $REVIEW_GATE_CONFIG"
 echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"
 
-exec little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT" "$@"
+exec little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT" --tools "$LITTLE_CODER_ALLOWED_TOOLS" "$@"

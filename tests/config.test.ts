@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { activeExternalExecutor, automaticReviewEnabled, loadConfig, normalizeConfig, resolveReviewers, resolvedExecutorPool } from "../src/config";
+import { activeExternalExecutor, automaticReviewEnabled, loadConfig, materializeReviewConfig, normalizeConfig, resolveReviewers, resolvedExecutorPool } from "../src/config";
 
 test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-config-"));
@@ -70,6 +70,16 @@ test("loadConfig supports PI_REVIEW_GATE_DISABLED", () => {
 
   assert.equal(loaded.config.enabled, false);
   assert.equal(loaded.disabledReason, "PI_REVIEW_GATE_DISABLED is set");
+});
+
+test("normalizeConfig preserves the global subtasks view preference", () => {
+  const config = normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: true } });
+  assert.equal(config.ui?.subtasksViewExpanded, true);
+  assert.equal(materializeReviewConfig(config, []).ui, undefined, "UI state is not frozen into a conversation review window");
+  assert.throws(
+    () => normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: "yes" } }),
+    /ui\.subtasksViewExpanded must be a boolean/,
+  );
 });
 
 test("normalizeConfig supplies defaults for typed reviewer adapters", () => {

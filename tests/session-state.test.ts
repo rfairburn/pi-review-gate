@@ -6,10 +6,17 @@ import test from "node:test";
 import { normalizeConfig } from "../src/config";
 import { createEvidenceState } from "../src/evidence";
 import {
+  configDigest,
   replaceReviewGateState,
   SESSION_STATE_ENTRY_TYPE,
   SessionStateStore,
 } from "../src/session-state";
+
+test("UI preferences do not change review configuration identity", () => {
+  const collapsed = normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: false } });
+  const expanded = normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: true } });
+  assert.equal(configDigest(collapsed), configDigest(expanded));
+});
 import {
   beginAgentRun,
   createState,

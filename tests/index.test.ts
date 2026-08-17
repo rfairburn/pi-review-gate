@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +32,76 @@ const indexTestConfig = {
   maxSnapshotBytes: 52_428_800,
   retainBundles: "never",
 } as const;
+
+test("automatic review waits for ShellStart process groups and resumes the orchestrator when they clear", { skip: process.platform === "win32" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-background-readiness-"));
+  let background: ChildProcess | undefined;
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const invocationMarker = join(dir, "reviewer-invoked.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'background work reviewed',findings:[]})))`,
+        ],
+        timeoutMs: 15_000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const followUps: Array<{ message: string; options: unknown }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand() {},
+      notify(message: string) { notices.push(message); },
+      sendUserMessage(message: string, options: unknown) { followUps.push({ message, options }); },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "make a background-assisted change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    background = spawn(process.execPath, ["-e", "setTimeout(()=>{},350)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    background.unref();
+    assert.ok(background.pid);
+    await trigger(hooks, "tool_result", {
+      cwd: dir,
+      toolName: "ShellStart",
+      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}).\nWaking you on: exit.` }] },
+      isError: false,
+    });
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
+
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+    assert.match(notices.join("\n"), /automatic review deferred while 1 background process group/);
+    await waitForCondition(() => followUps.length === 1);
+    assert.match(followUps[0]?.message ?? "", /All tracked ShellStart process groups have finished/);
+    assert.deepEqual(followUps[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
+    assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
+  } finally {
+    if (background?.pid) {
+      try { process.kill(-background.pid, "SIGKILL"); } catch { /* already exited */ }
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("delegated execution tool activation waits for session_start", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-runtime-start-"));

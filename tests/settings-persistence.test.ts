@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { persistReviewSettings, type ReviewSettingsSelection } from "../src/settings/persistence";
+import { persistReviewSettings, persistSubtasksViewPreference, type ReviewSettingsSelection } from "../src/settings/persistence";
 
 const selection: ReviewSettingsSelection = {
   executorPool: [],
@@ -21,6 +21,7 @@ const selection: ReviewSettingsSelection = {
     jitter: true,
     maxSameIncidentRepeats: 2,
   },
+  subtasksViewExpanded: false,
 };
 
 test("persistReviewSettings preserves restrictive configuration permissions", async (t) => {
@@ -37,6 +38,21 @@ test("persistReviewSettings preserves restrictive configuration permissions", as
     await chmod(configPath, 0o644);
     await persistReviewSettings(configPath, selection);
     assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("subtasks view preference persists globally without replacing unrelated settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-subtasks-view-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, '{"enabled":true,"customFutureKey":{"keep":true}}\n', "utf8");
+    const expanded = await persistSubtasksViewPreference(configPath, true);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.ui.subtasksViewExpanded, true);
+    assert.deepEqual(saved.customFutureKey, { keep: true });
+    assert.equal(expanded.ui?.subtasksViewExpanded, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

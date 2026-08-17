@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
 import { createWorkerWorktree, removeWorktree } from "../src/execution/wave-worktrees";
-import { runWaveWorker, resumeWaveWorker, buildWaveWorkerPrompt, type WaveWorkerTask, type WaveWorkerResult, type WaveWorkerContinuationInput } from "../src/execution/wave-worker";
+import { createTaskInstructionEvidenceRecorder, runWaveWorker, resumeWaveWorker, buildWaveWorkerPrompt, type WaveWorkerTask, type WaveWorkerResult, type WaveWorkerContinuationInput } from "../src/execution/wave-worker";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import { resolve } from "node:path";
 
@@ -15,6 +15,36 @@ async function mkTmp(prefix: string): Promise<string> {
   const { realpath } = await import("node:fs/promises");
   return realpath(await mkdtemp(join(tmpdir(), prefix)));
 }
+
+test("acknowledged live steering is durable and appears in the effective executor task", async () => {
+  const root = await mkTmp("pi-ww-steering-evidence-");
+  try {
+    const task = testTask();
+    await writeFile(join(root, "task.json"), JSON.stringify({ version: 1, taskId: "task-live-steer", task }), "utf8");
+    const evidence = createTaskInstructionEvidenceRecorder(task, root);
+    const control = evidence.wrap({
+      adapter: "test",
+      generation: 1,
+      capabilities: { steer: true, interrupt: true },
+      steer: async () => ({ status: "acknowledged", message: "delivered" }),
+      interrupt: async () => ({ status: "acknowledged", message: "stopped" }),
+    });
+
+    assert.equal((await control!.steer("Write false instead.", "live-steer-1")).status, "acknowledged");
+    await evidence.flush();
+
+    const persisted = JSON.parse(await readFile(join(root, "task.json"), "utf8"));
+    assert.deepEqual(persisted.task.authoritativeUpdates, [{
+      instructionId: "live-steer-1",
+      action: "steer",
+      instruction: "Write false instead.",
+      acknowledgedAt: persisted.task.authoritativeUpdates[0].acknowledgedAt,
+    }]);
+    assert.match(buildWaveWorkerPrompt(task, "/source", "/worker"), /\[steer:live-steer-1\] Write false instead\./);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 /** Create a committed source repo and capture it. */
 async function setupCapture(artifactDir: string): Promise<{ sourceDir: string; capture: WaveCaptureResult }> {

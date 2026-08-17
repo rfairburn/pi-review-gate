@@ -214,6 +214,8 @@ export interface WaveControllerInput {
   onLandingConflict?: (input: { capture: WaveCaptureResult; plan: LandingPlan }) => void | Promise<void>;
   /** Register live control for a specific task's current executor turn. */
   onLiveControl?: (taskId: string, control: ExecutorLiveControl | undefined) => void;
+  /** Claim task steering deferred until its current executor turn settles. */
+  takeDeferredSteering?: (taskId: string) => Promise<Array<{ instruction: string; instructionId: string }>>;
   /** Land one accepted task directly, without a combined integration worktree. */
   independentLanding?: boolean;
   /** @internal Per-invocation integration fault hooks used by regression tests. */
@@ -867,6 +869,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
             return nextLease;
           },
           onLiveControl: (control) => input.onLiveControl?.(item.taskId, control),
+          takeDeferredSteering: () => input.takeDeferredSteering?.(item.taskId) ?? Promise.resolve([]),
           onUpdate: (subtaskUpdate) => {
             // Track per-task latest phase and reviewers.
             taskPhases.set(item.taskId, subtaskUpdate.phase);
@@ -989,6 +992,17 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         const lastCycle = result.reviewCycles[result.reviewCycles.length - 1];
         taskCandidateCommits.set(item.taskId, lastCycle.candidateCommit);
       }
+
+      // Settled lifecycle states are externally actionable, especially the
+      // brief accepted window before independent landing begins. Publish the
+      // result before planning/landing so background consumers can notify the
+      // orchestrator instead of skipping directly from review to landing.
+      emitProgress(onProgress, "working", `${item.taskId}: worker settled ${result.status}`, undefined, {
+        waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
+        counts: computeCounts(taskItems, results, activeSlots, taskPhases),
+        taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
+        activity: [`${item.taskId}: worker settled ${result.status}`],
+      });
 
       // Update manifest with current results — use truthful statuses.
       // Tasks that have a result use the result status.

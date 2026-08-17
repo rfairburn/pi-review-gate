@@ -226,7 +226,8 @@ export function replaceReviewGateState(target: ReviewGateState, restored: Review
 }
 
 export function configDigest(config: ReviewGateConfig): string {
-  return createHash("sha256").update(stableJson(config)).digest("hex");
+  const { ui: _ui, ...reviewRelevantConfig } = config;
+  return createHash("sha256").update(stableJson(reviewRelevantConfig)).digest("hex");
 }
 
 function serializeState(state: ReviewGateState): PersistedReviewGateState {

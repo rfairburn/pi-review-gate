@@ -71,13 +71,14 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let retainBundles = input.config.retainBundles;
   let maxWorkers = input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS;
   let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
+  let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
 
   while (true) {
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const [executorRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow] = alignedSettingsRows([
+    const [executorRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, subtasksViewRow] = alignedSettingsRows([
       ["Executor pool", executorPoolSummary(executorPool)],
       ["Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`],
       ["Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`],
@@ -85,6 +86,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ["Bundle retention", retentionLabel(retainBundles)],
       ["Global concurrency", String(maxWorkers)],
       ["Retry policy", `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base`],
+      ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
     ]);
     const choice = await input.ui.select("Review settings", [
       executorRow,
@@ -94,6 +96,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retentionRow,
       workersRow,
       retryRow,
+      subtasksViewRow,
       "Save changes",
       "Cancel",
     ]);
@@ -134,6 +137,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retryPolicy = await selectRetryPolicy(input.ui, retryPolicy);
       continue;
     }
+    if (choice === subtasksViewRow) {
+      subtasksViewExpanded = !subtasksViewExpanded;
+      continue;
+    }
     const error = await validateSelection(executorPool, activeReviewers, agents, input.config, input.scoped);
     if (error) {
       await notify(input.ui, error, "error");
@@ -149,6 +156,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retainBundles,
       maxWorkers,
       retryPolicy,
+      subtasksViewExpanded,
     });
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config);

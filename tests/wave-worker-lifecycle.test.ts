@@ -395,6 +395,68 @@ test("lifecycle: needs_changes correction then pass", async () => {
   }
 });
 
+test("lifecycle: steering during review aborts reviewers and resumes the executor before fresh review", async () => {
+  const root = await mkTmp("pi-wwl-review-steer-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-review-steer");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-review-steer");
+    await mkdir(artifactDir, { recursive: true });
+    const executor = join(root, "review-steer-executor.cjs");
+    await writeFile(executor, [
+      "const fs=require('node:fs');",
+      "const turn=Number(process.env.PI_REVIEW_EXECUTOR_TURN||'1');",
+      "fs.writeFileSync('steered.txt',turn===1?'true\\n':'false\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID||'review-steer-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'turn '+turn+' complete'}));",
+    ].join("\n"), "utf8");
+    const config: ReviewGateConfig = {
+      ...buildConfig(executor),
+      enabled: true,
+      decider: {
+        id: "slow-pass",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: ["-e", [
+          "const fs=require('node:fs');const path=require('node:path');",
+          "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
+          "const request=fs.readFileSync(path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'request.md'),'utf8');",
+          "const visible=request.includes('[steer:review-steer-1] Write false instead.')&&request.includes('Later updates supersede');",
+          "process.stdout.write(JSON.stringify(visible?{verdict:'pass',summary:'authoritative steering visible',findings:[]}:{verdict:'needs_changes',summary:'steering missing',findings:[{severity:'blocking',issue:'steering missing',recommendation:'include steering'}]}));",
+          "},2000))",
+        ].join("")],
+        timeoutMs: 5_000,
+      },
+    };
+    let steered = false;
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-review-steer",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      onLiveControl: (control) => {
+        if (steered || control?.protocol !== "review-to-executor-handoff-v1") return;
+        steered = true;
+        void control.steer("Write false instead.", "review-steer-1");
+      },
+    });
+
+    assert.equal(steered, true);
+    assert.equal(result.status, "accepted", `expected accepted, got ${result.status}: ${result.error ?? result.summary}`);
+    assert.equal(await readFile(join(worker.worktreeRoot, "steered.txt"), "utf8"), "false\n");
+    assert.ok(result.reviewCycles.every((cycle) => cycle.verdict === "pass"));
+    const persisted = JSON.parse(await readFile(join(artifactDir, "task.json"), "utf8"));
+    assert.deepEqual(persisted.task.authoritativeUpdates.map((item: { instructionId: string }) => item.instructionId), ["review-steer-1"]);
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("lifecycle: correction cap reached", async () => {
   const root = await mkTmp("pi-wwl-cap-");
   try {

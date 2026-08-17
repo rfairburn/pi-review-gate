@@ -10,7 +10,7 @@ import type { WaveIntegrationResult } from "./wave-integration";
 import { executeWaveLanding, inspectLandingRecoveryManifests, planWaveLanding, recoverLandingManifest, type LandingExecutionResult, type LandingPlan, type LandingRecoveryManifestInspection } from "./wave-landing";
 import { readWaveCaptureRecord } from "./wave-repository";
 import { runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "./wave-worker-lifecycle";
-import { resumeWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
+import { createTaskInstructionEvidenceRecorder, resumeWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
 import { createWorkerWorktree, pinCommit, removeWorktree, type WorkerWorktree } from "./wave-worktrees";
 import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
 import {
@@ -273,6 +273,7 @@ export async function continueOperation(input: {
   executorAssignment?: ExecutorPoolLease;
   executorPool?: ExecutorPoolScheduler;
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+  takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
   onLandingConflict?: (input: { capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>; plan: LandingPlan }) => void | Promise<void>;
 }): Promise<{
   inspection: OperationInspection;
@@ -367,6 +368,10 @@ export async function continueOperation(input: {
   const continuationLandingBase = previouslyLanded ? record.checkpoint.commitSha : undefined;
 
   const task = await readTask(record.artifactDir);
+  const steeringEvidence = createTaskInstructionEvidenceRecorder(task, record.artifactDir);
+  const publishLiveControl = (control: ExecutorLiveControl | undefined): void => {
+    input.onLiveControl?.(steeringEvidence.wrap(control));
+  };
   const recoveryWorktree = await ensureRecoveryWorktree(capture, record, input.signal);
   record.generation += 1;
   const continuationCapture = { ...capture, waveId: `${capture.waveId}-g${record.generation}` };
@@ -446,9 +451,13 @@ export async function continueOperation(input: {
     signal: input.signal,
     executorAssignment: input.executorAssignment,
     acquireFailover,
-    onLiveControl: input.onLiveControl,
+    onLiveControl: publishLiveControl,
     onUpdate: (update) => input.onUpdate?.(update.message),
     });
+    if (continued.status === "completed") {
+      await steeringEvidence.record(input.instructions, input.instructionId, "continue");
+    }
+    await steeringEvidence.flush();
   } catch (error) {
     record = await readOperationRecord(operationRecordPath(record.artifactDir));
     const persistedInstruction = record.instructions.find((item) => item.instructionId === input.instructionId);
@@ -477,7 +486,8 @@ export async function continueOperation(input: {
       signal: input.signal,
       executorAssignment: input.executorAssignment,
       acquireFailover,
-      onLiveControl: input.onLiveControl,
+      onLiveControl: publishLiveControl,
+      takeDeferredSteering: input.takeDeferredSteering,
       onUpdate: (update) => input.onUpdate?.(update.message),
       initialResult: continued,
     });

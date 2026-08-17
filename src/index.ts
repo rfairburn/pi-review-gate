@@ -4,7 +4,7 @@ import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, isEscapeTerminalInput, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, createStatusTracker, setStatus } from "./pi";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, isEscapeTerminalInput, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, sendTriggeredFollowUp, createStatusTracker, setStatus } from "./pi";
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
   activeExchangeHasBaseline,
@@ -21,15 +21,24 @@ import {
 } from "./state";
 import { registerReviewSettings } from "./settings/command";
 import { scopedModelChoices } from "./settings/models";
+import { persistSubtasksViewPreference, replaceConfig } from "./settings/persistence";
 import { ExecutionToolManager } from "./execution/tool";
 import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
 import { configDigest, replaceReviewGateState, sessionPersistenceIdentity, SessionStateStore } from "./session-state";
+import { BackgroundProcessReadiness } from "./background-process-readiness";
 
 declare const module: {
   exports: unknown;
 };
+
+const orchestratorBackgroundCompletionPrompt = [
+  "[pi-review-background-ready] All tracked ShellStart process groups have finished.",
+  "Automatic review was deliberately deferred while they were active.",
+  "Inspect their results and the workspace, address any failure, and finish the original request.",
+  "Do not claim success from process exit alone; verify the requested outcome before completing this turn.",
+].join(" ");
 
 export async function activate(pi: unknown): Promise<void> {
   let loaded;
@@ -55,6 +64,9 @@ export async function activate(pi: unknown): Promise<void> {
   let agentRunActive = false;
   let reviewerQuestionPausePending = false;
   let stateStore: SessionStateStore | undefined;
+  let backgroundCompletionMonitor: Promise<void> | undefined;
+  let backgroundMonitorGeneration = 0;
+  const orchestratorBackgroundReadiness = new BackgroundProcessReadiness();
   const reviewerQuestionPauseWaiters = new Set<() => void>();
   const sessionAbortController = new AbortController();
   const executionTools = new ExecutionToolManager({
@@ -64,6 +76,12 @@ export async function activate(pi: unknown): Promise<void> {
     cwd: () => currentCwd,
     notify: (message) => sendNotice(pi, message),
     onAssociationsChanged: () => persistSessionState(),
+    onExpandedViewChanged: async (expanded) => {
+      if (!loaded.path) {
+        throw new Error("No persistent review-gate config file is loaded.");
+      }
+      replaceConfig(config, await persistSubtasksViewPreference(loaded.path, expanded));
+    },
   });
 
   const effectiveReviewConfig = () => {
@@ -86,6 +104,35 @@ export async function activate(pi: unknown): Promise<void> {
     reviewerQuestionPauseWaiters.clear();
   };
 
+  const scheduleBackgroundCompletion = (noticeTarget: unknown) => {
+    if (backgroundCompletionMonitor) return;
+    const generation = backgroundMonitorGeneration;
+    backgroundCompletionMonitor = (async () => {
+      while (sessionActive && generation === backgroundMonitorGeneration) {
+        const readiness = orchestratorBackgroundReadiness.snapshot();
+        if (readiness.unverifiable.length > 0 || readiness.running.length === 0) break;
+        await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
+      }
+      if (!sessionActive || generation !== backgroundMonitorGeneration) return;
+      const readiness = orchestratorBackgroundReadiness.snapshot();
+      if (readiness.unverifiable.length > 0) {
+        await sendNotice(
+          noticeTarget,
+          `review gate: review remains blocked because ShellStart background readiness could not be verified: ${readiness.unverifiable.join("; ")}`,
+        );
+        return;
+      }
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 250));
+      if (!sessionActive || generation !== backgroundMonitorGeneration || agentRunActive || state.reviewInProgress || !state.reviewWindow) return;
+      const delivered = await sendTriggeredFollowUp(pi, orchestratorBackgroundCompletionPrompt);
+      if (!delivered) {
+        await sendNotice(noticeTarget, "review gate: background work completed, but the orchestrator could not be resumed automatically; review remains deferred until the next turn");
+      }
+    })().finally(() => {
+      backgroundCompletionMonitor = undefined;
+    });
+  };
+
   registerHook(pi, "session_shutdown", async (...args) => {
     sessionActive = false;
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
@@ -96,6 +143,8 @@ export async function activate(pi: unknown): Promise<void> {
     activeStatusTracker = undefined;
     agentRunActive = false;
     reviewerQuestionPausePending = false;
+    backgroundMonitorGeneration += 1;
+    orchestratorBackgroundReadiness.clear();
     releaseReviewerQuestionPauseWaiters();
     await executionTools.shutdown();
     await persistSessionState(true);
@@ -107,6 +156,9 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "session_start", async (...args) => {
     sessionActive = true;
     currentCwd = extractCwd(args, currentCwd);
+    backgroundMonitorGeneration += 1;
+    backgroundCompletionMonitor = undefined;
+    orchestratorBackgroundReadiness.clear();
     updateScopedModels(args);
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(extractContext(args) ?? pi);
@@ -227,6 +279,7 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "tool_result", async (...args) => {
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
+    orchestratorBackgroundReadiness.observeToolResult(name, args[0], isToolError(args[0]));
     const window = state.reviewWindow;
     if (!window) {
       return;
@@ -273,6 +326,24 @@ export async function activate(pi: unknown): Promise<void> {
       } finally {
         releaseReviewerQuestionPauseWaiters();
       }
+      return;
+    }
+    const backgroundReadiness = orchestratorBackgroundReadiness.snapshot();
+    if (backgroundReadiness.unverifiable.length > 0) {
+      await sendNotice(
+        noticeTarget,
+        `review gate: automatic review blocked because ShellStart background readiness could not be verified: ${backgroundReadiness.unverifiable.join("; ")}`,
+      );
+      await persistSessionState();
+      return;
+    }
+    if (backgroundReadiness.running.length > 0) {
+      await sendNotice(
+        noticeTarget,
+        `review gate: automatic review deferred while ${backgroundReadiness.running.length} background process group(s) remain active (${backgroundReadiness.running.map((job) => `${job.id}: ${job.label}`).join(", ")})`,
+      );
+      scheduleBackgroundCompletion(noticeTarget);
+      await persistSessionState();
       return;
     }
     if (!window.baseline) {

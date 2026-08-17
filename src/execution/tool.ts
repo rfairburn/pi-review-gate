@@ -19,6 +19,7 @@ interface ExecutionToolManagerInput {
   cwd: () => string;
   notify?: (message: string) => void | Promise<void>;
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | Promise<void>;
+  onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
 }
 
 interface CommandUi {
@@ -81,6 +82,7 @@ export class ExecutionToolManager {
   }
 
   sync(): void {
+    this.controller.syncUiPreferences();
     this.controller.refreshPool();
     const pool = resolvedExecutorPool(this.input.config);
     const agents = externalAgentCatalog(this.input.config);
@@ -109,6 +111,10 @@ export class ExecutionToolManager {
       });
     };
     register("subtasks", "List background execution subtasks.", async () => this.controller.list());
+    register("subtasks-view", "Toggle the live expanded execution-subtask view below the editor.", async (_args, ctx) => {
+      await this.controller.toggleExpandedView(ctx);
+      return undefined;
+    });
     register("subtask-inspect", "Pick and inspect an execution subtask; explicit IDs remain optional.", async (args, ctx) => {
       const [executionId, taskId] = words(args);
       if (executionId) return this.controller.inspect(executionId, taskId);
@@ -131,11 +137,11 @@ export class ExecutionToolManager {
       const tasks = normalizeTasks(Array.isArray(parsed) ? parsed : [parsed]);
       return this.controller.add(executionId, tasks);
     });
-    register("subtask-steer", "Pick and steer a queued, starting, or live task; explicit arguments remain optional.", async (args, ctx) => {
+    register("subtask-steer", "Pick and steer a queued, active, or reviewing task; explicit arguments remain optional.", async (args, ctx) => {
       let [executionId, rest] = splitFirst(args);
       let [taskId, instruction] = splitFirst(rest);
       if (!executionId || !taskId) {
-        const selected = await selectTask(this.controller, ctx, "Steer execution subtask", (task) => ["queued", "capturing", "running"].includes(task.state));
+        const selected = await selectTask(this.controller, ctx, "Steer execution subtask", (task) => ["queued", "capturing", "running", "reviewing"].includes(task.state));
         if (!selected) return undefined;
         executionId = selected.executionId;
         taskId = selected.taskId;
@@ -174,7 +180,7 @@ export class ExecutionToolManager {
         actor: "user",
       });
     });
-    register("subtask-force-merge", "Pick a stopped recoverable task to force-merge; explicit arguments remain optional.", async (args, ctx) => {
+    register("subtask-force-merge", "Mechanically land a stopped checkpoint, then manually inspect the workspace; explicit arguments remain optional.", async (args, ctx) => {
       let [executionId, taskId, mode] = words(args);
       const explicitTarget = Boolean(executionId && taskId);
       if (!executionId || !taskId) {
@@ -216,7 +222,7 @@ export class ExecutionToolManager {
       description:
         "Start, add, inspect, continue, steer, interrupt, or recover durable background execution subtasks. " +
         "start/add return immediately; tasks run independently and each accepted task attempts to land as soon as it is ready. " +
-        "start/add/inspect expose stable execution and task handles. Completion and failures wake you automatically; inspect on demand and avoid tight repetitive polling.",
+        "start/add expose queued task handles immediately. Automatic turns are reserved for meaningful interaction points: running, reviewing, landed, failed, conflicted, and other recovery-required outcomes. Internal capture, acceptance, and landing-progress states remain visible through inspect and /subtasks-view without waking you. DO NOT POLL for state changes; inspect only when its diagnostic snapshot is independently useful.",
       promptSnippet: "Run and interact with durable background execution subtasks",
       promptGuidelines: [
         "Use ExecuteSubtasks start with an array of one or more bounded tasks; retain the stable execution/task handles returned for every task.",
@@ -224,10 +230,14 @@ export class ExecutionToolManager {
         "Each task captures main independently when dispatched and lands independently when accepted.",
         "Use inspect for durable state and recent activity; artifact paths permit deeper rg-based investigation.",
         "Use steer for queued, starting, or live tasks: queued steering is durably incorporated before startup and live steering uses the executor transport.",
+        "Steering wins over review: a steer received while reviewing interrupts that review, resumes the executor with the changed request, and reviews the replacement result.",
+        "If an active adapter cannot steer its current long-running command, keep the steer queued for the next executor handoff; do not treat that transport limitation as rejection.",
+        "The start/add result reports queued tasks. Meaningful interaction points inject a message and trigger an orchestrator turn: RUNNING (steerable), REVIEWING (steering can supersede review), and LANDED, FAILED, CONFLICTED, or other recovery-required outcomes. CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING remain visible in inspect and /subtasks-view but do not trigger turns. DO NOT POLL for task-state changes and do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate. Use inspect only when a current diagnostic snapshot is independently useful for a decision.",
         "A taskId may be omitted only when the supplied executionId contains exactly one task; otherwise use the returned taskId.",
         "Partial landing notifications list every sibling that has not landed. Do not verify aggregate outputs until the execution-complete notification.",
         "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call mark_clean.",
-        "Use force_merge only for a stopped task with a verified checkpoint; mergeAnyhow may intentionally materialize conflicts in main.",
+        "Use force_merge only for a stopped task with a verified checkpoint; mergeAnyhow may intentionally materialize conflicts in main. Every force_merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
+        "A request to cancel or stop without landing means interrupt_as_failure. Use interrupt_with_merge only when the user explicitly wants a mechanical checkpoint landing; it never guarantees the requested changes are present or correct, so inspect the main workspace manually afterward in every case.",
         "Completion, failure, requested matches, and critical conflicts trigger model notifications. Use inspect whenever you need current status or diagnostics; avoid tight repetitive polling.",
       ],
       executionMode: "sequential",
@@ -246,11 +256,11 @@ export class ExecutionToolManager {
         try {
           switch (normalized.action) {
             case "start": {
-              const inspection = await this.controller.start(normalized.tasks!);
+              const inspection = await this.controller.start(this.withParentTools(normalized.tasks!));
               return backgroundResult("start", inspection, false);
             }
             case "add": {
-              const inspection = await this.controller.add(normalized.executionId, normalized.tasks!);
+              const inspection = await this.controller.add(normalized.executionId, this.withParentTools(normalized.tasks!));
               return backgroundResult("add", inspection, false);
             }
             case "inspect": {
@@ -344,6 +354,16 @@ export class ExecutionToolManager {
     });
     this.registered = true;
   }
+
+  private withParentTools(tasks: BackgroundTaskDefinition[]): BackgroundTaskDefinition[] {
+    const allowedTools = activeToolSnapshot(this.input.pi);
+    return tasks.map((task) => ({
+      ...task,
+      acceptanceCriteria: [...task.acceptanceCriteria],
+      wakeOn: task.wakeOn ? { ...task.wakeOn, match: task.wakeOn.match ? [...task.wakeOn.match] : undefined } : undefined,
+      executorAllowedTools: allowedTools ? [...allowedTools] : undefined,
+    }));
+  }
 }
 
 function toolSchema(): Record<string, unknown> {
@@ -379,8 +399,8 @@ function toolSchema(): Record<string, unknown> {
       bundle: reattachmentSchema(),
       instructions: { type: "string", minLength: 1, description: "New direction for continue/steer, not for start/add." },
       instructionId: { type: "string", minLength: 1 },
-      interruptMode: { type: "string", enum: ["interrupt_as_failure", "interrupt_with_merge"] },
-      mergeAnyhow: { type: "boolean" },
+      interruptMode: { type: "string", enum: ["interrupt_as_failure", "interrupt_with_merge"], description: "interrupt_as_failure stops without landing. interrupt_with_merge mechanically attempts to land a stopped checkpoint only when explicitly requested; it does not guarantee the requested changes are present or correct, and the main workspace must always be inspected afterward." },
+      mergeAnyhow: { type: "boolean", description: "Allow force_merge to materialize ordinary conflict markers. Whether true or false, force_merge is only a mechanical landing attempt and always requires manual workspace inspection afterward." },
       offset: { type: "integer", minimum: 0 },
       lines: { type: "integer", minimum: 1, maximum: 500 },
     },
@@ -507,8 +527,12 @@ function backgroundResult(action: string, inspection: BackgroundInspection, isEr
     ? " Queued tasks may wait for executor startup or available pool capacity."
     : "";
   const summary = action === "start" || action === "add"
-    ? `${action} accepted: execution ${inspection.executionId} has ${active} active task(s).${startupDelay} You will be notified automatically on important events. Inspect whenever you need current status or diagnostics; avoid tight repetitive polling.`
-    : `${action}: execution ${inspection.executionId}, ${active} active task(s).`;
+    ? `${action} accepted: execution ${inspection.executionId} has ${active} active task(s).${startupDelay} Queued state and stable task handles are included below. The review gate will inject a message and trigger an orchestrator turn at meaningful interaction points: RUNNING, REVIEWING, LANDED, FAILED, CONFLICTED, and other recovery-required outcomes. Internal CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress stays available in inspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use inspect only when a current diagnostic snapshot is independently useful for a decision.`
+    : action === "force_merge"
+      ? `force_merge: execution ${inspection.executionId}, ${active} active task(s). Force-merge only reports a mechanical landing attempt; always inspect the main workspace manually because it does not prove the requested changes are present or correct.`
+    : action === "interrupt" && inspection.tasks.some((task) => task.commands.some((command) => command.action === "interrupt" && command.mode === "interrupt_with_merge"))
+      ? `interrupt: execution ${inspection.executionId}, ${active} active task(s). Interrupt-with-merge only attempted a mechanical checkpoint landing; always inspect the main workspace manually because this status does not prove the requested changes are present or correct.`
+      : `${action}: execution ${inspection.executionId}, ${active} active task(s).`;
   return result(formatInspectionForModel(summary, inspection), { action, ...inspection }, isError);
 }
 
@@ -521,12 +545,13 @@ function formatInspectionForModel(summary: string, inspection: BackgroundInspect
         ? "waiting for executor startup/capacity"
         : "no live control currently registered";
     lines.push(`- ${task.taskId} · ${task.definition.title} · ${task.state} · ${control}`);
+    if (task.summary) lines.push(`  current authoritative outcome: ${clipPlain(task.summary, 700)}`);
     const command = task.commands.at(-1);
     if (command) lines.push(`  latest command: ${command.action} ${command.instructionId} · ${command.status}${command.error ? ` · ${command.error}` : ""}`);
     if (task.artifactDir) lines.push(`  artifacts: ${task.artifactDir}`);
     const activity = task.activity.slice(-3);
     if (activity.length > 0) {
-      lines.push("  recent activity:");
+      lines.push("  recent historical activity (earlier phases may be superseded; the current state/outcome above is authoritative):");
       for (const event of activity) lines.push(`  - ${event.sequence} · ${event.phase} · ${clipPlain(event.message, 500)}`);
     }
   }
@@ -608,6 +633,13 @@ function setToolActive(pi: unknown, name: string, active: boolean): void {
     ? current.includes(name) ? current : [...current, name]
     : current.filter((value) => value !== name);
   pi.setActiveTools(next);
+}
+
+function activeToolSnapshot(pi: unknown): string[] | undefined {
+  if (!isRecord(pi) || typeof pi.getActiveTools !== "function") return undefined;
+  const current = pi.getActiveTools();
+  if (!Array.isArray(current) || !current.every((value) => typeof value === "string")) return undefined;
+  return [...new Set(current.map((value) => value.trim()).filter(Boolean))];
 }
 
 function isAction(value: unknown): value is Action {

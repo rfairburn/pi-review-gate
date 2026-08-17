@@ -61,6 +61,7 @@ test("settings persistence removes parallelEnabled and stores concurrency and re
       jitter: false,
       maxSameIncidentRepeats: 4,
     },
+    subtasksViewExpanded: false,
   });
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));

@@ -334,6 +334,28 @@ test("bundle retention is staged and saved from review settings", async () => {
   assert.equal(config.retainBundles, "always");
 });
 
+test("subtasks view is staged and saved as a global review setting", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-subtasks-view-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    ui: { subtasksViewExpanded: false },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Subtasks view", "Collapsed"),
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.ui.subtasksViewExpanded, true);
+  assert.equal(config.ui?.subtasksViewExpanded, true);
+});
+
 test("internal executor and reviewers persist independent per-model reasoning levels", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-reasoning-"));
   const configPath = join(dir, "review-gate.json");
@@ -486,6 +508,7 @@ const ROOT_SETTING_LABELS = [
   "Bundle retention",
   "Global concurrency",
   "Retry policy",
+  "Subtasks view",
 ] as const;
 
 const RETRY_SETTING_LABELS = [

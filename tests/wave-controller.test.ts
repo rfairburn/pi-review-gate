@@ -607,7 +607,7 @@ test("emits progress updates via callback", async () => {
 
 // ── integration policy: all-or-nothing default ───────────────────────────────
 
-test("reviewer milestones reach execute_subtasks activity updates", async () => {
+test("reviewer milestones reach execution activity updates", async () => {
   const artifactDir = await mkTmp("pi-wc-review-progress-art-");
   const sourceDir = await mkTmp("pi-wc-review-progress-src-");
   await git(["init", "--quiet"], sourceDir);
@@ -682,43 +682,6 @@ test("default all-or-nothing: failed worker blocks integration", async () => {
     assert.equal(result.phase, "completed");
     const manifest = JSON.parse(await readFile(join(result.waveRoot, "wave-manifest.json"), "utf8"));
     assert.equal(manifest.integrationStatus, "worker_failure");
-  } finally {
-    await rm(artifactDir, { recursive: true, force: true });
-    await rm(sourceDir, { recursive: true, force: true });
-  }
-});
-
-// ── integration policy: integratePartial ─────────────────────────────────────
-
-test("integratePartial integrates eligible workers despite a failed worker", async () => {
-  const artifactDir = await mkTmp("pi-wc-art-");
-  const sourceDir = await mkTmp("pi-wc-src-");
-  await git(["init", "--quiet"], sourceDir);
-  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
-  await git(["add", "."], sourceDir);
-  await git(["commit", "--quiet", "-m", "init"], sourceDir);
-
-  try {
-    const result = await executeWave({
-      cwd: sourceDir,
-      tasks: [
-        { title: "FAILTHISONE", instructions: "noop", acceptanceCriteria: [] },
-        { title: "OK", instructions: "noop", acceptanceCriteria: [] },
-      ],
-      config: makeConfigWithMixedExecutor(),
-      artifactDir,
-      waveId: "wc-partial-fail",
-      integratePartial: true,
-    });
-
-    // First worker should fail, second should succeed.
-    assert.equal(result.taskResults[0].status, "executor_error");
-    assert.equal(result.taskResults[1].status, "completed_unreviewed");
-    assert.ok(result.taskResults[1].acceptedCommitSha);
-
-    // Integration should have been attempted with the eligible worker.
-    assert.ok(result.integration, "Integration should have been attempted");
-    assert.equal(result.integration.status, "integrated");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });
@@ -1308,50 +1271,6 @@ test("scopedModels are forwarded to WaveControllerInput", async () => {
     // The wave should complete successfully with scopedModels passed through.
     assert.ok(result.waveId);
     assert.equal(result.taskResults.length, 1);
-  } finally {
-    await rm(artifactDir, { recursive: true, force: true });
-    await rm(sourceDir, { recursive: true, force: true });
-  }
-});
-
-// ── SEMANTICS FIX: partial mode all-failed wave ─────────────────────────────
-
-test("integratePartial with all workers failed skips integration/landing and returns worker_failure", async () => {
-  const artifactDir = await mkTmp("pi-wc-art-");
-  const sourceDir = await mkTmp("pi-wc-src-");
-  await git(["init", "--quiet"], sourceDir);
-  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
-  await git(["add", "."], sourceDir);
-  await git(["commit", "--quiet", "-m", "init"], sourceDir);
-
-  try {
-    const result = await executeWave({
-      cwd: sourceDir,
-      tasks: [
-        { title: "FAILTHISONE", instructions: "noop", acceptanceCriteria: [] },
-        { title: "ALSOFAIL", instructions: "FAILTHISONE", acceptanceCriteria: [] },
-      ],
-      config: makeConfigWithMixedExecutor(),
-      artifactDir,
-      waveId: "wc-partial-allfail",
-      integratePartial: true,
-    });
-
-    // Both workers should fail.
-    assert.equal(result.taskResults[0].status, "executor_error");
-    assert.equal(result.taskResults[1].status, "executor_error");
-
-    // Integration should be worker_failure, not no_changes.
-    assert.ok(result.integration, "Integration should be present");
-    assert.equal(result.integration.status, "worker_failure");
-
-    // Landing should not have been attempted.
-    assert.equal(result.landing, undefined);
-
-    // Manifest should reflect worker_failure.
-    const manifestPath = join(result.waveRoot, "wave-manifest.json");
-    const manifestData = JSON.parse(await readFile(manifestPath, "utf8"));
-    assert.equal(manifestData.integrationStatus, "worker_failure");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

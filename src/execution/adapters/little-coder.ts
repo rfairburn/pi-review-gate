@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { reviewerEnv, runPromptProcess } from "../../adapters/process";
+import { reviewerEnv, terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
+import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
 import { writeExecutorArtifacts } from "../artifacts";
 import { PiJsonlActivityExtractor } from "../progress";
-import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorRequest, type ExecutorTurn } from "../types";
+import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorInteractionAcknowledgement, type ExecutorRequest, type ExecutorTurn } from "../types";
 import type { ThinkingLevel } from "../../config";
 import { withLittleCoderThinkingBudget } from "../../little-coder-thinking";
 
@@ -65,43 +66,101 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
     const activity = new PiJsonlActivityExtractor((message) => request.onUpdate?.(message));
     const args = [
       "--model", this.options.model,
-      "--mode", "json",
-      "--print",
+      "--mode", "rpc",
       "--thinking", thinkingLevel,
       "--session-id", sessionId,
       "--session-dir", sessionDir,
       "--approve",
       ...(this.options.args ?? []),
     ];
-    const output = await runPromptProcess({
-      command: this.options.command ?? "little-coder",
-      args,
+    const proc = spawn(this.options.command ?? "little-coder", args, {
       cwd: request.cwd,
-      prompt: request.prompt,
-      timeoutMs: this.options.timeoutMs ?? 1_800_000,
+      detached: process.platform !== "win32",
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
       env: executorEnv(this.options.model, thinkingLevel),
-      signal: request.signal,
-      onProcessStart: request.onProcessStart,
-      onProcessExit: request.onProcessExit,
-      onStdoutChunk: (chunk) => {
-        extractor.push(chunk);
-        activity.push(chunk);
-      },
     });
+    const identity = proc.pid === undefined ? undefined : {
+      pid: proc.pid,
+      processGroupId: process.platform === "win32" ? undefined : proc.pid,
+    };
+    if (identity) await request.onProcessStart?.(identity);
+    const rpc = new LittleCoderRpc(proc, (chunk) => {
+      extractor.push(chunk);
+      activity.push(chunk);
+    });
+    const completion = rpc.waitForSettled();
+    let timedOut = false;
+    let aborted = false;
+    let interruptedByControl = false;
+    let protocolFailure: string | undefined;
+    let finalText = "";
+    const timer = setTimeout(() => {
+      timedOut = true;
+      rpc.terminate();
+    }, this.options.timeoutMs ?? 1_800_000);
+    timer.unref?.();
+    const onAbort = () => {
+      aborted = true;
+      if (interruptedByControl) return;
+      void rpc.request("abort", {}).catch(() => undefined).finally(() => rpc.terminate());
+    };
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      await rpc.request("prompt", { message: request.prompt });
+      request.onLiveControl?.({
+        adapter: this.kind,
+        generation: request.turn,
+        protocol: "pi rpc",
+        capabilities: { steer: true, interrupt: true },
+        steer: async (instruction, instructionId) => {
+          try {
+            await rpc.request("steer", { message: instruction }, instructionId);
+            return { status: "acknowledged", message: "Little Coder RPC acknowledged live steering." };
+          } catch (error) {
+            return { status: "failed", message: messageOf(error) };
+          }
+        },
+        interrupt: async (): Promise<ExecutorInteractionAcknowledgement> => {
+          try {
+            interruptedByControl = true;
+            await rpc.request("abort", {});
+            await completion;
+            return { status: "acknowledged", message: "Little Coder RPC acknowledged interruption and the agent settled." };
+          } catch (error) {
+            return { status: "failed", message: messageOf(error) };
+          }
+        },
+      });
+      await completion;
+      const response = await rpc.request("get_last_assistant_text", {});
+      finalText = isRecord(response.data) && typeof response.data.text === "string" ? response.data.text : "";
+    } catch (error) {
+      if (!timedOut && !aborted) protocolFailure = messageOf(error);
+    } finally {
+      clearTimeout(timer);
+      request.signal?.removeEventListener("abort", onAbort);
+      request.onLiveControl?.(undefined);
+      rpc.terminate();
+    }
+    const exit = await rpc.closed();
+    if (identity) await request.onProcessExit?.({ ...identity, code: exit.code, signal: exit.signal });
+    const output = rpc.output(protocolFailure ? 1 : 0, timedOut, aborted || interruptedByControl);
     activity.finish();
     const streamed = extractor.finish();
     const extracted = streamed.text.trim() ? streamed : extractReviewTextFromPiJsonl(output.stdout);
+    const text = finalText.trim() || extracted.text;
     const artifacts = await writeExecutorArtifacts({
       artifactDir: request.artifactDir,
       turn: request.turn,
       output,
-      text: extracted.text,
+      text,
       usage: extracted.usage,
       sessionId,
       adapter: this.kind,
     });
     return {
-      text: extracted.text,
+      text,
       session: { adapter: this.kind, id: sessionId },
       usage: extracted.usage,
       ...artifacts,
@@ -109,16 +168,121 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       timedOut: output.timedOut,
       aborted: output.aborted,
       lifecycle: extracted.lifecycle,
-      failure: extracted.lifecycle.compaction.status === "in_progress"
+      failure: protocolFailure
+        ? { category: "protocol", message: protocolFailure }
+        : interruptedByControl
+          ? { category: "interruption", message: "Little Coder RPC turn was interrupted." }
+        : extracted.lifecycle.compaction.status === "in_progress"
         ? { category: "interruption", message: "Executor process ended while context compaction was in progress." }
         : extracted.lifecycle.compaction.status === "failed" || extracted.lifecycle.compaction.status === "aborted"
           ? { category: "compaction", message: extracted.lifecycle.compaction.error ?? "Context compaction did not complete." }
           : extracted.terminalError
             ? { category: "provider", message: extracted.terminalError }
-        : output.stdinError
-          ? { category: "stdin", message: output.stdinError }
           : undefined,
     };
+  }
+}
+
+class LittleCoderRpc {
+  private nextId = 1;
+  private buffer = "";
+  private pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
+  private settledWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  private readonly exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  private readonly stdout = new BoundedTextAccumulator(100 * MEBIBYTE);
+  private readonly stderr = new BoundedTextAccumulator(16 * MEBIBYTE);
+
+  constructor(private readonly proc: ChildProcess, private readonly onJsonl: (chunk: string) => void) {
+    proc.stdout?.on("data", (value: Buffer) => this.consume(value.toString("utf8")));
+    proc.stderr?.on("data", (value: Buffer) => { this.stderr.append(value.toString("utf8")); });
+    this.exitPromise = new Promise((resolvePromise) => {
+      proc.once("close", (code, signal) => {
+        const error = new Error(`Little Coder RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`);
+        for (const pending of this.pending.values()) pending.reject(error);
+        this.pending.clear();
+        for (const waiter of this.settledWaiters) waiter.reject(error);
+        this.settledWaiters = [];
+        resolvePromise({ code, signal });
+      });
+      proc.once("error", (error) => {
+        for (const pending of this.pending.values()) pending.reject(error);
+        this.pending.clear();
+      });
+    });
+  }
+
+  request(type: string, fields: Record<string, unknown>, explicitId?: string): Promise<Record<string, unknown>> {
+    const id = explicitId ?? `review-gate-${this.nextId++}`;
+    return new Promise((resolvePromise, reject) => {
+      this.pending.set(id, { resolve: resolvePromise, reject });
+      if (!this.proc.stdin?.writable) {
+        this.pending.delete(id);
+        reject(new Error("Little Coder RPC stdin is not writable."));
+        return;
+      }
+      this.proc.stdin.write(`${JSON.stringify({ id, type, ...fields })}\n`);
+    });
+  }
+
+  waitForSettled(): Promise<void> {
+    return new Promise((resolvePromise, reject) => this.settledWaiters.push({ resolve: resolvePromise, reject }));
+  }
+
+  terminate(): void {
+    if (this.proc.exitCode !== null || this.proc.signalCode !== null) return;
+    terminateProcessTree(this.proc, "SIGTERM");
+    const timer = setTimeout(() => {
+      if (this.proc.exitCode === null && this.proc.signalCode === null) terminateProcessTree(this.proc, "SIGKILL");
+    }, 2_000);
+    timer.unref?.();
+  }
+
+  closed(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+    return this.exitPromise;
+  }
+
+  output(code: number | null, timedOut: boolean, aborted: boolean): ProcessRunResult {
+    return {
+      stdout: this.stdout.value,
+      stderr: this.stderr.value,
+      stdoutTruncated: this.stdout.truncated,
+      stderrTruncated: this.stderr.truncated,
+      stdoutBytes: this.stdout.bytes,
+      stderrBytes: this.stderr.bytes,
+      streamEvents: this.stdout.value.split("\n").filter(Boolean).length,
+      toolCalls: 0,
+      toolResultBytes: 0,
+      compactions: 0,
+      code,
+      timedOut,
+      aborted,
+    };
+  }
+
+  private consume(chunk: string): void {
+    this.stdout.append(chunk);
+    this.buffer += chunk;
+    for (;;) {
+      const newline = this.buffer.indexOf("\n");
+      if (newline < 0) break;
+      const raw = this.buffer.slice(0, newline);
+      this.buffer = this.buffer.slice(newline + 1);
+      if (!raw.trim()) continue;
+      this.onJsonl(`${raw}\n`);
+      let event: Record<string, unknown>;
+      try { event = JSON.parse(raw) as Record<string, unknown>; } catch { continue; }
+      if (event.type === "response" && typeof event.id === "string") {
+        const pending = this.pending.get(event.id);
+        if (!pending) continue;
+        this.pending.delete(event.id);
+        if (event.success === true) pending.resolve(event);
+        else pending.reject(new Error(rpcError(event)));
+      } else if (event.type === "agent_settled") {
+        const waiters = this.settledWaiters;
+        this.settledWaiters = [];
+        for (const waiter of waiters) waiter.resolve();
+      }
+    }
   }
 }
 
@@ -275,6 +439,14 @@ function rpcError(event: Record<string, unknown>): string {
   const error = event.error as Record<string, unknown> | undefined;
   if (typeof error?.message === "string") return error.message;
   return "unknown RPC error";
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function abortError(signal?: AbortSignal): Error {

@@ -37,6 +37,26 @@ export interface ExecutorRequest {
   onUpdate?: (text: string) => void;
   onProcessStart?: (process: { pid: number; processGroupId?: number }) => void | Promise<void>;
   onProcessExit?: (process: { pid: number; processGroupId?: number; code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
+  onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+}
+
+export interface ExecutorInteractionAcknowledgement {
+  status: "acknowledged" | "blocked" | "failed";
+  message: string;
+  turnId?: string;
+}
+
+export interface ExecutorLiveControl {
+  adapter: string;
+  generation: number;
+  /** Adapter-negotiated protocol or harness identity for diagnostics. */
+  protocol?: string;
+  capabilities: {
+    steer: boolean;
+    interrupt: boolean;
+  };
+  steer(instruction: string, instructionId: string): Promise<ExecutorInteractionAcknowledgement>;
+  interrupt(): Promise<ExecutorInteractionAcknowledgement>;
 }
 
 export interface ExecutorAdapter {

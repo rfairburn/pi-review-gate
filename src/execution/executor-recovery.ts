@@ -96,6 +96,8 @@ export async function runExecutorWithRecovery(input: {
       });
     } catch (error) {
       thrown = error;
+    } finally {
+      input.request.onLiveControl?.(undefined);
     }
 
     if (input.request.signal?.aborted) {

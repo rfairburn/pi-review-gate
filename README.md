@@ -175,21 +175,24 @@ Top-level `enabled: false` is the automatic-review master switch and does not
 disable a configured executor pool. The environment kill switches disable the whole
 extension, including delegated execution.
 
-With an executor selected, the plugin exposes one delegated-execution tool:
-`execute_subtasks`. It accepts 1–16 bounded tasks, so a single phase and a
-multi-worker wave use the same isolated worktree, review, retry, integration,
-and landing lifecycle. The configured harness/model cannot be changed in tool
-arguments. If review is enabled, corrections and post-pass confirmation reuse
-the child's durable session; any post-pass tree change is reviewed again.
+With an executor pool selected, the plugin exposes one model tool:
+`ExecuteSubtasks`. `start` and `add` accept 1–16 bounded tasks and return stable
+execution/task handles immediately. Work continues in the background up to the
+configured global and per-model capacities. Each task owns its capture,
+worktree, session, checkpoint, review, and landing outcome; there is no
+wave-wide shared base or all-workers integration barrier.
 
-The tool has four top-level actions: `start`, `continue`, `steer`, and `inspect`.
-`start` creates a wave. `continue` performs another durable turn and completes
-review/integration/landing. `inspect` expands a reattachment bundle, or an
-explicit `waveRoot` for a wave without an operation bundle yet, into current
-state and recovery diagnostics. `steer` is live-turn-only and currently reports
-that foreground adapters are not steerable; it never silently becomes a
-continuation. `continue`, `steer`, and `inspect` may omit the bundle only when
-the calling orchestrator has exactly one associated operation.
+The actions are `start`, `add`, `inspect`, `continue`, `steer`, `interrupt`,
+`force_merge`, and `mark_clean`. `continue` accepts either an associated task
+handle or a verified reattachment bundle. `steer` is valid while a task is
+queued, starting, or in a live executor turn: queued instructions are durably
+incorporated into the initial prompt, while live instructions use the adapter's
+acknowledged steering transport.
+`interrupt` explicitly chooses failure or merge disposition. `force_merge`
+operates only on a stopped task with an accepted commit or verified checkpoint;
+`mergeAnyhow` may deliberately install ordinary conflict markers in main.
+`mark_clean` validates that those markers are resolved before queued landings
+resume. No singular or snake_case compatibility tool is registered.
 
 Executor failures are checkpointed to a protected recovery ref before bounded
 retry. Compaction is a lifecycle transition: an interrupted Little Coder
@@ -204,19 +207,28 @@ session, attempts, incidents, changed paths, verified checkpoint, hashed
 artifact inventory, current bundle, and safe next actions. Only `landed` means
 that worker changes reached the source workspace.
 
-The tool card shows the current phase and elapsed time. Ctrl+O expands bounded
-per-task activity, executor/reviewer identity, artifacts, review cycles, and
-verdicts. Five-second UI refreshes do not slow executor turns and are not copied
-into model context; only the final result packet is returned as tool context.
+The persistent widget shows active tasks below the editor and distinguishes a
+queued executor-startup/capacity wait from active work. Every model-facing
+`start`, `add`, and `inspect` result includes the stable task UUIDs, states,
+recent activity, and full artifact paths needed for control and deeper `rg`
+inspection. A partial landing event identifies the landed paths and every
+sibling that has not landed; only the final event invites aggregate verification.
+Completion, failure, requested pattern matches, and workspace conflicts use
+event-driven wake lanes (`now`, `soon`, or `idle`); polling loops are neither
+required nor recommended, but purposeful `inspect` calls are always supported.
+User analogs are available as `/subtasks` and the `/subtask-*` commands for
+inspect, add, steer, interrupt, force-merge, and mark-clean. These commands open
+interactive execution/task and action pickers when handles are omitted; their
+explicit-handle forms remain available for scripting.
 
 Review and execution recovery state is scoped to the exact Pi conversation.
 The normal restart flow—launching into a temporary/default session and then
 running `/resume <session>`—loads the selected conversation in a fresh extension
 runtime and restores only that conversation's integrity-checked sidecar state.
 The temporary startup session is shut down and cannot leak its review window or
-wave associations into the resumed session. Restored state includes review
-baselines/evidence, pending model deliveries, wave roots, operation bundles,
-task definitions, incidents, checkpoints, and owner leases. A live or uncertain
+execution associations into the resumed session. Restored state includes review
+baselines/evidence, pending model deliveries, execution groups, operation bundles,
+task definitions, activity, commands, incidents, checkpoints, and conflict gates. A live or uncertain
 owner blocks another writer; a confirmed-dead writer can be reconciled into a
 freshly reverified checkpoint before an explicit continuation. Queued inputs
 from a review interrupted by restart are not reordered automatically: use
@@ -232,73 +244,66 @@ Foreground automatic reviews, `/review-now`, and reviewer-question commands show
 the active reviewer milestone and elapsed time in the status line until the
 review completes or is cancelled.
 
-### Delegated waves with `execute_subtasks`
+### Background execution with `ExecuteSubtasks`
 
-Each task runs in an isolated worktree with its own review lifecycle. Tasks are
-specified as an array of 1–16 items.
+Each task runs in an isolated worktree with its own review lifecycle and
+permanent task UUID. Tasks are specified as an array of 1–16 items.
 
-**Concurrency**: `maxWorkers` controls concurrent workers (1–16, default 4).
-The tool-call value overrides `config.execution.maxWorkers`; task count is
-independent, and excess tasks queue. Fresh tasks scan `execution.executorPool`
+**Concurrency**: `config.execution.maxWorkers` controls concurrent workers
+(1–16, default 4); there is no parallelism toggle or per-tool override. Task
+count is independent, and excess tasks queue. Fresh tasks scan `execution.executorPool`
 in strict priority order and use the first entry with remaining
 `maxConcurrent` capacity. Thus a one-slot local primary can remain preferred
 while lower-priority cloud entries absorb overflow. The sum of pool capacities
 may exceed `maxWorkers`; it describes available fallback capacity, not the
 number of workers that must run.
 
-**Integration policy**: By default all-or-nothing: any worker that is not
-accepted, accepted_with_warnings, completed_unreviewed, or no_changes blocks
-integration entirely. Set `integratePartial: true` to integrate eligible workers
-(accepted / accepted_with_warnings / completed_unreviewed) in declared order
-despite failed ones.
+**Independent landing**: As soon as one task is accepted, it acquires the short
+source-mutation lease, replans against current main, and attempts to land. It
+does not wait for, integrate with, or roll back a sibling. A completed landing
+immediately frees capacity, and `add` can top the execution group back up. The
+landed changes remain uncommitted; source HEAD, index, staging state, and stash
+are preserved.
 
-**Integration order**: Workers are integrated in the declared order from the
-tasks array, regardless of completion order.
-
-**Landing**: After integration, changes are landed into the source workspace.
-The final changes are uncommitted — they appear as unstaged working-tree
-changes; the source index and staging state remain unchanged.
-
-**Snapshot and ignore policy**: The wave captures a snapshot of the source
-workspace. Non-ignored untracked files are included in the snapshot. Git-ignored
-files are excluded from the captured snapshot and landing. This means dependencies
+**Snapshot and ignore policy**: Each dispatched task captures the source
+workspace independently. Non-ignored untracked files are included. Git-ignored
+files are excluded from capture and landing. This means dependencies
 installed in `node_modules`, secrets in `.env`, and other ignored paths are
 not captured or landed. If your task depends on files that are git-ignored,
 the worker will not see them. Files known to Git through `HEAD` or the index are
-always captured regardless of repository size. During parallel wave capture,
+always captured regardless of repository size. During task capture,
 `maxSnapshotBytes` limits only the cumulative size of non-ignored untracked
 files (50 MiB by default). For ordinary serial review snapshots, the same
 setting continues to bound the textual file content retained for diffing.
 
-**Artifacts**: Each wave produces a `waveRoot` directory containing artifacts
-for each task, a wave manifest (`wave-manifest.json`), and stable refs for
-integrated commits. The wave root path is returned in the tool result. On later
-wave starts, completed non-recovery roots older than `waveArtifactTtlMs` are
+**Artifacts**: Each task produces a `waveRoot` containing its operation record,
+bounded executor/reviewer protocol streams, worktree/checkpoint metadata, manifest, and
+stable refs. Its execution group has a separate integrity-checked manifest and
+is associated with the exact parent conversation sidecar. On later captures,
+completed non-recovery roots older than `waveArtifactTtlMs` are
 garbage-collected (30 days by default; `0` disables collection). Conflict,
 integration-error, and recovery-required roots are never removed by this GC,
 and `retainBundles: "always"` disables wave GC.
 
-**Conflict and recovery**: If integration encounters conflicts, the wave
-returns a `conflicted` status with details about the conflicting task, commit,
-and paths. The integration worktree is preserved for diagnosis. Landing
-conflicts are reported with per-path conflict details. Rolled-back landings
-store a recovery manifest for manual recovery.
+**Conflict and recovery**: A clean accepted task lands immediately. On a
+three-way conflict, clean paths are applied and ordinary diff3 markers are
+materialized for the conflicting text paths in main. A durable critical gate
+then blocks every later landing, identifies the owning task and paths in
+`inspect`, and injects a priority instruction on every matching orchestrator
+turn. After resolving the files, use `mark_clean`; it verifies that markers are
+gone, checkpoints the resolution, clears the gate, and wakes queued landings.
+Stopped tasks retain verified checkpoints and reattachment bundles for
+`continue` or `force_merge`; `force_merge` with `mergeAnyhow` deliberately
+materializes the same conflict state when a clean landing is impossible.
 
-Every non-landed `execute_subtasks` result includes an explicit outcome and
-recovery packet for both the controlling model and the expanded activity view.
-For integration and landing conflicts it states that no executor changes were
-applied to the source workspace, identifies preserved diagnostic worktrees when
-present, retained commits, paths, Git diagnostics, and reattachment bundles,
-and explains that the orchestrator must either resolve the combined change
-itself or continue a specific retained task. Conflict wave manifests retain
-the same provenance so `inspect` can recover it after compaction or
-reattachment. A
-`recovery_required` landing is called out separately because an incomplete
-rollback means the source may be partially modified and its recovery manifest
-must be handled before further edits.
+Every failed or non-landed `ExecuteSubtasks` action returns the complete group
+and task inspection: durable handles, current source disposition, commands and
+acknowledgements, incidents, checkpoint/bundle data, artifact paths, conflicts,
+and concrete recovery actions. This state remains inspectable after compaction
+or an exact-session restart.
 
-**Source preservation**: The wave never mutates the source repository through
-Git operations. Source HEAD, index, staging state, and stash are preserved.
+**Source preservation**: Landing never changes source HEAD, index, staging
+state, or stash. Final filesystem mutations are serialized and rollback-protected.
 Absolute source-workspace paths in task and correction text are remapped to the
 worker worktree, and executor `PWD` is set to its actual isolated cwd. Clean
 worktrees are removed after completion; dirty or conflicted worktrees are

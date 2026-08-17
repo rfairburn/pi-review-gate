@@ -11,7 +11,7 @@ import {
   resolvedExecutorPool,
   type ReviewGateConfig,
 } from "../config";
-import type { ExecutorAdapter, ExecutorSession, ExecutorTurn, SubtaskProgressUpdate } from "./types";
+import type { ExecutorAdapter, ExecutorLiveControl, ExecutorSession, ExecutorTurn, SubtaskProgressUpdate } from "./types";
 import type { TokenUsage } from "../usage";
 import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
 import { runExecutorWithRecovery, type RecoveredExecutorRun } from "./executor-recovery";
@@ -180,6 +180,8 @@ export interface WaveWorkerInput {
   signal?: AbortSignal;
   /** Progress callback. */
   onUpdate?: (update: SubtaskProgressUpdate) => void;
+  /** Register live steering/interruption for the current executor turn. */
+  onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
   /** Capacity lease selected by the wave scheduler. */
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
@@ -214,6 +216,8 @@ export interface WaveWorkerContinuationInput {
   signal?: AbortSignal;
   /** Progress callback. */
   onUpdate?: (update: SubtaskProgressUpdate) => void;
+  /** Register live steering/interruption for the current executor turn. */
+  onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
   /** Capacity lease selected by the wave scheduler. */
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
@@ -635,6 +639,7 @@ async function runWithPoolFailover(input: {
           adapter: adapter!.kind,
           model: adapter!.model,
         }),
+        onLiveControl: input.worker.onLiveControl,
       },
       prompt,
       startingTurn,
@@ -1002,9 +1007,9 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
 
   const operation = await readOperationRecord(operationRecordPath(resolvedArtifactDir));
   operation.state = "running";
-  const assignment = config.execution?.executorPool !== undefined
-    ? assignmentFromOperation(operation, config) ?? input.executorAssignment ?? configuredAssignment(config)
-    : input.executorAssignment ?? configuredAssignment(config);
+  const assignment = input.executorAssignment ?? (config.execution?.executorPool !== undefined
+    ? assignmentFromOperation(operation, config) ?? configuredAssignment(config)
+    : configuredAssignment(config));
   if (!assignment) {
     return {
       status: "executor_error",

@@ -97,9 +97,10 @@ export async function activate(pi: unknown): Promise<void> {
     agentRunActive = false;
     reviewerQuestionPausePending = false;
     releaseReviewerQuestionPauseWaiters();
+    await executionTools.shutdown();
     await persistSessionState(true);
     await stateStore?.drain();
-    await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
+    await executionTools.detach();
     discardSessionState(state);
   });
 
@@ -107,6 +108,8 @@ export async function activate(pi: unknown): Promise<void> {
     sessionActive = true;
     currentCwd = extractCwd(args, currentCwd);
     updateScopedModels(args);
+    executionTools.setScopedModels(currentScopedModels);
+    executionTools.setUiContext(extractContext(args) ?? pi);
     discardSessionState(state);
     await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
     const context = extractContext(args);
@@ -184,9 +187,11 @@ export async function activate(pi: unknown): Promise<void> {
     agentRunActive = true;
     currentCwd = extractCwd(args, currentCwd);
     updateScopedModels(args);
+    executionTools.setScopedModels(currentScopedModels);
+    executionTools.setUiContext(extractContext(args) ?? pi);
     beginAgentRun(state);
     if (activeExchangeHasBaseline(state)) {
-      return;
+      return executionPromptInjection(executionTools.criticalPrompt());
     }
     const baseline = await createWorkspaceSnapshot(currentCwd, {
       maxFileBytes: config.maxFileBytes,
@@ -195,6 +200,7 @@ export async function activate(pi: unknown): Promise<void> {
     setReviewWindowBaseline(state, baseline);
     freezeReviewWindowConfig(state, config, currentScopedModels);
     await persistSessionState();
+    return executionPromptInjection(executionTools.criticalPrompt());
   });
 
   registerHook(pi, "tool_call", async (...args) => {
@@ -531,6 +537,7 @@ export async function activate(pi: unknown): Promise<void> {
     onSaved: () => executionTools.sync(),
     onScopedModels: (models) => {
       currentScopedModels = [...models];
+      executionTools.setScopedModels(currentScopedModels);
     },
   });
 
@@ -538,6 +545,17 @@ export async function activate(pi: unknown): Promise<void> {
     const choices = scopedModelChoices(extractContext(args) ?? args.find((arg) => scopedModelChoices(arg) !== undefined));
     if (choices) currentScopedModels = choices.map((choice) => choice.model);
   }
+}
+
+function executionPromptInjection(content: string | undefined): { message: { customType: string; content: string; display: boolean } } | undefined {
+  if (!content) return undefined;
+  return {
+    message: {
+      customType: "pi-review-subtask-critical",
+      content,
+      display: false,
+    },
+  };
 }
 
 async function transmitReviewPass(input: {

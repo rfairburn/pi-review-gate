@@ -14,6 +14,16 @@ const SESSION_STATE_VERSION = 1;
 export interface ExecutionAssociationsSnapshot {
   waveRoots: string[];
   bundles: ReattachmentBundle[];
+  groupRoots?: string[];
+  conflictGate?: {
+    executionId: string;
+    taskId: string;
+    sourceRoot: string;
+    paths: string[];
+    activatedAt: string;
+    manifestPath: string;
+    reason: string;
+  };
 }
 
 export interface SessionPersistenceIdentity {
@@ -382,6 +392,8 @@ function cloneExecutionAssociations(value: ExecutionAssociationsSnapshot): Execu
   return {
     waveRoots: [...new Set(value.waveRoots)],
     bundles: value.bundles.map((bundle) => ({ ...bundle })),
+    groupRoots: value.groupRoots ? [...new Set(value.groupRoots)] : undefined,
+    conflictGate: value.conflictGate ? { ...value.conflictGate, paths: [...value.conflictGate.paths] } : undefined,
   };
 }
 
@@ -418,6 +430,18 @@ function isPersistedSessionState(value: unknown): value is PersistedSessionState
     || !Array.isArray(value.state.queuedUserInputsDuringReview)
     || (value.state.pendingModelDeliveries !== undefined && !Array.isArray(value.state.pendingModelDeliveries))) return false;
   if (!Array.isArray(value.execution.waveRoots) || !Array.isArray(value.execution.bundles)) return false;
+  if (value.execution.groupRoots !== undefined && !Array.isArray(value.execution.groupRoots)) return false;
+  if (value.execution.conflictGate !== undefined) {
+    const gate = value.execution.conflictGate;
+    if (!isRecord(gate)
+      || typeof gate.executionId !== "string"
+      || typeof gate.taskId !== "string"
+      || typeof gate.sourceRoot !== "string"
+      || !Array.isArray(gate.paths)
+      || typeof gate.activatedAt !== "string"
+      || typeof gate.manifestPath !== "string"
+      || typeof gate.reason !== "string") return false;
+  }
   return true;
 }
 

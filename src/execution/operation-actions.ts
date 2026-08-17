@@ -6,8 +6,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import { candidateRefName, normalizeCandidate, pinRecoveryCandidate } from "./wave-commits";
-import { integrateWave, type SelectedWorker, type WaveIntegrationResult } from "./wave-integration";
-import { executeWaveLanding, inspectLandingRecoveryManifests, planWaveLanding, recoverLandingManifest, type LandingExecutionResult, type LandingRecoveryManifestInspection } from "./wave-landing";
+import type { WaveIntegrationResult } from "./wave-integration";
+import { executeWaveLanding, inspectLandingRecoveryManifests, planWaveLanding, recoverLandingManifest, type LandingExecutionResult, type LandingPlan, type LandingRecoveryManifestInspection } from "./wave-landing";
 import { readWaveCaptureRecord } from "./wave-repository";
 import { runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "./wave-worker-lifecycle";
 import { resumeWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
@@ -28,6 +28,8 @@ import {
 import type { WaveManifest, WaveManifestTask } from "./wave-controller";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { acquireWaveOwner, heartbeatWaveOwner, inspectWaveOwner, releaseWaveOwner } from "./wave-owner";
+import type { ExecutorLiveControl } from "./types";
+import { sourceMutationCoordinator } from "./source-mutation-lease";
 
 export interface OperationInspection {
   bundle: ReattachmentBundle;
@@ -268,6 +270,10 @@ export async function continueOperation(input: {
   scopedModels?: string[];
   signal?: AbortSignal;
   onUpdate?: (message: string) => void;
+  executorAssignment?: ExecutorPoolLease;
+  executorPool?: ExecutorPoolScheduler;
+  onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+  onLandingConflict?: (input: { capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>; plan: LandingPlan }) => void | Promise<void>;
 }): Promise<{
   inspection: OperationInspection;
   lifecycle?: WaveWorkerLifecycleResult;
@@ -416,7 +422,7 @@ export async function continueOperation(input: {
   instructionRecord.status = "delivered";
   instructionRecord.deliveredAt = new Date().toISOString();
   await writeOperationRecord(record);
-  const continuationPool = new ExecutorPoolScheduler(resolvedExecutorPool(input.config));
+  const continuationPool = input.executorPool ?? new ExecutorPoolScheduler(resolvedExecutorPool(input.config));
   let failoverLease: ExecutorPoolLease | undefined;
   const acquireFailover = async (currentPriority: number) => {
     failoverLease?.release();
@@ -438,7 +444,9 @@ export async function continueOperation(input: {
     feedback: instruction,
     turn: nextTurn,
     signal: input.signal,
+    executorAssignment: input.executorAssignment,
     acquireFailover,
+    onLiveControl: input.onLiveControl,
     onUpdate: (update) => input.onUpdate?.(update.message),
     });
   } catch (error) {
@@ -467,7 +475,9 @@ export async function continueOperation(input: {
       sourceRootAliases: [capture.discovery.requestedCwd],
       scopedModels: input.scopedModels,
       signal: input.signal,
+      executorAssignment: input.executorAssignment,
       acquireFailover,
+      onLiveControl: input.onLiveControl,
       onUpdate: (update) => input.onUpdate?.(update.message),
       initialResult: continued,
     });
@@ -489,20 +499,31 @@ export async function continueOperation(input: {
     return { inspection: await inspectOperation(createReattachmentBundle(record, waveRoot)), lifecycle };
   }
 
-  const selected = selectedWorkers(manifest, lifecycle);
-  for (const worker of selected) {
-    if (worker.taskId === lifecycle.taskId) continue;
-    await pinCommit(continuationCapture, worker.commitSha, { type: "worker", taskId: worker.taskId }, input.signal);
-  }
-  const integration = await retryOperationStage(
+  const integration = await retryOperationStage<WaveIntegrationResult>(
     record,
     input.config,
     "integrating",
     "integration_error",
     async () => {
-      input.onUpdate?.("integrating accepted task results in declared order");
-      await removeWorktree(join(waveRoot, "integration"), capture.repositoryPath).catch(() => {});
-      return integrateWave(continuationCapture, selected, input.signal);
+      input.onUpdate?.("preparing the accepted continuation for independent landing");
+      const integratedRef = await pinCommit(
+        continuationCapture,
+        lifecycle.acceptedCommitSha!,
+        { type: "integration" },
+        input.signal,
+      );
+      return {
+        status: "integrated",
+        integratedRef,
+        finalCommitSha: lifecycle.acceptedCommitSha!,
+        workerMappings: [{
+          taskId: lifecycle.taskId,
+          originalCommitSha: lifecycle.acceptedCommitSha!,
+          integratedCommitSha: lifecycle.acceptedCommitSha!,
+          order: 1,
+        }],
+        validationStatus: "not_run",
+      };
     },
     input.signal,
   );
@@ -519,12 +540,18 @@ export async function continueOperation(input: {
     "landing",
     "landing_error",
     async () => {
-      input.onUpdate?.("landing the integrated continuation into the source workspace");
+      input.onUpdate?.("landing the accepted continuation into the source workspace");
       const landingCapture = continuationLandingBase
         ? { ...continuationCapture, baseCommit: continuationLandingBase }
         : continuationCapture;
-      const plan = await planWaveLanding(landingCapture, integration.finalCommitSha, capture.discovery.captureRoot, input.signal);
-      return executeWaveLanding(plan, landingCapture, input.signal);
+      const releaseSource = await sourceMutationCoordinator.acquire(capture.discovery.captureRoot, input.signal);
+      try {
+        const plan = await planWaveLanding(landingCapture, integration.finalCommitSha, capture.discovery.captureRoot, input.signal);
+        if (plan.conflicts.length > 0) await input.onLandingConflict?.({ capture: landingCapture, plan });
+        return executeWaveLanding(plan, landingCapture, input.signal);
+      } finally {
+        releaseSource();
+      }
     },
     input.signal,
   );
@@ -874,14 +901,4 @@ async function readTask(artifactDir: string): Promise<WaveWorkerTask> {
 
 function isEligible(result: WaveWorkerLifecycleResult): boolean {
   return result.status === "accepted" || result.status === "accepted_with_warnings" || result.status === "completed_unreviewed";
-}
-
-function selectedWorkers(manifest: WaveManifest, recovered: WaveWorkerLifecycleResult): SelectedWorker[] {
-  return manifest.tasks.flatMap((task) => {
-    if (task.taskId === recovered.taskId) {
-      return [{ taskId: recovered.taskId, commitSha: recovered.acceptedCommitSha! }];
-    }
-    if (!task.acceptedCommitSha || !["accepted", "accepted_with_warnings", "completed_unreviewed"].includes(task.status)) return [];
-    return [{ taskId: task.taskId, commitSha: task.acceptedCommitSha }];
-  });
 }

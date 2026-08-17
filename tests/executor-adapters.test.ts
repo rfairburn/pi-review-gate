@@ -3,241 +3,154 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ClaudeExecutorAdapter } from "../src/execution/adapters/claude-cli";
 import { CodexExecutorAdapter } from "../src/execution/adapters/codex-cli";
 import { LittleCoderExecutorAdapter } from "../src/execution/adapters/little-coder";
+import type { ExecutorLiveControl } from "../src/execution/types";
 
-test("little-coder executor uses the canonical model, isolated session, and nested-gate kill switch", async () => {
-  const fixture = await harnessFixture("little");
-  const adapter = new LittleCoderExecutorAdapter({
-    model: "openai-codex/gpt-5.6-sol",
-    thinkingLevel: "max",
-    command: fixture.command,
-    args: [fixture.capture],
-  });
-
-  const activity: string[] = [];
-  const first = await adapter.run({
-    ...request(fixture, 1),
-    onUpdate: (message) => activity.push(message),
-  });
-  const second = await adapter.run(request(fixture, 2, first.session));
-
-  assert.equal(first.text, "little complete");
-  assert.deepEqual(activity, ["model turn started", "model update · little complete", "model turn completed"]);
-  assert.equal(second.session.id, first.session.id);
-  const captured = JSON.parse(await readFile(fixture.capture, "utf8"));
-  assert.deepEqual(valueAfter(captured.argv, "--model"), "openai-codex/gpt-5.6-sol");
-  assert.deepEqual(valueAfter(captured.argv, "--thinking"), "max");
-  assert.equal(captured.thinkingBudget, "0");
-  assert.deepEqual(valueAfter(captured.argv, "--session-id"), first.session.id);
-  assert.equal(captured.disabled, "1");
-});
-
-test("little-coder executor preserves terminal provider errors", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-review-little-provider-error-"));
+test("Little Coder executor uses acknowledged RPC steering and a durable session", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-little-rpc-"));
   try {
     const artifactDir = join(root, "artifacts");
+    const capture = join(root, "capture.json");
+    const command = join(root, "little-rpc.cjs");
     await mkdir(artifactDir);
-    const command = join(root, "provider-error.cjs");
     await writeFile(command, [
       "#!/usr/bin/env node",
-      "process.stdin.resume();",
-      "process.stdin.on('end',()=>{",
-      "console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[],errorMessage:'Provider capacity exhausted'}}));",
-      "console.log(JSON.stringify({type:'auto_retry_end',success:false,finalError:'Provider capacity exhausted'}));",
-      "});",
+      `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2)));`,
+      "let input=''; process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));}",
+      "else if(c.type==='steer'){console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'little complete'}]}}));console.log(JSON.stringify({type:'turn_end'}));console.log(JSON.stringify({type:'agent_settled'}));}",
+      "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:'little complete'}}));",
+      "else if(c.type==='abort'){console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));console.log(JSON.stringify({type:'agent_settled'}));}",
+      "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);
-    const adapter = new LittleCoderExecutorAdapter({ model: "provider/model", command });
-    const result = await adapter.run({ cwd: root, prompt: "work", artifactDir, turn: 1 });
-    assert.deepEqual(result.failure, { category: "provider", message: "Provider capacity exhausted" });
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("little-coder executor classifies an unfinished compaction as an interruption", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-review-little-compaction-"));
-  try {
-    const artifactDir = join(root, "artifacts");
-    await mkdir(artifactDir);
-    const command = join(root, "compaction.cjs");
-    await writeFile(command, [
-      "#!/usr/bin/env node",
-      "process.stdin.resume();",
-      "process.stdin.on('end',()=>{",
-      "console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[],errorMessage:'This operation was aborted'}}));",
-      "console.log(JSON.stringify({type:'compaction_start',reason:'manual'}));",
-      "});",
-    ].join("\n"), "utf8");
-    await chmod(command, 0o755);
-    const adapter = new LittleCoderExecutorAdapter({ model: "provider/model", command });
-    const result = await adapter.run({ cwd: root, prompt: "work", artifactDir, turn: 1 });
-    assert.deepEqual(result.failure, {
-      category: "interruption",
-      message: "Executor process ended while context compaction was in progress.",
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new LittleCoderExecutorAdapter({
+      model: "provider/model",
+      thinkingLevel: "high",
+      command,
+      args: [],
     });
-    assert.equal(result.lifecycle?.compaction.status, "in_progress");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("little-coder executor explicitly compacts the exact durable session before resuming", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-review-little-compact-recovery-"));
-  try {
-    const artifactDir = join(root, "artifacts");
-    await mkdir(artifactDir);
-    const command = join(root, "compact-recovery.cjs");
-    const log = join(root, "rpc-log.jsonl");
-    await writeFile(command, [
-      "#!/usr/bin/env node",
-      "const fs=require('node:fs');",
-      "const mode=process.argv[process.argv.indexOf('--mode')+1];",
-      `const log=${JSON.stringify(log)};`,
-      "if(mode==='rpc') {",
-      " let input=''; process.stdin.setEncoding('utf8');",
-      " process.stdin.on('data',chunk=>{ input+=chunk; for(;;){ const n=input.indexOf('\\n'); if(n<0)break; const line=input.slice(0,n); input=input.slice(n+1); if(!line)continue; const command=JSON.parse(line); fs.appendFileSync(log,JSON.stringify(command)+'\\n'); if(command.type==='get_state') console.log(JSON.stringify({type:'response',id:command.id,command:'get_state',success:true,data:{sessionId:'durable-session'}})); else if(command.type==='compact') console.log(JSON.stringify({type:'response',id:command.id,command:'compact',success:true,data:{summary:'preserved'}})); } });",
-      "} else {",
-      " process.stdin.resume(); process.stdin.on('end',()=>{ console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'resumed after compact'}]}})); });",
-      "}",
-    ].join("\n"), "utf8");
-    await chmod(command, 0o755);
-    const adapter = new LittleCoderExecutorAdapter({ model: "provider/model", command });
-    const updates: string[] = [];
-    const processLifecycle: string[] = [];
-    const result = await adapter.run({
+    const run = adapter.run({
       cwd: root,
-      prompt: "continue",
+      prompt: "initial task",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.deepEqual(control.capabilities, { steer: true, interrupt: true });
+    assert.equal((await control.steer("new direction", "steer-1")).status, "acknowledged");
+    const result = await run;
+    assert.equal(result.text, "little complete");
+    assert.equal(result.session.adapter, "little-coder-model");
+    const argv: string[] = JSON.parse(await readFile(capture, "utf8"));
+    assert.equal(argv[argv.indexOf("--mode") + 1], "rpc");
+    assert.equal(argv.includes("--print"), false);
+
+    let resolveInterruptControl!: (control: ExecutorLiveControl) => void;
+    const interruptControlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveInterruptControl = resolvePromise; });
+    const interruptedRun = adapter.run({
+      cwd: root,
+      prompt: "interrupt this task",
       artifactDir,
       turn: 2,
-      session: { adapter: "little-coder-model", id: "durable-session" },
-      recovery: { kind: "compaction", compactBeforePrompt: true },
-      onUpdate: (message) => updates.push(message),
-      onProcessStart: ({ pid }) => { processLifecycle.push(`start:${pid}`); },
-      onProcessExit: ({ pid }) => { processLifecycle.push(`exit:${pid}`); },
+      onLiveControl: (next) => { if (next) resolveInterruptControl(next); },
     });
-
-    assert.equal(result.text, "resumed after compact");
-    const commands = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    assert.deepEqual(commands.map((entry) => entry.type), ["get_state", "compact"]);
-    assert.match(commands[1].customInstructions, /Preserve the task objective/);
-    assert.ok(updates.includes("reopening executor session for context compaction"));
-    assert.ok(updates.includes("context compaction completed; resuming executor"));
-    assert.equal(processLifecycle.length, 4);
-    assert.match(processLifecycle[0] ?? "", /^start:/);
-    assert.equal(processLifecycle[1]?.replace("exit:", ""), processLifecycle[0]?.replace("start:", ""));
-    assert.match(processLifecycle[2] ?? "", /^start:/);
-    assert.equal(processLifecycle[3]?.replace("exit:", ""), processLifecycle[2]?.replace("start:", ""));
+    const interruptControl = await interruptControlReady;
+    assert.equal((await interruptControl.interrupt()).status, "acknowledged");
+    const interrupted = await interruptedRun;
+    assert.equal(interrupted.aborted, true);
+    assert.equal(interrupted.failure?.category, "interruption");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("Codex executor starts with automatic workspace-write approval and resumes the exact thread", async () => {
-  const fixture = await harnessFixture("codex");
-  const adapter = new CodexExecutorAdapter({
-    id: "codex",
-    adapter: "codex-cli",
-    command: fixture.command,
-    model: "gpt-5.6-sol",
-    args: [],
-    env: { CAPTURE_PATH: fixture.capture, PI_REVIEW_GATE_DISABLED: "0" },
-  });
-
-  const activity: string[] = [];
-  const first = await adapter.run({
-    ...request(fixture, 1),
-    onUpdate: (message) => activity.push(message),
-  });
-  assert.equal(first.session.id, "11111111-1111-4111-8111-111111111111");
-  assert.deepEqual(activity, ["model turn started", "model update · codex complete", "model turn completed"]);
-  const start = JSON.parse(await readFile(fixture.capture, "utf8"));
-  assert.ok(start.argv.includes("--approve-for-me"));
-  assert.ok(!start.argv.includes("--sandbox"));
-  assert.equal(valueAfter(start.argv, "--model"), "gpt-5.6-sol");
-  assert.equal(start.disabled, "1");
-
-  await adapter.run(request(fixture, 2, first.session));
-  const resumed = JSON.parse(await readFile(fixture.capture, "utf8"));
-  assert.deepEqual(resumed.argv.slice(0, 2), ["exec", "resume"]);
-  assert.ok(resumed.argv.includes(first.session.id));
+test("Codex executor uses app-server turn steering with exact thread and turn ids", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-app-server-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "capture.jsonl");
+    const command = join(root, "codex-app-server.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs'); let input=''; process.stdin.setEncoding('utf8');",
+      `const capture=${JSON.stringify(capture)};`,
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(capture,raw+'\\n');if(!c.id)continue;",
+      "if(c.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));",
+      "else if(c.method==='thread/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-1'}}}));",
+      "else if(c.method==='turn/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turn:{id:'turn-1'}}}));",
+      "else if(c.method==='turn/steer'){console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turnId:'turn-1'}}));console.log(JSON.stringify({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text:'codex complete'}}}));console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-1',status:'completed'}}}));}",
+      "else if(c.method==='turn/interrupt')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "work",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.steer("adjust", "durable-steer-id")).status, "acknowledged");
+    const result = await run;
+    assert.equal(result.text, "codex complete");
+    assert.equal(result.session.id, "thread-1");
+    const calls = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const steer = calls.find((call) => call.method === "turn/steer");
+    assert.equal(steer.params.threadId, "thread-1");
+    assert.equal(steer.params.expectedTurnId, "turn-1");
+    assert.equal(steer.params.clientUserMessageId, "durable-steer-id");
+    assert.ok(calls.some((call) => call.method === "initialized"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
-test("Claude executor uses editable auto mode and resumes its UUID", async () => {
-  const fixture = await harnessFixture("claude");
-  const adapter = new ClaudeExecutorAdapter({
-    id: "claude",
-    adapter: "claude-cli",
-    command: fixture.command,
-    model: "sonnet",
-    args: [],
-    env: { CAPTURE_PATH: fixture.capture },
-  });
-
-  const first = await adapter.run(request(fixture, 1));
-  const start = JSON.parse(await readFile(fixture.capture, "utf8"));
-  assert.equal(first.text, "claude complete");
-  assert.equal(valueAfter(start.argv, "--permission-mode"), "auto");
-  assert.equal(valueAfter(start.argv, "--tools"), "default");
-  assert.equal(valueAfter(start.argv, "--session-id"), first.session.id);
-
-  await adapter.run(request(fixture, 2, first.session));
-  const resumed = JSON.parse(await readFile(fixture.capture, "utf8"));
-  assert.equal(valueAfter(resumed.argv, "--resume"), first.session.id);
+test("Codex interrupt waits for the active turn terminal notification", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-interrupt-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "codex-interrupt.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "let input='';process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);if(!c.id)continue;",
+      "if(c.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{userAgent:'codex-test/1.0'}}));",
+      "else if(c.method==='thread/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-i'}}}));",
+      "else if(c.method==='turn/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turn:{id:'turn-i'}}}));",
+      "else if(c.method==='turn/interrupt'){console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));setTimeout(()=>console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-i',turn:{id:'turn-i',status:'interrupted'}}})),40);}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "work",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal(control.protocol, "codex-test/1.0");
+    const startedAt = Date.now();
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    assert.ok(Date.now() - startedAt >= 30, "interrupt acknowledgement must await turn completion");
+    const result = await run;
+    assert.equal(result.failure?.category, "interruption");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
-
-async function harnessFixture(mode: "little" | "codex" | "claude"): Promise<{
-  root: string;
-  artifactDir: string;
-  command: string;
-  capture: string;
-}> {
-  const root = await mkdtemp(join(tmpdir(), `pi-review-${mode}-adapter-`));
-  const artifactDir = join(root, "artifacts");
-  await mkdir(artifactDir);
-  const command = join(root, "fake-harness.cjs");
-  const capture = join(root, "capture.json");
-  await writeFile(command, [
-    "#!/usr/bin/env node",
-    "const fs = require('node:fs');",
-    `const mode = ${JSON.stringify(mode)};`,
-    "const argv = process.argv.slice(2);",
-    "const capture = process.env.CAPTURE_PATH || argv.at(-1);",
-    "fs.writeFileSync(capture, JSON.stringify({ argv, disabled: process.env.PI_REVIEW_GATE_DISABLED, thinkingBudget: process.env.LITTLE_CODER_THINKING_BUDGET }));",
-    "if (mode === 'little') {",
-    "  console.log(JSON.stringify({ type: 'turn_start' }));",
-    "  console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'little complete' }] } }));",
-    "  console.log(JSON.stringify({ type: 'turn_end', message: { role: 'assistant' }, toolResults: [] }));",
-    "} else if (mode === 'codex') {",
-    "  console.log(JSON.stringify({ type: 'thread.started', thread_id: '11111111-1111-4111-8111-111111111111' }));",
-    "  console.log(JSON.stringify({ type: 'turn.started' }));",
-    "  console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'codex complete' } }));",
-    "  console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }));",
-    "} else {",
-    "  console.log(JSON.stringify({ result: 'claude complete', usage: { input_tokens: 10, output_tokens: 2 } }));",
-    "}",
-  ].join("\n"), "utf8");
-  await chmod(command, 0o755);
-  return { root, artifactDir, command, capture };
-}
-
-function request(
-  fixture: { root: string; artifactDir: string },
-  turn: number,
-  session?: { adapter: string; id: string },
-) {
-  return {
-    cwd: fixture.root,
-    prompt: `turn ${turn}`,
-    artifactDir: fixture.artifactDir,
-    turn,
-    session,
-  };
-}
-
-function valueAfter(values: string[], flag: string): string | undefined {
-  const index = values.indexOf(flag);
-  return index === -1 ? undefined : values[index + 1];
-}

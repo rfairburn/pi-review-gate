@@ -139,6 +139,7 @@ test("wave-integration — deterministic non-conflicting order", async () => {
 
     // Verify the history contains the three worker commits plus the wave base.
     // The wave base is parented by the source HEAD, so total = source commits + base + 3 workers.
+    assert.ok(success.worktree);
     const log = await git(["log", "--format=%H", "HEAD"], success.worktree);
     const commits = log.split("\n").filter(Boolean);
     assert.ok(commits.length >= 3, "should have at least 3 commits in history");

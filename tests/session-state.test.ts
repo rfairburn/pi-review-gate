@@ -70,6 +70,16 @@ test("session state round-trips review evidence and associations only for the sa
     );
     await store.save(state, {
       waveRoots: ["/tmp/wave-one"],
+      groupRoots: ["/tmp/pi-review-execution-one"],
+      conflictGate: {
+        executionId: "exec-one",
+        taskId: "task-one",
+        sourceRoot: root,
+        paths: ["conflicted.txt"],
+        activatedAt: "2026-08-16T00:00:00.000Z",
+        manifestPath: "/tmp/pi-review-execution-one/conflict.json",
+        reason: "resolve the conflict",
+      },
       bundles: [{
         version: 1,
         operationId: "wave-one/task-0",
@@ -94,6 +104,8 @@ test("session state round-trips review evidence and associations only for the sa
     assert.equal(restored.state.reviewWindow?.evidence.candidates.get(join(root, "outside.txt"))?.exchangeBaselines.get(1)?.error, "missing");
     assert.equal(restored.state.reviewWindow?.reviewerSessions.get("reviewer")?.id, "review-session");
     assert.equal(restored.execution.bundles[0]?.expectedRevision, 7);
+    assert.deepEqual(restored.execution.groupRoots, ["/tmp/pi-review-execution-one"]);
+    assert.deepEqual(restored.execution.conflictGate?.paths, ["conflicted.txt"]);
 
     const target = createState();
     replaceReviewGateState(target, restored.state);

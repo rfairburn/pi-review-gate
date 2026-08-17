@@ -83,8 +83,8 @@ test("delegated execution tool activation waits for session_start", async () => 
 
     runtimeInitialized = true;
     await trigger(hooks, "session_start", { cwd: dir });
-    assert.deepEqual(registeredTools, ["execute_subtasks"]);
-    assert.deepEqual(activeTools, ["read", "execute_subtasks"]);
+    assert.deepEqual(registeredTools, ["ExecuteSubtasks"]);
+    assert.deepEqual(activeTools, ["read", "ExecuteSubtasks"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

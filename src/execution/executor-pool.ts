@@ -16,7 +16,7 @@ interface Waiter {
   abort?: () => void;
 }
 
-/** Ordered, capacity-aware leases for one execute_subtasks invocation. */
+/** Ordered, capacity-aware leases shared by background execution groups. */
 export class ExecutorPoolScheduler {
   private readonly running = new Map<string, number>();
   private readonly waiters: Waiter[] = [];
@@ -47,6 +47,28 @@ export class ExecutorPoolScheduler {
     return undefined;
   }
 
+  tryAcquireEntry(entryId: string): ExecutorPoolLease | undefined {
+    const priority = this.entries.findIndex((entry) => entry.entryId === entryId);
+    if (priority < 0) return undefined;
+    const entry = this.entries[priority]!;
+    const active = this.running.get(entry.entryId) ?? 0;
+    if (active >= entry.maxConcurrent) return undefined;
+    this.running.set(entry.entryId, active + 1);
+    let released = false;
+    return {
+      entry,
+      priority,
+      release: () => {
+        if (released) return;
+        released = true;
+        const remaining = Math.max(0, (this.running.get(entry.entryId) ?? 1) - 1);
+        if (remaining === 0) this.running.delete(entry.entryId);
+        else this.running.set(entry.entryId, remaining);
+        this.drainWaiters();
+      },
+    };
+  }
+
   acquireAfter(priority: number, signal?: AbortSignal): Promise<ExecutorPoolLease | undefined> {
     const startPriority = priority + 1;
     if (startPriority >= this.entries.length) return Promise.resolve(undefined);
@@ -67,6 +89,10 @@ export class ExecutorPoolScheduler {
 
   activeCount(entryId: string): number {
     return this.running.get(entryId) ?? 0;
+  }
+
+  hasEntry(entryId: string): boolean {
+    return this.entries.some((entry) => entry.entryId === entryId);
   }
 
   private drainWaiters(): void {

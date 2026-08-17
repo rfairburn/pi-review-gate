@@ -104,7 +104,7 @@ test("landed operation can rehydrate its checkpoint, continue, land, and dedupli
   }
 });
 
-test("continuing an earlier task reintegrates every accepted task in declared order", async () => {
+test("continuing one task lands only that task and leaves an already-landed sibling untouched", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-operation-order-")));
   try {
     await execFileAsync("git", ["init"], { cwd: root });
@@ -163,7 +163,7 @@ test("continuing an earlier task reintegrates every accepted task in declared or
     if (continued.integration?.status !== "integrated") assert.fail("continuation was not integrated");
     assert.deepEqual(
       continued.integration.workerMappings.map((mapping) => mapping.taskId),
-      ["task-0", "task-1"],
+      ["task-0"],
     );
     assert.equal(await readFile(join(root, "first.txt"), "utf8"), "turn-1\nturn-2\n");
     assert.equal(await readFile(join(root, "second.txt"), "utf8"), "turn-1\n");

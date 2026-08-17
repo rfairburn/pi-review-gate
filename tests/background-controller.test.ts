@@ -66,7 +66,7 @@ test("background tasks return immediately, land independently, and additions cap
     assert.equal(first.tasks.length, 1);
     await waitFor(() => controller.inspect(first.executionId).tasks[0]?.state === "landed");
     assert.equal(await readFile(join(root, "first.txt"), "utf8"), "first landed\n");
-    assert.ok(messages.some((message) => /QUEUED -> CAPTURING.*task is ACTIVE/s.test(message)));
+    assert.ok(messages.some((message) => /CAPTURING -> RUNNING.*task is ACTIVE/s.test(message)));
 
     const toppedOff = await controller.add(first.executionId, [{
       title: "second",
@@ -144,7 +144,8 @@ test("background tasks wake the orchestrator when active execution enters review
     await waitFor(() => controller!.inspect(started.executionId).tasks[0]?.state === "landed", 30_000);
     assert.ok(messages.some((message) => /CAPTURING -> RUNNING.*task is ACTIVE/s.test(message)));
     assert.ok(messages.some((message) => /(?:CAPTURING|RUNNING) -> REVIEWING.*task is REVIEWING/s.test(message)));
-    assert.ok(messages.some((message) => /NO ACTION OR ACKNOWLEDGEMENT IS NECESSARY/.test(message)));
+    assert.ok(messages.some((message) => /NO TOOL ACTION IS NECESSARY/.test(message)));
+    assert.ok(messages.some((message) => new RegExp(`No action for ${started.tasks[0]!.taskId} at (?:RUNNING|REVIEWING)`).test(message)));
     assert.ok(messages.every((message) => !/-> (?:CAPTURING|ACCEPTED|WAITING_TO_LAND|LANDING)/.test(message)));
     assert.ok(messages.every((message) => !/interaction reported a failure/.test(message)));
     const inspection = controller.inspect(started.executionId);

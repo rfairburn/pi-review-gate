@@ -1456,7 +1456,7 @@ function formatExecutionEvent(
       lines.push(`Execution ${group.executionId} currently has ${landed.length}/${group.tasks.length} tasks landed.`);
       lines.push("This is an informational state update; rely on the separate completion or failure event for the execution outcome.");
     }
-    if (kind === "state") lines.push(noActionNecessaryNotice);
+    if (kind === "state") lines.push(noActionResponseNotice(task));
     return lines.join("\n");
   }
   const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
@@ -1470,11 +1470,13 @@ function formatExecutionEvent(
   for (const candidate of notLanded) {
     lines.push(`- ${candidate.taskId} · ${candidate.definition.title} · ${candidate.state}`);
   }
-  if (kind === "state") lines.push(noActionNecessaryNotice);
+  if (kind === "state") lines.push(noActionResponseNotice(task));
   return lines.join("\n");
 }
 
-const noActionNecessaryNotice = "NO ACTION OR ACKNOWLEDGEMENT IS NECESSARY for this status update unless you want to steer the task or the reported state requires recovery. Do not call inspect merely to acknowledge it; if no action is needed, remain idle and wait for the next event.";
+function noActionResponseNotice(task: BackgroundTaskRecord): string {
+  return `NO TOOL ACTION IS NECESSARY unless you want to steer this task or the reported state requires recovery. This notification triggered a harness turn, so do not return an empty response. If no action is needed, reply briefly with: No action for ${task.taskId} at ${task.state.toUpperCase()}. Do not call inspect merely to acknowledge this event.`;
+}
 
 function transitionEventSnapshot(
   group: BackgroundExecutionGroup,

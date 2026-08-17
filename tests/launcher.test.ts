@@ -73,6 +73,14 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
   );
 });
 
+test("orchestrator prompt names the registered tool and current steering contract", async () => {
+  const prompt = await readFile(resolve("scripts/orchestrator-system-prompt.md"), "utf8");
+  assert.match(prompt, /`ExecuteSubtasks`/);
+  assert.match(prompt, /durably queued for the next executor handoff/);
+  assert.doesNotMatch(prompt, /execute_subtasks/);
+  assert.doesNotMatch(prompt, /live-turn-only/);
+});
+
 test("preset launcher appends the orchestrator prompt and preserves forwarded arguments", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-preset-launcher-"));
   const bin = join(root, "bin");

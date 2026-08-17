@@ -13,8 +13,10 @@ npm test
 The complete test run executes up to four test files concurrently. Use
 `npm run test:fast` for the short pure/unit development loop. Use `npm test`
 (or `npm run test:integration`) for the process, Git, filesystem, and end-to-end
-suite before finalizing a phase. For diagnosing resource-sensitive or
-ordering-sensitive failures, use the serial fallback:
+suite before finalizing a phase. Use `npm run test:execution` for the serial
+background-controller, recovery, pool, session, and tool-contract tier. For
+diagnosing resource-sensitive or ordering-sensitive failures, use the full
+serial fallback:
 
 ```bash
 npm run test:serial
@@ -190,8 +192,12 @@ are durable, live instructions use the adapter's acknowledged transport, and a
 steer during review cancels that review and resumes the executor with the changed
 request before a fresh review. If the current adapter cannot steer a long-running
 command, the instruction waits for that next executor handoff instead of being
-reported as rejected. Queued-to-active and active-to-reviewing transitions wake
-the orchestrator automatically.
+reported as rejected. Meaningful interaction points wake the orchestrator:
+`RUNNING`, `REVIEWING`, `LANDED`, failures, conflicts, and other recovery-required
+outcomes. A normal successful reviewed task commonly reports
+`RUNNING -> REVIEWING -> RUNNING -> LANDED` because the executor receives a
+final result-inspection turn after review. Internal `CAPTURING`, `ACCEPTED`, `WAITING_TO_LAND`, and
+`LANDING` progress remains durable and user-visible without starting model turns.
 
 `ShellStart` is treated as an executor-readiness boundary, not ordinary tool
 completion. Review-gate reads the returned detached process-group id and keeps
@@ -206,6 +212,13 @@ process-group liveness check rather than trusting a tool's “completed” label
 an unparseable ShellStart success fails closed and visibly blocks automatic
 review. A process that deliberately creates a new session/process group can
 escape this best-effort boundary and is not claimed as covered.
+
+The same top-level review-readiness gate covers `ExecuteSubtasks`: automatic
+review of the primary orchestrator is deferred while any task is queued,
+capturing, running, reviewing, accepted, waiting to land, or landing. A normal
+task completion/failure notification wakes the orchestrator according to its
+configured wake policy; only after no execution task remains active may that
+turn enter automatic review.
 
 `interrupt` explicitly chooses failure or merge disposition. A normal cancellation
 uses `interrupt_as_failure`; `interrupt_with_merge` must be requested explicitly.
@@ -233,7 +246,12 @@ artifact inventory, current bundle, and safe next actions. Only `landed` means
 that worker changes reached the source workspace.
 
 The persistent widget shows active tasks below the editor and distinguishes a
-queued executor-startup/capacity wait from active work. Every model-facing
+queued executor-startup/capacity wait from active work. `/subtasks-view` toggles
+the expanded panel, and the same expanded/collapsed preference is available in
+`/review-settings`. This is a global UI preference rather than conversation
+state. The expanded view lists only active tasks (up to 16), while its combined
+newest-ten activity feed may temporarily retain events from tasks that have
+already landed. Every model-facing
 `start`, `add`, and `inspect` result includes the stable task UUIDs, states,
 recent activity, and full artifact paths needed for control and deeper `rg`
 inspection. A partial landing event identifies the landed paths and every

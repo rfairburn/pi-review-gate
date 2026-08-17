@@ -4,7 +4,11 @@ import { scopedModelChoices } from "../settings/models";
 import type { ExecutionAssociationsSnapshot } from "../session-state";
 import {
   BackgroundExecutionController,
+  isActiveTaskState,
+  isForceMergeCandidateTaskState,
+  isInterruptibleTaskState,
   type BackgroundInspection,
+  type BackgroundReviewReadinessTask,
   type BackgroundTaskDefinition,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
@@ -71,6 +75,10 @@ export class ExecutionToolManager {
 
   criticalPrompt(): string | undefined {
     return this.controller.criticalPrompt();
+  }
+
+  reviewReadiness(): BackgroundReviewReadinessTask[] {
+    return this.controller.reviewReadiness();
   }
 
   async shutdown(): Promise<void> {
@@ -157,7 +165,7 @@ export class ExecutionToolManager {
     register("subtask-interrupt", "Pick a queued or active task to interrupt; explicit arguments remain optional.", async (args, ctx) => {
       let [executionId, taskId, mode] = words(args);
       if (!executionId || !taskId) {
-        const selected = await selectTask(this.controller, ctx, "Interrupt execution subtask", (task) => ["queued", "capturing", "running", "reviewing", "accepted", "waiting_to_land", "landing"].includes(task.state));
+        const selected = await selectTask(this.controller, ctx, "Interrupt execution subtask", (task) => isInterruptibleTaskState(task.state));
         if (!selected) return undefined;
         executionId = selected.executionId;
         taskId = selected.taskId;
@@ -184,7 +192,7 @@ export class ExecutionToolManager {
       let [executionId, taskId, mode] = words(args);
       const explicitTarget = Boolean(executionId && taskId);
       if (!executionId || !taskId) {
-        const selected = await selectTask(this.controller, ctx, "Force-merge execution subtask", (task) => Boolean(task.bundle) && !["queued", "capturing", "running", "reviewing", "accepted", "waiting_to_land", "landing"].includes(task.state));
+        const selected = await selectTask(this.controller, ctx, "Force-merge execution subtask", (task) => Boolean(task.bundle) && isForceMergeCandidateTaskState(task.state));
         if (!selected) return undefined;
         executionId = selected.executionId;
         taskId = selected.taskId;
@@ -522,7 +530,7 @@ function normalizeBundle(value: unknown): ReattachmentBundle {
 }
 
 function backgroundResult(action: string, inspection: BackgroundInspection, isError: boolean): Record<string, unknown> {
-  const active = inspection.tasks.filter((task) => ["queued", "capturing", "running", "reviewing", "accepted", "waiting_to_land", "landing"].includes(task.state)).length;
+  const active = inspection.tasks.filter((task) => isActiveTaskState(task.state)).length;
   const startupDelay = action === "start" || action === "add"
     ? " Queued tasks may wait for executor startup or available pool capacity."
     : "";

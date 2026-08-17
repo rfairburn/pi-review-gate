@@ -3,8 +3,11 @@ import { readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { ExecutorSession } from "./types";
-import type { TerminalSafetyCode } from "./terminal-safety";
 import type { ExecutorSelection } from "../config";
+
+export type TerminalSafetyCode =
+  | "recovery_state_corrupt_or_unverifiable"
+  | "landing_rollback_incomplete";
 
 export type OperationState =
   | "running"

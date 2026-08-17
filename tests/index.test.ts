@@ -103,6 +103,82 @@ test("automatic review waits for ShellStart process groups and resumes the orche
   }
 });
 
+test("automatic review waits while execution subtasks remain active", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-execution-readiness-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const invocationMarker = join(dir, "reviewer-invoked.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "reviewer",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed',findings:[]}))`,
+        ],
+        timeoutMs: 15_000,
+      },
+      externalAgents: [{
+        id: "slow-executor",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1",
+          args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
+        },
+      }],
+      execution: {
+        activeExecutor: { source: "external", id: "slow-executor" },
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    let executionTool: {
+      execute: (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<unknown>;
+    } | undefined;
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand() {},
+      registerTool(tool: typeof executionTool) { executionTool = tool; },
+      getActiveTools() { return ["read", "bash", "ExecuteSubtasks"]; },
+      setToolActive() {},
+      notify(message: string) { notices.push(message); },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "session_start", { cwd: dir });
+    assert.ok(executionTool);
+    await trigger(hooks, "input", { cwd: dir, text: "make a delegated change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await executionTool.execute("start-slow-task", {
+      action: "start",
+      tasks: [{
+        title: "slow delegated work",
+        instructions: "Remain active while the readiness gate is tested.",
+        acceptanceCriteria: ["The delegated task finishes."],
+      }],
+    }, undefined, undefined, { cwd: dir });
+
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "subtask still active" }] });
+
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+    assert.match(notices.join("\n"), /automatic review deferred while 1 execution subtask\(s\) remain active/);
+    assert.match(notices.join("\n"), /slow delegated work \[(queued|capturing|running)\]/);
+    await trigger(hooks, "session_shutdown", { cwd: dir });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("delegated execution tool activation waits for session_start", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-runtime-start-"));
   try {

@@ -122,8 +122,9 @@ export async function activate(pi: unknown): Promise<void> {
         );
         return;
       }
+      if (executionTools.reviewReadiness().length > 0) return;
       await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 250));
-      if (!sessionActive || generation !== backgroundMonitorGeneration || agentRunActive || state.reviewInProgress || !state.reviewWindow) return;
+      if (!sessionActive || generation !== backgroundMonitorGeneration || agentRunActive || state.reviewInProgress || !state.reviewWindow || executionTools.reviewReadiness().length > 0) return;
       const delivered = await sendTriggeredFollowUp(pi, orchestratorBackgroundCompletionPrompt);
       if (!delivered) {
         await sendNotice(noticeTarget, "review gate: background work completed, but the orchestrator could not be resumed automatically; review remains deferred until the next turn");
@@ -163,7 +164,6 @@ export async function activate(pi: unknown): Promise<void> {
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(extractContext(args) ?? pi);
     discardSessionState(state);
-    await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
     const context = extractContext(args);
     const identity = sessionPersistenceIdentity(context, currentCwd);
     const appendEntry = typeof pi === "object" && pi !== null && "appendEntry" in pi && typeof pi.appendEntry === "function"
@@ -193,6 +193,8 @@ export async function activate(pi: unknown): Promise<void> {
       } catch (error) {
         await sendNotice(context ?? pi, `review gate: persisted conversation state was not restored: ${error instanceof Error ? error.message : String(error)}`);
       }
+    } else {
+      await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
     }
     executionTools.sync();
     if (restoredRevision !== undefined) {
@@ -329,6 +331,7 @@ export async function activate(pi: unknown): Promise<void> {
       return;
     }
     const backgroundReadiness = orchestratorBackgroundReadiness.snapshot();
+    const executionReadiness = executionTools.reviewReadiness();
     if (backgroundReadiness.unverifiable.length > 0) {
       await sendNotice(
         noticeTarget,
@@ -337,12 +340,20 @@ export async function activate(pi: unknown): Promise<void> {
       await persistSessionState();
       return;
     }
-    if (backgroundReadiness.running.length > 0) {
+    if (backgroundReadiness.running.length > 0 || executionReadiness.length > 0) {
+      const blockers = [
+        backgroundReadiness.running.length > 0
+          ? `${backgroundReadiness.running.length} background process group(s) remain active (${backgroundReadiness.running.map((job) => `${job.id}: ${job.label}`).join(", ")})`
+          : undefined,
+        executionReadiness.length > 0
+          ? `${executionReadiness.length} execution subtask(s) remain active (${executionReadiness.map((task) => `${task.taskId}: ${task.title} [${task.state}]`).join(", ")})`
+          : undefined,
+      ].filter((value): value is string => Boolean(value));
       await sendNotice(
         noticeTarget,
-        `review gate: automatic review deferred while ${backgroundReadiness.running.length} background process group(s) remain active (${backgroundReadiness.running.map((job) => `${job.id}: ${job.label}`).join(", ")})`,
+        `review gate: automatic review deferred while ${blockers.join(" and ")}`,
       );
-      scheduleBackgroundCompletion(noticeTarget);
+      if (backgroundReadiness.running.length > 0) scheduleBackgroundCompletion(noticeTarget);
       await persistSessionState();
       return;
     }

@@ -3,6 +3,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
+import {
+  BACKGROUND_TASK_STATES,
+  isActiveTaskState,
+  isForceMergeCandidateTaskState,
+  isInterruptibleTaskState,
+} from "../src/execution/background-controller";
 import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
 
@@ -78,6 +84,35 @@ test("ExecuteSubtasks is the sole execution tool and exposes the durable action 
   assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Steering wins over review/.test(guideline)));
   assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Meaningful interaction points inject a message/.test(guideline)));
   assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Every force_merge outcome requires manual inspection/.test(guideline)));
+});
+
+test("background task state predicates classify every durable state consistently", () => {
+  const active = new Set(["queued", "capturing", "running", "reviewing", "accepted", "waiting_to_land", "landing"]);
+  for (const state of BACKGROUND_TASK_STATES) {
+    assert.equal(isActiveTaskState(state), active.has(state), state);
+    assert.equal(isInterruptibleTaskState(state), active.has(state), state);
+    assert.equal(isForceMergeCandidateTaskState(state), !active.has(state), state);
+  }
+});
+
+test("execution review readiness reports every unfinished task and omits terminal tasks", async () => {
+  const { tools, manager } = harness({ slowExecutor: true });
+  try {
+    const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+    const started = await execute("readiness-start", {
+      action: "start",
+      tasks: [{ title: "readiness task", instructions: "remain active", acceptanceCriteria: ["eventually finish"] }],
+    }, undefined, undefined, {});
+    assert.equal(started.isError, false);
+    const readiness = manager.reviewReadiness();
+    assert.equal(readiness.length, 1);
+    assert.equal(readiness[0]?.title, "readiness task");
+    assert.ok(readiness[0] && isActiveTaskState(readiness[0].state));
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+  assert.deepEqual(manager.reviewReadiness(), []);
 });
 
 test("ExecuteSubtasks rejects malformed and obsolete requests with diagnostics", async () => {

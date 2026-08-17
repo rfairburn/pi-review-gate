@@ -23,20 +23,45 @@ import type { ExecutorInteractionAcknowledgement, ExecutorLiveControl } from "./
 const GROUP_VERSION = 1;
 const MAX_ACTIVITY = 5_000;
 
-export type BackgroundTaskState =
-  | "queued"
-  | "capturing"
-  | "running"
-  | "reviewing"
-  | "accepted"
-  | "waiting_to_land"
-  | "landing"
-  | "landed"
-  | "failed"
-  | "interrupted"
-  | "conflicted"
-  | "paused_recoverable"
-  | "stopped_for_application_exit";
+export const BACKGROUND_TASK_STATES = [
+  "queued",
+  "capturing",
+  "running",
+  "reviewing",
+  "accepted",
+  "waiting_to_land",
+  "landing",
+  "landed",
+  "failed",
+  "interrupted",
+  "conflicted",
+  "paused_recoverable",
+  "stopped_for_application_exit",
+] as const;
+
+export type BackgroundTaskState = typeof BACKGROUND_TASK_STATES[number];
+
+const ACTIVE_TASK_STATES: ReadonlySet<BackgroundTaskState> = new Set([
+  "queued",
+  "capturing",
+  "running",
+  "reviewing",
+  "accepted",
+  "waiting_to_land",
+  "landing",
+]);
+
+export function isActiveTaskState(state: BackgroundTaskState): boolean {
+  return ACTIVE_TASK_STATES.has(state);
+}
+
+export function isInterruptibleTaskState(state: BackgroundTaskState): boolean {
+  return isActiveTaskState(state);
+}
+
+export function isForceMergeCandidateTaskState(state: BackgroundTaskState): boolean {
+  return !isActiveTaskState(state);
+}
 
 export type WakeLane = "now" | "soon" | "idle";
 
@@ -149,6 +174,13 @@ export interface BackgroundInspection {
   }>;
 }
 
+export interface BackgroundReviewReadinessTask {
+  executionId: string;
+  taskId: string;
+  title: string;
+  state: BackgroundTaskState;
+}
+
 export class BackgroundExecutionController {
   private readonly groups = new Map<string, BackgroundExecutionGroup>();
   private readonly runtimes = new Map<string, RuntimeTask>();
@@ -249,7 +281,7 @@ export class BackgroundExecutionController {
             task.state = "queued";
             task.summary = "Exact parent conversation restored; undispatched task queued automatically.";
             task.updatedAt = new Date().toISOString();
-          } else if (isActiveState(task.state) && task.state !== "queued") {
+          } else if (isActiveTaskState(task.state) && task.state !== "queued") {
             task.state = "paused_recoverable";
             task.summary = "The prior application ended without a verified clean shutdown; inspect writer ownership before continuing.";
             task.updatedAt = new Date().toISOString();
@@ -332,7 +364,7 @@ export class BackgroundExecutionController {
       executionId: group.executionId,
       root: group.root,
       cwd: group.cwd,
-      activeCount: group.tasks.filter((task) => isActiveState(task.state)).length,
+      activeCount: group.tasks.filter((task) => isActiveTaskState(task.state)).length,
       historicalCount: group.tasks.length,
       conflictGate: this.conflictGate && this.conflictGate.executionId === group.executionId
         ? { ...this.conflictGate, paths: [...this.conflictGate.paths] }
@@ -357,6 +389,17 @@ export class BackgroundExecutionController {
     return [...this.groups.values()].map((group) => this.inspect(group.executionId));
   }
 
+  reviewReadiness(): BackgroundReviewReadinessTask[] {
+    return [...this.groups.values()].flatMap((group) => group.tasks
+      .filter((task) => isActiveTaskState(task.state))
+      .map((task) => ({
+        executionId: group.executionId,
+        taskId: task.taskId,
+        title: task.definition.title,
+        state: task.state,
+      })));
+  }
+
   async continueTask(input: {
     executionId?: string;
     taskId?: string;
@@ -367,7 +410,7 @@ export class BackgroundExecutionController {
   }): Promise<BackgroundInspection> {
     const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle);
     const { group, task } = target;
-    if (isActiveState(task.state)) throw new Error(`Task ${task.taskId} is already active.`);
+    if (isActiveTaskState(task.state)) throw new Error(`Task ${task.taskId} is already active.`);
     const bundle = input.bundle ?? task.bundle;
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
@@ -559,7 +602,7 @@ export class BackgroundExecutionController {
     actor: "model" | "user" | "system";
   }): Promise<BackgroundInspection> {
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
-    if (this.runtimes.has(task.taskId) || isActiveState(task.state)) {
+    if (this.runtimes.has(task.taskId) || isActiveTaskState(task.state)) {
       throw new Error(`Task ${task.taskId} still has a live or queued writer; interrupt and await acknowledgement before force-merge.`);
     }
     if (!task.bundle) throw new Error(`Task ${task.taskId} has no verified recovery bundle.`);
@@ -717,7 +760,7 @@ export class BackgroundExecutionController {
     this.shuttingDown = true;
     for (const group of this.groups.values()) {
       for (const task of group.tasks) {
-        if (!isActiveState(task.state)) continue;
+        if (!isActiveTaskState(task.state)) continue;
         task.state = "stopped_for_application_exit";
         task.summary = this.runtimes.has(task.taskId)
           ? "Stopping executor for application shutdown."
@@ -1346,13 +1389,13 @@ export class BackgroundExecutionController {
   private updateIndicator(): void {
     const ctx = this.uiContext;
     if (!isRecord(ctx) || !isRecord(ctx.ui) || typeof ctx.ui.setWidget !== "function") return;
-    const live = [...this.groups.values()].flatMap((group) => group.tasks).filter((task) => isActiveState(task.state));
+    const live = [...this.groups.values()].flatMap((group) => group.tasks).filter((task) => isActiveTaskState(task.state));
     try {
       if (this.expandedView) {
         const all = [...this.groups.values()]
           .flatMap((group) => group.tasks.map((task) => ({ group, task })))
           .sort((left, right) => right.task.updatedAt.localeCompare(left.task.updatedAt));
-        const activeTasks = all.filter(({ task }) => isActiveState(task.state));
+        const activeTasks = all.filter(({ task }) => isActiveTaskState(task.state));
         const shown = activeTasks.slice(0, 16);
         const lines = [
           `⟳ ${live.length} active execution subtask${live.length === 1 ? "" : "s"} — expanded live view (/subtasks-view to collapse)`,
@@ -1433,7 +1476,7 @@ function formatExecutionEvent(
 ): string {
   const landed = group.tasks.filter((candidate) => candidate.state === "landed");
   const notLanded = group.tasks.filter((candidate) => candidate.state !== "landed");
-  const active = group.tasks.filter((candidate) => isActiveState(candidate.state));
+  const active = group.tasks.filter((candidate) => isActiveTaskState(candidate.state));
   const title = task.definition.title;
   const lines = [
     content,
@@ -1537,10 +1580,6 @@ function stateFromProgress(update: WaveProgressUpdate): BackgroundTaskState | un
   if (phase === "executing" || phase === "starting") return "running";
   if (update.phase === "working" && (phase === "accepted" || phase === "accepted_with_warnings" || phase === "completed_unreviewed" || phase === "no_changes")) return "accepted";
   return undefined;
-}
-
-function isActiveState(state: BackgroundTaskState): boolean {
-  return ["queued", "capturing", "running", "reviewing", "accepted", "waiting_to_land", "landing"].includes(state);
 }
 
 function isStoppedForExit(task: BackgroundTaskRecord): boolean {

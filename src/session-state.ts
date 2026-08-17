@@ -227,7 +227,11 @@ export function replaceReviewGateState(target: ReviewGateState, restored: Review
 
 export function configDigest(config: ReviewGateConfig): string {
   const { ui: _ui, ...reviewRelevantConfig } = config;
-  return createHash("sha256").update(stableJson(reviewRelevantConfig)).digest("hex");
+  if (!reviewRelevantConfig.execution) {
+    return createHash("sha256").update(stableJson(reviewRelevantConfig)).digest("hex");
+  }
+  const { subtaskNotifications: _notifications, ...execution } = reviewRelevantConfig.execution;
+  return createHash("sha256").update(stableJson({ ...reviewRelevantConfig, execution })).digest("hex");
 }
 
 function serializeState(state: ReviewGateState): PersistedReviewGateState {

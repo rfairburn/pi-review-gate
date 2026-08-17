@@ -61,6 +61,7 @@ test("settings persistence removes parallelEnabled and stores concurrency and re
       jitter: false,
       maxSameIncidentRepeats: 4,
     },
+    subtaskNotifications: "quiet",
     subtasksViewExpanded: false,
   });
 

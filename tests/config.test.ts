@@ -82,6 +82,19 @@ test("normalizeConfig preserves the global subtasks view preference", () => {
   );
 });
 
+test("subtask notifications default to quiet and validate the noisy alternative", () => {
+  assert.equal(normalizeConfig({ enabled: true }).execution, undefined);
+  assert.equal(normalizeConfig({ enabled: true, execution: {} }).execution?.subtaskNotifications, "quiet");
+  assert.equal(
+    normalizeConfig({ enabled: true, execution: { subtaskNotifications: "noisy" } }).execution?.subtaskNotifications,
+    "noisy",
+  );
+  assert.throws(
+    () => normalizeConfig({ enabled: true, execution: { subtaskNotifications: "sometimes" } }),
+    /execution\.subtaskNotifications must be quiet or noisy/,
+  );
+});
+
 test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
   const codex = normalizeConfig({
     enabled: true,

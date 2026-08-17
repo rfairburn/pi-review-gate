@@ -84,7 +84,7 @@ test("ExecuteSubtasks is the sole execution tool and exposes the durable action 
   assert.match(parameters.properties.interruptMode.description, /must always be inspected afterward/i);
   assert.match(parameters.properties.mergeAnyhow.description, /always requires manual workspace inspection/i);
   assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Steering wins over review/.test(guideline)));
-  assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Meaningful interaction points inject a message/.test(guideline)));
+  assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Quiet mode \(the default\)/.test(guideline)));
   assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Every force_merge outcome requires manual inspection/.test(guideline)));
 });
 
@@ -279,7 +279,8 @@ test("ExecuteSubtasks start result explains that queued work may have startup de
     tasks: [{ title: "Waiting work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
   assert.match(result.content[0].text, /Queued tasks may wait for executor startup or available pool capacity/);
-  assert.match(result.content[0].text, /trigger an orchestrator turn at meaningful interaction points/);
+  assert.match(result.content[0].text, /Quiet notification mode is active/);
+  assert.match(result.content[0].text, /Every task still triggers a turn when it lands/);
   assert.match(result.content[0].text, /CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress.*without triggering turns/);
   assert.match(result.content[0].text, /DO NOT POLL for task-state changes/);
   assert.match(result.content[0].text, /repeated inspect loop, or other waiting surrogate/);

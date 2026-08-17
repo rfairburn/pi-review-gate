@@ -17,6 +17,12 @@ test("UI preferences do not change review configuration identity", () => {
   const expanded = normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: true } });
   assert.equal(configDigest(collapsed), configDigest(expanded));
 });
+
+test("subtask notification preference does not change execution configuration identity", () => {
+  const quiet = normalizeConfig({ enabled: true, execution: { subtaskNotifications: "quiet" } });
+  const noisy = normalizeConfig({ enabled: true, execution: { subtaskNotifications: "noisy" } });
+  assert.equal(configDigest(quiet), configDigest(noisy));
+});
 import {
   beginAgentRun,
   createState,

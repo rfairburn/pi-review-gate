@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { open, mkdir, mkdtemp, readFile, realpath, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import type { ReviewGateConfig } from "../config";
+import { DEFAULT_SUBTASK_NOTIFICATION_MODE, type ReviewGateConfig } from "../config";
 import { externalAgentCatalog, resolvedExecutorPool } from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
@@ -1305,6 +1305,10 @@ export class BackgroundExecutionController {
     content: string,
     eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
   ): Promise<void> {
+    if (kind === "state"
+      && (this.input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE) === "quiet") {
+      return;
+    }
     const lane = kind === "state"
       ? "now"
       : kind === "completion"

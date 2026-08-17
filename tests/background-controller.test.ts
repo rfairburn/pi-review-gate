@@ -66,8 +66,10 @@ test("background tasks return immediately, land independently, and additions cap
     assert.equal(first.tasks.length, 1);
     await waitFor(() => controller.inspect(first.executionId).tasks[0]?.state === "landed");
     assert.equal(await readFile(join(root, "first.txt"), "utf8"), "first landed\n");
-    assert.ok(messages.some((message) => /CAPTURING -> RUNNING.*task is ACTIVE/s.test(message)));
+    assert.ok(messages.every((message) => !/CAPTURING -> RUNNING.*task is ACTIVE/s.test(message)));
+    assert.ok(messages.some((message) => /landed independently/.test(message)), "quiet mode still reports each task landing");
 
+    config.execution!.subtaskNotifications = "noisy";
     const toppedOff = await controller.add(first.executionId, [{
       title: "second",
       instructions: "SECOND_SENTINEL",
@@ -77,6 +79,7 @@ test("background tasks return immediately, land independently, and additions cap
     assert.notEqual(toppedOff.tasks[0]?.taskId, toppedOff.tasks[1]?.taskId);
     await waitFor(() => controller.inspect(first.executionId).tasks.every((task) => task.state === "landed"));
     assert.equal(await readFile(join(root, "second.txt"), "utf8"), "saw first\n");
+    assert.ok(messages.some((message) => message.includes(toppedOff.tasks[1]!.taskId) && /task is ACTIVE/s.test(message)));
     assert.ok(messages.some((message) => /landed independently/.test(message)));
     assert.equal(controller.inspect(first.executionId).activeCount, 0);
     const associations = controller.associations();
@@ -91,7 +94,7 @@ test("background tasks return immediately, land independently, and additions cap
   }
 });
 
-test("background tasks wake the orchestrator when active execution enters review", async () => {
+test("noisy subtask notifications wake the orchestrator when active execution enters review", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-background-review-state-"));
   let controller: BackgroundExecutionController | undefined;
   try {
@@ -123,7 +126,11 @@ test("background tasks wake the orchestrator when active execution enters review
         command: process.execPath,
         execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
       }],
-      execution: { activeExecutor: { source: "external", id: "fake" }, maxWorkers: 1 },
+      execution: {
+        activeExecutor: { source: "external", id: "fake" },
+        maxWorkers: 1,
+        subtaskNotifications: "noisy",
+      },
     });
     const messages: string[] = [];
     const widgets: unknown[] = [];
@@ -250,7 +257,11 @@ test("queued steering is incorporated before startup and landing events distingu
         command: executor,
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "steerable" }, maxWorkers: 1 },
+      execution: {
+        activeExecutor: { source: "external", id: "steerable" },
+        maxWorkers: 1,
+        subtaskNotifications: "noisy",
+      },
       retainBundles: "always",
     });
     const messages: string[] = [];

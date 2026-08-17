@@ -9,6 +9,7 @@ import {
   type ExecutionRetryPolicy,
   type RetainBundles,
   type ReviewGateConfig,
+  type SubtaskNotificationMode,
 } from "../config";
 
 export interface ReviewSettingsSelection {
@@ -21,6 +22,7 @@ export interface ReviewSettingsSelection {
   retainBundles: RetainBundles;
   maxWorkers: number;
   retryPolicy: ExecutionRetryPolicy;
+  subtaskNotifications: SubtaskNotificationMode;
   subtasksViewExpanded: boolean;
 }
 
@@ -40,6 +42,7 @@ export async function persistReviewSettings(
     delete execution.activeExecutor;
     execution.maxWorkers = selection.maxWorkers;
     execution.retryPolicy = { ...selection.retryPolicy };
+    execution.subtaskNotifications = selection.subtaskNotifications;
     delete execution.parallelEnabled;
     delete execution.externalExecutors;
     parsed.execution = execution;

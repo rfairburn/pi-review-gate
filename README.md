@@ -131,7 +131,7 @@ The older single `decider` field is still supported for compatibility.
 
 ### Delegated execution and runtime settings
 
-`/review-settings` opens one staged settings transaction with eight sections:
+`/review-settings` opens one staged settings transaction with nine sections:
 
 - **Executor pool** is an ordered list of Pi-scoped little-coder models and
   execution-capable entries from `externalAgents`. **Add executor** walks
@@ -157,6 +157,10 @@ The older single `decider` field is still supported for compatibility.
   `maxConcurrent` capacity.
 - **Retry policy** configures bounded executor/reviewer recovery: retry count,
   exponential-backoff bounds, jitter, and the repeated-incident guard.
+- **Subtask notifications** defaults to **Quiet**, which keeps ordinary running
+  and reviewing transitions in passive UI telemetry while still notifying for
+  every task landing, failure, conflict, or recovery requirement. **Noisy** also
+  starts turns for running and reviewing transitions.
 
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the
 root discards all staged changes; **Save changes** atomically persists every
@@ -168,8 +172,9 @@ Saved values are authoritative for execution stages that have not started.
 Already-running executor and reviewer processes finish with their launch
 values, while queued dispatch, waiting failover, later continuation turns, and
 later review cycles use the current pool, capacities, policies, and reviewer
-selection. Running capacity leases survive pool edits; removed entries receive
-no new work. A restarted task warns when its prior runtime configuration differs,
+selection. Subtask notification mode is a delivery preference and takes effect
+immediately for subsequent events from already-running tasks. Running capacity
+leases survive pool edits; removed entries receive no new work. A restarted task warns when its prior runtime configuration differs,
 and an executor-selection change starts a fresh native session from the durable
 checkpoint instead of attaching an incompatible conversation.
 
@@ -201,12 +206,14 @@ are durable, live instructions use the adapter's acknowledged transport, and a
 steer during review cancels that review and resumes the executor with the changed
 request before a fresh review. If the current adapter cannot steer a long-running
 command, the instruction waits for that next executor handoff instead of being
-reported as rejected. Meaningful interaction points wake the orchestrator:
-`RUNNING`, `REVIEWING`, `LANDED`, failures, conflicts, and other recovery-required
-outcomes. A normal successful reviewed task commonly reports
-`RUNNING -> REVIEWING -> RUNNING -> LANDED` because the executor receives a
-final result-inspection turn after review. Internal `CAPTURING`, `ACCEPTED`, `WAITING_TO_LAND`, and
-`LANDING` progress remains durable and user-visible without starting model turns.
+reported as rejected. In the default quiet notification mode, each `LANDED`,
+failed, conflicted, or recovery-required task wakes the orchestrator, while
+ordinary `RUNNING` and `REVIEWING` transitions remain passive UI telemetry.
+Noisy mode additionally wakes on those two interactive states. Every task
+landing is reported immediately with its still-active siblings so the
+orchestrator can top off freed capacity without waiting for the entire execution.
+Internal `CAPTURING`, `ACCEPTED`, `WAITING_TO_LAND`, and `LANDING` progress
+remains durable and user-visible without starting model turns.
 
 `ShellStart` is treated as an executor-readiness boundary, not ordinary tool
 completion. Review-gate reads the returned detached process-group id and keeps

@@ -356,6 +356,29 @@ test("subtasks view is staged and saved as a global review setting", async () =>
   assert.equal(config.ui?.subtasksViewExpanded, true);
 });
 
+test("subtask notification mode is staged and saved with quiet as the default", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-subtask-notifications-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    execution: { activeExecutor: null },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Subtask notifications", "Quiet"),
+    "Noisy — include running and reviewing",
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.execution.subtaskNotifications, "noisy");
+  assert.equal(config.execution?.subtaskNotifications, "noisy");
+});
+
 test("internal executor and reviewers persist independent per-model reasoning levels", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-reasoning-"));
   const configPath = join(dir, "review-gate.json");
@@ -508,6 +531,7 @@ const ROOT_SETTING_LABELS = [
   "Bundle retention",
   "Global concurrency",
   "Retry policy",
+  "Subtask notifications",
   "Subtasks view",
 ] as const;
 

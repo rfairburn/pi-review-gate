@@ -4,6 +4,7 @@ import { delimiter, isAbsolute, join } from "node:path";
 import {
   DEFAULT_EXECUTION_RETRY_POLICY,
   DEFAULT_MAX_WORKERS,
+  DEFAULT_SUBTASK_NOTIFICATION_MODE,
   MAX_EXECUTION_WORKERS,
   externalAgentCatalog,
   externalAgentSupportsExecution,
@@ -19,6 +20,7 @@ import {
   type ExecutionRetryPolicy,
   type RetainBundles,
   type ReviewGateConfig,
+  type SubtaskNotificationMode,
   type ThinkingLevel,
 } from "../config";
 import { sendNotice } from "../pi";
@@ -71,6 +73,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let retainBundles = input.config.retainBundles;
   let maxWorkers = input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS;
   let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
+  let subtaskNotifications = input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
 
   while (true) {
@@ -78,7 +81,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const [executorRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, subtasksViewRow] = alignedSettingsRows([
+    const [executorRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, subtasksViewRow] = alignedSettingsRows([
       ["Executor pool", executorPoolSummary(executorPool)],
       ["Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`],
       ["Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`],
@@ -86,6 +89,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ["Bundle retention", retentionLabel(retainBundles)],
       ["Global concurrency", String(maxWorkers)],
       ["Retry policy", `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base`],
+      ["Subtask notifications", subtaskNotifications === "quiet" ? "Quiet" : "Noisy"],
       ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
     ]);
     const choice = await input.ui.select("Review settings", [
@@ -96,6 +100,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retentionRow,
       workersRow,
       retryRow,
+      notificationsRow,
       subtasksViewRow,
       "Save changes",
       "Cancel",
@@ -137,6 +142,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retryPolicy = await selectRetryPolicy(input.ui, retryPolicy);
       continue;
     }
+    if (choice === notificationsRow) {
+      subtaskNotifications = await selectSubtaskNotifications(input.ui, subtaskNotifications);
+      continue;
+    }
     if (choice === subtasksViewRow) {
       subtasksViewExpanded = !subtasksViewExpanded;
       continue;
@@ -156,6 +165,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retainBundles,
       maxWorkers,
       retryPolicy,
+      subtaskNotifications,
       subtasksViewExpanded,
     });
     replaceConfig(input.config, next);
@@ -163,6 +173,19 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     await notify(input.ui, "Review settings saved.", "info");
     return;
   }
+}
+
+async function selectSubtaskNotifications(
+  ui: UiContext,
+  current: SubtaskNotificationMode,
+): Promise<SubtaskNotificationMode> {
+  const rows: Array<{ label: string; value: SubtaskNotificationMode }> = [
+    { label: "Quiet — terminal and recovery events", value: "quiet" },
+    { label: "Noisy — include running and reviewing", value: "noisy" },
+  ];
+  const options = rows.map((row) => `${row.label}${row.value === current ? "  current" : ""}`);
+  const selected = await ui.select("Subtask notifications", options);
+  return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
 }
 
 async function selectBundleRetention(ui: UiContext, current: RetainBundles): Promise<RetainBundles> {

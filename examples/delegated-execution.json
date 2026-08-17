@@ -42,6 +42,7 @@
       }
     ],
     "maxWorkers": 4,
+    "subtaskNotifications": "quiet",
     "retryPolicy": {
       "maxRetries": 2,
       "baseDelayMs": 1000,

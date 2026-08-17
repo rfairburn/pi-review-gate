@@ -1,4 +1,4 @@
-import { externalAgentCatalog, externalAgentSupportsExecution, resolvedExecutorPool, type ReviewGateConfig } from "../config";
+import { DEFAULT_SUBTASK_NOTIFICATION_MODE, externalAgentCatalog, externalAgentSupportsExecution, resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
 import type { ExecutionAssociationsSnapshot } from "../session-state";
@@ -230,7 +230,7 @@ export class ExecutionToolManager {
       description:
         "Start, add, inspect, continue, steer, interrupt, or recover durable background execution subtasks. " +
         "start/add return immediately; tasks run independently and each accepted task attempts to land as soon as it is ready. " +
-        "start/add expose queued task handles immediately. Automatic turns are reserved for meaningful interaction points: running, reviewing, landed, failed, conflicted, and other recovery-required outcomes. Internal capture, acceptance, and landing-progress states remain visible through inspect and /subtasks-view without waking you. DO NOT POLL for state changes; inspect only when its diagnostic snapshot is independently useful.",
+        "start/add expose queued task handles immediately. Quiet notifications are the default: ordinary running/reviewing progress remains passive UI telemetry, while each landed, failed, conflicted, or recovery-required task triggers a turn. Noisy mode in /review-settings additionally triggers running/reviewing turns. Internal capture, acceptance, and landing-progress states remain visible through inspect and /subtasks-view without waking you. DO NOT POLL for state changes; inspect only when its diagnostic snapshot is independently useful.",
       promptSnippet: "Run and interact with durable background execution subtasks",
       promptGuidelines: [
         "Use ExecuteSubtasks start with an array of one or more bounded tasks; retain the stable execution/task handles returned for every task.",
@@ -240,13 +240,13 @@ export class ExecutionToolManager {
         "Use steer for queued, starting, or live tasks: queued steering is durably incorporated before startup and live steering uses the executor transport.",
         "Steering wins over review: a steer received while reviewing interrupts that review, resumes the executor with the changed request, and reviews the replacement result.",
         "If an active adapter cannot steer its current long-running command, keep the steer queued for the next executor handoff; do not treat that transport limitation as rejection.",
-        "The start/add result reports queued tasks. Meaningful interaction points inject a message and trigger an orchestrator turn: RUNNING (steerable), REVIEWING (steering can supersede review), and LANDED, FAILED, CONFLICTED, or other recovery-required outcomes. CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING remain visible in inspect and /subtasks-view but do not trigger turns. DO NOT POLL for task-state changes and do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate. Use inspect only when a current diagnostic snapshot is independently useful for a decision.",
+        "The start/add result reports queued tasks. Quiet mode (the default) triggers orchestrator turns for each LANDED, FAILED, CONFLICTED, or other recovery-required task; Noisy mode additionally triggers RUNNING (steerable) and REVIEWING (steering can supersede review). CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING remain visible in inspect and /subtasks-view but do not trigger turns. DO NOT POLL for task-state changes and do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate. Use inspect only when a current diagnostic snapshot is independently useful for a decision.",
         "A taskId may be omitted only when the supplied executionId contains exactly one task; otherwise use the returned taskId.",
-        "Partial landing notifications list every sibling that has not landed. Do not verify aggregate outputs until the execution-complete notification.",
+        "Every task landing triggers a notification and lists every sibling that has not landed, even in quiet mode, so freed capacity can be topped off immediately. Do not verify aggregate outputs until the execution-complete notification.",
         "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call mark_clean.",
         "Use force_merge only for a stopped task with a verified checkpoint; mergeAnyhow may intentionally materialize conflicts in main. Every force_merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
         "A request to cancel or stop without landing means interrupt_as_failure. Use interrupt_with_merge only when the user explicitly wants a mechanical checkpoint landing; it never guarantees the requested changes are present or correct, so inspect the main workspace manually afterward in every case.",
-        "Completion, failure, meaningful state changes, and critical conflicts trigger model notifications. Use inspect whenever you need current status or diagnostics; avoid tight repetitive polling.",
+        "Each task completion, failure, and critical conflict triggers a model notification. Ordinary running/reviewing transitions do so only in noisy mode. Use inspect whenever you need current status or diagnostics; avoid tight repetitive polling.",
       ],
       executionMode: "sequential",
       parameters: toolSchema(),
@@ -265,11 +265,11 @@ export class ExecutionToolManager {
           switch (normalized.action) {
             case "start": {
               const inspection = await this.controller.start(this.withParentTools(normalized.tasks!));
-              return backgroundResult("start", inspection, false);
+              return backgroundResult("start", inspection, false, this.input.config);
             }
             case "add": {
               const inspection = await this.controller.add(normalized.executionId, this.withParentTools(normalized.tasks!));
-              return backgroundResult("add", inspection, false);
+              return backgroundResult("add", inspection, false, this.input.config);
             }
             case "inspect": {
               const inspection = this.controller.inspect(
@@ -498,13 +498,22 @@ function normalizeBundle(value: unknown): ReattachmentBundle {
   };
 }
 
-function backgroundResult(action: string, inspection: BackgroundInspection, isError: boolean): Record<string, unknown> {
+function backgroundResult(
+  action: string,
+  inspection: BackgroundInspection,
+  isError: boolean,
+  config?: ReviewGateConfig,
+): Record<string, unknown> {
   const active = inspection.tasks.filter((task) => isActiveTaskState(task.state)).length;
   const startupDelay = action === "start" || action === "add"
     ? " Queued tasks may wait for executor startup or available pool capacity."
     : "";
+  const notificationMode = config?.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
+  const notificationContract = notificationMode === "quiet"
+    ? "Quiet notification mode is active: ordinary RUNNING and REVIEWING transitions remain passive UI telemetry. Every task still triggers a turn when it lands, fails, conflicts, or requires recovery, and landing events identify siblings that remain active."
+    : "Noisy notification mode is active: RUNNING and REVIEWING transitions trigger turns in addition to every landed, failed, conflicted, or recovery-required task.";
   const summary = action === "start" || action === "add"
-    ? `${action} accepted: execution ${inspection.executionId} has ${active} active task(s).${startupDelay} Queued state and stable task handles are included below. The review gate will inject a message and trigger an orchestrator turn at meaningful interaction points: RUNNING, REVIEWING, LANDED, FAILED, CONFLICTED, and other recovery-required outcomes. Internal CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress stays available in inspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use inspect only when a current diagnostic snapshot is independently useful for a decision.`
+    ? `${action} accepted: execution ${inspection.executionId} has ${active} active task(s).${startupDelay} Queued state and stable task handles are included below. ${notificationContract} Internal CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress stays available in inspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use inspect only when a current diagnostic snapshot is independently useful for a decision.`
     : action === "force_merge"
       ? `force_merge: execution ${inspection.executionId}, ${active} active task(s). Force-merge only reports a mechanical landing attempt; always inspect the main workspace manually because it does not prove the requested changes are present or correct.`
     : action === "interrupt" && inspection.tasks.some((task) => task.commands.some((command) => command.action === "interrupt" && command.mode === "interrupt_with_merge"))

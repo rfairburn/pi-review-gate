@@ -126,6 +126,8 @@ export interface ExecutionRetryPolicy {
 
 export const DEFAULT_MAX_WORKERS = 4;
 export const MAX_EXECUTION_WORKERS = 16;
+export type SubtaskNotificationMode = "quiet" | "noisy";
+export const DEFAULT_SUBTASK_NOTIFICATION_MODE: SubtaskNotificationMode = "quiet";
 export const DEFAULT_EXECUTION_RETRY_POLICY: ExecutionRetryPolicy = {
   maxRetries: 2,
   baseDelayMs: 1_000,
@@ -142,6 +144,7 @@ export interface ExecutionConfig {
   externalExecutors?: ExternalExecutorConfig[];
   maxWorkers?: number;
   retryPolicy?: ExecutionRetryPolicy;
+  subtaskNotifications?: SubtaskNotificationMode;
 }
 
 export interface ReviewGateUiConfig {
@@ -653,13 +656,23 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
     : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
   const maxWorkers = normalizeMaxWorkers(value.maxWorkers);
   const retryPolicy = normalizeExecutionRetryPolicy(value.retryPolicy);
+  const subtaskNotifications = normalizeSubtaskNotificationMode(value.subtaskNotifications);
   return {
     activeExecutor,
     executorPool,
     externalExecutors,
     ...(maxWorkers !== undefined ? { maxWorkers } : {}),
     retryPolicy,
+    subtaskNotifications,
   };
+}
+
+function normalizeSubtaskNotificationMode(value: unknown): SubtaskNotificationMode {
+  if (value === undefined) return DEFAULT_SUBTASK_NOTIFICATION_MODE;
+  if (value !== "quiet" && value !== "noisy") {
+    throw new Error("execution.subtaskNotifications must be quiet or noisy");
+  }
+  return value;
 }
 
 function normalizeExecutorPool(value: unknown): ExecutorPoolEntry[] {

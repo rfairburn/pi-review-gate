@@ -21,6 +21,7 @@ const selection: ReviewSettingsSelection = {
     jitter: true,
     maxSameIncidentRepeats: 2,
   },
+  subtaskNotifications: "quiet",
   subtasksViewExpanded: false,
 };
 

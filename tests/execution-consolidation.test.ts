@@ -1,162 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeConfig } from "../src/config";
-import { ExecutionToolManager } from "../src/execution/tool";
-import { createState } from "../src/state";
 
-// ── Activation opt-in tests ──────────────────────────────────────────────────
-
-test("execute_subtasks is inactive by default even with resolvable executor", () => {
-  const registered: Array<Record<string, unknown>> = [];
-  let activeTools = ["read"];
-  const pi = {
-    registerTool(tool: Record<string, unknown>) {
-      registered.push(tool);
-    },
-    getActiveTools() {
-      return activeTools;
-    },
-    setActiveTools(next: string[]) {
-      activeTools = next;
-    },
-  };
-  const config = normalizeConfig({
-    enabled: true,
-    review: { activeReviewers: [] },
+function noChangeExecutorConfig(): Record<string, unknown> {
+  return {
     externalAgents: [{
-      id: "fake",
+      id: "fixture-noop",
       adapter: "run-as-binary",
       command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
+      execution: {
+        protocol: "pi-review-executor-jsonl-v1",
+        args: ["-e", [
+          "process.stdin.resume();",
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          'process.stdout.write(JSON.stringify({type:"session",sessionId:"fixture"})+"\\n");',
+          'process.stdout.write(JSON.stringify({type:"assistant",text:"No changes."})+"\\n");',
+          "});",
+        ].join("")],
+      },
     }],
     execution: {
-      activeExecutor: { source: "external", id: "fake" },
-      // parallelEnabled not set — defaults to false
-    },
-  });
-  const manager = new ExecutionToolManager({
-    pi,
-    config,
-    state: createState(),
-    cwd: () => process.cwd(),
-  });
-
-  manager.sync();
-  // Both tools registered (because executor is resolvable), but only execute_subtask is active.
-  assert.equal(registered.length, 2);
-  assert.equal(registered[0].name, "execute_subtask");
-  assert.equal(registered[1].name, "execute_subtasks");
-  // execute_subtask is active, execute_subtasks is not.
-  assert.ok(activeTools.includes("execute_subtask"));
-  assert.ok(!activeTools.includes("execute_subtasks"));
-});
-
-test("execute_subtasks is active only with parallelEnabled=true", () => {
-  const registered: Array<Record<string, unknown>> = [];
-  let activeTools = ["read"];
-  const pi = {
-    registerTool(tool: Record<string, unknown>) {
-      registered.push(tool);
-    },
-    getActiveTools() {
-      return activeTools;
-    },
-    setActiveTools(next: string[]) {
-      activeTools = next;
+      executorPool: [{
+        entryId: "fixture-noop",
+        selection: { source: "external", id: "fixture-noop" },
+        maxConcurrent: 1,
+      }],
     },
   };
-  const config = normalizeConfig({
-    enabled: true,
-    review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
-    }],
-    execution: {
-      activeExecutor: { source: "external", id: "fake" },
-      parallelEnabled: true,
-    },
-  });
-  const manager = new ExecutionToolManager({
-    pi,
-    config,
-    state: createState(),
-    cwd: () => process.cwd(),
-  });
-
-  manager.sync();
-  assert.equal(registered.length, 2);
-  assert.ok(activeTools.includes("execute_subtask"));
-  assert.ok(activeTools.includes("execute_subtasks"));
-});
-
-test("execute_subtask activation is unchanged without parallelEnabled", () => {
-  const registered: Array<Record<string, unknown>> = [];
-  let activeTools = ["read"];
-  const pi = {
-    registerTool(tool: Record<string, unknown>) {
-      registered.push(tool);
-    },
-    getActiveTools() {
-      return activeTools;
-    },
-    setActiveTools(next: string[]) {
-      activeTools = next;
-    },
-  };
-  const config = normalizeConfig({
-    enabled: true,
-    review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
-    }],
-    execution: {
-      activeExecutor: { source: "external", id: "fake" },
-    },
-  });
-  const manager = new ExecutionToolManager({
-    pi,
-    config,
-    state: createState(),
-    cwd: () => process.cwd(),
-  });
-
-  manager.sync();
-  assert.ok(activeTools.includes("execute_subtask"));
-});
-
-// ── Config normalization tests ───────────────────────────────────────────────
-
-test("parallelEnabled is normalized as boolean", () => {
-  const truthy = normalizeConfig({
-    enabled: true,
-    execution: { parallelEnabled: true },
-  });
-  assert.equal(truthy.execution?.parallelEnabled, true);
-
-  const falsy = normalizeConfig({
-    enabled: true,
-    execution: { parallelEnabled: false },
-  });
-  assert.equal(falsy.execution?.parallelEnabled, false);
-});
-
-test("parallelEnabled defaults to undefined (effectively false)", () => {
-  const config = normalizeConfig({
-    enabled: true,
-    execution: { activeExecutor: null },
-  });
-  assert.equal(config.execution?.parallelEnabled, undefined);
-});
+}
 
 // ── Settings persistence tests ───────────────────────────────────────────────
 
-test("settings persistence includes parallelEnabled", async () => {
+test("settings persistence removes parallelEnabled and stores concurrency and retries", async () => {
   const { mkdtemp, readFile, writeFile, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
@@ -167,24 +42,34 @@ test("settings persistence includes parallelEnabled", async () => {
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: null },
+    execution: { activeExecutor: null, parallelEnabled: true },
   }), "utf8");
 
   const next = await persistReviewSettings(configPath, {
-    activeExecutor: null,
+    executorPool: [],
     activeReviewers: [],
     reviewerTimeoutMs: 600000,
     executorTimeoutMs: 1800000,
     maxCorrectionCycles: 1,
     implementationGuidanceAfterCorrectionAttempts: 1,
     retainBundles: "on-failure",
-    maxWorkers: 2,
-    parallelEnabled: true,
+    maxWorkers: 12,
+    retryPolicy: {
+      maxRetries: 3,
+      baseDelayMs: 250,
+      maxDelayMs: 5_000,
+      jitter: false,
+      maxSameIncidentRepeats: 4,
+    },
+    subtaskNotifications: "quiet",
+    subtasksViewExpanded: false,
   });
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.equal(saved.execution.parallelEnabled, true);
-  assert.equal(next.execution?.parallelEnabled, true);
+  assert.equal(saved.execution.parallelEnabled, undefined);
+  assert.equal(saved.execution.maxWorkers, 12);
+  assert.equal(next.execution?.maxWorkers, 12);
+  assert.equal(next.execution?.retryPolicy?.maxRetries, 3);
 
   await rm(dir, { recursive: true, force: true });
 });
@@ -216,7 +101,7 @@ test("manifest includes snapshot policy disclosure", async () => {
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      execution: { activeExecutor: null },
+      ...noChangeExecutorConfig(),
     });
 
     const progressUpdates: Array<Record<string, any>> = [];
@@ -367,7 +252,7 @@ test("progress updates include counts and bounded activity", async () => {
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      execution: { activeExecutor: null },
+      ...noChangeExecutorConfig(),
     });
 
     const progressUpdates: Array<Record<string, any>> = [];
@@ -400,33 +285,4 @@ test("progress updates include counts and bounded activity", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-// ── String false normalization test ──────────────────────────────────────────
-
-test("parallelEnabled rejects non-boolean values", () => {
-  assert.throws(
-    () => normalizeConfig({ enabled: true, execution: { parallelEnabled: "false" } }),
-    { message: /execution.parallelEnabled must be a boolean/ },
-  );
-  assert.throws(
-    () => normalizeConfig({ enabled: true, execution: { parallelEnabled: "true" } }),
-    { message: /execution.parallelEnabled must be a boolean/ },
-  );
-  assert.throws(
-    () => normalizeConfig({ enabled: true, execution: { parallelEnabled: 0 } }),
-    { message: /execution.parallelEnabled must be a boolean/ },
-  );
-  assert.throws(
-    () => normalizeConfig({ enabled: true, execution: { parallelEnabled: 1 } }),
-    { message: /execution.parallelEnabled must be a boolean/ },
-  );
-  assert.throws(
-    () => normalizeConfig({ enabled: true, execution: { parallelEnabled: null } }),
-    { message: /execution.parallelEnabled must be a boolean/ },
-  );
-  assert.throws(
-    () => normalizeConfig({ enabled: true, execution: { parallelEnabled: "yes" } }),
-    { message: /execution.parallelEnabled must be a boolean/ },
-  );
 });

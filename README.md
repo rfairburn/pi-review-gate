@@ -13,8 +13,10 @@ npm test
 The complete test run executes up to four test files concurrently. Use
 `npm run test:fast` for the short pure/unit development loop. Use `npm test`
 (or `npm run test:integration`) for the process, Git, filesystem, and end-to-end
-suite before finalizing a phase. For diagnosing resource-sensitive or
-ordering-sensitive failures, use the serial fallback:
+suite before finalizing a phase. Use `npm run test:execution` for the serial
+background-controller, recovery, pool, session, and tool-contract tier. For
+diagnosing resource-sensitive or ordering-sensitive failures, use the full
+serial fallback:
 
 ```bash
 npm run test:serial
@@ -129,11 +131,12 @@ The older single `decider` field is still supported for compatibility.
 
 ### Delegated execution and runtime settings
 
-`/review-settings` opens one staged settings transaction with six sections:
+`/review-settings` opens one staged settings transaction with nine sections:
 
-- **Executor** is a single-selection, `/model`-style picker over Pi-scoped
-  little-coder models plus execution-capable entries from `externalAgents`.
-  Selecting an internal model also selects its executor reasoning level.
+- **Executor pool** is an ordered list of Pi-scoped little-coder models and
+  execution-capable entries from `externalAgents`. **Add executor** walks
+  through model, reasoning (when supported), and maximum concurrency. Existing
+  entries can be edited, moved up/down, or removed.
 - **Reviewers** is a multi-selection, `/scoped-models`-style picker over the
   same Pi-scoped models plus review-capable entries from `externalAgents`.
   Clearing every reviewer is valid and disables automatic review without
@@ -149,11 +152,15 @@ The older single `decider` field is still supported for compatibility.
 - **Bundle retention** selects `never`, `on-failure`, or `always`. Choose
   `always` when successful executor and reviewer turns need to remain available
   for inspection.
-- **Parallel workers** sets `execution.maxWorkers` (1–4, default 2) which
-  controls the maximum concurrent workers for `execute_subtasks`.
-- **Parallel execution** toggles `execution.parallelEnabled` (default `false`).
-  When disabled, `execute_subtasks` is inactive even with a resolvable executor;
-  `execute_subtask` remains available. Enable this to opt in to parallel execution.
+- **Global concurrency** sets `execution.maxWorkers` (1–16, default 4). This is
+  the total worker ceiling; each executor-pool entry also has its own
+  `maxConcurrent` capacity.
+- **Retry policy** configures bounded executor/reviewer recovery: retry count,
+  exponential-backoff bounds, jitter, and the repeated-incident guard.
+- **Subtask notifications** defaults to **Quiet**, which keeps ordinary running
+  and reviewing transitions in passive UI telemetry while still notifying for
+  every task landing, failure, conflict, or recovery requirement. **Noisy** also
+  starts turns for running and reviewing transitions.
 
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the
 root discards all staged changes; **Save changes** atomically persists every
@@ -161,108 +168,210 @@ section while preserving unrelated JSON keys. An inactive external definition
 does not need to be installed. Its command is checked when that definition is
 selected or run.
 
-The executor and reviewers are independent:
+Saved values are authoritative for execution stages that have not started.
+Already-running executor and reviewer processes finish with their launch
+values, while queued dispatch, waiting failover, later continuation turns, and
+later review cycles use the current pool, capacities, policies, and reviewer
+selection. Subtask notification mode is a delivery preference and takes effect
+immediately for subsequent events from already-running tasks. Running capacity
+leases survive pool edits; removed entries receive no new work. A restarted task warns when its prior runtime configuration differs,
+and an executor-selection change starts a fresh native session from the durable
+checkpoint instead of attaching an incompatible conversation.
 
-| Reviewers | Executor | Behavior |
+The executor pool and reviewers are independent:
+
+| Reviewers | Executor pool | Behavior |
 | --- | --- | --- |
-| selected | selected | delegated execution with the full review/correction loop |
-| none | selected | delegated execution returns `completed_unreviewed` |
-| selected | disabled | automatic parent review only |
-| none | disabled | settings remain available; both behaviors are off |
+| selected | non-empty | delegated execution with the full review/correction loop |
+| none | non-empty | delegated execution returns `completed_unreviewed` |
+| selected | empty | automatic parent review only |
+| none | empty | settings remain available; both behaviors are off |
 
 Top-level `enabled: false` is the automatic-review master switch and does not
-disable an active executor. The environment kill switches disable the whole
+disable a configured executor pool. The environment kill switches disable the whole
 extension, including delegated execution.
 
-With an executor selected, the plugin exposes `execute_subtask`. The primary
-model supplies one bounded phase, its acceptance criteria, and optional context;
-the configured harness/model cannot be changed in tool arguments. Calls are
-serial. The primary model waits for the returned packet before planning the next
-phase. If review is enabled, the child receives corrections in its own session
-and is accepted only after reviewer pass followed by an unchanged child
-response. This post-pass turn lets the child consider noncritical reviewer
-suggestions; any resulting tree change is reviewed again. Child changes are checkpointed so an unchanged parent turn is not
-reviewed again; later parent edits remain parent-owned and follow the ordinary
-gate.
+With an executor pool selected, the plugin exposes one exact-schema tool per
+operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`,
+`SubtasksContinue`, `SubtasksSteer`, `SubtasksInterrupt`,
+`SubtasksForceMerge`, and `SubtasksMarkClean`. Start and add accept 1–16 bounded
+tasks and return stable execution/task handles immediately. Work continues in
+the background up to the configured global and per-model capacities. Each task owns its capture,
+worktree, session, checkpoint, review, and landing outcome; there is no
+wave-wide shared base or all-workers integration barrier.
 
-If the parent has already edited the workspace during its active exchange,
-those edits are adopted as seed work for the delegated phase rather than
-blocking delegation. The child is told which paths it inherited, and review is
-still computed from the original parent baseline so inherited and child-authored
-changes receive the same gate treatment. A successful child checkpoints the
-combined result. A failed, timed-out, or cancelled child does not move the
-parent baseline, allowing a retry to adopt all surviving partial work or the
-ordinary parent gate to review it.
+`SubtasksContinue` accepts either an associated task handle or a verified
+reattachment bundle. `SubtasksSteer` is valid while a task is
+queued, starting, in a live executor turn, or being reviewed. Queued instructions
+are durable, live instructions use the adapter's acknowledged transport, and a
+steer during review cancels that review and resumes the executor with the changed
+request before a fresh review. If the current adapter cannot steer a long-running
+command, the instruction waits for that next executor handoff instead of being
+reported as rejected. In the default quiet notification mode, each `LANDED`,
+failed, conflicted, or recovery-required task wakes the orchestrator, while
+ordinary `RUNNING` and `REVIEWING` transitions remain passive UI telemetry.
+Noisy mode additionally wakes on those two interactive states. Every task
+landing is reported immediately with its still-active siblings so the
+orchestrator can top off freed capacity without waiting for the entire execution.
+Each completion reports the durable execution revision, per-phase task timing,
+and estimated post-settlement capacity after already-queued work. Final completion
+also reports wall time, summed task time, and peak concurrent workers.
+Internal `CAPTURING`, `ACCEPTED`, `WAITING_TO_LAND`, and `LANDING` progress
+remains durable and user-visible without starting model turns.
 
-Escape while the child is executing or being reviewed aborts that child flow.
-This is the "child Escape" behavior: it cancels only the active delegated
-operation, returns a `cancelled` failure packet, retains failure artifacts under
-the normal bundle policy, and never treats the partial work as accepted.
+`ShellStart` is treated as an executor-readiness boundary, not ordinary tool
+completion. Review-gate reads the returned detached process-group id and keeps
+the Little Coder RPC session and live task control open after `agent_settled`
+while that group remains alive. Steering an idle executor starts another turn
+in the same session. Once every tracked group exits, the executor receives a
+final workspace/result-inspection turn before review. The executor timeout is
+suspended while a verified group remains alive. At the top level, automatic
+review is similarly deferred and the orchestrator is triggered to inspect and
+finish the work when its tracked groups clear. Readiness is determined with a
+process-group liveness check rather than trusting a tool's “completed” label;
+an unparseable ShellStart success fails closed and visibly blocks automatic
+review. A process that deliberately creates a new session/process group can
+escape this best-effort boundary and is not claimed as covered.
 
-While `execute_subtask` is active, its tool card shows the current lifecycle
-phase and elapsed time. Press Ctrl+O to expand a bounded live activity view with
-the executor model, artifact directory, recent native little-coder or Codex CLI
-tool and test milestones, review cycle, reviewer models, and reviewer completion
-verdicts.
-Streaming activity updates are UI-only and are not copied into the controlling
-model's context; only the final subtask packet is returned as tool context.
+The same top-level review-readiness gate covers execution subtasks: automatic
+review of the primary orchestrator is deferred while any task is queued,
+capturing, running, reviewing, accepted, waiting to land, or landing. Normal
+task completion is delivered as a follow-up and failure is delivered
+immediately; only after no execution task remains active may that turn enter
+automatic review.
 
-Claude CLI reviewers and executors also stream bounded native lifecycle and tool
-activity into these views without exposing reasoning or reviewer output.
+`SubtasksInterrupt` explicitly chooses failure or merge disposition. A normal cancellation
+uses `interrupt_as_failure`; `interrupt_with_merge` must be requested explicitly.
+`SubtasksForceMerge`
+operates only on a stopped task with an accepted commit or verified checkpoint;
+`mergeAnyhow` may deliberately install ordinary conflict markers in main.
+Both `interrupt_with_merge` and every direct force merge are mechanical landing
+attempts, not verification that the requested changes are present or correct.
+The main workspace must always be inspected manually afterward, including when
+the task's authoritative state is `landed`.
+`SubtasksMarkClean` validates that those markers are resolved before queued landings
+resume. No singular or snake_case compatibility tool is registered.
+
+Executor failures are checkpointed to a protected recovery ref before bounded
+retry. Compaction is a lifecycle transition: an interrupted Little Coder
+session is reopened by exact UUID, explicitly compacted through Pi RPC, and
+only then prompted to continue. If same-executor recovery is exhausted, a
+verified checkpoint may be handed to the next lower-priority pool entry. That
+adapter starts a new native session in the same isolated worktree, so different
+providers and CLI harnesses can take over without pretending to share conversation
+state. Durable diagnostics include the complete executor assignment history.
+Non-landed results include the worktree,
+session, attempts, incidents, changed paths, verified checkpoint, hashed
+artifact inventory, current bundle, and safe next actions. Only `landed` means
+that worker changes reached the source workspace.
+
+The persistent widget shows active tasks below the editor and distinguishes a
+task assigned for executor startup from one still waiting for capacity and from
+active work. `/subtasks-view` toggles
+the expanded panel, and the same expanded/collapsed preference is available in
+`/review-settings`. This is a global UI preference rather than conversation
+state. The expanded view lists only active tasks (up to 16), while its combined
+newest-ten activity feed may temporarily retain events from tasks that have
+already landed. Every model-facing `SubtasksStart`, `SubtasksAdd`, and
+`SubtasksInspect` result includes the stable task UUIDs, states,
+recent activity, and full artifact paths needed for control and deeper `rg`
+inspection. Start/add results also show assigned-starting versus capacity-waiting
+tasks and a point-in-time scheduler snapshot without claiming startup has completed.
+A partial landing event identifies the landed paths and every
+sibling that has not landed; only the final event invites aggregate verification.
+Completion, failure, meaningful state changes, and workspace conflicts are
+delivered proactively; polling loops are neither required nor recommended, but
+purposeful `SubtasksInspect` calls are always supported.
+User analogs are available as `/subtasks` and the `/subtask-*` commands for
+inspect, add, steer, interrupt, force-merge, and mark-clean. These commands open
+interactive execution/task and action pickers when handles are omitted; their
+explicit-handle forms remain available for scripting.
+
+Review and execution recovery state is scoped to the exact Pi conversation.
+The normal restart flow—launching into a temporary/default session and then
+running `/resume <session>`—loads the selected conversation in a fresh extension
+runtime and restores only that conversation's integrity-checked sidecar state.
+The temporary startup session is shut down and cannot leak its review window or
+execution associations into the resumed session. Restored state includes review
+baselines/evidence, pending model deliveries, execution groups, operation bundles,
+task definitions, activity, commands, incidents, checkpoints, and conflict gates. A live or uncertain
+owner blocks another writer; a confirmed-dead writer can be reconciled into a
+freshly reverified checkpoint before an explicit continuation. Queued inputs
+from a review interrupted by restart are not reordered automatically: use
+`/review-now` to finish the review and release them, or `/review-clear` to cancel
+them.
+
+Codex CLI, Claude CLI, and Little Coder reviewers stream bounded native lifecycle
+and read-only tool activity into ordinary review status and delegated-subtask
+activity views without exposing reasoning contents or reviewer output. Generic
+CLI reviewers expose start/finish status because their protocol has no structured
+intermediate event stream.
 Foreground automatic reviews, `/review-now`, and reviewer-question commands show
 the active reviewer milestone and elapsed time in the status line until the
 review completes or is cancelled.
 
-### Parallel execution with `execute_subtasks`
+### Background execution tools
 
-`execute_subtasks` runs multiple independent bounded tasks in parallel. Each
-task runs in an isolated worktree with its own review lifecycle. Tasks are
-specified as an array (1–16) with the same schema as `execute_subtask`.
+Each task runs in an isolated worktree with its own review lifecycle and
+permanent task UUID. Tasks are specified as an array of 1–16 items.
 
-**Concurrency**: `maxWorkers` controls the maximum concurrent workers (1–4,
-default 2). The tool-call `maxWorkers` overrides `config.execution.maxWorkers`,
-which overrides the built-in default of 2.
+**Concurrency**: `config.execution.maxWorkers` controls concurrent workers
+(1–16, default 4); there is no parallelism toggle or per-tool override. Task
+count is independent, and excess tasks queue. Fresh tasks scan `execution.executorPool`
+in strict priority order and use the first entry with remaining
+`maxConcurrent` capacity. Thus a one-slot local primary can remain preferred
+while lower-priority cloud entries absorb overflow. The sum of pool capacities
+may exceed `maxWorkers`; it describes available fallback capacity, not the
+number of workers that must run.
 
-**Integration policy**: By default all-or-nothing: any worker that is not
-accepted, accepted_with_warnings, completed_unreviewed, or no_changes blocks
-integration entirely. Set `integratePartial: true` to integrate eligible workers
-(accepted / accepted_with_warnings / completed_unreviewed) in declared order
-despite failed ones.
+**Independent landing**: As soon as one task is accepted, it acquires the short
+source-mutation lease, replans against current main, and attempts to land. It
+does not wait for, integrate with, or roll back a sibling. A completed landing
+immediately frees capacity, and `SubtasksAdd` can top the execution group back up. The
+landed changes remain uncommitted; source HEAD, index, staging state, and stash
+are preserved.
 
-**Integration order**: Workers are integrated in the declared order from the
-tasks array, regardless of completion order.
-
-**Landing**: After integration, changes are landed into the source workspace.
-The final changes are uncommitted — they appear as unstaged working-tree
-changes; the source index and staging state remain unchanged.
-
-**Snapshot and ignore policy**: The wave captures a snapshot of the source
-workspace. Non-ignored untracked files are included in the snapshot. Git-ignored
-files are excluded from the captured snapshot and landing. This means dependencies
+**Snapshot and ignore policy**: Each dispatched task captures the source
+workspace independently. Non-ignored untracked files are included. Git-ignored
+files are excluded from capture and landing. This means dependencies
 installed in `node_modules`, secrets in `.env`, and other ignored paths are
 not captured or landed. If your task depends on files that are git-ignored,
 the worker will not see them. Files known to Git through `HEAD` or the index are
-always captured regardless of repository size. During parallel wave capture,
+always captured regardless of repository size. During task capture,
 `maxSnapshotBytes` limits only the cumulative size of non-ignored untracked
 files (50 MiB by default). For ordinary serial review snapshots, the same
 setting continues to bound the textual file content retained for diffing.
 
-**Artifacts**: Each wave produces a `waveRoot` directory containing artifacts
-for each task, a wave manifest (`wave-manifest.json`), and stable refs for
-integrated commits. The wave root path is returned in the tool result. On later
-wave starts, completed non-recovery roots older than `waveArtifactTtlMs` are
+**Artifacts**: Each task produces a `waveRoot` containing its operation record,
+bounded executor/reviewer protocol streams, worktree/checkpoint metadata, manifest, and
+stable refs. Its execution group has a separate integrity-checked manifest and
+is associated with the exact parent conversation sidecar. On later captures,
+completed non-recovery roots older than `waveArtifactTtlMs` are
 garbage-collected (30 days by default; `0` disables collection). Conflict,
 integration-error, and recovery-required roots are never removed by this GC,
 and `retainBundles: "always"` disables wave GC.
 
-**Conflict and recovery**: If integration encounters conflicts, the wave
-returns a `conflicted` status with details about the conflicting task, commit,
-and paths. The integration worktree is preserved for diagnosis. Landing
-conflicts are reported with per-path conflict details. Rolled-back landings
-store a recovery manifest for manual recovery.
+**Conflict and recovery**: A clean accepted task lands immediately. On a
+three-way conflict, clean paths are applied and ordinary diff3 markers are
+materialized for the conflicting text paths in main. A durable critical gate
+then blocks every later landing, identifies the owning task and paths in
+`SubtasksInspect`, and injects a priority instruction on every matching orchestrator
+turn. After resolving the files, use `SubtasksMarkClean`; it verifies that markers are
+gone, checkpoints the resolution, clears the gate, and wakes queued landings.
+Stopped tasks retain verified checkpoints and reattachment bundles for
+`SubtasksContinue` or `SubtasksForceMerge`; `SubtasksForceMerge` with `mergeAnyhow` deliberately
+materializes the same conflict state when a clean landing is impossible. A
+force-merge result describes only the mechanical landing outcome; manually
+inspect the main workspace after every attempt before claiming task success.
 
-**Source preservation**: The wave never mutates the source repository through
-Git operations. Source HEAD, index, staging state, and stash are preserved.
+Every failed or non-landed execution-tool operation returns the complete group
+and task inspection: durable handles, current source disposition, commands and
+acknowledgements, incidents, checkpoint/bundle data, artifact paths, conflicts,
+and concrete recovery actions. This state remains inspectable after compaction
+or an exact-session restart.
+
+**Source preservation**: Landing never changes source HEAD, index, staging
+state, or stash. Final filesystem mutations are serialized and rollback-protected.
 Absolute source-workspace paths in task and correction text are remapped to the
 worker worktree, and executor `PWD` is set to its actual isolated cwd. Clean
 worktrees are removed after completion; dirty or conflicted worktrees are
@@ -396,7 +505,14 @@ launcher:
 
 It builds and explicitly enables this extension, forwards all arguments to
 little-coder, sets the foreground model's `LITTLE_CODER_THINKING_BUDGET` to
-16,384 tokens, and leaves config resolution on the established fallback order:
+16,384 tokens, and applies a shared `LITTLE_CODER_ALLOWED_TOOLS` launch policy
+containing every tool shipped by Pi, Little Coder, and review-gate except
+`ShellSession`. Little Coder's tool gate therefore refuses `ShellSession`, and
+skill-inject omits its skill card. The environment is inherited by Little Coder
+execution subtasks; Little Coder reviewers remain more restrictive through
+their existing read-only/no-skills launch. The same policy is used by the
+preset launcher and all named wrappers. Config resolution remains on the
+established fallback order:
 `~/.config/pi-review-gate/config.json`, `~/.config/pi/review-gate.json`, then
 `~/.config/little-coder/review-gate.json`. It fails clearly if none exists and
 does not generate or rewrite configuration.

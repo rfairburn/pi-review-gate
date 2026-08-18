@@ -87,6 +87,7 @@ export async function writeReviewDeliveryReceipt(
   invocationDir: string,
   action: ReviewTransmissionAction,
   message: string,
+  idempotencyKey?: string,
 ): Promise<void> {
   const path = join(invocationDir, "delivery.json");
   const existing = await readFile(path, "utf8")
@@ -97,6 +98,7 @@ export async function writeReviewDeliveryReceipt(
     sequence: deliveries.length + 1,
     deliveredAt: new Date().toISOString(),
     action,
+    idempotencyKey,
   };
   if (deliveries.length === 0) {
     delivery.content = "implementing-model-transmission.md";
@@ -114,13 +116,23 @@ export async function deliverReviewTransmission(input: {
   invocationDir: string;
   action: ReviewTransmissionAction;
   message: string;
+  idempotencyKey?: string;
   deliver: () => Promise<boolean>;
 }): Promise<boolean> {
   const delivered = await input.deliver();
   if (delivered) {
-    await writeReviewDeliveryReceipt(input.invocationDir, input.action, input.message);
+    await writeReviewDeliveryReceipt(input.invocationDir, input.action, input.message, input.idempotencyKey);
   }
   return delivered;
+}
+
+export async function hasReviewDeliveryReceipt(invocationDir: string, idempotencyKey: string): Promise<boolean> {
+  const parsed = await readFile(join(invocationDir, "delivery.json"), "utf8")
+    .then((content) => JSON.parse(content) as { deliveries?: unknown[] })
+    .catch(() => undefined);
+  return Boolean(parsed?.deliveries?.some((entry) =>
+    typeof entry === "object" && entry !== null && "idempotencyKey" in entry
+      && (entry as { idempotencyKey?: unknown }).idempotencyKey === idempotencyKey));
 }
 
 function renderTransmission(envelope: ReviewTransmissionEnvelope, bundleDir: string): string {

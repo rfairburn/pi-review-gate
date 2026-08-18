@@ -39,9 +39,6 @@ export interface IntegratedWorkerMapping {
   order: number;
 }
 
-/** Status of a wave integration result. */
-export type WaveIntegrationStatus = "integrated" | "conflicted" | "no_changes";
-
 /** Successful integration result. */
 export interface WaveIntegrationSuccess {
   status: "integrated";
@@ -49,8 +46,8 @@ export interface WaveIntegrationSuccess {
   integratedRef: string;
   /** The final integrated commit SHA. */
   finalCommitSha: string;
-  /** Path to the integration worktree. */
-  worktree: string;
+  /** Path to the integration worktree, absent for independent single-task landing. */
+  worktree?: string;
   /** Ordered mappings of each worker commit. */
   workerMappings: IntegratedWorkerMapping[];
   /** Validation status (always 'not_run' — no semantic validation). */
@@ -81,8 +78,8 @@ export interface WaveIntegrationNoChanges {
   baseCommitSha: string;
   /** The integrated ref pinned to the base. */
   integratedRef: string;
-  /** Path to the integration worktree. */
-  worktree: string;
+  /** Path to the integration worktree, absent for independent single-task landing. */
+  worktree?: string;
   /** Empty worker mappings. */
   workerMappings: IntegratedWorkerMapping[];
   /** Validation status. */

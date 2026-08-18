@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { access, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { processTelemetry, runPromptProcess } from "../src/adapters/process";
 
 test("review process telemetry records stream, tool-result, and compaction volume without imposing a budget", async () => {
@@ -83,4 +86,73 @@ test("runPromptProcess remains abortable while a large prompt is being written",
   const output = await running;
   assert.equal(output.aborted, true);
   assert.equal(output.timedOut, false);
+});
+
+test("runPromptProcess durably announces ownership before sending the prompt and reports exit", async () => {
+  const events: string[] = [];
+  let releaseStart!: () => void;
+  let announceStart!: () => void;
+  const startAnnounced = new Promise<void>((resolve) => { announceStart = resolve; });
+  const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+  let completed = false;
+  const running = runPromptProcess({
+    command: process.execPath,
+    args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('done'))"],
+    cwd: process.cwd(),
+    prompt: "begin",
+    timeoutMs: 15_000,
+    onProcessStart: async ({ pid, processGroupId }) => {
+      assert.ok(pid > 0);
+      if (process.platform !== "win32") assert.equal(processGroupId, pid);
+      events.push("start-begin");
+      announceStart();
+      await startGate;
+      events.push("start-durable");
+    },
+    onProcessExit: ({ code }) => {
+      events.push(`exit-${code}`);
+    },
+  }).then((result) => {
+    completed = true;
+    return result;
+  });
+
+  await startAnnounced;
+  assert.equal(completed, false, "the child must not receive its prompt before ownership is durable");
+  releaseStart();
+  const output = await running;
+  assert.equal(output.stdout, "done");
+  assert.deepEqual(events, ["start-begin", "start-durable", "exit-0"]);
+});
+
+test("an ownership-publication failure quiesces the child and records exit before rejecting", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-process-owner-failure-"));
+  const marker = join(root, "prompt-received");
+  const events: string[] = [];
+  try {
+    await assert.rejects(
+      runPromptProcess({
+        command: process.execPath,
+        args: ["-e", [
+          "const fs=require('node:fs');",
+          "process.stdin.resume();",
+          `process.stdin.on('end',()=>fs.writeFileSync(${JSON.stringify(marker)},'yes'));`,
+          "setInterval(()=>{},1000);",
+        ].join("")],
+        cwd: root,
+        prompt: "must not be delivered",
+        timeoutMs: 15_000,
+        onProcessStart: () => {
+          events.push("start");
+          throw new Error("ownership publication failed");
+        },
+        onProcessExit: () => { events.push("exit"); },
+      }),
+      /ownership publication failed/,
+    );
+    assert.deepEqual(events, ["start", "exit"]);
+    await assert.rejects(access(marker), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

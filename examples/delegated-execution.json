@@ -14,13 +14,42 @@
     ]
   },
   "execution": {
-    "activeExecutor": {
-      "source": "little-coder",
-      "model": "openai-codex/gpt-5.6-sol",
-      "thinkingLevel": "high"
-    },
-    "maxWorkers": 2,
-    "parallelEnabled": true
+    "executorPool": [
+      {
+        "entryId": "local-primary",
+        "selection": {
+          "source": "little-coder",
+          "model": "openai-codex/gpt-5.6-sol",
+          "thinkingLevel": "high"
+        },
+        "maxConcurrent": 1
+      },
+      {
+        "entryId": "codex-cloud-overflow",
+        "selection": {
+          "source": "external",
+          "id": "codex-luna"
+        },
+        "maxConcurrent": 3
+      },
+      {
+        "entryId": "claude-overflow",
+        "selection": {
+          "source": "external",
+          "id": "claude"
+        },
+        "maxConcurrent": 4
+      }
+    ],
+    "maxWorkers": 4,
+    "subtaskNotifications": "quiet",
+    "retryPolicy": {
+      "maxRetries": 2,
+      "baseDelayMs": 1000,
+      "maxDelayMs": 15000,
+      "jitter": true,
+      "maxSameIncidentRepeats": 2
+    }
   },
   "externalAgents": [
     {

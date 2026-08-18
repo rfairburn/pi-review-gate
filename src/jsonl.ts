@@ -17,6 +17,7 @@ export interface JsonlDecoderStats {
 export class BoundedTextAccumulator {
   private current = "";
   private currentBytes = 0;
+  private receivedBytes = 0;
 
   constructor(private readonly maxBytes: number) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
@@ -28,9 +29,18 @@ export class BoundedTextAccumulator {
     return this.current;
   }
 
+  get bytes(): number {
+    return this.receivedBytes;
+  }
+
+  get truncated(): boolean {
+    return this.receivedBytes > this.currentBytes;
+  }
+
   clear(): void {
     this.current = "";
     this.currentBytes = 0;
+    this.receivedBytes = 0;
   }
 
   set(value: string): void {
@@ -39,6 +49,7 @@ export class BoundedTextAccumulator {
   }
 
   append(value: string): void {
+    this.receivedBytes += Buffer.byteLength(value);
     const remaining = this.maxBytes - this.currentBytes;
     if (remaining <= 0 || !value) return;
     const addition = utf8Prefix(value, remaining);

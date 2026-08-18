@@ -192,6 +192,36 @@ test("extractReviewTextFromPiJsonl preserves a terminal provider error after ret
   assert.equal(extracted.terminalError, "Codex error: servers currently overloaded");
 });
 
+test("Pi extraction treats an abort followed by compaction as a provisional lifecycle event", () => {
+  const output = [
+    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], errorMessage: "This operation was aborted" } }),
+    JSON.stringify({ type: "compaction_start", reason: "manual" }),
+    JSON.stringify({ type: "compaction_end", reason: "manual", result: { summary: "kept work" }, aborted: false }),
+    JSON.stringify({ type: "turn_start" }),
+    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "continued" }] } }),
+    JSON.stringify({ type: "turn_end" }),
+  ].join("\n");
+
+  const extracted = extractReviewTextFromPiJsonl(output);
+  assert.equal(extracted.text, "continued");
+  assert.equal(extracted.terminalError, undefined);
+  assert.equal(extracted.lifecycle.provisionalAbortResolved, true);
+  assert.equal(extracted.lifecycle.compaction.status, "completed");
+  assert.equal(extracted.lifecycle.compaction.resumeObserved, true);
+});
+
+test("Pi extraction reports an interrupted in-progress compaction structurally", () => {
+  const output = [
+    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], errorMessage: "This operation was aborted" } }),
+    JSON.stringify({ type: "compaction_start", reason: "manual" }),
+  ].join("\n");
+
+  const extracted = extractReviewTextFromPiJsonl(output);
+  assert.equal(extracted.terminalError, undefined);
+  assert.equal(extracted.lifecycle.compaction.status, "in_progress");
+  assert.equal(extracted.lifecycle.provisionalAbortResolved, true);
+});
+
 test("extractPiUsageFromMessages sums acting model usage from agent_end args", () => {
   const usage = extractPiUsageFromMessages([
     {

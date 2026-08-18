@@ -1,14 +1,35 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { promises as fs } from "node:fs";
 import { createExecutorAdapter } from "./adapters/factory";
-import { normalizeCandidate, type CandidateCommit } from "./wave-commits";
+import { normalizeCandidate, pinRecoveryCandidate, type CandidateCommit } from "./wave-commits";
 import type { WorkerWorktree } from "./wave-worktrees";
 import type { WaveCaptureResult } from "./wave-repository";
-import type { ReviewGateConfig } from "../config";
-import type { ExecutorAdapter, ExecutorSession, ExecutorTurn, SubtaskProgressUpdate } from "./types";
+import {
+  DEFAULT_EXECUTION_RETRY_POLICY,
+  executorSelectionKey,
+  resolvedExecutorPool,
+  type ReviewGateConfig,
+} from "../config";
+import type { ExecutorAdapter, ExecutorLiveControl, ExecutorSession, ExecutorTurn, SubtaskProgressUpdate } from "./types";
 import type { TokenUsage } from "../usage";
 import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
+import { runExecutorWithRecovery, type RecoveredExecutorRun } from "./executor-recovery";
+import type { ExecutorPoolAssignment } from "./executor-pool";
+import {
+  createOperationRecord,
+  createIncident,
+  createReattachmentBundle,
+  operationRecordPath,
+  readOperationRecord,
+  writeOperationRecord,
+  type ExecutionIncident,
+  type ExecutorAssignmentRecord,
+  type OperationRecord,
+  type ReattachmentBundle,
+  type RecoveryCheckpoint,
+} from "./operation-record";
 
 // ── path rewriting for workspace isolation ───────────────────────────────────
 
@@ -69,6 +90,11 @@ export function rewriteTaskPaths(
     relevantContext: task.relevantContext
       ? rewriteSourcePaths(task.relevantContext, sourceRoot, workerRoot)
       : undefined,
+    executorAllowedTools: task.executorAllowedTools ? [...task.executorAllowedTools] : undefined,
+    authoritativeUpdates: task.authoritativeUpdates?.map((item) => ({
+      ...item,
+      instruction: rewriteSourcePaths(item.instruction, sourceRoot, workerRoot),
+    })),
   };
 }
 
@@ -105,6 +131,71 @@ export interface WaveWorkerTask {
   instructions: string;
   acceptanceCriteria: string[];
   relevantContext?: string;
+  /**
+   * Durable snapshot of the parent agent's active tools. Little Coder
+   * executor launches reuse this allowlist across retries, compaction, and
+   * continuation so a parent CLI restriction cannot be widened by spawning.
+   */
+  executorAllowedTools?: string[];
+  /** Acknowledged steering in delivery order. Later entries supersede conflicting earlier task text. */
+  authoritativeUpdates?: Array<{
+    instructionId: string;
+    action: "continue" | "steer";
+    instruction: string;
+    acknowledgedAt: string;
+  }>;
+}
+
+/** Persist acknowledged steering for executors, reviewers, and restart recovery. */
+export function createTaskInstructionEvidenceRecorder(
+  task: WaveWorkerTask,
+  artifactDir: string,
+): {
+  record(instruction: string, instructionId: string, action?: "continue" | "steer", acknowledgedAt?: string): Promise<void>;
+  wrap(control: ExecutorLiveControl | undefined): ExecutorLiveControl | undefined;
+  flush(): Promise<void>;
+} {
+  let tail = Promise.resolve();
+  const record = (
+    instruction: string,
+    instructionId: string,
+    action: "continue" | "steer" = "steer",
+    acknowledgedAt = new Date().toISOString(),
+  ): Promise<void> => {
+    tail = tail.then(async () => {
+      task.authoritativeUpdates ??= [];
+      if (task.authoritativeUpdates.some((item) => item.instructionId === instructionId)) return;
+      task.authoritativeUpdates.push({ instructionId, action, instruction, acknowledgedAt });
+      await persistTaskDefinition(artifactDir, task);
+    });
+    return tail;
+  };
+  const wrap = (control: ExecutorLiveControl | undefined): ExecutorLiveControl | undefined => {
+    if (!control) return undefined;
+    return {
+      ...control,
+      steer: async (instruction, instructionId) => {
+        const acknowledgement = await control.steer(instruction, instructionId);
+        if (acknowledgement.status === "acknowledged") await record(instruction, instructionId);
+        return acknowledgement;
+      },
+    };
+  };
+  return { record, wrap, flush: () => tail };
+}
+
+/** Update only the task definition while preserving executor metadata. */
+export async function persistTaskDefinition(artifactDir: string, task: WaveWorkerTask): Promise<void> {
+  const path = join(artifactDir, "task.json");
+  const metadata = JSON.parse(await fs.readFile(path, "utf8")) as Record<string, unknown>;
+  metadata.task = task;
+  const temporaryPath = `${path}.tmp.${randomUUID()}`;
+  try {
+    await fs.writeFile(temporaryPath, JSON.stringify(metadata, null, 2), "utf8");
+    await fs.rename(temporaryPath, path);
+  } finally {
+    await fs.unlink(temporaryPath).catch(() => undefined);
+  }
 }
 
 /** Status of a wave worker turn result. */
@@ -128,6 +219,12 @@ export interface WaveWorkerResult {
   model?: string;
   usage?: TokenUsage;
   error?: string;
+  operationRecord?: string;
+  bundle?: ReattachmentBundle;
+  incidents?: ExecutionIncident[];
+  checkpoint?: RecoveryCheckpoint;
+  attempts?: number;
+  lastExecutorTurn?: number;
 }
 
 /** Input for running a single wave worker turn. */
@@ -154,6 +251,14 @@ export interface WaveWorkerInput {
   signal?: AbortSignal;
   /** Progress callback. */
   onUpdate?: (update: SubtaskProgressUpdate) => void;
+  /** Register live steering/interruption for the current executor turn. */
+  onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+  /** Atomically claim steering that could not reach the completed live turn. */
+  takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
+  /** Capacity lease selected by the wave scheduler. */
+  executorAssignment?: ExecutorPoolAssignment;
+  /** Acquire the next lower-priority executor after verified recovery fails. */
+  acquireFailover?: (current: ExecutorPoolAssignment) => Promise<ExecutorPoolAssignment | undefined>;
 }
 
 /** Input for resuming a wave worker turn (continuation). */
@@ -184,6 +289,14 @@ export interface WaveWorkerContinuationInput {
   signal?: AbortSignal;
   /** Progress callback. */
   onUpdate?: (update: SubtaskProgressUpdate) => void;
+  /** Register live steering/interruption for the current executor turn. */
+  onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+  /** Atomically claim steering that could not reach the completed live turn. */
+  takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
+  /** Capacity lease selected by the wave scheduler. */
+  executorAssignment?: ExecutorPoolAssignment;
+  /** Acquire the next lower-priority executor after verified recovery fails. */
+  acquireFailover?: (current: ExecutorPoolAssignment) => Promise<ExecutorPoolAssignment | undefined>;
 }
 
 // ── validation ───────────────────────────────────────────────────────────────
@@ -392,7 +505,7 @@ export function buildWaveWorkerPrompt(
 }
 
 function renderWaveWorkerTask(task: WaveWorkerTask): string {
-  return [
+  const lines = [
     `Subtask: ${task.title}`,
     "",
     task.instructions,
@@ -400,7 +513,16 @@ function renderWaveWorkerTask(task: WaveWorkerTask): string {
     "Acceptance criteria:",
     ...task.acceptanceCriteria.map((criterion) => `- ${criterion}`),
     ...(task.relevantContext ? ["", "Relevant context:", task.relevantContext] : []),
-  ].join("\n");
+  ];
+  if (task.authoritativeUpdates?.length) {
+    lines.push(
+      "",
+      "Acknowledged task updates (authoritative, in delivery order):",
+      "Later updates supersede any conflicting original instruction or acceptance criterion.",
+      ...task.authoritativeUpdates.map((item) => `- [${item.action}:${item.instructionId}] ${item.instruction}`),
+    );
+  }
+  return lines.join("\n");
 }
 
 // ── progress helpers ─────────────────────────────────────────────────────────
@@ -413,6 +535,253 @@ function reportProgress(
 }
 
 // ── main execution ───────────────────────────────────────────────────────────
+
+interface PoolRunResult {
+  adapter?: ExecutorAdapter;
+  recovered: RecoveredExecutorRun;
+}
+
+function configuredAssignment(config: ReviewGateConfig): ExecutorPoolAssignment | undefined {
+  const entry = resolvedExecutorPool(config)[0];
+  return entry ? { entry, priority: 0 } : undefined;
+}
+
+function assignmentFromOperation(operation: OperationRecord, config: ReviewGateConfig): ExecutorPoolAssignment | undefined {
+  if (!operation.executorSelection || operation.executorEntryId === undefined || operation.executorPriority === undefined) {
+    return undefined;
+  }
+  const configured = resolvedExecutorPool(config);
+  const configuredPriority = configured.findIndex((entry) =>
+    executorSelectionKey(entry.selection) === executorSelectionKey(operation.executorSelection!));
+  if (configuredPriority >= 0) {
+    return { entry: configured[configuredPriority]!, priority: configuredPriority };
+  }
+  return {
+    entry: {
+      entryId: operation.executorEntryId,
+      selection: operation.executorSelection,
+      maxConcurrent: 1,
+    },
+    priority: operation.executorPriority,
+  };
+}
+
+function beginAssignment(
+  operation: OperationRecord,
+  assignment: ExecutorPoolAssignment,
+  reason: ExecutorAssignmentRecord["reason"],
+): ExecutorAssignmentRecord {
+  operation.executorEntryId = assignment.entry.entryId;
+  operation.executorPriority = assignment.priority;
+  operation.executorSelection = assignment.entry.selection;
+  const record: ExecutorAssignmentRecord = {
+    entryId: assignment.entry.entryId,
+    priority: assignment.priority,
+    selection: assignment.entry.selection,
+    generation: operation.generation,
+    reason,
+    startedAt: new Date().toISOString(),
+  };
+  operation.assignments.push(record);
+  return record;
+}
+
+function finishAssignment(
+  assignment: ExecutorAssignmentRecord,
+  outcome: NonNullable<ExecutorAssignmentRecord["outcome"]>,
+): void {
+  assignment.endedAt = new Date().toISOString();
+  assignment.outcome = outcome;
+}
+
+function checkpointHandoffPrompt(
+  originalPrompt: string,
+  recovered: RecoveredExecutorRun,
+): string {
+  const checkpoint = recovered.checkpoint;
+  return [
+    "Executor handoff (authoritative):",
+    "A prior executor exhausted its recovery attempts. Continue this same task in the existing isolated worktree.",
+    "Inspect and preserve useful work already present. Do not reset, discard, or recreate changes merely because the native conversation changed.",
+    checkpoint
+      ? `Verified checkpoint: ${checkpoint.commitSha} (${checkpoint.ref}); changed paths: ${checkpoint.changedPaths.join(", ") || "none"}.`
+      : "No prior file changes were produced before executor initialization failed.",
+    `Prior executor failure: ${recovered.error ?? "unknown executor failure"}`,
+    "",
+    "Original task and current instructions:",
+    originalPrompt,
+  ].join("\n");
+}
+
+async function runWithPoolFailover(input: {
+  worker: WaveWorkerInput | WaveWorkerContinuationInput;
+  operation: OperationRecord;
+  assignment: ExecutorPoolAssignment;
+  prompt: string;
+  handoffPrompt: string;
+  startingTurn: number;
+  session?: ExecutorSession;
+  reason: ExecutorAssignmentRecord["reason"];
+  resolvedArtifactDir: string;
+}): Promise<PoolRunResult> {
+  let assignment = input.assignment;
+  let prompt = input.prompt;
+  let session = input.session;
+  let startingTurn = input.startingTurn;
+  let reason = input.reason;
+
+  for (;;) {
+    const assignmentRecord = beginAssignment(input.operation, assignment, reason);
+    let adapter: ExecutorAdapter | undefined;
+    try {
+      adapter = createExecutorAdapter(input.worker.config, assignment.entry.selection);
+      input.operation.adapter = adapter.kind;
+      input.operation.model = adapter.model;
+      await writeOperationRecord(input.operation);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to create executor adapter.";
+      const incident = createIncident({
+        attempt: input.operation.attempts.length,
+        generation: input.operation.generation,
+        cause: "provider_error",
+        stage: "adapter_initialization",
+        message,
+        retryable: true,
+      });
+      input.operation.incidents.push(incident);
+      finishAssignment(assignmentRecord, "failed");
+      let checkpoint = input.operation.checkpoint;
+      try {
+        const candidate = await normalizeCandidate(
+          input.worker.capture,
+          input.worker.worktree.worktreeRoot,
+          input.worker.taskId,
+          input.worker.task.title,
+        );
+        checkpoint = await checkpointCandidate(input.worker.capture, input.worker.taskId, candidate);
+        input.operation.checkpoint = checkpoint;
+      } catch (checkpointError) {
+        incident.retryable = false;
+        incident.terminalCode = "recovery_state_corrupt_or_unverifiable";
+        incident.message = `${message}; the recovery checkpoint could not be created or verified. ${checkpointError instanceof Error ? checkpointError.message : String(checkpointError)}`;
+        input.operation.state = "failed_critical";
+        await writeOperationRecord(input.operation);
+        return {
+          recovered: {
+            status: "critical",
+            error: incident.message,
+            lastTurnNumber: Math.max(0, startingTurn - 1),
+            checkpoint,
+            incidents: [incident],
+          },
+        };
+      }
+      await writeOperationRecord(input.operation);
+      const recovered: RecoveredExecutorRun = {
+        status: "failed",
+        error: message,
+        lastTurnNumber: Math.max(0, startingTurn - 1),
+        checkpoint,
+        incidents: [incident],
+      };
+      const next = await input.worker.acquireFailover?.(assignment);
+      if (!next) {
+        input.operation.state = "paused_recoverable";
+        await writeOperationRecord(input.operation);
+        return { recovered };
+      }
+      incident.resolvedAt = new Date().toISOString();
+      incident.resolution = "executor_pool_failover";
+      input.operation.generation += 1;
+      input.operation.session = undefined;
+      assignment = next;
+      prompt = checkpointHandoffPrompt(input.handoffPrompt, recovered);
+      session = undefined;
+      reason = "failover";
+      continue;
+    }
+
+    reportProgress(input.worker, {
+      phase: "executing",
+      message: `executor turn ${startingTurn} running`,
+      artifactDir: input.resolvedArtifactDir,
+      adapter: adapter.kind,
+      model: adapter.model,
+      executorTurn: startingTurn,
+    });
+
+    const recovered = await runExecutorWithRecovery({
+      adapter,
+      request: {
+        cwd: input.worker.worktree.effectiveCwd,
+        artifactDir: input.resolvedArtifactDir,
+        allowedTools: input.worker.task.executorAllowedTools,
+        signal: input.worker.signal,
+        onUpdate: (message) => reportProgress(input.worker, {
+          phase: "executing",
+          message,
+          artifactDir: input.resolvedArtifactDir,
+          adapter: adapter!.kind,
+          model: adapter!.model,
+        }),
+        onLiveControl: input.worker.onLiveControl,
+      },
+      prompt,
+      startingTurn,
+      session,
+      capture: input.worker.capture,
+      worktree: input.worker.worktree,
+      taskId: input.worker.taskId,
+      title: input.worker.task.title,
+      retryPolicy: input.worker.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY,
+      operation: input.operation,
+      onRetry: (message, executorTurn) => reportProgress(input.worker, {
+        phase: "executing",
+        message,
+        artifactDir: input.resolvedArtifactDir,
+        adapter: adapter!.kind,
+        model: adapter!.model,
+        executorTurn,
+      }),
+    });
+
+    if (recovered.status === "completed") {
+      finishAssignment(assignmentRecord, "completed");
+      await writeOperationRecord(input.operation);
+      return { adapter, recovered };
+    }
+    if (recovered.status === "cancelled") {
+      finishAssignment(assignmentRecord, "cancelled");
+      await writeOperationRecord(input.operation);
+      return { adapter, recovered };
+    }
+    finishAssignment(assignmentRecord, "failed");
+    if (recovered.status === "critical" || !recovered.checkpoint?.verified) {
+      await writeOperationRecord(input.operation);
+      return { adapter, recovered };
+    }
+
+    const next = await input.worker.acquireFailover?.(assignment);
+    if (!next) {
+      await writeOperationRecord(input.operation);
+      return { adapter, recovered };
+    }
+    for (const incident of recovered.incidents) {
+      if (!incident.resolvedAt) {
+        incident.resolvedAt = new Date().toISOString();
+        incident.resolution = "verified_checkpoint_failover";
+      }
+    }
+    input.operation.generation += 1;
+    input.operation.session = undefined;
+    assignment = next;
+    prompt = checkpointHandoffPrompt(input.handoffPrompt, recovered);
+    session = undefined;
+    startingTurn = recovered.lastTurnNumber + 1;
+    reason = "failover";
+    await writeOperationRecord(input.operation);
+  }
+}
 
 /**
  * Run exactly one initial wave executor turn.
@@ -433,7 +802,7 @@ function reportProgress(
  * - Implement scheduling.
  */
 export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerResult> {
-  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, signal } = input;
+  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases } = input;
 
   // ── Validate artifact directory (before mkdir) ──
   const resolvedArtifactDir = resolve(artifactDir);
@@ -458,18 +827,15 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
   await assertEffectiveCwdInsideWorktree(worktree.effectiveCwd, worktree.worktreeRoot);
   await assertWorktreeBelongsToRepo(worktree.worktreeRoot, capture);
 
-  // ── Create executor adapter ──
-  let adapter: ExecutorAdapter;
-  try {
-    adapter = createExecutorAdapter(config);
-  } catch (error) {
+  const assignment = input.executorAssignment ?? configuredAssignment(config);
+  if (!assignment) {
     return {
       status: "executor_error",
       taskId,
       title: task.title,
-      summary: error instanceof Error ? error.message : "Failed to create executor adapter.",
+      summary: "No executor pool is configured.",
       adapter: "none",
-      error: error instanceof Error ? error.message : "Failed to create executor adapter.",
+      error: "No executor pool is configured.",
     };
   }
 
@@ -477,8 +843,6 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     phase: "starting",
     message: "wave worker starting executor",
     artifactDir: resolvedArtifactDir,
-    adapter: adapter.kind,
-    model: adapter.model,
   });
 
   // ── Write task metadata ──
@@ -488,8 +852,9 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       version: 1,
       taskId,
       task,
-      adapter: adapter.kind,
-      model: adapter.model,
+      executorEntryId: assignment.entry.entryId,
+      executorPriority: assignment.priority,
+      executorSelection: assignment.entry.selection,
       startedAt: new Date().toISOString(),
     }, null, 2),
     "utf8",
@@ -502,136 +867,57 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     worktree.worktreeRoot,
   );
 
-  // ── Run one executor turn ──
-  reportProgress(input, {
-    phase: "executing",
-    message: "executor turn 1 running",
+  const operation = createOperationRecord({
+    waveId: capture.waveId,
+    taskId,
+    title: task.title,
+    worktreeRoot: worktree.worktreeRoot,
+    effectiveCwd: worktree.effectiveCwd,
     artifactDir: resolvedArtifactDir,
-    adapter: adapter.kind,
-    model: adapter.model,
-    executorTurn: 1,
+    retryBudget: config.execution?.retryPolicy?.maxRetries ?? DEFAULT_EXECUTION_RETRY_POLICY.maxRetries,
   });
+  await writeOperationRecord(operation);
 
-  let turn: ExecutorTurn;
-  try {
-    turn = await adapter.run({
-      cwd: worktree.effectiveCwd,
-      prompt,
-      artifactDir: resolvedArtifactDir,
-      turn: 1,
-      signal,
-      onUpdate: (message) => reportProgress(input, {
-        phase: "executing",
-        message,
-        artifactDir: resolvedArtifactDir,
-        adapter: adapter.kind,
-        model: adapter.model,
-        executorTurn: 1,
-      }),
-    });
-  } catch (error) {
-    // Prioritize cancellation over generic executor error.
-    if (signal?.aborted) {
-      return {
-        status: "cancelled",
-        taskId,
-        title: task.title,
-        summary: "Executor was cancelled.",
-        adapter: adapter.kind,
-        model: adapter.model,
-        error: "Executor was cancelled.",
-      };
-    }
+  const poolRun = await runWithPoolFailover({
+    worker: input,
+    operation,
+    assignment,
+    prompt,
+    handoffPrompt: prompt,
+    startingTurn: 1,
+    reason: "initial",
+    resolvedArtifactDir,
+  });
+  const { recovered } = poolRun;
+  const adapter = poolRun.adapter;
+  const adapterKind = adapter?.kind ?? "none";
+  const commonFailure = {
+    taskId,
+    title: task.title,
+    summary: recovered.error ?? "Executor failed.",
+    session: recovered.turn?.session,
+    turn: recovered.turn,
+    adapter: adapterKind,
+    model: adapter?.model,
+    usage: recovered.turn?.usage,
+    error: recovered.error ?? "Executor failed.",
+    operationRecord: operationRecordPath(resolvedArtifactDir),
+    bundle: createReattachmentBundle(operation, capture.waveRoot),
+    incidents: operation.incidents,
+    checkpoint: recovered.checkpoint,
+    attempts: operation.attempts.length,
+    lastExecutorTurn: recovered.lastTurnNumber,
+  };
+  if (recovered.status !== "completed" || !recovered.turn) {
     return {
-      status: "executor_error",
-      taskId,
-      title: task.title,
-      summary: error instanceof Error ? error.message : "Executor process failed.",
-      adapter: adapter.kind,
-      model: adapter.model,
-      error: error instanceof Error ? error.message : "Executor process failed.",
+      status: recovered.status === "cancelled" ? "cancelled" : recovered.error?.includes("timed out") ? "timeout" : "executor_error",
+      ...commonFailure,
     };
   }
-
-  // ── Check for cancellation ──
-  if (turn.aborted || signal?.aborted) {
-    return {
-      status: "cancelled",
-      taskId,
-      title: task.title,
-      summary: "Executor was cancelled.",
-      session: turn.session,
-      turn,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turn.usage,
-      error: "Executor was cancelled.",
-    };
+  if (!adapter) {
+    return { status: "executor_error", ...commonFailure, adapter: "none", error: "Executor completed without an adapter record." };
   }
-
-  // ── Check for timeout ──
-  if (turn.timedOut) {
-    return {
-      status: "timeout",
-      taskId,
-      title: task.title,
-      summary: "Executor timed out.",
-      session: turn.session,
-      turn,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turn.usage,
-      error: "Executor timed out.",
-    };
-  }
-
-  if (turn.failure) {
-    const message = `Executor ${turn.failure.category} error: ${turn.failure.message}`;
-    return {
-      status: "executor_error",
-      taskId,
-      title: task.title,
-      summary: message,
-      session: turn.session,
-      turn,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turn.usage,
-      error: message,
-    };
-  }
-
-  // ── Check for executor error ──
-  if (turn.code !== 0) {
-    return {
-      status: "executor_error",
-      taskId,
-      title: task.title,
-      summary: `Executor exited with status ${turn.code}.`,
-      session: turn.session,
-      turn,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turn.usage,
-      error: `Executor exited with status ${turn.code}.`,
-    };
-  }
-
-  // ── Check for empty response ──
-  if (!turn.text.trim()) {
-    return {
-      status: "executor_error",
-      taskId,
-      title: task.title,
-      summary: "Executor did not produce a usable final response.",
-      session: turn.session,
-      turn,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turn.usage,
-      error: "Executor did not produce a usable final response.",
-    };
-  }
+  const turn = recovered.turn;
 
   // ── Normalize the candidate ──
   reportProgress(input, {
@@ -651,19 +937,42 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       task.title,
     );
   } catch (error) {
+    const message = error instanceof Error ? error.message : "Candidate normalization failed.";
+    operation.state = "failed_critical";
+    operation.incidents.push(createIncident({
+      attempt: operation.attempts.length,
+      generation: operation.generation,
+      cause: "workspace_error",
+      stage: "checkpointing",
+      message,
+      retryable: false,
+      terminalCode: "recovery_state_corrupt_or_unverifiable",
+    }));
+    await writeOperationRecord(operation);
     return {
       status: "executor_error",
       taskId,
       title: task.title,
-      summary: error instanceof Error ? error.message : "Candidate normalization failed.",
+      summary: message,
       session: turn.session,
       turn,
       adapter: adapter.kind,
       model: adapter.model,
       usage: turn.usage,
-      error: error instanceof Error ? error.message : "Candidate normalization failed.",
+      error: message,
+      operationRecord: operationRecordPath(resolvedArtifactDir),
+      bundle: createReattachmentBundle(operation, capture.waveRoot),
+      incidents: operation.incidents,
+      checkpoint: operation.checkpoint,
+      attempts: operation.attempts.length,
+      lastExecutorTurn: recovered.lastTurnNumber,
     };
   }
+
+  operation.checkpoint = await checkpointCandidate(capture, taskId, candidate);
+  operation.session = turn.session;
+  operation.state = "completed";
+  await writeOperationRecord(operation);
 
   // ── Write completion artifact ──
   const result: WaveWorkerResult = candidate.differsFromBase
@@ -678,6 +987,12 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       adapter: adapter.kind,
       model: adapter.model,
       usage: turn.usage,
+      operationRecord: operationRecordPath(resolvedArtifactDir),
+      bundle: createReattachmentBundle(operation, capture.waveRoot),
+      incidents: operation.incidents,
+      checkpoint: operation.checkpoint,
+      attempts: operation.attempts.length,
+      lastExecutorTurn: recovered.lastTurnNumber,
     }
     : {
       status: "no_changes",
@@ -690,6 +1005,12 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       adapter: adapter.kind,
       model: adapter.model,
       usage: turn.usage,
+      operationRecord: operationRecordPath(resolvedArtifactDir),
+      bundle: createReattachmentBundle(operation, capture.waveRoot),
+      incidents: operation.incidents,
+      checkpoint: operation.checkpoint,
+      attempts: operation.attempts.length,
+      lastExecutorTurn: recovered.lastTurnNumber,
     };
 
   await writeFile(
@@ -729,11 +1050,12 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
  * Resume a wave worker turn with feedback from a prior review.
  *
  * Given the same capture/worktree/task/artifact/config plus a prior successful
- * WaveWorkerResult (session and candidate), prompt text, and turn number >= 2,
+ * WaveWorkerResult with a candidate checkpoint, prompt text, and turn number >= 2,
  * this function:
  * 1. Revalidates the isolated paths/worktree.
  * 2. Recreates the configured adapter.
- * 3. Resumes the exact executor session in worker.effectiveCwd.
+ * 3. Resumes the exact executor session when available, or hands the verified
+ *    checkpoint and full task context to a fresh executor session.
  * 4. Handles cancellation/timeout/nonzero/empty response with typed statuses.
  * 5. Re-normalizes the final tree against the immutable base using the prior candidate.
  * 6. Returns the same WaveWorkerResult shape with the new turn/session/candidate.
@@ -745,12 +1067,9 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
  * - Implement scheduling.
  */
 export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Promise<WaveWorkerResult> {
-  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, priorResult, feedback, turn, signal } = input;
+  const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, priorResult, feedback, turn } = input;
 
   // ── Validate prior result ──
-  if (!priorResult.session) {
-    throw new Error("Continuation requires a prior result with a session.");
-  }
   if (!priorResult.candidate) {
     throw new Error("Continuation requires a prior result with a candidate.");
   }
@@ -771,18 +1090,20 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   await assertEffectiveCwdInsideWorktree(worktree.effectiveCwd, worktree.worktreeRoot);
   await assertWorktreeBelongsToRepo(worktree.worktreeRoot, capture);
 
-  // ── Create executor adapter ──
-  let adapter: ExecutorAdapter;
-  try {
-    adapter = createExecutorAdapter(config);
-  } catch (error) {
+  const operation = await readOperationRecord(operationRecordPath(resolvedArtifactDir));
+  operation.state = "running";
+  const priorExecutorSelection = operation.executorSelection;
+  const assignment = input.executorAssignment ?? (config.execution?.executorPool !== undefined
+    ? assignmentFromOperation(operation, config) ?? configuredAssignment(config)
+    : configuredAssignment(config));
+  if (!assignment) {
     return {
       status: "executor_error",
       taskId,
       title: task.title,
-      summary: error instanceof Error ? error.message : "Failed to create executor adapter.",
+      summary: "No executor pool is configured.",
       adapter: "none",
-      error: error instanceof Error ? error.message : "Failed to create executor adapter.",
+      error: "No executor pool is configured.",
     };
   }
 
@@ -790,8 +1111,6 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     phase: "correcting",
     message: `resuming executor turn ${turn}`,
     artifactDir: resolvedArtifactDir,
-    adapter: adapter.kind,
-    model: adapter.model,
   });
 
   // ── Resume the exact executor session ──
@@ -801,135 +1120,72 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     worktree.worktreeRoot,
   );
 
-  reportProgress(input, {
-    phase: "executing",
-    message: `executor turn ${turn} running (resumed)`,
-    artifactDir: resolvedArtifactDir,
-    adapter: adapter.kind,
-    model: adapter.model,
-    executorTurn: turn,
-  });
-
-  let turnResult: ExecutorTurn;
-  try {
-    turnResult = await adapter.run({
-      cwd: worktree.effectiveCwd,
-      prompt: rewrittenFeedback,
+  const handoffPrompt = [
+    buildWaveWorkerPrompt(task, [sourceRoot, ...(sourceRootAliases ?? [])], worktree.worktreeRoot),
+    "",
+    "Current continuation instructions:",
+    rewrittenFeedback,
+  ].join("\n");
+  const selectionChanged = priorExecutorSelection !== undefined
+    && executorSelectionKey(priorExecutorSelection) !== executorSelectionKey(assignment.entry.selection);
+  const resumableSession = selectionChanged ? undefined : priorResult.session;
+  if (priorResult.session && selectionChanged) {
+    reportProgress(input, {
+      phase: "correcting",
+      message: `current /review-settings changed the executor assignment; starting a new ${assignment.entry.entryId} session from the durable checkpoint`,
       artifactDir: resolvedArtifactDir,
-      turn,
-      signal,
-      session: priorResult.session, // resume exact prior session
-      onUpdate: (message) => reportProgress(input, {
-        phase: "executing",
-        message,
-        artifactDir: resolvedArtifactDir,
-        adapter: adapter.kind,
-        model: adapter.model,
-        executorTurn: turn,
-      }),
     });
-  } catch (error) {
-    if (signal?.aborted) {
-      return {
-        status: "cancelled",
-        taskId,
-        title: task.title,
-        summary: "Executor was cancelled.",
-        adapter: adapter.kind,
-        model: adapter.model,
-        error: "Executor was cancelled.",
-      };
-    }
+  }
+  const poolRun = await runWithPoolFailover({
+    worker: input,
+    operation,
+    assignment,
+    prompt: resumableSession ? rewrittenFeedback : handoffPrompt,
+    handoffPrompt,
+    startingTurn: turn,
+    session: resumableSession,
+    reason: "continuation",
+    resolvedArtifactDir,
+  });
+  const { recovered } = poolRun;
+  const adapter = poolRun.adapter;
+  if (recovered.status !== "completed" || !recovered.turn) {
+    return {
+      status: recovered.status === "cancelled" ? "cancelled" : recovered.error?.includes("timed out") ? "timeout" : "executor_error",
+      taskId,
+      title: task.title,
+      summary: recovered.error ?? "Executor continuation failed.",
+      session: recovered.turn?.session ?? priorResult.session,
+      turn: recovered.turn,
+      adapter: adapter?.kind ?? "none",
+      model: adapter?.model,
+      usage: recovered.turn?.usage,
+      error: recovered.error ?? "Executor continuation failed.",
+      operationRecord: operationRecordPath(resolvedArtifactDir),
+      bundle: createReattachmentBundle(operation, capture.waveRoot),
+      incidents: operation.incidents,
+      checkpoint: recovered.checkpoint,
+      attempts: operation.attempts.length,
+      lastExecutorTurn: recovered.lastTurnNumber,
+    };
+  }
+  if (!adapter) {
     return {
       status: "executor_error",
       taskId,
       title: task.title,
-      summary: error instanceof Error ? error.message : "Executor process failed.",
-      adapter: adapter.kind,
-      model: adapter.model,
-      error: error instanceof Error ? error.message : "Executor process failed.",
+      summary: "Executor completed without an adapter record.",
+      adapter: "none",
+      error: "Executor completed without an adapter record.",
+      operationRecord: operationRecordPath(resolvedArtifactDir),
+      bundle: createReattachmentBundle(operation, capture.waveRoot),
+      incidents: operation.incidents,
+      checkpoint: operation.checkpoint,
+      attempts: operation.attempts.length,
+      lastExecutorTurn: recovered.lastTurnNumber,
     };
   }
-
-  // ── Check for cancellation ──
-  if (turnResult.aborted || signal?.aborted) {
-    return {
-      status: "cancelled",
-      taskId,
-      title: task.title,
-      summary: "Executor was cancelled.",
-      session: turnResult.session,
-      turn: turnResult,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turnResult.usage,
-      error: "Executor was cancelled.",
-    };
-  }
-
-  // ── Check for timeout ──
-  if (turnResult.timedOut) {
-    return {
-      status: "timeout",
-      taskId,
-      title: task.title,
-      summary: "Executor timed out.",
-      session: turnResult.session,
-      turn: turnResult,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turnResult.usage,
-      error: "Executor timed out.",
-    };
-  }
-
-  if (turnResult.failure) {
-    const message = `Executor ${turnResult.failure.category} error: ${turnResult.failure.message}`;
-    return {
-      status: "executor_error",
-      taskId,
-      title: task.title,
-      summary: message,
-      session: turnResult.session,
-      turn: turnResult,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turnResult.usage,
-      error: message,
-    };
-  }
-
-  // ── Check for executor error ──
-  if (turnResult.code !== 0) {
-    return {
-      status: "executor_error",
-      taskId,
-      title: task.title,
-      summary: `Executor exited with status ${turnResult.code}.`,
-      session: turnResult.session,
-      turn: turnResult,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turnResult.usage,
-      error: `Executor exited with status ${turnResult.code}.`,
-    };
-  }
-
-  // ── Check for empty response ──
-  if (!turnResult.text.trim()) {
-    return {
-      status: "executor_error",
-      taskId,
-      title: task.title,
-      summary: "Executor did not produce a usable final response.",
-      session: turnResult.session,
-      turn: turnResult,
-      adapter: adapter.kind,
-      model: adapter.model,
-      usage: turnResult.usage,
-      error: "Executor did not produce a usable final response.",
-    };
-  }
+  const turnResult = recovered.turn;
 
   // ── Re-normalize the candidate against the immutable base ──
   reportProgress(input, {
@@ -950,19 +1206,42 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       { commitSha: priorResult.candidate.commitSha },
     );
   } catch (error) {
+    const message = error instanceof Error ? error.message : "Candidate normalization failed.";
+    operation.state = "failed_critical";
+    operation.incidents.push(createIncident({
+      attempt: operation.attempts.length,
+      generation: operation.generation,
+      cause: "workspace_error",
+      stage: "checkpointing",
+      message,
+      retryable: false,
+      terminalCode: "recovery_state_corrupt_or_unverifiable",
+    }));
+    await writeOperationRecord(operation);
     return {
       status: "executor_error",
       taskId,
       title: task.title,
-      summary: error instanceof Error ? error.message : "Candidate normalization failed.",
+      summary: message,
       session: turnResult.session,
       turn: turnResult,
       adapter: adapter.kind,
       model: adapter.model,
       usage: turnResult.usage,
-      error: error instanceof Error ? error.message : "Candidate normalization failed.",
+      error: message,
+      operationRecord: operationRecordPath(resolvedArtifactDir),
+      bundle: createReattachmentBundle(operation, capture.waveRoot),
+      incidents: operation.incidents,
+      checkpoint: operation.checkpoint,
+      attempts: operation.attempts.length,
+      lastExecutorTurn: recovered.lastTurnNumber,
     };
   }
+
+  operation.checkpoint = await checkpointCandidate(capture, taskId, candidate);
+  operation.session = turnResult.session;
+  operation.state = "completed";
+  await writeOperationRecord(operation);
 
   // ── Determine status based on candidate vs base ──
   const status: WaveWorkerStatus = candidate.differsFromBase ? "completed" : "no_changes";
@@ -979,6 +1258,12 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     adapter: adapter.kind,
     model: adapter.model,
     usage: turnResult.usage,
+    operationRecord: operationRecordPath(resolvedArtifactDir),
+    bundle: createReattachmentBundle(operation, capture.waveRoot),
+    incidents: operation.incidents,
+    checkpoint: operation.checkpoint,
+    attempts: operation.attempts.length,
+    lastExecutorTurn: recovered.lastTurnNumber,
   };
 
   await writeFile(
@@ -1010,4 +1295,27 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   });
 
   return result;
+}
+
+async function checkpointCandidate(
+  capture: WaveCaptureResult,
+  taskId: string,
+  candidate: CandidateCommit,
+): Promise<RecoveryCheckpoint> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const output = await promisify(execFile)("git", ["diff", "--name-only", "-z", capture.baseCommit, candidate.commitSha], {
+    cwd: capture.repositoryPath,
+    timeout: 30_000,
+  });
+  return {
+    checkpointId: `${capture.waveId}/${taskId}:${candidate.commitSha.slice(0, 12)}`,
+    commitSha: candidate.commitSha,
+    treeSha: candidate.treeSha,
+    ref: await pinRecoveryCandidate(capture, taskId, candidate),
+    differsFromBase: candidate.differsFromBase,
+    createdAt: new Date().toISOString(),
+    verified: true,
+    changedPaths: output.stdout.split("\0").filter(Boolean),
+  };
 }

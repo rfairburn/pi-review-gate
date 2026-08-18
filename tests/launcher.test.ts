@@ -8,6 +8,18 @@ import test from "node:test";
 
 const execFileAsync = promisify(execFile);
 
+const launchAllowedTools = [
+  "read", "bash", "edit", "write", "grep", "find", "ls",
+  "glob", "webfetch", "websearch",
+  "EvidenceAdd", "EvidenceGet", "EvidenceList",
+  "BrowserNavigate", "BrowserClick", "BrowserType", "BrowserScroll", "BrowserExtract", "BrowserBack", "BrowserHistory",
+  "dispatch",
+  "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop",
+  "ShellSessionCwd", "ShellSessionReset",
+  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue",
+  "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
+];
+
 test("persistent launcher uses fallback config, clears overrides, and preserves extensions", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-launcher-"));
   const home = join(root, "home");
@@ -29,6 +41,7 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
     "printf '%s' \"${PI_REVIEW_GATE_DISABLED:-unset}\" > \"$CAPTURE_DIR/disabled-env\"",
     "printf '%s' \"${LITTLE_CODER_THINKING_BUDGET:-unset}\" > \"$CAPTURE_DIR/thinking-budget\"",
     "printf '%s' \"${LITTLE_CODER_EXTRA_EXTENSIONS:-}\" > \"$CAPTURE_DIR/extensions\"",
+    "printf '%s' \"${LITTLE_CODER_ALLOWED_TOOLS:-}\" > \"$CAPTURE_DIR/allowed-tools\"",
     "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
   ].join("\n"), "utf8");
   await Promise.all([chmod(npmPath, 0o755), chmod(littleCoderPath, 0o755)]);
@@ -43,6 +56,7 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
       PI_REVIEW_GATE_DISABLED: "1",
       LITTLE_CODER_THINKING_BUDGET: "4096",
       LITTLE_CODER_EXTRA_EXTENSIONS: "/other/extension.js",
+      LITTLE_CODER_ALLOWED_TOOLS: "ShellSession",
     },
   });
 
@@ -53,10 +67,23 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
   const extensions = await readFile(join(capture, "extensions"), "utf8");
   assert.match(extensions, /dist\/src\/index\.js/);
   assert.match(extensions, /\/other\/extension\.js/);
+  assertLaunchToolPolicy(await readFile(join(capture, "allowed-tools"), "utf8"));
   assert.equal(
     await readFile(join(capture, "args"), "utf8"),
-    `--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
+    `--tui-mode\nfullscreen\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--tools\n${launchAllowedTools.join(",")}\n--model\nexample\n`,
   );
+});
+
+test("orchestrator prompt names the operation-specific tools and current steering contract", async () => {
+  const prompt = await readFile(resolve("scripts/orchestrator-system-prompt.md"), "utf8");
+  assert.match(prompt, /`SubtasksStart`/);
+  assert.match(prompt, /`SubtasksInspect`/);
+  assert.match(prompt, /`SubtasksContinue`/);
+  assert.match(prompt, /`SubtasksSteer`/);
+  assert.doesNotMatch(prompt, /ExecuteSubtasks/);
+  assert.match(prompt, /durably queued for the next executor handoff/);
+  assert.doesNotMatch(prompt, /execute_subtasks/);
+  assert.doesNotMatch(prompt, /live-turn-only/);
 });
 
 test("preset launcher appends the orchestrator prompt and preserves forwarded arguments", async () => {
@@ -73,6 +100,7 @@ test("preset launcher appends the orchestrator prompt and preserves forwarded ar
     "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
     "printf '%s' \"$PI_REVIEW_GATE_CONFIG\" > \"$CAPTURE_DIR/config-path\"",
     "printf '%s' \"${LITTLE_CODER_THINKING_BUDGET:-unset}\" > \"$CAPTURE_DIR/thinking-budget\"",
+    "printf '%s' \"${LITTLE_CODER_ALLOWED_TOOLS:-}\" > \"$CAPTURE_DIR/allowed-tools\"",
     "node -e 'const fs=require(\"node:fs\");process.stdout.write((fs.statSync(process.argv[1]).mode & 0o777).toString(8))' \"$PI_REVIEW_GATE_CONFIG\" > \"$CAPTURE_DIR/config-mode\"",
   ].join("\n"), "utf8");
   await Promise.all([chmod(npmPath, 0o755), chmod(littleCoderPath, 0o755)]);
@@ -84,17 +112,19 @@ test("preset launcher appends the orchestrator prompt and preserves forwarded ar
       CAPTURE_DIR: capture,
       TMPDIR: root,
       LITTLE_CODER_THINKING_BUDGET: "4096",
+      LITTLE_CODER_ALLOWED_TOOLS: "ShellSession",
     },
   });
 
   assert.equal(
     await readFile(join(capture, "args"), "utf8"),
-    `--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
+    `--tui-mode\nfullscreen\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--tools\n${launchAllowedTools.join(",")}\n--model\nexample\n`,
   );
   const temporaryConfig = await readFile(join(capture, "config-path"), "utf8");
   assert.match(temporaryConfig, /pi-review-gate\.[^/]+\/review\.json$/);
   assert.equal(await readFile(join(capture, "config-mode"), "utf8"), "600");
   assert.equal(await readFile(join(capture, "thinking-budget"), "utf8"), "16384");
+  assertLaunchToolPolicy(await readFile(join(capture, "allowed-tools"), "utf8"));
   await assert.rejects(readFile(temporaryConfig, "utf8"), /ENOENT/);
 });
 
@@ -122,4 +152,10 @@ function isExecError(value: unknown): value is Error & { code: number; stderr: s
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function assertLaunchToolPolicy(value: string): void {
+  const actual = value.split(",").filter(Boolean);
+  assert.deepEqual(actual, launchAllowedTools);
+  assert.equal(actual.includes("ShellSession"), false);
 }

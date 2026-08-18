@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
 import { createWorkerWorktree, removeWorktree } from "../src/execution/wave-worktrees";
-import { runWaveWorker, resumeWaveWorker, buildWaveWorkerPrompt, type WaveWorkerTask, type WaveWorkerResult, type WaveWorkerContinuationInput } from "../src/execution/wave-worker";
+import { createTaskInstructionEvidenceRecorder, runWaveWorker, resumeWaveWorker, buildWaveWorkerPrompt, type WaveWorkerTask, type WaveWorkerResult, type WaveWorkerContinuationInput } from "../src/execution/wave-worker";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import { resolve } from "node:path";
 
@@ -15,6 +15,36 @@ async function mkTmp(prefix: string): Promise<string> {
   const { realpath } = await import("node:fs/promises");
   return realpath(await mkdtemp(join(tmpdir(), prefix)));
 }
+
+test("acknowledged live steering is durable and appears in the effective executor task", async () => {
+  const root = await mkTmp("pi-ww-steering-evidence-");
+  try {
+    const task = testTask();
+    await writeFile(join(root, "task.json"), JSON.stringify({ version: 1, taskId: "task-live-steer", task }), "utf8");
+    const evidence = createTaskInstructionEvidenceRecorder(task, root);
+    const control = evidence.wrap({
+      adapter: "test",
+      generation: 1,
+      capabilities: { steer: true, interrupt: true },
+      steer: async () => ({ status: "acknowledged", message: "delivered" }),
+      interrupt: async () => ({ status: "acknowledged", message: "stopped" }),
+    });
+
+    assert.equal((await control!.steer("Write false instead.", "live-steer-1")).status, "acknowledged");
+    await evidence.flush();
+
+    const persisted = JSON.parse(await readFile(join(root, "task.json"), "utf8"));
+    assert.deepEqual(persisted.task.authoritativeUpdates, [{
+      instructionId: "live-steer-1",
+      action: "steer",
+      instruction: "Write false instead.",
+      acknowledgedAt: persisted.task.authoritativeUpdates[0].acknowledgedAt,
+    }]);
+    assert.match(buildWaveWorkerPrompt(task, "/source", "/worker"), /\[steer:live-steer-1\] Write false instead\./);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 /** Create a committed source repo and capture it. */
 async function setupCapture(artifactDir: string): Promise<{ sourceDir: string; capture: WaveCaptureResult }> {
@@ -115,6 +145,14 @@ function testTask(): WaveWorkerTask {
     acceptanceCriteria: ["worker-output.txt exists with content"],
   };
 }
+
+const NO_RETRY = {
+  maxRetries: 0,
+  baseDelayMs: 0,
+  maxDelayMs: 0,
+  jitter: false,
+  maxSameIncidentRepeats: 0,
+};
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
@@ -308,6 +346,7 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
       enabled: true,
       execution: {
         activeExecutor: { source: "external", id: "fail-exec" },
+        retryPolicy: NO_RETRY,
       },
       externalAgents: [{
         id: "fail-exec",
@@ -341,6 +380,206 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
   }
 });
 
+test("wave-worker checkpoints and pauses when adapter initialization fails", async () => {
+  const root = await mkTmp("pi-ww-adapter-init-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-adapter-init");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-adapter-init");
+    const config = normalizeConfig({
+      enabled: true,
+      execution: {
+        executorPool: [{
+          entryId: "missing",
+          selection: { source: "external", id: "missing" },
+          maxConcurrent: 1,
+        }],
+        retryPolicy: NO_RETRY,
+      },
+    });
+
+    const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-adapter-init",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "executor_error");
+    assert.equal(result.checkpoint?.verified, true);
+    const operation = JSON.parse(await readFile(join(artifactDir, "operation.json"), "utf8"));
+    assert.equal(operation.state, "paused_recoverable");
+    assert.equal(operation.checkpoint.verified, true);
+    assert.equal(operation.assignments[0].outcome, "failed");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("wave-worker checkpoints partial edits and automatically recovers a failed executor", async () => {
+  const root = await mkTmp("pi-ww-retry-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-retry");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-retry");
+    await mkdir(artifactDir, { recursive: true });
+    const counter = join(root, "retry-count.txt");
+    const command = join(root, "retry-executor.cjs");
+    await writeFile(command, [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      `const counter=${JSON.stringify(counter)};`,
+      "const count=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8')):0;",
+      "fs.writeFileSync(counter,String(count+1));",
+      "console.log(JSON.stringify({type:'session',sessionId:'retry-session'}));",
+      "if(count===0){",
+      " fs.writeFileSync(path.join(process.cwd(),'partial.txt'),'preserved\\n');",
+      " console.log(JSON.stringify({type:'error',message:'temporary provider failure'}));",
+      " process.exit(1);",
+      "}",
+      "fs.writeFileSync(path.join(process.cwd(),'finished.txt'),'done\\n');",
+      "console.log(JSON.stringify({type:'assistant',text:'Recovered and completed.'}));",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      execution: {
+        activeExecutor: { source: "external", id: "retry-exec" },
+        retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 2 },
+      },
+      externalAgents: [{
+        id: "retry-exec",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: [command], timeoutMs: 15_000 },
+      }],
+    });
+
+    const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-retry",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "completed");
+    assert.equal(result.attempts, 2);
+    assert.equal(result.incidents?.length, 1);
+    assert.ok(result.checkpoint?.differsFromBase);
+    assert.equal(await git(["show", `${result.candidate!.commitSha}:partial.txt`], worker.worktreeRoot), "preserved");
+    assert.equal(await git(["show", `${result.candidate!.commitSha}:finished.txt`], worker.worktreeRoot), "done");
+    const operation = JSON.parse(await readFile(join(artifactDir, "operation.json"), "utf8"));
+    assert.equal(operation.attempts.length, 2);
+    assert.equal(operation.incidents[0].resolvedBy, undefined);
+    assert.equal(operation.incidents[0].resolution, "executor_recovered");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("wave-worker hands a verified checkpoint to the next executor pool entry in a new session", async () => {
+  const root = await mkTmp("pi-ww-failover-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-failover");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-failover");
+    await mkdir(artifactDir, { recursive: true });
+    const handoffCapture = join(root, "handoff-prompt.txt");
+    const primaryCommand = join(root, "primary-fail.cjs");
+    const fallbackCommand = join(root, "fallback-complete.cjs");
+    await writeFile(primaryCommand, [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      "fs.writeFileSync(path.join(process.cwd(),'partial.txt'),'preserve me\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:'qwen-session'}));",
+      "console.log(JSON.stringify({type:'error',message:'primary provider failed'}));",
+      "process.exit(1);",
+    ].join("\n"), "utf8");
+    await writeFile(fallbackCommand, [
+      "const fs=require('node:fs');",
+      "const path=require('node:path');",
+      `fs.writeFileSync(${JSON.stringify(handoffCapture)},fs.readFileSync(0,'utf8'));`,
+      "if(!fs.existsSync(path.join(process.cwd(),'partial.txt'))) process.exit(2);",
+      "fs.writeFileSync(path.join(process.cwd(),'finished.txt'),'done\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:'deepseek-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'Completed from checkpoint.'}));",
+    ].join("\n"), "utf8");
+    await chmod(primaryCommand, 0o755);
+    await chmod(fallbackCommand, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      execution: {
+        executorPool: [
+          { entryId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+          { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+        ],
+        retryPolicy: NO_RETRY,
+      },
+      externalAgents: [
+        {
+          id: "qwen",
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [primaryCommand], timeoutMs: 15_000 },
+        },
+        {
+          id: "deepseek",
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [fallbackCommand], timeoutMs: 15_000 },
+        },
+      ],
+    });
+    const pool = config.execution!.executorPool!;
+
+    const result = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-failover",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      executorAssignment: { entry: pool[0]!, priority: 0 },
+      acquireFailover: async (assignment) => assignment.priority === 0 ? { entry: pool[1]!, priority: 1 } : undefined,
+    });
+
+    assert.equal(result.status, "completed");
+    assert.equal(result.session?.id, "deepseek-session");
+    assert.equal(result.model, undefined);
+    assert.equal(await git(["show", `${result.candidate!.commitSha}:partial.txt`], worker.worktreeRoot), "preserve me");
+    assert.equal(await git(["show", `${result.candidate!.commitSha}:finished.txt`], worker.worktreeRoot), "done");
+    const handoff = await readFile(handoffCapture, "utf8");
+    assert.match(handoff, /Executor handoff \(authoritative\)/);
+    assert.match(handoff, /Verified checkpoint:/);
+    const operation = JSON.parse(await readFile(join(artifactDir, "operation.json"), "utf8"));
+    assert.equal(operation.generation, 1);
+    assert.deepEqual(operation.assignments.map((assignment: { entryId: string; reason: string; outcome: string }) => ({
+      entryId: assignment.entryId,
+      reason: assignment.reason,
+      outcome: assignment.outcome,
+    })), [
+      { entryId: "qwen", reason: "initial", outcome: "failed" },
+      { entryId: "deepseek", reason: "failover", outcome: "completed" },
+    ]);
+    assert.equal(operation.incidents[0].resolution, "verified_checkpoint_failover");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("wave-worker returns timeout on executor timeout", async () => {
   const root = await mkTmp("pi-ww-to-");
   try {
@@ -354,6 +593,7 @@ test("wave-worker returns timeout on executor timeout", async () => {
       enabled: true,
       execution: {
         activeExecutor: { source: "external", id: "to-exec" },
+        retryPolicy: NO_RETRY,
       },
       externalAgents: [{
         id: "to-exec",
@@ -451,6 +691,7 @@ test("wave-worker returns executor_error on empty response", async () => {
       enabled: true,
       execution: {
         activeExecutor: { source: "external", id: "empty-exec" },
+        retryPolicy: NO_RETRY,
       },
       externalAgents: [{
         id: "empty-exec",
@@ -971,7 +1212,10 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
       }],
     });
 
-    // Resume with corrections.
+    // Resume with corrections. The changed executor selection must use a new
+    // session and the verified checkpoint handoff rather than attempting to
+    // attach the old executor's native session.
+    const updates: string[] = [];
     const resumeResult = await resumeWaveWorker({
       sourceRoot: capture.discovery.captureRoot,
       taskId: "task-resume2",
@@ -983,9 +1227,12 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
       priorResult: firstResult,
       feedback: "Please fix the issue.",
       turn: 2,
+      onUpdate: (update) => updates.push(update.message),
     });
 
     assert.equal(resumeResult.status, "completed");
+    assert.notEqual(resumeResult.session?.id, firstResult.session?.id, "changed executor settings must start a fresh session");
+    assert.ok(updates.some((message) => /current \/review-settings changed the executor assignment/.test(message)));
     const resumeCandidate = resumeResult.candidate!;
 
     // The new candidate should have a different SHA (correction changed files).
@@ -1477,7 +1724,7 @@ test("resumeWaveWorker rejects turn < 2", async () => {
   }
 });
 
-test("resumeWaveWorker requires prior session and candidate", async () => {
+test("resumeWaveWorker requires a prior candidate checkpoint", async () => {
   const root = await mkTmp("pi-ww-resume7-");
   try {
     const { capture } = await setupCapture(root);
@@ -1501,30 +1748,6 @@ test("resumeWaveWorker requires prior session and candidate", async () => {
         },
       }],
     });
-
-    const noSessionResult: WaveWorkerResult = {
-      status: "completed",
-      taskId: "task-resume7",
-      title: "Test",
-      summary: "done",
-      adapter: "test",
-    };
-
-    await assert.rejects(
-      resumeWaveWorker({
-        taskId: "task-resume7",
-        task: testTask(),
-        capture,
-        worktree: worker,
-        artifactDir,
-        config: dummyConfig7,
-        sourceRoot: capture.discovery.captureRoot,
-        priorResult: noSessionResult,
-        feedback: "fix",
-        turn: 2,
-      }),
-      /prior result with a session/,
-    );
 
     const noCandidateResult: WaveWorkerResult = {
       status: "completed",

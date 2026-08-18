@@ -93,6 +93,22 @@ export function candidateRefName(waveId: string, taskId: string): string {
   return `refs/pi-review-gate/waves/${waveId}/candidates/${taskId}`;
 }
 
+export function recoveryRefName(waveId: string, taskId: string): string {
+  validateSafeId(waveId, "waveId");
+  validateSafeId(taskId, "taskId");
+  return `refs/pi-review-gate/waves/${waveId}/recovery/${taskId}`;
+}
+
+export async function pinRecoveryCandidate(
+  capture: WaveCaptureResult,
+  taskId: string,
+  candidate: CandidateCommit,
+): Promise<string> {
+  const ref = recoveryRefName(capture.waveId, taskId);
+  await gitCmd(["update-ref", ref, candidate.commitSha], capture.repositoryPath);
+  return ref;
+}
+
 /**
  * Normalize a worker worktree into a single candidate commit.
  *

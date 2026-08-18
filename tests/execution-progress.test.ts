@@ -158,3 +158,23 @@ test("CodexJsonlActivityExtractor reports failures and ignores malformed or unkn
     "model turn failed · request failed",
   ]);
 });
+
+test("CodexJsonlActivityExtractor can suppress reviewer model text while retaining milestones", () => {
+  const messages: string[] = [];
+  const extractor = new CodexJsonlActivityExtractor(
+    (message) => messages.push(message),
+    { includeModelUpdates: false },
+  );
+  extractor.push([
+    JSON.stringify({ type: "turn.started" }),
+    JSON.stringify({ type: "item.started", item: { type: "reasoning" } }),
+    JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "private chain" } }),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "private reviewer JSON" } }),
+    JSON.stringify({ type: "item.started", item: { type: "command_execution", command: "rg TODO" } }),
+    JSON.stringify({ type: "turn.completed" }),
+  ].join("\n"));
+  extractor.finish();
+
+  assert.deepEqual(messages, ["model turn started", "model reasoning", "bash · rg TODO", "model turn completed"]);
+  assert.equal(messages.some((message) => message.includes("private")), false);
+});

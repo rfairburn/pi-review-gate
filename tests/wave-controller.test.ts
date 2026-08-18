@@ -282,7 +282,7 @@ function makeConfigWithNoopExecutor(): ReviewGateConfig {
 
 // ── maxWorkers validation ────────────────────────────────────────────────────
 
-test("maxWorkers defaults to 2", async () => {
+test("maxWorkers defaults to 4", async () => {
   const artifactDir = await mkTmp("pi-wc-art-");
   const sourceDir = await mkTmp("pi-wc-src-");
   await git(["init", "--quiet"], sourceDir);
@@ -313,19 +313,19 @@ test("maxWorkers rejects 0", async () => {
       config: makeConfigWithWritingExecutor(),
       maxWorkers: 0,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 4/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
   );
 });
 
-test("maxWorkers rejects 5", async () => {
+test("maxWorkers rejects 17", async () => {
   await assert.rejects(
     async () => executeWave({
       cwd: "/tmp",
       tasks: [{ title: "T", instructions: "i", acceptanceCriteria: [] }],
       config: makeConfigWithWritingExecutor(),
-      maxWorkers: 5,
+      maxWorkers: 17,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 4/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
   );
 });
 
@@ -337,7 +337,7 @@ test("maxWorkers rejects non-integer", async () => {
       config: makeConfigWithWritingExecutor(),
       maxWorkers: 2.5,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 4/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
   );
 });
 
@@ -365,7 +365,7 @@ test("maxWorkers accepts 1", async () => {
   }
 });
 
-test("maxWorkers accepts 4", async () => {
+test("maxWorkers accepts 16", async () => {
   const artifactDir = await mkTmp("pi-wc-art-");
   const sourceDir = await mkTmp("pi-wc-src-");
   await git(["init", "--quiet"], sourceDir);
@@ -378,11 +378,11 @@ test("maxWorkers accepts 4", async () => {
       cwd: sourceDir,
       tasks: [{ title: "Test", instructions: "noop", acceptanceCriteria: [] }],
       config: makeConfigWithWritingExecutor(),
-      maxWorkers: 4,
+      maxWorkers: 16,
       artifactDir,
-      waveId: "wc-4",
+      waveId: "wc-16",
     });
-    assert.equal(result.waveId, "wc-4");
+    assert.equal(result.waveId, "wc-16");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });
@@ -472,6 +472,11 @@ test("writes atomic wave manifest with provenance and phase", async () => {
     assert.ok(typeof manifestData.totalBytes === "number");
     assert.equal(manifestData.tasks.length, 1);
     assert.equal(manifestData.tasks[0].taskId, "task-0");
+    assert.deepEqual(manifestData.tasks[0].task, {
+      title: "Test",
+      instructions: "noop",
+      acceptanceCriteria: [],
+    });
     assert.ok(manifestData.updatedAt);
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
@@ -602,6 +607,47 @@ test("emits progress updates via callback", async () => {
 
 // ── integration policy: all-or-nothing default ───────────────────────────────
 
+test("reviewer milestones reach execution activity updates", async () => {
+  const artifactDir = await mkTmp("pi-wc-review-progress-art-");
+  const sourceDir = await mkTmp("pi-wc-review-progress-src-");
+  await git(["init", "--quiet"], sourceDir);
+  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
+  await git(["add", "."], sourceDir);
+  await git(["commit", "--quiet", "-m", "init"], sourceDir);
+  const config: ReviewGateConfig = {
+    ...makeConfigWithWritingExecutor(),
+    enabled: true,
+    decider: {
+      id: "passing",
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
+      ],
+      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+    },
+  };
+  const activity: string[] = [];
+
+  try {
+    await executeWave({
+      cwd: sourceDir,
+      tasks: [{ title: "Test", instructions: "noop", acceptanceCriteria: [] }],
+      config,
+      artifactDir,
+      waveId: "wc-review-progress",
+      onProgress: (update) => activity.push(...(update.activity ?? [])),
+    });
+
+    assert.ok(activity.includes("task-0: passing started"));
+    assert.ok(activity.includes("task-0: passing finished · pass"));
+  } finally {
+    await rm(artifactDir, { recursive: true, force: true });
+    await rm(sourceDir, { recursive: true, force: true });
+  }
+});
+
 test("default all-or-nothing: failed worker blocks integration", async () => {
   const artifactDir = await mkTmp("pi-wc-art-");
   const sourceDir = await mkTmp("pi-wc-src-");
@@ -629,47 +675,13 @@ test("default all-or-nothing: failed worker blocks integration", async () => {
       assert.equal(tr.status, "executor_error", `Expected executor_error, got ${tr.status}`);
     }
 
-    // Integration and landing should be skipped (all-or-nothing).
-    assert.equal(result.integration, undefined);
+    // Integration and landing should be skipped (all-or-nothing), with the
+    // worker-failure reason preserved for the tool response and later inspect.
+    assert.equal(result.integration?.status, "worker_failure");
     assert.equal(result.landing, undefined);
     assert.equal(result.phase, "completed");
-  } finally {
-    await rm(artifactDir, { recursive: true, force: true });
-    await rm(sourceDir, { recursive: true, force: true });
-  }
-});
-
-// ── integration policy: integratePartial ─────────────────────────────────────
-
-test("integratePartial integrates eligible workers despite a failed worker", async () => {
-  const artifactDir = await mkTmp("pi-wc-art-");
-  const sourceDir = await mkTmp("pi-wc-src-");
-  await git(["init", "--quiet"], sourceDir);
-  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
-  await git(["add", "."], sourceDir);
-  await git(["commit", "--quiet", "-m", "init"], sourceDir);
-
-  try {
-    const result = await executeWave({
-      cwd: sourceDir,
-      tasks: [
-        { title: "FAILTHISONE", instructions: "noop", acceptanceCriteria: [] },
-        { title: "OK", instructions: "noop", acceptanceCriteria: [] },
-      ],
-      config: makeConfigWithMixedExecutor(),
-      artifactDir,
-      waveId: "wc-partial-fail",
-      integratePartial: true,
-    });
-
-    // First worker should fail, second should succeed.
-    assert.equal(result.taskResults[0].status, "executor_error");
-    assert.equal(result.taskResults[1].status, "completed_unreviewed");
-    assert.ok(result.taskResults[1].acceptedCommitSha);
-
-    // Integration should have been attempted with the eligible worker.
-    assert.ok(result.integration, "Integration should have been attempted");
-    assert.equal(result.integration.status, "integrated");
+    const manifest = JSON.parse(await readFile(join(result.waveRoot, "wave-manifest.json"), "utf8"));
+    assert.equal(manifest.integrationStatus, "worker_failure");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });
@@ -782,6 +794,68 @@ test("observed concurrency never exceeds maxWorkers", async () => {
 
     assert.equal(result.taskResults.length, 4);
     assert.ok(maxActive <= 2, `observed concurrency ${maxActive} exceeded maxWorkers 2`);
+  } finally {
+    await rm(artifactDir, { recursive: true, force: true });
+    await rm(sourceDir, { recursive: true, force: true });
+  }
+});
+
+test("fresh workers overflow through the ordered executor pool by per-model capacity", async () => {
+  const artifactDir = await mkTmp("pi-wc-pool-art-");
+  const sourceDir = await mkTmp("pi-wc-pool-src-");
+  await git(["init", "--quiet"], sourceDir);
+  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
+  await git(["add", "."], sourceDir);
+  await git(["commit", "--quiet", "-m", "init"], sourceDir);
+
+  const writer = (id: string) => ({
+    id,
+    adapter: "run-as-binary" as const,
+    protocol: "pi-review-executor-jsonl-v1" as const,
+    command: process.execPath,
+    args: [
+      "-e",
+      [
+        "process.stdin.resume();",
+        "process.stdin.on('data',()=>{});",
+        "process.stdin.on('end',()=>{",
+        '  const fs=require("fs");',
+        `  fs.writeFileSync(require("path").join(process.cwd(),${JSON.stringify(`${id}.txt`)}),${JSON.stringify(`${id}\n`)});`,
+        `  process.stdout.write(JSON.stringify({type:"session",sessionId:${JSON.stringify(`${id}-session`)}})+"\\n");`,
+        '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+        "});",
+      ].join(""),
+    ],
+    timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+  });
+  const config: ReviewGateConfig = {
+    ...makeConfigWithWritingExecutor(),
+    execution: {
+      executorPool: [
+        { entryId: "primary", selection: { source: "external", id: "primary" }, maxConcurrent: 1 },
+        { entryId: "overflow", selection: { source: "external", id: "overflow" }, maxConcurrent: 1 },
+      ],
+      externalExecutors: [writer("primary"), writer("overflow")],
+    },
+  };
+
+  try {
+    const result = await executeWave({
+      cwd: sourceDir,
+      tasks: [
+        { title: "Primary task", instructions: "write output", acceptanceCriteria: [] },
+        { title: "Overflow task", instructions: "write output", acceptanceCriteria: [] },
+      ],
+      config,
+      maxWorkers: 2,
+      artifactDir,
+      waveId: "wc-pool-overflow",
+    });
+    const assignments = await Promise.all(result.taskResults.map(async (task) => {
+      const operation = JSON.parse(await readFile(join(result.waveRoot, "artifacts", task.taskId, "operation.json"), "utf8"));
+      return operation.executorEntryId;
+    }));
+    assert.deepEqual(assignments, ["primary", "overflow"]);
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });
@@ -1197,50 +1271,6 @@ test("scopedModels are forwarded to WaveControllerInput", async () => {
     // The wave should complete successfully with scopedModels passed through.
     assert.ok(result.waveId);
     assert.equal(result.taskResults.length, 1);
-  } finally {
-    await rm(artifactDir, { recursive: true, force: true });
-    await rm(sourceDir, { recursive: true, force: true });
-  }
-});
-
-// ── SEMANTICS FIX: partial mode all-failed wave ─────────────────────────────
-
-test("integratePartial with all workers failed skips integration/landing and returns worker_failure", async () => {
-  const artifactDir = await mkTmp("pi-wc-art-");
-  const sourceDir = await mkTmp("pi-wc-src-");
-  await git(["init", "--quiet"], sourceDir);
-  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
-  await git(["add", "."], sourceDir);
-  await git(["commit", "--quiet", "-m", "init"], sourceDir);
-
-  try {
-    const result = await executeWave({
-      cwd: sourceDir,
-      tasks: [
-        { title: "FAILTHISONE", instructions: "noop", acceptanceCriteria: [] },
-        { title: "ALSOFAIL", instructions: "FAILTHISONE", acceptanceCriteria: [] },
-      ],
-      config: makeConfigWithMixedExecutor(),
-      artifactDir,
-      waveId: "wc-partial-allfail",
-      integratePartial: true,
-    });
-
-    // Both workers should fail.
-    assert.equal(result.taskResults[0].status, "executor_error");
-    assert.equal(result.taskResults[1].status, "executor_error");
-
-    // Integration should be worker_failure, not no_changes.
-    assert.ok(result.integration, "Integration should be present");
-    assert.equal(result.integration.status, "worker_failure");
-
-    // Landing should not have been attempted.
-    assert.equal(result.landing, undefined);
-
-    // Manifest should reflect worker_failure.
-    const manifestPath = join(result.waveRoot, "wave-manifest.json");
-    const manifestData = JSON.parse(await readFile(manifestPath, "utf8"));
-    assert.equal(manifestData.integrationStatus, "worker_failure");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

@@ -1,17 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { open, readFile, rename, stat, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   externalAgentCatalog,
   normalizeConfig,
-  type ActiveExecutorSelection,
   type ActiveReviewerSelection,
+  type ExecutorPoolEntry,
+  type ExecutionRetryPolicy,
   type RetainBundles,
   type ReviewGateConfig,
+  type SubtaskNotificationMode,
 } from "../config";
 
 export interface ReviewSettingsSelection {
-  activeExecutor: ActiveExecutorSelection;
+  executorPool: ExecutorPoolEntry[];
   activeReviewers: ActiveReviewerSelection[];
   reviewerTimeoutMs: number;
   executorTimeoutMs: number;
@@ -19,39 +21,87 @@ export interface ReviewSettingsSelection {
   implementationGuidanceAfterCorrectionAttempts: number;
   retainBundles: RetainBundles;
   maxWorkers: number;
-  parallelEnabled: boolean;
+  retryPolicy: ExecutionRetryPolicy;
+  subtaskNotifications: SubtaskNotificationMode;
+  subtasksViewExpanded: boolean;
 }
+
+const configUpdateTails = new Map<string, Promise<void>>();
 
 export async function persistReviewSettings(
   configPath: string,
   selection: ReviewSettingsSelection,
 ): Promise<ReviewGateConfig> {
-  const parsed = JSON.parse(await readFile(configPath, "utf8")) as unknown;
-  if (!isRecord(parsed)) {
-    throw new Error("review gate config must be a JSON object");
+  return updateReviewGateConfig(configPath, (parsed) => {
+    const catalog = externalAgentCatalog(normalizeConfig(parsed));
+    const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
+    execution.executorPool = selection.executorPool.map((entry) => ({
+      ...entry,
+      selection: { ...entry.selection },
+    }));
+    delete execution.activeExecutor;
+    execution.maxWorkers = selection.maxWorkers;
+    execution.retryPolicy = { ...selection.retryPolicy };
+    execution.subtaskNotifications = selection.subtaskNotifications;
+    delete execution.parallelEnabled;
+    delete execution.externalExecutors;
+    parsed.execution = execution;
+    const review = isRecord(parsed.review) ? { ...parsed.review } : {};
+    review.activeReviewers = selection.activeReviewers.map((reviewer) => ({ ...reviewer }));
+    parsed.review = review;
+    parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
+    parsed.executorTimeoutMs = selection.executorTimeoutMs;
+    parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
+    parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
+    parsed.retainBundles = selection.retainBundles;
+    const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
+    ui.subtasksViewExpanded = selection.subtasksViewExpanded;
+    parsed.ui = ui;
+    parsed.externalAgents = catalog;
+    delete parsed.decider;
+    delete parsed.reviewers;
+    delete parsed.enabledReviewerIds;
+  });
+}
+
+export async function persistSubtasksViewPreference(
+  configPath: string,
+  expanded: boolean,
+): Promise<ReviewGateConfig> {
+  return updateReviewGateConfig(configPath, (parsed) => {
+    const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
+    ui.subtasksViewExpanded = expanded;
+    parsed.ui = ui;
+  });
+}
+
+export async function updateReviewGateConfig(
+  configPath: string,
+  mutate: (config: Record<string, unknown>) => void,
+): Promise<ReviewGateConfig> {
+  const key = resolve(configPath);
+  const prior = configUpdateTails.get(key) ?? Promise.resolve();
+  let normalized: ReviewGateConfig | undefined;
+  const operation = prior.catch(() => undefined).then(async () => {
+    const parsed = JSON.parse(await readFile(configPath, "utf8")) as unknown;
+    if (!isRecord(parsed)) {
+      throw new Error("review gate config must be a JSON object");
+    }
+    mutate(parsed);
+    normalized = normalizeConfig(parsed);
+    await writeConfigAtomically(configPath, parsed);
+  });
+  const tail = operation.catch(() => undefined);
+  configUpdateTails.set(key, tail);
+  try {
+    await operation;
+    return normalized!;
+  } finally {
+    if (configUpdateTails.get(key) === tail) configUpdateTails.delete(key);
   }
+}
 
-  const catalog = externalAgentCatalog(normalizeConfig(parsed));
-  const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
-  execution.activeExecutor = selection.activeExecutor;
-  execution.maxWorkers = selection.maxWorkers;
-  execution.parallelEnabled = selection.parallelEnabled;
-  delete execution.externalExecutors;
-  parsed.execution = execution;
-  const review = isRecord(parsed.review) ? { ...parsed.review } : {};
-  review.activeReviewers = selection.activeReviewers.map((reviewer) => ({ ...reviewer }));
-  parsed.review = review;
-  parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
-  parsed.executorTimeoutMs = selection.executorTimeoutMs;
-  parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
-  parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
-  parsed.retainBundles = selection.retainBundles;
-  parsed.externalAgents = catalog;
-  delete parsed.decider;
-  delete parsed.reviewers;
-  delete parsed.enabledReviewerIds;
-
-  const normalized = normalizeConfig(parsed);
+async function writeConfigAtomically(configPath: string, parsed: Record<string, unknown>): Promise<void> {
   const existing = await stat(configPath);
   const mode = existing.mode & 0o777;
   const targetMode = mode !== 0 && (mode & 0o077) === 0 ? mode : 0o600;
@@ -80,7 +130,6 @@ export async function persistReviewSettings(
     await unlink(tempPath).catch(() => undefined);
     throw error;
   }
-  return normalized;
 }
 
 export function replaceConfig(target: ReviewGateConfig, next: ReviewGateConfig): void {

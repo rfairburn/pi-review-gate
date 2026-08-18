@@ -246,6 +246,26 @@ export interface PiJsonlReviewExtraction {
   text: string;
   usage?: TokenUsage;
   terminalError?: string;
+  lifecycle: PiLifecycleSummary;
+}
+
+export interface PiLifecycleEvent {
+  sequence: number;
+  type: "model_error" | "retry_start" | "retry_end" | "compaction_start" | "compaction_end" | "turn_start" | "turn_end" | "assistant_text";
+  reason?: string;
+  error?: string;
+  success?: boolean;
+}
+
+export interface PiLifecycleSummary {
+  events: PiLifecycleEvent[];
+  compaction: {
+    status: "none" | "in_progress" | "completed" | "failed" | "aborted";
+    reason?: string;
+    error?: string;
+    resumeObserved: boolean;
+  };
+  provisionalAbortResolved: boolean;
 }
 
 export function extractReviewTextFromPiJsonl(stdout: string): PiJsonlReviewExtraction {
@@ -260,6 +280,13 @@ export class PiJsonlReviewExtractor {
   private partialText = "";
   private usage: TokenUsage | undefined;
   private terminalError = "";
+  private sequence = 0;
+  private readonly lifecycleEvents: PiLifecycleEvent[] = [];
+  private compactionStatus: PiLifecycleSummary["compaction"]["status"] = "none";
+  private compactionReason: string | undefined;
+  private compactionError: string | undefined;
+  private resumeObserved = false;
+  private provisionalAbortResolved = false;
   private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
 
   push(chunk: string): void {
@@ -276,6 +303,16 @@ export class PiJsonlReviewExtractor {
       text: this.finalText || this.currentDeltaText.value || this.partialText,
       usage: this.usage,
       terminalError: this.terminalError || undefined,
+      lifecycle: {
+        events: [...this.lifecycleEvents],
+        compaction: {
+          status: this.compactionStatus,
+          reason: this.compactionReason,
+          error: this.compactionError,
+          resumeObserved: this.resumeObserved,
+        },
+        provisionalAbortResolved: this.provisionalAbortResolved,
+      },
     };
   }
 
@@ -301,9 +338,62 @@ export class PiJsonlReviewExtractor {
     const terminalError = piStreamError(parsed);
     if (terminalError) {
       this.terminalError = terminalError;
+      this.record({ type: "model_error", error: terminalError });
     }
     if (parsed.type === "auto_retry_end" && parsed.success === true) {
       this.terminalError = "";
+    }
+
+    if (parsed.type === "turn_start") {
+      if (this.compactionStatus === "completed") this.resumeObserved = true;
+      this.record({ type: "turn_start" });
+    }
+    if (parsed.type === "turn_end") this.record({ type: "turn_end" });
+    if (parsed.type === "auto_retry_start") {
+      this.record({
+        type: "retry_start",
+        error: typeof parsed.errorMessage === "string" ? boundedError(parsed.errorMessage) : undefined,
+      });
+    }
+    if (parsed.type === "auto_retry_end") {
+      this.record({
+        type: "retry_end",
+        success: parsed.success === true,
+        error: typeof parsed.finalError === "string" ? boundedError(parsed.finalError) : undefined,
+      });
+    }
+    if (parsed.type === "compaction_start") {
+      this.compactionStatus = "in_progress";
+      this.compactionReason = typeof parsed.reason === "string" ? parsed.reason : undefined;
+      this.compactionError = undefined;
+      if (isAbortLikeError(this.terminalError)) {
+        this.terminalError = "";
+        this.provisionalAbortResolved = true;
+      }
+      this.record({ type: "compaction_start", reason: this.compactionReason });
+    }
+    if (parsed.type === "compaction_end") {
+      const error = typeof parsed.errorMessage === "string" && parsed.errorMessage.trim()
+        ? boundedError(parsed.errorMessage)
+        : undefined;
+      this.compactionStatus = parsed.aborted === true
+        ? "aborted"
+        : parsed.result
+          ? "completed"
+          : "failed";
+      this.compactionReason = typeof parsed.reason === "string" ? parsed.reason : this.compactionReason;
+      this.compactionError = error;
+      if (error) this.terminalError = error;
+      else if (this.compactionStatus === "completed" && isAbortLikeError(this.terminalError)) {
+        this.terminalError = "";
+        this.provisionalAbortResolved = true;
+      }
+      this.record({
+        type: "compaction_end",
+        reason: this.compactionReason,
+        error,
+        success: this.compactionStatus === "completed",
+      });
     }
 
     if (parsed.type === "message_start" && isAssistantMessage(parsed.message)) {
@@ -348,8 +438,17 @@ export class PiJsonlReviewExtractor {
       this.currentDeltaText.set(bounded);
       this.partialText = bounded;
       this.terminalError = "";
+      this.record({ type: "assistant_text" });
     }
   }
+
+  private record(event: Omit<PiLifecycleEvent, "sequence">): void {
+    this.lifecycleEvents.push({ sequence: ++this.sequence, ...event });
+  }
+}
+
+function isAbortLikeError(value: string): boolean {
+  return /\babort(?:ed|ing)?\b/i.test(value);
 }
 
 function piStreamError(event: Record<string, unknown>): string | undefined {

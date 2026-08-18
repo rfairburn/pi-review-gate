@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -219,6 +219,7 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
     // Executor writes a file.
     const { command } = await createFakeExecutor(root);
     const config = buildPassingReviewerConfig(command);
+    const updates: Array<{ phase: string; message: string }> = [];
 
     const result = await runWaveWorkerLifecycle({
       sourceRoot: capture.discovery.captureRoot,
@@ -228,6 +229,7 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
       worktree: worker,
       artifactDir,
       config,
+      onUpdate: (update) => updates.push(update),
     });
 
     assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
@@ -236,6 +238,8 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
     assert.equal(result.unreviewed, undefined, "should not be unreviewed");
     assert.equal(result.reviewCycles.length, 1, "should have exactly one review cycle");
     assert.equal(result.reviewCycles[0].verdict, "pass");
+    assert.ok(updates.some((update) => update.phase === "reviewing" && update.message === "passing started"));
+    assert.ok(updates.some((update) => update.phase === "reviewing" && update.message === "passing finished · pass"));
 
     // Verify the worker ref points to the accepted commit.
     const refSha = await gitInRepo(
@@ -249,6 +253,62 @@ test("lifecycle: pass + unchanged confirmation accepts and pins worker ref", asy
     assert.equal(resultJson.status, "accepted");
     assert.equal(resultJson.taskId, "task-pass");
 
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle resolves current review settings after executor work completes", async () => {
+  const root = await mkTmp("pi-wwl-live-review-settings-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-live-review-settings");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-live-review-settings");
+    const startedMarker = join(root, "executor-started.txt");
+    const oldReviewerMarker = join(root, "old-reviewer.txt");
+    const newReviewerMarker = join(root, "new-reviewer.txt");
+    const executor = join(root, "delayed-executor.cjs");
+    await writeFile(executor, [
+      "const fs=require('node:fs');const path=require('node:path');",
+      `fs.writeFileSync(${JSON.stringify(startedMarker)},'started');`,
+      "setTimeout(()=>{",
+      "fs.writeFileSync(path.join(process.cwd(),'worker-output.txt'),'worker done\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:'live-settings-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'Implemented the change.'}));",
+      "},250);",
+    ].join("\n"), "utf8");
+    const reviewer = (id: string, marker: string) => ({
+      id,
+      adapter: "generic-cli" as const,
+      command: process.execPath,
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'used');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))`],
+      timeoutMs: 15_000,
+    });
+    const config = buildConfig(executor);
+    config.decider = reviewer("old", oldReviewerMarker);
+
+    const running = runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-live-review-settings",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (await access(startedMarker).then(() => true, () => false)) break;
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+    }
+    await access(startedMarker);
+    config.decider = reviewer("new", newReviewerMarker);
+
+    const result = await running;
+    assert.equal(result.status, "accepted");
+    assert.equal(await readFile(newReviewerMarker, "utf8"), "used");
+    await assert.rejects(access(oldReviewerMarker), /ENOENT/);
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -384,6 +444,68 @@ test("lifecycle: needs_changes correction then pass", async () => {
     assert.equal(result.status, "correction_cap", `expected correction_cap, got ${result.status}`);
     assert.ok(result.reviewCycles.length >= 1, "should have at least one review cycle");
     assert.equal(result.reviewCycles[0].verdict, "needs_changes");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: steering during review aborts reviewers and resumes the executor before fresh review", async () => {
+  const root = await mkTmp("pi-wwl-review-steer-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-review-steer");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-review-steer");
+    await mkdir(artifactDir, { recursive: true });
+    const executor = join(root, "review-steer-executor.cjs");
+    await writeFile(executor, [
+      "const fs=require('node:fs');",
+      "const turn=Number(process.env.PI_REVIEW_EXECUTOR_TURN||'1');",
+      "fs.writeFileSync('steered.txt',turn===1?'true\\n':'false\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID||'review-steer-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'turn '+turn+' complete'}));",
+    ].join("\n"), "utf8");
+    const config: ReviewGateConfig = {
+      ...buildConfig(executor),
+      enabled: true,
+      decider: {
+        id: "slow-pass",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: ["-e", [
+          "const fs=require('node:fs');const path=require('node:path');",
+          "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
+          "const request=fs.readFileSync(path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'request.md'),'utf8');",
+          "const visible=request.includes('[steer:review-steer-1] Write false instead.')&&request.includes('Later updates supersede');",
+          "process.stdout.write(JSON.stringify(visible?{verdict:'pass',summary:'authoritative steering visible',findings:[]}:{verdict:'needs_changes',summary:'steering missing',findings:[{severity:'blocking',issue:'steering missing',recommendation:'include steering'}]}));",
+          "},2000))",
+        ].join("")],
+        timeoutMs: 5_000,
+      },
+    };
+    let steered = false;
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-review-steer",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      onLiveControl: (control) => {
+        if (steered || control?.protocol !== "review-to-executor-handoff-v1") return;
+        steered = true;
+        void control.steer("Write false instead.", "review-steer-1");
+      },
+    });
+
+    assert.equal(steered, true);
+    assert.equal(result.status, "accepted", `expected accepted, got ${result.status}: ${result.error ?? result.summary}`);
+    assert.equal(await readFile(join(worker.worktreeRoot, "steered.txt"), "utf8"), "false\n");
+    assert.ok(result.reviewCycles.every((cycle) => cycle.verdict === "pass"));
+    const persisted = JSON.parse(await readFile(join(artifactDir, "task.json"), "utf8"));
+    assert.deepEqual(persisted.task.authoritativeUpdates.map((item: { instructionId: string }) => item.instructionId), ["review-steer-1"]);
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {

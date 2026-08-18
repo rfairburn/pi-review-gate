@@ -3,10 +3,10 @@ import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { persistReviewSettings, type ReviewSettingsSelection } from "../src/settings/persistence";
+import { persistReviewSettings, persistSubtasksViewPreference, updateReviewGateConfig, type ReviewSettingsSelection } from "../src/settings/persistence";
 
 const selection: ReviewSettingsSelection = {
-  activeExecutor: null,
+  executorPool: [],
   activeReviewers: [],
   reviewerTimeoutMs: 600_000,
   executorTimeoutMs: 1_800_000,
@@ -14,7 +14,15 @@ const selection: ReviewSettingsSelection = {
   implementationGuidanceAfterCorrectionAttempts: 1,
   retainBundles: "on-failure",
   maxWorkers: 2,
-  parallelEnabled: false,
+  retryPolicy: {
+    maxRetries: 2,
+    baseDelayMs: 1_000,
+    maxDelayMs: 15_000,
+    jitter: true,
+    maxSameIncidentRepeats: 2,
+  },
+  subtaskNotifications: "quiet",
+  subtasksViewExpanded: false,
 };
 
 test("persistReviewSettings preserves restrictive configuration permissions", async (t) => {
@@ -31,6 +39,38 @@ test("persistReviewSettings preserves restrictive configuration permissions", as
     await chmod(configPath, 0o644);
     await persistReviewSettings(configPath, selection);
     assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("subtasks view preference persists globally without replacing unrelated settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-subtasks-view-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, '{"enabled":true,"customFutureKey":{"keep":true}}\n', "utf8");
+    const expanded = await persistSubtasksViewPreference(configPath, true);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.ui.subtasksViewExpanded, true);
+    assert.deepEqual(saved.customFutureKey, { keep: true });
+    assert.equal(expanded.ui?.subtasksViewExpanded, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("global config updates serialize without losing unrelated concurrent changes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-config-update-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, '{"enabled":true}\n', "utf8");
+    await Promise.all([
+      updateReviewGateConfig(configPath, (config) => { config.firstUpdate = true; }),
+      updateReviewGateConfig(configPath, (config) => { config.secondUpdate = true; }),
+    ]);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.firstUpdate, true);
+    assert.equal(saved.secondUpdate, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -177,6 +177,7 @@ test("/review-now requested changes reset the automatic correction budget", asyn
     const followUps: string[] = [];
     const notices: string[] = [];
     const statuses: Array<[string, string | undefined]> = [];
+    let queuedInputsReleased = 0;
     const pi = {
       registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
         commands.set(name, options.handler);
@@ -201,6 +202,7 @@ test("/review-now requested changes reset the automatic correction budget", asyn
       cwd: () => dir,
       config: reviewConfig(),
       state,
+      releaseQueuedUserInputs: async () => { queuedInputsReleased += 1; },
     });
 
     await commands.get("review-now")?.("", ctx);
@@ -211,6 +213,7 @@ test("/review-now requested changes reset the automatic correction budget", asyn
     assert.match(notices.join("\n"), /review gate: changes requested/);
     assert.ok(statuses.some(([, text]) => text?.includes("reviewing changes")));
     assert.deepEqual(statuses.at(-1), ["review-gate", undefined]);
+    assert.equal(queuedInputsReleased, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

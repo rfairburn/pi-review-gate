@@ -25,18 +25,6 @@ export interface IntegrationWorktree {
   effectiveCwd: string;
 }
 
-/** Describes a managed worktree tracked by this module. */
-export interface ManagedWorktree {
-  /** Absolute path to the worktree root. */
-  path: string;
-  /** The wave ID this worktree belongs to. */
-  waveId: string;
-  /** The task ID (worker) or "integration". */
-  taskId: string;
-  /** Whether this is a worker or integration worktree. */
-  type: "worker" | "integration";
-}
-
 /** Validate that a path stays under the wave root (using resolved real paths). */
 async function assertUnderWaveRoot(path: string, waveRoot: string): Promise<void> {
   const resolvedPath = await fs.realpath(path);

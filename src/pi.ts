@@ -52,6 +52,21 @@ export async function sendFollowUp(pi: unknown, message: string): Promise<boolea
   return false;
 }
 
+export async function sendTriggeredFollowUp(pi: unknown, message: string): Promise<boolean> {
+  if (isRecord(pi) && typeof pi.sendMessage === "function") {
+    await pi.sendMessage(
+      { customType: "pi-review-background-ready", content: message, display: true },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+    return true;
+  }
+  if (isRecord(pi) && typeof pi.sendUserMessage === "function") {
+    await pi.sendUserMessage(message, { deliverAs: "followUp", triggerTurn: true });
+    return true;
+  }
+  return false;
+}
+
 export async function sendSteeringPrompt(pi: unknown, message: string): Promise<boolean> {
   if (isRecord(pi) && typeof pi.sendUserMessage === "function") {
     await pi.sendUserMessage(message, { deliverAs: "steer" });

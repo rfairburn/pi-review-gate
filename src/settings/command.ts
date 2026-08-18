@@ -2,15 +2,25 @@ import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import {
+  DEFAULT_EXECUTION_RETRY_POLICY,
+  DEFAULT_MAX_WORKERS,
+  DEFAULT_SUBTASK_NOTIFICATION_MODE,
+  MAX_EXECUTION_WORKERS,
   externalAgentCatalog,
   externalAgentSupportsExecution,
   externalAgentSupportsReview,
+  executorEntryId,
+  executorSelectionKey,
+  resolvedExecutorPool,
   resolveReviewers,
-  type ActiveExecutorSelection,
   type ActiveReviewerSelection,
+  type ExecutorPoolEntry,
+  type ExecutorSelection,
   type ExternalAgentConfig,
+  type ExecutionRetryPolicy,
   type RetainBundles,
   type ReviewGateConfig,
+  type SubtaskNotificationMode,
   type ThinkingLevel,
 } from "../config";
 import { sendNotice } from "../pi";
@@ -54,28 +64,34 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
 
 async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; scoped: ScopedModelChoice[] }): Promise<void> {
   const agents = externalAgentCatalog(input.config);
-  let activeExecutor = materializeExecutorThinking(input.config.execution?.activeExecutor ?? null, input.scoped);
+  let executorPool = materializeExecutorPool(resolvedExecutorPool(input.config), input.scoped);
   let activeReviewers = materializeReviewerThinking(initialReviewerSelections(input.config), input.scoped);
   let reviewerTimeoutMs = input.config.reviewerTimeoutMs;
   let executorTimeoutMs = input.config.executorTimeoutMs;
   let maxCorrectionCycles = input.config.maxCorrectionCycles;
   let guidanceThreshold = input.config.implementationGuidanceAfterCorrectionAttempts;
   let retainBundles = input.config.retainBundles;
-  let maxWorkers = input.config.execution?.maxWorkers ?? 2;
-  let parallelEnabled = input.config.execution?.parallelEnabled === true;
+  let maxWorkers = input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS;
+  let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
+  let subtaskNotifications = input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
+  let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
 
   while (true) {
-    const executorRow = settingsRow("Executor", executorSummary(activeExecutor, agents, input.scoped));
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const reviewersRow = settingsRow("Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`);
-    const timeoutsRow = settingsRow("Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`);
-    const policyRow = settingsRow("Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`);
-    const retentionRow = settingsRow("Bundle retention", retentionLabel(retainBundles));
-    const workersRow = settingsRow("Parallel workers", String(maxWorkers));
-    const parallelRow = settingsRow("Parallel execution", parallelEnabled ? "Enabled" : "Disabled");
+    const [executorRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, subtasksViewRow] = alignedSettingsRows([
+      ["Executor pool", executorPoolSummary(executorPool)],
+      ["Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`],
+      ["Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`],
+      ["Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`],
+      ["Bundle retention", retentionLabel(retainBundles)],
+      ["Global concurrency", String(maxWorkers)],
+      ["Retry policy", `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base`],
+      ["Subtask notifications", subtaskNotifications === "quiet" ? "Quiet" : "Noisy"],
+      ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
+    ]);
     const choice = await input.ui.select("Review settings", [
       executorRow,
       reviewersRow,
@@ -83,13 +99,15 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       policyRow,
       retentionRow,
       workersRow,
-      parallelRow,
+      retryRow,
+      notificationsRow,
+      subtasksViewRow,
       "Save changes",
       "Cancel",
     ]);
     if (!choice || choice === "Cancel") return;
     if (choice === executorRow) {
-      activeExecutor = await selectExecutor(input.ui, activeExecutor, agents, input.scoped);
+      executorPool = await selectExecutorPool(input.ui, executorPool, agents, input.scoped);
       continue;
     }
     if (choice === reviewersRow) {
@@ -120,17 +138,25 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       maxWorkers = await selectMaxWorkers(input.ui, maxWorkers);
       continue;
     }
-    if (choice === parallelRow) {
-      parallelEnabled = await selectParallelEnabled(input.ui, parallelEnabled);
+    if (choice === retryRow) {
+      retryPolicy = await selectRetryPolicy(input.ui, retryPolicy);
       continue;
     }
-    const error = await validateSelection(activeExecutor, activeReviewers, agents, input.config, input.scoped);
+    if (choice === notificationsRow) {
+      subtaskNotifications = await selectSubtaskNotifications(input.ui, subtaskNotifications);
+      continue;
+    }
+    if (choice === subtasksViewRow) {
+      subtasksViewExpanded = !subtasksViewExpanded;
+      continue;
+    }
+    const error = await validateSelection(executorPool, activeReviewers, agents, input.config, input.scoped);
     if (error) {
       await notify(input.ui, error, "error");
       continue;
     }
     const next = await persistReviewSettings(input.configPath!, {
-      activeExecutor,
+      executorPool,
       activeReviewers,
       reviewerTimeoutMs,
       executorTimeoutMs,
@@ -138,13 +164,28 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
       retainBundles,
       maxWorkers,
-      parallelEnabled,
+      retryPolicy,
+      subtaskNotifications,
+      subtasksViewExpanded,
     });
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config);
     await notify(input.ui, "Review settings saved.", "info");
     return;
   }
+}
+
+async function selectSubtaskNotifications(
+  ui: UiContext,
+  current: SubtaskNotificationMode,
+): Promise<SubtaskNotificationMode> {
+  const rows: Array<{ label: string; value: SubtaskNotificationMode }> = [
+    { label: "Quiet — terminal and recovery events", value: "quiet" },
+    { label: "Noisy — include running and reviewing", value: "noisy" },
+  ];
+  const options = rows.map((row) => `${row.label}${row.value === current ? "  current" : ""}`);
+  const selected = await ui.select("Subtask notifications", options);
+  return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
 }
 
 async function selectBundleRetention(ui: UiContext, current: RetainBundles): Promise<RetainBundles> {
@@ -159,21 +200,59 @@ async function selectBundleRetention(ui: UiContext, current: RetainBundles): Pro
 }
 
 async function selectMaxWorkers(ui: UiContext, current: number): Promise<number> {
-  const options = ["1", "2", "3", "4"].map((v) => `${v}${v === String(current) ? "  current" : ""}`);
-  const selected = await ui.select("Parallel workers (1–4)", options);
+  const options = Array.from({ length: MAX_EXECUTION_WORKERS }, (_, index) => String(index + 1))
+    .map((v) => `${v}${v === String(current) ? "  current" : ""}`);
+  const selected = await ui.select(`Global concurrency (1–${MAX_EXECUTION_WORKERS})`, options);
   const parsed = Number(selected?.split(" ")[0]);
-  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 4 ? parsed : current;
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_EXECUTION_WORKERS ? parsed : current;
 }
 
-async function selectParallelEnabled(ui: UiContext, current: boolean): Promise<boolean> {
-  const options = [
-    `Enabled${current ? "  current" : ""}`,
-    `Disabled${!current ? "  current" : ""}`,
-  ];
-  const selected = await ui.select("Parallel execution", options);
-  if (selected === `Enabled${current ? "  current" : ""}`) return true;
-  if (selected === `Disabled${!current ? "  current" : ""}`) return false;
-  return current;
+async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): Promise<ExecutionRetryPolicy> {
+  let policy = { ...initial };
+  while (true) {
+    const [retriesRow, baseRow, maxRow, repeatsRow, jitterRow] = alignedSettingsRows([
+      ["Retries after initial attempt", String(policy.maxRetries)],
+      ["Base delay", formatDuration(policy.baseDelayMs)],
+      ["Maximum delay", formatDuration(policy.maxDelayMs)],
+      ["Same-incident repeat limit", String(policy.maxSameIncidentRepeats)],
+      ["Delay jitter", policy.jitter ? "Enabled" : "Disabled"],
+    ]);
+    const choice = await ui.select("Executor retry policy", [retriesRow, baseRow, maxRow, repeatsRow, jitterRow, "Back"]);
+    if (!choice || choice === "Back") return policy;
+    if (choice === jitterRow) {
+      policy.jitter = !policy.jitter;
+      continue;
+    }
+    if (!ui.input) {
+      await notify(ui, "This UI does not support numeric input.", "error");
+      continue;
+    }
+    const isDelay = choice === baseRow || choice === maxRow;
+    const current = choice === retriesRow
+      ? policy.maxRetries
+      : choice === baseRow
+        ? policy.baseDelayMs
+        : choice === maxRow
+          ? policy.maxDelayMs
+          : policy.maxSameIncidentRepeats;
+    const entered = await ui.input(isDelay ? "Delay in milliseconds" : "Retry limit", String(current));
+    if (entered === undefined) continue;
+    const parsed = Number(entered.trim());
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+      await notify(ui, "Enter a non-negative whole number.", "error");
+      continue;
+    }
+    const next = { ...policy };
+    if (choice === retriesRow) next.maxRetries = parsed;
+    else if (choice === baseRow) next.baseDelayMs = parsed;
+    else if (choice === maxRow) next.maxDelayMs = parsed;
+    else next.maxSameIncidentRepeats = parsed;
+    if (next.maxDelayMs < next.baseDelayMs) {
+      await notify(ui, "Maximum delay must be greater than or equal to base delay.", "error");
+      continue;
+    }
+    policy = next;
+  }
 }
 
 function retentionLabel(value: RetainBundles): string {
@@ -182,44 +261,154 @@ function retentionLabel(value: RetainBundles): string {
   return "Never";
 }
 
-function settingsRow(label: string, value: string): string {
-  return `${label.padEnd(19)}${value}`;
+function alignedSettingsRows(entries: ReadonlyArray<readonly [label: string, value: string]>): string[] {
+  const labelWidth = Math.max(0, ...entries.map(([label]) => label.length));
+  return entries.map(([label, value]) => `${label.padEnd(labelWidth)}  ${value}`);
 }
 
-function policyValueRow(label: string, value: string): string {
-  return `${label.padEnd(31)}${value}`;
-}
-
-async function selectExecutor(
+async function selectExecutorPool(
   ui: UiContext,
-  current: ActiveExecutorSelection,
+  initial: ExecutorPoolEntry[],
   agents: ExternalAgentConfig[],
   scoped: ScopedModelChoice[],
-): Promise<ActiveExecutorSelection> {
-  const external = agents.filter(externalAgentSupportsExecution);
-  const rows: Array<{ label: string; value: ActiveExecutorSelection }> = [
-    ...scoped.map((choice) => ({
-      label: `${choice.label}${current?.source === "little-coder" && current.model === choice.model ? "  current" : ""}`,
-      value: { source: "little-coder" as const, model: choice.model },
+): Promise<ExecutorPoolEntry[]> {
+  let pool = initial.map(cloneExecutorPoolEntry);
+  while (true) {
+    const entryRows = pool.map((entry, index) => `${index + 1}. ${executorPoolEntrySummary(entry, agents, scoped)}`);
+    const choice = await ui.select("Executor pool — priority order", [...entryRows, "Add executor", "Back"]);
+    if (!choice || choice === "Back") return pool;
+    if (choice === "Add executor") {
+      const selection = await selectExecutorModel(ui, undefined, pool, agents, scoped);
+      if (!selection) continue;
+      const maxConcurrent = await selectExecutorCapacity(ui, 1);
+      pool.push({ entryId: executorEntryId(selection), selection, maxConcurrent });
+      continue;
+    }
+    const index = entryRows.indexOf(choice);
+    if (index < 0) continue;
+    pool = await editExecutorPoolEntry(ui, pool, index, agents, scoped);
+  }
+}
+
+async function editExecutorPoolEntry(
+  ui: UiContext,
+  initial: ExecutorPoolEntry[],
+  index: number,
+  agents: ExternalAgentConfig[],
+  scoped: ScopedModelChoice[],
+): Promise<ExecutorPoolEntry[]> {
+  let pool = initial.map(cloneExecutorPoolEntry);
+  while (pool[index]) {
+    const entry = pool[index]!;
+    const [modelRow, thinkingRow, capacityRow] = alignedSettingsRows([
+      ["Model", executorSelectionLabel(entry.selection, agents, scoped)],
+      ["Thinking", executorThinkingSummary(entry.selection, scoped)],
+      ["Maximum concurrency", String(entry.maxConcurrent)],
+    ]);
+    const moveUp = "Move up";
+    const moveDown = "Move down";
+    const remove = "Remove";
+    const choice = await ui.select(`Executor ${index + 1}`, [
+      modelRow,
+      thinkingRow,
+      capacityRow,
+      ...(index > 0 ? [moveUp] : []),
+      ...(index < pool.length - 1 ? [moveDown] : []),
+      remove,
+      "Back",
+    ]);
+    if (!choice || choice === "Back") return pool;
+    if (choice === modelRow) {
+      const selection = await selectExecutorModel(ui, entry.selection, pool.filter((_, candidate) => candidate !== index), agents, scoped);
+      if (selection) pool[index] = { ...entry, entryId: executorEntryId(selection), selection };
+      continue;
+    }
+    if (choice === thinkingRow) {
+      const selection = entry.selection;
+      if (selection.source === "little-coder") {
+        const model = scoped.find((candidate) => candidate.model === selection.model);
+        if (model) {
+          pool[index] = {
+            ...entry,
+            selection: {
+              ...selection,
+              thinkingLevel: await selectThinkingLevel(
+                ui,
+                model,
+                effectiveThinkingLevel(selection.thinkingLevel, model),
+              ),
+            },
+          };
+        }
+      }
+      continue;
+    }
+    if (choice === capacityRow) {
+      pool[index] = { ...entry, maxConcurrent: await selectExecutorCapacity(ui, entry.maxConcurrent) };
+      continue;
+    }
+    if (choice === moveUp && index > 0) {
+      [pool[index - 1], pool[index]] = [pool[index]!, pool[index - 1]!];
+      index -= 1;
+      continue;
+    }
+    if (choice === moveDown && index < pool.length - 1) {
+      [pool[index], pool[index + 1]] = [pool[index + 1]!, pool[index]!];
+      index += 1;
+      continue;
+    }
+    if (choice === remove) {
+      pool.splice(index, 1);
+      return pool;
+    }
+  }
+  return pool;
+}
+
+async function selectExecutorModel(
+  ui: UiContext,
+  current: ExecutorSelection | undefined,
+  existing: ExecutorPoolEntry[],
+  agents: ExternalAgentConfig[],
+  scoped: ScopedModelChoice[],
+): Promise<ExecutorSelection | undefined> {
+  const unavailable = new Set(existing.map((entry) => executorSelectionKey(entry.selection)));
+  const choices: Array<{ label: string; selection: ExecutorSelection; model?: ScopedModelChoice }> = [
+    ...scoped.map((model) => ({
+      label: model.label,
+      selection: { source: "little-coder" as const, model: model.model },
+      model,
     })),
-    ...external.map((agent) => ({
-      label: `${agent.id} [${agent.adapter}]${current?.source === "external" && current.id === agent.id ? "  current" : ""}`,
-      value: { source: "external" as const, id: agent.id },
+    ...agents.filter(externalAgentSupportsExecution).map((agent) => ({
+      label: `${agent.id} [${agent.adapter}]`,
+      selection: { source: "external" as const, id: agent.id },
     })),
-    { label: `Disabled${current === null ? "  current" : ""}`, value: null },
-  ];
-  const options = scoped.length + external.length === 0
-    ? ["No scoped internal models or execution-capable external agents configured", ...rows.map((row) => row.label)]
-    : rows.map((row) => row.label);
-  const selected = await ui.select("Executor", options);
-  const next = cloneActiveExecutor(rows.find((row) => row.label === selected)?.value ?? current);
-  if (next?.source !== "little-coder") return next;
-  const choice = scoped.find((candidate) => candidate.model === next.model);
-  if (!choice) return next;
+  ].filter((choice) => !unavailable.has(executorSelectionKey(choice.selection)));
+  const rows = choices.map((choice) => `${choice.label}${current && executorSelectionKey(current) === executorSelectionKey(choice.selection) ? "  current" : ""}`);
+  const selected = await ui.select("Executor model", rows.length > 0 ? [...rows, "Back"] : ["No additional executors available", "Back"]);
+  if (!selected || selected === "Back") return undefined;
+  const found = choices.find((_choice, index) => selected === rows[index]);
+  if (!found) return undefined;
+  if (!found.model) return { ...found.selection };
+  const previousThinking = current?.source === "little-coder" && current.model === found.model.model
+    ? current.thinkingLevel
+    : undefined;
   return {
-    ...next,
-    thinkingLevel: await selectThinkingLevel(ui, choice, effectiveThinkingLevel(next.thinkingLevel, choice)),
+    source: "little-coder",
+    model: found.model.model,
+    thinkingLevel: await selectThinkingLevel(
+      ui,
+      found.model,
+      effectiveThinkingLevel(previousThinking, found.model),
+    ),
   };
+}
+
+async function selectExecutorCapacity(ui: UiContext, current: number): Promise<number> {
+  const values = Array.from({ length: MAX_EXECUTION_WORKERS }, (_, index) => index + 1);
+  const rows = values.map((value) => `${value}${value === current ? "  current" : ""}`);
+  const selected = await ui.select(`Maximum concurrency (1–${MAX_EXECUTION_WORKERS})`, rows);
+  return values.find((_value, index) => selected === rows[index]) ?? current;
 }
 
 async function selectReviewers(
@@ -332,8 +521,10 @@ async function selectReviewPolicy(
   let maxCorrectionCycles = initialCycles;
   let guidanceThreshold = initialThreshold;
   while (true) {
-    const cyclesRow = policyValueRow("Automatic correction attempts", String(maxCorrectionCycles));
-    const guidanceRow = policyValueRow("Concrete guidance after", String(guidanceThreshold));
+    const [cyclesRow, guidanceRow] = alignedSettingsRows([
+      ["Automatic correction attempts", String(maxCorrectionCycles)],
+      ["Concrete guidance after", String(guidanceThreshold)],
+    ]);
     const choice = await ui.select("Review policy", [cyclesRow, guidanceRow, "Back"]);
     if (!choice || choice === "Back") return { maxCorrectionCycles, guidanceThreshold };
     if (!ui.input) {
@@ -364,8 +555,10 @@ async function selectTimeouts(
   let reviewerTimeoutMs = initialReviewerTimeoutMs;
   let executorTimeoutMs = initialExecutorTimeoutMs;
   while (true) {
-    const reviewerRow = policyValueRow("Reviewer timeout", formatDuration(reviewerTimeoutMs));
-    const executorRow = policyValueRow("Executor timeout", formatDuration(executorTimeoutMs));
+    const [reviewerRow, executorRow] = alignedSettingsRows([
+      ["Reviewer timeout", formatDuration(reviewerTimeoutMs)],
+      ["Executor timeout", formatDuration(executorTimeoutMs)],
+    ]);
     const choice = await ui.select("Timeouts", [reviewerRow, executorRow, "Back"]);
     if (!choice || choice === "Back") return { reviewerTimeoutMs, executorTimeoutMs };
     if (!ui.input) {
@@ -396,7 +589,7 @@ function formatDuration(milliseconds: number): string {
 }
 
 async function validateSelection(
-  active: ActiveExecutorSelection,
+  executorPool: ExecutorPoolEntry[],
   reviewers: ActiveReviewerSelection[],
   agents: ExternalAgentConfig[],
   config: ReviewGateConfig,
@@ -406,6 +599,26 @@ async function validateSelection(
   if (duplicateReviewer) return `Duplicate enabled reviewer: ${duplicateReviewer}`;
   const scopedModels = new Set(scoped.map((choice) => choice.model));
   const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+  const duplicateExecutor = duplicate(executorPool.map((entry) => executorSelectionKey(entry.selection)));
+  if (duplicateExecutor) return `Duplicate executor pool selection: ${duplicateExecutor}`;
+  for (const entry of executorPool) {
+    if (!Number.isInteger(entry.maxConcurrent) || entry.maxConcurrent < 1 || entry.maxConcurrent > MAX_EXECUTION_WORKERS) {
+      return `Executor maximum concurrency must be between 1 and ${MAX_EXECUTION_WORKERS}: ${entry.entryId}`;
+    }
+    const selection = entry.selection;
+    if (selection.source === "little-coder") {
+      const choice = scoped.find((candidate) => candidate.model === selection.model);
+      if (!choice) return `Little-coder executor model is not currently scoped: ${selection.model}`;
+      if (selection.thinkingLevel && !choice.supportedThinkingLevels.includes(selection.thinkingLevel)) {
+        return `Little-coder executor reasoning is unsupported for ${selection.model}: ${selection.thinkingLevel}`;
+      }
+      if (config.enabled && !await commandAvailable("little-coder")) return "Executor executable is unavailable: little-coder";
+      continue;
+    }
+    const agent = agentsById.get(selection.id);
+    if (!agent || !externalAgentSupportsExecution(agent)) return `External executor is unavailable: ${selection.id}`;
+    if (!await commandAvailable(agent.command!)) return `Executor executable is unavailable: ${agent.command}`;
+  }
   for (const reviewer of reviewers) {
     if (reviewer.source === "little-coder") {
       const choice = scoped.find((candidate) => candidate.model === reviewer.model);
@@ -420,20 +633,6 @@ async function validateSelection(
     if (!agent || !externalAgentSupportsReview(agent)) return `External reviewer is unavailable: ${reviewer.id}`;
     if (config.enabled && !await commandAvailable(agent.command!)) return `Reviewer executable is unavailable: ${agent.command} (${agent.id})`;
   }
-  if (active?.source === "little-coder" && !scopedModels.has(active.model)) {
-    return `Little-coder executor model is not currently scoped: ${active.model}`;
-  }
-  if (active?.source === "little-coder") {
-    const choice = scoped.find((candidate) => candidate.model === active.model)!;
-    if (active.thinkingLevel && !choice.supportedThinkingLevels.includes(active.thinkingLevel)) {
-      return `Little-coder executor reasoning is unsupported for ${active.model}: ${active.thinkingLevel}`;
-    }
-  }
-  if (active?.source === "external") {
-    const agent = agentsById.get(active.id);
-    if (!agent || !externalAgentSupportsExecution(agent)) return `External executor is unavailable: ${active.id}`;
-    if (!await commandAvailable(agent.command!)) return `Executor executable is unavailable: ${agent.command}`;
-  }
   return undefined;
 }
 
@@ -446,16 +645,29 @@ function initialReviewerSelections(config: ReviewGateConfig): ActiveReviewerSele
     : { source: "external" as const, id: reviewer.id });
 }
 
-function executorSummary(active: ActiveExecutorSelection, agents: ExternalAgentConfig[], scoped: ScopedModelChoice[]): string {
-  if (!active) return "Disabled";
-  if (active.source === "little-coder") {
-    const choice = scoped.find((candidate) => candidate.model === active.model);
-    return choice
-      ? `${choice.label} · ${thinkingLevelLabel(effectiveThinkingLevel(active.thinkingLevel, choice))}`
-      : `${active.model} [unavailable]`;
+function executorPoolSummary(pool: ExecutorPoolEntry[]): string {
+  const slots = pool.reduce((total, entry) => total + entry.maxConcurrent, 0);
+  return `${pool.length} ${pool.length === 1 ? "model" : "models"} · ${slots} ${slots === 1 ? "slot" : "slots"}`;
+}
+
+function executorPoolEntrySummary(entry: ExecutorPoolEntry, agents: ExternalAgentConfig[], scoped: ScopedModelChoice[]): string {
+  return `${executorSelectionLabel(entry.selection, agents, scoped)} · ${executorThinkingSummary(entry.selection, scoped)} · max ${entry.maxConcurrent}`;
+}
+
+function executorSelectionLabel(selection: ExecutorSelection, agents: ExternalAgentConfig[], scoped: ScopedModelChoice[]): string {
+  if (selection.source === "little-coder") {
+    return scoped.find((candidate) => candidate.model === selection.model)?.label ?? `${selection.model} [unavailable]`;
   }
-  const agent = agents.find((candidate) => candidate.id === active.id && externalAgentSupportsExecution(candidate));
-  return agent ? `${agent.id} [${agent.adapter}]` : `${active.id} [unavailable]`;
+  const agent = agents.find((candidate) => candidate.id === selection.id && externalAgentSupportsExecution(candidate));
+  return agent ? `${agent.id} [${agent.adapter}]` : `${selection.id} [unavailable]`;
+}
+
+function executorThinkingSummary(selection: ExecutorSelection, scoped: ScopedModelChoice[]): string {
+  if (selection.source === "external") return "Configured by agent";
+  const model = scoped.find((candidate) => candidate.model === selection.model);
+  return model
+    ? thinkingLevelLabel(effectiveThinkingLevel(selection.thinkingLevel, model))
+    : selection.thinkingLevel ? thinkingLevelLabel(selection.thinkingLevel) : "Unavailable";
 }
 
 function reviewerSelectionLabel(selection: ActiveReviewerSelection): string {
@@ -474,18 +686,29 @@ function cloneReviewerSelection(value: ActiveReviewerSelection): ActiveReviewerS
   return { ...value };
 }
 
-function cloneActiveExecutor(value: ActiveExecutorSelection | undefined): ActiveExecutorSelection {
-  return value ? { ...value } : null;
+function cloneExecutorPoolEntry(entry: ExecutorPoolEntry): ExecutorPoolEntry {
+  return { ...entry, selection: { ...entry.selection } };
 }
 
-function materializeExecutorThinking(
-  value: ActiveExecutorSelection | undefined,
+function materializeExecutorPool(
+  entries: ExecutorPoolEntry[],
   scoped: ScopedModelChoice[],
-): ActiveExecutorSelection {
-  const cloned = cloneActiveExecutor(value);
-  if (cloned?.source !== "little-coder") return cloned;
-  const choice = scoped.find((candidate) => candidate.model === cloned.model);
-  return choice ? { ...cloned, thinkingLevel: effectiveThinkingLevel(cloned.thinkingLevel, choice) } : cloned;
+): ExecutorPoolEntry[] {
+  return entries.map((entry) => {
+    const cloned = cloneExecutorPoolEntry(entry);
+    const selection = cloned.selection;
+    if (selection.source !== "little-coder") return cloned;
+    const choice = scoped.find((candidate) => candidate.model === selection.model);
+    return choice
+      ? {
+        ...cloned,
+        selection: {
+          ...selection,
+          thinkingLevel: effectiveThinkingLevel(selection.thinkingLevel, choice),
+        },
+      }
+      : cloned;
+  });
 }
 
 function materializeReviewerThinking(

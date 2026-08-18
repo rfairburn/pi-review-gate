@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ORCHESTRATOR_PROMPT="$ROOT/scripts/orchestrator-system-prompt.md"
+# shellcheck source=scripts/little-coder-tool-policy.sh
+source "$ROOT/scripts/little-coder-tool-policy.sh"
 export LITTLE_CODER_THINKING_BUDGET=16384
 PRESET="${1:-}"
 if [[ -z "$PRESET" ]]; then
@@ -141,7 +143,7 @@ export PI_REVIEW_GATE_CONFIG="$CONFIG"
 export LITTLE_CODER_EXTRA_EXTENSIONS="$ROOT/dist/src/index.js${LITTLE_CODER_EXTRA_EXTENSIONS:+:$LITTLE_CODER_EXTRA_EXTENSIONS}"
 echo "LITTLE_CODER_EXTRA_EXTENSIONS=$LITTLE_CODER_EXTRA_EXTENSIONS"
 if ((${#LITTLE_CODER_ARGS[@]})); then
-  little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT" "${LITTLE_CODER_ARGS[@]}"
+  little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT" --tools "$LITTLE_CODER_ALLOWED_TOOLS" "${LITTLE_CODER_ARGS[@]}"
 else
-  little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT"
+  little-coder --tui-mode fullscreen --append-system-prompt "$ORCHESTRATOR_PROMPT" --tools "$LITTLE_CODER_ALLOWED_TOOLS"
 fi

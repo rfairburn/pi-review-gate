@@ -18,7 +18,8 @@ import { runAskReviewer, runReview } from "./review";
 import { extractSignal, isEscapeTerminalInput, onTerminalInput, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
-import { createReviewTransmissionMessage, deliverReviewTransmission, writeReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
+import { createReviewTransmissionMessage, deliverReviewTransmission, type ReviewTransmissionAction } from "./transmission";
+import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
 
 export interface RegisterCommandsInput {
   pi: unknown;
@@ -29,13 +30,25 @@ export interface RegisterCommandsInput {
   isSessionActive?: () => boolean;
   sessionSignal?: AbortSignal;
   prepareReviewerQuestion?: (commandName: string, ctx: unknown) => Promise<void>;
+  onStateChanged?: () => void | Promise<void>;
+  releaseQueuedUserInputs?: () => Promise<void>;
 }
 
 export function registerCommands(input: RegisterCommandsInput): void {
-  const registerCommand = getRegisterCommand(input.pi);
-  if (!registerCommand) {
+  const rawRegisterCommand = getRegisterCommand(input.pi);
+  if (!rawRegisterCommand) {
     return;
   }
+  const registerCommand: RegisterCommand = (name, options) => rawRegisterCommand(name, {
+    ...options,
+    handler: async (args, ctx) => {
+      try {
+        return await options.handler(args, ctx);
+      } finally {
+        await input.onStateChanged?.();
+      }
+    },
+  });
   const isSessionActive = input.isSessionActive ?? (() => true);
   const currentConfig = () => input.getConfig?.() ?? input.config;
   const sendCommandNotice = (ctx: unknown, message: string): Promise<void> =>
@@ -140,6 +153,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           signal: reviewSignal,
           notify: (message) => sendCommandNotice(ctx, message),
           onUpdate: (message) => statusTracker.update(message),
+          onInvocationPrepared: () => input.onStateChanged?.(),
         });
       } finally {
         await statusTracker.clear({ immediate: reviewSignal?.aborted, signal: reviewSignal });
@@ -152,6 +166,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       if (!output.changed) {
         await sendCommandNotice(ctx, "review gate: no changes detected");
         closeReviewWindow(input.state, true);
+        await input.releaseQueuedUserInputs?.();
         return;
       }
       if (reviewSignal?.aborted || output.result?.error === "aborted") {
@@ -172,7 +187,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           ctx,
           `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
         );
-        await deliverCommandTransmission(input.pi, output, "passed", transmission, isSessionActive);
+        await deliverCommandTransmission(input, output, "passed", transmission, isSessionActive);
       } else if (output.result?.verdict === "needs_changes") {
         const transmission = await createCommandTransmission(output, "correction_required");
         await sendCommandNotice(ctx, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
@@ -186,7 +201,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           disposition: "sent_for_correction",
           reviewedSnapshot: output.reviewedSnapshot!,
         });
-        await deliverCommandTransmission(input.pi, output, "correction_required", transmission, isSessionActive);
+        await deliverCommandTransmission(input, output, "correction_required", transmission, isSessionActive);
       } else {
         const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
         if (output.result) {
@@ -199,10 +214,11 @@ export function registerCommands(input: RegisterCommandsInput): void {
             disposition: "sent_review_error",
             reviewedSnapshot: output.reviewedSnapshot!,
           });
-          await deliverCommandTransmission(input.pi, output, "review_error", transmission, isSessionActive);
+          await deliverCommandTransmission(input, output, "review_error", transmission, isSessionActive);
         }
         await sendCommandNotice(ctx, failed);
       }
+      await input.releaseQueuedUserInputs?.();
     },
   });
 
@@ -227,15 +243,15 @@ export function registerCommands(input: RegisterCommandsInput): void {
         maxSnapshotBytes: reviewConfig.maxSnapshotBytes,
       }));
       await sendCommandNotice(ctx, `review gate: continuing review; correction budget reset to ${reviewConfig.maxCorrectionCycles}`);
-      if (isSessionActive()) {
-        if (await sendFollowUp(input.pi, followUp) && feedback && window.bundleDir) {
-          await writeReviewDeliveryReceipt(
-            join(window.bundleDir, "reviews", String(feedback.sequence).padStart(4, "0")),
-            "correction_required",
-            followUp,
-          );
-        }
-      }
+      await deliverDurableCommandMessage(input, {
+        kind: "review_authorization",
+        channel: "follow_up",
+        ...(feedback && window.bundleDir ? {
+          invocationDir: join(window.bundleDir, "reviews", String(feedback.sequence).padStart(4, "0")),
+          action: "correction_required" as const,
+        } : {}),
+        message: followUp,
+      }, isSessionActive);
     },
   });
 
@@ -283,6 +299,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           signal: reviewSignal,
           notify: (message) => sendCommandNotice(ctx, message),
           onUpdate: (message) => statusTracker.update(message),
+          onInvocationPrepared: () => input.onStateChanged?.(),
         });
       } finally {
         await statusTracker.clear({ immediate: reviewSignal?.aborted, signal: reviewSignal });
@@ -319,11 +336,16 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       if (typeof submittedPayload === "string" && submittedPayload.trim()) {
         const acceptedAnswer = submittedPayload.trim();
-        recordAcceptedReviewerQuestion(input.state, contextWindow, {
+        const accepted = recordAcceptedReviewerQuestion(input.state, contextWindow, {
           question,
           acceptedAnswer,
         });
-        await sendSteeringPrompt(input.pi, acceptedAnswer);
+        await deliverDurableCommandMessage(input, {
+          deliveryId: `reviewer-answer:${contextWindow?.id ?? input.state.reviewWindow?.id ?? "window"}:${accepted.sequence}`,
+          kind: "reviewer_answer",
+          channel: "steer",
+          message: acceptedAnswer,
+        }, isSessionActive);
         return;
       }
       const cleared = `${formatTokenUsage(output.result.usage)}\nreview gate: reviewer answer cleared`;
@@ -360,20 +382,48 @@ async function createCommandTransmission(
 }
 
 async function deliverCommandTransmission(
-  pi: unknown,
+  input: RegisterCommandsInput,
   output: Awaited<ReturnType<typeof runReview>>,
   action: ReviewTransmissionAction,
   message: string,
   isSessionActive: () => boolean,
 ): Promise<void> {
   if (!output.invocationDir || !isSessionActive()) {
-    return;
+    if (!output.invocationDir) return;
   }
-  await deliverReviewTransmission({
+  await deliverDurableCommandMessage(input, {
+    kind: "review_transmission",
+    channel: "follow_up",
     invocationDir: output.invocationDir,
     action,
     message,
-    deliver: () => isSessionActive() ? sendFollowUp(pi, message) : Promise.resolve(false),
+  }, isSessionActive);
+}
+
+async function deliverDurableCommandMessage(
+  input: RegisterCommandsInput,
+  pending: Parameters<typeof queueModelDelivery>[1],
+  isSessionActive: () => boolean,
+): Promise<void> {
+  const delivery = queueModelDelivery(input.state, pending);
+  await input.onStateChanged?.();
+  if (!isSessionActive()) return;
+  await dispatchModelDelivery({
+    delivery,
+    persist: () => input.onStateChanged?.(),
+    deliver: () => delivery.invocationDir && delivery.action
+      ? deliverReviewTransmission({
+          invocationDir: delivery.invocationDir,
+          action: delivery.action,
+          message: delivery.message,
+          idempotencyKey: delivery.deliveryId,
+          deliver: () => delivery.channel === "steer"
+            ? sendSteeringPrompt(input.pi, delivery.message)
+            : sendFollowUp(input.pi, delivery.message),
+        })
+      : delivery.channel === "steer"
+        ? sendSteeringPrompt(input.pi, delivery.message)
+        : sendFollowUp(input.pi, delivery.message),
   });
 }
 

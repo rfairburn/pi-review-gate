@@ -77,13 +77,6 @@ export interface LandingPlan {
 
 // ── execution result types ───────────────────────────────────────────────────
 
-/** Status of a landing execution. */
-export type LandingExecutionStatus =
-  | "landed"
-  | "conflicted"
-  | "rolled_back"
-  | "recovery_required";
-
 /** A single path entry in the recovery manifest. */
 export interface RecoveryPathEntry {
   /** Normalized repo-relative path. */
@@ -264,6 +257,54 @@ export type RecoveryResult =
   | RecoveryResultManual
   | RecoveryResultRejected
   | RecoveryResultTerminal;
+
+export interface LandingRecoveryManifestInspection {
+  manifestPath: string;
+  state?: RecoveryManifest["state"];
+  verified: boolean;
+  sourceRoot?: string;
+  paths: Array<{ path: string; phase: RecoveryPathEntry["phase"] }>;
+  error?: string;
+}
+
+export async function inspectLandingRecoveryManifests(waveRoot: string): Promise<LandingRecoveryManifestInspection[]> {
+  const landingDir = join(waveRoot, "landing");
+  const entries = await fs.readdir(landingDir, { withFileTypes: true }).catch(() => []);
+  const key = await readAuthKey(landingDir);
+  const inspections: LandingRecoveryManifestInspection[] = [];
+  for (const entry of entries.filter((candidate) => candidate.isFile() && /^manifest-[0-9a-zA-Z-]+\.json$/.test(candidate.name)).sort((a, b) => a.name.localeCompare(b.name))) {
+    const manifestPath = join(landingDir, entry.name);
+    try {
+      const parsed = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Partial<RecoveryManifest>;
+      const structurallyValid = parsed.version === 1
+        && typeof parsed.sourceRoot === "string"
+        && ["in_progress", "completed", "rolled_back", "recovery_required"].includes(String(parsed.state))
+        && Array.isArray(parsed.paths)
+        && parsed.paths.every((path) => path && typeof path.path === "string" && typeof path.phase === "string");
+      const verified = Boolean(structurallyValid && key && parsed.authTag && verifyAuthTag(key, parsed as RecoveryManifest));
+      inspections.push({
+        manifestPath,
+        state: structurallyValid ? parsed.state : undefined,
+        verified,
+        sourceRoot: typeof parsed.sourceRoot === "string" ? parsed.sourceRoot : undefined,
+        paths: Array.isArray(parsed.paths)
+          ? parsed.paths.flatMap((path) => path && typeof path.path === "string" && typeof path.phase === "string"
+            ? [{ path: path.path, phase: path.phase }]
+            : [])
+          : [],
+        error: structurallyValid ? verified ? undefined : "Manifest authentication could not be verified." : "Manifest structure is invalid.",
+      });
+    } catch (error) {
+      inspections.push({
+        manifestPath,
+        verified: false,
+        paths: [],
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return inspections;
+}
 
 // ── git helpers ──────────────────────────────────────────────────────────────
 

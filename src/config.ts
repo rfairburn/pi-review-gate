@@ -53,6 +53,14 @@ export type ActiveExecutorSelection =
   | { source: "external"; id: string }
   | null;
 
+export type ExecutorSelection = Exclude<ActiveExecutorSelection, null>;
+
+export interface ExecutorPoolEntry {
+  entryId: string;
+  selection: ExecutorSelection;
+  maxConcurrent: number;
+}
+
 interface ExternalExecutorBase {
   id: string;
   command?: string;
@@ -108,15 +116,39 @@ export interface ReviewSelectionConfig {
   activeReviewers?: ActiveReviewerSelection[];
 }
 
+export interface ExecutionRetryPolicy {
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitter: boolean;
+  maxSameIncidentRepeats: number;
+}
+
+export const DEFAULT_MAX_WORKERS = 4;
+export const MAX_EXECUTION_WORKERS = 16;
+export type SubtaskNotificationMode = "quiet" | "noisy";
+export const DEFAULT_SUBTASK_NOTIFICATION_MODE: SubtaskNotificationMode = "quiet";
+export const DEFAULT_EXECUTION_RETRY_POLICY: ExecutionRetryPolicy = {
+  maxRetries: 2,
+  baseDelayMs: 1_000,
+  maxDelayMs: 15_000,
+  jitter: true,
+  maxSameIncidentRepeats: 2,
+};
+
 export interface ExecutionConfig {
+  /** Ordered executor priority pool. Earlier entries are preferred. */
+  executorPool?: ExecutorPoolEntry[];
+  /** Legacy single-executor selection, materialized as one pool entry when executorPool is absent. */
   activeExecutor?: ActiveExecutorSelection;
   externalExecutors?: ExternalExecutorConfig[];
   maxWorkers?: number;
-  /**
-   * When true, the execute_subtasks parallel tool is active.
-   * Defaults to false (opt-in). execute_subtask activation is unchanged.
-   */
-  parallelEnabled?: boolean;
+  retryPolicy?: ExecutionRetryPolicy;
+  subtaskNotifications?: SubtaskNotificationMode;
+}
+
+export interface ReviewGateUiConfig {
+  subtasksViewExpanded?: boolean;
 }
 
 export interface ReviewGateConfig {
@@ -137,6 +169,7 @@ export interface ReviewGateConfig {
   review?: ReviewSelectionConfig;
   externalAgents?: ExternalAgentConfig[];
   execution?: ExecutionConfig;
+  ui?: ReviewGateUiConfig;
 }
 
 export interface LoadedConfig {
@@ -229,6 +262,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
     execution: value.execution === undefined ? undefined : normalizeExecution(value.execution, executorTimeoutMs),
+    ui: value.ui === undefined ? undefined : normalizeUi(value.ui),
   };
 
   if (config.reviewers) {
@@ -236,6 +270,20 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
   }
 
   return config;
+}
+
+function normalizeUi(value: unknown): ReviewGateUiConfig {
+  if (!isRecord(value)) {
+    throw new Error("ui must be an object");
+  }
+  if (value.subtasksViewExpanded !== undefined && typeof value.subtasksViewExpanded !== "boolean") {
+    throw new Error("ui.subtasksViewExpanded must be a boolean");
+  }
+  return {
+    ...(value.subtasksViewExpanded !== undefined
+      ? { subtasksViewExpanded: value.subtasksViewExpanded }
+      : {}),
+  };
 }
 
 export interface ReviewerResolution {
@@ -275,8 +323,9 @@ export function automaticReviewEnabled(config: ReviewGateConfig, scopedModels: s
 }
 
 export function configWithReviewers(config: ReviewGateConfig, reviewers: DeciderConfig[], enabled: boolean): ReviewGateConfig {
+  const { ui: _ui, ...reviewRelevantConfig } = config;
   return {
-    ...config,
+    ...reviewRelevantConfig,
     enabled,
     review: undefined,
     decider: undefined,
@@ -296,11 +345,37 @@ export function materializeReviewConfig(config: ReviewGateConfig, scopedModels: 
   );
 }
 
-export function activeExternalExecutor(config: ReviewGateConfig): ExternalExecutorConfig | undefined {
-  const active = config.execution?.activeExecutor;
+export function activeExternalExecutor(
+  config: ReviewGateConfig,
+  selection: ExecutorSelection | undefined = config.execution?.activeExecutor ?? undefined,
+): ExternalExecutorConfig | undefined {
+  const active = selection;
   if (active?.source !== "external") return undefined;
   const agent = externalAgentCatalog(config).find((candidate) => candidate.id === active.id);
   return agent ? executorFromExternalAgent(agent, config.executorTimeoutMs) : undefined;
+}
+
+export function resolvedExecutorPool(config: ReviewGateConfig): ExecutorPoolEntry[] {
+  if (config.execution?.executorPool !== undefined) {
+    return config.execution.executorPool.map(cloneExecutorPoolEntry);
+  }
+  const active = config.execution?.activeExecutor;
+  if (!active) return [];
+  return [{
+    entryId: executorEntryId(active),
+    selection: cloneExecutorSelection(active),
+    maxConcurrent: config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS,
+  }];
+}
+
+export function executorEntryId(selection: ExecutorSelection): string {
+  return selection.source === "external"
+    ? `external-${selection.id}`
+    : `little-coder-${Buffer.from(selection.model).toString("base64url")}`;
+}
+
+export function executorSelectionKey(selection: ExecutorSelection): string {
+  return selection.source === "external" ? `external:${selection.id}` : `little-coder:${selection.model}`;
 }
 
 export function externalAgentCatalog(config: ReviewGateConfig): ExternalAgentConfig[] {
@@ -573,25 +648,94 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
   const activeExecutor = value.activeExecutor === undefined
     ? undefined
     : normalizeActiveExecutor(value.activeExecutor);
+  const executorPool = value.executorPool === undefined
+    ? undefined
+    : normalizeExecutorPool(value.executorPool);
   const externalExecutors = value.externalExecutors === undefined
     ? undefined
     : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
   const maxWorkers = normalizeMaxWorkers(value.maxWorkers);
-  const parallelEnabled = normalizeParallelEnabled(value.parallelEnabled);
+  const retryPolicy = normalizeExecutionRetryPolicy(value.retryPolicy);
+  const subtaskNotifications = normalizeSubtaskNotificationMode(value.subtaskNotifications);
   return {
     activeExecutor,
+    executorPool,
     externalExecutors,
     ...(maxWorkers !== undefined ? { maxWorkers } : {}),
-    ...(parallelEnabled !== undefined ? { parallelEnabled } : {}),
+    retryPolicy,
+    subtaskNotifications,
   };
 }
 
-function normalizeParallelEnabled(value: unknown): boolean | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "boolean") {
-    throw new Error("execution.parallelEnabled must be a boolean");
+function normalizeSubtaskNotificationMode(value: unknown): SubtaskNotificationMode {
+  if (value === undefined) return DEFAULT_SUBTASK_NOTIFICATION_MODE;
+  if (value !== "quiet" && value !== "noisy") {
+    throw new Error("execution.subtaskNotifications must be quiet or noisy");
   }
   return value;
+}
+
+function normalizeExecutorPool(value: unknown): ExecutorPoolEntry[] {
+  if (!Array.isArray(value)) throw new Error("execution.executorPool must be an array");
+  const entries = value.map((entry, index) => {
+    if (!isRecord(entry)) throw new Error(`execution.executorPool[${index}] must be an object`);
+    const selection = normalizeActiveExecutor(entry.selection);
+    if (!selection) throw new Error(`execution.executorPool[${index}].selection cannot be null`);
+    const entryId = typeof entry.entryId === "string" && entry.entryId.trim()
+      ? entry.entryId.trim()
+      : executorEntryId(selection);
+    validateConfiguredId(entryId, `execution.executorPool[${index}].entryId`);
+    const maxConcurrent = normalizeRequiredWorkerCount(
+      entry.maxConcurrent,
+      `execution.executorPool[${index}].maxConcurrent`,
+    );
+    return { entryId, selection, maxConcurrent };
+  });
+  validateUniqueConfiguredIds(entries.map((entry) => ({ id: entry.entryId })), "executor pool entry");
+  const selections = new Set<string>();
+  for (const entry of entries) {
+    const key = executorSelectionKey(entry.selection);
+    if (selections.has(key)) throw new Error(`duplicate executor pool selection: ${key}`);
+    selections.add(key);
+  }
+  return entries;
+}
+
+function normalizeExecutionRetryPolicy(value: unknown): ExecutionRetryPolicy {
+  if (value === undefined) return { ...DEFAULT_EXECUTION_RETRY_POLICY };
+  if (!isRecord(value)) throw new Error("execution.retryPolicy must be an object");
+  const maxRetries = nonNegativeIntegerOrDefault(
+    value.maxRetries,
+    DEFAULT_EXECUTION_RETRY_POLICY.maxRetries,
+    "execution.retryPolicy.maxRetries",
+  );
+  const baseDelayMs = nonNegativeIntegerOrDefault(
+    value.baseDelayMs,
+    DEFAULT_EXECUTION_RETRY_POLICY.baseDelayMs,
+    "execution.retryPolicy.baseDelayMs",
+  );
+  const maxDelayMs = nonNegativeIntegerOrDefault(
+    value.maxDelayMs,
+    DEFAULT_EXECUTION_RETRY_POLICY.maxDelayMs,
+    "execution.retryPolicy.maxDelayMs",
+  );
+  if (maxDelayMs < baseDelayMs) {
+    throw new Error("execution.retryPolicy.maxDelayMs must be greater than or equal to baseDelayMs");
+  }
+  if (value.jitter !== undefined && typeof value.jitter !== "boolean") {
+    throw new Error("execution.retryPolicy.jitter must be a boolean");
+  }
+  return {
+    maxRetries,
+    baseDelayMs,
+    maxDelayMs,
+    jitter: value.jitter ?? DEFAULT_EXECUTION_RETRY_POLICY.jitter,
+    maxSameIncidentRepeats: nonNegativeIntegerOrDefault(
+      value.maxSameIncidentRepeats,
+      DEFAULT_EXECUTION_RETRY_POLICY.maxSameIncidentRepeats,
+      "execution.retryPolicy.maxSameIncidentRepeats",
+    ),
+  };
 }
 
 function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
@@ -620,6 +764,15 @@ function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
     return { source: "external", id: value.id };
   }
   throw new Error("unsupported execution.activeExecutor source");
+}
+
+function normalizeRequiredWorkerCount(value: unknown, field: string): number {
+  if (!Number.isInteger(value)) throw new Error(`${field} must be an integer`);
+  const count = value as number;
+  if (count < 1 || count > MAX_EXECUTION_WORKERS) {
+    throw new Error(`${field} must be between 1 and ${MAX_EXECUTION_WORKERS}`);
+  }
+  return count;
 }
 
 function normalizeExternalExecutors(value: unknown, defaultTimeoutMs: number): ExternalExecutorConfig[] {
@@ -902,6 +1055,24 @@ function cloneDecider(decider: DeciderConfig): DeciderConfig {
   };
 }
 
+function cloneExecutorSelection(selection: ExecutorSelection): ExecutorSelection {
+  return selection.source === "external"
+    ? { source: "external", id: selection.id }
+    : {
+      source: "little-coder",
+      model: selection.model,
+      ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
+    };
+}
+
+function cloneExecutorPoolEntry(entry: ExecutorPoolEntry): ExecutorPoolEntry {
+  return {
+    entryId: entry.entryId,
+    selection: cloneExecutorSelection(entry.selection),
+    maxConcurrent: entry.maxConcurrent,
+  };
+}
+
 function normalizeRetainBundles(value: unknown): RetainBundles {
   if (value === undefined) return DEFAULT_CONFIG.retainBundles;
   if (value === "never" || value === "always" || value === "on-failure") return value;
@@ -947,8 +1118,8 @@ function normalizeMaxWorkers(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isInteger(value)) {
     throw new Error("execution.maxWorkers must be an integer");
   }
-  if (value < 1 || value > 4) {
-    throw new Error("execution.maxWorkers must be between 1 and 4");
+  if (value < 1 || value > MAX_EXECUTION_WORKERS) {
+    throw new Error(`execution.maxWorkers must be between 1 and ${MAX_EXECUTION_WORKERS}`);
   }
   return value;
 }

@@ -1,4 +1,5 @@
 import type { TokenUsage } from "../usage";
+import type { PiLifecycleSummary } from "../usage";
 
 export interface ExecutorSession {
   adapter: string;
@@ -14,8 +15,9 @@ export interface ExecutorTurn {
   code: number | null;
   timedOut: boolean;
   aborted: boolean;
+  lifecycle?: PiLifecycleSummary;
   failure?: {
-    category: "provider" | "stdin" | "protocol" | "process";
+    category: "provider" | "stdin" | "protocol" | "process" | "interruption" | "compaction";
     message: string;
   };
 }
@@ -25,15 +27,55 @@ export interface ExecutorRequest {
   prompt: string;
   artifactDir: string;
   turn: number;
+  /** Durable parent tool allowlist to apply to child harness launches. */
+  allowedTools?: readonly string[];
   signal?: AbortSignal;
   session?: ExecutorSession;
+  recovery?: {
+    kind: "retry" | "compaction";
+    /** Reopen the durable session and finish compaction before prompting. */
+    compactBeforePrompt?: boolean;
+  };
   onUpdate?: (text: string) => void;
+  onProcessStart?: (process: { pid: number; processGroupId?: number }) => void | Promise<void>;
+  onProcessExit?: (process: { pid: number; processGroupId?: number; code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
+  onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
+}
+
+export interface ExecutorInteractionAcknowledgement {
+  status: "acknowledged" | "blocked" | "failed";
+  message: string;
+  turnId?: string;
+}
+
+export interface ExecutorLiveControl {
+  adapter: string;
+  generation: number;
+  /** Adapter-negotiated protocol or harness identity for diagnostics. */
+  protocol?: string;
+  capabilities: {
+    steer: boolean;
+    interrupt: boolean;
+  };
+  steer(instruction: string, instructionId: string): Promise<ExecutorInteractionAcknowledgement>;
+  interrupt(): Promise<ExecutorInteractionAcknowledgement>;
 }
 
 export interface ExecutorAdapter {
   readonly kind: string;
   readonly model?: string;
   run(request: ExecutorRequest): Promise<ExecutorTurn>;
+}
+
+export class ExecutorLifecycleError extends Error {
+  constructor(
+    readonly category: "compaction" | "interruption" | "protocol" | "process",
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "ExecutorLifecycleError";
+  }
 }
 
 export type SubtaskProgressPhase =

@@ -1,5 +1,6 @@
 import {
   activeExternalExecutor,
+  type ExecutorSelection,
   type ReviewGateConfig,
 } from "../../config";
 import type { ExecutorAdapter } from "../types";
@@ -8,8 +9,8 @@ import { CodexExecutorAdapter } from "./codex-cli";
 import { LittleCoderExecutorAdapter } from "./little-coder";
 import { RunAsBinaryExecutorAdapter } from "./run-as-binary";
 
-export function createExecutorAdapter(config: ReviewGateConfig): ExecutorAdapter {
-  const active = config.execution?.activeExecutor;
+export function createExecutorAdapter(config: ReviewGateConfig, selection?: ExecutorSelection): ExecutorAdapter {
+  const active = selection ?? config.execution?.activeExecutor;
   if (!active) {
     throw new Error("delegated execution is disabled; choose an executor with /review-settings");
   }
@@ -20,7 +21,7 @@ export function createExecutorAdapter(config: ReviewGateConfig): ExecutorAdapter
       timeoutMs: config.executorTimeoutMs,
     });
   }
-  const external = activeExternalExecutor(config);
+  const external = activeExternalExecutor(config, active);
   if (!external) {
     throw new Error(`external executor definition is unavailable: ${active.id}`);
   }

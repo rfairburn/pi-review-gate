@@ -32,20 +32,28 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const selections = [
-    "Executor           Disabled",
+    rootSettingsRow("Executor pool", "0 models · 0 slots"),
+    "Add executor",
     "fake [run-as-binary]",
-    "Reviewers          1/2 selected",
+    "1  current",
+    "Back",
+    rootSettingsRow("Reviewers", "1/2 selected"),
     "two [generic-cli] ✗",
     "Back",
-    "Parallel workers   2",
-    "2  current",
+    rootSettingsRow("Global concurrency", "4"),
+    "2",
     "Save changes",
   ];
 
   await registered.handler("", contextWithSelections(selections));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.activeExecutor, { source: "external", id: "fake" });
+  assert.deepEqual(saved.execution.executorPool, [{
+    entryId: "external-fake",
+    selection: { source: "external", id: "fake" },
+    maxConcurrent: 1,
+  }]);
+  assert.equal(saved.execution.activeExecutor, undefined);
   assert.equal(saved.execution.maxWorkers, 2);
   assert.deepEqual(saved.review.activeReviewers, [
     { source: "external", id: "one" },
@@ -55,7 +63,52 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   assert.equal(saved.reviewers, undefined);
   assert.equal(saved.enabledReviewerIds, undefined);
   assert.deepEqual(saved.customFutureKey, { keep: true });
-  assert.deepEqual(config.execution?.activeExecutor, { source: "external", id: "fake" });
+  assert.deepEqual(config.execution?.executorPool, [{
+    entryId: "external-fake",
+    selection: { source: "external", id: "fake" },
+    maxConcurrent: 1,
+  }]);
+});
+
+test("/review-settings builds and reorders an executor pool with per-model concurrency", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-pool-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    externalAgents: ["qwen", "deepseek"].map((id) => ({
+      id,
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: { protocol: "pi-review-executor-jsonl-v1" },
+    })),
+    execution: { executorPool: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Executor pool", "0 models · 0 slots"),
+    "Add executor",
+    "qwen [run-as-binary]",
+    "1  current",
+    "Add executor",
+    "deepseek [run-as-binary]",
+    "3",
+    "2. deepseek [run-as-binary] · Configured by agent · max 3",
+    "Move up",
+    "Back",
+    "Back",
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.execution.executorPool, [
+    { entryId: "external-deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 3 },
+    { entryId: "external-qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+  ]);
+  assert.equal(saved.execution.activeExecutor, undefined);
 });
 
 test("/review-settings clear-all saves a valid review-disabled configuration", async () => {
@@ -70,7 +123,7 @@ test("/review-settings clear-all saves a valid review-disabled configuration", a
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Reviewers          1/1 selected",
+    rootSettingsRow("Reviewers", "1/1 selected"),
     "Clear all",
     "Back",
     "Save changes",
@@ -93,7 +146,7 @@ test("root Escape leaves the settings file unchanged", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Bundle retention   On failure",
+    rootSettingsRow("Bundle retention", "On failure"),
     "Always",
     undefined,
   ]));
@@ -115,18 +168,25 @@ test("internal executor uses the exact Pi model label and canonical value", asyn
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Executor           Disabled",
+    rootSettingsRow("Executor pool", "0 models · 0 slots"),
+    "Add executor",
     "gpt-5.6-sol [openai-codex]",
     "High  current",
+    "1  current",
+    "Back",
     "Save changes",
   ], [{ model: reasoningModel("openai-codex", "gpt-5.6-sol") }]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.activeExecutor, {
-    source: "little-coder",
-    model: "openai-codex/gpt-5.6-sol",
-    thinkingLevel: "high",
-  });
+  assert.deepEqual(saved.execution.executorPool, [{
+    entryId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s",
+    selection: {
+      source: "little-coder",
+      model: "openai-codex/gpt-5.6-sol",
+      thinkingLevel: "high",
+    },
+    maxConcurrent: 1,
+  }]);
 });
 
 test("first settings save migrates a legacy decider into the shared external catalog", async () => {
@@ -182,7 +242,7 @@ test("reviewer picker includes scoped models and shared review-capable external 
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Reviewers          0/2 selected — review disabled by master setting",
+    rootSettingsRow("Reviewers", "0/2 selected — review disabled by master setting"),
     "gpt-5.6-sol [openai-codex] ✗",
     "High  current",
     "codex [codex-cli] ✗",
@@ -211,7 +271,7 @@ test("review policy values are staged and saved atomically", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Review policy      1 corrections · concrete after 1",
+    rootSettingsRow("Review policy", "1 corrections · concrete after 1"),
     "Automatic correction attempts  1",
     "Concrete guidance after        1",
     "Back",
@@ -237,9 +297,9 @@ test("reviewer and executor timeouts are staged and saved together", async () =>
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Timeouts           review 10m · executor 30m",
-    "Reviewer timeout               10m",
-    "Executor timeout               30m",
+    rootSettingsRow("Timeouts", "review 10m · executor 30m"),
+    "Reviewer timeout  10m",
+    "Executor timeout  30m",
     "Back",
     "Save changes",
   ], [], ["20", "90"]));
@@ -264,7 +324,7 @@ test("bundle retention is staged and saved from review settings", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Bundle retention   On failure",
+    rootSettingsRow("Bundle retention", "On failure"),
     "Always",
     "Save changes",
   ]));
@@ -272,6 +332,51 @@ test("bundle retention is staged and saved from review settings", async () => {
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(saved.retainBundles, "always");
   assert.equal(config.retainBundles, "always");
+});
+
+test("subtasks view is staged and saved as a global review setting", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-subtasks-view-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    ui: { subtasksViewExpanded: false },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Subtasks view", "Collapsed"),
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.ui.subtasksViewExpanded, true);
+  assert.equal(config.ui?.subtasksViewExpanded, true);
+});
+
+test("subtask notification mode is staged and saved with quiet as the default", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-subtask-notifications-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    execution: { activeExecutor: null },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Subtask notifications", "Quiet"),
+    "Noisy — include running and reviewing",
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.execution.subtaskNotifications, "noisy");
+  assert.equal(config.execution?.subtaskNotifications, "noisy");
 });
 
 test("internal executor and reviewers persist independent per-model reasoning levels", async () => {
@@ -301,10 +406,13 @@ test("internal executor and reviewers persist independent per-model reasoning le
   ];
 
   await registered.handler("", contextWithSelections([
-    "Executor           gpt-5.6-luna [openai-codex] · High",
-    "gpt-5.6-luna [openai-codex]  current",
+    rootSettingsRow("Executor pool", "1 model · 4 slots"),
+    "1. gpt-5.6-luna [openai-codex] · High · max 4",
+    "Thinking             High",
     "Max",
-    "Reviewers          2/2 selected — review disabled by master setting",
+    "Back",
+    "Back",
+    rootSettingsRow("Reviewers", "2/2 selected — review disabled by master setting"),
     "Reasoning · gpt-5.6-luna [openai-codex]  High",
     "Max",
     "Back",
@@ -312,11 +420,15 @@ test("internal executor and reviewers persist independent per-model reasoning le
   ], scoped));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.activeExecutor, {
-    source: "little-coder",
-    model: "openai-codex/gpt-5.6-luna",
-    thinkingLevel: "max",
-  });
+  assert.deepEqual(saved.execution.executorPool, [{
+    entryId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+    selection: {
+      source: "little-coder",
+      model: "openai-codex/gpt-5.6-luna",
+      thinkingLevel: "max",
+    },
+    maxConcurrent: 4,
+  }]);
   assert.deepEqual(saved.review.activeReviewers, [
     { source: "little-coder", model: "openai-codex/gpt-5.6-luna", thinkingLevel: "max" },
     { source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
@@ -330,7 +442,7 @@ test("scoped model reasoning choices omit unsupported extended levels", () => {
   assert.deepEqual(local.supportedThinkingLevels, ["off", "minimal", "low", "medium", "high"]);
 });
 
-test("parallel workers is staged and saved atomically", async () => {
+test("executor concurrency is staged and saved atomically", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-workers-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
@@ -343,17 +455,17 @@ test("parallel workers is staged and saved atomically", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Parallel workers   2",
-    "4",
+    rootSettingsRow("Global concurrency", "4"),
+    "12",
     "Save changes",
   ]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.equal(saved.execution.maxWorkers, 4);
-  assert.equal(config.execution?.maxWorkers, 4);
+  assert.equal(saved.execution.maxWorkers, 12);
+  assert.equal(config.execution?.maxWorkers, 12);
 });
 
-test("parallel execution toggle is staged and saved atomically", async () => {
+test("retry policy is staged and saved atomically", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-parallel-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
@@ -366,15 +478,93 @@ test("parallel execution toggle is staged and saved atomically", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    "Parallel execution Disabled",
-    "Enabled",
+    rootSettingsRow("Retry policy", "2 retries · 1s base"),
+    retrySettingsRow("Retries after initial attempt", "2"),
+    "Back",
     "Save changes",
-  ]));
+  ], [], ["5"]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.equal(saved.execution.parallelEnabled, true);
-  assert.equal(config.execution?.parallelEnabled, true);
+  assert.equal(saved.execution.retryPolicy.maxRetries, 5);
+  assert.equal(config.execution?.retryPolicy?.maxRetries, 5);
 });
+
+test("/review-settings aligns every settings value column from the full label set", async () => {
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    execution: { activeExecutor: null },
+  });
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath: "/unused/review-gate.json" });
+  let rootRows: string[] = [];
+  let retryRows: string[] = [];
+  let selection = 0;
+
+  await registered.handler("", {
+    scopedModels: [],
+    ui: {
+      async select(title: string, options: string[]) {
+        if (title === "Review settings" && selection++ === 0) {
+          rootRows = options.slice(0, ROOT_SETTING_LABELS.length);
+          return rootSettingsRow("Retry policy", "2 retries · 1s base");
+        }
+        if (title === "Executor retry policy") {
+          retryRows = options.slice(0, RETRY_SETTING_LABELS.length);
+          return undefined;
+        }
+        return undefined;
+      },
+      notify() {},
+    },
+  });
+
+  assertAlignedValueColumn(rootRows, ROOT_SETTING_LABELS);
+  assertAlignedValueColumn(retryRows, RETRY_SETTING_LABELS);
+});
+
+const ROOT_SETTING_LABELS = [
+  "Executor pool",
+  "Reviewers",
+  "Timeouts",
+  "Review policy",
+  "Bundle retention",
+  "Global concurrency",
+  "Retry policy",
+  "Subtask notifications",
+  "Subtasks view",
+] as const;
+
+const RETRY_SETTING_LABELS = [
+  "Retries after initial attempt",
+  "Base delay",
+  "Maximum delay",
+  "Same-incident repeat limit",
+  "Delay jitter",
+] as const;
+
+function rootSettingsRow(label: typeof ROOT_SETTING_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, ROOT_SETTING_LABELS);
+}
+
+function retrySettingsRow(label: typeof RETRY_SETTING_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, RETRY_SETTING_LABELS);
+}
+
+function alignedTestRow(label: string, value: string, labels: readonly string[]): string {
+  const width = Math.max(...labels.map((candidate) => candidate.length));
+  return `${label.padEnd(width)}  ${value}`;
+}
+
+function assertAlignedValueColumn(rows: string[], labels: readonly string[]): void {
+  assert.equal(rows.length, labels.length);
+  const expectedColumn = Math.max(...labels.map((label) => label.length)) + 2;
+  rows.forEach((row, index) => {
+    const label = labels[index];
+    const valueOffset = row.slice(label.length).search(/\S/);
+    assert.equal(label.length + valueOffset, expectedColumn, row);
+  });
+}
 
 function commandHarness(): {
   pi: { registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }): void };

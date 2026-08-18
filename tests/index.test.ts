@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
+import { queueModelDelivery } from "../src/durable-delivery";
+import { SessionStateStore } from "../src/session-state";
+
+const executionToolNames = [
+  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue",
+  "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
+];
 
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
@@ -29,6 +37,153 @@ const indexTestConfig = {
   maxSnapshotBytes: 52_428_800,
   retainBundles: "never",
 } as const;
+
+test("automatic review waits for ShellStart process groups and resumes the orchestrator when they clear", { skip: process.platform === "win32" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-background-readiness-"));
+  let background: ChildProcess | undefined;
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const invocationMarker = join(dir, "reviewer-invoked.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'background work reviewed',findings:[]})))`,
+        ],
+        timeoutMs: 15_000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const followUps: Array<{ message: string; options: unknown }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand() {},
+      notify(message: string) { notices.push(message); },
+      sendUserMessage(message: string, options: unknown) { followUps.push({ message, options }); },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "make a background-assisted change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    background = spawn(process.execPath, ["-e", "setTimeout(()=>{},350)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    background.unref();
+    assert.ok(background.pid);
+    await trigger(hooks, "tool_result", {
+      cwd: dir,
+      toolName: "ShellStart",
+      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}).\nWaking you on: exit.` }] },
+      isError: false,
+    });
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
+
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+    assert.match(notices.join("\n"), /automatic review deferred while 1 background process group/);
+    await waitForCondition(() => followUps.length === 1);
+    assert.match(followUps[0]?.message ?? "", /All tracked ShellStart process groups have finished/);
+    assert.deepEqual(followUps[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
+    assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
+  } finally {
+    if (background?.pid) {
+      try { process.kill(-background.pid, "SIGKILL"); } catch { /* already exited */ }
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("automatic review waits while execution subtasks remain active", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-execution-readiness-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const invocationMarker = join(dir, "reviewer-invoked.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "reviewer",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed',findings:[]}))`,
+        ],
+        timeoutMs: 15_000,
+      },
+      externalAgents: [{
+        id: "slow-executor",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1",
+          args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
+        },
+      }],
+      execution: {
+        activeExecutor: { source: "external", id: "slow-executor" },
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    let executionTool: {
+      execute: (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<unknown>;
+    } | undefined;
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand() {},
+      registerTool(tool: typeof executionTool & { name?: string }) {
+        if (tool?.name === "SubtasksStart") executionTool = tool;
+      },
+      getActiveTools() { return ["read", "bash", ...executionToolNames]; },
+      setToolActive() {},
+      notify(message: string) { notices.push(message); },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "session_start", { cwd: dir });
+    assert.ok(executionTool);
+    await trigger(hooks, "input", { cwd: dir, text: "make a delegated change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await executionTool.execute("start-slow-task", {
+      tasks: [{
+        title: "slow delegated work",
+        instructions: "Remain active while the readiness gate is tested.",
+        acceptanceCriteria: ["The delegated task finishes."],
+      }],
+    }, undefined, undefined, { cwd: dir });
+
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "subtask still active" }] });
+
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+    assert.match(notices.join("\n"), /automatic review deferred while 1 execution subtask\(s\) remain active/);
+    assert.match(notices.join("\n"), /slow delegated work \[(queued|capturing|running)\]/);
+    await trigger(hooks, "session_shutdown", { cwd: dir });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("delegated execution tool activation waits for session_start", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-runtime-start-"));
@@ -81,9 +236,102 @@ test("delegated execution tool activation waits for session_start", async () => 
 
     runtimeInitialized = true;
     await trigger(hooks, "session_start", { cwd: dir });
-    assert.deepEqual(registeredTools, ["execute_subtask", "execute_subtasks"]);
-    // Config does not enable parallel execution, so only execute_subtask is active.
-    assert.deepEqual(activeTools, ["read", "execute_subtask"]);
+    assert.deepEqual(registeredTools, executionToolNames);
+    assert.deepEqual(activeTools, ["read", ...executionToolNames]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("review state restores only when the same persisted conversation resumes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-conversation-restore-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const runtime = (sessionId: string, file: string) => {
+      const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+      const notices: string[] = [];
+      const entries: Array<{ type: string; data: unknown }> = [];
+      const sent: Array<{ message: string; options: unknown }> = [];
+      const pi = {
+        on(name: string, handler: (...args: unknown[]) => unknown) {
+          hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+        },
+        registerCommand() {},
+        appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
+        notify(message: string) { notices.push(message); },
+        sendUserMessage(message: string, options: unknown) { sent.push({ message, options }); },
+      };
+      const ctx = {
+        cwd: dir,
+        ui: { notify: (message: string) => notices.push(message) },
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getSessionFile: () => file,
+          getCwd: () => dir,
+        },
+      };
+      return { hooks, notices, entries, sent, pi, ctx };
+    };
+
+    const first = runtime("conversation-a", sessionFile);
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: dir, text: "preserve this request", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "printf evidence" } }, first.ctx);
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+    const targetStore = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const targetState = await targetStore.restore(dir);
+    assert.ok(targetState);
+    queueModelDelivery(targetState.state, {
+      kind: "review_authorization",
+      channel: "follow_up",
+      message: "durable pending message for resumed conversation",
+    });
+    await targetStore.save(targetState.state, targetState.execution);
+
+    // Model the ordinary interactive flow exactly: a later application starts
+    // in a temporary/default session, then /resume replaces that runtime with
+    // a freshly loaded extension instance for the selected conversation.
+    const bootstrapFile = join(dir, "startup-session.jsonl");
+    await writeFile(bootstrapFile, "", "utf8");
+    const bootstrap = runtime("startup-session", bootstrapFile);
+    await activate(bootstrap.pi);
+    await trigger(bootstrap.hooks, "session_start", { type: "session_start", reason: "startup" }, bootstrap.ctx);
+    await trigger(bootstrap.hooks, "input", { cwd: dir, text: "must not leak into resumed conversation", source: "user" }, bootstrap.ctx);
+    await trigger(bootstrap.hooks, "session_shutdown", {
+      type: "session_shutdown",
+      reason: "resume",
+      targetSessionFile: sessionFile,
+    }, bootstrap.ctx);
+
+    const resumed = runtime("conversation-a", sessionFile);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+    assert.match(resumed.notices.join("\n"), /restored conversation state revision/);
+    assert.deepEqual(resumed.sent, [{
+      message: "durable pending message for resumed conversation",
+      options: { deliverAs: "followUp" },
+    }]);
+    const resumedState = await readFile(`${sessionFile}.pi-review-gate-state.json`, "utf8");
+    assert.match(resumedState, /preserve this request/);
+    assert.doesNotMatch(resumedState, /must not leak into resumed conversation/);
+
+    const newSessionFile = join(dir, "conversation-b.jsonl");
+    await writeFile(newSessionFile, "", "utf8");
+    const fresh = runtime("conversation-b", newSessionFile);
+    await activate(fresh.pi);
+    await trigger(fresh.hooks, "session_start", { type: "session_start", reason: "new" }, fresh.ctx);
+    assert.doesNotMatch(fresh.notices.join("\n"), /restored conversation state revision/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -781,6 +1029,7 @@ test("automatic correction is reviewed when it exactly restores the original bas
 test("automatic correction starts each reviewer in a fresh session against the stable window bundle", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewer-session-resume-"));
   const argvPath = join(tmpdir(), `pi-review-gate-reviewer-session-argv-${process.pid}-${Date.now()}.json`);
+  let retainedBundleDir: string | undefined;
 
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -857,11 +1106,13 @@ test("automatic correction starts each reviewer in a fresh session against the s
     assert.equal(freshInvocation.session.id, "stable-review-session");
 
     const bundleDir = history[1].bundle;
+    retainedBundleDir = bundleDir;
     await trigger(hooks, "session_shutdown", { reason: "test" });
-    await assert.rejects(access(bundleDir), /ENOENT/);
+    await access(bundleDir);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(argvPath, { force: true });
+    if (retainedBundleDir) await rm(retainedBundleDir, { recursive: true, force: true });
   }
 });
 

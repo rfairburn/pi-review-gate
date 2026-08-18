@@ -102,8 +102,12 @@ export class PiJsonlActivityExtractor {
 export class CodexJsonlActivityExtractor {
   private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
   private lastModelUpdate = "";
+  private reasoningActive = false;
 
-  constructor(private readonly onActivity: (message: string) => void) {}
+  constructor(
+    private readonly onActivity: (message: string) => void,
+    private readonly options: { includeModelUpdates?: boolean } = {},
+  ) {}
 
   push(chunk: string): void {
     this.decoder.push(chunk);
@@ -124,6 +128,7 @@ export class CodexJsonlActivityExtractor {
 
     if (parsed.type === "turn.started") {
       this.lastModelUpdate = "";
+      this.reasoningActive = false;
       this.onActivity("model turn started");
       return;
     }
@@ -146,7 +151,13 @@ export class CodexJsonlActivityExtractor {
     const started = eventType === "item.started";
 
     if (item.type === "reasoning") {
-      if (!started) this.onActivity("model reasoning");
+      if (started) {
+        if (!this.reasoningActive) this.onActivity("model reasoning");
+        this.reasoningActive = true;
+      } else {
+        if (!this.reasoningActive) this.onActivity("model reasoning");
+        this.reasoningActive = false;
+      }
       return;
     }
     if (item.type === "agent_message") {
@@ -188,7 +199,7 @@ export class CodexJsonlActivityExtractor {
 
   private emitModelUpdate(text: string): void {
     const message = singleLine(text);
-    if (!message || message === this.lastModelUpdate) return;
+    if (this.options.includeModelUpdates === false || !message || message === this.lastModelUpdate) return;
     this.lastModelUpdate = message;
     this.onActivity(`model update · ${message}`);
   }

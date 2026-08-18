@@ -24,7 +24,9 @@
     "build:test": "npm run clean:test && tsc -p tsconfig.test.json",
     "test": "npm run build && npm run build:test && npm run test:run",
     "test:fast": "npm run build:test && npm run test:fast:run",
-    "test:fast:run": "node --test --test-concurrency=4 dist-test/tests/config.test.js dist-test/tests/diff.test.js dist-test/tests/execution-progress.test.js dist-test/tests/jsonl.test.js dist-test/tests/little-coder-thinking.test.js dist-test/tests/prompts.test.js dist-test/tests/redaction.test.js dist-test/tests/review-report.test.js dist-test/tests/schema.test.js dist-test/tests/serial-writer.test.js dist-test/tests/state.test.js dist-test/tests/transmission.test.js dist-test/tests/usage.test.js",
+    "test:fast:run": "node --test --test-concurrency=4 dist-test/tests/config.test.js dist-test/tests/diff.test.js dist-test/tests/execution-progress.test.js dist-test/tests/execution-tool-batch.test.js dist-test/tests/jsonl.test.js dist-test/tests/little-coder-thinking.test.js dist-test/tests/prompts.test.js dist-test/tests/redaction.test.js dist-test/tests/review-report.test.js dist-test/tests/schema.test.js dist-test/tests/serial-writer.test.js dist-test/tests/session-state.test.js dist-test/tests/state.test.js dist-test/tests/transmission.test.js dist-test/tests/usage.test.js",
+    "test:execution": "npm run build:test && npm run test:execution:run",
+    "test:execution:run": "node --test --test-concurrency=1 dist-test/tests/background-controller.test.js dist-test/tests/background-process-readiness.test.js dist-test/tests/execution-tool-batch.test.js dist-test/tests/executor-pool.test.js dist-test/tests/operation-actions.test.js dist-test/tests/session-state.test.js dist-test/tests/source-mutation-lease.test.js",
     "test:integration": "npm test",
     "test:package": "node scripts/package-smoke.cjs",
     "check:static": "tsc -p tsconfig.json --noEmit && shellcheck scripts/*.sh",
@@ -39,5 +41,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.233"
   }
 }

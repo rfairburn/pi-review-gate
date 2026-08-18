@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import type { ReviewGateConfig } from "../config";
+import { DEFAULT_EXECUTION_RETRY_POLICY, resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import type { WaveCaptureHooks, WaveCaptureResult } from "./wave-repository";
-import { captureWaveBase, WaveCaptureError } from "./wave-repository";
+import { captureWaveBase, discoverWaveSource, WaveCaptureError } from "./wave-repository";
 import {
   createWorkerWorktree,
+  pinCommit,
   removeWorktree,
   isWorktreeClean,
 } from "./wave-worktrees";
@@ -27,9 +28,14 @@ import type {
   LandingExecutionResult,
 } from "./wave-landing";
 import { planWaveLanding, executeWaveLanding } from "./wave-landing";
-import type { SubtaskProgressUpdate } from "./types";
+import type { ExecutorLiveControl, SubtaskProgressUpdate } from "./types";
 import type { SubtaskReviewReport } from "../review-report";
 import { SerialWriter } from "./serial-writer";
+import type { ExecutionIncident, OperationDiagnostics, ReattachmentBundle, RecoveryCheckpoint } from "./operation-record";
+import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
+import { acquireWaveOwner, heartbeatWaveOwner, releaseWaveOwner } from "./wave-owner";
+import { sourceMutationCoordinator } from "./source-mutation-lease";
+import { validateSafeId } from "./wave-validation";
 
 // ── public input / result contract ───────────────────────────────────────────
 
@@ -98,6 +104,16 @@ export interface WaveTaskResult {
   unreviewed?: boolean;
   /** Structured reviewer evidence for the orchestrator. */
   reviewReport?: SubtaskReviewReport;
+  operationRecord?: string;
+  bundle?: ReattachmentBundle;
+  incidents?: ExecutionIncident[];
+  checkpoint?: RecoveryCheckpoint;
+  attempts?: number;
+  diagnostics?: OperationDiagnostics;
+  worktree?: string;
+  artifactDir?: string;
+  /** Durable original task definition for restart diagnosis/re-dispatch. */
+  taskDefinition?: WaveWorkerTask;
 }
 
 /** Integration result embedded in the wave result. */
@@ -128,7 +144,7 @@ export interface WaveIntegrationOutcome {
 /** Landing result embedded in the wave result. */
 export interface WaveLandingOutcome {
   /** Landing execution status. */
-  status: LandingExecutionResult["status"] | "aborted";
+  status: LandingExecutionResult["status"] | "aborted" | "planning_error";
   /** Applied paths. */
   appliedPaths?: string[];
   /** Already-applied paths. */
@@ -176,22 +192,32 @@ export interface WaveControllerInput {
   config: ReviewGateConfig;
   /** Scoped model identifiers for reviewer resolution in every worker lifecycle. */
   scopedModels?: string[];
-  /** Maximum concurrent workers (1..4, default 2). */
+  /** Maximum concurrent workers (1..16, default 4). */
   maxWorkers?: number;
   /** Abort signal. */
   signal?: AbortSignal;
   /** Progress callback. */
   onProgress?: (update: WaveProgressUpdate) => void;
+  /** Called after the durable wave manifest exists and before any worker starts. */
+  onWaveCreated?: (waveRoot: string) => void | Promise<void>;
   /** Artifact parent directory (outside source). */
   artifactDir?: string;
   /** Wave identifier (generated if omitted). */
   waveId?: string;
-  /**
-   * When true, integrate eligible workers (accepted / completed_unreviewed)
-   * in original declared order despite failed workers.
-   * Default is false (all-or-nothing: any non-eligible worker blocks integration).
-   */
-  integratePartial?: boolean;
+  /** Stable externally assigned task ids. Defaults to task-0, task-1, ... */
+  taskIds?: string[];
+  /** Shared capacity scheduler used by background execution groups. */
+  executorPool?: ExecutorPoolScheduler;
+  /** Capacity already reserved by the caller for the first dispatched tasks. */
+  initialExecutorLeases?: ExecutorPoolLease[];
+  /** Called while holding the source lease when landing detects conflicts. */
+  onLandingConflict?: (input: { capture: WaveCaptureResult; plan: LandingPlan }) => void | Promise<void>;
+  /** Register live control for a specific task's current executor turn. */
+  onLiveControl?: (taskId: string, control: ExecutorLiveControl | undefined) => void;
+  /** Claim task steering deferred until its current executor turn settles. */
+  takeDeferredSteering?: (taskId: string) => Promise<Array<{ instruction: string; instructionId: string }>>;
+  /** Land one accepted task directly, without a combined integration worktree. */
+  independentLanding?: boolean;
   /** @internal Per-invocation integration fault hooks used by regression tests. */
   integrationHooks?: WaveIntegrationHooks;
   /** @internal Per-invocation capture fault hooks used by regression tests. */
@@ -220,6 +246,11 @@ export interface WaveManifestTask {
   acceptedCommitSha?: string;
   unreviewed?: boolean;
   reviewReport?: SubtaskReviewReport;
+  operationRecord?: string;
+  bundle?: ReattachmentBundle;
+  incidents?: ExecutionIncident[];
+  checkpoint?: RecoveryCheckpoint;
+  attempts?: number;
   /** Executor adapter used (when known). */
   executorAdapter?: string;
   /** Executor model used (when known). */
@@ -232,6 +263,8 @@ export interface WaveManifestTask {
   artifactDir?: string;
   /** Candidate commit SHA (when executor produced changes). */
   candidateCommitSha?: string;
+  /** Durable original instructions and acceptance criteria. */
+  task?: WaveWorkerTask;
 }
 
 /** The wave manifest written atomically under waveRoot. */
@@ -263,6 +296,10 @@ export interface WaveManifest {
   integrationStatus?: WaveIntegrationResult["status"] | "error" | "worker_failure";
   /** Integration validation status. */
   integrationValidationStatus?: "not_run";
+  /** Stable integrated ref, when integration completed. */
+  integrationRef?: string;
+  /** Final integrated commit, when integration completed. */
+  integrationFinalCommitSha?: string;
   /** Integration worktree path (when created/preserved). */
   integrationWorktree?: string;
   /** Worker mappings (when integrated). */
@@ -271,12 +308,13 @@ export interface WaveManifest {
   integrationSuccessfullyIntegrated?: Array<{ taskId: string; originalCommitSha: string; integratedCommitSha: string; order: number }>;
   /** Conflict details. */
   integrationConflictingTaskId?: string;
+  integrationConflictingCommitSha?: string;
   integrationConflictingPaths?: string[];
   /** Integration error diagnostics. */
   integrationError?: string;
   integrationGitDiagnostics?: string;
   /** Landing status (if attempted). */
-  landingStatus?: LandingExecutionResult["status"] | "aborted";
+  landingStatus?: LandingExecutionResult["status"] | "aborted" | "planning_error";
   /** Landing applied paths. */
   landingAppliedPaths?: string[];
   /** Landing already-applied paths. */
@@ -299,8 +337,8 @@ export interface WaveManifest {
 // ── validation ───────────────────────────────────────────────────────────────
 
 const MIN_WORKERS = 1;
-const MAX_WORKERS = 4;
-const DEFAULT_WORKERS = 2;
+const MAX_WORKERS = 16;
+const DEFAULT_WORKERS = 4;
 
 function validateMaxWorkers(value: number | undefined): number {
   if (value === undefined) {
@@ -314,6 +352,47 @@ function validateMaxWorkers(value: number | undefined): number {
   return value;
 }
 
+async function retryInfrastructure<T>(
+  config: ReviewGateConfig,
+  invoke: (attempt: number) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  const policy = config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY;
+  let retries = 0;
+  let priorMessage: string | undefined;
+  let repeats = 0;
+  for (;;) {
+    try {
+      return await invoke(retries);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      repeats = priorMessage === message ? repeats + 1 : 1;
+      priorMessage = message;
+      if (retries >= policy.maxRetries || repeats > policy.maxSameIncidentRepeats) throw error;
+      retries += 1;
+      const ceiling = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, retries - 1));
+      const delay = policy.jitter ? Math.floor(ceiling * (0.5 + Math.random() * 0.5)) : ceiling;
+      if (delay > 0) {
+        await new Promise<void>((resolvePromise, reject) => {
+          const finish = () => {
+            signal?.removeEventListener("abort", abort);
+            resolvePromise();
+          };
+          const timer = setTimeout(finish, delay);
+          const abort = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+            reject(signal?.reason instanceof Error ? signal.reason : new Error("Infrastructure retry cancelled."));
+          };
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+    }
+  }
+}
+
 // ── manifest helpers ─────────────────────────────────────────────────────────
 
 /** Write the wave manifest atomically (temp file + rename). */
@@ -321,6 +400,14 @@ async function writeWaveManifest(waveRoot: string, manifest: WaveManifest): Prom
   const manifestPath = join(waveRoot, "wave-manifest.json");
   const tmpPath = `${manifestPath}.tmp.${randomUUID()}`;
   try {
+    const previous = await fs.readFile(manifestPath, "utf8")
+      .then((text) => JSON.parse(text) as WaveManifest)
+      .catch(() => undefined);
+    if (previous?.version === 1) {
+      for (const task of manifest.tasks) {
+        task.task ??= previous.tasks.find((candidate) => candidate.taskId === task.taskId)?.task;
+      }
+    }
     await fs.writeFile(tmpPath, JSON.stringify(manifest, null, 2), "utf8");
     await fs.rename(tmpPath, manifestPath);
   } catch (err) {
@@ -336,7 +423,7 @@ function buildManifest(
   capture: WaveCaptureResult,
   taskResults: WaveTaskResult[],
   integrationStatus?: WaveIntegrationResult["status"] | "error" | "worker_failure",
-  landingStatus?: LandingExecutionResult["status"] | "aborted",
+  landingStatus?: LandingExecutionResult["status"] | "aborted" | "planning_error",
   integrationOutcome?: WaveIntegrationOutcome,
   landingOutcome?: WaveLandingOutcome,
   handles?: WorkerHandle[],
@@ -373,20 +460,30 @@ function buildManifest(
         acceptedCommitSha: tr.acceptedCommitSha,
         unreviewed: tr.unreviewed,
         reviewReport: tr.reviewReport,
+        operationRecord: tr.operationRecord,
+        bundle: tr.bundle,
+        incidents: tr.incidents,
+        checkpoint: tr.checkpoint,
+        attempts: tr.attempts,
+        diagnostics: tr.diagnostics,
         executorAdapter: executorInfo?.adapter,
         executorModel: executorInfo?.model,
         reviewCycle,
         worktree: handle?.worktreeRoot,
         artifactDir: handle?.artifactDir,
         candidateCommitSha: candidateCommit,
+        task: tr.taskDefinition ?? handle?.task,
       };
     }),
     integrationStatus,
     ...(integrationOutcome?.validationStatus ? { integrationValidationStatus: integrationOutcome.validationStatus } : {}),
+    ...(integrationOutcome?.integratedRef ? { integrationRef: integrationOutcome.integratedRef } : {}),
+    ...(integrationOutcome?.finalCommitSha ? { integrationFinalCommitSha: integrationOutcome.finalCommitSha } : {}),
     ...(integrationOutcome?.worktree ? { integrationWorktree: integrationOutcome.worktree } : {}),
     ...(integrationOutcome?.workerMappings ? { integrationWorkerMappings: integrationOutcome.workerMappings } : {}),
     ...(integrationOutcome?.successfullyIntegrated ? { integrationSuccessfullyIntegrated: integrationOutcome.successfullyIntegrated } : {}),
     ...(integrationOutcome?.conflictingTaskId ? { integrationConflictingTaskId: integrationOutcome.conflictingTaskId } : {}),
+    ...(integrationOutcome?.conflictingCommitSha ? { integrationConflictingCommitSha: integrationOutcome.conflictingCommitSha } : {}),
     ...(integrationOutcome?.conflictingPaths ? { integrationConflictingPaths: integrationOutcome.conflictingPaths } : {}),
     ...(integrationOutcome?.error ? { integrationError: integrationOutcome.error } : {}),
     ...(integrationOutcome?.gitDiagnostics ? { integrationGitDiagnostics: integrationOutcome.gitDiagnostics } : {}),
@@ -560,7 +657,7 @@ function isEligibleForIntegration(result: WaveTaskResult): boolean {
  * (up to maxWorkers), integrate eligible results, plan and execute landing.
  *
  * This is the controller-owned orchestrator. It:
- * 1. Validates input (maxWorkers 1..4, tasks >= 1).
+ * 1. Validates input (maxWorkers 1..16, tasks >= 1).
  * 2. Generates deterministic task IDs (task-0, task-1, ...).
  * 3. Captures the source exactly once via captureWaveBase.
  * 4. Starts at most maxWorkers isolated worktrees/lifecycles concurrently.
@@ -568,7 +665,7 @@ function isEligibleForIntegration(result: WaveTaskResult): boolean {
  * 6. Emits aggregate/per-worker progress via onProgress callback.
  * 7. Writes an atomically-replaced wave manifest under waveRoot.
  * 8. Selects eligible workers for integration (accepted / completed_unreviewed with pinned commit).
- * 9. Integrates in original declared order (all-or-nothing by default, integratePartial for partial).
+ * 9. Integrates eligible results for this controller invocation.
  * 10. Plans and executes landing.
  * 11. Returns structured results.
  * 12. Never mutates source through Git operations.
@@ -584,20 +681,44 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     onProgress,
     artifactDir,
     waveId: givenWaveId,
-    integratePartial = false,
   } = input;
 
   // ── Validate input ──
   if (!tasks || tasks.length < 1) {
     throw new Error("Wave requires at least 1 task.");
   }
+  if (input.independentLanding && tasks.length !== 1) {
+    throw new Error("Independent landing requires exactly one task.");
+  }
   const maxWorkers = validateMaxWorkers(input.maxWorkers);
+  const executorPoolEntries = resolvedExecutorPool(config);
+  if (executorPoolEntries.length === 0) {
+    throw new Error("Wave execution requires at least one configured executor pool entry.");
+  }
+  const executorPool = input.executorPool ?? new ExecutorPoolScheduler(executorPoolEntries);
+  const initialExecutorLeases = [...(input.initialExecutorLeases ?? [])];
+  if (initialExecutorLeases.length > tasks.length) {
+    for (const lease of initialExecutorLeases) lease.release();
+    throw new Error("More initial executor leases were supplied than tasks.");
+  }
 
-  // Generate deterministic task IDs.
-  const taskItems = tasks.map((task, index) => ({
-    taskId: `task-${index}`,
-    task,
-  }));
+  if (input.taskIds && input.taskIds.length !== tasks.length) {
+    for (const lease of initialExecutorLeases) lease.release();
+    throw new Error("taskIds length must match tasks length.");
+  }
+  // Generate deterministic task IDs unless permanent ids were assigned by a
+  // background execution group.
+  let taskItems: Array<{ taskId: string; task: WaveWorkerTask }>;
+  try {
+    taskItems = tasks.map((task, index) => {
+      const taskId = input.taskIds?.[index] ?? `task-${index}`;
+      validateSafeId(taskId, "taskId");
+      return { taskId, task };
+    });
+  } catch (error) {
+    for (const lease of initialExecutorLeases) lease.release();
+    throw error;
+  }
 
   const waveId = givenWaveId ?? randomUUID().replace(/-/g, "").slice(0, 12);
 
@@ -629,19 +750,29 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   let capture: WaveCaptureResult;
   try {
-    capture = await captureWaveBase({
-      cwd,
-      maxSnapshotBytes: config.maxSnapshotBytes,
-      artifactTtlMs: config.retainBundles === "always" ? 0 : config.waveArtifactTtlMs,
-      hooks: input.captureHooks,
-      waveId,
-      artifactDir,
-      signal,
-    });
+    const discovery = await discoverWaveSource(cwd, signal);
+    const releaseCapture = await sourceMutationCoordinator.acquire(discovery.captureRoot, signal);
+    try {
+      capture = await captureWaveBase({
+        cwd,
+        maxSnapshotBytes: config.maxSnapshotBytes,
+        artifactTtlMs: config.retainBundles === "always" ? 0 : config.waveArtifactTtlMs,
+        hooks: input.captureHooks,
+        waveId,
+        artifactDir,
+        signal,
+      });
+    } finally {
+      releaseCapture();
+    }
   } catch (err) {
+    for (const lease of initialExecutorLeases.splice(0)) lease.release();
     // Preserve typed WaveCaptureError; wrap other errors as capture_failed.
     if (err instanceof WaveCaptureError) {
       throw err;
+    }
+    if (signal?.aborted) {
+      throw new WaveCaptureError("Wave capture was cancelled.", "cancelled", waveId, "capturing");
     }
     const captureError = err instanceof Error ? err.message : "Capture failed.";
     throw new WaveCaptureError(`Wave capture failed: ${captureError}`, "capture_failed", waveId, "capturing");
@@ -655,8 +786,17 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     title: ti.task.title,
     status: "queued" as WaveWorkerLifecycleStatus,
     summary: "Queued for execution.",
+    taskDefinition: ti.task,
   }));
   await writeWaveManifest(waveRoot, buildManifest(waveId, "capturing", capture, initialTaskResults, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+  const waveOwner = await acquireWaveOwner(waveRoot, waveId);
+  let waveHeartbeatTail: Promise<void> = Promise.resolve();
+  const waveOwnerHeartbeat = setInterval(() => {
+    waveHeartbeatTail = waveHeartbeatTail.then(() => heartbeatWaveOwner(waveRoot, waveOwner)).catch(() => undefined);
+  }, 5_000);
+  waveOwnerHeartbeat.unref?.();
+  try {
+    await input.onWaveCreated?.(waveRoot);
 
   // ── Phase: working ──
   emitProgress(onProgress, "working", `Starting ${taskItems.length} worker(s) with max ${maxWorkers} concurrent`, undefined, {
@@ -683,8 +823,12 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   const infrastructureWarnings = (): Pick<WaveResult, "infrastructureWarnings"> =>
     manifestPersistenceWarning ? { infrastructureWarnings: [manifestPersistenceWarning] } : {};
 
-  const startWorker = async (taskIndex: number): Promise<void> => {
-    if (signal?.aborted) return;
+  const startWorker = async (taskIndex: number, initialLease: ExecutorPoolLease): Promise<void> => {
+    let currentLease = initialLease;
+    if (signal?.aborted) {
+      currentLease.release();
+      return;
+    }
 
     const item = taskItems[taskIndex];
     if (!item) return;
@@ -716,6 +860,16 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
           )],
           scopedModels,
           signal,
+          executorAssignment: currentLease,
+          acquireFailover: async (currentAssignment) => {
+            currentLease.release();
+            const nextLease = await executorPool.acquireAfter(currentAssignment, signal);
+            if (!nextLease) return undefined;
+            currentLease = nextLease;
+            return nextLease;
+          },
+          onLiveControl: (control) => input.onLiveControl?.(item.taskId, control),
+          takeDeferredSteering: () => input.takeDeferredSteering?.(item.taskId) ?? Promise.resolve([]),
           onUpdate: (subtaskUpdate) => {
             // Track per-task latest phase and reviewers.
             taskPhases.set(item.taskId, subtaskUpdate.phase);
@@ -839,6 +993,17 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         taskCandidateCommits.set(item.taskId, lastCycle.candidateCommit);
       }
 
+      // Settled lifecycle states are externally actionable, especially the
+      // brief accepted window before independent landing begins. Publish the
+      // result before planning/landing so background consumers can notify the
+      // orchestrator instead of skipping directly from review to landing.
+      emitProgress(onProgress, "working", `${item.taskId}: worker settled ${result.status}`, undefined, {
+        waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
+        counts: computeCounts(taskItems, results, activeSlots, taskPhases),
+        taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
+        activity: [`${item.taskId}: worker settled ${result.status}`],
+      });
+
       // Update manifest with current results — use truthful statuses.
       // Tasks that have a result use the result status.
       // Tasks currently running in active slots use their current phase.
@@ -894,6 +1059,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       };
       results.set(item.taskId, result);
     } finally {
+      currentLease.release();
       activeSlots.delete(slot);
     }
   };
@@ -910,28 +1076,26 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       break;
     }
 
-    // Wait for a slot to open if at capacity.
-    if (activeSlots.size >= maxWorkers) {
-      // Check abort while waiting.
-      if (signal?.aborted) break;
-      // Await the first worker to settle so we can refill the slot immediately.
-      // Wrap each promise with its index so we know which one settled.
-      const settledIndex = await Promise.race(
-        running.map((p, i) => p.then(() => i)),
-      );
-      if (settledIndex >= 0 && settledIndex < running.length) {
-        running.splice(settledIndex, 1);
-      }
-    }
-
-    if (signal?.aborted) break;
-
-    // Start as many workers as we have slots for.
+    // Fill global worker slots using the first executor pool entry with capacity.
     while (activeSlots.size < maxWorkers && nextTaskIndex < taskItems.length) {
       if (signal?.aborted) break;
+      const lease = initialExecutorLeases.shift() ?? executorPool.tryAcquire();
+      if (!lease) break;
       const taskIndex = nextTaskIndex++;
-      const p = startWorker(taskIndex);
+      const p = startWorker(taskIndex, lease);
       running.push(p);
+    }
+
+    if (nextTaskIndex >= taskItems.length || signal?.aborted) break;
+    if (running.length === 0) {
+      throw new Error("Executor pool has no available capacity.");
+    }
+
+    // Capacity may be constrained by either maxWorkers or a pool entry. Refill
+    // immediately when the first active lifecycle settles and releases a lease.
+    const settledIndex = await Promise.race(running.map((p, i) => p.then(() => i)));
+    if (settledIndex >= 0 && settledIndex < running.length) {
+      running.splice(settledIndex, 1);
     }
   }
 
@@ -939,6 +1103,9 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   if (running.length > 0) {
     await Promise.allSettled(running);
   }
+  // Defensive release for malformed/aborted dispatch paths that did not
+  // consume every caller-reserved lease.
+  for (const lease of initialExecutorLeases.splice(0)) lease.release();
 
   // ── Phase: settling (if aborted) ──
   if (signal?.aborted) {
@@ -970,6 +1137,14 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         acceptedCommitSha: r.acceptedCommitSha,
         unreviewed: r.unreviewed,
         reviewReport: r.reviewReport,
+        operationRecord: r.operationRecord,
+        bundle: r.bundle,
+        incidents: r.incidents,
+        checkpoint: r.checkpoint,
+        attempts: r.attempts,
+        diagnostics: r.diagnostics,
+        worktree: handles.find((handle) => handle.taskId === ti.taskId)?.worktreeRoot,
+        artifactDir: handles.find((handle) => handle.taskId === ti.taskId)?.artifactDir,
       };
     }
     const activeHandle = handles.find((h) => h.taskId === ti.taskId && !h.settled);
@@ -1005,11 +1180,11 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   // ── Abort: skip integration/landing ──
   if (signal?.aborted) {
-    emitProgress(onProgress, "aborted", "Wave aborted — skipping integration and landing", undefined, {
+    emitProgress(onProgress, "aborted", "Wave aborted — nothing landed; source workspace unchanged by this wave", undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Wave aborted — skipping integration and landing"],
+      activity: ["Wave aborted — nothing landed; source workspace unchanged by this wave"],
     });
 
     // Update manifest.
@@ -1029,43 +1204,20 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   }
 
   // ── Integration eligibility check ──
-  if (!integratePartial && hasFailedWorker) {
-    emitProgress(onProgress, "completed", "Integration skipped: failed worker(s) present (all-or-nothing policy)", undefined, {
+  if (hasFailedWorker) {
+    const workerFailureMessage = "Integration skipped: failed worker(s) present; nothing landed, source workspace unchanged by this wave, and recovery action is required";
+    emitProgress(onProgress, "completed", workerFailureMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Integration skipped: failed worker(s) present (all-or-nothing policy)"],
-    });
-
-    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, undefined, undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
-
-    // Cleanup clean worktrees.
-    await cleanupWorktrees(handles, capture);
-
-    return {
-      ...infrastructureWarnings(),
-      waveId,
-      waveRoot,
-      sourceRoot: capture.discovery.captureRoot,
-      phase: "completed",
-      taskResults: taskResultsArray,
-    };
-  }
-
-  // ── Partial mode: all workers failed — skip integration/landing ──
-  if (integratePartial && hasFailedWorker && eligibleWorkers.length === 0) {
-    emitProgress(onProgress, "completed", "Integration skipped: all workers failed (partial mode)", undefined, {
-      waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
-      counts: computeCounts(taskItems, results, activeSlots, taskPhases),
-      taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Integration skipped: all workers failed (partial mode)"],
+      activity: [workerFailureMessage],
     });
 
     const workerFailureOutcome: WaveIntegrationOutcome = {
       status: "worker_failure",
     };
 
-    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, "worker_failure", undefined, undefined, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
+    await queueManifestWrite(buildManifest(waveId, "completed", capture, taskResultsArray, "worker_failure", undefined, workerFailureOutcome, undefined, handles, taskExecutorInfo, taskReviewCycles, taskCandidateCommits));
 
     // Cleanup clean worktrees.
     await cleanupWorktrees(handles, capture);
@@ -1093,7 +1245,41 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   let integrationResult: WaveIntegrationResult | undefined;
 
   try {
-    integrationResult = await integrateWave(capture, eligibleWorkers, signal, input.integrationHooks);
+    if (input.independentLanding) {
+      const selected = eligibleWorkers[0];
+      const acceptedRef = taskResultsArray[0]?.acceptedRef;
+      if (selected && acceptedRef) {
+        const landingRef = await pinCommit(capture, selected.commitSha, { type: "integration" }, signal);
+        integrationResult = {
+            status: "integrated",
+            integratedRef: landingRef,
+            finalCommitSha: selected.commitSha,
+            workerMappings: [{
+              taskId: selected.taskId,
+              originalCommitSha: selected.commitSha,
+              integratedCommitSha: selected.commitSha,
+              order: 1,
+            }],
+            validationStatus: "not_run",
+          };
+      } else {
+        const landingRef = await pinCommit(capture, capture.baseCommit, { type: "integration" }, signal);
+        integrationResult = {
+            status: "no_changes",
+            baseCommitSha: capture.baseCommit,
+            integratedRef: landingRef,
+            workerMappings: [],
+            validationStatus: "not_run",
+          };
+      }
+    } else {
+      integrationResult = await retryInfrastructure(input.config, async (attempt) => {
+        if (attempt > 0) {
+          await removeWorktree(join(waveRoot, "integration"), capture.repositoryPath).catch(() => {});
+        }
+        return integrateWave(capture, eligibleWorkers, signal, input.integrationHooks);
+      }, signal);
+    }
 
     if (integrationResult.status === "integrated") {
       integrationOutcome = {
@@ -1129,6 +1315,8 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       integrationOutcome = {
         status: "no_changes",
         validationStatus: "not_run",
+        integratedRef: integrationResult.integratedRef,
+        finalCommitSha: integrationResult.baseCommitSha,
         worktree: integrationResult.worktree,
         workerMappings: [],
       };
@@ -1168,11 +1356,12 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   // ── Abort check after integration ──
   if (signal?.aborted) {
-    emitProgress(onProgress, "aborted", "Wave aborted after integration — skipping landing", undefined, {
+    const abortMessage = "Wave aborted after integration — nothing landed; source workspace unchanged by this wave";
+    emitProgress(onProgress, "aborted", abortMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Wave aborted after integration — skipping landing"],
+      activity: [abortMessage],
     });
 
     const abortIntegrationStatus = integrationOutcome?.status ?? integrationResult?.status;
@@ -1207,8 +1396,8 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       ? "error"
       : integrationResult?.status;
     const message = integrationOutcome?.status === "error"
-      ? "Integration infrastructure error — skipping landing"
-      : "Integration conflicted — skipping landing";
+      ? "Integration infrastructure error — nothing landed; source workspace unchanged by this wave and recovery action is required"
+      : "Integration conflicted — nothing landed; source workspace unchanged by this wave and conflict resolution is required";
     emitProgress(onProgress, "completed", message, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
@@ -1263,6 +1452,15 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     : capture.baseCommit;
   const integrationWorktree = integrationResult.worktree;
 
+  // Only the final revalidation and source mutation are serialized. If a
+  // previous task materialized a critical conflict, acquire waits until that
+  // gate is explicitly cleared.
+  const releaseSourceMutation = await sourceMutationCoordinator.acquire(
+    capture.discovery.captureRoot,
+    signal,
+  );
+  try {
+
   // ── Phase: planning ──
   emitProgress(onProgress, "planning", "Planning wave landing", undefined, {
     waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
@@ -1273,19 +1471,20 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   let landingPlan: LandingPlan;
   try {
-    landingPlan = await planWaveLanding(
+    landingPlan = await retryInfrastructure(input.config, () => planWaveLanding(
       capture,
       landingCommitSha,
       capture.discovery.captureRoot,
       signal,
-    );
+    ), signal);
   } catch (err) {
     if (signal?.aborted) {
-      emitProgress(onProgress, "aborted", "Wave aborted during landing planning", undefined, {
+      const abortMessage = "Wave aborted during landing planning — nothing landed; source workspace unchanged by this wave";
+      emitProgress(onProgress, "aborted", abortMessage, undefined, {
         waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
         counts: computeCounts(taskItems, results, activeSlots, taskPhases),
         taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-        activity: ["Wave aborted during landing planning"],
+        activity: [abortMessage],
       });
       await queueManifestWrite(buildManifest(
         waveId, "aborted", capture, taskResultsArray,
@@ -1310,19 +1509,25 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         landing: { status: "aborted" },
       };
     }
-    emitProgress(onProgress, "completed", `Landing planning failed: ${err instanceof Error ? err.message : "unknown"}`, undefined, {
+    const planningError = err instanceof Error ? err.message : "unknown";
+    const planningErrorMessage = `Landing planning failed: ${planningError} — nothing landed; source workspace unchanged by this wave and recovery action is required`;
+    const planningErrorOutcome: WaveLandingOutcome = {
+      status: "planning_error",
+      failureReason: planningError,
+    };
+    emitProgress(onProgress, "completed", planningErrorMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: [`Landing planning failed: ${err instanceof Error ? err.message : "unknown"}`],
+      activity: [planningErrorMessage],
     });
 
     await queueManifestWrite(buildManifest(
       waveId, "completed", capture, taskResultsArray,
       integrationResult.status,
-      undefined,
+      "planning_error",
       integrationOutcome,
-      undefined,
+      planningErrorOutcome,
       handles,
       taskExecutorInfo,
       taskReviewCycles,
@@ -1339,16 +1544,18 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       phase: "completed",
       taskResults: taskResultsArray,
       integration: integrationOutcome,
+      landing: planningErrorOutcome,
     };
   }
 
   // ── Abort check after planning ──
   if (signal?.aborted) {
-    emitProgress(onProgress, "aborted", "Wave aborted after planning — skipping landing", undefined, {
+    const abortMessage = "Wave aborted after planning — nothing landed; source workspace unchanged by this wave";
+    emitProgress(onProgress, "aborted", abortMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: ["Wave aborted after planning — skipping landing"],
+      activity: [abortMessage],
     });
 
     await queueManifestWrite(buildManifest(waveId, "aborted", capture, taskResultsArray,
@@ -1378,17 +1585,19 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   // If plan has conflicts, skip landing.
   if (landingPlan.conflicts.length > 0) {
-    emitProgress(onProgress, "completed", `Landing planning found ${landingPlan.conflicts.length} conflict(s)`, undefined, {
+    await input.onLandingConflict?.({ capture, plan: landingPlan });
+    const landingConflictMessage = `Landing planning found ${landingPlan.conflicts.length} conflict(s) — nothing landed; source workspace unchanged by this wave and conflict resolution is required`;
+    emitProgress(onProgress, "completed", landingConflictMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
       taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-      activity: [`Landing planning found ${landingPlan.conflicts.length} conflict(s)`],
+      activity: [landingConflictMessage],
     });
 
     await queueManifestWrite(buildManifest(
       waveId, "completed", capture, taskResultsArray,
       integrationResult.status,
-      undefined,
+      "conflicted",
       integrationOutcome,
       { status: "conflicted", conflicts: landingPlan.conflicts },
       handles,
@@ -1453,11 +1662,18 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
   // Cleanup clean worktrees including integration worktree.
   await cleanupWorktrees(handles, capture, integrationWorktree);
 
-  emitProgress(onProgress, "completed", `Wave completed: landing ${landingResult.status}`, undefined, {
+  const landingMessage = landingResult.status === "landed"
+    ? "Wave completed: executor changes landed in the source workspace"
+    : landingResult.status === "conflicted"
+      ? "Landing conflicted — nothing landed; source workspace unchanged by this wave and conflict resolution is required"
+      : landingResult.status === "rolled_back"
+        ? "Landing failed and was rolled back — source workspace restored; recovery action is required"
+        : "Landing rollback incomplete — source workspace may be partially modified; manual recovery is required";
+  emitProgress(onProgress, "completed", landingMessage, undefined, {
     waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
     counts: computeCounts(taskItems, results, activeSlots, taskPhases),
     taskStatuses: buildTaskStatuses(handles, results, taskPhases, taskReviewers, taskExecutorInfo, taskReviewCycles, taskCandidateCommits),
-    activity: [`Wave completed: landing ${landingResult.status}`],
+    activity: [landingMessage],
   });
 
   return {
@@ -1470,6 +1686,14 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
     integration: integrationOutcome,
     landing: landingOutcome,
   };
+  } finally {
+    releaseSourceMutation();
+  }
+  } finally {
+    clearInterval(waveOwnerHeartbeat);
+    await waveHeartbeatTail;
+    await releaseWaveOwner(waveRoot, waveOwner);
+  }
 }
 
 // ── landing outcome builder ──────────────────────────────────────────────────

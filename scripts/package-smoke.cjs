@@ -29,6 +29,7 @@ try {
     "dist/src/index.js",
     "scripts/little-coder-review-gate.sh",
     "scripts/little-coder-review.sh",
+    "scripts/little-coder-tool-policy.sh",
     "scripts/orchestrator-system-prompt.md",
     "scripts/fake-reviewer.cjs",
   ]) {

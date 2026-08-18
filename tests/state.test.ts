@@ -105,12 +105,21 @@ test("clearReviewState discards every review context and queued input", () => {
   });
   state.lastQuestionWindow = oldWindow;
   state.queuedUserInputsDuringReview.push("old queued input");
+  state.pendingModelDeliveries.push({
+    deliveryId: "queued-old-input",
+    kind: "queued_user_input",
+    channel: "follow_up",
+    message: "old queued input",
+    status: "queued",
+    createdAt: new Date().toISOString(),
+  });
 
   clearReviewState(state);
 
   assert.equal(state.reviewWindow, undefined);
   assert.equal(state.lastQuestionWindow, undefined);
   assert.deepEqual(state.queuedUserInputsDuringReview, []);
+  assert.equal(state.pendingModelDeliveries[0]?.status, "cancelled");
 
   rememberUserRequest(state, "fresh task");
   const freshWindow = state.reviewWindow!;

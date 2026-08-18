@@ -33,7 +33,16 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       "const out = args[args.indexOf('--output-last-message') + 1];",
       `writeFileSync(out, ${JSON.stringify(reviewJson)});`,
       "process.stdin.resume();",
-      "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'codex-session-1'})+'\\n'+JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:2}})+'\\n'));",
+      "process.stdin.on('end',()=>{const events=[",
+      "{type:'thread.started',thread_id:'codex-session-1'},",
+      "{type:'turn.started'},",
+      "{type:'item.started',item:{type:'reasoning'}},",
+      "{type:'item.completed',item:{type:'reasoning',text:'private reasoning'}},",
+      "{type:'item.completed',item:{type:'agent_message',text:'private reviewer response'}},",
+      "{type:'item.started',item:{type:'command_execution',command:'rg TODO',status:'in_progress'}},",
+      "{type:'item.completed',item:{type:'command_execution',command:'rg TODO',aggregated_output:'',exit_code:0,status:'completed'}},",
+      "{type:'turn.completed',usage:{input_tokens:1,output_tokens:2}}",
+      "];process.stdout.write(events.map(JSON.stringify).join('\\n')+'\\n');});",
     ].join("\n"), "utf8");
     await chmod(commandPath, 0o755);
 
@@ -45,6 +54,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
     });
 
     let session;
+    const activity: string[] = [];
     const result = await adapter.run({
       id: "codex",
       cwd: process.cwd(),
@@ -52,6 +62,7 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       bundleDir: dir,
       timeoutMs: 15000,
       onSession(value) { session = value; },
+      onUpdate(message) { activity.push(message); },
     });
     const resumed = await adapter.run({
       id: "codex",
@@ -78,6 +89,14 @@ test("CodexCliAdapter runs with read-only sandbox and review bundle access", asy
       ["severity", "file", "line", "issue", "recommendation"],
     );
     assert.equal(argv.includes("--ephemeral"), false);
+    assert.deepEqual(activity, [
+      "model turn started",
+      "model reasoning",
+      "bash · rg TODO",
+      "bash completed",
+      "model turn completed",
+    ]);
+    assert.equal(activity.some((message) => message.includes("private")), false);
     assert.deepEqual(resumedArgv.slice(0, 2), ["exec", "resume"]);
     assert.equal(resumedArgv.includes("codex-session-1"), true);
   } finally {

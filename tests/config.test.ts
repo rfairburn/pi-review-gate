@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { activeExternalExecutor, automaticReviewEnabled, loadConfig, normalizeConfig, resolveReviewers } from "../src/config";
+import { activeExternalExecutor, automaticReviewEnabled, loadConfig, materializeReviewConfig, normalizeConfig, resolveReviewers, resolvedExecutorPool } from "../src/config";
 
 test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-config-"));
@@ -70,6 +70,29 @@ test("loadConfig supports PI_REVIEW_GATE_DISABLED", () => {
 
   assert.equal(loaded.config.enabled, false);
   assert.equal(loaded.disabledReason, "PI_REVIEW_GATE_DISABLED is set");
+});
+
+test("normalizeConfig preserves the global subtasks view preference", () => {
+  const config = normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: true } });
+  assert.equal(config.ui?.subtasksViewExpanded, true);
+  assert.equal(materializeReviewConfig(config, []).ui, undefined, "UI state is not frozen into a conversation review window");
+  assert.throws(
+    () => normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: "yes" } }),
+    /ui\.subtasksViewExpanded must be a boolean/,
+  );
+});
+
+test("subtask notifications default to quiet and validate the noisy alternative", () => {
+  assert.equal(normalizeConfig({ enabled: true }).execution, undefined);
+  assert.equal(normalizeConfig({ enabled: true, execution: {} }).execution?.subtaskNotifications, "quiet");
+  assert.equal(
+    normalizeConfig({ enabled: true, execution: { subtaskNotifications: "noisy" } }).execution?.subtaskNotifications,
+    "noisy",
+  );
+  assert.throws(
+    () => normalizeConfig({ enabled: true, execution: { subtaskNotifications: "sometimes" } }),
+    /execution\.subtaskNotifications must be quiet or noisy/,
+  );
 });
 
 test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
@@ -324,6 +347,61 @@ test("normalizeConfig preserves internal and external executor selections", () =
   assert.deepEqual(internal.execution?.externalExecutors?.map((executor) => executor.id), ["codex", "fake"]);
 });
 
+test("normalizeConfig preserves an ordered executor pool with per-model capacity", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    execution: {
+      executorPool: [
+        {
+          entryId: "local-primary",
+          selection: { source: "little-coder", model: "qwen/local", thinkingLevel: "high" },
+          maxConcurrent: 1,
+        },
+        {
+          entryId: "cloud-overflow",
+          selection: { source: "external", id: "deepseek" },
+          maxConcurrent: 3,
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(resolvedExecutorPool(config), [
+    {
+      entryId: "local-primary",
+      selection: { source: "little-coder", model: "qwen/local", thinkingLevel: "high" },
+      maxConcurrent: 1,
+    },
+    {
+      entryId: "cloud-overflow",
+      selection: { source: "external", id: "deepseek" },
+      maxConcurrent: 3,
+    },
+  ]);
+});
+
+test("normalizeConfig rejects invalid or duplicate executor pool entries", () => {
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    execution: {
+      executorPool: [{
+        entryId: "bad-capacity",
+        selection: { source: "external", id: "deepseek" },
+        maxConcurrent: 17,
+      }],
+    },
+  }), /maxConcurrent/);
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    execution: {
+      executorPool: [
+        { entryId: "first", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+        { entryId: "second", selection: { source: "external", id: "deepseek" }, maxConcurrent: 2 },
+      ],
+    },
+  }), /duplicate executor pool selection/);
+});
+
 test("resolveReviewers reports stale and duplicate enabled ids without rejecting config loading", () => {
   const config = normalizeConfig({
     enabled: true,
@@ -390,8 +468,8 @@ test("scoped little-coder models resolve as reviewers only when currently availa
   assert.equal(automaticReviewEnabled(config, ["openai-codex/gpt-5.6-sol"]), true);
 });
 
-test("normalizeConfig accepts execution.maxWorkers 1..4", () => {
-  for (const w of [1, 2, 3, 4]) {
+test("normalizeConfig accepts execution.maxWorkers 1..16", () => {
+  for (const w of [1, 2, 4, 8, 12, 16]) {
     const config = normalizeConfig({
       enabled: true,
       execution: { maxWorkers: w },
@@ -401,8 +479,8 @@ test("normalizeConfig accepts execution.maxWorkers 1..4", () => {
 });
 
 test("normalizeConfig rejects invalid execution.maxWorkers", () => {
-  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 0 } }), /maxWorkers must be between 1 and 4/);
-  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 5 } }), /maxWorkers must be between 1 and 4/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 0 } }), /maxWorkers must be between 1 and 16/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 17 } }), /maxWorkers must be between 1 and 16/);
   assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 2.5 } }), /maxWorkers must be an integer/);
   assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: "2" } }), /maxWorkers must be an integer/);
 });

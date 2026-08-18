@@ -42,7 +42,7 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
       prompt: "initial task",
       artifactDir,
       turn: 1,
-      allowedTools: ["read", "bash", "ExecuteSubtasks"],
+      allowedTools: ["read", "bash", "SubtasksStart", "SubtasksSteer"],
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
@@ -53,8 +53,8 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
     assert.equal(result.session.adapter, "little-coder-model");
     const argv: string[] = JSON.parse(await readFile(capture, "utf8"));
     assert.equal(argv[argv.indexOf("--mode") + 1], "rpc");
-    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,ExecuteSubtasks");
-    assert.deepEqual(JSON.parse(await readFile(environmentCapture, "utf8")), { allowedTools: "read,bash,ExecuteSubtasks" });
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,SubtasksStart,SubtasksSteer");
+    assert.deepEqual(JSON.parse(await readFile(environmentCapture, "utf8")), { allowedTools: "read,bash,SubtasksStart,SubtasksSteer" });
     assert.equal(argv.includes("--print"), false);
 
     let resolveInterruptControl!: (control: ExecutorLiveControl) => void;

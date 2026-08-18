@@ -13,6 +13,19 @@ import {
 import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
 
+const executionToolNames = [
+  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue",
+  "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
+];
+
+type ExecuteTool = (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+
+function executionTool(tools: Array<Record<string, any>>, name: string): Record<string, any> {
+  const tool = tools.find((candidate) => candidate.name === name);
+  assert.ok(tool, `${name} was not registered`);
+  return tool;
+}
+
 function harness(options: { slowExecutor?: boolean; expandedView?: boolean } = {}) {
   const tools: Array<Record<string, any>> = [];
   const commands: string[] = [];
@@ -26,7 +39,7 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean } = {
       commandHandlers.set(name, options.handler);
     },
     setToolActive(name: string, enabled: boolean) { active.push({ name, enabled }); },
-    getActiveTools() { return ["read", "bash", "ExecuteSubtasks"]; },
+    getActiveTools() { return ["read", "bash", ...executionToolNames]; },
   };
   const config = normalizeConfig({
     enabled: true,
@@ -57,10 +70,10 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean } = {
   return { tools, commands, commandHandlers, notices, active, manager, config };
 }
 
-test("ExecuteSubtasks is the sole execution tool and exposes the durable action surface", () => {
+test("operation-specific execution tools expose exact durable schemas", () => {
   const { tools, commands, active } = harness();
-  assert.deepEqual(tools.map((tool) => tool.name), ["ExecuteSubtasks"]);
-  assert.deepEqual(active.at(-1), { name: "ExecuteSubtasks", enabled: true });
+  assert.deepEqual(tools.map((tool) => tool.name), executionToolNames);
+  assert.deepEqual(active, executionToolNames.map((name) => ({ name, enabled: true })));
   assert.deepEqual(commands.sort(), [
     "subtask-add",
     "subtask-force-merge",
@@ -71,21 +84,33 @@ test("ExecuteSubtasks is the sole execution tool and exposes the durable action 
     "subtasks",
     "subtasks-view",
   ]);
-  const parameters = tools[0]!.parameters as Record<string, any>;
-  assert.deepEqual(parameters.required, ["action"]);
-  assert.deepEqual(parameters.properties.action.enum, [
-    "start", "add", "inspect", "continue", "steer", "interrupt", "force_merge", "mark_clean",
-  ]);
-  assert.equal(parameters.properties.tasks.minItems, 1);
-  assert.equal(parameters.properties.tasks.maxItems, 16);
-  assert.equal(parameters.properties.tasks.items.properties.wakeOn, undefined);
-  assert.equal(parameters.properties.maxWorkers, undefined);
-  assert.equal(parameters.properties.parallelism, undefined);
-  assert.match(parameters.properties.interruptMode.description, /must always be inspected afterward/i);
-  assert.match(parameters.properties.mergeAnyhow.description, /always requires manual workspace inspection/i);
-  assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Steering wins over review/.test(guideline)));
-  assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Quiet mode \(the default\)/.test(guideline)));
-  assert.ok(tools[0]!.promptGuidelines.some((guideline: string) => /Every force_merge outcome requires manual inspection/.test(guideline)));
+  const expectedProperties: Record<string, string[]> = {
+    SubtasksStart: ["tasks"],
+    SubtasksAdd: ["executionId", "tasks"],
+    SubtasksInspect: ["executionId", "taskId", "offset", "lines"],
+    SubtasksContinue: ["executionId", "taskId", "bundle", "instructions", "instructionId"],
+    SubtasksSteer: ["executionId", "taskId", "instructions", "instructionId"],
+    SubtasksInterrupt: ["executionId", "taskId", "interruptMode", "instructionId"],
+    SubtasksForceMerge: ["executionId", "taskId", "mergeAnyhow", "instructionId"],
+    SubtasksMarkClean: [],
+  };
+  for (const tool of tools) {
+    assert.equal(tool.parameters.additionalProperties, false, tool.name);
+    assert.deepEqual(Object.keys(tool.parameters.properties), expectedProperties[tool.name], tool.name);
+    assert.equal(tool.parameters.properties.action, undefined, tool.name);
+    assert.ok(tool.promptGuidelines.some((guideline: string) => /Steering wins over review/.test(guideline)), tool.name);
+    assert.ok(tool.promptGuidelines.some((guideline: string) => /Quiet mode \(the default\)/.test(guideline)), tool.name);
+  }
+  const start = executionTool(tools, "SubtasksStart").parameters;
+  assert.deepEqual(start.required, ["tasks"]);
+  assert.equal(start.properties.tasks.minItems, 1);
+  assert.equal(start.properties.tasks.maxItems, 16);
+  assert.equal(start.properties.tasks.items.properties.wakeOn, undefined);
+  assert.equal(start.properties.instructions, undefined);
+  const forceMerge = executionTool(tools, "SubtasksForceMerge").parameters;
+  assert.equal(forceMerge.properties.bundle, undefined);
+  assert.match(forceMerge.properties.mergeAnyhow.description, /manual workspace inspection/i);
+  assert.match(executionTool(tools, "SubtasksInterrupt").parameters.properties.interruptMode.description, /must always be inspected afterward/i);
 });
 
 test("background task state predicates classify every durable state consistently", () => {
@@ -100,9 +125,8 @@ test("background task state predicates classify every durable state consistently
 test("execution review readiness reports every unfinished task and omits terminal tasks", async () => {
   const { tools, manager } = harness({ slowExecutor: true });
   try {
-    const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+    const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
     const started = await execute("readiness-start", {
-      action: "start",
       tasks: [{ title: "readiness task", instructions: "remain active", acceptanceCriteria: ["eventually finish"] }],
     }, undefined, undefined, {});
     assert.equal(started.isError, false);
@@ -144,18 +168,18 @@ test("saved executor settings govern queued dispatch while existing leases keep 
       registerTool(tool: Record<string, any>) { tools.push(tool); },
       registerCommand() {},
       setToolActive() {},
-      getActiveTools() { return ["read", "ExecuteSubtasks"]; },
+      getActiveTools() { return ["read", ...executionToolNames]; },
     },
     config,
     state: createState(),
     cwd: () => process.cwd(),
   });
   manager.sync();
-  const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const inspectTool = executionTool(tools, "SubtasksInspect").execute as ExecuteTool;
   let executionRoot: string | undefined;
   try {
-    const started = await execute("live-settings-start", {
-      action: "start",
+    const started = await start("live-settings-start", {
       tasks: [
         { title: "existing lease", instructions: "remain active", acceptanceCriteria: ["eventually finish"] },
         { title: "queued dispatch", instructions: "remain queued", acceptanceCriteria: ["eventually finish"] },
@@ -163,7 +187,7 @@ test("saved executor settings govern queued dispatch while existing leases keep 
     }, undefined, undefined, {});
     executionRoot = started.details.root as string;
     const executionId = started.details.executionId as string;
-    const inspect = async () => (await execute("live-settings-inspect", { action: "inspect", executionId }, undefined, undefined, {})).details as Record<string, any>;
+    const inspect = async () => (await inspectTool("live-settings-inspect", { executionId }, undefined, undefined, {})).details as Record<string, any>;
     await waitUntil(async () => (await inspect()).tasks[0]?.executorEntryId === "qwen");
 
     config.execution!.executorPool = [
@@ -185,20 +209,23 @@ test("saved executor settings govern queued dispatch while existing leases keep 
   }
 });
 
-test("ExecuteSubtasks rejects malformed and obsolete requests with diagnostics", async () => {
+test("operation-specific execution tools reject malformed and obsolete requests with diagnostics", async () => {
   const { tools } = harness();
-  const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   for (const [id, request] of [
-    ["empty", { action: "start", tasks: [] }],
-    ["obsolete", { action: "start", tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"] }], maxWorkers: 2 }],
-    ["unknown-task-key", { action: "start", tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"], extra: true }] }],
-    ["removed-wake-policy", { action: "start", tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"], wakeOn: { completion: "now" } }] }],
-    ["missing-steer-target", { action: "steer", instructions: "change direction" }],
+    ["empty", { tasks: [] }],
+    ["obsolete", { tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"] }], maxWorkers: 2 }],
+    ["unknown-task-key", { tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"], extra: true }] }],
+    ["removed-wake-policy", { tasks: [{ title: "T", instructions: "I", acceptanceCriteria: ["A"], wakeOn: { completion: "now" } }] }],
   ] as const) {
-    const result = await execute(id, request, undefined, undefined, {});
+    const result = await start(id, request, undefined, undefined, {});
     assert.equal(result.isError, true, id);
     assert.equal(typeof result.details.diagnostic, "string", id);
   }
+  const steer = executionTool(tools, "SubtasksSteer").execute as ExecuteTool;
+  const missingTarget = await steer("missing-steer-target", { instructions: "change direction" }, undefined, undefined, {});
+  assert.equal(missingTarget.isError, true);
+  assert.equal(typeof missingTarget.details.diagnostic, "string");
 });
 
 test("restoring an unverifiable background group drops it with a visible diagnostic", async () => {
@@ -219,13 +246,14 @@ test("restoring an unverifiable background group drops it with a visible diagnos
   assert.match(notices.join("\n"), /background execution was not restored/);
 });
 
-test("ExecuteSubtasks renders action, task count, and durable task states", () => {
+test("operation-specific execution tools render operation, task count, and durable task states", () => {
   const { tools } = harness();
   const theme = { bold: (value: string) => value, fg: (_color: string, value: string) => value };
-  const call = tools[0]!.renderCall({ action: "start", tasks: [{}, {}, {}] }, theme).render(100).join("\n");
-  assert.match(call, /ExecuteSubtasks start/);
+  const start = executionTool(tools, "SubtasksStart");
+  const call = start.renderCall({ tasks: [{}, {}, {}] }, theme).render(100).join("\n");
+  assert.match(call, /SubtasksStart/);
   assert.match(call, /3 tasks/);
-  const rendered = tools[0]!.renderResult({
+  const rendered = executionTool(tools, "SubtasksInspect").renderResult({
     content: [{ type: "text", text: "inspect: execution exec-1" }],
     details: {
       tasks: [
@@ -271,11 +299,10 @@ test("/subtasks-view toggles a live multiline widget without entering model cont
   assert.equal(config.ui?.subtasksViewExpanded, false);
 });
 
-test("ExecuteSubtasks start result explains that queued work may have startup delay", async () => {
+test("SubtasksStart result explains that queued work may have startup delay", async () => {
   const { tools, manager } = harness();
-  const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+  const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   const result = await execute("start-delay", {
-    action: "start",
     tasks: [{ title: "Waiting work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
   assert.match(result.content[0].text, /Queued tasks may wait for executor startup or available pool capacity/);
@@ -285,16 +312,15 @@ test("ExecuteSubtasks start result explains that queued work may have startup de
   assert.match(result.content[0].text, /DO NOT POLL for task-state changes/);
   assert.match(result.content[0].text, /repeated inspect loop, or other waiting surrogate/);
   assert.match(result.content[0].text, new RegExp(result.details.tasks[0].taskId));
-  assert.match(result.content[0].text, /Task handles \(retain these for steer\/interrupt\/inspect\)/);
-  assert.deepEqual(result.details.tasks[0].definition.executorAllowedTools, ["read", "bash", "ExecuteSubtasks"]);
+  assert.match(result.content[0].text, /Task handles \(retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect\)/);
+  assert.deepEqual(result.details.tasks[0].definition.executorAllowedTools, ["read", "bash", ...executionToolNames]);
   await manager.shutdown();
 });
 
 test("slash-command task inspection uses an interactive picker when IDs are omitted", async () => {
   const { tools, commandHandlers, notices, manager } = harness();
-  const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+  const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   const started = await execute("picker-start", {
-    action: "start",
     tasks: [{ title: "Pick me", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
   const selectedOptions: string[][] = [];
@@ -314,9 +340,8 @@ test("slash-command task inspection uses an interactive picker when IDs are omit
 
 test("slash-command interrupt selects both the task and outcome when IDs are omitted", async () => {
   const { tools, commandHandlers, notices, manager } = harness({ slowExecutor: true });
-  const execute = tools[0]!.execute as (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+  const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   const started = await execute("interrupt-picker-start", {
-    action: "start",
     tasks: [{ title: "Cancel me", instructions: "Wait for interruption", acceptanceCriteria: ["Task is interrupted"] }],
   }, undefined, undefined, {});
   const selections: string[] = [];

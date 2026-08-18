@@ -8,6 +8,11 @@ import { activate } from "../src/index";
 import { queueModelDelivery } from "../src/durable-delivery";
 import { SessionStateStore } from "../src/session-state";
 
+const executionToolNames = [
+  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue",
+  "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
+];
+
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
 
@@ -147,8 +152,10 @@ test("automatic review waits while execution subtasks remain active", async () =
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
       registerCommand() {},
-      registerTool(tool: typeof executionTool) { executionTool = tool; },
-      getActiveTools() { return ["read", "bash", "ExecuteSubtasks"]; },
+      registerTool(tool: typeof executionTool & { name?: string }) {
+        if (tool?.name === "SubtasksStart") executionTool = tool;
+      },
+      getActiveTools() { return ["read", "bash", ...executionToolNames]; },
       setToolActive() {},
       notify(message: string) { notices.push(message); },
     };
@@ -160,7 +167,6 @@ test("automatic review waits while execution subtasks remain active", async () =
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     await executionTool.execute("start-slow-task", {
-      action: "start",
       tasks: [{
         title: "slow delegated work",
         instructions: "Remain active while the readiness gate is tested.",
@@ -230,8 +236,8 @@ test("delegated execution tool activation waits for session_start", async () => 
 
     runtimeInitialized = true;
     await trigger(hooks, "session_start", { cwd: dir });
-    assert.deepEqual(registeredTools, ["ExecuteSubtasks"]);
-    assert.deepEqual(activeTools, ["read", "ExecuteSubtasks"]);
+    assert.deepEqual(registeredTools, executionToolNames);
+    assert.deepEqual(activeTools, ["read", ...executionToolNames]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

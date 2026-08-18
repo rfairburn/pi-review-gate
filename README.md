@@ -191,16 +191,17 @@ Top-level `enabled: false` is the automatic-review master switch and does not
 disable a configured executor pool. The environment kill switches disable the whole
 extension, including delegated execution.
 
-With an executor pool selected, the plugin exposes one model tool:
-`ExecuteSubtasks`. `start` and `add` accept 1–16 bounded tasks and return stable
-execution/task handles immediately. Work continues in the background up to the
-configured global and per-model capacities. Each task owns its capture,
+With an executor pool selected, the plugin exposes one exact-schema tool per
+operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`,
+`SubtasksContinue`, `SubtasksSteer`, `SubtasksInterrupt`,
+`SubtasksForceMerge`, and `SubtasksMarkClean`. Start and add accept 1–16 bounded
+tasks and return stable execution/task handles immediately. Work continues in
+the background up to the configured global and per-model capacities. Each task owns its capture,
 worktree, session, checkpoint, review, and landing outcome; there is no
 wave-wide shared base or all-workers integration barrier.
 
-The actions are `start`, `add`, `inspect`, `continue`, `steer`, `interrupt`,
-`force_merge`, and `mark_clean`. `continue` accepts either an associated task
-handle or a verified reattachment bundle. `steer` is valid while a task is
+`SubtasksContinue` accepts either an associated task handle or a verified
+reattachment bundle. `SubtasksSteer` is valid while a task is
 queued, starting, in a live executor turn, or being reviewed. Queued instructions
 are durable, live instructions use the adapter's acknowledged transport, and a
 steer during review cancels that review and resumes the executor with the changed
@@ -229,23 +230,23 @@ an unparseable ShellStart success fails closed and visibly blocks automatic
 review. A process that deliberately creates a new session/process group can
 escape this best-effort boundary and is not claimed as covered.
 
-The same top-level review-readiness gate covers `ExecuteSubtasks`: automatic
+The same top-level review-readiness gate covers execution subtasks: automatic
 review of the primary orchestrator is deferred while any task is queued,
 capturing, running, reviewing, accepted, waiting to land, or landing. Normal
 task completion is delivered as a follow-up and failure is delivered
 immediately; only after no execution task remains active may that turn enter
 automatic review.
 
-`interrupt` explicitly chooses failure or merge disposition. A normal cancellation
+`SubtasksInterrupt` explicitly chooses failure or merge disposition. A normal cancellation
 uses `interrupt_as_failure`; `interrupt_with_merge` must be requested explicitly.
-`force_merge`
+`SubtasksForceMerge`
 operates only on a stopped task with an accepted commit or verified checkpoint;
 `mergeAnyhow` may deliberately install ordinary conflict markers in main.
-Both `interrupt_with_merge` and every direct `force_merge` are mechanical landing
+Both `interrupt_with_merge` and every direct force merge are mechanical landing
 attempts, not verification that the requested changes are present or correct.
 The main workspace must always be inspected manually afterward, including when
 the task's authoritative state is `landed`.
-`mark_clean` validates that those markers are resolved before queued landings
+`SubtasksMarkClean` validates that those markers are resolved before queued landings
 resume. No singular or snake_case compatibility tool is registered.
 
 Executor failures are checkpointed to a protected recovery ref before bounded
@@ -303,7 +304,7 @@ Foreground automatic reviews, `/review-now`, and reviewer-question commands show
 the active reviewer milestone and elapsed time in the status line until the
 review completes or is cancelled.
 
-### Background execution with `ExecuteSubtasks`
+### Background execution tools
 
 Each task runs in an isolated worktree with its own review lifecycle and
 permanent task UUID. Tasks are specified as an array of 1–16 items.
@@ -320,7 +321,7 @@ number of workers that must run.
 **Independent landing**: As soon as one task is accepted, it acquires the short
 source-mutation lease, replans against current main, and attempts to land. It
 does not wait for, integrate with, or roll back a sibling. A completed landing
-immediately frees capacity, and `add` can top the execution group back up. The
+immediately frees capacity, and `SubtasksAdd` can top the execution group back up. The
 landed changes remain uncommitted; source HEAD, index, staging state, and stash
 are preserved.
 
@@ -348,16 +349,16 @@ and `retainBundles: "always"` disables wave GC.
 three-way conflict, clean paths are applied and ordinary diff3 markers are
 materialized for the conflicting text paths in main. A durable critical gate
 then blocks every later landing, identifies the owning task and paths in
-`inspect`, and injects a priority instruction on every matching orchestrator
-turn. After resolving the files, use `mark_clean`; it verifies that markers are
+`SubtasksInspect`, and injects a priority instruction on every matching orchestrator
+turn. After resolving the files, use `SubtasksMarkClean`; it verifies that markers are
 gone, checkpoints the resolution, clears the gate, and wakes queued landings.
 Stopped tasks retain verified checkpoints and reattachment bundles for
-`continue` or `force_merge`; `force_merge` with `mergeAnyhow` deliberately
+`SubtasksContinue` or `SubtasksForceMerge`; `SubtasksForceMerge` with `mergeAnyhow` deliberately
 materializes the same conflict state when a clean landing is impossible. A
 force-merge result describes only the mechanical landing outcome; manually
 inspect the main workspace after every attempt before claiming task success.
 
-Every failed or non-landed `ExecuteSubtasks` action returns the complete group
+Every failed or non-landed execution-tool operation returns the complete group
 and task inspection: durable handles, current source disposition, commands and
 acknowledgements, incidents, checkpoint/bundle data, artifact paths, conflicts,
 and concrete recovery actions. This state remains inspectable after compaction

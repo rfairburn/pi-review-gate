@@ -644,7 +644,7 @@ export class BackgroundExecutionController {
           command.status = "failed";
           command.error = task.summary;
           await this.save(group);
-          throw new Error(`${task.summary} Re-run force_merge with mergeAnyhow only if ordinary conflict markers should be materialized.`);
+          throw new Error(`${task.summary} Re-run SubtasksForceMerge with mergeAnyhow only if ordinary conflict markers should be materialized.`);
         }
         const materialized = await materializeLandingConflicts(capture, plan, `forced subtask ${task.taskId}`);
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths);
@@ -741,7 +741,7 @@ export class BackgroundExecutionController {
       "CRITICAL REVIEW-GATE WORKSPACE CONFLICT:",
       `Execution ${gate.executionId}, task ${gate.taskId} materialized merge-conflict markers in the main workspace.`,
       `Conflicted paths: ${gate.paths.join(", ")}.`,
-      "Automatic task landings are blocked. Resolve these files now, verify the workspace, then call ExecuteSubtasks with action mark_clean.",
+      "Automatic task landings are blocked. Resolve these files now, verify the workspace, then call SubtasksMarkClean.",
       "Do not claim the workspace is clean or continue unrelated source mutations while this gate remains active.",
     ].join("\n");
   }

@@ -346,7 +346,7 @@ export async function activate(pi: unknown): Promise<void> {
           ? `${backgroundReadiness.running.length} background process group(s) remain active (${backgroundReadiness.running.map((job) => `${job.id}: ${job.label}`).join(", ")})`
           : undefined,
         executionReadiness.length > 0
-          ? `${executionReadiness.length} execution subtask(s) remain active (${executionReadiness.map((task) => `${task.taskId}: ${task.title} [${task.state}]`).join(", ")})`
+          ? `${executionReadiness.length} background subtask(s) remain active (${executionReadiness.map((task) => `${task.taskId}: ${task.kind} · ${task.title} [${task.state}]`).join(", ")})`
           : undefined,
       ].filter((value): value is string => Boolean(value));
       await sendNotice(

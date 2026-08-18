@@ -14,18 +14,17 @@
     ]
   },
   "execution": {
-    "executorPool": [
+    "workerResources": [
       {
-        "entryId": "local-primary",
+        "resourceId": "local-primary",
         "selection": {
           "source": "little-coder",
-          "model": "openai-codex/gpt-5.6-sol",
-          "thinkingLevel": "high"
+          "model": "openai-codex/gpt-5.6-sol"
         },
         "maxConcurrent": 1
       },
       {
-        "entryId": "codex-cloud-overflow",
+        "resourceId": "codex-cloud-overflow",
         "selection": {
           "source": "external",
           "id": "codex-luna"
@@ -33,7 +32,7 @@
         "maxConcurrent": 3
       },
       {
-        "entryId": "claude-overflow",
+        "resourceId": "claude-overflow",
         "selection": {
           "source": "external",
           "id": "claude"
@@ -41,6 +40,17 @@
         "maxConcurrent": 4
       }
     ],
+    "routes": {
+      "execute": [
+        { "resourceId": "local-primary", "thinkingLevel": "high" },
+        { "resourceId": "codex-cloud-overflow" },
+        { "resourceId": "claude-overflow" }
+      ],
+      "research": [
+        { "resourceId": "codex-cloud-overflow" },
+        { "resourceId": "local-primary", "thinkingLevel": "medium" }
+      ]
+    },
     "maxWorkers": 4,
     "subtaskNotifications": "quiet",
     "retryPolicy": {

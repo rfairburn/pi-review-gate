@@ -1,23 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, mkdir, mkdtemp, readFile, realpath, rename } from "node:fs/promises";
+import { open, mkdir, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { DEFAULT_SUBTASK_NOTIFICATION_MODE, type ReviewGateConfig } from "../config";
-import { externalAgentCatalog, resolvedExecutorPool } from "../config";
+import { externalAgentCatalog, resolvedWorkerResources, resolvedWorkerRoute } from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts, unresolvedConflictMarkers } from "./conflict-materialization";
-import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
+import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
 import { continueOperation, inspectOperation } from "./operation-actions";
 import type { ReattachmentBundle } from "./operation-record";
 import { readOperationRecord } from "./operation-record";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 import { executeWave, type WaveProgressUpdate, type WaveResult } from "./wave-controller";
-import type { WaveWorkerTask } from "./wave-worker";
-import { readWaveCaptureRecord } from "./wave-repository";
+import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
+import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
+import { researchWorkspaceChanges } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
+import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
 import type { ExecutorInteractionAcknowledgement, ExecutorLiveControl } from "./types";
 
 const GROUP_VERSION = 1;
@@ -32,6 +34,7 @@ export const BACKGROUND_TASK_STATES = [
   "waiting_to_land",
   "landing",
   "landed",
+  "reported",
   "failed",
   "interrupted",
   "conflicted",
@@ -40,6 +43,7 @@ export const BACKGROUND_TASK_STATES = [
 ] as const;
 
 export type BackgroundTaskState = typeof BACKGROUND_TASK_STATES[number];
+export type BackgroundTaskKind = "execute" | "research";
 
 const ACTIVE_TASK_STATES: ReadonlySet<BackgroundTaskState> = new Set([
   "queued",
@@ -126,6 +130,9 @@ export interface BackgroundTaskRecord {
   executorEntryId?: string;
   lastRuntimeConfigDigest?: string;
   result?: WaveResult;
+  researchResult?: WaveWorkerResult;
+  report?: string;
+  reportPath?: string;
   summary?: string;
   error?: string;
   activity: BackgroundActivityEvent[];
@@ -148,6 +155,7 @@ export interface BackgroundExecutionGroup {
   revision: number;
   integritySha256: string;
   executionId: string;
+  kind: BackgroundTaskKind;
   root: string;
   cwd: string;
   createdAt: string;
@@ -192,6 +200,7 @@ interface BackgroundControllerInput {
 
 export interface BackgroundInspection {
   executionId: string;
+  kind: BackgroundTaskKind;
   revision: number;
   root: string;
   cwd: string;
@@ -212,6 +221,7 @@ export interface BackgroundInspection {
 
 export interface BackgroundReviewReadinessTask {
   executionId: string;
+  kind: BackgroundTaskKind;
   taskId: string;
   title: string;
   state: BackgroundTaskState;
@@ -234,7 +244,7 @@ export class BackgroundExecutionController {
   private expandedView = false;
 
   constructor(private readonly input: BackgroundControllerInput) {
-    this.pool = new ExecutorPoolScheduler(resolvedExecutorPool(input.config));
+    this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
     this.expandedView = input.config.ui?.subtasksViewExpanded === true;
   }
 
@@ -260,7 +270,7 @@ export class BackgroundExecutionController {
   }
 
   refreshPool(): void {
-    this.pool.reconfigure(resolvedExecutorPool(this.input.config));
+    this.pool.reconfigure(resolvedWorkerResources(this.input.config));
     void this.pump();
   }
 
@@ -352,13 +362,16 @@ export class BackgroundExecutionController {
         gate.reason,
       );
     }
-    this.pool = new ExecutorPoolScheduler(resolvedExecutorPool(this.input.config));
+    this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(this.input.config));
     this.updateIndicator();
     void this.pump();
   }
 
-  async start(tasks: BackgroundTaskDefinition[]): Promise<BackgroundInspection> {
+  async start(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind = "execute"): Promise<BackgroundInspection> {
     if (this.shuttingDown) throw new Error("Application shutdown is in progress.");
+    if (resolvedWorkerRoute(this.input.config, kind).length === 0) {
+      throw new Error(`No ${kind} worker route is configured. Add at least one eligible resource in /review-settings.`);
+    }
     const root = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
     const executionId = `exec-${randomUUID()}`;
     const now = new Date().toISOString();
@@ -367,6 +380,7 @@ export class BackgroundExecutionController {
       revision: 0,
       integritySha256: "",
       executionId,
+      kind,
       root,
       cwd: resolve(this.input.cwd()),
       createdAt: now,
@@ -399,6 +413,7 @@ export class BackgroundExecutionController {
     const count = Math.max(1, Math.min(lines ?? MAX_ACTIVITY, 500));
     return {
       executionId: group.executionId,
+      kind: group.kind,
       revision: group.revision,
       root: group.root,
       cwd: group.cwd,
@@ -440,6 +455,7 @@ export class BackgroundExecutionController {
       .filter((task) => isActiveTaskState(task.state))
       .map((task) => ({
         executionId: group.executionId,
+        kind: group.kind,
         taskId: task.taskId,
         title: task.definition.title,
         state: task.state,
@@ -503,6 +519,7 @@ export class BackgroundExecutionController {
           revision: 0,
           integritySha256: "",
           executionId: `exec-${randomUUID()}`,
+          kind: definition.backgroundKind === "research" ? "research" : "execute",
           root,
           cwd: resolve(this.input.cwd()),
           createdAt: now,
@@ -570,6 +587,9 @@ export class BackgroundExecutionController {
     actor: "model" | "user";
   }): Promise<BackgroundInspection> {
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
+    if (group.kind === "research" && input.mode === "interrupt_with_merge") {
+      throw new Error("Research tasks cannot use interrupt_with_merge because research workspaces are never eligible to land. Use interrupt_as_failure.");
+    }
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) return this.inspect(group.executionId, task.taskId);
     const runtime = this.runtimes.get(task.taskId);
@@ -648,6 +668,7 @@ export class BackgroundExecutionController {
     actor: "model" | "user" | "system";
   }): Promise<BackgroundInspection> {
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
+    if (group.kind === "research") throw new Error("Research tasks have reports, not mergeable checkpoints; force-merge is unavailable.");
     if (this.runtimes.has(task.taskId) || isActiveTaskState(task.state)) {
       throw new Error(`Task ${task.taskId} still has a live or queued writer; interrupt and await acknowledgement before force-merge.`);
     }
@@ -847,12 +868,14 @@ export class BackgroundExecutionController {
       while (this.active < maxWorkers) {
         let launched = false;
         for (const queued of this.queuedTasks()) {
+          const route = resolvedWorkerRoute(this.input.config, queued.group.kind);
+          if (route.length === 0) continue;
           const requiredEntry = queued.task.pendingContinuation
             ? await continuationEntryId(queued.task).catch(() => undefined)
             : undefined;
-          const lease = requiredEntry && this.pool.hasEntry(requiredEntry)
-            ? this.pool.tryAcquireEntry(requiredEntry)
-            : this.pool.tryAcquire();
+          const lease = requiredEntry && route.some((entry) => entry.entryId === requiredEntry)
+            ? this.pool.tryAcquireRouteEntry(requiredEntry, route)
+            : this.pool.tryAcquireRoute(route);
           if (!lease) continue;
           const currentConfigDigest = configDigest(this.input.config);
           const settingsChanged = Boolean(
@@ -892,9 +915,13 @@ export class BackgroundExecutionController {
     const executionActiveBeforeLaunch = group.tasks.filter((candidate) => this.runtimes.has(candidate.taskId)).length;
     group.peakConcurrency = Math.max(group.peakConcurrency ?? 0, executionActiveBeforeLaunch + 1);
     task.executorEntryId = lease.entry.entryId;
-    const promise = (task.pendingContinuation
-      ? this.runContinuation(group, task, abort, lease)
-      : this.runFresh(group, task, abort, lease))
+    const promise = (group.kind === "research"
+      ? task.pendingContinuation
+        ? this.runResearchContinuation(group, task, abort, lease)
+        : this.runResearchFresh(group, task, abort, lease)
+      : task.pendingContinuation
+        ? this.runContinuation(group, task, abort, lease)
+        : this.runFresh(group, task, abort, lease))
       .catch(async (error) => {
         if (task.interruptionMode) {
           this.failUndeliveredSteering(task, "Task was interrupted before the queued steering instruction was delivered.");
@@ -922,6 +949,233 @@ export class BackgroundExecutionController {
         void this.pump();
       });
     this.runtimes.set(task.taskId, { abort, promise, controlStatus: "pending" });
+    this.updateIndicator();
+  }
+
+  private async runResearchFresh(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    abort: AbortController,
+    lease: ExecutorPoolLease,
+  ): Promise<void> {
+    await this.incorporatePrestartSteering(group, task);
+    task.generation += 1;
+    const priorState = transitionTaskState(task, "capturing");
+    addActivity(task, "capturing", "Capturing a stable private workspace for read-only research.");
+    await this.save(group);
+    const activation = stateTransitionNotice(task, priorState, task.state);
+    if (activation) await this.wake(task, "state", activation);
+
+    const discovery = await discoverWaveSource(group.cwd, abort.signal);
+    const releaseCapture = await sourceMutationCoordinator.acquire(discovery.captureRoot, abort.signal);
+    let capture;
+    try {
+      capture = await captureWaveBase({
+        cwd: group.cwd,
+        maxSnapshotBytes: this.input.config.maxSnapshotBytes,
+        artifactTtlMs: this.input.config.retainBundles === "always" ? 0 : this.input.config.waveArtifactTtlMs,
+        signal: abort.signal,
+      });
+    } finally {
+      releaseCapture();
+    }
+    task.waveRoot = capture.waveRoot;
+    await this.save(group);
+    await this.publishAssociations();
+    const worktree = await createWorkerWorktree(capture, task.taskId, abort.signal);
+    const artifactDir = join(capture.waveRoot, "artifacts", task.taskId);
+    const result = await this.runResearchWorker(group, task, abort, lease, worktree, artifactDir, false);
+    await this.finishResearch(group, task, result, artifactDir);
+  }
+
+  private async runResearchContinuation(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    abort: AbortController,
+    lease: ExecutorPoolLease,
+  ): Promise<void> {
+    if (!task.waveRoot || !task.researchResult?.candidate) {
+      throw new Error("Research continuation requires its persisted private workspace and prior candidate checkpoint.");
+    }
+    const pending = task.pendingContinuation!;
+    pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
+    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId)!;
+    task.pendingContinuation = undefined;
+    task.generation += 1;
+    const previous = transitionTaskState(task, "running");
+    command.status = "delivered";
+    command.deliveredAt = new Date().toISOString();
+    addActivity(task, "running", `Continuing research from its durable session (${pending.instructionId}).`);
+    await this.save(group);
+    const activation = stateTransitionNotice(task, previous, task.state);
+    if (activation) await this.wake(task, "state", activation);
+    try {
+      const capture = await readWaveCaptureRecord(task.waveRoot);
+      const worktree = researchWorktree(capture, task.taskId);
+      const artifactDir = join(capture.waveRoot, "artifacts", task.taskId);
+      const result = await this.runResearchWorker(
+        group,
+        task,
+        abort,
+        lease,
+        worktree,
+        artifactDir,
+        true,
+        researchContinuationInstruction(pending.instructions),
+      );
+      command.status = "acknowledged";
+      command.acknowledgedAt = new Date().toISOString();
+      await this.finishResearch(group, task, result, artifactDir);
+    } catch (error) {
+      command.status = "failed";
+      command.error = messageOf(error);
+      throw error;
+    }
+  }
+
+  private async runResearchWorker(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    abort: AbortController,
+    lease: ExecutorPoolLease,
+    worktree: WorkerWorktree,
+    artifactDir: string,
+    continuation: boolean,
+    feedback?: string,
+  ): Promise<WaveWorkerResult> {
+    const capture = await readWaveCaptureRecord(task.waveRoot!);
+    let currentLease = lease;
+    const common = {
+      taskId: task.taskId,
+      task: researchTaskDefinition(task.definition),
+      capture,
+      worktree,
+      artifactDir,
+      config: this.input.config,
+      sourceRoot: capture.discovery.captureRoot,
+      sourceRootAliases: [group.cwd],
+      scopedModels: this.scopedModels,
+      signal: abort.signal,
+      executorAssignment: currentLease,
+      acquireFailover: async (currentAssignment: ExecutorPoolAssignment) => {
+        currentLease.release();
+        const next = await this.pool.acquireAfterRoute(
+          currentAssignment,
+          () => resolvedWorkerRoute(this.input.config, "research"),
+          abort.signal,
+        );
+        if (next) currentLease = next;
+        return next;
+      },
+      onLiveControl: (control: ExecutorLiveControl | undefined) => {
+        const runtime = this.runtimes.get(task.taskId);
+        if (!runtime) return;
+        runtime.control = control;
+        runtime.controlStatus = control ? "registered" : "closed";
+        if (control) void this.flushQueuedSteering(group, task, runtime, control).catch((error) => {
+          void this.input.notify?.(`review gate: queued research steering delivery failed: ${messageOf(error)}`);
+        });
+      },
+      takeDeferredSteering: () => this.takeDeferredSteering(group, task),
+      onUpdate: (update: import("./types").SubtaskProgressUpdate) => this.researchProgress(group, task, update),
+    };
+    try {
+      return continuation
+        ? await resumeWaveWorker({
+            ...common,
+            priorResult: task.researchResult!,
+            feedback: feedback!,
+            turn: (task.researchResult?.lastExecutorTurn ?? 1) + 1,
+          })
+        : await runWaveWorker(common);
+    } finally {
+      currentLease.release();
+    }
+  }
+
+  private researchProgress(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    update: import("./types").SubtaskProgressUpdate,
+  ): void {
+    const next = update.phase === "starting" || update.phase === "executing" || update.phase === "correcting"
+      ? "running"
+      : undefined;
+    const previous = next ? transitionTaskState(task, next) : task.state;
+    addActivity(task, `research:${update.phase}`, update.message);
+    const saved = this.save(group);
+    void saved.catch((error) => this.input.notify?.(`review gate: failed to persist research progress: ${messageOf(error)}`));
+    const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
+    const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
+    if (transition) void saved.then((persisted) => {
+      synchronizeEventSnapshot(snapshot!, persisted);
+      return this.wake(task, "state", transition, snapshot);
+    }).catch(() => undefined);
+    this.updateIndicator();
+  }
+
+  private async finishResearch(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    result: WaveWorkerResult,
+    artifactDir: string,
+  ): Promise<void> {
+    task.researchResult = result;
+    task.bundle = result.bundle;
+    task.summary = result.summary;
+    task.error = result.error;
+    const undelivered = this.failUndeliveredSteering(task, "The research turn ended before queued steering reached a verified transport.");
+    const capture = await readWaveCaptureRecord(task.waveRoot!);
+    const workspaceChanges = await researchWorkspaceChanges(researchWorktree(capture, task.taskId).worktreeRoot);
+    const changed = result.candidate?.differsFromBase === true || workspaceChanges.length > 0;
+    const report = result.turn?.text.trim() ?? result.summary.trim();
+    if (isStoppedForExit(task)) {
+      task.summary = "Research worker stopped for application shutdown; continue it from the retained session and workspace after restore.";
+    } else if (changed) {
+      transitionTaskState(task, "failed");
+      task.error = `Research worker modified its private workspace in violation of the read-only contract; nothing was landed. Detected entries: ${workspaceChanges.slice(0, 20).join(", ") || "candidate tree changed"}`;
+      task.summary = task.error;
+      addActivity(task, "research:policy_failure", task.error);
+      await this.wake(task, "failure", `Research task ${task.taskId} violated its read-only workspace contract. Its private changes were quarantined and main is unchanged.`);
+    } else if ((result.status === "no_changes" || result.status === "completed") && report && undelivered.length === 0) {
+      task.report = report;
+      task.reportPath = join(artifactDir, "research-report.md");
+      await writeFile(task.reportPath, [
+        `# ${task.definition.title}`,
+        "",
+        `- Task: ${task.taskId}`,
+        `- Captured source commit: ${capture.baseCommit}`,
+        `- Source workspace: ${group.cwd}`,
+        "- Workspace disposition: unchanged; nothing from this research task was landed",
+        "",
+        report,
+        "",
+      ].join("\n"), "utf8");
+      transitionTaskState(task, "reported");
+      task.summary = report;
+      task.error = undefined;
+      const snapshot = transitionEventSnapshot(group, task);
+      const persisted = await this.save(group);
+      await this.publishAssociations();
+      synchronizeEventSnapshot(snapshot, persisted);
+      await this.wake(task, "completion", `Research task ${task.taskId} completed without workspace changes. Report: ${task.reportPath}\nSummary: ${clipActivity(report, 900)}`, snapshot);
+      this.updateIndicator();
+      return;
+    } else if (result.status === "cancelled" || task.interruptionMode) {
+      transitionTaskState(task, "interrupted");
+      task.summary = "Research worker was interrupted; its private workspace was not landed.";
+      await this.acknowledgeInterrupt(task);
+    } else {
+      transitionTaskState(task, result.bundle ? "paused_recoverable" : "failed");
+      task.error = undelivered.length > 0
+        ? `${undelivered.length} queued steering instruction(s) were not applied.`
+        : result.error ?? "Research worker did not produce a usable report.";
+      task.summary = task.error;
+      await this.wake(task, "failure", `Research task ${task.taskId} stopped without a usable report: ${task.error}`);
+    }
+    task.updatedAt = new Date().toISOString();
+    await this.save(group);
+    await this.publishAssociations();
     this.updateIndicator();
   }
 
@@ -1511,17 +1765,17 @@ export class BackgroundExecutionController {
         const activeTasks = all.filter(({ task }) => isActiveTaskState(task.state));
         const shown = activeTasks.slice(0, 16);
         const lines = [
-          `⟳ ${live.length} active execution subtask${live.length === 1 ? "" : "s"} — expanded live view (/subtasks-view to collapse)`,
+          `⟳ ${live.length} active background subtask${live.length === 1 ? "" : "s"} — expanded live view (/subtasks-view to collapse)`,
         ];
         if (this.conflictGate) lines.push(`CRITICAL conflict: ${this.conflictGate.paths.join(", ")}`);
-        if (shown.length === 0) lines.push("  No active execution subtasks.");
-        for (const { task } of shown) {
+        if (shown.length === 0) lines.push("  No active background subtasks.");
+        for (const { group, task } of shown) {
           const reviewers = task.reviewStatus
             ? ` · reviewers ${task.reviewStatus.reviewers.join(", ") || "none"} (${task.reviewStatus.phase})`
             : "";
           const command = task.commands.at(-1);
           const latestCommand = command ? ` · ${command.action} ${command.status}` : "";
-          lines.push(`  ${task.definition.title} [${task.state}] · ${executorDisplayLabel(task, this.input.config)}${reviewers}${latestCommand}`);
+          lines.push(`  ${group.kind} · ${task.definition.title} [${task.state}] · ${executorDisplayLabel(task, this.input.config, group.kind)}${reviewers}${latestCommand}`);
         }
         if (activeTasks.length > shown.length) lines.push(`  … ${activeTasks.length - shown.length} additional active task${activeTasks.length - shown.length === 1 ? "" : "s"} omitted`);
         const recent = all
@@ -1548,7 +1802,7 @@ export class BackgroundExecutionController {
               : task.state})`),
             ...(live.length > 3 ? [`+${live.length - 3} more`] : []),
           ].join(", ");
-      ctx.ui.setWidget("review-gate-subtasks", [`⟳ ${live.length} execution subtask${live.length === 1 ? "" : "s"} — ${detail}`], { placement: "belowEditor" });
+      ctx.ui.setWidget("review-gate-subtasks", [`⟳ ${live.length} background subtask${live.length === 1 ? "" : "s"} — ${detail}`], { placement: "belowEditor" });
     } catch {
       // UI surfaces are optional in print/headless harnesses.
     }
@@ -1560,9 +1814,10 @@ function clipActivity(value: string, max = 180): string {
   return compact.length <= max ? compact : `${compact.slice(0, Math.max(1, max - 1))}…`;
 }
 
-function executorDisplayLabel(task: BackgroundTaskRecord, config: ReviewGateConfig): string {
+function executorDisplayLabel(task: BackgroundTaskRecord, config: ReviewGateConfig, kind: BackgroundTaskKind = "execute"): string {
   if (!task.executorEntryId) return "executor pending";
-  const entry = resolvedExecutorPool(config).find((candidate) => candidate.entryId === task.executorEntryId);
+  const entry = resolvedWorkerRoute(config, kind).find((candidate) => candidate.entryId === task.executorEntryId)
+    ?? resolvedWorkerResources(config).find((candidate) => candidate.entryId === task.executorEntryId);
   if (!entry) return task.executorEntryId;
   if (entry.selection.source === "little-coder") return entry.selection.model;
   const externalId = entry.selection.id;
@@ -1590,8 +1845,10 @@ function formatExecutionEvent(
   content: string,
   scheduling?: BackgroundSchedulingSnapshot,
 ): string {
-  const landed = group.tasks.filter((candidate) => candidate.state === "landed");
-  const notLanded = group.tasks.filter((candidate) => candidate.state !== "landed");
+  const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
+  const successVerb = group.kind === "research" ? "reported" : "landed";
+  const successful = group.tasks.filter((candidate) => candidate.state === successState);
+  const incomplete = group.tasks.filter((candidate) => candidate.state !== successState);
   const active = group.tasks.filter((candidate) => isActiveTaskState(candidate.state));
   const title = task.definition.title;
   const lines = [
@@ -1614,32 +1871,34 @@ function formatExecutionEvent(
       lines.push(`Top-off opportunity: up to ${topOff} additional task(s) may be submitted with SubtasksAdd if planned work remains.`);
     }
   }
-  if (notLanded.length === 0) {
+  if (incomplete.length === 0) {
     if (kind === "completion") {
-      lines.push(`Execution ${group.executionId} COMPLETE: ${landed.length}/${group.tasks.length} tasks landed.`);
+      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} COMPLETE: ${successful.length}/${group.tasks.length} tasks ${successVerb}.`);
       const wallTimeMs = Math.max(0, Date.parse(group.updatedAt) - Date.parse(group.createdAt));
       const summedTaskTimeMs = group.tasks.reduce((sum, candidate) => sum + taskTiming(candidate).totalMs, 0);
       lines.push(`Execution timing (ms): wall ${wallTimeMs}; summed task time ${summedTaskTimeMs}; peak concurrency ${group.peakConcurrency ?? 0}.`);
-      lines.push("All requested task outputs have landed; aggregate verification is now appropriate.");
+      lines.push(group.kind === "research"
+        ? "All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group."
+        : "All requested task outputs have landed; aggregate verification is now appropriate.");
     } else if (kind === "failure") {
-      lines.push(`Execution ${group.executionId} has ${landed.length}/${group.tasks.length} tasks landed, but this interaction reported a failure.`);
-      lines.push("Inspect the failed command and verify the landed output before treating the execution as successful.");
+      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} has ${successful.length}/${group.tasks.length} tasks ${successVerb}, but this interaction reported a failure.`);
+      lines.push(`Inspect the failed command and verify the ${group.kind === "research" ? "reports" : "landed output"} before treating the group as successful.`);
     } else {
-      lines.push(`Execution ${group.executionId} currently has ${landed.length}/${group.tasks.length} tasks landed.`);
+      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} currently has ${successful.length}/${group.tasks.length} tasks ${successVerb}.`);
       lines.push("This is an informational state update; rely on the separate completion or failure event for the execution outcome.");
     }
     if (kind === "state") lines.push(noActionResponseNotice(task));
     return lines.join("\n");
   }
   const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
-  lines.push(`Execution ${group.executionId} ${disposition}: ${landed.length}/${group.tasks.length} landed; ${notLanded.length} not landed.`);
+  lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} ${disposition}: ${successful.length}/${group.tasks.length} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
   if (kind === "completion") {
-    lines.push("This is a partial task completion, not completion of the whole execution. Do not verify or claim outputs from tasks that have not landed.");
+    lines.push(`This is a partial task completion, not completion of the whole group. Do not claim outputs from tasks that have not ${successVerb}.`);
   } else if (kind === "failure") {
     lines.push("The whole execution is not successfully complete. Use the task handles and states below to recover deliberately.");
   }
-  lines.push("Tasks not yet landed:");
-  for (const candidate of notLanded) {
+  lines.push(`Tasks not yet ${successVerb}:`);
+  for (const candidate of incomplete) {
     lines.push(`- ${candidate.taskId} · ${candidate.definition.title} · ${candidate.state}`);
   }
   if (kind === "state") lines.push(noActionResponseNotice(task));
@@ -1701,6 +1960,42 @@ function newTask(definition: BackgroundTaskDefinition): BackgroundTaskRecord {
     stateHistory: [{ sequence: 1, state: "queued", at: now, generation: 0 }],
     nextStateSequence: 2,
     commands: [],
+  };
+}
+
+function researchTaskDefinition(definition: BackgroundTaskDefinition): BackgroundTaskDefinition {
+  return {
+    ...definition,
+    backgroundKind: "research",
+    acceptanceCriteria: [...definition.acceptanceCriteria],
+    instructions: [
+      definition.instructions,
+      "",
+      "Research mode (authoritative):",
+      "Inspect and synthesize evidence only. Do not edit, create, delete, rename, format, or otherwise modify project files.",
+      "Do not run commands or browser actions with persistent side effects. Do not start other agents or background subtasks.",
+      "Return a concise, self-contained report addressing every acceptance criterion, with file paths/line references and web sources where applicable.",
+      "This worker runs in a disposable private worktree. Any workspace modification is treated as a policy failure and will never be landed.",
+    ].join("\n"),
+  };
+}
+
+function researchContinuationInstruction(instruction: string): string {
+  return [
+    instruction,
+    "",
+    "Research mode remains authoritative: inspect and report only. Do not modify project files or perform actions with persistent side effects.",
+    "Any workspace change fails this task and is never landed, even if the continuation instruction or steering requests a write.",
+  ].join("\n");
+}
+
+function researchWorktree(capture: WaveCaptureResult, taskId: string): WorkerWorktree {
+  const worktreeRoot = join(capture.waveRoot, "workers", taskId);
+  return {
+    worktreeRoot,
+    effectiveCwd: capture.discovery.relativeCwd === "."
+      ? worktreeRoot
+      : join(worktreeRoot, capture.discovery.relativeCwd),
   };
 }
 
@@ -1790,6 +2085,7 @@ async function readGroup(root: string): Promise<BackgroundExecutionGroup> {
     }
     task.nextStateSequence = Math.max(task.nextStateSequence ?? 1, (task.stateHistory.at(-1)?.sequence ?? 0) + 1);
   }
+  parsed.kind ??= parsed.tasks.some((task) => task.definition.backgroundKind === "research") ? "research" : "execute";
   parsed.peakConcurrency ??= 0;
   return parsed;
 }

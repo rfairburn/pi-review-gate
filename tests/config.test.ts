@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { activeExternalExecutor, automaticReviewEnabled, loadConfig, materializeReviewConfig, normalizeConfig, resolveReviewers, resolvedExecutorPool } from "../src/config";
+import { activeExternalExecutor, automaticReviewEnabled, loadConfig, materializeReviewConfig, normalizeConfig, resolveReviewers, resolvedExecutorPool, resolvedWorkerResources, resolvedWorkerRoute } from "../src/config";
 
 test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-config-"));
@@ -378,6 +378,98 @@ test("normalizeConfig preserves an ordered executor pool with per-model capacity
       maxConcurrent: 3,
     },
   ]);
+});
+
+test("research routing excludes generic binary resources until their protocol can enforce the contract", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    externalAgents: [{
+      id: "binary",
+      adapter: "run-as-binary",
+      command: "binary",
+      execution: { protocol: "pi-review-executor-jsonl-v1" },
+    }],
+    execution: {
+      workerResources: [{
+        resourceId: "binary",
+        selection: { source: "external", id: "binary" },
+        maxConcurrent: 1,
+      }],
+      routes: { execute: [{ resourceId: "binary" }], research: [{ resourceId: "binary" }] },
+    },
+  });
+  assert.equal(resolvedWorkerRoute(config, "execute").length, 1);
+  assert.equal(resolvedWorkerRoute(config, "research").length, 0);
+});
+
+test("worker resources have shared capacity and independently ordered, excluding routes", () => {
+  const config = normalizeConfig({
+    enabled: true,
+    externalAgents: ["deepseek", "luna"].map((id) => ({
+      id,
+      adapter: "codex-cli",
+      command: "codex",
+      execution: {},
+    })),
+    execution: {
+      workerResources: [
+        {
+          resourceId: "qwen",
+          selection: { source: "little-coder", model: "qwen/local", thinkingLevel: "high" },
+          maxConcurrent: 1,
+        },
+        {
+          resourceId: "deepseek",
+          selection: { source: "external", id: "deepseek" },
+          maxConcurrent: 3,
+        },
+        {
+          resourceId: "luna",
+          selection: { source: "external", id: "luna" },
+          maxConcurrent: 4,
+        },
+      ],
+      routes: {
+        execute: [
+          { resourceId: "qwen", thinkingLevel: "max" },
+          { resourceId: "deepseek" },
+        ],
+        research: [
+          { resourceId: "luna" },
+          { resourceId: "qwen", thinkingLevel: "medium" },
+        ],
+      },
+    },
+  });
+
+  assert.deepEqual(resolvedWorkerResources(config).map((entry) => [entry.entryId, entry.maxConcurrent]), [
+    ["qwen", 1], ["deepseek", 3], ["luna", 4],
+  ]);
+  assert.deepEqual(resolvedWorkerRoute(config, "execute").map((entry) => [entry.entryId, entry.selection]), [
+    ["qwen", { source: "little-coder", model: "qwen/local", thinkingLevel: "max" }],
+    ["deepseek", { source: "external", id: "deepseek" }],
+  ]);
+  assert.deepEqual(resolvedWorkerRoute(config, "research").map((entry) => [entry.entryId, entry.selection]), [
+    ["luna", { source: "external", id: "luna" }],
+    ["qwen", { source: "little-coder", model: "qwen/local", thinkingLevel: "medium" }],
+  ]);
+  assert.equal(resolvedWorkerRoute(config, "research").some((entry) => entry.entryId === "deepseek"), false);
+});
+
+test("worker routes reject unknown and duplicate resource references", () => {
+  const resources = [{
+    resourceId: "qwen",
+    selection: { source: "external", id: "qwen" },
+    maxConcurrent: 1,
+  }];
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    execution: { workerResources: resources, routes: { research: [{ resourceId: "missing" }] } },
+  }), /unknown worker resource missing/);
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    execution: { workerResources: resources, routes: { research: [{ resourceId: "qwen" }, { resourceId: "qwen" }] } },
+  }), /execution\.routes\.research resource id must be unique/);
 });
 
 test("normalizeConfig rejects invalid or duplicate executor pool entries", () => {

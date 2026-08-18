@@ -177,7 +177,7 @@ test("automatic review waits while execution subtasks remain active", async () =
     await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "subtask still active" }] });
 
     await assert.rejects(access(invocationMarker), /ENOENT/);
-    assert.match(notices.join("\n"), /automatic review deferred while 1 execution subtask\(s\) remain active/);
+    assert.match(notices.join("\n"), /automatic review deferred while 1 background subtask\(s\) remain active/);
     assert.match(notices.join("\n"), /slow delegated work \[(queued|capturing|running)\]/);
     await trigger(hooks, "session_shutdown", { cwd: dir });
   } finally {

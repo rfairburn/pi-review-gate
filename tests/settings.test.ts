@@ -32,8 +32,8 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const selections = [
-    rootSettingsRow("Executor pool", "0 models · 0 slots"),
-    "Add executor",
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
     "fake [run-as-binary]",
     "1  current",
     "Back",
@@ -48,11 +48,15 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   await registered.handler("", contextWithSelections(selections));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.executorPool, [{
-    entryId: "external-fake",
+  assert.deepEqual(saved.execution.workerResources, [{
+    resourceId: "external-fake",
     selection: { source: "external", id: "fake" },
     maxConcurrent: 1,
   }]);
+  assert.deepEqual(saved.execution.routes, {
+    execute: [{ resourceId: "external-fake" }],
+    research: [],
+  });
   assert.equal(saved.execution.activeExecutor, undefined);
   assert.equal(saved.execution.maxWorkers, 2);
   assert.deepEqual(saved.review.activeReviewers, [
@@ -63,8 +67,8 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   assert.equal(saved.reviewers, undefined);
   assert.equal(saved.enabledReviewerIds, undefined);
   assert.deepEqual(saved.customFutureKey, { keep: true });
-  assert.deepEqual(config.execution?.executorPool, [{
-    entryId: "external-fake",
+  assert.deepEqual(config.execution?.workerResources, [{
+    resourceId: "external-fake",
     selection: { source: "external", id: "fake" },
     maxConcurrent: 1,
   }]);
@@ -89,14 +93,14 @@ test("/review-settings builds and reorders an executor pool with per-model concu
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Executor pool", "0 models · 0 slots"),
-    "Add executor",
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
     "qwen [run-as-binary]",
     "1  current",
-    "Add executor",
+    "Add worker resource",
     "deepseek [run-as-binary]",
     "3",
-    "2. deepseek [run-as-binary] · Configured by agent · max 3",
+    "2. deepseek [run-as-binary] · shared max 3",
     "Move up",
     "Back",
     "Back",
@@ -104,11 +108,48 @@ test("/review-settings builds and reorders an executor pool with per-model concu
   ]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.executorPool, [
-    { entryId: "external-deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 3 },
-    { entryId: "external-qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+  assert.deepEqual(saved.execution.workerResources, [
+    { resourceId: "external-deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 3 },
+    { resourceId: "external-qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
   ]);
   assert.equal(saved.execution.activeExecutor, undefined);
+});
+
+test("/review-settings independently excludes a shared worker resource from research", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-routes-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    externalAgents: ["qwen", "deepseek"].map((id) => ({
+      id,
+      adapter: "codex-cli",
+      command: process.execPath,
+      execution: {},
+    })),
+    execution: {
+      executorPool: [
+        { entryId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+        { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 2 },
+      ],
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Research priority", "qwen → deepseek"),
+    "2. deepseek [codex-cli] · Configured by agent · shared max 2",
+    "Exclude from this route",
+    "Back",
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId: "qwen" }, { resourceId: "deepseek" }]);
+  assert.deepEqual(saved.execution.routes.research, [{ resourceId: "qwen" }]);
+  assert.equal(saved.execution.workerResources[1].maxConcurrent, 2);
 });
 
 test("/review-settings clear-all saves a valid review-disabled configuration", async () => {
@@ -168,25 +209,27 @@ test("internal executor uses the exact Pi model label and canonical value", asyn
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Executor pool", "0 models · 0 slots"),
-    "Add executor",
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
     "gpt-5.6-sol [openai-codex]",
-    "High  current",
     "1  current",
     "Back",
     "Save changes",
   ], [{ model: reasoningModel("openai-codex", "gpt-5.6-sol") }]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.executorPool, [{
-    entryId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s",
+  assert.deepEqual(saved.execution.workerResources, [{
+    resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s",
     selection: {
       source: "little-coder",
       model: "openai-codex/gpt-5.6-sol",
-      thinkingLevel: "high",
     },
     maxConcurrent: 1,
   }]);
+  assert.deepEqual(saved.execution.routes, {
+    execute: [{ resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s", thinkingLevel: "high" }],
+    research: [{ resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s", thinkingLevel: "high" }],
+  });
 });
 
 test("first settings save migrates a legacy decider into the shared external catalog", async () => {
@@ -406,9 +449,9 @@ test("internal executor and reviewers persist independent per-model reasoning le
   ];
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Executor pool", "1 model · 4 slots"),
-    "1. gpt-5.6-luna [openai-codex] · High · max 4",
-    "Thinking             High",
+    rootSettingsRow("Execution priority", "gpt-5.6-luna"),
+    "1. gpt-5.6-luna [openai-codex] · High · shared max 4",
+    "Thinking  High",
     "Max",
     "Back",
     "Back",
@@ -420,15 +463,23 @@ test("internal executor and reviewers persist independent per-model reasoning le
   ], scoped));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.executorPool, [{
-    entryId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+  assert.deepEqual(saved.execution.workerResources, [{
+    resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
     selection: {
       source: "little-coder",
       model: "openai-codex/gpt-5.6-luna",
-      thinkingLevel: "max",
     },
     maxConcurrent: 4,
   }]);
+  assert.deepEqual(saved.execution.routes, {
+    execute: [{
+      resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+      thinkingLevel: "max",
+    }],
+    research: [{
+      resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+    }],
+  });
   assert.deepEqual(saved.review.activeReviewers, [
     { source: "little-coder", model: "openai-codex/gpt-5.6-luna", thinkingLevel: "max" },
     { source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
@@ -524,7 +575,9 @@ test("/review-settings aligns every settings value column from the full label se
 });
 
 const ROOT_SETTING_LABELS = [
-  "Executor pool",
+  "Worker resources",
+  "Execution priority",
+  "Research priority",
   "Reviewers",
   "Timeouts",
   "Review policy",

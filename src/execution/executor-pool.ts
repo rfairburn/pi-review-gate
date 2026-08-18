@@ -24,6 +24,7 @@ export interface ExecutorPoolCapacitySnapshot {
 
 interface Waiter {
   after: number | string;
+  entries?: readonly ExecutorPoolEntry[] | (() => readonly ExecutorPoolEntry[]);
   resolve: (lease: ExecutorPoolLease | undefined) => void;
   signal?: AbortSignal;
   abort?: () => void;
@@ -42,8 +43,13 @@ export class ExecutorPoolScheduler {
   }
 
   tryAcquire(startPriority = 0): ExecutorPoolLease | undefined {
-    for (let priority = Math.max(0, startPriority); priority < this.entries.length; priority += 1) {
-      const entry = this.entries[priority];
+    return this.tryAcquireRoute(this.entries, startPriority);
+  }
+
+  /** Acquire through a role-specific ordering while charging shared resource capacity. */
+  tryAcquireRoute(entries: readonly ExecutorPoolEntry[], startPriority = 0): ExecutorPoolLease | undefined {
+    for (let priority = Math.max(0, startPriority); priority < entries.length; priority += 1) {
+      const entry = entries[priority];
       if (!entry) continue;
       const active = this.running.get(entry.entryId) ?? 0;
       if (active >= entry.maxConcurrent) continue;
@@ -66,9 +72,13 @@ export class ExecutorPoolScheduler {
   }
 
   tryAcquireEntry(entryId: string): ExecutorPoolLease | undefined {
-    const priority = this.entries.findIndex((entry) => entry.entryId === entryId);
+    return this.tryAcquireRouteEntry(entryId, this.entries);
+  }
+
+  tryAcquireRouteEntry(entryId: string, entries: readonly ExecutorPoolEntry[]): ExecutorPoolLease | undefined {
+    const priority = entries.findIndex((entry) => entry.entryId === entryId);
     if (priority < 0) return undefined;
-    const entry = this.entries[priority]!;
+    const entry = entries[priority]!;
     const active = this.running.get(entry.entryId) ?? 0;
     if (active >= entry.maxConcurrent) return undefined;
     this.running.set(entry.entryId, active + 1);
@@ -88,14 +98,23 @@ export class ExecutorPoolScheduler {
   }
 
   acquireAfter(current: number | ExecutorPoolAssignment, signal?: AbortSignal): Promise<ExecutorPoolLease | undefined> {
+    return this.acquireAfterRoute(current, () => this.entries, signal);
+  }
+
+  acquireAfterRoute(
+    current: number | ExecutorPoolAssignment,
+    entries: readonly ExecutorPoolEntry[] | (() => readonly ExecutorPoolEntry[]),
+    signal?: AbortSignal,
+  ): Promise<ExecutorPoolLease | undefined> {
     const after = typeof current === "number" ? current : current.entry.entryId;
-    const startPriority = this.priorityAfter(after);
-    if (startPriority >= this.entries.length) return Promise.resolve(undefined);
-    const immediate = this.tryAcquire(startPriority);
+    const currentEntries = resolveEntries(entries);
+    const startPriority = this.priorityAfter(after, currentEntries);
+    if (startPriority >= currentEntries.length) return Promise.resolve(undefined);
+    const immediate = this.tryAcquireRoute(currentEntries, startPriority);
     if (immediate) return Promise.resolve(immediate);
     if (signal?.aborted) return Promise.resolve(undefined);
     return new Promise((resolvePromise) => {
-      const waiter: Waiter = { after, resolve: resolvePromise, signal };
+      const waiter: Waiter = { after, entries, resolve: resolvePromise, signal };
       waiter.abort = () => {
         const index = this.waiters.indexOf(waiter);
         if (index >= 0) this.waiters.splice(index, 1);
@@ -143,14 +162,15 @@ export class ExecutorPoolScheduler {
         waiter?.resolve(undefined);
         continue;
       }
-      const startPriority = this.priorityAfter(waiter.after);
-      if (startPriority >= this.entries.length) {
+      const entries = resolveEntries(waiter.entries ?? this.entries);
+      const startPriority = this.priorityAfter(waiter.after, entries);
+      if (startPriority >= entries.length) {
         this.waiters.splice(index, 1);
         waiter.signal?.removeEventListener("abort", waiter.abort!);
         waiter.resolve(undefined);
         continue;
       }
-      const lease = this.tryAcquire(startPriority);
+      const lease = this.tryAcquireRoute(entries, startPriority);
       if (!lease) {
         index += 1;
         continue;
@@ -161,9 +181,15 @@ export class ExecutorPoolScheduler {
     }
   }
 
-  private priorityAfter(after: number | string): number {
+  private priorityAfter(after: number | string, entries: readonly ExecutorPoolEntry[] = this.entries): number {
     if (typeof after === "number") return after + 1;
-    const currentPriority = this.entries.findIndex((entry) => entry.entryId === after);
+    const currentPriority = entries.findIndex((entry) => entry.entryId === after);
     return currentPriority < 0 ? 0 : currentPriority + 1;
   }
+}
+
+function resolveEntries(
+  entries: readonly ExecutorPoolEntry[] | (() => readonly ExecutorPoolEntry[]),
+): readonly ExecutorPoolEntry[] {
+  return typeof entries === "function" ? entries() : entries;
 }

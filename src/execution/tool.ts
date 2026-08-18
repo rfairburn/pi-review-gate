@@ -1,4 +1,4 @@
-import { DEFAULT_SUBTASK_NOTIFICATION_MODE, externalAgentCatalog, externalAgentSupportsExecution, resolvedExecutorPool, type ReviewGateConfig } from "../config";
+import { DEFAULT_SUBTASK_NOTIFICATION_MODE, externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
 import type { ExecutionAssociationsSnapshot } from "../session-state";
@@ -9,6 +9,7 @@ import {
   isInterruptibleTaskState,
   type BackgroundInspection,
   type BackgroundReviewReadinessTask,
+  type BackgroundTaskKind,
   type BackgroundTaskDefinition,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
@@ -31,7 +32,9 @@ export const EXECUTION_TOOL_NAMES: Record<Action, string> = {
 const EXECUTION_TOOL_NAME_LIST = ACTIONS.map((action) => EXECUTION_TOOL_NAMES[action]);
 
 const SHARED_PROMPT_GUIDELINES = [
-  "Use SubtasksStart with an array of one or more bounded tasks; retain the stable execution/task handles returned for every task.",
+  "Use SubtasksStart with an array of one or more bounded tasks and kind execute or research; retain the stable execution/task handles returned for every task.",
+  "Use kind research for substantial independent read-only discovery that can proceed in the background. Use concurrent foreground read/web/shell calls for quick, shallow, or tightly coupled investigation, and continue useful foreground work while research runs.",
+  "Research groups return reports and never land workspace changes. Execution groups review and land accepted changes.",
   "Use SubtasksAdd to top off a running execution without waiting for slower tasks.",
   "Each task captures main independently when dispatched and lands independently when accepted.",
   "Use SubtasksInspect for durable state and recent activity; artifact paths permit deeper rg-based investigation.",
@@ -51,17 +54,17 @@ const SHARED_PROMPT_GUIDELINES = [
 function toolDescription(action: Action): string {
   switch (action) {
     case "start":
-      return "Start 1–16 durable background execution subtasks and return stable execution/task handles immediately.";
+      return "Start 1–16 durable background execution or read-only research subtasks and return stable execution/task handles immediately.";
     case "add":
       return "Add 1–16 durable background subtasks to an existing execution so freed capacity can be topped off.";
     case "inspect":
       return "Inspect durable execution-subtask state, recent activity, live controls, and artifact locations.";
     case "continue":
-      return "Continue a stopped execution subtask from its verified checkpoint, optionally using an explicit reattachment bundle.";
+      return "Continue a stopped background subtask from its verified checkpoint, optionally using an explicit reattachment bundle.";
     case "steer":
-      return "Give new authoritative instructions to a queued, running, or reviewing execution subtask.";
+      return "Give new authoritative instructions to a queued, running, or reviewing background subtask.";
     case "interrupt":
-      return "Interrupt a queued or active execution subtask, either as failure or with an explicitly requested checkpoint landing.";
+      return "Interrupt a queued or active background subtask as failure; execute tasks may explicitly request checkpoint landing.";
     case "force_merge":
       return "Mechanically attempt to land a stopped task's verified checkpoint; manual workspace inspection is always required afterward.";
     case "mark_clean":
@@ -103,6 +106,7 @@ interface NormalizedInput {
   executionId?: string;
   taskId?: string;
   tasks?: BackgroundTaskDefinition[];
+  kind?: BackgroundTaskKind;
   bundle?: ReattachmentBundle;
   instructions?: string;
   instructionId?: string;
@@ -156,7 +160,7 @@ export class ExecutionToolManager {
   sync(): void {
     this.controller.syncUiPreferences();
     this.controller.refreshPool();
-    const pool = resolvedExecutorPool(this.input.config);
+    const pool = resolvedWorkerResources(this.input.config);
     const agents = externalAgentCatalog(this.input.config);
     const resolvable = pool.length > 0 && pool.every(({ selection }) =>
       selection.source === "little-coder"
@@ -184,15 +188,15 @@ export class ExecutionToolManager {
         },
       });
     };
-    register("subtasks", "List background execution subtasks.", async () => this.controller.list());
+    register("subtasks", "List background execute and research subtasks.", async () => this.controller.list());
     register("subtasks-view", "Toggle the live expanded execution-subtask view below the editor.", async (_args, ctx) => {
       await this.controller.toggleExpandedView(ctx);
       return undefined;
     });
-    register("subtask-inspect", "Pick and inspect an execution subtask; explicit IDs remain optional.", async (args, ctx) => {
+    register("subtask-inspect", "Pick and inspect a background subtask; explicit IDs remain optional.", async (args, ctx) => {
       const [executionId, taskId] = words(args);
       if (executionId) return this.controller.inspect(executionId, taskId);
-      const selected = await selectTask(this.controller, ctx, "Inspect execution subtask");
+      const selected = await selectTask(this.controller, ctx, "Inspect background subtask");
       return selected ? this.controller.inspect(selected.executionId, selected.taskId) : undefined;
     });
     register("subtask-add", "Pick an execution and add JSON task definitions; explicit arguments remain optional.", async (args, ctx) => {
@@ -215,7 +219,7 @@ export class ExecutionToolManager {
       let [executionId, rest] = splitFirst(args);
       let [taskId, instruction] = splitFirst(rest);
       if (!executionId || !taskId) {
-        const selected = await selectTask(this.controller, ctx, "Steer execution subtask", (task) => ["queued", "capturing", "running", "reviewing"].includes(task.state));
+        const selected = await selectTask(this.controller, ctx, "Steer background subtask", (task) => ["queued", "capturing", "running", "reviewing"].includes(task.state));
         if (!selected) return undefined;
         executionId = selected.executionId;
         taskId = selected.taskId;
@@ -231,7 +235,7 @@ export class ExecutionToolManager {
     register("subtask-interrupt", "Pick a queued or active task to interrupt; explicit arguments remain optional.", async (args, ctx) => {
       let [executionId, taskId, mode] = words(args);
       if (!executionId || !taskId) {
-        const selected = await selectTask(this.controller, ctx, "Interrupt execution subtask", (task) => isInterruptibleTaskState(task.state));
+        const selected = await selectTask(this.controller, ctx, "Interrupt background subtask", (task) => isInterruptibleTaskState(task.state));
         if (!selected) return undefined;
         executionId = selected.executionId;
         taskId = selected.taskId;
@@ -239,7 +243,11 @@ export class ExecutionToolManager {
       if (!mode) {
         const ui = commandUi(ctx);
         if (!ui) throw new Error("interactive selector is unavailable; use /subtask-interrupt <executionId> <taskId> <failure|merge>");
-        const selectedMode = await ui.select("Interrupt outcome", ["Interrupt as failure", "Interrupt and merge checkpoint"]);
+        const kind = this.controller.inspect(executionId, taskId).kind;
+        const options = kind === "research"
+          ? ["Interrupt as failure"]
+          : ["Interrupt as failure", "Interrupt and merge checkpoint"];
+        const selectedMode = await ui.select("Interrupt outcome", options);
         if (!selectedMode) return undefined;
         mode = selectedMode === "Interrupt and merge checkpoint" ? "merge" : "failure";
       }
@@ -258,7 +266,12 @@ export class ExecutionToolManager {
       let [executionId, taskId, mode] = words(args);
       const explicitTarget = Boolean(executionId && taskId);
       if (!executionId || !taskId) {
-        const selected = await selectTask(this.controller, ctx, "Force-merge execution subtask", (task) => Boolean(task.bundle) && isForceMergeCandidateTaskState(task.state));
+        const selected = await selectTask(
+          this.controller,
+          ctx,
+          "Force-merge execution subtask",
+          (task, inspection) => inspection.kind === "execute" && Boolean(task.bundle) && isForceMergeCandidateTaskState(task.state),
+        );
         if (!selected) return undefined;
         executionId = selected.executionId;
         taskId = selected.taskId;
@@ -323,11 +336,13 @@ export class ExecutionToolManager {
     try {
       switch (normalized.action) {
         case "start": {
-          const inspection = await this.controller.start(this.withParentTools(normalized.tasks!));
+          const kind = normalized.kind ?? "execute";
+          const inspection = await this.controller.start(this.withParentTools(normalized.tasks!, kind), kind);
           return backgroundResult("start", inspection, false, this.input.config);
         }
         case "add": {
-          const inspection = await this.controller.add(normalized.executionId, this.withParentTools(normalized.tasks!));
+          const kind = this.controller.inspect(normalized.executionId).kind;
+          const inspection = await this.controller.add(normalized.executionId, this.withParentTools(normalized.tasks!, kind));
           return backgroundResult("add", inspection, false, this.input.config);
         }
         case "inspect": {
@@ -412,14 +427,29 @@ export class ExecutionToolManager {
     }
   }
 
-  private withParentTools(tasks: BackgroundTaskDefinition[]): BackgroundTaskDefinition[] {
+  private withParentTools(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind): BackgroundTaskDefinition[] {
     const allowedTools = activeToolSnapshot(this.input.pi);
+    if (kind === "research" && !allowedTools) {
+      throw new Error("Research requires an authoritative parent active-tool snapshot; the current harness did not provide one.");
+    }
+    const childTools = kind === "research" ? researchToolIntersection(allowedTools) : allowedTools;
     return tasks.map((task) => ({
       ...task,
+      backgroundKind: kind,
       acceptanceCriteria: [...task.acceptanceCriteria],
-      executorAllowedTools: allowedTools ? [...allowedTools] : undefined,
+      executorAllowedTools: childTools ? [...childTools] : undefined,
     }));
   }
+}
+
+const RESEARCH_ALLOWED_TOOLS = new Set([
+  "read", "grep", "glob", "find", "ls", "webfetch", "websearch",
+  "BrowserNavigate", "BrowserExtract", "BrowserScroll", "BrowserBack", "BrowserHistory",
+  "EvidenceAdd", "EvidenceGet", "EvidenceList",
+]);
+
+function researchToolIntersection(parent: string[] | undefined): string[] | undefined {
+  return parent?.filter((tool) => RESEARCH_ALLOWED_TOOLS.has(tool));
 }
 
 function taskSchema(): Record<string, unknown> {
@@ -440,13 +470,18 @@ function taskSchema(): Record<string, unknown> {
 function toolSchema(action: Action): Record<string, unknown> {
   const executionId = { type: "string", minLength: 1, description: "Stable execution handle returned by SubtasksStart, SubtasksAdd, or SubtasksInspect." };
   const taskId = { type: "string", minLength: 1, description: "Stable task handle. May be omitted only when the execution contains exactly one task." };
-  const tasks = { type: "array", minItems: 1, maxItems: 16, items: taskSchema(), description: "One to sixteen bounded execution-subtask definitions." };
+  const tasks = { type: "array", minItems: 1, maxItems: 16, items: taskSchema(), description: "One to sixteen bounded task definitions for the selected group kind." };
   const instructions = { type: "string", minLength: 1, description: "New authoritative direction for this operation." };
   const instructionId = { type: "string", minLength: 1, description: "Optional caller-provided idempotency handle." };
   const properties: Record<string, unknown> = {};
   const required: string[] = [];
   switch (action) {
     case "start":
+      properties.kind = {
+        type: "string",
+        enum: ["execute", "research"],
+        description: "execute produces reviewed workspace changes that land; research is read-only and returns a report. Defaults to execute.",
+      };
       properties.tasks = tasks;
       required.push("tasks");
       break;
@@ -531,6 +566,10 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     offset: optionalInteger(value.offset, "offset", 0, Number.MAX_SAFE_INTEGER),
     lines: optionalInteger(value.lines, "lines", 1, 500),
   };
+  if (value.kind !== undefined) {
+    if (value.kind !== "execute" && value.kind !== "research") throw new Error("kind must be execute or research");
+    normalized.kind = value.kind;
+  }
   if (value.bundle !== undefined) normalized.bundle = normalizeBundle(value.bundle);
   if (value.tasks !== undefined) normalized.tasks = normalizeTasks(value.tasks);
   if (value.interruptMode !== undefined) {
@@ -554,7 +593,7 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
 
 function allowedKeys(action: Action): Set<string> {
   switch (action) {
-    case "start": return new Set(["tasks"]);
+    case "start": return new Set(["kind", "tasks"]);
     case "add": return new Set(["executionId", "tasks"]);
     case "inspect": return new Set(["executionId", "taskId", "offset", "lines"]);
     case "continue": return new Set(["executionId", "taskId", "bundle", "instructions", "instructionId"]);
@@ -606,21 +645,22 @@ function backgroundResult(
     ? " Queued tasks may wait for executor startup or available pool capacity."
     : "";
   const notificationMode = config?.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
+  const successVerb = inspection.kind === "research" ? "reports" : "lands";
   const notificationContract = notificationMode === "quiet"
-    ? "Quiet notification mode is active: ordinary RUNNING and REVIEWING transitions remain passive UI telemetry. Every task still triggers a turn when it lands, fails, conflicts, or requires recovery, and landing events identify siblings that remain active."
-    : "Noisy notification mode is active: RUNNING and REVIEWING transitions trigger turns in addition to every landed, failed, conflicted, or recovery-required task.";
+    ? `Quiet notification mode is active: ordinary RUNNING and REVIEWING transitions remain passive UI telemetry. Every task still triggers a turn when it ${successVerb}, fails, conflicts, or requires recovery, and completion events identify siblings that remain active.`
+    : `Noisy notification mode is active: RUNNING and REVIEWING transitions trigger turns in addition to every successful, failed, conflicted, or recovery-required task.`;
   const scheduling = inspection.scheduling;
   const schedulingSummary = action === "start" || action === "add"
     ? ` Scheduler at acceptance: ${scheduling.dispatchAssigned} task(s) assigned and starting, ${scheduling.dispatchPending} still pending dispatch; ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} global workers and ${scheduling.activePoolLeases}/${scheduling.configuredPoolCapacity} executor-pool slots are occupied; ${scheduling.estimatedImmediatelyAvailableSlots} slot(s) appear immediately available. Assignment is not proof that executor startup has completed.`
     : "";
   const toolName = EXECUTION_TOOL_NAMES[action];
   const summary = action === "start" || action === "add"
-    ? `${toolName} accepted: execution ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract} Internal CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress stays available in SubtasksInspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.`
+    ? `${toolName} accepted: ${inspection.kind} group ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract} Internal progress stays available in SubtasksInspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.`
     : action === "force_merge"
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Force-merge only reports a mechanical landing attempt; always inspect the main workspace manually because it does not prove the requested changes are present or correct.`
     : action === "interrupt" && inspection.tasks.some((task) => task.commands.some((command) => command.action === "interrupt" && command.mode === "interrupt_with_merge"))
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Interrupt-with-merge only attempted a mechanical checkpoint landing; always inspect the main workspace manually because this status does not prove the requested changes are present or correct.`
-      : `${toolName}: execution ${inspection.executionId}, ${active} active task(s).`;
+      : `${toolName}: ${inspection.kind} group ${inspection.executionId}, ${active} active task(s).`;
   return result(formatInspectionForModel(summary, inspection, action === "inspect"), { action, ...inspection }, isError);
 }
 
@@ -637,6 +677,7 @@ function formatInspectionForModel(summary: string, inspection: BackgroundInspect
       lines.push(`  timing (ms): total ${task.timing.totalMs}; queued ${task.timing.queueMs}; capture ${task.timing.captureMs}; execution ${task.timing.executionMs}; review ${task.timing.reviewMs}; landing ${task.timing.landingMs}`);
     }
     if (task.summary) lines.push(`  current authoritative outcome: ${clipPlain(task.summary, 700)}`);
+    if (task.reportPath) lines.push(`  research report: ${task.reportPath}`);
     const command = task.commands.at(-1);
     if (command) lines.push(`  latest command: ${command.action} ${command.instructionId} · ${command.status}${command.error ? ` · ${command.error}` : ""}`);
     if (task.artifactDir) lines.push(`  artifacts: ${task.artifactDir}`);
@@ -756,18 +797,18 @@ async function selectTask(
   controller: BackgroundExecutionController,
   ctx: unknown,
   title: string,
-  predicate: (task: BackgroundInspection["tasks"][number]) => boolean = () => true,
+  predicate: (task: BackgroundInspection["tasks"][number], inspection: BackgroundInspection) => boolean = () => true,
 ): Promise<{ executionId: string; taskId: string } | undefined> {
   const ui = commandUi(ctx);
   if (!ui) throw new Error("this command requires an interactive selector UI or explicit IDs");
   const choices = controller.list().flatMap((inspection) => inspection.tasks
-    .filter(predicate)
+    .filter((task) => predicate(task, inspection))
     .map((task) => ({
       executionId: inspection.executionId,
       taskId: task.taskId,
       label: `${task.definition.title} · ${task.state} · ${task.taskId} · ${inspection.executionId}`,
     })));
-  if (choices.length === 0) throw new Error("no matching execution subtasks are available");
+  if (choices.length === 0) throw new Error("no matching background subtasks are available");
   const selected = await ui.select(title, choices.map((choice) => choice.label));
   const choice = choices.find((candidate) => candidate.label === selected);
   return choice ? { executionId: choice.executionId, taskId: choice.taskId } : undefined;
@@ -811,7 +852,7 @@ function formatUserCommandResult(value: unknown): string {
   const lines: string[] = [];
   for (const inspection of inspections) {
     if (!isRecord(inspection) || typeof inspection.executionId !== "string" || !Array.isArray(inspection.tasks)) continue;
-    lines.push(`execution ${inspection.executionId} (${inspection.activeCount ?? 0} active)`);
+    lines.push(`${typeof inspection.kind === "string" ? inspection.kind : "background"} group ${inspection.executionId} (${inspection.activeCount ?? 0} active)`);
     for (const task of inspection.tasks) {
       if (!isRecord(task)) continue;
       const title = isRecord(task.definition) && typeof task.definition.title === "string" ? task.definition.title : "task";

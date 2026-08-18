@@ -11,7 +11,9 @@ import {
   externalAgentSupportsReview,
   executorEntryId,
   executorSelectionKey,
-  resolvedExecutorPool,
+  resolvedWorkerResources,
+  resolvedWorkerRoute,
+  workerResourceSupportsResearch,
   resolveReviewers,
   type ActiveReviewerSelection,
   type ExecutorPoolEntry,
@@ -22,6 +24,7 @@ import {
   type ReviewGateConfig,
   type SubtaskNotificationMode,
   type ThinkingLevel,
+  type WorkerRouteEntry,
 } from "../config";
 import { sendNotice } from "../pi";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
@@ -64,7 +67,10 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
 
 async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; scoped: ScopedModelChoice[] }): Promise<void> {
   const agents = externalAgentCatalog(input.config);
-  let executorPool = materializeExecutorPool(resolvedExecutorPool(input.config), input.scoped);
+  let workerResources = materializeExecutorPool(resolvedWorkerResources(input.config), input.scoped);
+  let executeRoute = initialWorkerRoute(input.config, "execute", workerResources);
+  let researchRoute = initialWorkerRoute(input.config, "research", workerResources);
+  workerResources = workerResources.map(withoutResourceThinking);
   let activeReviewers = materializeReviewerThinking(initialReviewerSelections(input.config), input.scoped);
   let reviewerTimeoutMs = input.config.reviewerTimeoutMs;
   let executorTimeoutMs = input.config.executorTimeoutMs;
@@ -81,8 +87,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const [executorRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, subtasksViewRow] = alignedSettingsRows([
-      ["Executor pool", executorPoolSummary(executorPool)],
+    const [resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, subtasksViewRow] = alignedSettingsRows([
+      ["Worker resources", executorPoolSummary(workerResources)],
+      ["Execution priority", workerRouteSummary(executeRoute, workerResources, agents, input.scoped)],
+      ["Research priority", workerRouteSummary(researchRoute, workerResources, agents, input.scoped)],
       ["Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`],
       ["Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`],
       ["Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`],
@@ -93,7 +101,9 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
     ]);
     const choice = await input.ui.select("Review settings", [
-      executorRow,
+      resourcesRow,
+      executeRouteRow,
+      researchRouteRow,
       reviewersRow,
       timeoutsRow,
       policyRow,
@@ -106,8 +116,35 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       "Cancel",
     ]);
     if (!choice || choice === "Cancel") return;
-    if (choice === executorRow) {
-      executorPool = await selectExecutorPool(input.ui, executorPool, agents, input.scoped);
+    if (choice === resourcesRow) {
+      const priorResourceIds = new Set(workerResources.map((entry) => entry.entryId));
+      workerResources = await selectExecutorPool(input.ui, workerResources, agents, input.scoped);
+      executeRoute = reconcileWorkerRoute(executeRoute, workerResources);
+      researchRoute = reconcileWorkerRoute(
+        researchRoute,
+        workerResources.filter((entry) => workerResourceSupportsResearch(input.config, entry)),
+      );
+      for (const resource of workerResources) {
+        if (priorResourceIds.has(resource.entryId)) continue;
+        const routeEntry = defaultWorkerRouteEntry(resource, input.scoped);
+        executeRoute.push({ ...routeEntry });
+        if (workerResourceSupportsResearch(input.config, resource)) researchRoute.push({ ...routeEntry });
+      }
+      continue;
+    }
+    if (choice === executeRouteRow) {
+      executeRoute = await selectWorkerRoute(input.ui, "Execution priority", executeRoute, workerResources, agents, input.scoped);
+      continue;
+    }
+    if (choice === researchRouteRow) {
+      researchRoute = await selectWorkerRoute(
+        input.ui,
+        "Research priority",
+        researchRoute,
+        workerResources.filter((entry) => workerResourceSupportsResearch(input.config, entry)),
+        agents,
+        input.scoped,
+      );
       continue;
     }
     if (choice === reviewersRow) {
@@ -150,13 +187,15 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       subtasksViewExpanded = !subtasksViewExpanded;
       continue;
     }
-    const error = await validateSelection(executorPool, activeReviewers, agents, input.config, input.scoped);
+    const error = await validateSelection(workerResources, activeReviewers, agents, input.config, input.scoped, executeRoute, researchRoute);
     if (error) {
       await notify(input.ui, error, "error");
       continue;
     }
     const next = await persistReviewSettings(input.configPath!, {
-      executorPool,
+      workerResources,
+      executeRoute,
+      researchRoute,
       activeReviewers,
       reviewerTimeoutMs,
       executorTimeoutMs,
@@ -275,9 +314,9 @@ async function selectExecutorPool(
   let pool = initial.map(cloneExecutorPoolEntry);
   while (true) {
     const entryRows = pool.map((entry, index) => `${index + 1}. ${executorPoolEntrySummary(entry, agents, scoped)}`);
-    const choice = await ui.select("Executor pool — priority order", [...entryRows, "Add executor", "Back"]);
+    const choice = await ui.select("Worker resources — shared capacity", [...entryRows, "Add worker resource", "Back"]);
     if (!choice || choice === "Back") return pool;
-    if (choice === "Add executor") {
+    if (choice === "Add worker resource") {
       const selection = await selectExecutorModel(ui, undefined, pool, agents, scoped);
       if (!selection) continue;
       const maxConcurrent = await selectExecutorCapacity(ui, 1);
@@ -287,6 +326,105 @@ async function selectExecutorPool(
     const index = entryRows.indexOf(choice);
     if (index < 0) continue;
     pool = await editExecutorPoolEntry(ui, pool, index, agents, scoped);
+  }
+}
+
+function initialWorkerRoute(
+  config: ReviewGateConfig,
+  kind: "execute" | "research",
+  resources: ExecutorPoolEntry[],
+): WorkerRouteEntry[] {
+  const configured = config.execution?.routes?.[kind];
+  if (configured) return configured.map((entry) => ({ ...entry }));
+  const resolved = resolvedWorkerRoute(config, kind);
+  return resolved.flatMap((entry) => resources.some((resource) => resource.entryId === entry.entryId)
+    ? [{
+        resourceId: entry.entryId,
+        thinkingLevel: entry.selection.source === "little-coder" ? entry.selection.thinkingLevel : undefined,
+      }]
+    : []);
+}
+
+function reconcileWorkerRoute(route: WorkerRouteEntry[], resources: ExecutorPoolEntry[]): WorkerRouteEntry[] {
+  const available = new Set(resources.map((entry) => entry.entryId));
+  return route.filter((entry) => available.has(entry.resourceId));
+}
+
+function defaultWorkerRouteEntry(resource: ExecutorPoolEntry, scoped: ScopedModelChoice[]): WorkerRouteEntry {
+  const selection = resource.selection;
+  const choice = selection.source === "little-coder"
+    ? scoped.find((candidate) => candidate.model === selection.model)
+    : undefined;
+  return {
+    resourceId: resource.entryId,
+    thinkingLevel: choice ? effectiveThinkingLevel(undefined, choice) : undefined,
+  };
+}
+
+async function selectWorkerRoute(
+  ui: UiContext,
+  title: string,
+  initial: WorkerRouteEntry[],
+  resources: ExecutorPoolEntry[],
+  agents: ExternalAgentConfig[],
+  scoped: ScopedModelChoice[],
+): Promise<WorkerRouteEntry[]> {
+  let route = reconcileWorkerRoute(initial.map((entry) => ({ ...entry })), resources);
+  while (true) {
+    const rows = route.map((entry, index) => `${index + 1}. ${workerRouteEntrySummary(entry, resources, agents, scoped)}`);
+    const choice = await ui.select(title, [...rows, "Add resource", "Back"]);
+    if (!choice || choice === "Back") return route;
+    if (choice === "Add resource") {
+      const used = new Set(route.map((entry) => entry.resourceId));
+      const available = resources.filter((entry) => !used.has(entry.entryId));
+      const labels = available.map((entry) => executorSelectionLabel(entry.selection, agents, scoped));
+      const selected = await ui.select(`${title} — add`, labels.length ? [...labels, "Back"] : ["No additional resources", "Back"]);
+      const index = labels.indexOf(selected ?? "");
+      if (index >= 0) {
+        const resource = available[index]!;
+        route.push({
+          resourceId: resource.entryId,
+          thinkingLevel: resource.selection.source === "little-coder" ? resource.selection.thinkingLevel : undefined,
+        });
+      }
+      continue;
+    }
+    let index = rows.indexOf(choice);
+    if (index < 0) continue;
+    while (route[index]) {
+      const entry = route[index]!;
+      const resource = resources.find((candidate) => candidate.entryId === entry.resourceId)!;
+      const [thinkingRow] = alignedSettingsRows([
+        ["Thinking", routeThinkingSummary(entry, resource, scoped)],
+      ]);
+      const options = [
+        ...(resource.selection.source === "little-coder" ? [thinkingRow] : []),
+        ...(index > 0 ? ["Move up"] : []),
+        ...(index < route.length - 1 ? ["Move down"] : []),
+        "Exclude from this route",
+        "Back",
+      ];
+      const edit = await ui.select(`${title} — ${executorSelectionLabel(resource.selection, agents, scoped)}`, options);
+      if (!edit || edit === "Back") break;
+      if (edit === thinkingRow && resource.selection.source === "little-coder") {
+        const selection = resource.selection;
+        const model = scoped.find((candidate) => candidate.model === selection.model);
+        if (model) entry.thinkingLevel = await selectThinkingLevel(
+          ui,
+          model,
+          effectiveThinkingLevel(entry.thinkingLevel ?? selection.thinkingLevel, model),
+        );
+      } else if (edit === "Move up" && index > 0) {
+        [route[index - 1], route[index]] = [route[index]!, route[index - 1]!];
+        index -= 1;
+      } else if (edit === "Move down" && index < route.length - 1) {
+        [route[index], route[index + 1]] = [route[index + 1]!, route[index]!];
+        index += 1;
+      } else if (edit === "Exclude from this route") {
+        route.splice(index, 1);
+        break;
+      }
+    }
   }
 }
 
@@ -300,9 +438,8 @@ async function editExecutorPoolEntry(
   let pool = initial.map(cloneExecutorPoolEntry);
   while (pool[index]) {
     const entry = pool[index]!;
-    const [modelRow, thinkingRow, capacityRow] = alignedSettingsRows([
+    const [modelRow, capacityRow] = alignedSettingsRows([
       ["Model", executorSelectionLabel(entry.selection, agents, scoped)],
-      ["Thinking", executorThinkingSummary(entry.selection, scoped)],
       ["Maximum concurrency", String(entry.maxConcurrent)],
     ]);
     const moveUp = "Move up";
@@ -310,7 +447,6 @@ async function editExecutorPoolEntry(
     const remove = "Remove";
     const choice = await ui.select(`Executor ${index + 1}`, [
       modelRow,
-      thinkingRow,
       capacityRow,
       ...(index > 0 ? [moveUp] : []),
       ...(index < pool.length - 1 ? [moveDown] : []),
@@ -320,27 +456,7 @@ async function editExecutorPoolEntry(
     if (!choice || choice === "Back") return pool;
     if (choice === modelRow) {
       const selection = await selectExecutorModel(ui, entry.selection, pool.filter((_, candidate) => candidate !== index), agents, scoped);
-      if (selection) pool[index] = { ...entry, entryId: executorEntryId(selection), selection };
-      continue;
-    }
-    if (choice === thinkingRow) {
-      const selection = entry.selection;
-      if (selection.source === "little-coder") {
-        const model = scoped.find((candidate) => candidate.model === selection.model);
-        if (model) {
-          pool[index] = {
-            ...entry,
-            selection: {
-              ...selection,
-              thinkingLevel: await selectThinkingLevel(
-                ui,
-                model,
-                effectiveThinkingLevel(selection.thinkingLevel, model),
-              ),
-            },
-          };
-        }
-      }
+      if (selection) pool[index] = { ...entry, selection };
       continue;
     }
     if (choice === capacityRow) {
@@ -389,19 +505,7 @@ async function selectExecutorModel(
   if (!selected || selected === "Back") return undefined;
   const found = choices.find((_choice, index) => selected === rows[index]);
   if (!found) return undefined;
-  if (!found.model) return { ...found.selection };
-  const previousThinking = current?.source === "little-coder" && current.model === found.model.model
-    ? current.thinkingLevel
-    : undefined;
-  return {
-    source: "little-coder",
-    model: found.model.model,
-    thinkingLevel: await selectThinkingLevel(
-      ui,
-      found.model,
-      effectiveThinkingLevel(previousThinking, found.model),
-    ),
-  };
+  return { ...found.selection };
 }
 
 async function selectExecutorCapacity(ui: UiContext, current: number): Promise<number> {
@@ -594,6 +698,8 @@ async function validateSelection(
   agents: ExternalAgentConfig[],
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
+  executeRoute: WorkerRouteEntry[] = [],
+  researchRoute: WorkerRouteEntry[] = [],
 ): Promise<string | undefined> {
   const duplicateReviewer = duplicate(reviewers.map(reviewerKey));
   if (duplicateReviewer) return `Duplicate enabled reviewer: ${duplicateReviewer}`;
@@ -601,6 +707,28 @@ async function validateSelection(
   const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
   const duplicateExecutor = duplicate(executorPool.map((entry) => executorSelectionKey(entry.selection)));
   if (duplicateExecutor) return `Duplicate executor pool selection: ${duplicateExecutor}`;
+  const resources = new Set(executorPool.map((entry) => entry.entryId));
+  for (const [kind, route] of [["Execution", executeRoute], ["Research", researchRoute]] as const) {
+    const duplicateResource = duplicate(route.map((entry) => entry.resourceId));
+    if (duplicateResource) return `${kind} priority contains duplicate resource: ${duplicateResource}`;
+    for (const entry of route) {
+      if (!resources.has(entry.resourceId)) return `${kind} priority references missing worker resource: ${entry.resourceId}`;
+      const resource = executorPool.find((candidate) => candidate.entryId === entry.resourceId)!;
+      if (kind === "Research" && !workerResourceSupportsResearch(config, resource)) {
+        return `Research priority resource is not research-capable: ${entry.resourceId}`;
+      }
+      if (entry.thinkingLevel && resource.selection.source !== "little-coder") {
+        return `${kind} priority cannot override thinking for external resource: ${entry.resourceId}`;
+      }
+      if (entry.thinkingLevel && resource.selection.source === "little-coder") {
+        const selection = resource.selection;
+        const model = scoped.find((candidate) => candidate.model === selection.model);
+        if (!model?.supportedThinkingLevels.includes(entry.thinkingLevel)) {
+          return `${kind} priority reasoning is unsupported for ${selection.model}: ${entry.thinkingLevel}`;
+        }
+      }
+    }
+  }
   for (const entry of executorPool) {
     if (!Number.isInteger(entry.maxConcurrent) || entry.maxConcurrent < 1 || entry.maxConcurrent > MAX_EXECUTION_WORKERS) {
       return `Executor maximum concurrency must be between 1 and ${MAX_EXECUTION_WORKERS}: ${entry.entryId}`;
@@ -650,8 +778,38 @@ function executorPoolSummary(pool: ExecutorPoolEntry[]): string {
   return `${pool.length} ${pool.length === 1 ? "model" : "models"} · ${slots} ${slots === 1 ? "slot" : "slots"}`;
 }
 
+function workerRouteSummary(
+  route: WorkerRouteEntry[],
+  resources: ExecutorPoolEntry[],
+  agents: ExternalAgentConfig[],
+  scoped: ScopedModelChoice[],
+): string {
+  if (route.length === 0) return "Disabled (no resources)";
+  return route.map((entry) => {
+    const resource = resources.find((candidate) => candidate.entryId === entry.resourceId);
+    return resource ? executorSelectionLabel(resource.selection, agents, scoped).split(" [")[0] : `${entry.resourceId} [missing]`;
+  }).join(" → ");
+}
+
+function workerRouteEntrySummary(
+  route: WorkerRouteEntry,
+  resources: ExecutorPoolEntry[],
+  agents: ExternalAgentConfig[],
+  scoped: ScopedModelChoice[],
+): string {
+  const resource = resources.find((entry) => entry.entryId === route.resourceId);
+  if (!resource) return `${route.resourceId} [missing]`;
+  return `${executorSelectionLabel(resource.selection, agents, scoped)} · ${routeThinkingSummary(route, resource, scoped)} · shared max ${resource.maxConcurrent}`;
+}
+
+function routeThinkingSummary(route: WorkerRouteEntry, resource: ExecutorPoolEntry, scoped: ScopedModelChoice[]): string {
+  if (resource.selection.source === "external") return "Configured by agent";
+  const selection = { ...resource.selection, thinkingLevel: route.thinkingLevel ?? resource.selection.thinkingLevel };
+  return executorThinkingSummary(selection, scoped);
+}
+
 function executorPoolEntrySummary(entry: ExecutorPoolEntry, agents: ExternalAgentConfig[], scoped: ScopedModelChoice[]): string {
-  return `${executorSelectionLabel(entry.selection, agents, scoped)} · ${executorThinkingSummary(entry.selection, scoped)} · max ${entry.maxConcurrent}`;
+  return `${executorSelectionLabel(entry.selection, agents, scoped)} · shared max ${entry.maxConcurrent}`;
 }
 
 function executorSelectionLabel(selection: ExecutorSelection, agents: ExternalAgentConfig[], scoped: ScopedModelChoice[]): string {
@@ -688,6 +846,12 @@ function cloneReviewerSelection(value: ActiveReviewerSelection): ActiveReviewerS
 
 function cloneExecutorPoolEntry(entry: ExecutorPoolEntry): ExecutorPoolEntry {
   return { ...entry, selection: { ...entry.selection } };
+}
+
+function withoutResourceThinking(entry: ExecutorPoolEntry): ExecutorPoolEntry {
+  const cloned = cloneExecutorPoolEntry(entry);
+  if (cloned.selection.source === "little-coder") delete cloned.selection.thinkingLevel;
+  return cloned;
 }
 
 function materializeExecutorPool(

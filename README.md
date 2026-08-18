@@ -131,12 +131,15 @@ The older single `decider` field is still supported for compatibility.
 
 ### Delegated execution and runtime settings
 
-`/review-settings` opens one staged settings transaction with nine sections:
+`/review-settings` opens one staged settings transaction with eleven sections:
 
-- **Executor pool** is an ordered list of Pi-scoped little-coder models and
-  execution-capable entries from `externalAgents`. **Add executor** walks
-  through model, reasoning (when supported), and maximum concurrency. Existing
-  entries can be edited, moved up/down, or removed.
+- **Worker resources** defines Pi-scoped little-coder models and
+  execution-capable entries from `externalAgents`, each with one physical
+  maximum concurrency shared by every background-task kind.
+- **Execution priority** and **Research priority** are independently ordered
+  subsets of those resources. Either route can exclude a resource. Per-route
+  reasoning lets the same local model use different effort without creating a
+  second capacity bucket.
 - **Reviewers** is a multi-selection, `/scoped-models`-style picker over the
   same Pi-scoped models plus review-capable entries from `externalAgents`.
   Clearing every reviewer is valid and disables automatic review without
@@ -153,7 +156,7 @@ The older single `decider` field is still supported for compatibility.
   `always` when successful executor and reviewer turns need to remain available
   for inspection.
 - **Global concurrency** sets `execution.maxWorkers` (1–16, default 4). This is
-  the total worker ceiling; each executor-pool entry also has its own
+  the total worker ceiling; each worker resource also has its own shared
   `maxConcurrent` capacity.
 - **Retry policy** configures bounded executor/reviewer recovery: retry count,
   exponential-backoff bounds, jitter, and the repeated-incident guard.
@@ -161,6 +164,8 @@ The older single `decider` field is still supported for compatibility.
   and reviewing transitions in passive UI telemetry while still notifying for
   every task landing, failure, conflict, or recovery requirement. **Noisy** also
   starts turns for running and reviewing transitions.
+- **Subtasks view** stores the expanded/collapsed live-panel preference
+  globally.
 
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the
 root discards all staged changes; **Save changes** atomically persists every
@@ -171,16 +176,16 @@ selected or run.
 Saved values are authoritative for execution stages that have not started.
 Already-running executor and reviewer processes finish with their launch
 values, while queued dispatch, waiting failover, later continuation turns, and
-later review cycles use the current pool, capacities, policies, and reviewer
+later review cycles use the current routes, capacities, policies, and reviewer
 selection. Subtask notification mode is a delivery preference and takes effect
 immediately for subsequent events from already-running tasks. Running capacity
 leases survive pool edits; removed entries receive no new work. A restarted task warns when its prior runtime configuration differs,
 and an executor-selection change starts a fresh native session from the durable
 checkpoint instead of attaching an incompatible conversation.
 
-The executor pool and reviewers are independent:
+Worker routes and reviewers are independent:
 
-| Reviewers | Executor pool | Behavior |
+| Reviewers | Execution route | Behavior |
 | --- | --- | --- |
 | selected | non-empty | delegated execution with the full review/correction loop |
 | none | non-empty | delegated execution returns `completed_unreviewed` |
@@ -188,17 +193,24 @@ The executor pool and reviewers are independent:
 | none | empty | settings remain available; both behaviors are off |
 
 Top-level `enabled: false` is the automatic-review master switch and does not
-disable a configured executor pool. The environment kill switches disable the whole
+disable configured worker routes. The environment kill switches disable the whole
 extension, including delegated execution.
 
-With an executor pool selected, the plugin exposes one exact-schema tool per
+With at least one worker resource selected, the plugin exposes one exact-schema tool per
 operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`,
 `SubtasksContinue`, `SubtasksSteer`, `SubtasksInterrupt`,
-`SubtasksForceMerge`, and `SubtasksMarkClean`. Start and add accept 1–16 bounded
-tasks and return stable execution/task handles immediately. Work continues in
+`SubtasksForceMerge`, and `SubtasksMarkClean`. `SubtasksStart` accepts an
+optional immutable group-level `kind`: `execute` (the default) or `research`.
+Start and add accept 1–16 bounded tasks and return stable execution/task handles immediately. Work continues in
 the background up to the configured global and per-model capacities. Each task owns its capture,
 worktree, session, checkpoint, review, and landing outcome; there is no
-wave-wide shared base or all-workers integration barrier.
+wave-wide shared base or all-workers integration barrier. Research tasks skip
+review and landing, validate that their private worktree stayed unchanged, and
+finish as `reported` with a durable report path. Little Coder enforces the
+read-only tool intersection; Codex and Claude are initially best-effort inside
+the disposable private worktree, with any writes quarantined. Generic binary
+adapters are ineligible for research until their protocol can acknowledge the
+restriction.
 
 `SubtasksContinue` accepts either an associated task handle or a verified
 reattachment bundle. `SubtasksSteer` is valid while a task is
@@ -233,11 +245,11 @@ an unparseable ShellStart success fails closed and visibly blocks automatic
 review. A process that deliberately creates a new session/process group can
 escape this best-effort boundary and is not claimed as covered.
 
-The same top-level review-readiness gate covers execution subtasks: automatic
+The same top-level review-readiness gate covers execution and research subtasks: automatic
 review of the primary orchestrator is deferred while any task is queued,
 capturing, running, reviewing, accepted, waiting to land, or landing. Normal
 task completion is delivered as a follow-up and failure is delivered
-immediately; only after no execution task remains active may that turn enter
+immediately; only after no background task remains active may that turn enter
 automatic review.
 
 `SubtasksInterrupt` explicitly chooses failure or merge disposition. A normal cancellation
@@ -310,17 +322,19 @@ Foreground automatic reviews, `/review-now`, and reviewer-question commands show
 the active reviewer milestone and elapsed time in the status line until the
 review completes or is cancelled.
 
-### Background execution tools
+### Background task tools
 
-Each task runs in an isolated worktree with its own review lifecycle and
-permanent task UUID. Tasks are specified as an array of 1–16 items.
+Each task runs in an isolated worktree with a permanent task UUID. Execute tasks
+have a review/landing lifecycle; research tasks have a report-only lifecycle.
+Tasks are specified as an array of 1–16 items.
 
 **Concurrency**: `config.execution.maxWorkers` controls concurrent workers
 (1–16, default 4); there is no parallelism toggle or per-tool override. Task
-count is independent, and excess tasks queue. Fresh tasks scan `execution.executorPool`
-in strict priority order and use the first entry with remaining
-`maxConcurrent` capacity. Thus a one-slot local primary can remain preferred
-while lower-priority cloud entries absorb overflow. The sum of pool capacities
+count is independent, and excess tasks queue. Fresh tasks scan their
+`execution.routes.execute` or `execution.routes.research` ordering and use the
+first eligible `workerResources` entry with remaining shared capacity. Thus a
+one-slot local primary cannot run one execution and one research worker at the
+same time, while lower-priority cloud entries can absorb overflow. The sum of resource capacities
 may exceed `maxWorkers`; it describes available fallback capacity, not the
 number of workers that must run.
 
@@ -506,9 +520,10 @@ launcher:
 It builds and explicitly enables this extension, forwards all arguments to
 little-coder, sets the foreground model's `LITTLE_CODER_THINKING_BUDGET` to
 16,384 tokens, and applies a shared `LITTLE_CODER_ALLOWED_TOOLS` launch policy
-containing every tool shipped by Pi, Little Coder, and review-gate except
-`ShellSession`. Little Coder's tool gate therefore refuses `ShellSession`, and
-skill-inject omits its skill card. The environment is inherited by Little Coder
+containing the tools used by this workflow except `ShellSession` and `dispatch`.
+Little Coder's tool gate therefore refuses both, and skill-inject omits their
+skill cards. First-class research subtasks replace foreground-blocking dispatch.
+The environment is inherited by Little Coder
 execution subtasks; Little Coder reviewers remain more restrictive through
 their existing read-only/no-skills launch. The same policy is used by the
 preset launcher and all named wrappers. Config resolution remains on the

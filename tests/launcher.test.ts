@@ -13,7 +13,6 @@ const launchAllowedTools = [
   "glob", "webfetch", "websearch",
   "EvidenceAdd", "EvidenceGet", "EvidenceList",
   "BrowserNavigate", "BrowserClick", "BrowserType", "BrowserScroll", "BrowserExtract", "BrowserBack", "BrowserHistory",
-  "dispatch",
   "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop",
   "ShellSessionCwd", "ShellSessionReset",
   "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue",
@@ -77,10 +76,12 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
 test("orchestrator prompt names the operation-specific tools and current steering contract", async () => {
   const prompt = await readFile(resolve("scripts/orchestrator-system-prompt.md"), "utf8");
   assert.match(prompt, /`SubtasksStart`/);
+  assert.match(prompt, /kind: "research"/);
   assert.match(prompt, /`SubtasksInspect`/);
   assert.match(prompt, /`SubtasksContinue`/);
   assert.match(prompt, /`SubtasksSteer`/);
   assert.doesNotMatch(prompt, /ExecuteSubtasks/);
+  assert.doesNotMatch(prompt, /`dispatch`/);
   assert.match(prompt, /durably queued for the next executor handoff/);
   assert.doesNotMatch(prompt, /execute_subtasks/);
   assert.doesNotMatch(prompt, /live-turn-only/);

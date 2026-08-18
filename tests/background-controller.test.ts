@@ -121,6 +121,111 @@ test("background tasks return immediately, land independently, and additions cap
   }
 });
 
+test("research tasks report without review or landing and quarantine accidental writes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-research-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await writeFile(join(root, ".gitignore"), "ignored-research.txt\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt", ".gitignore"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "research-codex.cjs");
+    await writeFile(executor, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs'),readline=require('node:readline');let threadId='thread-'+process.pid,turn=0;",
+      "const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');",
+      "readline.createInterface({input:process.stdin}).on('line',line=>{const request=JSON.parse(line);",
+      "if(request.method==='initialize')return send({jsonrpc:'2.0',id:request.id,result:{userAgent:'test-codex'}});",
+      "if(request.method==='initialized')return;",
+      "if(request.method==='thread/start'||request.method==='thread/resume')return send({jsonrpc:'2.0',id:request.id,result:{thread:{id:request.params.threadId||threadId}}});",
+      "if(request.method==='turn/start'){const prompt=request.params.input?.[0]?.text||'';if(prompt.includes('DIRTY_RESEARCH'))fs.writeFileSync('ignored-research.txt','must not land\\n');",
+      "const turnId='turn-'+(++turn),text='Evidence-backed finding: base.txt contains the captured baseline.';send({jsonrpc:'2.0',id:request.id,result:{turn:{id:turnId}}});",
+      "setImmediate(()=>{send({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text}}});send({jsonrpc:'2.0',method:'turn/completed',params:{threadId,turn:{id:turnId,status:'completed',items:[{type:'agentMessage',text}]}}});});return;}",
+      "});",
+    ].join("\n"), "utf8");
+    await chmod(executor, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "researcher",
+        adapter: "codex-cli",
+        command: executor,
+        execution: {},
+      }],
+      execution: {
+        workerResources: [{
+          resourceId: "researcher",
+          selection: { source: "external", id: "researcher" },
+          maxConcurrent: 2,
+        }],
+        routes: {
+          execute: [],
+          research: [{ resourceId: "researcher" }],
+        },
+        maxWorkers: 2,
+      },
+      retainBundles: "always",
+    });
+    const messages: string[] = [];
+    const controller = new BackgroundExecutionController({
+      pi: { sendMessage: (message: { content: string }) => messages.push(message.content) },
+      config,
+      state: createState(),
+      cwd: () => root,
+    });
+
+    const started = await controller.start([
+      {
+        title: "clean research",
+        instructions: "Inspect base.txt and report evidence.",
+        acceptanceCriteria: ["Return an evidence-backed report"],
+      },
+      {
+        title: "dirty research",
+        instructions: "DIRTY_RESEARCH",
+        acceptanceCriteria: ["Return an evidence-backed report"],
+      },
+    ], "research");
+    assert.equal(started.kind, "research");
+    await waitFor(() => controller.inspect(started.executionId).activeCount === 0);
+    const finished = controller.inspect(started.executionId);
+    const clean = finished.tasks.find((task) => task.definition.title === "clean research")!;
+    const dirty = finished.tasks.find((task) => task.definition.title === "dirty research")!;
+    assert.equal(clean.state, "reported");
+    assert.match(clean.report ?? "", /Evidence-backed finding/);
+    const reportArtifact = await readFile(clean.reportPath!, "utf8");
+    assert.match(reportArtifact, new RegExp(`Captured source commit: [0-9a-f]{40}`));
+    assert.match(reportArtifact, /Workspace disposition: unchanged/);
+    assert.match(reportArtifact, /Evidence-backed finding/);
+    assert.equal(dirty.state, "failed");
+    assert.match(dirty.error ?? "", /read-only contract/);
+    await assert.rejects(readFile(join(root, "ignored-research.txt"), "utf8"), /ENOENT/);
+    await waitFor(() => messages.some((message) => /completed without workspace changes/.test(message)));
+    await waitFor(() => messages.some((message) => /private changes were quarantined and main is unchanged/.test(message)));
+    await assert.rejects(controller.forceMerge({
+      executionId: started.executionId,
+      taskId: dirty.taskId,
+      mergeAnyhow: false,
+      instructionId: "research-force-merge",
+      actor: "model",
+    }), /Research tasks have reports, not mergeable checkpoints/);
+
+    const associations = controller.associations();
+    await controller.shutdown();
+    await controller.detach();
+    const restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    await restored.restore(associations);
+    assert.equal(restored.inspect(started.executionId).kind, "research");
+    assert.equal(restored.inspect(started.executionId).tasks.find((task) => task.taskId === clean.taskId)?.state, "reported");
+    await restored.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("noisy subtask notifications wake the orchestrator when active execution enters review", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-background-review-state-"));
   let controller: BackgroundExecutionController | undefined;
@@ -327,7 +432,7 @@ test("queued steering is incorporated before startup and landing events distingu
     assert.match(interrupted.tasks[0]?.summary ?? "", /before executor startup/);
 
     await waitFor(() => controller!.inspect(started.executionId).tasks[0]?.state === "landed", 60_000);
-    await waitFor(() => messages.some((message) => /partial task completion, not completion of the whole execution/.test(message)));
+    await waitFor(() => messages.some((message) => /partial task completion, not completion of the whole group/.test(message)));
     assert.ok(messages.some((message) => message.includes(secondId) && /not landed/.test(message)));
     await waitFor(() => controller!.inspect(started.executionId).tasks.every((task) => task.state === "landed"), 60_000);
     await waitFor(() => messages.some((message) => /COMPLETE: 2\/2 tasks landed/.test(message)));

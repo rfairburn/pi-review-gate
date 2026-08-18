@@ -432,7 +432,11 @@ export async function continueOperation(input: {
   let failoverLease: ExecutorPoolLease | undefined;
   const acquireFailover = async (currentAssignment: ExecutorPoolAssignment) => {
     failoverLease?.release();
-    failoverLease = await continuationPool.acquireAfter(currentAssignment, input.signal);
+    failoverLease = await continuationPool.acquireAfterRoute(
+      currentAssignment,
+      () => resolvedExecutorPool(input.config),
+      input.signal,
+    );
     return failoverLease;
   };
   let continued: WaveWorkerResult;

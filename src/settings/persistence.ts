@@ -6,6 +6,7 @@ import {
   normalizeConfig,
   type ActiveReviewerSelection,
   type ExecutorPoolEntry,
+  type WorkerRouteEntry,
   type ExecutionRetryPolicy,
   type RetainBundles,
   type ReviewGateConfig,
@@ -13,7 +14,11 @@ import {
 } from "../config";
 
 export interface ReviewSettingsSelection {
-  executorPool: ExecutorPoolEntry[];
+  workerResources?: ExecutorPoolEntry[];
+  executeRoute?: WorkerRouteEntry[];
+  researchRoute?: WorkerRouteEntry[];
+  /** @deprecated Compatibility for direct callers compiled against the former settings shape. */
+  executorPool?: ExecutorPoolEntry[];
   activeReviewers: ActiveReviewerSelection[];
   reviewerTimeoutMs: number;
   executorTimeoutMs: number;
@@ -35,10 +40,23 @@ export async function persistReviewSettings(
   return updateReviewGateConfig(configPath, (parsed) => {
     const catalog = externalAgentCatalog(normalizeConfig(parsed));
     const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
-    execution.executorPool = selection.executorPool.map((entry) => ({
-      ...entry,
-      selection: { ...entry.selection },
+    const resources = selection.workerResources ?? selection.executorPool ?? [];
+    const defaultRoute = resources.map((entry) => ({
+      resourceId: entry.entryId,
+      ...(entry.selection.source === "little-coder" && entry.selection.thinkingLevel
+        ? { thinkingLevel: entry.selection.thinkingLevel }
+        : {}),
     }));
+    execution.workerResources = resources.map((entry) => ({
+      resourceId: entry.entryId,
+      selection: { ...entry.selection },
+      maxConcurrent: entry.maxConcurrent,
+    }));
+    execution.routes = {
+      execute: (selection.executeRoute ?? defaultRoute).map((entry) => ({ ...entry })),
+      research: (selection.researchRoute ?? defaultRoute).map((entry) => ({ ...entry })),
+    };
+    delete execution.executorPool;
     delete execution.activeExecutor;
     execution.maxWorkers = selection.maxWorkers;
     execution.retryPolicy = { ...selection.retryPolicy };

@@ -287,11 +287,26 @@ test("review state restores only when the same persisted conversation resumes", 
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "preserve this request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
-    await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "printf evidence" } }, first.ctx);
+    const statePath = `${sessionFile}.pi-review-gate-state.json`;
+    const beforeTools = await readFile(statePath, "utf8");
+    await Promise.all([
+      trigger(first.hooks, "tool_call", { cwd: dir, toolName: "read", input: { path: "one.ts" } }, first.ctx),
+      trigger(first.hooks, "tool_call", { cwd: dir, toolName: "grep", input: { path: dir, pattern: "evidence" } }, first.ctx),
+      trigger(first.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "printf evidence" } }, first.ctx),
+    ]);
+    await Promise.all([
+      trigger(first.hooks, "tool_result", { cwd: dir, toolName: "read", input: { path: "one.ts" }, content: [{ type: "text", text: "contents" }], isError: false }, first.ctx),
+      trigger(first.hooks, "tool_result", { cwd: dir, toolName: "grep", input: { path: dir, pattern: "evidence" }, content: [{ type: "text", text: "grep failed" }], isError: true }, first.ctx),
+      trigger(first.hooks, "tool_result", { cwd: dir, toolName: "bash", input: { command: "printf evidence" }, content: [{ type: "text", text: "evidence" }], isError: false }, first.ctx),
+    ]);
+    assert.equal(await readFile(statePath, "utf8"), beforeTools, "tool hooks keep evidence in memory");
     await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
     const targetStore = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
     const targetState = await targetStore.restore(dir);
     assert.ok(targetState);
+    assert.deepEqual(targetState.state.reviewWindow?.evidence.events.map((event) => event.toolName), ["bash", "grep", "bash"]);
+    assert.match(targetState.state.reviewWindow?.evidence.events[0]?.summary ?? "", /printf evidence/);
+    assert.equal(targetState.state.reviewWindow?.evidence.events[1]?.isError, true);
     queueModelDelivery(targetState.state, {
       kind: "review_authorization",
       channel: "follow_up",

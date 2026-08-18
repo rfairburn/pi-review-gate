@@ -3,7 +3,13 @@ import { removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
-import { recordToolCallEvidence, recordToolResultEvidence, rememberFinalAssistantSummary } from "./evidence";
+import {
+  recordToolCallEvidence,
+  recordToolResultEvidence,
+  rememberFinalAssistantSummary,
+  shouldRecordToolCallEvidence,
+  shouldRecordToolResultEvidence,
+} from "./evidence";
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, isEscapeTerminalInput, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, sendTriggeredFollowUp, createStatusTracker, setStatus } from "./pi";
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
@@ -66,6 +72,7 @@ export async function activate(pi: unknown): Promise<void> {
   let stateStore: SessionStateStore | undefined;
   let backgroundCompletionMonitor: Promise<void> | undefined;
   let backgroundMonitorGeneration = 0;
+  const pendingEvidenceCaptures = new Set<Promise<void>>();
   const orchestratorBackgroundReadiness = new BackgroundProcessReadiness();
   const reviewerQuestionPauseWaiters = new Set<() => void>();
   const sessionAbortController = new AbortController();
@@ -95,6 +102,21 @@ export async function activate(pi: unknown): Promise<void> {
   const persistSessionState = async (force = false) => {
     if (!stateStore || (!sessionActive && !force)) return;
     await stateStore.save(state, executionTools.associations(), effectiveReviewConfig());
+  };
+
+  const trackEvidenceCapture = async (operation: Promise<void>): Promise<void> => {
+    pendingEvidenceCaptures.add(operation);
+    try {
+      await operation;
+    } finally {
+      pendingEvidenceCaptures.delete(operation);
+    }
+  };
+
+  const drainEvidenceCaptures = async (): Promise<void> => {
+    while (pendingEvidenceCaptures.size > 0) {
+      await Promise.allSettled([...pendingEvidenceCaptures]);
+    }
   };
 
   const releaseReviewerQuestionPauseWaiters = () => {
@@ -148,6 +170,7 @@ export async function activate(pi: unknown): Promise<void> {
     orchestratorBackgroundReadiness.clear();
     releaseReviewerQuestionPauseWaiters();
     await executionTools.shutdown();
+    await drainEvidenceCaptures();
     await persistSessionState(true);
     await stateStore?.drain();
     await executionTools.detach();
@@ -261,10 +284,10 @@ export async function activate(pi: unknown): Promise<void> {
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
     const window = state.reviewWindow;
-    if (!window) {
+    if (!window || !shouldRecordToolCallEvidence(name)) {
       return;
     }
-    await recordToolCallEvidence({
+    await trackEvidenceCapture(recordToolCallEvidence({
       state: window.evidence,
       cwd: currentCwd,
       toolName: name,
@@ -274,8 +297,7 @@ export async function activate(pi: unknown): Promise<void> {
         maxSnapshotBytes: config.maxSnapshotBytes,
       },
       exchangeSequence: window.activeExchange?.sequence,
-    });
-    await persistSessionState();
+    }));
   });
 
   registerHook(pi, "tool_result", async (...args) => {
@@ -283,7 +305,8 @@ export async function activate(pi: unknown): Promise<void> {
     const toolArgs = extractToolArgs(args);
     orchestratorBackgroundReadiness.observeToolResult(name, args[0], isToolError(args[0]));
     const window = state.reviewWindow;
-    if (!window) {
+    const toolError = isToolError(args[0]);
+    if (!window || !shouldRecordToolResultEvidence(name, toolError)) {
       return;
     }
     recordToolResultEvidence({
@@ -291,10 +314,9 @@ export async function activate(pi: unknown): Promise<void> {
       toolName: name,
       toolInput: toolArgs,
       result: args[0],
-      isError: isToolError(args[0]),
+      isError: toolError,
       exchangeSequence: window.activeExchange?.sequence,
     });
-    await persistSessionState();
   });
 
   registerHook(pi, "agent_end", async (...args) => {
@@ -392,6 +414,7 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     state.reviewInProgress = true;
+    await drainEvidenceCaptures();
     await persistSessionState();
     const reviewAbort = createReviewAbortController({
       signal,

@@ -26,6 +26,7 @@ test("background tasks return immediately, land independently, and additions cap
       "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
       "process.stdin.on('end',()=>setTimeout(()=>{",
       "if(prompt.includes('FIRST_SENTINEL'))fs.writeFileSync('first.txt','first landed\\n');",
+      "if(prompt.includes('PEER_SENTINEL'))fs.writeFileSync('peer.txt','peer landed\\n');",
       "if(prompt.includes('SECOND_SENTINEL'))fs.writeFileSync('second.txt',fs.existsSync('first.txt')?'saw first\\n':'missed first\\n');",
       "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
       "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
@@ -56,18 +57,35 @@ test("background tasks return immediately, land independently, and additions cap
     });
 
     const startedAt = Date.now();
-    const first = await controller.start([{
-      title: "first",
-      instructions: "FIRST_SENTINEL",
-      acceptanceCriteria: ["first.txt exists"],
-    }]);
+    const first = await controller.start([
+      {
+        title: "first",
+        instructions: "FIRST_SENTINEL",
+        acceptanceCriteria: ["first.txt exists"],
+      },
+      {
+        title: "peer",
+        instructions: "PEER_SENTINEL",
+        acceptanceCriteria: ["peer.txt exists"],
+      },
+    ]);
     assert.ok(Date.now() - startedAt < 300, "start should return before the deliberately delayed worker");
-    assert.equal(first.activeCount, 1);
-    assert.equal(first.tasks.length, 1);
-    await waitFor(() => controller.inspect(first.executionId).tasks[0]?.state === "landed");
+    assert.equal(first.activeCount, 2);
+    assert.equal(first.tasks.length, 2);
+    assert.equal(first.scheduling.dispatchPending, 0);
+    assert.equal(first.scheduling.dispatchAssigned, 2);
+    assert.equal(first.scheduling.configuredWorkerLimit, 2);
+    assert.equal(first.scheduling.configuredPoolCapacity, 2);
+    assert.equal(first.scheduling.estimatedImmediatelyAvailableSlots, 0);
+    await waitFor(() => controller.inspect(first.executionId).tasks.every((task) => task.state === "landed"));
     assert.equal(await readFile(join(root, "first.txt"), "utf8"), "first landed\n");
+    assert.equal(await readFile(join(root, "peer.txt"), "utf8"), "peer landed\n");
+    await waitFor(() => messages.some((message) => /Landed paths: first\.txt/.test(message)));
     assert.ok(messages.every((message) => !/CAPTURING -> RUNNING.*task is ACTIVE/s.test(message)));
     assert.ok(messages.some((message) => /landed independently/.test(message)), "quiet mode still reports each task landing");
+    assert.ok(messages.some((message) => /Execution revision: \d+/.test(message)));
+    assert.ok(messages.some((message) => /Task timing \(ms\): total \d+; queued \d+; capture \d+; execution \d+; review \d+; landing \d+/.test(message)));
+    assert.ok(messages.some((message) => /Top-off opportunity: up to 1 additional task\(s\) may be submitted with SubtasksAdd/.test(message)));
 
     config.execution!.subtaskNotifications = "noisy";
     const toppedOff = await controller.add(first.executionId, [{
@@ -75,19 +93,28 @@ test("background tasks return immediately, land independently, and additions cap
       instructions: "SECOND_SENTINEL",
       acceptanceCriteria: ["second.txt records the prior landing"],
     }]);
-    assert.equal(toppedOff.tasks.length, 2);
-    assert.notEqual(toppedOff.tasks[0]?.taskId, toppedOff.tasks[1]?.taskId);
+    assert.equal(toppedOff.tasks.length, 3);
+    assert.notEqual(toppedOff.tasks[0]?.taskId, toppedOff.tasks[2]?.taskId);
     await waitFor(() => controller.inspect(first.executionId).tasks.every((task) => task.state === "landed"));
     assert.equal(await readFile(join(root, "second.txt"), "utf8"), "saw first\n");
-    assert.ok(messages.some((message) => message.includes(toppedOff.tasks[1]!.taskId) && /task is ACTIVE/s.test(message)));
+    assert.ok(messages.some((message) => message.includes(toppedOff.tasks[2]!.taskId) && /task is ACTIVE/s.test(message)));
     assert.ok(messages.some((message) => /landed independently/.test(message)));
+    await waitFor(() => messages.some((message) => /Top-off opportunity: up to 2 additional task\(s\) may be submitted with SubtasksAdd/.test(message)));
     assert.equal(controller.inspect(first.executionId).activeCount, 0);
+    const completedInspection = controller.inspect(first.executionId);
+    assert.equal(completedInspection.peakConcurrency, 2);
+    assert.ok(completedInspection.tasks.every((task) => task.timing.totalMs > 0));
+    assert.ok(completedInspection.tasks.every((task) => (task.stateHistory?.length ?? 0) >= 3));
+    assert.ok(messages.some((message) => /Execution timing \(ms\): wall \d+; summed task time \d+; peak concurrency 2/.test(message)));
     const associations = controller.associations();
     await controller.shutdown();
     await controller.detach();
     const restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
     await restored.restore(associations);
-    assert.equal(restored.inspect(first.executionId).tasks.filter((task) => task.state === "landed").length, 2);
+    const restoredInspection = restored.inspect(first.executionId);
+    assert.equal(restoredInspection.tasks.filter((task) => task.state === "landed").length, 3);
+    assert.equal(restoredInspection.peakConcurrency, 2);
+    assert.ok(restoredInspection.tasks.every((task) => (task.stateHistory?.length ?? 0) >= 3));
     await restored.shutdown();
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -300,9 +327,10 @@ test("queued steering is incorporated before startup and landing events distingu
     assert.match(interrupted.tasks[0]?.summary ?? "", /before executor startup/);
 
     await waitFor(() => controller!.inspect(started.executionId).tasks[0]?.state === "landed", 60_000);
-    assert.ok(messages.some((message) => /partial task completion, not completion of the whole execution/.test(message)));
+    await waitFor(() => messages.some((message) => /partial task completion, not completion of the whole execution/.test(message)));
     assert.ok(messages.some((message) => message.includes(secondId) && /not landed/.test(message)));
     await waitFor(() => controller!.inspect(started.executionId).tasks.every((task) => task.state === "landed"), 60_000);
+    await waitFor(() => messages.some((message) => /COMPLETE: 2\/2 tasks landed/.test(message)));
     assert.equal(await readFile(join(root, "second.txt"), "utf8"), "false");
     for (const task of started.tasks) {
       assert.ok(

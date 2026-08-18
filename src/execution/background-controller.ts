@@ -85,6 +85,35 @@ export interface BackgroundActivityEvent {
   message: string;
 }
 
+export interface BackgroundStateTransition {
+  sequence: number;
+  state: BackgroundTaskState;
+  at: string;
+  generation: number;
+}
+
+export interface BackgroundTaskTimingSummary {
+  queueMs: number;
+  captureMs: number;
+  executionMs: number;
+  reviewMs: number;
+  landingMs: number;
+  totalMs: number;
+}
+
+export interface BackgroundSchedulingSnapshot {
+  configuredWorkerLimit: number;
+  configuredPoolCapacity: number;
+  activeWorkers: number;
+  activePoolLeases: number;
+  availableWorkerSlots: number;
+  availablePoolSlots: number;
+  estimatedImmediatelyAvailableSlots: number;
+  dispatchPending: number;
+  dispatchAssigned: number;
+  globallyDispatchPending: number;
+}
+
 export interface BackgroundTaskRecord {
   taskId: string;
   definition: BackgroundTaskDefinition;
@@ -101,6 +130,8 @@ export interface BackgroundTaskRecord {
   error?: string;
   activity: BackgroundActivityEvent[];
   nextActivitySequence: number;
+  stateHistory?: BackgroundStateTransition[];
+  nextStateSequence?: number;
   commands: BackgroundCommandRecord[];
   pendingContinuation?: { instructions: string; instructionId: string };
   interruptionMode?: "interrupt_as_failure" | "interrupt_with_merge";
@@ -121,6 +152,7 @@ export interface BackgroundExecutionGroup {
   cwd: string;
   createdAt: string;
   updatedAt: string;
+  peakConcurrency?: number;
   tasks: BackgroundTaskRecord[];
 }
 
@@ -141,6 +173,13 @@ interface RuntimeTask {
   controlStatus: "pending" | "registered" | "closed";
 }
 
+interface PersistedGroupRevision {
+  revision: number;
+  updatedAt: string;
+  peakConcurrency: number;
+  integritySha256: string;
+}
+
 interface BackgroundControllerInput {
   pi: unknown;
   config: ReviewGateConfig;
@@ -153,12 +192,19 @@ interface BackgroundControllerInput {
 
 export interface BackgroundInspection {
   executionId: string;
+  revision: number;
   root: string;
   cwd: string;
+  createdAt: string;
+  updatedAt: string;
+  peakConcurrency: number;
   activeCount: number;
   historicalCount: number;
+  scheduling: BackgroundSchedulingSnapshot;
   conflictGate?: BackgroundConflictGate;
   tasks: Array<BackgroundTaskRecord & {
+    timing: BackgroundTaskTimingSummary;
+    dispatchState?: "waiting_for_capacity" | "assigned_starting";
     artifactDir?: string;
     liveControl?: { adapter: string; generation: number; protocol?: string; steer: boolean; interrupt: boolean };
   }>;
@@ -264,15 +310,15 @@ export class BackgroundExecutionController {
               status: "queued",
               createdAt: new Date().toISOString(),
             });
-            task.state = "queued";
+            transitionTaskState(task, "queued");
             task.summary = "Exact parent conversation restored; durable continuation queued automatically.";
             task.updatedAt = new Date().toISOString();
           } else if (task.state === "stopped_for_application_exit" && !task.waveRoot) {
-            task.state = "queued";
+            transitionTaskState(task, "queued");
             task.summary = "Exact parent conversation restored; undispatched task queued automatically.";
             task.updatedAt = new Date().toISOString();
           } else if (isActiveTaskState(task.state) && task.state !== "queued") {
-            task.state = "paused_recoverable";
+            transitionTaskState(task, "paused_recoverable");
             task.summary = "The prior application ended without a verified clean shutdown; inspect writer ownership before continuing.";
             task.updatedAt = new Date().toISOString();
           }
@@ -325,6 +371,7 @@ export class BackgroundExecutionController {
       cwd: resolve(this.input.cwd()),
       createdAt: now,
       updatedAt: now,
+      peakConcurrency: 0,
       tasks: tasks.map((definition) => newTask(definition)),
     };
     this.groups.set(executionId, group);
@@ -352,15 +399,24 @@ export class BackgroundExecutionController {
     const count = Math.max(1, Math.min(lines ?? MAX_ACTIVITY, 500));
     return {
       executionId: group.executionId,
+      revision: group.revision,
       root: group.root,
       cwd: group.cwd,
+      createdAt: group.createdAt,
+      updatedAt: group.updatedAt,
+      peakConcurrency: group.peakConcurrency ?? 0,
       activeCount: group.tasks.filter((task) => isActiveTaskState(task.state)).length,
       historicalCount: group.tasks.length,
+      scheduling: this.schedulingSnapshot(group),
       conflictGate: this.conflictGate && this.conflictGate.executionId === group.executionId
         ? { ...this.conflictGate, paths: [...this.conflictGate.paths] }
         : undefined,
       tasks: selected.map((task) => ({
         ...cloneTask(task),
+        timing: taskTiming(task),
+        dispatchState: task.state === "queued"
+          ? this.runtimes.has(task.taskId) ? "assigned_starting" : "waiting_for_capacity"
+          : undefined,
         activity: task.activity.slice(offset === undefined ? Math.max(0, task.activity.length - count) : from, offset === undefined ? undefined : from + count),
         artifactDir: task.waveRoot ? join(task.waveRoot, "artifacts", task.taskId) : undefined,
         liveControl: this.runtimes.get(task.taskId)?.control
@@ -415,8 +471,7 @@ export class BackgroundExecutionController {
       status: "queued",
       createdAt: new Date().toISOString(),
     });
-    task.state = "queued";
-    task.updatedAt = new Date().toISOString();
+    transitionTaskState(task, "queued");
     await this.save(group);
     void this.pump();
     return this.inspect(group.executionId, task.taskId);
@@ -452,6 +507,7 @@ export class BackgroundExecutionController {
           cwd: resolve(this.input.cwd()),
           createdAt: now,
           updatedAt: now,
+          peakConcurrency: 0,
           tasks: [],
         };
         this.groups.set(group.executionId, group);
@@ -459,7 +515,7 @@ export class BackgroundExecutionController {
       const task = newTask(definition);
       task.bundle = { ...inspection.bundle };
       task.waveRoot = inspection.bundle.waveRoot;
-      task.state = "paused_recoverable";
+      transitionTaskState(task, "paused_recoverable");
       task.summary = `Adopted durable operation ${inspection.bundle.operationId} for triage-style continuation.`;
       addActivity(task, "recovery", task.summary);
       group.tasks.push(task);
@@ -535,7 +591,7 @@ export class BackgroundExecutionController {
         pending.status = "failed";
         pending.error = "Task was interrupted before executor startup.";
       }
-      task.state = "interrupted";
+      transitionTaskState(task, "interrupted");
       task.summary = input.mode === "interrupt_with_merge"
         ? "Interrupted before executor startup; there was no task checkpoint to merge."
         : "Interrupted before executor startup; the source workspace is unchanged.";
@@ -631,7 +687,7 @@ export class BackgroundExecutionController {
     try {
       command.status = "delivered";
       command.deliveredAt = new Date().toISOString();
-      task.state = "waiting_to_land";
+      transitionTaskState(task, "waiting_to_land");
       addActivity(task, "force_merge", `Force-merge requested from ${commitSha}. This is a mechanical landing attempt; manual inspection of the main workspace is required afterward in every outcome.`);
       await this.save(group);
 
@@ -639,7 +695,7 @@ export class BackgroundExecutionController {
       const plan = await planWaveLanding(capture, commitSha, group.cwd);
       if (plan.conflicts.length > 0) {
         if (!input.mergeAnyhow) {
-          task.state = "paused_recoverable";
+          transitionTaskState(task, "paused_recoverable");
           task.summary = `Force-merge found ${plan.conflicts.length} conflict(s); main remains unchanged. Manual workspace inspection is required before choosing recovery.`;
           command.status = "failed";
           command.error = task.summary;
@@ -658,7 +714,7 @@ export class BackgroundExecutionController {
           reason: `Forced task ${task.taskId} materialized conflicts that require immediate resolution.`,
         };
         this.releaseConflictBlock = sourceMutationCoordinator.block(group.cwd, this.conflictGate.reason);
-        task.state = "conflicted";
+        transitionTaskState(task, "conflicted");
         task.summary = `Force-merge materialized conflict markers in ${materialized.paths.join(", ")}. Resolve them and manually inspect the complete workspace; force-merge does not verify the requested result.`;
         command.status = "acknowledged";
         command.acknowledgedAt = new Date().toISOString();
@@ -667,10 +723,10 @@ export class BackgroundExecutionController {
         await this.wake(task, "failure", this.criticalPrompt()!);
         return this.inspect(group.executionId, task.taskId);
       }
-      task.state = "landing";
+      transitionTaskState(task, "landing");
       const landing = await executeWaveLanding(plan, capture);
       if (landing.status !== "landed") throw new Error(`Force-merge landing ended in ${landing.status}.`);
-      task.state = "landed";
+      transitionTaskState(task, "landed");
       const paths = [...landing.appliedPaths, ...landing.alreadyAppliedPaths];
       task.summary = paths.length > 0
         ? "Stopped task force-merged mechanically into the main workspace; manual workspace inspection is still required to confirm the requested changes are present and correct."
@@ -687,7 +743,7 @@ export class BackgroundExecutionController {
         command.status = "failed";
         command.error = messageOf(error);
       }
-      if (task.state !== "conflicted") task.state = "paused_recoverable";
+      if (task.state !== "conflicted") transitionTaskState(task, "paused_recoverable");
       task.error = messageOf(error);
       await this.save(group);
       throw error;
@@ -707,7 +763,7 @@ export class BackgroundExecutionController {
     const group = this.groups.get(gate.executionId);
     const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
     if (task) {
-      task.state = "landed";
+      transitionTaskState(task, "landed");
       task.summary = "Conflict resolution was validated and marked landed.";
       task.updatedAt = new Date().toISOString();
       await this.save(group!);
@@ -751,7 +807,7 @@ export class BackgroundExecutionController {
     for (const group of this.groups.values()) {
       for (const task of group.tasks) {
         if (!isActiveTaskState(task.state)) continue;
-        task.state = "stopped_for_application_exit";
+        transitionTaskState(task, "stopped_for_application_exit");
         task.summary = this.runtimes.has(task.taskId)
           ? "Stopping executor for application shutdown."
           : "Queued task stopped before dispatch for application shutdown.";
@@ -833,6 +889,8 @@ export class BackgroundExecutionController {
   private launch(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, lease: ExecutorPoolLease): void {
     const abort = new AbortController();
     this.active += 1;
+    const executionActiveBeforeLaunch = group.tasks.filter((candidate) => this.runtimes.has(candidate.taskId)).length;
+    group.peakConcurrency = Math.max(group.peakConcurrency ?? 0, executionActiveBeforeLaunch + 1);
     task.executorEntryId = lease.entry.entryId;
     const promise = (task.pendingContinuation
       ? this.runContinuation(group, task, abort, lease)
@@ -840,13 +898,13 @@ export class BackgroundExecutionController {
       .catch(async (error) => {
         if (task.interruptionMode) {
           this.failUndeliveredSteering(task, "Task was interrupted before the queued steering instruction was delivered.");
-          task.state = "interrupted";
+          transitionTaskState(task, "interrupted");
           task.error = undefined;
           task.summary = `Executor acknowledged ${task.interruptionMode} during startup or capture; its writer is quiesced.`;
           addActivity(task, "interrupt", task.summary);
         } else {
           this.failUndeliveredSteering(task, "Task failed before the queued steering instruction was delivered.");
-          task.state = task.state === "stopped_for_application_exit" ? task.state : "failed";
+          if (task.state !== "stopped_for_application_exit") transitionTaskState(task, "failed");
           task.error = messageOf(error);
           task.summary = `Background controller failure: ${task.error}`;
         }
@@ -881,9 +939,8 @@ export class BackgroundExecutionController {
       reuseUnchangedFrom: parentBaseline,
     }) : undefined;
     await this.incorporatePrestartSteering(group, task);
-    const priorState = task.state;
-    task.state = "capturing";
     task.generation += 1;
+    const priorState = transitionTaskState(task, "capturing");
     addActivity(task, "capturing", "Capturing an independent task base from current main.");
     await this.save(group);
     const activation = stateTransitionNotice(task, priorState, task.state);
@@ -929,7 +986,7 @@ export class BackgroundExecutionController {
           reason: `Task ${task.taskId} requires immediate conflict resolution.`,
         };
         this.releaseConflictBlock = sourceMutationCoordinator.block(group.cwd, this.conflictGate.reason);
-        task.state = "conflicted";
+        transitionTaskState(task, "conflicted");
         addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
         await this.save(group);
         await this.publishAssociations();
@@ -950,30 +1007,35 @@ export class BackgroundExecutionController {
       return;
     }
     if (result.landing?.status === "landed") {
-      task.state = "landed";
+      transitionTaskState(task, "landed");
+      const completionSnapshot = transitionEventSnapshot(group, task);
       this.updateIndicator();
       const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
       await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
+      const persisted = await this.save(group);
+      await this.publishAssociations();
+      synchronizeEventSnapshot(completionSnapshot, persisted);
       await this.wake(
         task,
         undeliveredSteering.length > 0 ? "failure" : "completion",
         undeliveredSteering.length > 0
           ? `Task ${task.taskId} landed, but ${undeliveredSteering.length} queued steering instruction(s) were not applied.`
           : `Task ${task.taskId} landed independently in the main workspace.`,
+        completionSnapshot,
       );
     } else if (result.landing?.status === "conflicted") {
-      task.state = "conflicted";
+      transitionTaskState(task, "conflicted");
       task.summary = this.conflictGate
         ? `Merge conflict requires immediate resolution: ${this.conflictGate.paths.join(", ")}.`
         : "Landing conflict could not be materialized automatically; inspect full diagnostics before modifying main.";
     } else if (result.phase === "aborted") {
-      task.state = task.interruptionMode ? "interrupted" : "paused_recoverable";
+      transitionTaskState(task, task.interruptionMode ? "interrupted" : "paused_recoverable");
       task.summary = task.interruptionMode
         ? `Executor acknowledged ${task.interruptionMode}.`
         : "Executor stopped with a recoverable checkpoint.";
       await this.acknowledgeInterrupt(task);
     } else {
-      task.state = worker?.bundle ? "paused_recoverable" : "failed";
+      transitionTaskState(task, worker?.bundle ? "paused_recoverable" : "failed");
       await this.wake(task, "failure", `Task ${task.taskId} failed: ${task.error ?? task.summary ?? "unknown failure"}`);
     }
     task.updatedAt = new Date().toISOString();
@@ -999,9 +1061,8 @@ export class BackgroundExecutionController {
     pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
     const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId)!;
     task.pendingContinuation = undefined;
-    const priorState = task.state;
-    task.state = "running";
     task.generation += 1;
+    const priorState = transitionTaskState(task, "running");
     command.status = "delivered";
     command.deliveredAt = new Date().toISOString();
     addActivity(task, "running", `Continuing from durable checkpoint (${pending.instructionId}).`);
@@ -1048,25 +1109,30 @@ export class BackgroundExecutionController {
         return;
       }
       if (result.landing?.status === "landed") {
-        task.state = "landed";
+        transitionTaskState(task, "landed");
+        const completionSnapshot = transitionEventSnapshot(group, task);
         this.updateIndicator();
         task.summary = "Continued task landed independently in the main workspace.";
         const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
+        const persisted = await this.save(group);
+        await this.publishAssociations();
+        synchronizeEventSnapshot(completionSnapshot, persisted);
         await this.wake(
           task,
           undeliveredSteering.length > 0 ? "failure" : "completion",
           undeliveredSteering.length > 0
-            ? `Task ${task.taskId} continuation landed, but ${undeliveredSteering.length} queued steering instruction(s) were not applied.`
-            : `Task ${task.taskId} continuation landed.`,
+              ? `Task ${task.taskId} continuation landed, but ${undeliveredSteering.length} queued steering instruction(s) were not applied.`
+              : `Task ${task.taskId} continuation landed.`,
+          completionSnapshot,
         );
       } else if (result.landing?.status === "conflicted") {
-        task.state = "conflicted";
+        transitionTaskState(task, "conflicted");
         task.summary = this.conflictGate
           ? `Merge conflict requires immediate resolution: ${this.conflictGate.paths.join(", ")}.`
           : "Continuation landing conflict could not be materialized automatically; inspect full diagnostics.";
       } else {
-        task.state = result.lifecycle?.status === "cancelled" ? "interrupted" : "paused_recoverable";
+        transitionTaskState(task, result.lifecycle?.status === "cancelled" ? "interrupted" : "paused_recoverable");
         task.summary = result.lifecycle?.summary ?? result.inspection.record.state;
         task.error = result.lifecycle?.error;
         if (task.state !== "interrupted") await this.wake(task, "failure", `Task ${task.taskId} continuation stopped: ${task.error ?? task.summary}`);
@@ -1101,21 +1167,23 @@ export class BackgroundExecutionController {
       reason,
     };
     this.releaseConflictBlock = sourceMutationCoordinator.block(group.cwd, reason);
-    task.state = "conflicted";
+    transitionTaskState(task, "conflicted");
   }
 
   private progress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: WaveProgressUpdate): void {
-    const previous = task.state;
     const next = stateFromProgress(update);
-    if (next) task.state = next;
-    task.updatedAt = new Date().toISOString();
+    const previous = next ? transitionTaskState(task, next) : task.state;
+    if (!next) task.updatedAt = new Date().toISOString();
     this.updateReviewStatus(task, update, next);
     for (const message of update.activity ?? [update.message]) addActivity(task, update.phase, message);
     const saved = this.save(group);
     void saved.catch((error) => this.input.notify?.(`review gate: failed to persist task progress: ${messageOf(error)}`));
     const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
     const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
-    if (transition) void saved.then(() => this.wake(task, "state", transition, snapshot)).catch(() => undefined);
+    if (transition) void saved.then((persisted) => {
+      synchronizeEventSnapshot(snapshot!, persisted);
+      return this.wake(task, "state", transition, snapshot);
+    }).catch(() => undefined);
     this.updateIndicator();
   }
 
@@ -1152,15 +1220,18 @@ export class BackgroundExecutionController {
   }
 
   private progressMessage(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, message: string): void {
-    const previous = task.state;
-    task.state = /review/i.test(message) ? "reviewing" : /land|integrat/i.test(message) ? "landing" : "running";
+    const next = /review/i.test(message) ? "reviewing" : /land|integrat/i.test(message) ? "landing" : "running";
+    const previous = transitionTaskState(task, next);
     addActivity(task, task.state, message);
     task.updatedAt = new Date().toISOString();
     const saved = this.save(group);
     void saved.catch(() => undefined);
     const transition = stateTransitionNotice(task, previous, task.state);
     const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
-    if (transition) void saved.then(() => this.wake(task, "state", transition, snapshot)).catch(() => undefined);
+    if (transition) void saved.then((persisted) => {
+      synchronizeEventSnapshot(snapshot!, persisted);
+      return this.wake(task, "state", transition, snapshot);
+    }).catch(() => undefined);
     this.updateIndicator();
   }
 
@@ -1317,7 +1388,10 @@ export class BackgroundExecutionController {
     const owner = [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
     const eventOwner = eventSnapshot?.group ?? owner;
     const eventTask = eventSnapshot?.task ?? task;
-    const eventContent = eventOwner ? formatExecutionEvent(eventOwner, eventTask, kind, content) : content;
+    const scheduling = eventOwner
+      ? this.schedulingSnapshot(eventOwner, kind === "completion" ? eventTask : undefined)
+      : undefined;
+    const eventContent = eventOwner ? formatExecutionEvent(eventOwner, eventTask, kind, content, scheduling) : content;
     const diagnostic = kind === "failure" && owner
       ? this.inspect(owner.executionId, task.taskId)
       : undefined;
@@ -1355,6 +1429,29 @@ export class BackgroundExecutionController {
     return queued;
   }
 
+  private schedulingSnapshot(group: BackgroundExecutionGroup, releasingTask?: BackgroundTaskRecord): BackgroundSchedulingSnapshot {
+    const configuredWorkerLimit = this.input.config.execution?.maxWorkers ?? 4;
+    const releasingEntryId = releasingTask && this.runtimes.has(releasingTask.taskId)
+      ? releasingTask.executorEntryId
+      : undefined;
+    const releasingActiveWorker = releasingEntryId ? 1 : 0;
+    const activeWorkers = Math.max(0, this.active - releasingActiveWorker);
+    const pool = this.pool.capacitySnapshot(releasingEntryId);
+    const availableWorkerSlots = Math.max(0, configuredWorkerLimit - activeWorkers);
+    return {
+      configuredWorkerLimit,
+      configuredPoolCapacity: pool.totalCapacity,
+      activeWorkers,
+      activePoolLeases: pool.activeLeases,
+      availableWorkerSlots,
+      availablePoolSlots: pool.availableSlots,
+      estimatedImmediatelyAvailableSlots: Math.min(availableWorkerSlots, pool.availableSlots),
+      dispatchPending: group.tasks.filter((task) => task.state === "queued" && !this.runtimes.has(task.taskId)).length,
+      dispatchAssigned: group.tasks.filter((task) => task.state === "queued" && this.runtimes.has(task.taskId)).length,
+      globallyDispatchPending: this.queuedTasks().length,
+    };
+  }
+
   private resolveGroup(executionId?: string): BackgroundExecutionGroup {
     if (executionId) {
       const group = this.groups.get(executionId);
@@ -1379,7 +1476,7 @@ export class BackgroundExecutionController {
     return candidates[0]!;
   }
 
-  private async save(group: BackgroundExecutionGroup): Promise<void> {
+  private async save(group: BackgroundExecutionGroup): Promise<PersistedGroupRevision> {
     group.revision += 1;
     group.updatedAt = new Date().toISOString();
     const snapshot = JSON.parse(JSON.stringify(group)) as BackgroundExecutionGroup;
@@ -1390,6 +1487,12 @@ export class BackgroundExecutionController {
     const next = prior.then(() => atomicWrite(join(group.root, "execution.json"), `${JSON.stringify(snapshot, null, 2)}\n`));
     this.saveTails.set(group.executionId, next.catch(() => undefined));
     await next;
+    return {
+      revision: snapshot.revision,
+      updatedAt: snapshot.updatedAt,
+      peakConcurrency: snapshot.peakConcurrency ?? 0,
+      integritySha256: snapshot.integritySha256,
+    };
   }
 
   private async publishAssociations(): Promise<void> {
@@ -1440,7 +1543,9 @@ export class BackgroundExecutionController {
       const detail = this.conflictGate
         ? `CRITICAL conflict: ${this.conflictGate.paths.join(", ")}`
         : [
-            ...live.slice(0, 3).map((task) => `${task.definition.title} (${task.state === "queued" ? "queued: executor startup/capacity wait" : task.state})`),
+            ...live.slice(0, 3).map((task) => `${task.definition.title} (${task.state === "queued"
+              ? this.runtimes.has(task.taskId) ? "queued: executor assigned/startup" : "queued: executor capacity wait"
+              : task.state})`),
             ...(live.length > 3 ? [`+${live.length - 3} more`] : []),
           ].join(", ");
       ctx.ui.setWidget("review-gate-subtasks", [`⟳ ${live.length} execution subtask${live.length === 1 ? "" : "s"} — ${detail}`], { placement: "belowEditor" });
@@ -1483,6 +1588,7 @@ function formatExecutionEvent(
   task: BackgroundTaskRecord,
   kind: "completion" | "failure" | "state",
   content: string,
+  scheduling?: BackgroundSchedulingSnapshot,
 ): string {
   const landed = group.tasks.filter((candidate) => candidate.state === "landed");
   const notLanded = group.tasks.filter((candidate) => candidate.state !== "landed");
@@ -1492,15 +1598,28 @@ function formatExecutionEvent(
     content,
     "",
     `Task: ${task.taskId} · ${title} · ${task.state}`,
+    `Execution revision: ${group.revision}`,
   ];
   const landedPaths = [
     ...(task.result?.landing?.appliedPaths ?? []),
     ...(task.result?.landing?.alreadyAppliedPaths ?? []),
   ];
   if (landedPaths.length > 0) lines.push(`Landed paths: ${[...new Set(landedPaths)].join(", ")}`);
+  if (kind === "completion") {
+    const timing = taskTiming(task);
+    lines.push(`Task timing (ms): total ${timing.totalMs}; queued ${timing.queueMs}; capture ${timing.captureMs}; execution ${timing.executionMs}; review ${timing.reviewMs}; landing ${timing.landingMs}.`);
+    if (scheduling) {
+      const topOff = Math.max(0, scheduling.estimatedImmediatelyAvailableSlots - scheduling.globallyDispatchPending);
+      lines.push(`Post-settlement scheduler: ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} workers active; ${scheduling.dispatchPending} task(s) in this execution and ${scheduling.globallyDispatchPending} task(s) globally already pending dispatch; estimated immediate slots after pending work: ${topOff}.`);
+      lines.push(`Top-off opportunity: up to ${topOff} additional task(s) may be submitted with SubtasksAdd if planned work remains.`);
+    }
+  }
   if (notLanded.length === 0) {
     if (kind === "completion") {
       lines.push(`Execution ${group.executionId} COMPLETE: ${landed.length}/${group.tasks.length} tasks landed.`);
+      const wallTimeMs = Math.max(0, Date.parse(group.updatedAt) - Date.parse(group.createdAt));
+      const summedTaskTimeMs = group.tasks.reduce((sum, candidate) => sum + taskTiming(candidate).totalMs, 0);
+      lines.push(`Execution timing (ms): wall ${wallTimeMs}; summed task time ${summedTaskTimeMs}; peak concurrency ${group.peakConcurrency ?? 0}.`);
       lines.push("All requested task outputs have landed; aggregate verification is now appropriate.");
     } else if (kind === "failure") {
       lines.push(`Execution ${group.executionId} has ${landed.length}/${group.tasks.length} tasks landed, but this interaction reported a failure.`);
@@ -1542,6 +1661,16 @@ function transitionEventSnapshot(
   };
 }
 
+function synchronizeEventSnapshot(
+  snapshot: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
+  persisted: PersistedGroupRevision,
+): void {
+  snapshot.group.revision = persisted.revision;
+  snapshot.group.updatedAt = persisted.updatedAt;
+  snapshot.group.peakConcurrency = persisted.peakConcurrency;
+  snapshot.group.integritySha256 = persisted.integritySha256;
+}
+
 function stateTransitionNotice(
   task: BackgroundTaskRecord,
   previous: BackgroundTaskState,
@@ -1569,7 +1698,47 @@ function newTask(definition: BackgroundTaskDefinition): BackgroundTaskRecord {
     generation: 0,
     activity: [],
     nextActivitySequence: 1,
+    stateHistory: [{ sequence: 1, state: "queued", at: now, generation: 0 }],
+    nextStateSequence: 2,
     commands: [],
+  };
+}
+
+function transitionTaskState(task: BackgroundTaskRecord, next: BackgroundTaskState, at = new Date().toISOString()): BackgroundTaskState {
+  const previous = task.state;
+  task.updatedAt = at;
+  if (previous === next) return previous;
+  task.stateHistory ??= [{ sequence: 1, state: previous, at: task.createdAt, generation: task.generation }];
+  task.nextStateSequence ??= (task.stateHistory.at(-1)?.sequence ?? 0) + 1;
+  task.state = next;
+  task.stateHistory.push({ sequence: task.nextStateSequence++, state: next, at, generation: task.generation });
+  if (task.stateHistory.length > MAX_ACTIVITY) task.stateHistory.splice(0, task.stateHistory.length - MAX_ACTIVITY);
+  return previous;
+}
+
+function taskTiming(task: BackgroundTaskRecord, now = Date.now()): BackgroundTaskTimingSummary {
+  const history = task.stateHistory?.length
+    ? task.stateHistory
+    : [{ sequence: 1, state: task.state, at: task.createdAt, generation: task.generation }];
+  const totals = { queueMs: 0, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0 };
+  for (let index = 0; index < history.length; index += 1) {
+    const transition = history[index]!;
+    if (!isActiveTaskState(transition.state)) continue;
+    const start = Date.parse(transition.at);
+    const next = history[index + 1];
+    const end = next ? Date.parse(next.at) : now;
+    const elapsed = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : 0;
+    if (transition.state === "queued") totals.queueMs += elapsed;
+    else if (transition.state === "capturing") totals.captureMs += elapsed;
+    else if (transition.state === "running") totals.executionMs += elapsed;
+    else if (transition.state === "reviewing") totals.reviewMs += elapsed;
+    else totals.landingMs += elapsed;
+  }
+  const terminalAt = !isActiveTaskState(task.state) ? Date.parse(history.at(-1)?.at ?? task.updatedAt) : now;
+  const createdAt = Date.parse(task.createdAt);
+  return {
+    ...totals,
+    totalMs: Number.isFinite(createdAt) && Number.isFinite(terminalAt) ? Math.max(0, terminalAt - createdAt) : 0,
   };
 }
 
@@ -1616,7 +1785,12 @@ async function readGroup(root: string): Promise<BackgroundExecutionGroup> {
   for (const task of parsed.tasks) {
     delete (task as BackgroundTaskRecord & { matchedWakePatterns?: string[] }).matchedWakePatterns;
     delete (task.definition as BackgroundTaskDefinition & { wakeOn?: unknown }).wakeOn;
+    if (!Array.isArray(task.stateHistory) || task.stateHistory.length === 0) {
+      task.stateHistory = [{ sequence: 1, state: task.state, at: task.createdAt, generation: task.generation }];
+    }
+    task.nextStateSequence = Math.max(task.nextStateSequence ?? 1, (task.stateHistory.at(-1)?.sequence ?? 0) + 1);
   }
+  parsed.peakConcurrency ??= 0;
   return parsed;
 }
 

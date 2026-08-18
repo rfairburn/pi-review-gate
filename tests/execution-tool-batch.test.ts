@@ -257,13 +257,15 @@ test("operation-specific execution tools render operation, task count, and durab
     content: [{ type: "text", text: "inspect: execution exec-1" }],
     details: {
       tasks: [
-        { taskId: "task-q", state: "queued", definition: { title: "Waiting work" } },
+        { taskId: "task-q", state: "queued", dispatchState: "waiting_for_capacity", definition: { title: "Waiting work" } },
+        { taskId: "task-s", state: "queued", dispatchState: "assigned_starting", definition: { title: "Starting work" } },
         { taskId: "task-a", state: "running", definition: { title: "Fast work" } },
         { taskId: "task-b", state: "conflicted", definition: { title: "Needs merge" } },
       ],
     },
   }, {}, theme).render(120).join("\n");
-  assert.match(rendered, /task-q queued \(executor startup\/capacity wait\) Waiting work/);
+  assert.match(rendered, /task-q queued \(executor capacity wait\) Waiting work/);
+  assert.match(rendered, /task-s queued \(executor assigned\/startup\) Starting work/);
   assert.match(rendered, /task-a running Fast work/);
   assert.match(rendered, /task-b conflicted Needs merge/);
 });
@@ -306,6 +308,12 @@ test("SubtasksStart result explains that queued work may have startup delay", as
     tasks: [{ title: "Waiting work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
   assert.match(result.content[0].text, /Queued tasks may wait for executor startup or available pool capacity/);
+  assert.match(result.content[0].text, /Scheduler at acceptance: 1 task\(s\) assigned and starting, 0 still pending dispatch/);
+  assert.match(result.content[0].text, /Assignment is not proof that executor startup has completed/);
+  assert.equal(result.details.scheduling.dispatchPending, 0);
+  assert.equal(result.details.scheduling.dispatchAssigned, 1);
+  assert.equal(result.details.scheduling.configuredWorkerLimit, 4);
+  assert.equal(result.details.scheduling.estimatedImmediatelyAvailableSlots, 3);
   assert.match(result.content[0].text, /Quiet notification mode is active/);
   assert.match(result.content[0].text, /Every task still triggers a turn when it lands/);
   assert.match(result.content[0].text, /CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress.*without triggering turns/);
@@ -313,7 +321,16 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.match(result.content[0].text, /repeated inspect loop, or other waiting surrogate/);
   assert.match(result.content[0].text, new RegExp(result.details.tasks[0].taskId));
   assert.match(result.content[0].text, /Task handles \(retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect\)/);
+  assert.match(result.content[0].text, /executor assigned; startup in progress/);
   assert.deepEqual(result.details.tasks[0].definition.executorAllowedTools, ["read", "bash", ...executionToolNames]);
+  assert.deepEqual(result.details.tasks[0].timing, {
+    queueMs: result.details.tasks[0].timing.queueMs,
+    captureMs: 0,
+    executionMs: 0,
+    reviewMs: 0,
+    landingMs: 0,
+    totalMs: result.details.tasks[0].timing.totalMs,
+  });
   await manager.shutdown();
 });
 

@@ -41,6 +41,7 @@ const SHARED_PROMPT_GUIDELINES = [
   "The start/add result reports queued tasks. Quiet mode (the default) triggers orchestrator turns for each LANDED, FAILED, CONFLICTED, or other recovery-required task; Noisy mode additionally triggers RUNNING (steerable) and REVIEWING (steering can supersede review). CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING remain visible in SubtasksInspect and /subtasks-view but do not trigger turns. DO NOT POLL for task-state changes and do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate. Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.",
   "A taskId may be omitted only when the supplied executionId contains exactly one task; otherwise use the returned taskId.",
   "Every task landing triggers a notification and lists every sibling that has not landed, even in quiet mode, so freed capacity can be topped off immediately. Do not verify aggregate outputs until the execution-complete notification.",
+  "Start/add distinguish tasks already assigned for executor startup from tasks still waiting for capacity. Completion events report durable phase timing, execution revision, peak concurrency on final completion, and estimated post-settlement capacity for SubtasksAdd.",
   "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call SubtasksMarkClean.",
   "Use SubtasksForceMerge only for a stopped task with a verified checkpoint; mergeAnyhow may intentionally materialize conflicts in main. Every force-merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
   "A request to cancel or stop without landing means interrupt_as_failure. Use interrupt_with_merge only when the user explicitly wants a mechanical checkpoint landing; it never guarantees the requested changes are present or correct, so inspect the main workspace manually afterward in every case.",
@@ -397,7 +398,7 @@ export class ExecutionToolManager {
         `Source workspace: ${sourceWorkspace.disposition}. ${sourceWorkspace.instruction}`,
         "Recovery guidance:",
         ...recovery.map((item) => `- ${item.action}: ${item.instruction}`),
-        ...inspections.map((inspection) => formatInspectionForModel(`Durable execution state for ${inspection.executionId}:`, inspection)),
+        ...inspections.map((inspection) => formatInspectionForModel(`Durable execution state for ${inspection.executionId}:`, inspection, true)),
       ].join("\n");
       return result(failureSummary, {
         action: normalized.action,
@@ -608,26 +609,33 @@ function backgroundResult(
   const notificationContract = notificationMode === "quiet"
     ? "Quiet notification mode is active: ordinary RUNNING and REVIEWING transitions remain passive UI telemetry. Every task still triggers a turn when it lands, fails, conflicts, or requires recovery, and landing events identify siblings that remain active."
     : "Noisy notification mode is active: RUNNING and REVIEWING transitions trigger turns in addition to every landed, failed, conflicted, or recovery-required task.";
+  const scheduling = inspection.scheduling;
+  const schedulingSummary = action === "start" || action === "add"
+    ? ` Scheduler at acceptance: ${scheduling.dispatchAssigned} task(s) assigned and starting, ${scheduling.dispatchPending} still pending dispatch; ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} global workers and ${scheduling.activePoolLeases}/${scheduling.configuredPoolCapacity} executor-pool slots are occupied; ${scheduling.estimatedImmediatelyAvailableSlots} slot(s) appear immediately available. Assignment is not proof that executor startup has completed.`
+    : "";
   const toolName = EXECUTION_TOOL_NAMES[action];
   const summary = action === "start" || action === "add"
-    ? `${toolName} accepted: execution ${inspection.executionId} has ${active} active task(s).${startupDelay} Queued state and stable task handles are included below. ${notificationContract} Internal CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress stays available in SubtasksInspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.`
+    ? `${toolName} accepted: execution ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract} Internal CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress stays available in SubtasksInspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.`
     : action === "force_merge"
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Force-merge only reports a mechanical landing attempt; always inspect the main workspace manually because it does not prove the requested changes are present or correct.`
     : action === "interrupt" && inspection.tasks.some((task) => task.commands.some((command) => command.action === "interrupt" && command.mode === "interrupt_with_merge"))
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Interrupt-with-merge only attempted a mechanical checkpoint landing; always inspect the main workspace manually because this status does not prove the requested changes are present or correct.`
       : `${toolName}: execution ${inspection.executionId}, ${active} active task(s).`;
-  return result(formatInspectionForModel(summary, inspection), { action, ...inspection }, isError);
+  return result(formatInspectionForModel(summary, inspection, action === "inspect"), { action, ...inspection }, isError);
 }
 
-function formatInspectionForModel(summary: string, inspection: BackgroundInspection): string {
+function formatInspectionForModel(summary: string, inspection: BackgroundInspection, includeTiming = false): string {
   const lines = [summary, "Task handles (retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect):"];
   for (const task of inspection.tasks) {
     const control = task.liveControl
       ? `live control: steer ${task.liveControl.steer ? "yes" : "no"}, interrupt ${task.liveControl.interrupt ? "yes" : "no"}`
       : task.state === "queued"
-        ? "waiting for executor startup/capacity"
+        ? task.dispatchState === "assigned_starting" ? "executor assigned; startup in progress" : "waiting for executor capacity"
         : "no live control currently registered";
     lines.push(`- ${task.taskId} · ${task.definition.title} · ${task.state} · ${control}`);
+    if (includeTiming) {
+      lines.push(`  timing (ms): total ${task.timing.totalMs}; queued ${task.timing.queueMs}; capture ${task.timing.captureMs}; execution ${task.timing.executionMs}; review ${task.timing.reviewMs}; landing ${task.timing.landingMs}`);
+    }
     if (task.summary) lines.push(`  current authoritative outcome: ${clipPlain(task.summary, 700)}`);
     const command = task.commands.at(-1);
     if (command) lines.push(`  latest command: ${command.action} ${command.instructionId} · ${command.status}${command.error ? ` · ${command.error}` : ""}`);
@@ -679,7 +687,9 @@ function renderResult(value: unknown, _options: unknown, theme: ThemeLike): unkn
         if (!isRecord(task)) continue;
         const title = isRecord(task.definition) && typeof task.definition.title === "string" ? task.definition.title : task.taskId;
         const state = task.state === "queued"
-          ? "queued (executor startup/capacity wait)"
+          ? task.dispatchState === "assigned_starting"
+            ? "queued (executor assigned/startup)"
+            : "queued (executor capacity wait)"
           : task.state ?? "unknown";
         lines.push(clip(`  ${String(task.taskId ?? "task")}  ${state}  ${title ?? "task"}`, width));
       }

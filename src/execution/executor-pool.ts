@@ -9,6 +9,19 @@ export interface ExecutorPoolLease extends ExecutorPoolAssignment {
   release(): void;
 }
 
+export interface ExecutorPoolCapacitySnapshot {
+  totalCapacity: number;
+  activeLeases: number;
+  availableSlots: number;
+  entries: Array<{
+    entryId: string;
+    priority: number;
+    capacity: number;
+    activeLeases: number;
+    availableSlots: number;
+  }>;
+}
+
 interface Waiter {
   after: number | string;
   resolve: (lease: ExecutorPoolLease | undefined) => void;
@@ -99,6 +112,26 @@ export class ExecutorPoolScheduler {
 
   hasEntry(entryId: string): boolean {
     return this.entries.some((entry) => entry.entryId === entryId);
+  }
+
+  capacitySnapshot(releasingEntryId?: string): ExecutorPoolCapacitySnapshot {
+    const entries = this.entries.map((entry, priority) => {
+      const current = this.running.get(entry.entryId) ?? 0;
+      const activeLeases = releasingEntryId === entry.entryId ? Math.max(0, current - 1) : current;
+      return {
+        entryId: entry.entryId,
+        priority,
+        capacity: entry.maxConcurrent,
+        activeLeases,
+        availableSlots: Math.max(0, entry.maxConcurrent - activeLeases),
+      };
+    });
+    return {
+      totalCapacity: entries.reduce((sum, entry) => sum + entry.capacity, 0),
+      activeLeases: entries.reduce((sum, entry) => sum + entry.activeLeases, 0),
+      availableSlots: entries.reduce((sum, entry) => sum + entry.availableSlots, 0),
+      entries,
+    };
   }
 
   private drainWaiters(): void {

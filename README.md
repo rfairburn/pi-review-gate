@@ -213,6 +213,9 @@ ordinary `RUNNING` and `REVIEWING` transitions remain passive UI telemetry.
 Noisy mode additionally wakes on those two interactive states. Every task
 landing is reported immediately with its still-active siblings so the
 orchestrator can top off freed capacity without waiting for the entire execution.
+Each completion reports the durable execution revision, per-phase task timing,
+and estimated post-settlement capacity after already-queued work. Final completion
+also reports wall time, summed task time, and peak concurrent workers.
 Internal `CAPTURING`, `ACCEPTED`, `WAITING_TO_LAND`, and `LANDING` progress
 remains durable and user-visible without starting model turns.
 
@@ -263,19 +266,22 @@ artifact inventory, current bundle, and safe next actions. Only `landed` means
 that worker changes reached the source workspace.
 
 The persistent widget shows active tasks below the editor and distinguishes a
-queued executor-startup/capacity wait from active work. `/subtasks-view` toggles
+task assigned for executor startup from one still waiting for capacity and from
+active work. `/subtasks-view` toggles
 the expanded panel, and the same expanded/collapsed preference is available in
 `/review-settings`. This is a global UI preference rather than conversation
 state. The expanded view lists only active tasks (up to 16), while its combined
 newest-ten activity feed may temporarily retain events from tasks that have
-already landed. Every model-facing
-`start`, `add`, and `inspect` result includes the stable task UUIDs, states,
+already landed. Every model-facing `SubtasksStart`, `SubtasksAdd`, and
+`SubtasksInspect` result includes the stable task UUIDs, states,
 recent activity, and full artifact paths needed for control and deeper `rg`
-inspection. A partial landing event identifies the landed paths and every
+inspection. Start/add results also show assigned-starting versus capacity-waiting
+tasks and a point-in-time scheduler snapshot without claiming startup has completed.
+A partial landing event identifies the landed paths and every
 sibling that has not landed; only the final event invites aggregate verification.
 Completion, failure, meaningful state changes, and workspace conflicts are
 delivered proactively; polling loops are neither required nor recommended, but
-purposeful `inspect` calls are always supported.
+purposeful `SubtasksInspect` calls are always supported.
 User analogs are available as `/subtasks` and the `/subtask-*` commands for
 inspect, add, steer, interrupt, force-merge, and mark-clean. These commands open
 interactive execution/task and action pickers when handles are omitted; their

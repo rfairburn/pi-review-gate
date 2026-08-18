@@ -37,6 +37,27 @@ test("released high-priority capacity is preferred for the next fresh task", () 
   next.release();
 });
 
+test("capacity snapshots can model a completing lease before its asynchronous release", () => {
+  const scheduler = new ExecutorPoolScheduler(entries);
+  const qwen = scheduler.tryAcquire()!;
+  const deepseek = scheduler.tryAcquire()!;
+  assert.deepEqual(scheduler.capacitySnapshot(), {
+    totalCapacity: 7,
+    activeLeases: 2,
+    availableSlots: 5,
+    entries: [
+      { entryId: "qwen", priority: 0, capacity: 1, activeLeases: 1, availableSlots: 0 },
+      { entryId: "deepseek", priority: 1, capacity: 2, activeLeases: 1, availableSlots: 1 },
+      { entryId: "luna", priority: 2, capacity: 4, activeLeases: 0, availableSlots: 4 },
+    ],
+  });
+  const afterQwen = scheduler.capacitySnapshot("qwen");
+  assert.equal(afterQwen.activeLeases, 1);
+  assert.equal(afterQwen.availableSlots, 6);
+  qwen.release();
+  deepseek.release();
+});
+
 test("failover only acquires a lower-priority executor", async () => {
   const scheduler = new ExecutorPoolScheduler(entries);
   const primary = scheduler.tryAcquire()!;

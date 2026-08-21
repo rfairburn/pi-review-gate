@@ -445,7 +445,6 @@ export class ExecutionToolManager {
 const RESEARCH_ALLOWED_TOOLS = new Set([
   "read", "grep", "glob", "find", "ls", "webfetch", "websearch",
   "BrowserNavigate", "BrowserExtract", "BrowserScroll", "BrowserBack", "BrowserHistory",
-  "EvidenceAdd", "EvidenceGet", "EvidenceList",
 ]);
 
 function researchToolIntersection(parent: string[] | undefined): string[] | undefined {
@@ -665,7 +664,15 @@ function backgroundResult(
 }
 
 function formatInspectionForModel(summary: string, inspection: BackgroundInspection, includeTiming = false): string {
-  const lines = [summary, "Task handles (retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect):"];
+  const lines = [summary];
+  if (includeTiming) {
+    const scheduling = inspection.scheduling;
+    lines.push(
+      `Execution diagnostics: revision ${inspection.revision}; peak concurrency ${inspection.peakConcurrency}.`,
+      `Scheduler: ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} workers active; ${scheduling.activePoolLeases}/${scheduling.configuredPoolCapacity} pool leases active; ${scheduling.dispatchPending} task(s) in this execution and ${scheduling.globallyDispatchPending} task(s) globally pending dispatch; ${scheduling.estimatedImmediatelyAvailableSlots} immediate slot(s) estimated.`,
+    );
+  }
+  lines.push("Task handles (retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect):");
   for (const task of inspection.tasks) {
     const control = task.liveControl
       ? `live control: steer ${task.liveControl.steer ? "yes" : "no"}, interrupt ${task.liveControl.interrupt ? "yes" : "no"}`

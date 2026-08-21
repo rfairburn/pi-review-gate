@@ -83,8 +83,9 @@ test("background tasks return immediately, land independently, and additions cap
     await waitFor(() => messages.some((message) => /Landed paths: first\.txt/.test(message)));
     assert.ok(messages.every((message) => !/CAPTURING -> RUNNING.*task is ACTIVE/s.test(message)));
     assert.ok(messages.some((message) => /landed independently/.test(message)), "quiet mode still reports each task landing");
-    assert.ok(messages.some((message) => /Execution revision: \d+/.test(message)));
-    assert.ok(messages.some((message) => /Task timing \(ms\): total \d+; queued \d+; capture \d+; execution \d+; review \d+; landing \d+/.test(message)));
+    assert.ok(messages.every((message) => !/Execution revision: \d+/.test(message)));
+    assert.ok(messages.every((message) => !/Task timing \(ms\):/.test(message)));
+    assert.ok(messages.every((message) => !/Post-settlement scheduler:/.test(message)));
     assert.ok(messages.some((message) => /Top-off opportunity: up to 1 additional task\(s\) may be submitted with SubtasksAdd/.test(message)));
 
     config.execution!.subtaskNotifications = "noisy";
@@ -105,7 +106,7 @@ test("background tasks return immediately, land independently, and additions cap
     assert.equal(completedInspection.peakConcurrency, 2);
     assert.ok(completedInspection.tasks.every((task) => task.timing.totalMs > 0));
     assert.ok(completedInspection.tasks.every((task) => (task.stateHistory?.length ?? 0) >= 3));
-    assert.ok(messages.some((message) => /Execution timing \(ms\): wall \d+; summed task time \d+; peak concurrency 2/.test(message)));
+    assert.ok(messages.every((message) => !/Execution timing \(ms\):/.test(message)));
     const associations = controller.associations();
     await controller.shutdown();
     await controller.detach();
@@ -141,7 +142,7 @@ test("research tasks report without review or landing and quarantine accidental 
       "if(request.method==='initialized')return;",
       "if(request.method==='thread/start'||request.method==='thread/resume')return send({jsonrpc:'2.0',id:request.id,result:{thread:{id:request.params.threadId||threadId}}});",
       "if(request.method==='turn/start'){const prompt=request.params.input?.[0]?.text||'';if(prompt.includes('DIRTY_RESEARCH'))fs.writeFileSync('ignored-research.txt','must not land\\n');",
-      "const turnId='turn-'+(++turn),text='Evidence-backed finding: base.txt contains the captured baseline.';send({jsonrpc:'2.0',id:request.id,result:{turn:{id:turnId}}});",
+      "const turnId='turn-'+(++turn),text=prompt.includes('LONG_RESEARCH')?'Summary: The captured baseline was found.\\n\\n## Details\\n'+('LONG_DETAIL '.repeat(120)):'Evidence-backed finding: base.txt contains the captured baseline.';send({jsonrpc:'2.0',id:request.id,result:{turn:{id:turnId}}});",
       "setImmediate(()=>{send({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text}}});send({jsonrpc:'2.0',method:'turn/completed',params:{threadId,turn:{id:turnId,status:'completed',items:[{type:'agentMessage',text}]}}});});return;}",
       "});",
     ].join("\n"), "utf8");
@@ -188,12 +189,18 @@ test("research tasks report without review or landing and quarantine accidental 
         instructions: "DIRTY_RESEARCH",
         acceptanceCriteria: ["Return an evidence-backed report"],
       },
+      {
+        title: "long research",
+        instructions: "LONG_RESEARCH",
+        acceptanceCriteria: ["Return a detailed report with a bounded summary"],
+      },
     ], "research");
     assert.equal(started.kind, "research");
     await waitFor(() => controller.inspect(started.executionId).activeCount === 0);
     const finished = controller.inspect(started.executionId);
     const clean = finished.tasks.find((task) => task.definition.title === "clean research")!;
     const dirty = finished.tasks.find((task) => task.definition.title === "dirty research")!;
+    const long = finished.tasks.find((task) => task.definition.title === "long research")!;
     assert.equal(clean.state, "reported");
     assert.match(clean.report ?? "", /Evidence-backed finding/);
     const reportArtifact = await readFile(clean.reportPath!, "utf8");
@@ -204,6 +211,14 @@ test("research tasks report without review or landing and quarantine accidental 
     assert.match(dirty.error ?? "", /read-only contract/);
     await assert.rejects(readFile(join(root, "ignored-research.txt"), "utf8"), /ENOENT/);
     await waitFor(() => messages.some((message) => /completed without workspace changes/.test(message)));
+    const cleanMessage = messages.find((message) => message.startsWith(`Research task ${clean.taskId} completed without workspace changes.`))!;
+    assert.match(cleanMessage, /Complete report:\nEvidence-backed finding/);
+    await waitFor(() => messages.some((message) => message.startsWith(`Research task ${long.taskId} completed without workspace changes.`)));
+    const longMessage = messages.find((message) => message.startsWith(`Research task ${long.taskId} completed without workspace changes.`))!;
+    assert.match(longMessage, /Full report: .*research-report\.md/);
+    assert.match(longMessage, /too long to inline completely; no partial report excerpt is included/);
+    assert.match(longMessage, /Summary: The captured baseline was found\./);
+    assert.doesNotMatch(longMessage, /LONG_DETAIL/);
     await waitFor(() => messages.some((message) => /private changes were quarantined and main is unchanged/.test(message)));
     await assert.rejects(controller.forceMerge({
       executionId: started.executionId,

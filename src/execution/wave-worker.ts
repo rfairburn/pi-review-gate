@@ -512,7 +512,7 @@ export function buildWaveWorkerPrompt(
     renderWaveWorkerTask(rewrittenTask),
     "",
     research
-      ? "When finished, return a concise, evidence-linked report that addresses every acceptance criterion and notes uncertainty or stale-snapshot risk."
+      ? "When finished, return a concise, source-linked report that addresses every acceptance criterion and notes uncertainty or stale-snapshot risk. Begin with one `Summary:` line of at most 240 characters that can stand alone in a parent completion notification; put supporting detail after it. Cite repository paths and external URLs directly. Do not cite child-local evidence IDs."
       : "When finished, summarize changed files, verification performed, and remaining risks.",
     isolationDirective(workerRoot),
   ].join("\n");

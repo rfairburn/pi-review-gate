@@ -1158,7 +1158,7 @@ export class BackgroundExecutionController {
       const persisted = await this.save(group);
       await this.publishAssociations();
       synchronizeEventSnapshot(snapshot, persisted);
-      await this.wake(task, "completion", `Research task ${task.taskId} completed without workspace changes. Report: ${task.reportPath}\nSummary: ${clipActivity(report, 900)}`, snapshot);
+      await this.wake(task, "completion", formatResearchCompletion(task.taskId, report, task.reportPath), snapshot);
       this.updateIndicator();
       return;
     } else if (result.status === "cancelled" || task.interruptionMode) {
@@ -1814,6 +1814,29 @@ function clipActivity(value: string, max = 180): string {
   return compact.length <= max ? compact : `${compact.slice(0, Math.max(1, max - 1))}…`;
 }
 
+const SHORT_RESEARCH_REPORT_MAX_CHARS = 900;
+const RESEARCH_SUMMARY_MAX_CHARS = 240;
+
+function formatResearchCompletion(taskId: string, report: string, reportPath: string): string {
+  const trimmed = report.trim();
+  const lines = [
+    `Research task ${taskId} completed without workspace changes.`,
+    `Full report: ${reportPath}`,
+  ];
+  if (trimmed.length <= SHORT_RESEARCH_REPORT_MAX_CHARS) {
+    lines.push("Complete report:", trimmed);
+    return lines.join("\n");
+  }
+  const declaredSummary = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^Summary:\s+\S/i.test(line) && line.length <= RESEARCH_SUMMARY_MAX_CHARS + "Summary: ".length);
+  lines.push("The report is too long to inline completely; no partial report excerpt is included.");
+  if (declaredSummary) lines.push(declaredSummary);
+  else lines.push("No bounded standalone summary was supplied; read the full report when its details are needed for synthesis.");
+  return lines.join("\n");
+}
+
 function executorDisplayLabel(task: BackgroundTaskRecord, config: ReviewGateConfig, kind: BackgroundTaskKind = "execute"): string {
   if (!task.executorEntryId) return "executor pending";
   const entry = resolvedWorkerRoute(config, kind).find((candidate) => candidate.entryId === task.executorEntryId)
@@ -1855,28 +1878,22 @@ function formatExecutionEvent(
     content,
     "",
     `Task: ${task.taskId} · ${title} · ${task.state}`,
-    `Execution revision: ${group.revision}`,
   ];
+  if (kind !== "completion") lines.push(`Execution revision: ${group.revision}`);
   const landedPaths = [
     ...(task.result?.landing?.appliedPaths ?? []),
     ...(task.result?.landing?.alreadyAppliedPaths ?? []),
   ];
   if (landedPaths.length > 0) lines.push(`Landed paths: ${[...new Set(landedPaths)].join(", ")}`);
   if (kind === "completion") {
-    const timing = taskTiming(task);
-    lines.push(`Task timing (ms): total ${timing.totalMs}; queued ${timing.queueMs}; capture ${timing.captureMs}; execution ${timing.executionMs}; review ${timing.reviewMs}; landing ${timing.landingMs}.`);
     if (scheduling) {
       const topOff = Math.max(0, scheduling.estimatedImmediatelyAvailableSlots - scheduling.globallyDispatchPending);
-      lines.push(`Post-settlement scheduler: ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} workers active; ${scheduling.dispatchPending} task(s) in this execution and ${scheduling.globallyDispatchPending} task(s) globally already pending dispatch; estimated immediate slots after pending work: ${topOff}.`);
       lines.push(`Top-off opportunity: up to ${topOff} additional task(s) may be submitted with SubtasksAdd if planned work remains.`);
     }
   }
   if (incomplete.length === 0) {
     if (kind === "completion") {
       lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} COMPLETE: ${successful.length}/${group.tasks.length} tasks ${successVerb}.`);
-      const wallTimeMs = Math.max(0, Date.parse(group.updatedAt) - Date.parse(group.createdAt));
-      const summedTaskTimeMs = group.tasks.reduce((sum, candidate) => sum + taskTiming(candidate).totalMs, 0);
-      lines.push(`Execution timing (ms): wall ${wallTimeMs}; summed task time ${summedTaskTimeMs}; peak concurrency ${group.peakConcurrency ?? 0}.`);
       lines.push(group.kind === "research"
         ? "All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group."
         : "All requested task outputs have landed; aggregate verification is now appropriate.");

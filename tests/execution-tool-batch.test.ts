@@ -26,7 +26,7 @@ function executionTool(tools: Array<Record<string, any>>, name: string): Record<
   return tool;
 }
 
-function harness(options: { slowExecutor?: boolean; expandedView?: boolean; researchCapable?: boolean; resourceCapacity?: number } = {}) {
+function harness(options: { slowExecutor?: boolean; expandedView?: boolean; researchCapable?: boolean; resourceCapacity?: number; activeTools?: string[] } = {}) {
   const tools: Array<Record<string, any>> = [];
   const commands: string[] = [];
   const commandHandlers = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
@@ -39,7 +39,7 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean; rese
       commandHandlers.set(name, options.handler);
     },
     setToolActive(name: string, enabled: boolean) { active.push({ name, enabled }); },
-    getActiveTools() { return ["read", "bash", ...executionToolNames]; },
+    getActiveTools() { return options.activeTools ?? ["read", "bash", ...executionToolNames]; },
   };
   const config = normalizeConfig({
     enabled: true,
@@ -336,6 +336,7 @@ test("/subtasks-view toggles a live multiline widget without entering model cont
 test("SubtasksStart result explains that queued work may have startup delay", async () => {
   const { tools, manager } = harness();
   const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const inspect = executionTool(tools, "SubtasksInspect").execute as ExecuteTool;
   const result = await execute("start-delay", {
     tasks: [{ title: "Waiting work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
@@ -363,11 +364,19 @@ test("SubtasksStart result explains that queued work may have startup delay", as
     landingMs: 0,
     totalMs: result.details.tasks[0].timing.totalMs,
   });
+  const diagnostic = await inspect("start-delay-inspect", { executionId: result.details.executionId }, undefined, undefined, {});
+  assert.match(diagnostic.content[0].text, /Execution diagnostics: revision \d+; peak concurrency \d+\./);
+  assert.match(diagnostic.content[0].text, /Scheduler: \d+\/4 workers active;/);
+  assert.match(diagnostic.content[0].text, /timing \(ms\): total \d+; queued \d+; capture \d+; execution \d+; review \d+; landing \d+/);
   await manager.shutdown();
 });
 
-test("SubtasksStart creates immutable research groups with a parent-intersected read-only toolset", async () => {
-  const { tools, manager } = harness({ slowExecutor: true, researchCapable: true });
+test("SubtasksStart creates immutable research groups without child-local evidence tools", async () => {
+  const { tools, manager } = harness({
+    slowExecutor: true,
+    researchCapable: true,
+    activeTools: ["read", "EvidenceAdd", "EvidenceGet", "EvidenceList"],
+  });
   const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   const add = executionTool(tools, "SubtasksAdd").execute as ExecuteTool;
   const started = await start("research-start", {

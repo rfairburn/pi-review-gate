@@ -7,7 +7,7 @@ ORCHESTRATOR_PROMPT="$REVIEW_GATE_ROOT/scripts/orchestrator-system-prompt.md"
 # shellcheck source=scripts/little-coder-tool-policy.sh
 source "$REVIEW_GATE_ROOT/scripts/little-coder-tool-policy.sh"
 
-export LITTLE_CODER_THINKING_BUDGET=16384
+export LITTLE_CODER_THINKING_BUDGET=262144
 
 unset PI_REVIEW_GATE_CONFIG
 unset LITTLE_CODER_REVIEW_CONFIG

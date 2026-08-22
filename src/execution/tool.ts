@@ -181,9 +181,9 @@ export class ExecutionToolManager {
         handler: async (args: string, ctx: unknown) => {
           try {
             const value = await handler(args, ctx);
-            if (value !== undefined) await this.input.notify?.(formatUserCommandResult(value));
+            if (value !== undefined) await notifyUserCommand(ctx, this.input.notify, formatUserCommandResult(value), "info");
           } catch (error) {
-            await this.input.notify?.(`review gate: /${name} failed: ${messageOf(error)}`);
+            await notifyUserCommand(ctx, this.input.notify, `review gate: /${name} failed: ${messageOf(error)}`, "error");
           }
         },
       });
@@ -216,20 +216,27 @@ export class ExecutionToolManager {
       return this.controller.add(executionId, tasks);
     });
     register("subtask-steer", "Pick and steer a queued, active, or reviewing task; explicit arguments remain optional.", async (args, ctx) => {
-      let [executionId, rest] = splitFirst(args);
-      let [taskId, instruction] = splitFirst(rest);
-      if (!executionId || !taskId) {
+      const explicit = args.trim().length > 0;
+      let executionId: string | undefined;
+      let taskId: string | undefined;
+      let instruction = "";
+      if (explicit) {
+        let rest: string;
+        [executionId, rest] = splitFirst(args);
+        [taskId, instruction] = splitFirst(rest);
+        if (!executionId?.startsWith("exec-") || !taskId?.startsWith("task-") || !instruction.trim()) {
+          throw new Error("usage: /subtask-steer <executionId> <taskId> <instruction>; or run /subtask-steer with no arguments to pick a task and enter the instruction interactively");
+        }
+      } else {
         const selected = await selectTask(this.controller, ctx, "Steer background subtask", (task) => ["queued", "capturing", "running", "reviewing"].includes(task.state));
         if (!selected) return undefined;
         executionId = selected.executionId;
         taskId = selected.taskId;
-      }
-      if (!instruction) {
         const ui = commandUi(ctx);
         if (!ui?.input && !ui?.editor) throw new Error("interactive input is unavailable; use /subtask-steer <executionId> <taskId> <instruction>");
         instruction = (await ui.input?.("Steering instruction")) ?? (await ui.editor?.("Steering instruction", "")) ?? "";
+        if (!instruction.trim()) return undefined;
       }
-      if (!instruction.trim()) return undefined;
       return this.controller.steer({ executionId, taskId, instructions: instruction, instructionId: `user-steer-${randomUUID()}`, actor: "user" });
     });
     register("subtask-interrupt", "Pick a queued or active task to interrupt; explicit arguments remain optional.", async (args, ctx) => {
@@ -865,10 +872,29 @@ function formatUserCommandResult(value: unknown): string {
       const title = isRecord(task.definition) && typeof task.definition.title === "string" ? task.definition.title : "task";
       lines.push(`  ${String(task.taskId)}  ${String(task.state)}  ${title}`);
       if (typeof task.summary === "string" && task.summary.trim()) lines.push(`    ${task.summary.trim()}`);
+      if (Array.isArray(task.commands)) {
+        const command = task.commands.at(-1);
+        if (isRecord(command) && typeof command.action === "string" && typeof command.status === "string") {
+          lines.push(`    latest command: ${command.action} ${command.status}${typeof command.error === "string" ? ` — ${command.error}` : ""}`);
+        }
+      }
     }
   }
   if (lines.length > 0) return `review gate subtasks:\n${lines.join("\n")}`;
   return `review gate subtasks: ${JSON.stringify(value)}`;
+}
+
+async function notifyUserCommand(
+  ctx: unknown,
+  fallback: ((message: string) => void | Promise<void>) | undefined,
+  message: string,
+  level: "info" | "error",
+): Promise<void> {
+  if (isRecord(ctx) && isRecord(ctx.ui) && typeof ctx.ui.notify === "function") {
+    await ctx.ui.notify(message, level);
+    return;
+  }
+  await fallback?.(message);
 }
 
 function messageOf(error: unknown): string {

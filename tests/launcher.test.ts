@@ -62,7 +62,7 @@ test("persistent launcher uses fallback config, clears overrides, and preserves 
   assert.match(result.stdout, new RegExp(escapeRegExp(configPath)));
   assert.equal(await readFile(join(capture, "config-env"), "utf8"), "unset");
   assert.equal(await readFile(join(capture, "disabled-env"), "utf8"), "unset");
-  assert.equal(await readFile(join(capture, "thinking-budget"), "utf8"), "16384");
+  assert.equal(await readFile(join(capture, "thinking-budget"), "utf8"), "262144");
   const extensions = await readFile(join(capture, "extensions"), "utf8");
   assert.match(extensions, /dist\/src\/index\.js/);
   assert.match(extensions, /\/other\/extension\.js/);
@@ -85,6 +85,8 @@ test("orchestrator prompt names the operation-specific tools and current steerin
   assert.match(prompt, /durably queued for the next executor handoff/);
   assert.doesNotMatch(prompt, /execute_subtasks/);
   assert.doesNotMatch(prompt, /live-turn-only/);
+  assert.doesNotMatch(prompt, /delegation overhead/);
+  assert.doesNotMatch(prompt, /You may directly handle/);
 });
 
 test("preset launcher appends the orchestrator prompt and preserves forwarded arguments", async () => {

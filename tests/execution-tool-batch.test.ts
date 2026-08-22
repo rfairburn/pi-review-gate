@@ -450,6 +450,47 @@ test("slash-command interrupt selects both the task and outcome when IDs are omi
   await manager.shutdown();
 });
 
+test("/subtask-steer reports immediate acknowledgement or queued status in the live command UI", async () => {
+  const { tools, commandHandlers, manager } = harness({ slowExecutor: true });
+  const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const started = await execute("steer-command-start", {
+    tasks: [{ title: "Steer me", instructions: "Wait for steering", acceptanceCriteria: ["Steering is applied"] }],
+  }, undefined, undefined, {});
+  const notifications: Array<{ message: string; level: string }> = [];
+  await commandHandlers.get("subtask-steer")!("", {
+    ui: {
+      select: async (_title: string, options: string[]) => options[0],
+      input: async () => "Change direction now",
+      notify: async (message: string, level: string) => notifications.push({ message, level }),
+    },
+  });
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.level, "info");
+  assert.match(notifications[0]?.message ?? "", new RegExp(started.details.tasks[0].taskId));
+  assert.match(notifications[0]?.message ?? "", /latest command: steer (queued|acknowledged)/);
+  await manager.shutdown();
+});
+
+test("/subtask-steer reports malformed syntax and unknown targets as immediate failures", async () => {
+  const { commandHandlers, manager } = harness();
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = {
+    ui: {
+      select: async () => undefined,
+      notify: async (message: string, level: string) => notifications.push({ message, level }),
+    },
+  };
+  await commandHandlers.get("subtask-steer")!("instruction without ids", ctx);
+  assert.equal(notifications.at(-1)?.level, "error");
+  assert.match(notifications.at(-1)?.message ?? "", /usage: \/subtask-steer <executionId> <taskId> <instruction>/);
+
+  await commandHandlers.get("subtask-steer")!("exec-missing task-missing change direction", ctx);
+  assert.equal(notifications.at(-1)?.level, "error");
+  assert.match(notifications.at(-1)?.message ?? "", /\/subtask-steer failed:/);
+  assert.match(notifications.at(-1)?.message ?? "", /unknown/i);
+  await manager.shutdown();
+});
+
 function renderWidget(content: unknown, width = 240): string[] {
   assert.equal(typeof content, "function");
   const component = (content as () => { render(width: number): string[] })();

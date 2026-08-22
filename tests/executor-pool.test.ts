@@ -37,6 +37,30 @@ test("released high-priority capacity is preferred for the next fresh task", () 
   next.release();
 });
 
+test("execution and research routes share one physical capacity ledger", () => {
+  const scheduler = new ExecutorPoolScheduler(entries);
+  const executeRoute = [entries[0]!, entries[1]!];
+  const researchRoute = [entries[0]!, entries[2]!];
+
+  const execution = scheduler.tryAcquireRoute(executeRoute)!;
+  const research = scheduler.tryAcquireRoute(researchRoute)!;
+
+  assert.equal(execution.entry.entryId, "qwen");
+  assert.equal(research.entry.entryId, "luna", "research cannot allocate a second qwen slot");
+  assert.equal(scheduler.activeCount("qwen"), 1);
+  execution.release();
+  research.release();
+});
+
+test("a route never selects an excluded resource", () => {
+  const scheduler = new ExecutorPoolScheduler(entries);
+  const researchRoute = [entries[2]!];
+  const leases = Array.from({ length: 4 }, () => scheduler.tryAcquireRoute(researchRoute));
+  assert.deepEqual(leases.map((lease) => lease?.entry.entryId), ["luna", "luna", "luna", "luna"]);
+  assert.equal(scheduler.tryAcquireRoute(researchRoute), undefined);
+  leases.forEach((lease) => lease?.release());
+});
+
 test("capacity snapshots can model a completing lease before its asynchronous release", () => {
   const scheduler = new ExecutorPoolScheduler(entries);
   const qwen = scheduler.tryAcquire()!;
@@ -107,5 +131,24 @@ test("waiting failover recomputes from current settings by stable entry id", asy
   qwen.release();
   deepseek.release();
   deepseekSecond.release();
+  fallback?.release();
+});
+
+test("waiting role failover resolves its current route after settings change", async () => {
+  const scheduler = new ExecutorPoolScheduler(entries);
+  let route = [entries[0]!, entries[1]!];
+  const qwen = scheduler.tryAcquireRoute(route)!;
+  const deepseekOne = scheduler.tryAcquireRoute(route)!;
+  const deepseekTwo = scheduler.tryAcquireRoute(route)!;
+  const waiting = scheduler.acquireAfterRoute(qwen, () => route);
+
+  route = [entries[0]!, entries[2]!];
+  scheduler.reconfigure(entries);
+
+  const fallback = await waiting;
+  assert.equal(fallback?.entry.entryId, "luna");
+  qwen.release();
+  deepseekOne.release();
+  deepseekTwo.release();
   fallback?.release();
 });

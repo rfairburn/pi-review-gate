@@ -90,6 +90,7 @@ export function rewriteTaskPaths(
     relevantContext: task.relevantContext
       ? rewriteSourcePaths(task.relevantContext, sourceRoot, workerRoot)
       : undefined,
+    backgroundKind: task.backgroundKind,
     executorAllowedTools: task.executorAllowedTools ? [...task.executorAllowedTools] : undefined,
     authoritativeUpdates: task.authoritativeUpdates?.map((item) => ({
       ...item,
@@ -131,6 +132,8 @@ export interface WaveWorkerTask {
   instructions: string;
   acceptanceCriteria: string[];
   relevantContext?: string;
+  /** Persisted background role for recovery-bundle adoption. */
+  backgroundKind?: "execute" | "research";
   /**
    * Durable snapshot of the parent agent's active tools. Little Coder
    * executor launches reuse this allowlist across retries, compaction, and
@@ -486,12 +489,21 @@ export function buildWaveWorkerPrompt(
 ): string {
   // Rewrite absolute source-root paths to worker-root paths.
   const rewrittenTask = rewriteTaskPaths(task, sourceRoot, workerRoot);
+  const research = rewrittenTask.backgroundKind === "research";
 
   return [
-    "You are the isolated implementation executor for one bounded phase.",
-    "Work directly in the current workspace. Inspect the repository, implement the requested change, and run relevant verification.",
-    "Do not broaden the task, commit, push, or modify unrelated files.",
-    "Do not manage Git commits — the workspace will be committed automatically after your changes.",
+    research
+      ? "You are the isolated read-only research worker for one bounded investigation."
+      : "You are the isolated implementation executor for one bounded phase.",
+    research
+      ? "Inspect the repository and available evidence, answer the requested questions, and do not modify the workspace."
+      : "Work directly in the current workspace. Inspect the repository, implement the requested change, and run relevant verification.",
+    research
+      ? "Do not broaden the investigation, commit, push, or perform actions with persistent side effects."
+      : "Do not broaden the task, commit, push, or modify unrelated files.",
+    research
+      ? "The private worktree is containment only; any detected workspace change fails this research task and is never landed."
+      : "Do not manage Git commits — the workspace will be committed automatically after your changes.",
     "",
     "Workspace snapshot disclosure:",
     "The isolated snapshot you are working from contains tracked files and non-ignored untracked files.",
@@ -499,7 +511,9 @@ export function buildWaveWorkerPrompt(
     "",
     renderWaveWorkerTask(rewrittenTask),
     "",
-    "When finished, summarize changed files, verification performed, and remaining risks.",
+    research
+      ? "When finished, return a concise, source-linked report that addresses every acceptance criterion and notes uncertainty or stale-snapshot risk. Begin with one `Summary:` line of at most 240 characters that can stand alone in a parent completion notification; put supporting detail after it. Cite repository paths and external URLs directly. Do not cite child-local evidence IDs."
+      : "When finished, summarize changed files, verification performed, and remaining risks.",
     isolationDirective(workerRoot),
   ].join("\n");
 }

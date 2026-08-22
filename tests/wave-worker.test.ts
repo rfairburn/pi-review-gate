@@ -198,6 +198,18 @@ test("wave-worker prompt discloses snapshot contents and enforces mapped isolati
   );
 });
 
+test("research worker prompt requests a portable bounded summary and direct sources", () => {
+  const prompt = buildWaveWorkerPrompt({
+    ...testTask(),
+    backgroundKind: "research",
+    instructions: "Inspect the implementation without changing it.",
+  }, "/source/root", "/worker/root");
+
+  assert.match(prompt, /Begin with one `Summary:` line of at most 240 characters/);
+  assert.match(prompt, /Cite repository paths and external URLs directly/);
+  assert.match(prompt, /Do not cite child-local evidence IDs/);
+});
+
 test("wave-worker runs one executor turn and normalizes to candidate", async () => {
   const root = await mkTmp("pi-ww-run-");
   try {

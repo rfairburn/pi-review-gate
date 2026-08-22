@@ -11,6 +11,8 @@ import {
   recordAcceptedReviewerQuestion,
   recordToolCallEvidence,
   rememberFinalAssistantSummary,
+  shouldRecordToolCallEvidence,
+  shouldRecordToolResultEvidence,
 } from "../src/evidence";
 
 const snapshotOptions = {
@@ -30,6 +32,36 @@ test("extractCandidatePaths finds shell redirection and tee targets", () => {
   assert.ok(result.riskSignals.includes("shell_redirection"));
   assert.ok(result.riskSignals.includes("tee_write"));
   assert.ok(result.riskSignals.includes("heredoc"));
+});
+
+test("successful discovery tools are transient while their failures remain review evidence", () => {
+  for (const toolName of ["read", "grep", "glob", "find", "ls", "Read", "GREP"]) {
+    assert.equal(shouldRecordToolCallEvidence(toolName), false, toolName);
+    assert.equal(shouldRecordToolResultEvidence(toolName, false), false, toolName);
+    assert.equal(shouldRecordToolResultEvidence(toolName, true), true, toolName);
+  }
+  assert.equal(shouldRecordToolCallEvidence("write"), true);
+  assert.equal(shouldRecordToolResultEvidence("bash", false), true);
+});
+
+test("candidate extraction follows mutation semantics instead of generic path arguments", () => {
+  for (const toolName of ["read", "grep", "glob", "find", "ls", "SubtasksInspect"]) {
+    assert.deepEqual(extractCandidatePaths(toolName, { path: "server/hosts.go" }).paths, [], toolName);
+  }
+
+  assert.deepEqual(extractCandidatePaths("write", { path: "server/hosts.go" }).paths, [{
+    path: "server/hosts.go",
+    source: "write:path",
+  }]);
+  assert.deepEqual(extractCandidatePaths("edit", { file_path: "server/hosts.go" }).paths, [{
+    path: "server/hosts.go",
+    source: "edit:file_path",
+  }]);
+
+  const copied = extractCandidatePaths("bash", { command: "cp source.txt generated/dest.txt" });
+  assert.deepEqual(copied.paths.map((entry) => entry.path), ["generated/dest.txt"]);
+  const moved = extractCandidatePaths("bash", { command: "mv source.txt generated/dest.txt" });
+  assert.deepEqual(moved.paths.map((entry) => entry.path), ["source.txt", "generated/dest.txt"]);
 });
 
 test("evidence pre-captures a missing outside-worktree file before creation", async () => {

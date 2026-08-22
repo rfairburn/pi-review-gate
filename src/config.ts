@@ -61,6 +61,24 @@ export interface ExecutorPoolEntry {
   maxConcurrent: number;
 }
 
+/** One physical/provider capacity bucket shared by every background-task kind. */
+export interface WorkerResourceEntry {
+  resourceId: string;
+  selection: ExecutorSelection;
+  maxConcurrent: number;
+}
+
+/** A role-specific ordered reference to a shared worker resource. */
+export interface WorkerRouteEntry {
+  resourceId: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
+export interface WorkerRoutesConfig {
+  execute?: WorkerRouteEntry[];
+  research?: WorkerRouteEntry[];
+}
+
 interface ExternalExecutorBase {
   id: string;
   command?: string;
@@ -137,6 +155,10 @@ export const DEFAULT_EXECUTION_RETRY_POLICY: ExecutionRetryPolicy = {
 };
 
 export interface ExecutionConfig {
+  /** Shared physical/provider capacity. Route lists never create extra slots. */
+  workerResources?: WorkerResourceEntry[];
+  /** Independent ordered resource eligibility for execution and research. */
+  routes?: WorkerRoutesConfig;
   /** Ordered executor priority pool. Earlier entries are preferred. */
   executorPool?: ExecutorPoolEntry[];
   /** Legacy single-executor selection, materialized as one pool entry when executorPool is absent. */
@@ -356,6 +378,17 @@ export function activeExternalExecutor(
 }
 
 export function resolvedExecutorPool(config: ReviewGateConfig): ExecutorPoolEntry[] {
+  return resolvedWorkerRoute(config, "execute");
+}
+
+export function resolvedWorkerResources(config: ReviewGateConfig): ExecutorPoolEntry[] {
+  if (config.execution?.workerResources !== undefined) {
+    return config.execution.workerResources.map((entry) => ({
+      entryId: entry.resourceId,
+      selection: cloneExecutorSelection(entry.selection),
+      maxConcurrent: entry.maxConcurrent,
+    }));
+  }
   if (config.execution?.executorPool !== undefined) {
     return config.execution.executorPool.map(cloneExecutorPoolEntry);
   }
@@ -366,6 +399,35 @@ export function resolvedExecutorPool(config: ReviewGateConfig): ExecutorPoolEntr
     selection: cloneExecutorSelection(active),
     maxConcurrent: config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS,
   }];
+}
+
+export function resolvedWorkerRoute(config: ReviewGateConfig, kind: "execute" | "research"): ExecutorPoolEntry[] {
+  const resources = resolvedWorkerResources(config);
+  const configured = config.execution?.routes?.[kind];
+  // Existing installations remain immediately usable for both roles until a
+  // role-specific route is saved. Once present, omission from the list is an
+  // explicit exclusion.
+  const eligible = kind === "research"
+    ? resources.filter((entry) => workerResourceSupportsResearch(config, entry))
+    : resources;
+  if (configured === undefined) return eligible;
+  const byId = new Map(eligible.map((entry) => [entry.entryId, entry]));
+  return configured.flatMap((route) => {
+    const resource = byId.get(route.resourceId);
+    if (!resource) return [];
+    const selection = resource.selection.source === "little-coder" && route.thinkingLevel
+      ? { ...resource.selection, thinkingLevel: route.thinkingLevel }
+      : cloneExecutorSelection(resource.selection);
+    return [{ ...resource, selection }];
+  });
+}
+
+/** Research is enforced by Little Coder and initially best-effort for Codex/Claude. */
+export function workerResourceSupportsResearch(config: ReviewGateConfig, entry: ExecutorPoolEntry): boolean {
+  const selection = entry.selection;
+  if (selection.source === "little-coder") return true;
+  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === selection.id);
+  return agent?.adapter === "codex-cli" || agent?.adapter === "claude-cli";
 }
 
 export function executorEntryId(selection: ExecutorSelection): string {
@@ -651,6 +713,12 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
   const executorPool = value.executorPool === undefined
     ? undefined
     : normalizeExecutorPool(value.executorPool);
+  const workerResources = value.workerResources === undefined
+    ? undefined
+    : normalizeWorkerResources(value.workerResources);
+  const routes = value.routes === undefined
+    ? undefined
+    : normalizeWorkerRoutes(value.routes, workerResources ?? executorPool ?? []);
   const externalExecutors = value.externalExecutors === undefined
     ? undefined
     : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
@@ -660,10 +728,63 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
   return {
     activeExecutor,
     executorPool,
+    workerResources,
+    routes,
     externalExecutors,
     ...(maxWorkers !== undefined ? { maxWorkers } : {}),
     retryPolicy,
     subtaskNotifications,
+  };
+}
+
+function normalizeWorkerResources(value: unknown): WorkerResourceEntry[] {
+  if (!Array.isArray(value)) throw new Error("execution.workerResources must be an array");
+  const entries = value.map((entry, index) => {
+    if (!isRecord(entry)) throw new Error(`execution.workerResources[${index}] must be an object`);
+    const selection = normalizeActiveExecutor(entry.selection);
+    if (!selection) throw new Error(`execution.workerResources[${index}].selection cannot be null`);
+    const resourceId = typeof entry.resourceId === "string" && entry.resourceId.trim()
+      ? entry.resourceId.trim()
+      : executorEntryId(selection);
+    validateConfiguredId(resourceId, `execution.workerResources[${index}].resourceId`);
+    return {
+      resourceId,
+      selection,
+      maxConcurrent: normalizeRequiredWorkerCount(entry.maxConcurrent, `execution.workerResources[${index}].maxConcurrent`),
+    };
+  });
+  validateUniqueConfiguredIds(entries.map((entry) => ({ id: entry.resourceId })), "worker resource");
+  const selections = new Set<string>();
+  for (const entry of entries) {
+    const key = executorSelectionKey(entry.selection);
+    if (selections.has(key)) throw new Error(`duplicate worker resource selection: ${key}`);
+    selections.add(key);
+  }
+  return entries;
+}
+
+function normalizeWorkerRoutes(value: unknown, resources: readonly (WorkerResourceEntry | ExecutorPoolEntry)[]): WorkerRoutesConfig {
+  if (!isRecord(value)) throw new Error("execution.routes must be an object");
+  const resourceIds = new Set(resources.map((entry) => "resourceId" in entry ? entry.resourceId : entry.entryId));
+  const normalizeRoute = (candidate: unknown, field: string): WorkerRouteEntry[] | undefined => {
+    if (candidate === undefined) return undefined;
+    if (!Array.isArray(candidate)) throw new Error(`${field} must be an array`);
+    const route = candidate.map((entry, index) => {
+      if (!isRecord(entry)) throw new Error(`${field}[${index}] must be an object`);
+      const resourceId = normalizeOptionalNonEmptyString(entry.resourceId, `${field}[${index}].resourceId`);
+      if (!resourceId) throw new Error(`${field}[${index}].resourceId is required`);
+      if (!resourceIds.has(resourceId)) throw new Error(`${field}[${index}] references unknown worker resource ${resourceId}`);
+      return {
+        resourceId,
+        thinkingLevel: normalizeOptionalThinkingLevel(entry.thinkingLevel, `${field}[${index}].thinkingLevel`),
+      };
+    });
+    validateUniqueConfiguredIds(route.map((entry) => ({ id: entry.resourceId })), `${field} resource`);
+    return route;
+  };
+  return {
+    execute: normalizeRoute(value.execute, "execution.routes.execute"),
+    research: normalizeRoute(value.research, "execution.routes.research"),
   };
 }
 

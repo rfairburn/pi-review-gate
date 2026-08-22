@@ -59,6 +59,18 @@ export interface EvidenceBundle {
   markdown: string;
 }
 
+const TRANSIENT_DISCOVERY_TOOLS = new Set(["read", "grep", "glob", "find", "ls"]);
+const PATH_MUTATION_TOOLS = new Set(["write", "edit"]);
+const SHELL_TOOLS = new Set(["bash", "shellstart"]);
+
+export function shouldRecordToolCallEvidence(toolName: string): boolean {
+  return !TRANSIENT_DISCOVERY_TOOLS.has(normalizedToolName(toolName));
+}
+
+export function shouldRecordToolResultEvidence(toolName: string, isError: boolean | undefined): boolean {
+  return Boolean(isError) || shouldRecordToolCallEvidence(toolName);
+}
+
 export function createEvidenceState(): EvidenceState {
   return {
     nextSequence: 1,
@@ -215,26 +227,30 @@ export function extractCandidatePaths(
     return { paths, riskSignals };
   }
 
-  for (const key of ["path", "file_path", "filePath", "target", "dest", "destination"]) {
-    const value = input[key];
-    if (typeof value === "string" && value.trim()) {
-      paths.push({ path: value.trim(), source: `${toolName}:${key}` });
-    }
-  }
+  const normalizedName = normalizedToolName(toolName);
 
-  for (const key of ["paths", "files"]) {
-    const value = input[key];
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (typeof item === "string" && item.trim()) {
-          paths.push({ path: item.trim(), source: `${toolName}:${key}` });
+  if (PATH_MUTATION_TOOLS.has(normalizedName)) {
+    for (const key of ["path", "file_path", "filePath", "target", "dest", "destination"]) {
+      const value = input[key];
+      if (typeof value === "string" && value.trim()) {
+        paths.push({ path: value.trim(), source: `${toolName}:${key}` });
+      }
+    }
+
+    for (const key of ["paths", "files"]) {
+      const value = input[key];
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (typeof item === "string" && item.trim()) {
+            paths.push({ path: item.trim(), source: `${toolName}:${key}` });
+          }
         }
       }
     }
   }
 
   const command = commandText(input);
-  if (command) {
+  if (command && SHELL_TOOLS.has(normalizedName)) {
     const shellPaths = extractShellCandidatePaths(command);
     paths.push(...shellPaths.paths.map((path) => ({ path, source: `${toolName}:command` })));
     riskSignals.push(...shellPaths.riskSignals);
@@ -244,6 +260,10 @@ export function extractCandidatePaths(
     paths: dedupePathSources(paths),
     riskSignals: unique(riskSignals),
   };
+}
+
+function normalizedToolName(toolName: string): string {
+  return toolName.trim().toLowerCase();
 }
 
 async function addCandidate(
@@ -345,7 +365,7 @@ function extractShellCandidatePaths(command: string): { paths: string[]; riskSig
     for (const match of command.matchAll(pattern)) {
       const source = match[1] ?? match[2] ?? match[3];
       const dest = match[4] ?? match[5] ?? match[6];
-      if (source) {
+      if (source && tool === "mv") {
         paths.push(source);
       }
       if (dest) {

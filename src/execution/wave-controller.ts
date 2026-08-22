@@ -863,7 +863,11 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
           executorAssignment: currentLease,
           acquireFailover: async (currentAssignment) => {
             currentLease.release();
-            const nextLease = await executorPool.acquireAfter(currentAssignment, signal);
+            const nextLease = await executorPool.acquireAfterRoute(
+              currentAssignment,
+              () => resolvedExecutorPool(config),
+              signal,
+            );
             if (!nextLease) return undefined;
             currentLease = nextLease;
             return nextLease;

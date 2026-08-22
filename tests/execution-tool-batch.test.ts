@@ -26,7 +26,7 @@ function executionTool(tools: Array<Record<string, any>>, name: string): Record<
   return tool;
 }
 
-function harness(options: { slowExecutor?: boolean; expandedView?: boolean } = {}) {
+function harness(options: { slowExecutor?: boolean; expandedView?: boolean; researchCapable?: boolean; resourceCapacity?: number; activeTools?: string[] } = {}) {
   const tools: Array<Record<string, any>> = [];
   const commands: string[] = [];
   const commandHandlers = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
@@ -39,23 +39,33 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean } = {
       commandHandlers.set(name, options.handler);
     },
     setToolActive(name: string, enabled: boolean) { active.push({ name, enabled }); },
-    getActiveTools() { return ["read", "bash", ...executionToolNames]; },
+    getActiveTools() { return options.activeTools ?? ["read", "bash", ...executionToolNames]; },
   };
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
     externalAgents: [{
       id: "fake",
-      adapter: "run-as-binary",
+      adapter: options.researchCapable ? "codex-cli" : "run-as-binary",
       command: process.execPath,
       execution: {
-        protocol: "pi-review-executor-jsonl-v1",
+        ...(options.researchCapable ? {} : { protocol: "pi-review-executor-jsonl-v1" as const }),
         args: options.slowExecutor
           ? ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"]
           : undefined,
       },
     }],
-    execution: { activeExecutor: { source: "external", id: "fake" } },
+    execution: options.resourceCapacity === undefined
+      ? { activeExecutor: { source: "external", id: "fake" } }
+      : {
+          workerResources: [{
+            resourceId: "fake-shared",
+            selection: { source: "external", id: "fake" },
+            maxConcurrent: options.resourceCapacity,
+          }],
+          routes: { execute: [{ resourceId: "fake-shared" }], research: [] },
+          maxWorkers: 4,
+        },
     ui: { subtasksViewExpanded: options.expandedView ?? false },
   });
   const manager = new ExecutionToolManager({
@@ -85,7 +95,7 @@ test("operation-specific execution tools expose exact durable schemas", () => {
     "subtasks-view",
   ]);
   const expectedProperties: Record<string, string[]> = {
-    SubtasksStart: ["tasks"],
+    SubtasksStart: ["kind", "tasks"],
     SubtasksAdd: ["executionId", "tasks"],
     SubtasksInspect: ["executionId", "taskId", "offset", "lines"],
     SubtasksContinue: ["executionId", "taskId", "bundle", "instructions", "instructionId"],
@@ -132,6 +142,7 @@ test("execution review readiness reports every unfinished task and omits termina
     assert.equal(started.isError, false);
     const readiness = manager.reviewReadiness();
     assert.equal(readiness.length, 1);
+    assert.equal(readiness[0]?.kind, "execute");
     assert.equal(readiness[0]?.title, "readiness task");
     assert.ok(readiness[0] && isActiveTaskState(readiness[0].state));
   } finally {
@@ -206,6 +217,27 @@ test("saved executor settings govern queued dispatch while existing leases keep 
     await manager.shutdown();
     await manager.detach();
     if (executionRoot) await rm(executionRoot, { recursive: true, force: true });
+  }
+});
+
+test("resource capacity is a grand total across independent subtask groups", async () => {
+  const { tools, manager } = harness({ slowExecutor: true, resourceCapacity: 1 });
+  try {
+    const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+    const first = await start("capacity-group-one", {
+      tasks: [{ title: "First holder", instructions: "Remain active", acceptanceCriteria: ["Eventually finish"] }],
+    }, undefined, undefined, {});
+    const second = await start("capacity-group-two", {
+      tasks: [{ title: "Second waiter", instructions: "Wait for capacity", acceptanceCriteria: ["Eventually finish"] }],
+    }, undefined, undefined, {});
+
+    assert.equal(first.details.scheduling.activePoolLeases, 1);
+    assert.equal(second.details.tasks[0].dispatchState, "waiting_for_capacity");
+    assert.equal(second.details.scheduling.activePoolLeases, 1);
+    assert.equal(second.details.scheduling.availablePoolSlots, 0);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
   }
 });
 
@@ -304,6 +336,7 @@ test("/subtasks-view toggles a live multiline widget without entering model cont
 test("SubtasksStart result explains that queued work may have startup delay", async () => {
   const { tools, manager } = harness();
   const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const inspect = executionTool(tools, "SubtasksInspect").execute as ExecuteTool;
   const result = await execute("start-delay", {
     tasks: [{ title: "Waiting work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
@@ -316,7 +349,7 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.equal(result.details.scheduling.estimatedImmediatelyAvailableSlots, 3);
   assert.match(result.content[0].text, /Quiet notification mode is active/);
   assert.match(result.content[0].text, /Every task still triggers a turn when it lands/);
-  assert.match(result.content[0].text, /CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING progress.*without triggering turns/);
+  assert.match(result.content[0].text, /Internal progress stays available in SubtasksInspect and \/subtasks-view without triggering turns/);
   assert.match(result.content[0].text, /DO NOT POLL for task-state changes/);
   assert.match(result.content[0].text, /repeated inspect loop, or other waiting surrogate/);
   assert.match(result.content[0].text, new RegExp(result.details.tasks[0].taskId));
@@ -331,6 +364,47 @@ test("SubtasksStart result explains that queued work may have startup delay", as
     landingMs: 0,
     totalMs: result.details.tasks[0].timing.totalMs,
   });
+  const diagnostic = await inspect("start-delay-inspect", { executionId: result.details.executionId }, undefined, undefined, {});
+  assert.match(diagnostic.content[0].text, /Execution diagnostics: revision \d+; peak concurrency \d+\./);
+  assert.match(diagnostic.content[0].text, /Scheduler: \d+\/4 workers active;/);
+  assert.match(diagnostic.content[0].text, /timing \(ms\): total \d+; queued \d+; capture \d+; execution \d+; review \d+; landing \d+/);
+  await manager.shutdown();
+});
+
+test("SubtasksStart creates immutable research groups without child-local evidence tools", async () => {
+  const { tools, manager } = harness({
+    slowExecutor: true,
+    researchCapable: true,
+    activeTools: ["read", "EvidenceAdd", "EvidenceGet", "EvidenceList"],
+  });
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const add = executionTool(tools, "SubtasksAdd").execute as ExecuteTool;
+  const started = await start("research-start", {
+    kind: "research",
+    tasks: [{
+      title: "Inspect safely",
+      instructions: "Read the repository and report findings",
+      acceptanceCriteria: ["Evidence-backed report is returned"],
+    }],
+  }, undefined, undefined, {});
+
+  assert.equal(started.details.kind, "research");
+  assert.match(started.content[0].text, /research group/);
+  assert.deepEqual(started.details.tasks[0].definition.executorAllowedTools, ["read"]);
+  assert.equal(started.details.tasks[0].definition.backgroundKind, "research");
+  assert.equal(manager.reviewReadiness()[0]?.kind, "research");
+
+  const added = await add("research-add", {
+    executionId: started.details.executionId,
+    tasks: [{
+      title: "Inspect another area",
+      instructions: "Read another area and report findings",
+      acceptanceCriteria: ["A second report is returned"],
+    }],
+  }, undefined, undefined, {});
+  assert.equal(added.details.kind, "research");
+  assert.equal(added.details.tasks[1].definition.backgroundKind, "research");
+  assert.deepEqual(added.details.tasks[1].definition.executorAllowedTools, ["read"]);
   await manager.shutdown();
 });
 
@@ -370,7 +444,7 @@ test("slash-command interrupt selects both the task and outcome when IDs are omi
       },
     },
   });
-  assert.deepEqual(selections, ["Interrupt execution subtask", "Interrupt outcome"]);
+  assert.deepEqual(selections, ["Interrupt background subtask", "Interrupt outcome"]);
   assert.match(notices.at(-1) ?? "", new RegExp(started.details.tasks[0].taskId));
   assert.match(notices.at(-1) ?? "", /interrupted/);
   await manager.shutdown();

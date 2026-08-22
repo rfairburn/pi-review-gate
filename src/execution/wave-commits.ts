@@ -43,6 +43,22 @@ export interface PriorCandidate {
   commitSha: string;
 }
 
+/**
+ * Return every tracked, untracked, or ignored workspace change. Research uses
+ * this stricter check because ordinary candidate normalization deliberately
+ * omits ignored files from execution landing.
+ */
+export async function researchWorkspaceChanges(worktreeRoot: string): Promise<string[]> {
+  const output = await gitOutBuffer([
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+    "--ignored=matching",
+  ], worktreeRoot);
+  return output.split("\0").map((entry) => entry.trim()).filter(Boolean);
+}
+
 /** Validate that a path stays under the wave root. */
 async function assertUnderWaveRoot(path: string, waveRoot: string): Promise<void> {
   const resolvedPath = await fs.realpath(path);

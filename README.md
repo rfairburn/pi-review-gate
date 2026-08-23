@@ -505,6 +505,13 @@ remaining arguments are forwarded unchanged. Pi remains independently
 installed and upgradeable; this project consumes its public extension and
 CLI/RPC surfaces rather than patching or bundling Pi.
 
+Tool restriction uses each harness's native allowlist. Pi reviewers and Pi
+workers are always launched with an explicit `--tools` value; worker values are
+captured from the orchestrator's active Pi tools and narrowed further for
+research. The launcher does not impose a separate orchestrator policy. To limit
+the orchestrator, pass Pi's native allowlist through the wrapper, for example
+`./scripts/pi-review-gate.sh --tools read,bash,edit,write`.
+
 A Codex-oriented starter config is available at:
 
 ```bash

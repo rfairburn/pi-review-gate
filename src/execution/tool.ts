@@ -119,6 +119,7 @@ interface NormalizedInput {
 export class ExecutionToolManager {
   private registered = false;
   private commandsRegistered = false;
+  private launchAllowedExecutionTools: Set<string> | undefined;
   private readonly controller: BackgroundExecutionController;
 
   constructor(private readonly input: ExecutionToolManagerInput) {
@@ -165,10 +166,18 @@ export class ExecutionToolManager {
     const resolvable = pool.length > 0 && pool.every(({ selection }) =>
       selection.source === "pi"
       || agents.some((agent) => agent.id === selection.id && externalAgentSupportsExecution(agent)));
-    if (resolvable && !this.registered) this.register();
+    if (resolvable && !this.registered) {
+      this.register();
+      const activeAtRegistration = activeToolSnapshot(this.input.pi);
+      this.launchAllowedExecutionTools = new Set(
+        activeAtRegistration?.filter((name) => EXECUTION_TOOL_NAME_LIST.includes(name as typeof EXECUTION_TOOL_NAME_LIST[number])) ?? [],
+      );
+    }
     if (!this.commandsRegistered) this.registerUserCommands();
     if (this.registered) {
-      for (const name of EXECUTION_TOOL_NAME_LIST) setToolActive(this.input.pi, name, resolvable);
+      for (const name of EXECUTION_TOOL_NAME_LIST) {
+        setToolActive(this.input.pi, name, resolvable && this.launchAllowedExecutionTools?.has(name) === true);
+      }
     }
   }
 
@@ -436,15 +445,15 @@ export class ExecutionToolManager {
 
   private withParentTools(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind): BackgroundTaskDefinition[] {
     const allowedTools = activeToolSnapshot(this.input.pi);
-    if (kind === "research" && !allowedTools) {
-      throw new Error("Research requires an authoritative parent active-tool snapshot; the current harness did not provide one.");
+    if (!allowedTools) {
+      throw new Error(`${kind === "research" ? "Research" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
     }
     const childTools = kind === "research" ? researchToolIntersection(allowedTools) : allowedTools;
     return tasks.map((task) => ({
       ...task,
       backgroundKind: kind,
       acceptanceCriteria: [...task.acceptanceCriteria],
-      executorAllowedTools: childTools ? [...childTools] : undefined,
+      executorAllowedTools: [...childTools],
     }));
   }
 }
@@ -454,8 +463,8 @@ const RESEARCH_ALLOWED_TOOLS = new Set([
   "BrowserNavigate", "BrowserExtract", "BrowserScroll", "BrowserBack", "BrowserHistory",
 ]);
 
-function researchToolIntersection(parent: string[] | undefined): string[] | undefined {
-  return parent?.filter((tool) => RESEARCH_ALLOWED_TOOLS.has(tool));
+function researchToolIntersection(parent: string[]): string[] {
+  return parent.filter((tool) => RESEARCH_ALLOWED_TOOLS.has(tool));
 }
 
 function taskSchema(): Record<string, unknown> {

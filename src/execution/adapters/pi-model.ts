@@ -10,6 +10,7 @@ import { PiJsonlActivityExtractor } from "../progress";
 import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorInteractionAcknowledgement, type ExecutorRequest, type ExecutorTurn } from "../types";
 import type { ThinkingLevel } from "../../config";
 import { BackgroundProcessReadiness } from "../../background-process-readiness";
+import { assertNoPiToolPolicyArgs } from "../../pi-tool-policy";
 
 export interface PiExecutorOptions {
   model: string;
@@ -28,7 +29,9 @@ export class PiExecutorAdapter implements ExecutorAdapter {
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    assertNoPiToolPolicyArgs(this.options.args ?? [], "Pi executor arguments");
     const thinkingLevel = this.options.thinkingLevel ?? "high";
+    const allowedTools = requireAllowedTools(request.allowedTools);
     const sessionId = request.session?.id ?? randomUUID();
     const sessionDir = join(request.artifactDir, "executor-sessions");
     await mkdir(sessionDir, { recursive: true });
@@ -38,7 +41,6 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       }
       request.onUpdate?.("reopening executor session for context compaction");
       try {
-        const allowedTools = normalizeAllowedTools(request.allowedTools);
         await compactInterruptedSession({
           command: this.options.command ?? "pi",
           model: this.options.model,
@@ -65,7 +67,6 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     }
     const extractor = new PiJsonlReviewExtractor();
     const activity = new PiJsonlActivityExtractor((message) => request.onUpdate?.(message));
-    const allowedTools = normalizeAllowedTools(request.allowedTools);
     const args = [
       "--model", this.options.model,
       "--mode", "rpc",
@@ -537,16 +538,18 @@ function abortError(signal?: AbortSignal): Error {
   return signal?.reason instanceof Error ? signal.reason : new Error("Executor recovery was cancelled.");
 }
 
-function normalizeAllowedTools(tools: readonly string[] | undefined): string[] | undefined {
-  if (!tools) return undefined;
+function requireAllowedTools(tools: readonly string[] | undefined): string[] {
+  if (!tools) {
+    throw new Error("Pi executor launch requires an authoritative tool allowlist for native --tools enforcement.");
+  }
   return [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
 }
 
-function childArgs(args: readonly string[], allowedTools: readonly string[] | undefined): string[] {
+function childArgs(args: readonly string[], allowedTools: readonly string[]): string[] {
   return [
     ...args,
     "--extension", resolve(__dirname, "../../index.js"),
-    ...(allowedTools ? ["--tools", allowedTools.join(",")] : []),
+    "--tools", allowedTools.join(","),
   ];
 }
 

@@ -15,6 +15,7 @@ import {
   writeReviewerProcessArtifacts,
 } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
+import { assertNoPiToolPolicyArgs } from "../pi-tool-policy";
 
 export class PiModelAdapter implements ModelAdapter {
   readonly kind = "pi-model";
@@ -25,6 +26,7 @@ export class PiModelAdapter implements ModelAdapter {
   ) {}
 
   async run(req: ModelAdapterRequest): Promise<ReviewResult> {
+    assertNoPiToolPolicyArgs(this.config.args ?? [], "Pi reviewer arguments");
     const thinkingLevel = this.config.thinkingLevel ?? "high";
     const artifacts = reviewerArtifactPaths(req.bundleDir);
     const rawStreamPath = join(req.bundleDir, "raw-stream.jsonl");
@@ -52,7 +54,6 @@ export class PiModelAdapter implements ModelAdapter {
       sessionId,
       "--session-dir",
       sessionDir,
-      "--no-tools",
       "--tools",
       "read,grep,find,ls",
       "--no-skills",

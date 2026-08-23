@@ -11,7 +11,7 @@ const ONE_MEGABYTE_RETAINED_PROCESS = (input: Parameters<typeof runPromptProcess
   maxRetainedOutputBytes: 1_000_000,
 });
 
-test("PiModelAdapter disables tools and reports missing final assistant text", async () => {
+test("PiModelAdapter uses one native --tools allowlist and reports missing final assistant text", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-pi-adapter-"));
   try {
     const argvPath = join(dir, "argv.json");
@@ -60,9 +60,9 @@ test("PiModelAdapter disables tools and reports missing final assistant text", a
     const [firstRun, resumedRun] = JSON.parse(await readFile(argvPath, "utf8"));
     const argv = firstRun.argv;
     const resumedArgv = resumedRun.argv;
-    assert.deepEqual(argv.includes("--no-tools"), true);
+    assert.deepEqual(argv.includes("--no-tools"), false);
     assert.deepEqual(argv.includes("--tools"), true);
-    assert.deepEqual(argv.includes("read,grep,find,ls"), true);
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls");
     assert.deepEqual(argv.includes("--system-prompt"), true);
     assert.equal(argv.includes("--output-schema"), false);
     assert.equal(argv[argv.indexOf("--thinking") + 1], "max");

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { assertNoPiToolPolicyArgs } from "./pi-tool-policy";
 
 export type RetainBundles = "never" | "on-failure" | "always";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -562,13 +563,15 @@ function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TI
     }
     const env = normalizeStringRecord(value.env, "pi reviewer env");
     const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "pi reviewer thinkingLevel");
+    const args = normalizeStringArray(value.args, "pi reviewer args");
+    assertNoPiToolPolicyArgs(args, "pi reviewer args");
     return {
       id: value.id,
       adapter: "pi-model",
       model: value.model,
       ...(thinkingLevel ? { thinkingLevel } : {}),
       command: normalizeOptionalNonEmptyString(value.command, "pi reviewer command") ?? "pi",
-      args: normalizeStringArray(value.args, "pi reviewer args"),
+      args,
       ...(env ? { env } : {}),
       timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "pi reviewer timeoutMs"),
     };

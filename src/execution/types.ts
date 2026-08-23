@@ -27,7 +27,7 @@ export interface ExecutorRequest {
   prompt: string;
   artifactDir: string;
   turn: number;
-  /** Durable parent tool allowlist to apply to child harness launches. */
+  /** Durable parent tool allowlist. Required by Pi-native child launches. */
   allowedTools?: readonly string[];
   signal?: AbortSignal;
   session?: ExecutorSession;

@@ -7,6 +7,19 @@ import { CodexExecutorAdapter } from "../src/execution/adapters/codex-cli";
 import { PiExecutorAdapter } from "../src/execution/adapters/pi-model";
 import type { ExecutorLiveControl } from "../src/execution/types";
 
+test("Pi executor refuses to launch without an authoritative native --tools allowlist", async () => {
+  const adapter = new PiExecutorAdapter({ model: "provider/model", command: "must-not-launch" });
+  await assert.rejects(
+    adapter.run({
+      cwd: process.cwd(),
+      prompt: "task",
+      artifactDir: join(tmpdir(), "pi-review-missing-tools"),
+      turn: 1,
+    }),
+    /requires an authoritative tool allowlist for native --tools enforcement/,
+  );
+});
+
 test("Pi executor uses acknowledged RPC steering and a durable session", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-little-rpc-"));
   try {
@@ -64,6 +77,7 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
       prompt: "interrupt this task",
       artifactDir,
       turn: 2,
+      allowedTools: ["read", "bash", "SubtasksStart", "SubtasksSteer"],
       onLiveControl: (next) => { if (next) resolveInterruptControl(next); },
     });
     const interruptControl = await interruptControlReady;
@@ -110,6 +124,7 @@ test("Pi stays alive for ShellStart work and accepts steering while its agent is
       prompt: "start background work",
       artifactDir,
       turn: 1,
+      allowedTools: ["read", "bash", "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"],
       onUpdate: (message) => updates.push(message),
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });

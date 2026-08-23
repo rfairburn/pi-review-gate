@@ -183,6 +183,15 @@ test("normalizeConfig keeps pi model selection generic", () => {
   });
 });
 
+test("normalizeConfig rejects competing Pi tool-policy arguments", () => {
+  for (const flag of ["--tools", "--tools=read", "-t", "--exclude-tools", "-xt", "--no-tools", "-nt", "--no-builtin-tools", "-nbt"]) {
+    assert.throws(() => normalizeConfig({
+      enabled: true,
+      decider: { id: "pi", adapter: "pi-model", model: "provider/model", args: [flag] },
+    }), /one native --tools allowlist/, flag);
+  }
+});
+
 test("normalizeConfig rejects unsupported internal thinking levels", () => {
   assert.throws(() => normalizeConfig({
     enabled: true,

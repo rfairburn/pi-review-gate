@@ -26,21 +26,23 @@ function executionTool(tools: Array<Record<string, any>>, name: string): Record<
   return tool;
 }
 
-function harness(options: { slowExecutor?: boolean; expandedView?: boolean; researchCapable?: boolean; resourceCapacity?: number; activeTools?: string[] } = {}) {
+function harness(options: { slowExecutor?: boolean; expandedView?: boolean; researchCapable?: boolean; resourceCapacity?: number; activeTools?: string[]; omitActiveToolSnapshot?: boolean } = {}) {
   const tools: Array<Record<string, any>> = [];
   const commands: string[] = [];
   const commandHandlers = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
   const notices: string[] = [];
   const active: Array<{ name: string; enabled: boolean }> = [];
-  const pi = {
+  const pi: Record<string, any> = {
     registerTool(tool: Record<string, any>) { tools.push(tool); },
     registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
       commands.push(name);
       commandHandlers.set(name, options.handler);
     },
     setToolActive(name: string, enabled: boolean) { active.push({ name, enabled }); },
-    getActiveTools() { return options.activeTools ?? ["read", "bash", ...executionToolNames]; },
   };
+  if (!options.omitActiveToolSnapshot) {
+    pi.getActiveTools = () => options.activeTools ?? ["read", "bash", ...executionToolNames];
+  }
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
@@ -123,12 +125,32 @@ test("operation-specific execution tools expose exact durable schemas", () => {
   assert.match(executionTool(tools, "SubtasksInterrupt").parameters.properties.interruptMode.description, /must always be inspected afterward/i);
 });
 
+test("runtime synchronization never widens the orchestrator's native --tools allowlist", () => {
+  const { active } = harness({ activeTools: ["read", "bash"] });
+  assert.deepEqual(active, executionToolNames.map((name) => ({ name, enabled: false })));
+});
+
 test("background task state predicates classify every durable state consistently", () => {
   const active = new Set(["queued", "capturing", "running", "reviewing", "accepted", "waiting_to_land", "landing"]);
   for (const state of BACKGROUND_TASK_STATES) {
     assert.equal(isActiveTaskState(state), active.has(state), state);
     assert.equal(isInterruptibleTaskState(state), active.has(state), state);
     assert.equal(isForceMergeCandidateTaskState(state), !active.has(state), state);
+  }
+});
+
+test("subtask launch fails closed when Pi cannot provide its native active-tool allowlist", async () => {
+  const { tools, manager } = harness({ omitActiveToolSnapshot: true });
+  try {
+    const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+    const response = await start("missing-tool-snapshot", {
+      tasks: [{ title: "must not launch", instructions: "do nothing", acceptanceCriteria: ["No worker starts"] }],
+    }, undefined, undefined, {});
+    assert.equal(response.isError, true);
+    assert.match(response.content[0].text, /Execution requires an authoritative parent active-tool snapshot/);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
   }
 });
 

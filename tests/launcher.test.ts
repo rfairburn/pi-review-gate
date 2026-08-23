@@ -31,7 +31,7 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
   ].join("\n"), "utf8");
   await Promise.all([chmod(npmPath, 0o755), chmod(piPath, 0o755)]);
 
-  const result = await execFileAsync(resolve("scripts/pi-review-gate.sh"), ["--model", "example"], {
+  const result = await execFileAsync(resolve("scripts/pi-review-gate.sh"), ["--model", "example", "--tools", "read,bash"], {
     env: {
       ...process.env,
       HOME: home,
@@ -47,7 +47,7 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
   assert.equal(await readFile(join(capture, "disabled-env"), "utf8"), "unset");
   assert.equal(
     await readFile(join(capture, "args"), "utf8"),
-    `--extension\n${resolve("dist/src/index.js")}\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n`,
+    `--extension\n${resolve("dist/src/index.js")}\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n--tools\nread,bash\n`,
   );
 });
 

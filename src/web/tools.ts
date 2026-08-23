@@ -150,6 +150,7 @@ function formatFetch(value: WebFetchResult): string {
     `Web page: ${value.title}`,
     `Source: ${value.finalUrl}`,
     `Fetched: ${value.fetchedAt} · ${value.cacheHit ? "session cache" : `${value.downloadedBytes} network bytes`}`,
+    "Cache scope: current session.",
     `Showing index ${value.startIndex}-${value.endIndex} of ${Math.max(0, value.totalBlocks - 1)}.`,
   ];
   if (value.dynamicContentSuspected) {

@@ -100,6 +100,7 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.match(firstText, /Tables discovered across the full page/);
   assert.match(firstText, /Population table/);
   assert.match(firstText, /dynamic_content_suspected: false/);
+  assert.match(firstText, /Cache scope: current session\./);
   const tableIndex = (first.details.response.tables[0].index) as number;
   const second = await tools.get("WebFetch").execute("two", { url: "https://example.com/cities", index: tableIndex });
   assert.match(second.content[0].text as string, /New York/);

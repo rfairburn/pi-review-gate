@@ -5,7 +5,7 @@ import { normalizeConfig } from "../src/config";
 import { WebPageCache } from "../src/web/cache";
 import { canonicalSearchUrl, parseDuckDuckGoResults, searchDuckDuckGo, type DownloadedText, type NetworkOptions } from "../src/web/network";
 import { extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
-import { WebToolManager } from "../src/web/tools";
+import { formatSearch, WebToolManager } from "../src/web/tools";
 
 const fixture = `<!doctype html><html><head><title>Population fixture</title></head><body>
 <main><h1>Largest cities</h1>${Array.from({ length: 20 }, (_, index) => `<p>Context paragraph ${index} with enough useful content for extraction and structural indexing.</p>`).join("")}</main>
@@ -161,6 +161,27 @@ test("WebSearch continues within a provider page, then follows its opaque next-p
     searchDuckDuckGo({ ...common, domain: "noise.example" }),
     /cannot also be excluded/,
   );
+});
+
+test("WebSearch reports provider date coverage without inferring missing dates", () => {
+  const base = {
+    provider: "duckduckgo" as const,
+    query: "cities",
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+    durationMs: 12,
+  };
+  const result = (rank: number, dateText?: string) => ({
+    rank,
+    title: `Result ${rank}`,
+    url: `https://example.com/${rank}`,
+    hostname: "example.com",
+    snippet: "A complete provider snippet with enough content for this formatting test.",
+    ...(dateText ? { dateText, dateSource: "provider" as const } : {}),
+  });
+
+  assert.match(formatSearch({ ...base, results: [result(1), result(2)] }), /unavailable for all 2 result\(s\); dates were not inferred/);
+  assert.match(formatSearch({ ...base, results: [result(1, "Aug 23, 2026"), result(2)] }), /supplied for 1\/2 result\(s\); absent dates were not inferred/);
+  assert.match(formatSearch({ ...base, results: [result(1, "Aug 23, 2026"), result(2, "Aug 22, 2026")] }), /supplied for all 2 result\(s\)/);
 });
 
 test("WebFetch reuses its session cache, exposes table indexes, and removes the cache on shutdown", async () => {

@@ -142,11 +142,17 @@ export class WebToolManager {
   }
 }
 
-function formatSearch(response: SearchResponse): string {
+export function formatSearch(response: SearchResponse): string {
   const lines = [
     `Web search via ${response.provider}: ${response.query}`,
     `Returned ${response.results.length} result(s) in ${response.durationMs}ms.`,
   ];
+  if (response.results.length > 0) {
+    const datedResults = response.results.filter((result) => result.dateText).length;
+    if (datedResults === 0) lines.push(`Provider dates: unavailable for all ${response.results.length} result(s); dates were not inferred.`);
+    else if (datedResults === response.results.length) lines.push(`Provider dates: supplied for all ${response.results.length} result(s).`);
+    else lines.push(`Provider dates: supplied for ${datedResults}/${response.results.length} result(s); absent dates were not inferred.`);
+  }
   if (response.excludedDomains?.length) lines.push(`Excluded domains: ${response.excludedDomains.join(", ")}`);
   for (const result of response.results) {
     const metadata = [result.hostname];

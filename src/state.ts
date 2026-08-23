@@ -81,6 +81,8 @@ export interface ReviewGateState {
   nextReviewWindowId: number;
   reviewWindow?: ReviewWindow;
   lastQuestionWindow?: ReviewWindow;
+  /** Runtime-only ownership registry used to remove superseded bundles at application shutdown. */
+  ownedBundleDirs: Set<string>;
   pendingAcceptedReviewerQuestions: AcceptedReviewerQuestion[];
   reviewsPaused: boolean;
   reviewInProgress: boolean;
@@ -119,6 +121,7 @@ export interface ReviewFeedbackContext {
 export function createState(): ReviewGateState {
   return {
     nextReviewWindowId: 1,
+    ownedBundleDirs: new Set(),
     pendingAcceptedReviewerQuestions: [],
     reviewsPaused: false,
     reviewInProgress: false,
@@ -278,11 +281,15 @@ export function hasUnresolvedReview(window: ReviewWindow | undefined): boolean {
 }
 
 export function closeReviewWindow(state: ReviewGateState, preserveForReviewerQuestions = false): void {
+  rememberOwnedBundle(state, state.lastQuestionWindow);
+  if (!preserveForReviewerQuestions) rememberOwnedBundle(state, state.reviewWindow);
   state.lastQuestionWindow = preserveForReviewerQuestions ? state.reviewWindow : undefined;
   state.reviewWindow = undefined;
 }
 
 export function clearReviewState(state: ReviewGateState): void {
+  rememberOwnedBundle(state, state.reviewWindow);
+  rememberOwnedBundle(state, state.lastQuestionWindow);
   for (const delivery of state.pendingModelDeliveries) {
     if (delivery.status !== "queued") continue;
     delivery.status = "cancelled";
@@ -428,6 +435,7 @@ export function buildRequestContext(
 
 function openReviewWindow(state: ReviewGateState): ReviewWindow {
   const carriedQuestions = state.pendingAcceptedReviewerQuestions.splice(0);
+  rememberOwnedBundle(state, state.lastQuestionWindow);
   state.lastQuestionWindow = undefined;
   const evidence = createEvidenceState();
   evidence.acceptedReviewerQuestions.push(...carriedQuestions.map((entry, index) => ({
@@ -450,6 +458,10 @@ function openReviewWindow(state: ReviewGateState): ReviewWindow {
   };
   state.reviewWindow = window;
   return window;
+}
+
+function rememberOwnedBundle(state: ReviewGateState, window: ReviewWindow | undefined): void {
+  if (window?.bundleDir) state.ownedBundleDirs.add(window.bundleDir);
 }
 
 function renderUserRequestContext(window: ReviewWindow): string[] {

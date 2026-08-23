@@ -89,6 +89,18 @@ test("closing a passed review window makes the next request start a fresh window
   assert.equal(second.baseline, undefined);
 });
 
+test("superseded retained bundles remain owned for application shutdown cleanup", () => {
+  const state = createState();
+  rememberUserRequest(state, "first task");
+  state.reviewWindow!.bundleDir = "/tmp/pi-review-gate-owned-bundle";
+  state.reviewWindow!.retainBundleAfterClose = true;
+
+  closeReviewWindow(state, true);
+  rememberUserRequest(state, "next task");
+
+  assert.deepEqual([...state.ownedBundleDirs], ["/tmp/pi-review-gate-owned-bundle"]);
+});
+
 test("clearReviewState discards every review context and queued input", () => {
   const state = createState();
   rememberUserRequest(state, "old task");

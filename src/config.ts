@@ -7,6 +7,27 @@ export type RetainBundles = "never" | "on-failure" | "always";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = typeof THINKING_LEVELS[number];
 
+export interface WebSearchConfig {
+  provider: "duckduckgo";
+  timeoutMs: number;
+  maxResults: number;
+}
+
+export interface WebFetchConfig {
+  timeoutMs: number;
+  maxDownloadBytes: number;
+  maxOutputChars: number;
+  cacheMaxBytes: number;
+  cacheMaxEntries: number;
+  userAgent: string;
+}
+
+export interface WebConfig {
+  enabled: boolean;
+  search: WebSearchConfig;
+  fetch: WebFetchConfig;
+}
+
 export interface GenericCliDeciderConfig {
   id: string;
   adapter: "generic-cli";
@@ -193,6 +214,7 @@ export interface ReviewGateConfig {
   externalAgents?: ExternalAgentConfig[];
   execution?: ExecutionConfig;
   ui?: ReviewGateUiConfig;
+  web?: WebConfig;
 }
 
 export interface LoadedConfig {
@@ -213,6 +235,18 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   maxSnapshotBytes: 52_428_800,
   waveArtifactTtlMs: 30 * 24 * 60 * 60 * 1000,
   retainBundles: "on-failure",
+  web: {
+    enabled: true,
+    search: { provider: "duckduckgo", timeoutMs: 20_000, maxResults: 10 },
+    fetch: {
+      timeoutMs: 30_000,
+      maxDownloadBytes: 8 * 1024 * 1024,
+      maxOutputChars: 12_000,
+      cacheMaxBytes: 64 * 1024 * 1024,
+      cacheMaxEntries: 32,
+      userAgent: "pi-review-gate/0.1 (+native web research)",
+    },
+  },
 };
 
 const DEFAULT_REVIEWER_TIMEOUT_MS = 600_000;
@@ -286,6 +320,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
     execution: value.execution === undefined ? undefined : normalizeExecution(value.execution, executorTimeoutMs),
     ui: value.ui === undefined ? undefined : normalizeUi(value.ui),
+    web: normalizeWeb(value.web),
   };
 
   if (config.reviewers) {
@@ -293,6 +328,37 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
   }
 
   return config;
+}
+
+function normalizeWeb(value: unknown): WebConfig {
+  const defaults = DEFAULT_CONFIG.web!;
+  if (value === undefined) return structuredClone(defaults);
+  if (!isRecord(value)) throw new Error("web must be an object");
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error("web.enabled must be a boolean");
+  const search = value.search === undefined ? {} : value.search;
+  const fetch = value.fetch === undefined ? {} : value.fetch;
+  if (!isRecord(search)) throw new Error("web.search must be an object");
+  if (!isRecord(fetch)) throw new Error("web.fetch must be an object");
+  const provider = search.provider ?? defaults.search.provider;
+  if (provider !== "duckduckgo") throw new Error("web.search.provider must be duckduckgo");
+  const userAgent = fetch.userAgent ?? defaults.fetch.userAgent;
+  if (typeof userAgent !== "string" || userAgent.trim().length === 0) throw new Error("web.fetch.userAgent must be a non-empty string");
+  return {
+    enabled: value.enabled ?? defaults.enabled,
+    search: {
+      provider,
+      timeoutMs: positiveIntegerOrDefault(search.timeoutMs, defaults.search.timeoutMs, "web.search.timeoutMs"),
+      maxResults: positiveIntegerOrDefault(search.maxResults, defaults.search.maxResults, "web.search.maxResults"),
+    },
+    fetch: {
+      timeoutMs: positiveIntegerOrDefault(fetch.timeoutMs, defaults.fetch.timeoutMs, "web.fetch.timeoutMs"),
+      maxDownloadBytes: positiveIntegerOrDefault(fetch.maxDownloadBytes, defaults.fetch.maxDownloadBytes, "web.fetch.maxDownloadBytes"),
+      maxOutputChars: positiveIntegerOrDefault(fetch.maxOutputChars, defaults.fetch.maxOutputChars, "web.fetch.maxOutputChars"),
+      cacheMaxBytes: positiveIntegerOrDefault(fetch.cacheMaxBytes, defaults.fetch.cacheMaxBytes, "web.fetch.cacheMaxBytes"),
+      cacheMaxEntries: positiveIntegerOrDefault(fetch.cacheMaxEntries, defaults.fetch.cacheMaxEntries, "web.fetch.cacheMaxEntries"),
+      userAgent: userAgent.trim(),
+    },
+  };
 }
 
 function normalizeUi(value: unknown): ReviewGateUiConfig {

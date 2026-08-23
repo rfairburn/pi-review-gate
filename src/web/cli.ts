@@ -1,0 +1,207 @@
+#!/usr/bin/env node
+import { loadConfig, normalizeConfig, type ReviewGateConfig, type WebConfig } from "../config";
+import { WebPageCache } from "./cache";
+import { searchDuckDuckGo } from "./network";
+
+interface CliRequest {
+  id?: string;
+  operation: "search" | "fetch";
+  query?: string;
+  url?: string;
+  index?: number;
+  maxChars?: number;
+  maxResults?: number;
+  domain?: string;
+  region?: string;
+  freshness?: "day" | "week" | "month" | "year";
+  refresh?: boolean;
+  find?: string;
+}
+
+type CliConfig = ReviewGateConfig & { web: WebConfig };
+
+async function main(): Promise<void> {
+  const config = cliConfig();
+  const cache = new WebPageCache(config.web.fetch);
+  process.on("exit", () => cache.cleanupSync());
+  try {
+    const [command, ...args] = process.argv.slice(2);
+    if (command === "search") {
+      const request = parseSearchArgs(args);
+      writeJson(await runRequest(request, cache, config));
+      return;
+    }
+    if (command === "fetch") {
+      const request = parseFetchArgs(args);
+      writeJson(await runRequest(request, cache, config));
+      return;
+    }
+    if (command === "batch") {
+      const input = await readStdin();
+      for (const line of input.split(/\r?\n/).filter((value) => value.trim())) {
+        let request: CliRequest;
+        try { request = JSON.parse(line) as CliRequest; } catch (error) {
+          writeJson({ ok: false, error: { message: `Invalid NDJSON: ${messageOf(error)}` } });
+          continue;
+        }
+        writeJson(await runRequest(request, cache, config));
+      }
+      return;
+    }
+    if (command === "doctor") {
+      writeJson({
+        ok: true,
+        operation: "doctor",
+        data: {
+          node: process.version,
+          provider: config.web.search.provider,
+          webEnabled: config.web.enabled,
+          limits: config.web,
+        },
+      });
+      return;
+    }
+    throw new Error("Usage: pi-review-web search QUERY [options] | fetch URL [options] | batch | doctor");
+  } finally {
+    await cache.cleanup();
+  }
+}
+
+async function runRequest(request: CliRequest, cache: WebPageCache, config: CliConfig): Promise<Record<string, unknown>> {
+  try {
+    if (request.operation === "search") {
+      if (!request.query?.trim()) throw new Error("search requires query");
+      const data = await searchDuckDuckGo({
+        query: request.query,
+        maxResults: bounded(request.maxResults, 1, config.web.search.maxResults, config.web.search.maxResults, "maxResults"),
+        ...(request.domain ? { domain: request.domain } : {}),
+        ...(request.region ? { region: request.region } : {}),
+        ...(request.freshness ? { freshness: request.freshness } : {}),
+        options: {
+          timeoutMs: config.web.search.timeoutMs,
+          maxBytes: 2 * 1024 * 1024,
+          userAgent: config.web.fetch.userAgent,
+        },
+      });
+      return envelope(request, data);
+    }
+    if (request.operation === "fetch") {
+      if (!request.url?.trim()) throw new Error("fetch requires url");
+      const data = await cache.fetch({
+        url: request.url,
+        index: bounded(request.index, 0, Number.MAX_SAFE_INTEGER, 0, "index"),
+        maxChars: bounded(request.maxChars, 1_000, config.web.fetch.maxOutputChars, config.web.fetch.maxOutputChars, "maxChars"),
+        refresh: request.refresh === true,
+        ...(request.find?.trim() ? { find: request.find.trim() } : {}),
+      });
+      return envelope(request, data);
+    }
+    throw new Error(`Unsupported operation: ${String(request.operation)}`);
+  } catch (error) {
+    return {
+      protocolVersion: 1,
+      ...(request.id ? { id: request.id } : {}),
+      ok: false,
+      operation: request.operation,
+      error: { message: messageOf(error) },
+    };
+  }
+}
+
+function parseSearchArgs(args: string[]): CliRequest {
+  const parsed = parseOptions(args);
+  const query = parsed.positionals.join(" ").trim();
+  return {
+    operation: "search",
+    query,
+    maxResults: numberOption(parsed.options, "max-results"),
+    domain: parsed.options.domain,
+    region: parsed.options.region,
+    freshness: parsed.options.freshness as CliRequest["freshness"],
+  };
+}
+
+function parseFetchArgs(args: string[]): CliRequest {
+  const parsed = parseOptions(args);
+  return {
+    operation: "fetch",
+    url: parsed.positionals[0],
+    index: numberOption(parsed.options, "index"),
+    maxChars: numberOption(parsed.options, "max-chars"),
+    refresh: parsed.options.refresh === "true",
+    find: parsed.options.find,
+  };
+}
+
+function parseOptions(args: string[]): { positionals: string[]; options: Record<string, string> } {
+  const positionals: string[] = [];
+  const options: Record<string, string> = {};
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (!value.startsWith("--")) {
+      positionals.push(value);
+      continue;
+    }
+    const name = value.slice(2);
+    if (name === "refresh") {
+      options.refresh = "true";
+      continue;
+    }
+    const next = args[index + 1];
+    if (!next || next.startsWith("--")) throw new Error(`--${name} requires a value`);
+    options[name] = next;
+    index += 1;
+  }
+  return { positionals, options };
+}
+
+function numberOption(options: Record<string, string>, name: string): number | undefined {
+  if (options[name] === undefined) return undefined;
+  const value = Number(options[name]);
+  if (!Number.isInteger(value)) throw new Error(`--${name} must be an integer`);
+  return value;
+}
+
+function bounded(value: number | undefined, min: number, max: number, fallback: number, field: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isInteger(resolved) || resolved < min || resolved > max) throw new Error(`${field} must be ${min}-${max}`);
+  return resolved;
+}
+
+function envelope(request: CliRequest, data: unknown): Record<string, unknown> {
+  return {
+    protocolVersion: 1,
+    ...(request.id ? { id: request.id } : {}),
+    ok: true,
+    operation: request.operation,
+    data,
+  };
+}
+
+function cliConfig(): CliConfig {
+  const config = (() => {
+    try { return loadConfig().config; } catch { return normalizeConfig({}); }
+  })();
+  if (!config.web) throw new Error("Normalized configuration omitted web defaults.");
+  return config as CliConfig;
+}
+
+function writeJson(value: unknown): void {
+  process.stdout.write(`${JSON.stringify(value, null, process.stdout.isTTY ? 2 : 0)}\n`);
+}
+
+async function readStdin(): Promise<string> {
+  process.stdin.setEncoding("utf8");
+  let input = "";
+  for await (const chunk of process.stdin) input += String(chunk);
+  return input;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+void main().catch((error) => {
+  process.stderr.write(`pi-review-web: ${messageOf(error)}\n`);
+  process.exitCode = 1;
+});

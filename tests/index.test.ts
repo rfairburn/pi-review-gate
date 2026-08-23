@@ -13,6 +13,7 @@ const executionToolNames = [
   "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
 ];
 const backgroundShellToolNames = ["ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"];
+const webToolNames = ["WebSearch", "WebFetch"];
 
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
@@ -234,12 +235,12 @@ test("delegated execution tool activation waits for session_start", async () => 
     };
 
     await activate(pi);
-    assert.deepEqual(registeredTools, backgroundShellToolNames);
+    assert.deepEqual(registeredTools, [...webToolNames, ...backgroundShellToolNames]);
 
     runtimeInitialized = true;
     await trigger(hooks, "session_start", { cwd: dir });
-    assert.deepEqual(registeredTools, [...backgroundShellToolNames, ...executionToolNames]);
-    assert.deepEqual(activeTools, ["read", ...backgroundShellToolNames, ...executionToolNames]);
+    assert.deepEqual(registeredTools, [...webToolNames, ...backgroundShellToolNames, ...executionToolNames]);
+    assert.deepEqual(activeTools, ["read", ...webToolNames, ...backgroundShellToolNames, ...executionToolNames]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1125,7 +1126,7 @@ test("automatic correction starts each reviewer in a fresh session against the s
     const bundleDir = history[1].bundle;
     retainedBundleDir = bundleDir;
     await trigger(hooks, "session_shutdown", { reason: "test" });
-    await access(bundleDir);
+    await assert.rejects(access(bundleDir), { code: "ENOENT" });
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(argvPath, { force: true });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -113,10 +113,11 @@ test("background tasks return immediately, land independently, and additions cap
     await controller.detach();
     const restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
     await restored.restore(associations);
-    const restoredInspection = restored.inspect(first.executionId);
-    assert.equal(restoredInspection.tasks.filter((task) => task.state === "landed").length, 3);
-    assert.equal(restoredInspection.peakConcurrency, 2);
-    assert.ok(restoredInspection.tasks.every((task) => (task.stateHistory?.length ?? 0) >= 3));
+    const restoredAssociations = restored.associations();
+    assert.deepEqual(restoredAssociations.waveRoots, []);
+    assert.deepEqual(restoredAssociations.bundles, []);
+    assert.deepEqual(restoredAssociations.groupRoots, []);
+    assert.throws(() => restored.inspect(first.executionId), /Unknown execution group/);
     await restored.shutdown();
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -185,6 +186,16 @@ test("parallel independent landings accumulate in the parent review checkpoint",
       reuseUnchangedFrom: checkpoint,
     });
     assert.deepEqual(compareSnapshots(checkpoint, current).map((change) => change.path), ["parent.txt"]);
+    const owned = controller.associations();
+    assert.equal(owned.groupRoots?.length, 1);
+    assert.equal(owned.waveRoots.length, 3);
+    await controller.shutdown();
+    await controller.cleanupSettledArtifacts();
+    assert.deepEqual(controller.associations().groupRoots, []);
+    assert.deepEqual(controller.associations().waveRoots, []);
+    for (const path of [...(owned.groupRoots ?? []), ...owned.waveRoots]) {
+      await assert.rejects(access(path), /ENOENT/);
+    }
   } finally {
     await controller?.shutdown().catch(() => undefined);
     await rm(root, { recursive: true, force: true });

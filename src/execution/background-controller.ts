@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, mkdir, mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { open, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { DEFAULT_SUBTASK_NOTIFICATION_MODE, type ReviewGateConfig } from "../config";
@@ -841,7 +841,27 @@ export class BackgroundExecutionController {
     }
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.promise));
     await Promise.all([...this.saveTails.values()].map((tail) => tail.catch(() => undefined)));
+    await this.cleanupSettledArtifacts();
     this.updateIndicator();
+  }
+
+  async cleanupSettledArtifacts(): Promise<void> {
+    for (const [executionId, group] of [...this.groups]) {
+      const settled = group.tasks.filter((task) => task.state === "landed" || task.state === "reported");
+      for (const task of settled) {
+        if (task.waveRoot) await removeOwnedWaveRoot(task.waveRoot);
+        task.waveRoot = undefined;
+        task.bundle = undefined;
+        task.result = undefined;
+      }
+      if (settled.length === group.tasks.length) {
+        await removeOwnedExecutionRoot(group.root);
+        this.groups.delete(executionId);
+      } else if (settled.length > 0) {
+        await this.save(group);
+      }
+    }
+    await this.publishAssociations();
   }
 
   async detach(): Promise<void> {
@@ -2108,6 +2128,24 @@ async function readGroup(root: string): Promise<BackgroundExecutionGroup> {
   parsed.kind ??= parsed.tasks.some((task) => task.definition.backgroundKind === "research") ? "research" : "execute";
   parsed.peakConcurrency ??= 0;
   return parsed;
+}
+
+async function removeOwnedWaveRoot(root: string): Promise<void> {
+  const resolved = resolve(root);
+  const temporaryRoot = await realpath(resolve(tmpdir()));
+  if (!basename(resolved).startsWith("wave-") || dirname(resolved) !== temporaryRoot) {
+    throw new Error(`Refusing to remove unrecognized wave root: ${resolved}`);
+  }
+  await rm(resolved, { recursive: true, force: true });
+}
+
+async function removeOwnedExecutionRoot(root: string): Promise<void> {
+  const resolved = resolve(root);
+  const temporaryRoot = await realpath(resolve(tmpdir()));
+  if (!basename(resolved).startsWith("pi-review-execution-") || dirname(resolved) !== temporaryRoot) {
+    throw new Error(`Refusing to remove unrecognized execution root: ${resolved}`);
+  }
+  await rm(resolved, { recursive: true, force: true });
 }
 
 async function atomicWrite(path: string, body: string): Promise<void> {

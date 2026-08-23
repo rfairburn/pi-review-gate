@@ -43,6 +43,26 @@ test("loadConfig supports PI_REVIEW_GATE_DISABLED", () => {
   assert.equal(loaded.disabledReason, "PI_REVIEW_GATE_DISABLED is set");
 });
 
+test("native web tooling has bounded defaults and validates overrides", () => {
+  const defaults = normalizeConfig({}).web!;
+  assert.equal(defaults.enabled, true);
+  assert.equal(defaults.search.provider, "duckduckgo");
+  assert.equal(defaults.search.maxResults, 10);
+  assert.equal(defaults.fetch.cacheMaxEntries, 32);
+  assert.equal(defaults.fetch.cacheMaxBytes, 64 * 1024 * 1024);
+
+  const configured = normalizeConfig({ web: {
+    search: { timeoutMs: 1234, maxResults: 7 },
+    fetch: { maxOutputChars: 9000, cacheMaxEntries: 4 },
+  } }).web!;
+  assert.equal(configured.search.timeoutMs, 1234);
+  assert.equal(configured.search.maxResults, 7);
+  assert.equal(configured.fetch.maxOutputChars, 9000);
+  assert.equal(configured.fetch.cacheMaxEntries, 4);
+  assert.throws(() => normalizeConfig({ web: { search: { provider: "unknown" } } }), /provider must be duckduckgo/);
+  assert.throws(() => normalizeConfig({ web: { fetch: { cacheMaxBytes: 0 } } }), /web\.fetch\.cacheMaxBytes/);
+});
+
 test("normalizeConfig preserves the global subtasks view preference", () => {
   const config = normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: true } });
   assert.equal(config.ui?.subtasksViewExpanded, true);

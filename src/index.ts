@@ -1,5 +1,5 @@
 import { loadConfig, materializeReviewConfig } from "./config";
-import { removeTransientWindowBundle } from "./bundle";
+import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
@@ -35,6 +35,7 @@ import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
 import { configDigest, replaceReviewGateState, sessionPersistenceIdentity, SessionStateStore } from "./session-state";
 import { BackgroundProcessReadiness } from "./background-process-readiness";
 import { registerBackgroundShell, type BackgroundShellHost } from "./background-shell";
+import { WebToolManager, type PiWebHost } from "./web/tools";
 
 declare const module: {
   exports: unknown;
@@ -48,11 +49,6 @@ const orchestratorBackgroundCompletionPrompt = [
 ].join(" ");
 
 export async function activate(pi: unknown): Promise<void> {
-  if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor") {
-    if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
-    return;
-  }
-
   let loaded;
   try {
     loaded = loadConfig();
@@ -67,6 +63,14 @@ export async function activate(pi: unknown): Promise<void> {
     return;
   }
 
+  const webTools = canRegisterWebTools(pi) ? new WebToolManager(pi, loaded.config) : undefined;
+  webTools?.register();
+
+  if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor") {
+    if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
+    return;
+  }
+
   if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
 
   const state = createState();
@@ -74,6 +78,7 @@ export async function activate(pi: unknown): Promise<void> {
   let currentScopedModels: string[] = [];
   let sessionActive = true;
   let activeReviewAbort: ReviewAbortHandle | undefined;
+  let activeReviewSettled: Promise<void> | undefined;
   let activeStatusTracker: ReturnType<typeof createStatusTracker> | undefined;
   let agentRunActive = false;
   let reviewerQuestionPausePending = false;
@@ -168,8 +173,10 @@ export async function activate(pi: unknown): Promise<void> {
     sessionActive = false;
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
     sessionAbortController.abort();
+    const reviewSettled = activeReviewSettled;
     activeReviewAbort?.shutdown();
     activeReviewAbort = undefined;
+    await reviewSettled;
     await activeStatusTracker?.clear({ immediate: true });
     activeStatusTracker = undefined;
     agentRunActive = false;
@@ -178,6 +185,8 @@ export async function activate(pi: unknown): Promise<void> {
     orchestratorBackgroundReadiness.clear();
     releaseReviewerQuestionPauseWaiters();
     await executionTools.shutdown();
+    await webTools?.cleanup();
+    await cleanupReviewBundles(state);
     await drainEvidenceCaptures();
     await persistSessionState(true);
     await stateStore?.drain();
@@ -422,8 +431,17 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     state.reviewInProgress = true;
+    let settleReview!: () => void;
+    const reviewSettled = new Promise<void>((resolvePromise) => { settleReview = resolvePromise; });
+    activeReviewSettled = reviewSettled;
     await drainEvidenceCaptures();
     await persistSessionState();
+    if (!sessionActive) {
+      state.reviewInProgress = false;
+      settleReview();
+      if (activeReviewSettled === reviewSettled) activeReviewSettled = undefined;
+      return;
+    }
     const reviewAbort = createReviewAbortController({
       signal,
       noticeTarget,
@@ -464,6 +482,8 @@ export async function activate(pi: unknown): Promise<void> {
       if (activeReviewAbort === reviewAbort) {
         activeReviewAbort = undefined;
       }
+      settleReview();
+      if (activeReviewSettled === reviewSettled) activeReviewSettled = undefined;
       // A resumed conversation may need the active review artifacts.
     }
 
@@ -660,7 +680,25 @@ export async function activate(pi: unknown): Promise<void> {
   }
 }
 
+async function cleanupReviewBundles(state: ReviewGateState): Promise<void> {
+  const windows = [state.reviewWindow, state.lastQuestionWindow].filter((window) => window !== undefined);
+  const directories = [...new Set([
+    ...state.ownedBundleDirs,
+    ...windows.map((window) => window.bundleDir).filter((value): value is string => Boolean(value)),
+  ])];
+  await Promise.all(directories.map((directory) => removeReviewBundle(directory)));
+  state.ownedBundleDirs.clear();
+  for (const window of windows) {
+    window.bundleDir = undefined;
+    window.retainBundleAfterClose = false;
+  }
+}
+
 function canRegisterBackgroundShell(value: unknown): value is BackgroundShellHost {
+  return typeof (value as { registerTool?: unknown } | undefined)?.registerTool === "function";
+}
+
+function canRegisterWebTools(value: unknown): value is PiWebHost {
   return typeof (value as { registerTool?: unknown } | undefined)?.registerTool === "function";
 }
 

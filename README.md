@@ -95,6 +95,60 @@ per stream for diagnostics; JSONL protocols are decoded incrementally with
 separate bounded records, so protocol correctness does not depend on display
 capture truncation.
 
+### Native web research
+
+`WebSearch` performs normalized DuckDuckGo HTML search without an API key.
+`WebFetch` downloads and indexes the complete selected page, but returns only a
+bounded structural range. Its result includes `nextIndex` when more blocks
+remain, a whole-page table inventory with directly readable indexes, possible
+site-pagination URLs, and `dynamic_content_suspected`. Use `find` on that same `WebFetch` URL to
+locate text anywhere in the indexed page; an accompanying `index` starts the
+case-insensitive search at that block. Continue at a returned match, table, or
+`nextIndex`; while the page remains cached, no second network request is made.
+A site-pagination URL is a different document and therefore a new fetch.
+
+The page cache is bounded by entry count and total bytes and is force-removed
+on session/application shutdown. Shutdown also removes settled subtask wave
+roots, completed execution manifests, and review bundles. Only genuinely
+unlanded recovery checkpoints are preserved for exact-session restart.
+
+Defaults can be overridden under `web`:
+
+```json
+{
+  "web": {
+    "enabled": true,
+    "search": { "provider": "duckduckgo", "timeoutMs": 20000, "maxResults": 10 },
+    "fetch": {
+      "timeoutMs": 30000,
+      "maxDownloadBytes": 8388608,
+      "maxOutputChars": 12000,
+      "cacheMaxBytes": 67108864,
+      "cacheMaxEntries": 32,
+      "userAgent": "pi-review-gate/0.1 (+native web research)"
+    }
+  }
+}
+```
+
+Search providers own their integration and configuration. Future providers
+that require credentials must accept the key through review-gate configuration
+or an environment-variable reference; credentials will not be embedded in tool
+arguments.
+
+For independent manual testing, use the same implementation outside Pi:
+
+```bash
+./scripts/pi-review-web.sh search "largest US cities census wikipedia" --max-results 10
+./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population
+./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --find Phoenix
+./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --index 110
+```
+
+The CLI emits versioned JSON. `batch` accepts NDJSON and keeps one cache alive
+across all requests in that process, which is useful for independently proving
+that indexed continuation is a cache hit.
+
 The reviewer treats orchestrator-provided task direction as authorized and
 reviews concrete logic, regressions, security, API behavior, tests, and explicit
 acceptance criteria. It must not request changes merely because an implementation
@@ -357,7 +411,9 @@ is associated with the exact parent conversation sidecar. On later captures,
 completed non-recovery roots older than `waveArtifactTtlMs` are
 garbage-collected (30 days by default; `0` disables collection). Conflict,
 integration-error, and recovery-required roots are never removed by this GC,
-and `retainBundles: "always"` disables wave GC.
+and `retainBundles: "always"` disables age-based wave GC while the application
+is running. Application shutdown still removes settled artifacts; recoverable
+unlanded checkpoints remain protected.
 
 **Conflict and recovery**: A clean accepted task lands immediately. On a
 three-way conflict, clean paths are applied and ordinary diff3 markers are

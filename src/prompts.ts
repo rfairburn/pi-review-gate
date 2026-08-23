@@ -8,8 +8,12 @@ Review for concrete technical defects: incorrect logic, regressions, unsafe beha
 
 export const REVIEW_TEST_POLICY = `Targeted tests are the expected verification inside delegated implementation and correction loops. Do not return "needs_changes" merely because the full repository test suite was not run. Require a full-suite run only when an explicit acceptance criterion assigns it to this task or when you identify a concrete cross-cutting risk that the targeted tests cannot exercise. Otherwise, mention a full-suite final orchestration run only as a non_blocking observation.`;
 
+export const REVIEW_OUTCOME_POLICY = `Judge the delivered outcome against the explicit request and acceptance criteria, not against a preferred implementation or process. The current workspace and independently verifiable final behavior are authoritative. Missing evidence that an intermediate step occurred is not a defect when the final state proves the required outcome and the method itself was not required. Treat the method as material only when the request makes it part of the deliverable or when safety, security, migration, destructive-operation, or audit semantics depend on it.
+Missing verification is blocking only when it leaves a concrete material risk that read-only inspection and existing targeted evidence cannot resolve. Name that risk and recommend the smallest targeted verification that would resolve it; do not demand redundant proof.`;
+
 const REVIEW_CONTEXT_POLICY = `Review policy:
 ${REVIEW_AUTHORIZATION_POLICY}
+${REVIEW_OUTCOME_POLICY}
 ${REVIEW_TEST_POLICY}
 - Submitted workspace changes define the parent exchange's review scope, not a delivery artifact. Independently reviewed subtask landings may be present in the live workspace but intentionally absent; do not flag that absence alone.
 - Captured side-effect changes are evidence from tool activity that was not detected as submitted workspace changes. They may include temp-like process artifacts, generated files, or real outside-workspace side effects.

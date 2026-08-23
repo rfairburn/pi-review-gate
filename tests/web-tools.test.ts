@@ -187,6 +187,7 @@ test("WebSearch reports provider date coverage without inferring missing dates",
 test("WebFetch reuses its session cache, exposes table indexes, and removes the cache on shutdown", async () => {
   const config = normalizeConfig({});
   let downloads = 0;
+  let browserRenders = 0;
   const cache = new WebPageCache(config.web!.fetch, async (url) => {
     downloads += 1;
     return {
@@ -200,15 +201,32 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   });
   const tools = new Map<string, any>();
   const hooks = new Map<string, (...args: unknown[]) => unknown>();
+  const browserCache = new WebPageCache(config.web!.fetch, async (url) => {
+    browserRenders += 1;
+    const rendered = fixture.replace("Largest cities", "Rendered largest cities");
+    return {
+      requestedUrl: url,
+      finalUrl: url,
+      contentType: "text/html; charset=utf-8",
+      text: rendered,
+      bytes: Buffer.byteLength(rendered),
+      fetchedAt: "2026-08-23T00:00:01.000Z",
+    };
+  });
   const manager = new WebToolManager({
     registerTool: (tool) => tools.set(tool.name, tool),
     on: (name, handler) => hooks.set(name, handler),
-  }, config, cache);
+  }, config, cache, browserCache);
   manager.register();
-  assert.deepEqual([...tools.keys()], ["WebSearch", "WebFetch"]);
+  assert.deepEqual([...tools.keys()], ["WebSearch", "WebFetch", "BrowserExtract"]);
   assert.equal(tools.has("WebRead"), false);
   assert.ok(tools.get("WebSearch").parameters.properties.excludeDomains);
   assert.ok(tools.get("WebSearch").parameters.properties.cursor);
+  assert.deepEqual(
+    Object.keys(tools.get("BrowserExtract").parameters.properties),
+    Object.keys(tools.get("WebFetch").parameters.properties),
+  );
+  assert.match(tools.get("BrowserExtract").promptSnippet, /only after WebFetch/);
 
   const first = await tools.get("WebFetch").execute("one", { url: "https://example.com/cities", maxChars: 1_000 });
   const firstText = first.content[0].text as string;
@@ -246,9 +264,56 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.match(found.content[0].text as string, /Los Angeles/);
   assert.equal(downloads, 1);
 
+  const browserFirst = await tools.get("BrowserExtract").execute("browser-one", {
+    url: "https://example.com/cities",
+    find: "Rendered largest cities",
+  });
+  assert.match(browserFirst.content[0].text as string, /Find "Rendered largest cities"/);
+  assert.match(browserFirst.content[0].text as string, /BrowserExtract/);
+  const browserIndex = browserFirst.details.response.find.matches[0].index as number;
+  const browserSecond = await tools.get("BrowserExtract").execute("browser-two", {
+    url: "https://example.com/cities",
+    index: browserIndex,
+  });
+  assert.match(browserSecond.content[0].text as string, /Rendered largest cities/);
+  assert.match(browserSecond.content[0].text as string, /session cache/);
+  assert.equal(browserRenders, 1);
+
   const root = manager.cacheRoot();
+  const browserRoot = manager.browserCacheRoot();
   assert.ok(root);
+  assert.ok(browserRoot);
   await access(root);
+  await access(browserRoot);
   await hooks.get("session_shutdown")?.();
   await assert.rejects(access(root), /ENOENT/);
+  await assert.rejects(access(browserRoot), /ENOENT/);
+});
+
+test("WebFetch gives a direct BrowserExtract escalation when static extraction suspects JavaScript", async () => {
+  const config = normalizeConfig({});
+  const shell = `<html><body><div id="root"></div>${"<script>void 0</script>".repeat(8)}</body></html>`;
+  const staticCache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "text/html",
+    text: shell,
+    bytes: Buffer.byteLength(shell),
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const browserCache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "text/html",
+    text: "<html><body><main><h1>Rendered application</h1><p>The JavaScript result is now present.</p></main></body></html>",
+    bytes: 111,
+    fetchedAt: "2026-08-23T00:00:01.000Z",
+  }));
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, staticCache, browserCache);
+  manager.register();
+  const staticResult = await tools.get("WebFetch").execute("static", { url: "https://example.com/app" });
+  assert.match(staticResult.content[0].text as string, /dynamic_content_suspected: true/);
+  assert.match(staticResult.content[0].text as string, /use BrowserExtract/i);
+  await manager.cleanup();
 });

@@ -13,7 +13,7 @@ const executionToolNames = [
   "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
 ];
 const backgroundShellToolNames = ["ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"];
-const webToolNames = ["WebSearch", "WebFetch"];
+const webToolNames = ["WebSearch", "WebFetch", "BrowserExtract"];
 
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;

@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { loadConfig, normalizeConfig, type ReviewGateConfig, type WebConfig } from "../config";
+import { renderWithChromium } from "./browser";
 import { WebPageCache } from "./cache";
 import { searchDuckDuckGo } from "./network";
 
 interface CliRequest {
   id?: string;
-  operation: "search" | "fetch";
+  operation: "search" | "fetch" | "browser-extract";
   query?: string;
   url?: string;
   index?: number;
@@ -26,17 +27,26 @@ type CliConfig = ReviewGateConfig & { web: WebConfig };
 async function main(): Promise<void> {
   const config = cliConfig();
   const cache = new WebPageCache(config.web.fetch);
-  process.on("exit", () => cache.cleanupSync());
+  const browserCache = new WebPageCache(config.web.fetch, renderWithChromium);
+  process.on("exit", () => {
+    cache.cleanupSync();
+    browserCache.cleanupSync();
+  });
   try {
     const [command, ...args] = process.argv.slice(2);
     if (command === "search") {
       const request = parseSearchArgs(args);
-      writeJson(await runRequest(request, cache, config));
+      writeJson(await runRequest(request, cache, browserCache, config));
       return;
     }
     if (command === "fetch") {
       const request = parseFetchArgs(args);
-      writeJson(await runRequest(request, cache, config));
+      writeJson(await runRequest(request, cache, browserCache, config));
+      return;
+    }
+    if (command === "browser-extract") {
+      const request = parseFetchArgs(args, "browser-extract");
+      writeJson(await runRequest(request, cache, browserCache, config));
       return;
     }
     if (command === "batch") {
@@ -47,7 +57,7 @@ async function main(): Promise<void> {
           writeJson({ ok: false, error: { message: `Invalid NDJSON: ${messageOf(error)}` } });
           continue;
         }
-        writeJson(await runRequest(request, cache, config));
+        writeJson(await runRequest(request, cache, browserCache, config));
       }
       return;
     }
@@ -64,13 +74,13 @@ async function main(): Promise<void> {
       });
       return;
     }
-    throw new Error("Usage: pi-review-web search QUERY [options] | fetch URL [options] | batch | doctor");
+    throw new Error("Usage: pi-review-web search QUERY [options] | fetch URL [options] | browser-extract URL [options] | batch | doctor");
   } finally {
-    await cache.cleanup();
+    await Promise.all([cache.cleanup(), browserCache.cleanup()]);
   }
 }
 
-async function runRequest(request: CliRequest, cache: WebPageCache, config: CliConfig): Promise<Record<string, unknown>> {
+async function runRequest(request: CliRequest, cache: WebPageCache, browserCache: WebPageCache, config: CliConfig): Promise<Record<string, unknown>> {
   try {
     if (request.operation === "search") {
       if (!request.query?.trim()) throw new Error("search requires query");
@@ -90,9 +100,9 @@ async function runRequest(request: CliRequest, cache: WebPageCache, config: CliC
       });
       return envelope(request, data);
     }
-    if (request.operation === "fetch") {
-      if (!request.url?.trim()) throw new Error("fetch requires url");
-      const data = await cache.fetch({
+    if (request.operation === "fetch" || request.operation === "browser-extract") {
+      if (!request.url?.trim()) throw new Error(`${request.operation} requires url`);
+      const data = await (request.operation === "browser-extract" ? browserCache : cache).fetch({
         url: request.url,
         index: bounded(request.index, 0, Number.MAX_SAFE_INTEGER, 0, "index"),
         maxChars: bounded(request.maxChars, 1_000, config.web.fetch.maxOutputChars, config.web.fetch.maxOutputChars, "maxChars"),
@@ -129,10 +139,10 @@ function parseSearchArgs(args: string[]): CliRequest {
   };
 }
 
-function parseFetchArgs(args: string[]): CliRequest {
+function parseFetchArgs(args: string[], operation: "fetch" | "browser-extract" = "fetch"): CliRequest {
   const parsed = parseOptions(args);
   return {
-    operation: "fetch",
+    operation,
     url: parsed.positionals[0],
     index: numberOption(parsed.options, "index"),
     maxChars: numberOption(parsed.options, "max-chars"),

@@ -110,6 +110,17 @@ When reading a table index, `columns` projects exact case-insensitive header
 names in the requested order; `#N` selects a 1-based column when headers are
 duplicated or inconvenient.
 
+`BrowserExtract` is the phase-one rendered-page fallback. Use it only after
+`WebFetch` reports `dynamic_content_suspected` or plausibly fails because the
+result requires JavaScript rendering, asynchronous page population,
+browser-managed cookies/bootstrap, or browser-style delivery. It launches an
+isolated headless Playwright Chromium process for an uncached URL, captures the
+rendered HTML, closes Chromium, and exposes the same `find`, `index`,
+`nextIndex`, table inventory, and `columns` operations as `WebFetch`. It does
+not yet click, type, authenticate, scroll, capture screenshots, or maintain an
+interactive browser session. Installation verifies and, when necessary,
+downloads Playwright's compatible Chromium build.
+
 The page cache is bounded by entry count and total bytes and is force-removed
 on session/application shutdown. Shutdown also removes settled subtask wave
 roots, completed execution manifests, and review bundles. Only genuinely
@@ -147,6 +158,7 @@ For independent manual testing, use the same implementation outside Pi:
 ./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --find Phoenix
 ./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --index 36
 ./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --index 36 --columns 'Municipality,2025estimate'
+./scripts/pi-review-web.sh browser-extract https://example.com/javascript-application --find 'Rendered result'
 ```
 
 The CLI emits versioned JSON. `batch` accepts NDJSON and keeps one cache alive

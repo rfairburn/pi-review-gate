@@ -459,8 +459,8 @@ export class ExecutionToolManager {
 }
 
 const RESEARCH_ALLOWED_TOOLS = new Set([
-  "read", "grep", "glob", "find", "ls", "WebFetch", "WebSearch",
-  "BrowserNavigate", "BrowserExtract", "BrowserScroll", "BrowserBack", "BrowserHistory",
+  "read", "grep", "glob", "find", "ls", "WebFetch", "WebSearch", "BrowserExtract",
+  "BrowserNavigate", "BrowserScroll", "BrowserBack", "BrowserHistory",
 ]);
 
 function researchToolIntersection(parent: string[]): string[] {

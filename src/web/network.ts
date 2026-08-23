@@ -291,7 +291,7 @@ async function readBoundedBody(response: Response, maxBytes: number, signal: Abo
   return output;
 }
 
-async function validatedPublicUrl(value: string): Promise<string> {
+export async function validatedPublicUrl(value: string): Promise<string> {
   let url: URL;
   try {
     url = new URL(value);

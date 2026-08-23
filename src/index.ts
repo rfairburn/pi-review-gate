@@ -283,7 +283,6 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "tool_call", async (...args) => {
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
-    orchestratorBackgroundReadiness.observeToolResult(name, args[0], isToolError(args[0]));
     const window = state.reviewWindow;
     if (!window || !shouldRecordToolCallEvidence(name)) {
       return;
@@ -304,6 +303,7 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "tool_result", async (...args) => {
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
+    orchestratorBackgroundReadiness.observeToolResult(name, args[0], isToolError(args[0]));
     const window = state.reviewWindow;
     const toolError = isToolError(args[0]);
     if (!window || !shouldRecordToolResultEvidence(name, toolError)) {

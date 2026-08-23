@@ -11,7 +11,7 @@ import { validateChangeIdentity } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
-import { LittleCoderAdapter } from "./adapters/little-coder";
+import { PiModelAdapter } from "./adapters/pi-model";
 import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, type ReviewWindow } from "./state";
@@ -921,8 +921,8 @@ function createAdapter(decider: DeciderConfig): ModelAdapter {
   if (decider.adapter === "claude-cli") {
     return new ClaudeCliAdapter(decider);
   }
-  if (decider.adapter === "little-coder-model") {
-    return new LittleCoderAdapter(decider);
+  if (decider.adapter === "pi-model") {
+    return new PiModelAdapter(decider);
   }
 
   throw new Error("unsupported reviewer adapter");

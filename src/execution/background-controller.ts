@@ -1842,7 +1842,7 @@ function executorDisplayLabel(task: BackgroundTaskRecord, config: ReviewGateConf
   const entry = resolvedWorkerRoute(config, kind).find((candidate) => candidate.entryId === task.executorEntryId)
     ?? resolvedWorkerResources(config).find((candidate) => candidate.entryId === task.executorEntryId);
   if (!entry) return task.executorEntryId;
-  if (entry.selection.source === "little-coder") return entry.selection.model;
+  if (entry.selection.source === "pi") return entry.selection.model;
   const externalId = entry.selection.id;
   const agent = externalAgentCatalog(config).find((candidate) => candidate.id === externalId);
   return agent && "model" in agent && typeof agent.model === "string" && agent.model

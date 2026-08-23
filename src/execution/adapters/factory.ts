@@ -6,7 +6,7 @@ import {
 import type { ExecutorAdapter } from "../types";
 import { ClaudeExecutorAdapter } from "./claude-cli";
 import { CodexExecutorAdapter } from "./codex-cli";
-import { LittleCoderExecutorAdapter } from "./little-coder";
+import { PiExecutorAdapter } from "./pi-model";
 import { RunAsBinaryExecutorAdapter } from "./run-as-binary";
 
 export function createExecutorAdapter(config: ReviewGateConfig, selection?: ExecutorSelection): ExecutorAdapter {
@@ -14,8 +14,8 @@ export function createExecutorAdapter(config: ReviewGateConfig, selection?: Exec
   if (!active) {
     throw new Error("delegated execution is disabled; choose an executor with /review-settings");
   }
-  if (active.source === "little-coder") {
-    return new LittleCoderExecutorAdapter({
+  if (active.source === "pi") {
+    return new PiExecutorAdapter({
       model: active.model,
       thinkingLevel: active.thinkingLevel,
       timeoutMs: config.executorTimeoutMs,

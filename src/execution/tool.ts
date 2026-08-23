@@ -163,7 +163,7 @@ export class ExecutionToolManager {
     const pool = resolvedWorkerResources(this.input.config);
     const agents = externalAgentCatalog(this.input.config);
     const resolvable = pool.length > 0 && pool.every(({ selection }) =>
-      selection.source === "little-coder"
+      selection.source === "pi"
       || agents.some((agent) => agent.id === selection.id && externalAgentSupportsExecution(agent)));
     if (resolvable && !this.registered) this.register();
     if (!this.commandsRegistered) this.registerUserCommands();

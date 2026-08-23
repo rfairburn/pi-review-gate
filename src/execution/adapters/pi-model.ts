@@ -9,10 +9,9 @@ import { writeExecutorArtifacts } from "../artifacts";
 import { PiJsonlActivityExtractor } from "../progress";
 import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorInteractionAcknowledgement, type ExecutorRequest, type ExecutorTurn } from "../types";
 import type { ThinkingLevel } from "../../config";
-import { withLittleCoderThinkingBudget } from "../../little-coder-thinking";
 import { BackgroundProcessReadiness } from "../../background-process-readiness";
 
-export interface LittleCoderExecutorOptions {
+export interface PiExecutorOptions {
   model: string;
   thinkingLevel?: ThinkingLevel;
   command?: string;
@@ -20,11 +19,11 @@ export interface LittleCoderExecutorOptions {
   timeoutMs?: number;
 }
 
-export class LittleCoderExecutorAdapter implements ExecutorAdapter {
-  readonly kind = "little-coder-model";
+export class PiExecutorAdapter implements ExecutorAdapter {
+  readonly kind = "pi-model";
   readonly model: string;
 
-  constructor(private readonly options: LittleCoderExecutorOptions) {
+  constructor(private readonly options: PiExecutorOptions) {
     this.model = options.model;
   }
 
@@ -41,7 +40,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       try {
         const allowedTools = normalizeAllowedTools(request.allowedTools);
         await compactInterruptedSession({
-          command: this.options.command ?? "little-coder",
+          command: this.options.command ?? "pi",
           model: this.options.model,
           thinkingLevel,
           sessionId,
@@ -49,7 +48,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
           cwd: request.cwd,
           args: childArgs(this.options.args ?? [], allowedTools),
           timeoutMs: Math.min(this.options.timeoutMs ?? 1_800_000, 300_000),
-          env: executorEnv(this.options.model, thinkingLevel, allowedTools),
+          env: executorEnv(),
           signal: request.signal,
           onProcessStart: request.onProcessStart,
           onProcessExit: request.onProcessExit,
@@ -73,15 +72,14 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       "--thinking", thinkingLevel,
       "--session-id", sessionId,
       "--session-dir", sessionDir,
-      "--approve",
       ...childArgs(this.options.args ?? [], allowedTools),
     ];
-    const proc = spawn(this.options.command ?? "little-coder", args, {
+    const proc = spawn(this.options.command ?? "pi", args, {
       cwd: request.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: executorEnv(this.options.model, thinkingLevel, allowedTools),
+      env: executorEnv(),
     });
     const identity = proc.pid === undefined ? undefined : {
       pid: proc.pid,
@@ -89,7 +87,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
     };
     if (identity) await request.onProcessStart?.(identity);
     const backgroundReadiness = new BackgroundProcessReadiness();
-    const rpc = new LittleCoderRpc(proc, backgroundReadiness, (chunk) => {
+    const rpc = new PiRpc(proc, backgroundReadiness, (chunk) => {
       extractor.push(chunk);
       activity.push(chunk);
     });
@@ -99,16 +97,10 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
     let protocolFailure: string | undefined;
     let finalText = "";
     const timeoutMs = this.options.timeoutMs ?? 1_800_000;
-    let timeoutDeadline = Date.now() + timeoutMs;
     const timer = setInterval(() => {
-      if (backgroundReadiness.snapshot().running.length > 0) {
-        timeoutDeadline = Date.now() + timeoutMs;
-        return;
-      }
-      if (Date.now() < timeoutDeadline) return;
       timedOut = true;
       rpc.terminate();
-    }, Math.min(250, Math.max(25, Math.floor(timeoutMs / 4))));
+    }, timeoutMs);
     timer.unref?.();
     const onAbort = () => {
       aborted = true;
@@ -129,12 +121,12 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
             const state = await rpc.request("get_state", {});
             if (rpcState(state).isStreaming) {
               await rpc.request("steer", { message: instruction }, instructionId);
-              return { status: "acknowledged", message: "Little Coder RPC acknowledged live steering." };
+              return { status: "acknowledged", message: "Pi RPC acknowledged live steering." };
             }
             await rpc.request("prompt", { message: instruction }, instructionId);
             return {
               status: "acknowledged",
-              message: "Little Coder RPC resumed the idle executor with the steering instruction while background work remained active.",
+              message: "Pi RPC accepted steering as a new prompt after the executor became idle.",
             };
           } catch (error) {
             return { status: "failed", message: messageOf(error) };
@@ -146,42 +138,23 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
             const state = await rpc.request("get_state", {});
             if (!rpcState(state).isStreaming) {
               rpc.terminate();
-              return { status: "acknowledged", message: "Little Coder RPC interruption terminated the idle executor and its background processes." };
+              return { status: "acknowledged", message: "Pi RPC interruption terminated the idle executor." };
             }
             const beforeInterrupt = rpc.settledGeneration;
             await rpc.request("abort", {});
             await rpc.waitForSettled(beforeInterrupt);
-            return { status: "acknowledged", message: "Little Coder RPC acknowledged interruption and the agent settled." };
+            return { status: "acknowledged", message: "Pi RPC acknowledged interruption and the agent settled." };
           } catch (error) {
             return { status: "failed", message: messageOf(error) };
           }
         },
       });
       await rpc.waitForSettled(settledGeneration);
-      for (;;) {
-        const background = backgroundReadiness.snapshot();
-        if (background.unverifiable.length > 0) {
-          throw new Error(
-            `ShellStart reported background work whose process group could not be verified: ${background.unverifiable.join("; ")}`,
-          );
-        }
-        if (background.running.length === 0) break;
-        request.onUpdate?.(
-          `executor waiting for ${background.running.length} background process group(s): ${background.running.map((job) => `${job.id} (${job.label})`).join(", ")}`,
+      const background = backgroundReadiness.snapshot();
+      if (background.running.length > 0 || background.unverifiable.length > 0) {
+        throw new Error(
+          "Pi-native executor background-shell continuation is not implemented; ShellStart work cannot yet cross executor settlement safely.",
         );
-        await waitForBackgroundProcesses(backgroundReadiness, request.signal);
-        if (request.signal?.aborted || timedOut || interruptedByControl) break;
-
-        settledGeneration = rpc.settledGeneration;
-        const state = rpcState(await rpc.request("get_state", {}));
-        if (state.isStreaming || state.pendingMessageCount > 0) {
-          request.onUpdate?.("background process completed; waiting for the executor's automatic completion turn");
-          await rpc.waitForSettled(settledGeneration);
-        } else {
-          request.onUpdate?.("background process completed; resuming executor for final inspection before review");
-          await rpc.request("prompt", { message: backgroundCompletionPrompt });
-          await rpc.waitForSettled(settledGeneration);
-        }
       }
       const response = await rpc.request("get_last_assistant_text", {});
       finalText = isRecord(response.data) && typeof response.data.text === "string" ? response.data.text : "";
@@ -221,7 +194,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       failure: protocolFailure
         ? { category: "protocol", message: protocolFailure }
         : interruptedByControl
-          ? { category: "interruption", message: "Little Coder RPC turn was interrupted." }
+          ? { category: "interruption", message: "Pi RPC turn was interrupted." }
         : extracted.lifecycle.compaction.status === "in_progress"
         ? { category: "interruption", message: "Executor process ended while context compaction was in progress." }
         : extracted.lifecycle.compaction.status === "failed" || extracted.lifecycle.compaction.status === "aborted"
@@ -233,7 +206,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
   }
 }
 
-class LittleCoderRpc {
+class PiRpc {
   private nextId = 1;
   private buffer = "";
   private pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
@@ -252,7 +225,7 @@ class LittleCoderRpc {
     proc.stderr?.on("data", (value: Buffer) => { this.stderr.append(value.toString("utf8")); });
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
-        const error = new Error(`Little Coder RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`);
+        const error = new Error(`Pi RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`);
         for (const pending of this.pending.values()) pending.reject(error);
         this.pending.clear();
         for (const waiter of this.settledWaiters) waiter.reject(error);
@@ -272,7 +245,7 @@ class LittleCoderRpc {
       this.pending.set(id, { resolve: resolvePromise, reject });
       if (!this.proc.stdin?.writable) {
         this.pending.delete(id);
-        reject(new Error("Little Coder RPC stdin is not writable."));
+        reject(new Error("Pi RPC stdin is not writable."));
         return;
       }
       this.proc.stdin.write(`${JSON.stringify({ id, type, ...fields })}\n`);
@@ -339,7 +312,7 @@ class LittleCoderRpc {
         else pending.reject(new Error(rpcError(event)));
       } else if (event.type === "tool_execution_end" && typeof event.toolName === "string") {
         this.backgroundReadiness.observeToolResult(event.toolName, event.result, event.isError === true);
-      } else if (event.type === "agent_settled") {
+      } else if (event.type === "agent_end") {
         this.settledCount += 1;
         const ready = this.settledWaiters.filter((waiter) => waiter.after < this.settledCount);
         this.settledWaiters = this.settledWaiters.filter((waiter) => waiter.after >= this.settledCount);
@@ -370,7 +343,6 @@ async function compactInterruptedSession(input: {
     "--thinking", input.thinkingLevel,
     "--session-id", input.sessionId,
     "--session-dir", input.sessionDir,
-    "--approve",
     ...input.args,
   ];
 
@@ -497,22 +469,6 @@ const recoveryCompactionInstructions = [
   "This session will be resumed automatically after compaction.",
 ].join(" ");
 
-const backgroundCompletionPrompt = [
-  "All ShellStart background process groups are now finished.",
-  "Inspect their results and the workspace, address any failure, and finish the original task.",
-  "Do not claim success from process exit alone; verify the requested outcome before responding.",
-].join(" ");
-
-async function waitForBackgroundProcesses(
-  readiness: BackgroundProcessReadiness,
-  signal?: AbortSignal,
-): Promise<void> {
-  while (readiness.snapshot().running.length > 0) {
-    if (signal?.aborted) throw abortError(signal);
-    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
-  }
-}
-
 function rpcState(response: Record<string, unknown>): { isStreaming: boolean; pendingMessageCount: number } {
   const data = isRecord(response.data) ? response.data : {};
   return {
@@ -552,16 +508,6 @@ function childArgs(args: readonly string[], allowedTools: readonly string[] | un
   ];
 }
 
-function executorEnv(model: string, thinkingLevel: ThinkingLevel, allowedTools?: readonly string[]): NodeJS.ProcessEnv {
-  const env = reviewerEnv(process.env);
-  // Keep normal little-coder extensions except this gate; the kill-switch is
-  // authoritative and prevents nested automatic review.
-  if (process.env.LITTLE_CODER_EXTRA_EXTENSIONS) {
-    env.LITTLE_CODER_EXTRA_EXTENSIONS = process.env.LITTLE_CODER_EXTRA_EXTENSIONS;
-  }
-  if (process.env.PI_EXTRA_EXTENSIONS) {
-    env.PI_EXTRA_EXTENSIONS = process.env.PI_EXTRA_EXTENSIONS;
-  }
-  if (allowedTools) env.LITTLE_CODER_ALLOWED_TOOLS = allowedTools.join(",");
-  return withLittleCoderThinkingBudget(env, model, thinkingLevel);
+function executorEnv(): NodeJS.ProcessEnv {
+  return reviewerEnv(process.env);
 }

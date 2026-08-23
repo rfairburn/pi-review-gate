@@ -35,9 +35,9 @@ export interface ClaudeCliDeciderConfig {
   timeoutMs?: number;
 }
 
-export interface LittleCoderDeciderConfig {
+export interface PiDeciderConfig {
   id: string;
-  adapter: "little-coder-model";
+  adapter: "pi-model";
   model: string;
   thinkingLevel?: ThinkingLevel;
   command?: string;
@@ -46,10 +46,10 @@ export interface LittleCoderDeciderConfig {
   timeoutMs?: number;
 }
 
-export type DeciderConfig = GenericCliDeciderConfig | CodexCliDeciderConfig | ClaudeCliDeciderConfig | LittleCoderDeciderConfig;
+export type DeciderConfig = GenericCliDeciderConfig | CodexCliDeciderConfig | ClaudeCliDeciderConfig | PiDeciderConfig;
 
 export type ActiveExecutorSelection =
-  | { source: "little-coder"; model: string; thinkingLevel?: ThinkingLevel }
+  | { source: "pi"; model: string; thinkingLevel?: ThinkingLevel }
   | { source: "external"; id: string }
   | null;
 
@@ -127,7 +127,7 @@ export interface ExternalAgentConfig {
 }
 
 export type ActiveReviewerSelection =
-  | { source: "little-coder"; model: string; thinkingLevel?: ThinkingLevel }
+  | { source: "pi"; model: string; thinkingLevel?: ThinkingLevel }
   | { source: "external"; id: string };
 
 export interface ReviewSelectionConfig {
@@ -218,7 +218,7 @@ const DEFAULT_REVIEWER_TIMEOUT_MS = 600_000;
 const REVIEWER_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
-  const disabledVar = firstTruthyEnv(env, ["PI_REVIEW_GATE_DISABLED", "LITTLE_CODER_REVIEW_GATE_DISABLED"]);
+  const disabledVar = firstTruthyEnv(env, ["PI_REVIEW_GATE_DISABLED"]);
   if (disabledVar) {
     return {
       config: { ...DEFAULT_CONFIG, enabled: false },
@@ -415,17 +415,17 @@ export function resolvedWorkerRoute(config: ReviewGateConfig, kind: "execute" | 
   return configured.flatMap((route) => {
     const resource = byId.get(route.resourceId);
     if (!resource) return [];
-    const selection = resource.selection.source === "little-coder" && route.thinkingLevel
+    const selection = resource.selection.source === "pi" && route.thinkingLevel
       ? { ...resource.selection, thinkingLevel: route.thinkingLevel }
       : cloneExecutorSelection(resource.selection);
     return [{ ...resource, selection }];
   });
 }
 
-/** Research is enforced by Little Coder and initially best-effort for Codex/Claude. */
+/** Research is enforced by Pi and initially best-effort for Codex/Claude. */
 export function workerResourceSupportsResearch(config: ReviewGateConfig, entry: ExecutorPoolEntry): boolean {
   const selection = entry.selection;
-  if (selection.source === "little-coder") return true;
+  if (selection.source === "pi") return true;
   const agent = externalAgentCatalog(config).find((candidate) => candidate.id === selection.id);
   return agent?.adapter === "codex-cli" || agent?.adapter === "claude-cli";
 }
@@ -433,11 +433,11 @@ export function workerResourceSupportsResearch(config: ReviewGateConfig, entry: 
 export function executorEntryId(selection: ExecutorSelection): string {
   return selection.source === "external"
     ? `external-${selection.id}`
-    : `little-coder-${Buffer.from(selection.model).toString("base64url")}`;
+    : `pi-${Buffer.from(selection.model).toString("base64url")}`;
 }
 
 export function executorSelectionKey(selection: ExecutorSelection): string {
-  return selection.source === "external" ? `external:${selection.id}` : `little-coder:${selection.model}`;
+  return selection.source === "external" ? `external:${selection.id}` : `pi:${selection.model}`;
 }
 
 export function externalAgentCatalog(config: ReviewGateConfig): ExternalAgentConfig[] {
@@ -452,7 +452,7 @@ export function externalAgentCatalog(config: ReviewGateConfig): ExternalAgentCon
   }
   const legacyReviewers = config.reviewers?.length ? config.reviewers : config.decider ? [config.decider] : [];
   for (const reviewer of legacyReviewers) {
-    if (reviewer.adapter === "little-coder-model") continue;
+    if (reviewer.adapter === "pi-model") continue;
     const existing = byId.get(reviewer.id);
     if (existing && existing.adapter === reviewer.adapter) {
       existing.review ??= roleFromLegacyReviewer(reviewer);
@@ -476,11 +476,11 @@ export function externalAgentSupportsExecution(agent: ExternalAgentConfig): bool
 }
 
 export function internalReviewerId(model: string): string {
-  return `little-coder-${Buffer.from(model).toString("base64url")}`;
+  return `pi-${Buffer.from(model).toString("base64url")}`;
 }
 
 export function reviewerDisplayLabel(reviewer: DeciderConfig): string {
-  if (reviewer.adapter === "little-coder-model") {
+  if (reviewer.adapter === "pi-model") {
     return reviewer.thinkingLevel
       ? `${reviewer.model} (${reviewer.thinkingLevel})`
       : reviewer.model;
@@ -501,14 +501,9 @@ function findConfigPath(env: NodeJS.ProcessEnv): string | undefined {
   if (env.PI_REVIEW_GATE_CONFIG) {
     return env.PI_REVIEW_GATE_CONFIG;
   }
-  if (env.LITTLE_CODER_REVIEW_CONFIG) {
-    return env.LITTLE_CODER_REVIEW_CONFIG;
-  }
-
   const candidates = [
     join(homedir(), ".config", "pi-review-gate", "config.json"),
     join(homedir(), ".config", "pi", "review-gate.json"),
-    join(homedir(), ".config", "little-coder", "review-gate.json"),
   ];
   return candidates.find((candidate) => existsSync(candidate));
 }
@@ -561,21 +556,21 @@ function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TI
       timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "claude reviewer timeoutMs"),
     };
   }
-  if (value.adapter === "little-coder-model") {
+  if (value.adapter === "pi-model") {
     if (typeof value.model !== "string" || !value.model.trim()) {
-      throw new Error("little-coder-model decider requires model");
+      throw new Error("pi-model decider requires model");
     }
-    const env = normalizeStringRecord(value.env, "little-coder reviewer env");
-    const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "little-coder reviewer thinkingLevel");
+    const env = normalizeStringRecord(value.env, "pi reviewer env");
+    const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "pi reviewer thinkingLevel");
     return {
       id: value.id,
-      adapter: "little-coder-model",
+      adapter: "pi-model",
       model: value.model,
       ...(thinkingLevel ? { thinkingLevel } : {}),
-      command: normalizeOptionalNonEmptyString(value.command, "little-coder reviewer command") ?? "little-coder",
-      args: normalizeStringArray(value.args, "little-coder reviewer args"),
+      command: normalizeOptionalNonEmptyString(value.command, "pi reviewer command") ?? "pi",
+      args: normalizeStringArray(value.args, "pi reviewer args"),
       ...(env ? { env } : {}),
-      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "little-coder reviewer timeoutMs"),
+      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "pi reviewer timeoutMs"),
     };
   }
   throw new Error("unsupported decider adapter");
@@ -600,13 +595,13 @@ function normalizeActiveReviewers(value: unknown): ActiveReviewerSelection[] {
     if (!isRecord(selection)) {
       throw new Error("review.activeReviewers entries must be objects");
     }
-    if (selection.source === "little-coder") {
+    if (selection.source === "pi") {
       if (typeof selection.model !== "string" || !selection.model.trim()) {
-        throw new Error("little-coder reviewer selection requires model");
+        throw new Error("pi reviewer selection requires model");
       }
-      const thinkingLevel = normalizeOptionalThinkingLevel(selection.thinkingLevel, "little-coder reviewer thinkingLevel");
+      const thinkingLevel = normalizeOptionalThinkingLevel(selection.thinkingLevel, "pi reviewer thinkingLevel");
       return {
-        source: "little-coder",
+        source: "pi",
         model: selection.model.trim(),
         ...(thinkingLevel ? { thinkingLevel } : {}),
       };
@@ -866,13 +861,13 @@ function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
   if (!isRecord(value)) {
     throw new Error("execution.activeExecutor must be an object or null");
   }
-  if (value.source === "little-coder") {
+  if (value.source === "pi") {
     if (typeof value.model !== "string" || !value.model.trim()) {
-      throw new Error("little-coder active executor requires model");
+      throw new Error("pi active executor requires model");
     }
-    const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "little-coder executor thinkingLevel");
+    const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "pi executor thinkingLevel");
     return {
-      source: "little-coder",
+      source: "pi",
       model: value.model.trim(),
       ...(thinkingLevel ? { thinkingLevel } : {}),
     };
@@ -960,19 +955,19 @@ function resolveSelectedReviewers(config: ReviewGateConfig, scopedModels: string
   const unknownIds: string[] = [];
   const counts = new Map<string, number>();
   for (const selection of selections) {
-    const key = selection.source === "little-coder" ? `little-coder:${selection.model}` : `external:${selection.id}`;
+    const key = selection.source === "pi" ? `pi:${selection.model}` : `external:${selection.id}`;
     counts.set(key, (counts.get(key) ?? 0) + 1);
-    if (selection.source === "little-coder") {
+    if (selection.source === "pi") {
       if (!scoped.has(selection.model)) {
         unknownIds.push(key);
         continue;
       }
       reviewers.push({
         id: internalReviewerId(selection.model),
-        adapter: "little-coder-model",
+        adapter: "pi-model",
         model: selection.model,
         ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
-        command: "little-coder",
+        command: "pi",
         args: [],
         timeoutMs: config.reviewerTimeoutMs,
       });
@@ -1068,7 +1063,7 @@ function externalAgentFromLegacyExecutor(executor: ExternalExecutorConfig): Exte
   };
 }
 
-function externalAgentFromLegacyReviewer(reviewer: Exclude<DeciderConfig, LittleCoderDeciderConfig>): ExternalAgentConfig {
+function externalAgentFromLegacyReviewer(reviewer: Exclude<DeciderConfig, PiDeciderConfig>): ExternalAgentConfig {
   return {
     id: reviewer.id,
     adapter: reviewer.adapter,
@@ -1180,7 +1175,7 @@ function cloneExecutorSelection(selection: ExecutorSelection): ExecutorSelection
   return selection.source === "external"
     ? { source: "external", id: selection.id }
     : {
-      source: "little-coder",
+      source: "pi",
       model: selection.model,
       ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
     };

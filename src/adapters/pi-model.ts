@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { LittleCoderDeciderConfig } from "../config";
+import type { PiDeciderConfig } from "../config";
 import { parseReviewResult, type ReviewResult } from "../schema";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../usage";
 import { PiJsonlActivityExtractor } from "../execution/progress";
@@ -15,13 +15,12 @@ import {
   writeReviewerProcessArtifacts,
 } from "./process";
 import type { ModelAdapter, ModelAdapterRequest } from "./types";
-import { withLittleCoderThinkingBudget } from "../little-coder-thinking";
 
-export class LittleCoderAdapter implements ModelAdapter {
-  readonly kind = "little-coder-model";
+export class PiModelAdapter implements ModelAdapter {
+  readonly kind = "pi-model";
 
   constructor(
-    private readonly config: LittleCoderDeciderConfig,
+    private readonly config: PiDeciderConfig,
     private readonly dependencies: { runPromptProcess?: typeof runPromptProcess } = {},
   ) {}
 
@@ -65,16 +64,12 @@ export class LittleCoderAdapter implements ModelAdapter {
     ];
 
     const output = await (this.dependencies.runPromptProcess ?? runPromptProcess)({
-      command: this.config.command ?? "little-coder",
+      command: this.config.command ?? "pi",
       args,
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
-      env: withLittleCoderThinkingBudget(
-        reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
-        this.config.model,
-        thinkingLevel,
-      ),
+      env: reviewerEnv({ ...process.env, ...this.config.env }, req.evidenceBundleDir),
       signal: req.signal,
       onStdoutChunk: (chunk) => {
         streamExtractor.push(chunk);
@@ -158,7 +153,7 @@ function missingFinalTextDiagnostic(output: {
   stderrTruncated: boolean;
 }): string {
   return [
-    "No final assistant text was captured from the little-coder JSONL stream.",
+    "No final assistant text was captured from the Pi JSONL stream.",
     `exitCode: ${output.code === null ? "null" : output.code}`,
     `timedOut: ${output.timedOut}`,
     `aborted: ${output.aborted}`,
@@ -173,7 +168,7 @@ function providerFailureDiagnostic(error: string, output: {
   aborted: boolean;
 }): string {
   return [
-    "The little-coder stream ended with a provider error before final assistant text was produced.",
+    "The Pi stream ended with a provider error before final assistant text was produced.",
     `providerError: ${error}`,
     `exitCode: ${output.code === null ? "null" : output.code}`,
     `timedOut: ${output.timedOut}`,

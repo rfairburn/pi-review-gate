@@ -164,7 +164,7 @@ function reportProgress(
  * Returns a frozen config with materialized reviewers, or throws on blockage.
  */
 export function reviewerProgressLabel(reviewer: DeciderConfig): string {
-  if (reviewer.adapter === "little-coder-model") {
+  if (reviewer.adapter === "pi-model") {
     return reviewerDisplayLabel(reviewer);
   }
   if ((reviewer.adapter === "codex-cli" || reviewer.adapter === "claude-cli") && reviewer.model) {

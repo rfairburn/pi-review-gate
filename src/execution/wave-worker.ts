@@ -135,7 +135,7 @@ export interface WaveWorkerTask {
   /** Persisted background role for recovery-bundle adoption. */
   backgroundKind?: "execute" | "research";
   /**
-   * Durable snapshot of the parent agent's active tools. Little Coder
+   * Durable snapshot of the parent agent's active tools. Pi
    * executor launches reuse this allowlist across retries, compaction, and
    * continuation so a parent CLI restriction cannot be widened by spawning.
    */

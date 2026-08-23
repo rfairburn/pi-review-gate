@@ -14,8 +14,8 @@ const baseConfig = fakeNeedsChangesConfig({ maxCorrectionCycles: 1 });
 
 test("reviewerDisplayLabel shows models instead of encoded internal reviewer ids", () => {
   assert.equal(reviewerDisplayLabel({
-    id: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
-    adapter: "little-coder-model",
+    id: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+    adapter: "pi-model",
     model: "openai-codex/gpt-5.6-luna",
     thinkingLevel: "max",
   }), "openai-codex/gpt-5.6-luna (max)");

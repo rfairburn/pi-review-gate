@@ -281,13 +281,13 @@ test("a review window keeps its original reviewer selection after live config ch
   assert.equal(freezeReviewWindowConfig(state, config), frozen);
 });
 
-test("a review window materializes and freezes scoped little-coder reviewers", () => {
+test("a review window materializes and freezes scoped pi reviewers", () => {
   const state = createState();
   beginAgentRun(state);
   const config = normalizeConfig({
     enabled: true,
     review: {
-      activeReviewers: [{ source: "little-coder", model: "openai-codex/gpt-5.6-sol" }],
+      activeReviewers: [{ source: "pi", model: "openai-codex/gpt-5.6-sol" }],
     },
   });
 
@@ -295,7 +295,7 @@ test("a review window materializes and freezes scoped little-coder reviewers", (
 
   assert.equal(frozen.enabled, true);
   assert.equal(frozen.review, undefined);
-  assert.equal(frozen.reviewers?.[0]?.adapter, "little-coder-model");
+  assert.equal(frozen.reviewers?.[0]?.adapter, "pi-model");
   assert.equal(
     frozen.reviewers?.[0] && "model" in frozen.reviewers[0] ? frozen.reviewers[0].model : undefined,
     "openai-codex/gpt-5.6-sol",
@@ -310,7 +310,7 @@ test("historical review context shows internal model labels instead of encoded r
     enabled: true,
     review: {
       activeReviewers: [{
-        source: "little-coder",
+        source: "pi",
         model: "ollama/deepseek-v4-flash:0731-cloud",
         thinkingLevel: "high",
       }],

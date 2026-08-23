@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CodexExecutorAdapter } from "../src/execution/adapters/codex-cli";
-import { LittleCoderExecutorAdapter } from "../src/execution/adapters/little-coder";
+import { PiExecutorAdapter } from "../src/execution/adapters/pi-model";
 import type { ExecutorLiveControl } from "../src/execution/types";
 
-test("Little Coder executor uses acknowledged RPC steering and a durable session", async () => {
+test("Pi executor uses acknowledged RPC steering and a durable session", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-little-rpc-"));
   try {
     const artifactDir = join(root, "artifacts");
@@ -18,20 +18,20 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
     await writeFile(command, [
       "#!/usr/bin/env node",
       `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2)));`,
-      `fs.writeFileSync(${JSON.stringify(environmentCapture)},JSON.stringify({allowedTools:process.env.LITTLE_CODER_ALLOWED_TOOLS}));`,
+      `fs.writeFileSync(${JSON.stringify(environmentCapture)},JSON.stringify({}));`,
       "let input=''; process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));}",
       "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:true,pendingMessageCount:0}}));",
-      "else if(c.type==='steer'){console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'little complete'}]}}));console.log(JSON.stringify({type:'turn_end'}));console.log(JSON.stringify({type:'agent_settled'}));}",
-      "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:'little complete'}}));",
-      "else if(c.type==='abort'){console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));console.log(JSON.stringify({type:'agent_settled'}));}",
+      "else if(c.type==='steer'){console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'pi complete'}]}}));console.log(JSON.stringify({type:'turn_end'}));console.log(JSON.stringify({type:'agent_end'}));}",
+      "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:'pi complete'}}));",
+      "else if(c.type==='abort'){console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));console.log(JSON.stringify({type:'agent_end'}));}",
       "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);
     let resolveControl!: (control: ExecutorLiveControl) => void;
     const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
-    const adapter = new LittleCoderExecutorAdapter({
+    const adapter = new PiExecutorAdapter({
       model: "provider/model",
       thinkingLevel: "high",
       command,
@@ -49,12 +49,12 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
     assert.deepEqual(control.capabilities, { steer: true, interrupt: true });
     assert.equal((await control.steer("new direction", "steer-1")).status, "acknowledged");
     const result = await run;
-    assert.equal(result.text, "little complete");
-    assert.equal(result.session.adapter, "little-coder-model");
+    assert.equal(result.text, "pi complete");
+    assert.equal(result.session.adapter, "pi-model");
     const argv: string[] = JSON.parse(await readFile(capture, "utf8"));
     assert.equal(argv[argv.indexOf("--mode") + 1], "rpc");
     assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,SubtasksStart,SubtasksSteer");
-    assert.deepEqual(JSON.parse(await readFile(environmentCapture, "utf8")), { allowedTools: "read,bash,SubtasksStart,SubtasksSteer" });
+    assert.deepEqual(JSON.parse(await readFile(environmentCapture, "utf8")), {});
     assert.equal(argv.includes("--print"), false);
 
     let resolveInterruptControl!: (control: ExecutorLiveControl) => void;
@@ -76,7 +76,7 @@ test("Little Coder executor uses acknowledged RPC steering and a durable session
   }
 });
 
-test("Little Coder stays alive for ShellStart work and accepts steering while its agent is idle", async () => {
+test("Pi stays alive for ShellStart work and accepts steering while its agent is idle", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-little-background-"));
   try {
     const artifactDir = join(root, "artifacts");
@@ -88,19 +88,19 @@ test("Little Coder stays alive for ShellStart work and accepts steering while it
       "const fs=require('node:fs');const {spawn}=require('node:child_process');let input='';let bg;let prompts=0;process.stdin.setEncoding('utf8');",
       `const capture=${JSON.stringify(capture)};`,
       "const out=(v)=>console.log(JSON.stringify(v));",
-      "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});out({type:'agent_settled'});};",
+      "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});out({type:'agent_end'});};",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){prompts++;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});if(prompts===1){bg=spawn(process.execPath,['-e','setTimeout(()=>{},5000)'],{detached:true,stdio:'ignore'});bg.unref();out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started \"long test\" as job1 (pid '+bg.pid+').\\nWaking you on: exit.'}]},isError:false});settle('background started');}else{if(bg){try{process.kill(-bg.pid,'SIGTERM')}catch{}}settle(prompts===2?'steering applied':'final inspection complete');}}",
       "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'final inspection complete'}});",
-      "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});out({type:'agent_settled'});}",
+      "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});out({type:'agent_end'});}",
       "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);
     const updates: string[] = [];
     let resolveControl!: (control: ExecutorLiveControl) => void;
     const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
-    const adapter = new LittleCoderExecutorAdapter({
+    const adapter = new PiExecutorAdapter({
       model: "provider/model",
       command,
       timeoutMs: 2_000,

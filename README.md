@@ -38,10 +38,6 @@ Disable the gate:
 PI_REVIEW_GATE_DISABLED=1
 ```
 
-The older `LITTLE_CODER_REVIEW_CONFIG` and
-`LITTLE_CODER_REVIEW_GATE_DISABLED` names are still accepted as compatibility
-aliases.
-
 Example config using Codex as the reviewer:
 
 ```json
@@ -77,7 +73,7 @@ Results from every reviewer are transmitted, including passing assessments,
 non-blocking observations, guidance, disagreements, and reviewer errors.
 Blocking findings are identified as required corrections; passing and
 non-blocking material remains visible without becoming mandatory work. The built-in Codex, Claude,
-and little-coder model adapters run
+and Pi model adapters run
 as read-only agentic reviewers so they can inspect the workspace and retained
 review bundle before deciding. Generic CLI reviewers remain prompt-only unless
 the configured command provides its own safe read-only behavior.
@@ -133,7 +129,7 @@ The older single `decider` field is still supported for compatibility.
 
 `/review-settings` opens one staged settings transaction with eleven sections:
 
-- **Worker resources** defines Pi-scoped little-coder models and
+- **Worker resources** defines Pi-scoped models and
   execution-capable entries from `externalAgents`, each with one physical
   maximum concurrency shared by every background-task kind.
 - **Execution priority** and **Research priority** are independently ordered
@@ -206,7 +202,7 @@ the background up to the configured global and per-model capacities. Each task o
 worktree, session, checkpoint, review, and landing outcome; there is no
 wave-wide shared base or all-workers integration barrier. Research tasks skip
 review and landing, validate that their private worktree stayed unchanged, and
-finish as `reported` with a durable report path. Little Coder enforces the
+finish as `reported` with a durable report path. Pi enforces the
 read-only tool intersection; Codex and Claude are initially best-effort inside
 the disposable private worktree, with any writes quarantined. Generic binary
 adapters are ineligible for research until their protocol can acknowledge the
@@ -231,19 +227,14 @@ also reports wall time, summed task time, and peak concurrent workers.
 Internal `CAPTURING`, `ACCEPTED`, `WAITING_TO_LAND`, and `LANDING` progress
 remains durable and user-visible without starting model turns.
 
-`ShellStart` is treated as an executor-readiness boundary, not ordinary tool
-completion. Review-gate reads the returned detached process-group id and keeps
-the Little Coder RPC session and live task control open after `agent_settled`
-while that group remains alive. Steering an idle executor starts another turn
-in the same session. Once every tracked group exits, the executor receives a
-final workspace/result-inspection turn before review. The executor timeout is
-suspended while a verified group remains alive. At the top level, automatic
-review is similarly deferred and the orchestrator is triggered to inspect and
-finish the work when its tracked groups clear. Readiness is determined with a
-process-group liveness check rather than trusting a tool's “completed” label;
-an unparseable ShellStart success fails closed and visibly blocks automatic
-review. A process that deliberately creates a new session/process group can
-escape this best-effort boundary and is not claimed as covered.
+`ShellStart` remains a deliberate compatibility seam. At the top level,
+review-gate reads its returned detached process-group id, defers automatic
+review while the group is alive, and triggers the orchestrator to inspect and
+finish the work after it clears. Pi does not currently provide the executor
+integration needed to keep an idle RPC task alive across that boundary. A Pi
+executor that observes background work therefore fails explicitly instead of
+silently reviewing or exiting early. The retained red integration test is the
+specification for the missing native replacement.
 
 The same top-level review-readiness gate covers execution and research subtasks: automatic
 review of the primary orchestrator is deferred while any task is queued,
@@ -265,7 +256,7 @@ the task's authoritative state is `landed`.
 resume. No singular or snake_case compatibility tool is registered.
 
 Executor failures are checkpointed to a protected recovery ref before bounded
-retry. Compaction is a lifecycle transition: an interrupted Little Coder
+retry. Compaction is a lifecycle transition: an interrupted Pi
 session is reopened by exact UUID, explicitly compacted through Pi RPC, and
 only then prompted to continue. If same-executor recovery is exhausted, a
 verified checkpoint may be handed to the next lower-priority pool entry. That
@@ -313,7 +304,7 @@ from a review interrupted by restart are not reordered automatically: use
 `/review-now` to finish the review and release them, or `/review-clear` to cancel
 them.
 
-Codex CLI, Claude CLI, and Little Coder reviewers stream bounded native lifecycle
+Codex CLI, Claude CLI, and Pi reviewers stream bounded native lifecycle
 and read-only tool activity into ordinary review status and delegated-subtask
 activity views without exposing reasoning contents or reviewer output. Generic
 CLI reviewers expose start/finish status because their protocol has no structured
@@ -393,7 +384,7 @@ preserved for diagnosis. This is worktree and instruction isolation, not an OS
 sandbox: a hostile custom executor process can still access paths allowed by
 the host account.
 
-Pi/little-coder internal model selections use the exact canonical
+Pi internal model selections use the exact canonical
 `provider/model` value and store a role-owned `thinkingLevel`. The allowed
 levels come from that scoped model's runtime metadata, including its
 `thinkingLevelMap`; unsupported extended levels such as `max` are not offered.
@@ -408,21 +399,15 @@ and persists:
 
 ```json
 {
-  "source": "little-coder",
+  "source": "pi",
   "model": "openai-codex/gpt-5.6-sol",
   "thinkingLevel": "high"
 }
 ```
 
-For internal little-coder providers, review-gate also sets the independent
-thinking-budget cap to match Pi's level guidance: `minimal` is 1,024 tokens,
-`low` is 2,048, `medium` is 8,192, and `high` is 16,384. `xhigh` and `max` use
-the same 16,384-token ceiling because Pi does not define a larger numeric
-budget for those levels. The `anthropic`, `openai`, and `openai-codex`
-providers are excluded because Pi already gives them native token budgets or
-reasoning effort. A second output-side character estimate would duplicate that
-budget or cap a summary rather than the provider's hidden reasoning. Reviewer
-and executor selections remain separate from the orchestrator. External
+Pi and the selected provider own reasoning effort and token-budget behavior;
+review-gate does not impose a second output-side thinking cap. Reviewer and
+executor selections remain separate from the orchestrator. External
 harnesses continue to configure reasoning through their role-specific arguments
 or environment.
 
@@ -440,7 +425,7 @@ Reviewer selections use discriminated references:
 {
   "review": {
     "activeReviewers": [
-      { "source": "little-coder", "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high" },
+      { "source": "pi", "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high" },
       { "source": "external", "id": "codex-sol" }
     ]
   }
@@ -503,34 +488,19 @@ PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json \
 pi -e /path/to/pi-review-gate/dist/src/index.js
 ```
 
-For little-coder specifically, the same built extension can be loaded with:
-
-```bash
-PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json \
-little-coder -e /path/to/pi-review-gate/dist/src/index.js
-```
-
 For normal use with the first existing fallback config, use the persistent
 launcher:
 
 ```bash
-./scripts/little-coder-review-gate.sh
+./scripts/pi-review-gate.sh
 ```
 
-It builds and explicitly enables this extension, forwards all arguments to
-little-coder, sets the foreground model's `LITTLE_CODER_THINKING_BUDGET` to
-16,384 tokens, and applies a shared `LITTLE_CODER_ALLOWED_TOOLS` launch policy
-containing the tools used by this workflow except `ShellSession` and `dispatch`.
-Little Coder's tool gate therefore refuses both, and skill-inject omits their
-skill cards. First-class research subtasks replace foreground-blocking dispatch.
-The environment is inherited by Little Coder
-execution subtasks; Little Coder reviewers remain more restrictive through
-their existing read-only/no-skills launch. The same policy is used by the
-preset launcher and all named wrappers. Config resolution remains on the
-established fallback order:
-`~/.config/pi-review-gate/config.json`, `~/.config/pi/review-gate.json`, then
-`~/.config/little-coder/review-gate.json`. It fails clearly if none exists and
-does not generate or rewrite configuration.
+It builds the extension, selects the first existing config from
+`~/.config/pi-review-gate/config.json` or `~/.config/pi/review-gate.json`, and
+executes the installed `pi` with the extension and orchestrator prompt. All
+remaining arguments are forwarded unchanged. Pi remains independently
+installed and upgradeable; this project consumes its public extension and
+CLI/RPC surfaces rather than patching or bundling Pi.
 
 A Codex-oriented starter config is available at:
 
@@ -538,15 +508,14 @@ A Codex-oriented starter config is available at:
 examples/single-codex.json
 ```
 
-Claude and little-coder model examples are available at:
+Claude and Pi model examples are available at:
 
 ```bash
 examples/single-claude.json
-examples/single-little-coder-model.json
+examples/single-pi-model.json
 ```
 
-Multi-reviewer examples matching the double and triple wrapper scripts are
-available at:
+Multi-reviewer examples are available at:
 
 ```bash
 examples/double-review.json
@@ -558,50 +527,12 @@ The DeepSeek double is an alternative to the default Codex + GLM-5.2 pairing;
 it runs Codex and `ollama/deepseek-v4-flash:0731-cloud` as independent
 reviewers.
 
-The little-coder model adapter is generic. The example currently uses
-`ollama/glm-5.2`, matching a provider/model entry from
-`~/.config/little-coder/models.json`. Legacy internal selections without a
+The Pi model adapter is generic. The example currently uses `ollama/glm-5.2`.
+Legacy internal selections without a
 `thinkingLevel` continue to use `high`; saving them through `/review-settings`
 materializes an explicit model-supported level.
 
-For little-coder plus Codex review, use:
-
-```bash
-./scripts/little-coder-codex-review.sh
-```
-
-For the Codex + DeepSeek-V4-Flash double, use:
-
-```bash
-./scripts/little-coder-double-deepseek-v4-flash-review.sh
-```
-
-All named development wrappers delegate to one preset launcher. It can also be
-used directly with `codex`, `claude`, `glm-5.2`, `double`,
-`double-deepseek-v4-flash`, `triple`, or `fake`:
-
-```bash
-./scripts/little-coder-review.sh double
-```
-
-The development wrappers pass all ordinary arguments through to `little-coder`
-and set the foreground model's `LITTLE_CODER_THINKING_BUDGET` to 16,384 tokens.
-By default they retain review temp bundles on reviewer failure. To keep every
-review bundle, pass:
-
-```bash
-./scripts/little-coder-codex-review.sh --retain-review-bundles
-```
-
-The wrapper flag also accepts explicit modes:
-
-```bash
---retain-review-bundles=never
---retain-review-bundles=on-failure
---retain-review-bundles=always
-```
-
-Every built-in Codex, Claude, and little-coder review pass starts a fresh CLI
+Every built-in Codex, Claude, and Pi review pass starts a fresh CLI
 session. Correction context comes from the stable evidence bundle rather than
 accumulated model/tool history, avoiding reviewer compaction across passes.
 Correction reviewers begin with the original task evidence, latest correction
@@ -615,36 +546,13 @@ stating that a review would have run there but was canceled by the user, so pass
 order remains unambiguous. The next review keeps the same evidence bundle but
 starts fresh reviewer sessions.
 
-## Temporary fake reviewer
-
-For local wiring tests, use the fake reviewer wrapper:
-
-```bash
-./scripts/little-coder-fake-review.sh
-```
-
-By default it approves changed files. To force the retry/follow-up path:
-
-```bash
-PI_REVIEW_GATE_FAKE_VERDICT=retry ./scripts/little-coder-fake-review.sh
-```
-
-Optional retry message controls:
-
-```bash
-PI_REVIEW_GATE_FAKE_ISSUE="Controlled fake issue." \
-PI_REVIEW_GATE_FAKE_RECOMMENDATION="Make any tiny follow-up edit." \
-PI_REVIEW_GATE_FAKE_VERDICT=retry \
-./scripts/little-coder-fake-review.sh
-```
-
 Each review window uses one stable temporary evidence bundle. Every completed
 agent run is appended as a numbered exchange containing its snapshot-derived
 workspace diff, captured side-effect diff, tool calls and results, assistant
 summary, usage, and before/after artifacts. The bundle also maintains the
 cumulative baseline-to-current patch and numbered reviewer invocations.
 
-Codex, Claude, and little-coder reviewers receive a compact prompt pointing to
+Codex, Claude, and Pi reviewers receive a compact prompt pointing to
 the bundle's `REVIEW.md` entry point and inspect the evidence with read-only
 tools. The generic CLI adapter retains the inline prompt as a compatibility
 transport and also receives the bundle path in `PI_REVIEW_GATE_BUNDLE_DIR`.
@@ -751,7 +659,7 @@ aggregate result is persisted. Telemetry records prompt and stream bytes,
 tool-call and tool-result volume, wall time, token usage, compaction events, and
 whether session reuse occurred; it measures behavior without imposing a token
 budget. A canceled numbered invocation contains
-`CANCELED.md` and `canceled.json` rather than reviewer results. The little-coder
+`CANCELED.md` and `canceled.json` rather than reviewer results. The Pi
 model adapter stores the extracted final review in `raw-output.txt` and the
 capped JSONL stream separately as `raw-stream.jsonl`. When supported by the
 reviewer CLI, user-facing notices include a compact reviewer token summary, for

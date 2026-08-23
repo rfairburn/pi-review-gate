@@ -8,7 +8,7 @@
   "retainBundles": "on-failure",
   "decider": {
     "id": "glm-5.2",
-    "adapter": "little-coder-model",
+    "adapter": "pi-model",
     "model": "ollama/glm-5.2",
     "timeoutMs": 600000
   }

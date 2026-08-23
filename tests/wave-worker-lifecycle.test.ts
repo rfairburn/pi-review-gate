@@ -196,8 +196,8 @@ test("review progress prefers model names over unique reviewer ids", () => {
     model: "openai-codex/gpt-5.6-luna",
   }), "openai-codex/gpt-5.6-luna");
   assert.equal(reviewerProgressLabel({
-    id: "little-coder-openai-codex-gpt-5-6-luna",
-    adapter: "little-coder-model",
+    id: "pi-openai-codex-gpt-5-6-luna",
+    adapter: "pi-model",
     model: "openai-codex/gpt-5.6-luna",
     thinkingLevel: "high",
   }), "openai-codex/gpt-5.6-luna (high)");

@@ -147,7 +147,7 @@ test("parseClaudeUsage ignores zero usage on Claude error envelopes", () => {
   assert.equal(usage, undefined);
 });
 
-test("extractReviewTextFromPiJsonl reads assistant text and little-coder usage", () => {
+test("extractReviewTextFromPiJsonl reads assistant text and pi usage", () => {
   const output = [
     JSON.stringify({ type: "status", message: "running" }),
     JSON.stringify({

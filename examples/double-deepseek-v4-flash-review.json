@@ -14,7 +14,7 @@
     },
     {
       "id": "deepseek-v4-flash",
-      "adapter": "little-coder-model",
+      "adapter": "pi-model",
       "model": "ollama/deepseek-v4-flash:0731-cloud",
       "timeoutMs": 600000
     }

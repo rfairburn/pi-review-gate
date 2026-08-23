@@ -461,11 +461,23 @@ function paginationLinks(document: Document, base: string): WebPaginationLink[] 
 
 function dynamicReasons(document: Document, html: string): string[] {
   const reasons: string[] = [];
-  const bodyText = cleanText(document.body?.textContent ?? "");
-  const scripts = document.querySelectorAll("script").length;
+  const visibleBody = document.body?.cloneNode(true) as HTMLElement | undefined;
+  for (const element of [...visibleBody?.querySelectorAll("script,style,noscript,template") ?? []]) element.remove();
+  const bodyText = cleanText(visibleBody?.textContent ?? "");
+  const scriptElements = [...document.querySelectorAll("script")];
+  const scripts = scriptElements.length;
+  const inlineScript = scriptElements
+    .filter((script) => !script.getAttribute("src"))
+    .map((script) => script.textContent ?? "")
+    .join("\n");
   if (bodyText.length < 300 && scripts >= 5) reasons.push("very little server-rendered text relative to script count");
   if (/__NEXT_DATA__|__NUXT__|data-reactroot|ng-version|id=["'](?:root|app)["']/i.test(html) && bodyText.length < 1_000) {
     reasons.push("framework shell detected with limited rendered content");
+  }
+  if (/\bdocument\s*\.\s*write(?:ln)?\s*\(/i.test(inlineScript)) {
+    reasons.push("inline script constructs visible page content with document.write");
+  } else if (bodyText.length < 1_000 && /(?:\.\s*(?:innerHTML|outerHTML)\s*(?:\+?=)|\.\s*insertAdjacentHTML\s*\()/i.test(inlineScript)) {
+    reasons.push("inline script mutates HTML while server-rendered content is limited");
   }
   if (/enable javascript|javascript is required|please turn on javascript/i.test(bodyText)) reasons.push("page explicitly requires JavaScript");
   return reasons;

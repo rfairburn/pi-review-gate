@@ -113,7 +113,9 @@ duplicated or inconvenient.
 `BrowserExtract` is the phase-one rendered-page fallback. Use it only after
 `WebFetch` reports `dynamic_content_suspected` or plausibly fails because the
 result requires JavaScript rendering, asynchronous page population,
-browser-managed cookies/bootstrap, or browser-style delivery. It launches an
+browser-managed cookies/bootstrap, or browser-style delivery. Missing expected
+primary content is also sufficient reason to try it: a false suspicion flag
+means no static heuristic fired, not that the page is proven complete. It launches an
 isolated headless Playwright Chromium process for an uncached URL, captures the
 rendered HTML, closes Chromium, and exposes the same `find`, `index`,
 `nextIndex`, table inventory, and `columns` operations as `WebFetch`. It does

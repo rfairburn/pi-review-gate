@@ -70,6 +70,34 @@ test("dynamic-content suspicion is explicit for script-heavy empty application s
   assert.ok(page.dynamicContentReasons.length > 0);
 });
 
+test("dynamic-content suspicion detects inline DOM construction without counting script data as visible text", () => {
+  const page = extractWebPage(`
+    <html><body>
+      <h1>Quotes</h1><a href="/login">Login</a>
+      <script src="/jquery.js"></script>
+      <script>
+        const data = [{ text: "The primary quote is embedded here but not server-rendered." }];
+        for (const item of data) document.write("<div class='quote'>" + item.text + "</div>");
+      </script>
+      <a href="/page/2">Next</a>
+    </body></html>
+  `, "https://example.com/js/");
+  assert.equal(page.dynamicContentSuspected, true);
+  assert.deepEqual(page.dynamicContentReasons, ["inline script constructs visible page content with document.write"]);
+});
+
+test("embedded script data alone does not imply missing rendered content", () => {
+  const page = extractWebPage(`
+    <html><body>
+      <main><h1>Complete article</h1><p>${"Server-rendered article text. ".repeat(50)}</p></main>
+      <script type="application/ld+json">{"headline":"Complete article"}</script>
+      <script>window.analyticsConfig = { enabled: true };</script>
+    </body></html>
+  `, "https://example.com/article");
+  assert.equal(page.dynamicContentSuspected, false);
+  assert.deepEqual(page.dynamicContentReasons, []);
+});
+
 test("image payloads are excluded while nearby captions and prose remain searchable", () => {
   const page = extractWebPage(
     `<html><body><main><h1>Atlas</h1><figure><img alt="Phoenix map marker" src="marker.svg"><figcaption>Map of major cities</figcaption></figure><p>Phoenix population details are tabulated below.</p></main></body></html>`,
@@ -232,7 +260,7 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   const firstText = first.content[0].text as string;
   assert.match(firstText, /Tables discovered across the full page/);
   assert.match(firstText, /Population table/);
-  assert.match(firstText, /dynamic_content_suspected: false/);
+  assert.match(firstText, /dynamic_content_suspected: false — no static heuristic detected; this does not prove the page is complete/);
   assert.match(firstText, /Cache scope: current session\./);
   const tableIndex = (first.details.response.tables[0].index) as number;
   const second = await tools.get("WebFetch").execute("two", { url: "https://example.com/cities", index: tableIndex });

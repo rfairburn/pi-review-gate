@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { reviewerEnv, terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
@@ -97,10 +97,16 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     let protocolFailure: string | undefined;
     let finalText = "";
     const timeoutMs = this.options.timeoutMs ?? 1_800_000;
+    let timeoutDeadline = Date.now() + timeoutMs;
     const timer = setInterval(() => {
+      if (backgroundReadiness.snapshot().running.length > 0) {
+        timeoutDeadline = Date.now() + timeoutMs;
+        return;
+      }
+      if (Date.now() < timeoutDeadline) return;
       timedOut = true;
       rpc.terminate();
-    }, timeoutMs);
+    }, Math.min(250, Math.max(25, Math.floor(timeoutMs / 4))));
     timer.unref?.();
     const onAbort = () => {
       aborted = true;
@@ -126,7 +132,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
             await rpc.request("prompt", { message: instruction }, instructionId);
             return {
               status: "acknowledged",
-              message: "Pi RPC accepted steering as a new prompt after the executor became idle.",
+              message: "Pi RPC resumed the idle executor with the steering instruction while background work remained active.",
             };
           } catch (error) {
             return { status: "failed", message: messageOf(error) };
@@ -138,7 +144,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
             const state = await rpc.request("get_state", {});
             if (!rpcState(state).isStreaming) {
               rpc.terminate();
-              return { status: "acknowledged", message: "Pi RPC interruption terminated the idle executor." };
+              return { status: "acknowledged", message: "Pi RPC interruption terminated the idle executor and its background processes." };
             }
             const beforeInterrupt = rpc.settledGeneration;
             await rpc.request("abort", {});
@@ -150,11 +156,30 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         },
       });
       await rpc.waitForSettled(settledGeneration);
-      const background = backgroundReadiness.snapshot();
-      if (background.running.length > 0 || background.unverifiable.length > 0) {
-        throw new Error(
-          "Pi-native executor background-shell continuation is not implemented; ShellStart work cannot yet cross executor settlement safely.",
+      for (;;) {
+        const background = backgroundReadiness.snapshot();
+        if (background.unverifiable.length > 0) {
+          throw new Error(
+            `ShellStart reported background work whose process group could not be verified: ${background.unverifiable.join("; ")}`,
+          );
+        }
+        if (background.running.length === 0) break;
+        request.onUpdate?.(
+          `executor waiting for ${background.running.length} background process group(s): ${background.running.map((job) => `${job.id} (${job.label})`).join(", ")}`,
         );
+        await waitForBackgroundProcesses(backgroundReadiness, request.signal);
+        if (request.signal?.aborted || timedOut || interruptedByControl) break;
+
+        settledGeneration = rpc.settledGeneration;
+        const state = rpcState(await rpc.request("get_state", {}));
+        if (state.isStreaming || state.pendingMessageCount > 0) {
+          request.onUpdate?.("background process completed; waiting for the executor's automatic completion turn");
+          await rpc.waitForSettled(settledGeneration);
+        } else {
+          request.onUpdate?.("background process completed; resuming executor for final inspection before review");
+          await rpc.request("prompt", { message: backgroundCompletionPrompt });
+          await rpc.waitForSettled(settledGeneration);
+        }
       }
       const response = await rpc.request("get_last_assistant_text", {});
       finalText = isRecord(response.data) && typeof response.data.text === "string" ? response.data.text : "";
@@ -469,6 +494,22 @@ const recoveryCompactionInstructions = [
   "This session will be resumed automatically after compaction.",
 ].join(" ");
 
+const backgroundCompletionPrompt = [
+  "All ShellStart background process groups are now finished.",
+  "Inspect their results and the workspace, address any failure, and finish the original task.",
+  "Do not claim success from process exit alone; verify the requested outcome before responding.",
+].join(" ");
+
+async function waitForBackgroundProcesses(
+  readiness: BackgroundProcessReadiness,
+  signal?: AbortSignal,
+): Promise<void> {
+  while (readiness.snapshot().running.length > 0) {
+    if (signal?.aborted) throw abortError(signal);
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+}
+
 function rpcState(response: Record<string, unknown>): { isStreaming: boolean; pendingMessageCount: number } {
   const data = isRecord(response.data) ? response.data : {};
   return {
@@ -504,10 +545,14 @@ function normalizeAllowedTools(tools: readonly string[] | undefined): string[] |
 function childArgs(args: readonly string[], allowedTools: readonly string[] | undefined): string[] {
   return [
     ...args,
+    "--extension", resolve(__dirname, "../../index.js"),
     ...(allowedTools ? ["--tools", allowedTools.join(",")] : []),
   ];
 }
 
 function executorEnv(): NodeJS.ProcessEnv {
-  return reviewerEnv(process.env);
+  return {
+    ...reviewerEnv(process.env),
+    PI_REVIEW_GATE_RUNTIME_ROLE: "executor",
+  };
 }

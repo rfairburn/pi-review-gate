@@ -1020,6 +1020,7 @@ test("lifecycle: reviewer receives task acceptance criteria in evidence", async 
             "&& s.includes('worker-output.txt exists with content')",
             "&& s.includes('Task instructions:')",
             "&& s.includes('Create worker-output.txt')",
+            "&& s.includes('Implemented the change.')",
             "&& s.includes('Workspace snapshot disclosure:')",
             "&& s.includes('Git-ignored files are not present');",
             "process.stdout.write(JSON.stringify(ok",
@@ -1043,6 +1044,69 @@ test("lifecycle: reviewer receives task acceptance criteria in evidence", async 
     });
 
     assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: an executor completion report resolves review without a tree change", async () => {
+  const root = await mkTmp("pi-wwl-response-evidence-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-response-evidence");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-response-evidence");
+    await mkdir(artifactDir, { recursive: true });
+
+    const completionMarker = "EXECUTOR-COMPLETION-REPORT-7A91";
+    const executor = join(root, "response-evidence-executor.cjs");
+    await writeFile(executor, [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const resumed = process.env.PI_REVIEW_EXECUTOR_OPERATION === 'resume';",
+      "fs.writeFileSync(path.join(process.cwd(), 'worker-output.txt'), 'worker done\\n');",
+      "console.log(JSON.stringify({ type: 'session', sessionId: process.env.PI_REVIEW_EXECUTOR_SESSION_ID || 'response-evidence-session' }));",
+      `console.log(JSON.stringify({ type: 'assistant', text: resumed ? ${JSON.stringify(completionMarker)} : 'Initial implementation complete.' }));`,
+    ].join("\n"), "utf8");
+    await chmod(executor, 0o755);
+
+    const reviewerScript = [
+      "process.stdin.resume();",
+      "let s='';",
+      "process.stdin.on('data',c=>s+=c);",
+      "process.stdin.on('end',()=>{",
+      `const complete=s.includes(${JSON.stringify(completionMarker)});`,
+      "process.stdout.write(JSON.stringify(complete",
+      "?{verdict:'pass',summary:'completion report is present',findings:[]}",
+      ":{verdict:'needs_changes',summary:'completion report missing',guidance:'Report completion.',findings:[{severity:'blocking',file:'session',line:null,issue:'completion report missing',recommendation:'Report completion.'}]}));",
+      "});",
+    ].join("");
+    const config: ReviewGateConfig = {
+      ...buildConfig(executor),
+      enabled: true,
+      maxCorrectionCycles: 2,
+      decider: {
+        id: "response-evidence-checker",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: ["-e", reviewerScript],
+        timeoutMs: 15_000,
+      },
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-response-evidence",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
+    assert.deepEqual(result.reviewCycles.map((cycle) => cycle.verdict), ["needs_changes", "pass"]);
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {

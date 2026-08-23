@@ -211,10 +211,14 @@ export function buildEvidenceBundle(
 
 export function rememberFinalAssistantSummary(state: EvidenceState, args: unknown[]): void {
   const summary = extractFinalAssistantText(args);
-  if (summary) {
-    const truncated = truncate(redactSensitiveText(summary), 4000);
-    state.finalAssistantSummaries.push(truncated);
-  }
+  rememberFinalAssistantSummaryText(state, summary);
+}
+
+/** Record a final response already extracted by an executor adapter. */
+export function rememberFinalAssistantSummaryText(state: EvidenceState, summary: string): void {
+  const normalized = summary.trim();
+  if (!normalized) return;
+  state.finalAssistantSummaries.push(truncate(redactSensitiveText(normalized), 4000));
 }
 
 export function extractCandidatePaths(

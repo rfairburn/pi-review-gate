@@ -45,7 +45,11 @@ import {
   type ExactChangeInput,
   type ReviewRunOutput,
 } from "../review";
-import { createEvidenceState, type EvidenceState } from "../evidence";
+import {
+  createEvidenceState,
+  rememberFinalAssistantSummaryText,
+  type EvidenceState,
+} from "../evidence";
 import type { ReviewWindow } from "../state";
 import {
   createState,
@@ -697,6 +701,13 @@ export async function runWaveWorkerLifecycle(
     return result;
   }
 
+  // Executor final responses are authoritative session evidence. Adapters
+  // persist them as artifacts, but reviewers cannot inspect runtime artifacts;
+  // copy the bounded, redacted text into the worker-local review evidence.
+  const { state: reviewState, window } = createWorkerReviewState();
+  setReviewWindowBaseline(reviewState, baseSnapshot);
+  rememberFinalAssistantSummaryText(window.evidence, initialResult.summary);
+
   // A transport that could not steer the live command leaves the instruction
   // in the controller's durable queue. Before accepting or reviewing that
   // candidate, claim those instructions and resume the same executor session.
@@ -794,6 +805,7 @@ export async function runWaveWorkerLifecycle(
       await writeResult(resolvedArtifactDir, result);
       return result;
     }
+    rememberFinalAssistantSummaryText(window.evidence, steeredResult.summary);
     initialResult = steeredResult;
     candidate = steeredResult.candidate!;
   }
@@ -816,9 +828,6 @@ export async function runWaveWorkerLifecycle(
   }
 
   // ── 5. Review loop ──
-  const { state: reviewState, window } = createWorkerReviewState();
-  // Set the baseline snapshot for the review window.
-  setReviewWindowBaseline(reviewState, baseSnapshot);
   const reviewCycles: ReviewCycle[] = [];
   // Give reviewers the same isolated task definition that the executor sees.
   // In particular, absolute source-workspace paths (including lexical aliases)
@@ -1058,6 +1067,7 @@ export async function runWaveWorkerLifecycle(
         await writeResult(resolvedArtifactDir, result);
         return result;
       }
+      rememberFinalAssistantSummaryText(window.evidence, steeredResult.summary);
       currentResult = steeredResult;
       currentCandidate = steeredResult.candidate!;
       lastCandidateTreeSha = undefined;
@@ -1310,6 +1320,7 @@ export async function runWaveWorkerLifecycle(
       }
 
       // Normalize the replacement candidate and continue review loop.
+      rememberFinalAssistantSummaryText(window.evidence, correctionResult.summary);
       currentResult = correctionResult;
       currentCandidate = correctionResult.candidate!;
       continue;
@@ -1460,6 +1471,7 @@ export async function runWaveWorkerLifecycle(
       return result;
     }
 
+    rememberFinalAssistantSummaryText(window.evidence, confirmResult.summary);
     const confirmCandidate = confirmResult.candidate!;
 
     // If the confirmation tree is unchanged from the passed candidate tree, accept.

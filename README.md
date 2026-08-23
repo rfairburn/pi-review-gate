@@ -97,7 +97,7 @@ capture truncation.
 
 ### Native web research
 
-`WebSearch` performs normalized DuckDuckGo HTML search without an API key.
+`WebSearch` performs normalized DuckDuckGo HTML search without an API key. It canonicalizes duplicate URLs, reports optional provider-supplied dates and weak snippets without inventing missing data, supports `excludeDomains`, and returns an opaque cursor for continuation with the same query and filters.
 `WebFetch` downloads and indexes the complete selected page, but returns only a
 bounded structural range. Its result includes `nextIndex` when more blocks
 remain, a whole-page table inventory with directly readable indexes, possible

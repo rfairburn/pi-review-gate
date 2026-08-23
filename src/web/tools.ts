@@ -61,19 +61,24 @@ export class WebToolManager {
         query: stringSchema("Focused web search query."),
         maxResults: integerSchema(`Maximum results, 1-${this.webConfig.search.maxResults}.`),
         domain: stringSchema("Optional domain to constrain with a site: filter."),
+        excludeDomains: stringArraySchema("Optional domains to exclude from the search."),
         region: stringSchema("Optional DuckDuckGo region such as us-en."),
         freshness: enumSchema(["day", "week", "month", "year"], "Optional freshness window."),
+        cursor: stringSchema("Opaque continuation cursor from a previous WebSearch response. Repeat the same query and filters."),
       }, ["query"]),
       execute: async (_id, params, signal) => {
         try {
           const query = requiredString(params.query, "query");
           const maxResults = boundedInteger(params.maxResults, 1, this.webConfig.search.maxResults, this.webConfig.search.maxResults, "maxResults");
+          const excludeDomains = optionalStringArray(params.excludeDomains, "excludeDomains");
           const response = await searchDuckDuckGo({
             query,
             maxResults,
             ...(optionalString(params.domain) ? { domain: optionalString(params.domain) } : {}),
+            ...(excludeDomains ? { excludeDomains } : {}),
             ...(optionalString(params.region) ? { region: optionalString(params.region) } : {}),
             ...(freshness(params.freshness) ? { freshness: freshness(params.freshness) } : {}),
+            ...(optionalString(params.cursor) ? { cursor: optionalString(params.cursor) } : {}),
             options: {
               timeoutMs: this.webConfig.search.timeoutMs,
               maxBytes: 2 * 1024 * 1024,
@@ -142,9 +147,14 @@ function formatSearch(response: SearchResponse): string {
     `Web search via ${response.provider}: ${response.query}`,
     `Returned ${response.results.length} result(s) in ${response.durationMs}ms.`,
   ];
+  if (response.excludedDomains?.length) lines.push(`Excluded domains: ${response.excludedDomains.join(", ")}`);
   for (const result of response.results) {
-    lines.push("", `${result.rank}. ${result.title}`, result.url, result.snippet);
+    const metadata = [result.hostname];
+    if (result.dateText) metadata.push(`provider date: ${result.dateText}`);
+    if (result.snippetQuality === "weak") metadata.push("snippet quality: weak");
+    lines.push("", `${result.rank}. ${result.title}`, result.url, metadata.join(" · "), result.snippet || "[No snippet supplied.]");
   }
+  if (response.nextCursor !== undefined) lines.push("", `Continue with the same WebSearch query and cursor ${response.nextCursor}.`);
   return lines.join("\n").trim();
 }
 

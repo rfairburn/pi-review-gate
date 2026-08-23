@@ -7,6 +7,8 @@ export interface NetworkOptions {
   maxBytes: number;
   userAgent: string;
   signal?: AbortSignal;
+  method?: "GET" | "POST";
+  body?: string;
 }
 
 export interface DownloadedText {
@@ -22,13 +24,18 @@ export interface SearchResult {
   rank: number;
   title: string;
   url: string;
+  hostname: string;
   snippet: string;
-  publishedAt?: string;
+  snippetQuality?: "weak";
+  dateText?: string;
+  dateSource?: "provider";
 }
 
 export interface SearchResponse {
   provider: "duckduckgo";
   query: string;
+  nextCursor?: string;
+  excludedDomains?: string[];
   results: SearchResult[];
   fetchedAt: string;
   durationMs: number;
@@ -43,16 +50,21 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
   options.signal?.addEventListener("abort", onAbort, { once: true });
   try {
     let current = requested;
+    let method = options.method ?? "GET";
+    let body = options.body;
     for (let redirects = 0; redirects <= 5; redirects += 1) {
       let response: Response;
       try {
         response = await fetch(current, {
           redirect: "manual",
           signal: controller.signal,
+          method,
+          ...(method === "POST" && body !== undefined ? { body } : {}),
           headers: {
             "user-agent": options.userAgent,
             accept: "text/html,application/xhtml+xml,text/plain,application/json;q=0.8,*/*;q=0.2",
             "accept-language": "en-US,en;q=0.8",
+            ...(method === "POST" ? { "content-type": "application/x-www-form-urlencoded" } : {}),
           },
         });
       } catch (error) {
@@ -63,6 +75,10 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
         if (!location) throw new Error(`HTTP ${response.status} redirect omitted Location.`);
         if (redirects === 5) throw new Error("Redirect limit exceeded.");
         current = await validatedPublicUrl(new URL(location, current).href);
+        if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === "POST")) {
+          method = "GET";
+          body = undefined;
+        }
         continue;
       }
       if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
@@ -93,34 +109,120 @@ export async function searchDuckDuckGo(input: {
   region?: string;
   freshness?: "day" | "week" | "month" | "year";
   domain?: string;
+  excludeDomains?: string[];
+  cursor?: string;
   options: NetworkOptions;
+  download?: typeof downloadText;
 }): Promise<SearchResponse> {
   const startedAt = Date.now();
-  const query = `${input.query.trim()}${input.domain ? ` site:${input.domain.trim()}` : ""}`;
-  if (!query) throw new Error("Search query cannot be empty.");
+  const requestedQuery = input.query.trim();
+  if (!requestedQuery) throw new Error("Search query cannot be empty.");
+  const domain = input.domain ? normalizeSearchDomain(input.domain) : undefined;
+  const excludedDomains = [...new Set((input.excludeDomains ?? []).map(normalizeSearchDomain))];
+  if (domain && excludedDomains.includes(domain)) throw new Error(`Search domain ${domain} cannot also be excluded.`);
+  const query = [requestedQuery, domain ? `site:${domain}` : "", ...excludedDomains.map((value) => `-site:${value}`)]
+    .filter(Boolean)
+    .join(" ");
+  const identity = JSON.stringify({ query, region: input.region?.trim() ?? "", freshness: input.freshness ?? "" });
+  const initialParameters = new URLSearchParams({ q: query });
+  if (input.region) initialParameters.set("kl", input.region);
+  if (input.freshness) initialParameters.set("df", freshnessCode(input.freshness));
+  const request = input.cursor
+    ? decodeSearchCursor(input.cursor, query, identity)
+    : { method: "GET" as const, parameters: Object.fromEntries(initialParameters), start: 0, rankOffset: 0, identity };
   const target = new URL("https://html.duckduckgo.com/html/");
-  target.searchParams.set("q", query);
-  if (input.region) target.searchParams.set("kl", input.region);
-  if (input.freshness) target.searchParams.set("df", freshnessCode(input.freshness));
-  const downloaded = await downloadText(target.href, {
+  const requestParameters = new URLSearchParams(request.parameters);
+  if (request.method === "GET") target.search = requestParameters.toString();
+  const downloaded = await (input.download ?? downloadText)(target.href, {
     ...input.options,
     maxBytes: Math.min(input.options.maxBytes, 2 * 1024 * 1024),
+    method: request.method,
+    ...(request.method === "POST" ? { body: requestParameters.toString() } : {}),
   });
-  const results = parseDuckDuckGoResults(downloaded.text, input.maxResults);
-  if (results.length === 0) {
+  const pageResults = parseDuckDuckGoResults(downloaded.text, 100);
+  const results = pageResults.slice(request.start, request.start + input.maxResults).map((result, index) => ({
+    ...result,
+    rank: request.rankOffset + request.start + index + 1,
+  }));
+  if (pageResults.length === 0) {
     const { document } = parseHTML(downloaded.text);
     const body = cleanText(document.body?.textContent ?? "");
     if (/captcha|automated|unusual traffic|challenge/i.test(body)) {
       throw new Error("DuckDuckGo rejected the request with an automated-traffic challenge.");
     }
   }
+  const nextStart = request.start + results.length;
+  const continuation = nextStart < pageResults.length
+    ? { ...request, start: nextStart }
+    : parseDuckDuckGoContinuation(downloaded.text, query, request.rankOffset + pageResults.length, identity);
   return {
     provider: "duckduckgo",
-    query: input.query.trim(),
+    query: requestedQuery,
+    ...(continuation ? { nextCursor: encodeSearchCursor(continuation) } : {}),
+    ...(excludedDomains.length > 0 ? { excludedDomains } : {}),
     results,
     fetchedAt: downloaded.fetchedAt,
     durationMs: Date.now() - startedAt,
   };
+}
+
+interface SearchCursor {
+  method: "GET" | "POST";
+  parameters: Record<string, string>;
+  start: number;
+  rankOffset: number;
+  identity: string;
+}
+
+export function parseDuckDuckGoContinuation(html: string, query: string, rankOffset: number, identity: string): SearchCursor | undefined {
+  const { document } = parseHTML(html);
+  for (const form of [...document.querySelectorAll("form")]) {
+    const submit = form.querySelector('input[type="submit"]') as HTMLInputElement | null;
+    if (!/^next$/i.test(cleanText(submit?.getAttribute("value") ?? ""))) continue;
+    const parameters: Record<string, string> = {};
+    for (const input of [...form.querySelectorAll('input[type="hidden"], input:not([type])')]) {
+      const name = input.getAttribute("name");
+      if (name) parameters[name] = input.getAttribute("value") ?? "";
+    }
+    if (parameters.q && parameters.q !== query) continue;
+    parameters.q = query;
+    return { method: "POST", parameters, start: 0, rankOffset, identity };
+  }
+  return undefined;
+}
+
+function encodeSearchCursor(value: SearchCursor): string {
+  return Buffer.from(JSON.stringify({ v: 1, ...value }), "utf8").toString("base64url");
+}
+
+function decodeSearchCursor(value: string, query: string, identity: string): SearchCursor {
+  if (value.length > 12_000) throw new Error("Search cursor is too large.");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Search cursor is invalid.");
+  }
+  if (!isCursorRecord(parsed) || parsed.v !== 1 || (parsed.method !== "GET" && parsed.method !== "POST")) {
+    throw new Error("Search cursor is invalid.");
+  }
+  const start = parsed.start;
+  const rankOffset = parsed.rankOffset;
+  if (typeof start !== "number" || !Number.isInteger(start) || start < 0 || start > 100 || typeof rankOffset !== "number" || !Number.isInteger(rankOffset) || rankOffset < 0 || rankOffset > 10_000) {
+    throw new Error("Search cursor is invalid.");
+  }
+  if (!isCursorRecord(parsed.parameters) || Object.keys(parsed.parameters).length > 32) throw new Error("Search cursor is invalid.");
+  const parameters: Record<string, string> = {};
+  for (const [name, field] of Object.entries(parsed.parameters)) {
+    if (typeof field !== "string" || name.length > 80 || field.length > 4_000) throw new Error("Search cursor is invalid.");
+    parameters[name] = field;
+  }
+  if (parsed.identity !== identity || parameters.q !== query) throw new Error("Search cursor does not match this query or its filters.");
+  return { method: parsed.method, parameters, start, rankOffset, identity };
+}
+
+function isCursorRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function parseDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
@@ -131,17 +233,36 @@ export function parseDuckDuckGoResults(html: string, maxResults: number): Search
     const link = result.querySelector("a.result__a") as HTMLAnchorElement | null;
     if (!link) continue;
     const url = unwrapDuckDuckGoUrl(link.getAttribute("href") ?? "");
-    if (!url || seen.has(url)) continue;
-    seen.add(url);
+    if (!url) continue;
+    const canonical = canonicalSearchUrl(url);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    const snippet = cleanText(result.querySelector(".result__snippet")?.textContent ?? "");
+    const dateText = providerDateText(result, snippet);
     results.push({
       rank: results.length + 1,
       title: cleanText(link.textContent ?? ""),
       url,
-      snippet: cleanText(result.querySelector(".result__snippet")?.textContent ?? ""),
+      hostname: new URL(url).hostname,
+      snippet,
+      ...(isWeakSnippet(snippet) ? { snippetQuality: "weak" as const } : {}),
+      ...(dateText ? { dateText, dateSource: "provider" as const } : {}),
     });
     if (results.length >= maxResults) break;
   }
   return results;
+}
+
+export function canonicalSearchUrl(value: string): string {
+  const url = new URL(value);
+  const hostname = url.hostname.toLowerCase().replace(/^www\./, "");
+  const pathname = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
+  for (const name of [...url.searchParams.keys()]) {
+    if (isTrackingParameter(name)) url.searchParams.delete(name);
+  }
+  url.searchParams.sort();
+  const search = url.searchParams.toString();
+  return `${hostname}${url.port ? `:${url.port}` : ""}${pathname}${search ? `?${search}` : ""}`;
 }
 
 async function readBoundedBody(response: Response, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
@@ -218,10 +339,44 @@ function unwrapDuckDuckGoUrl(value: string): string | undefined {
     const target = redirected ? new URL(redirected) : url;
     if (target.protocol !== "http:" && target.protocol !== "https:") return undefined;
     target.hash = "";
+    for (const name of [...target.searchParams.keys()]) {
+      if (isTrackingParameter(name)) target.searchParams.delete(name);
+    }
+    target.searchParams.sort();
     return target.href;
   } catch {
     return undefined;
   }
+}
+
+function providerDateText(result: Element, snippet: string): string | undefined {
+  const dateElement = result.querySelector(".result__timestamp, .result__date, time");
+  const explicit = cleanText(dateElement?.getAttribute("datetime") ?? dateElement?.textContent ?? "");
+  if (explicit) return explicit;
+  const month = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
+  const prefix = new RegExp(`^(?:Updated\\s+|Published\\s+)?(${month}\\s+\\d{1,2},\\s+\\d{4}|\\d{1,2}\\s+${month}\\s+\\d{4}|\\d{4}-\\d{2}-\\d{2}|\\d+\\s+(?:hours?|days?|weeks?|months?|years?)\\s+ago)(?:\\s*[-–—·|]\\s*)?`, "i");
+  return snippet.match(prefix)?.[1];
+}
+
+function isWeakSnippet(value: string): boolean {
+  return value.length < 40;
+}
+
+function isTrackingParameter(name: string): boolean {
+  return /^(?:utm_.+|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|vero_id)$/i.test(name);
+}
+
+function normalizeSearchDomain(value: string): string {
+  const trimmed = value.trim().toLowerCase().replace(/^\.+/, "");
+  if (!trimmed || /[\s/:?#@]/.test(trimmed)) throw new Error(`Invalid search domain: ${value}`);
+  let hostname: string;
+  try {
+    hostname = new URL(`https://${trimmed}`).hostname;
+  } catch {
+    throw new Error(`Invalid search domain: ${value}`);
+  }
+  if (hostname !== trimmed || !hostname.includes(".")) throw new Error(`Invalid search domain: ${value}`);
+  return hostname;
 }
 
 function cleanText(value: string): string {

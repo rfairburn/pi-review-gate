@@ -3,7 +3,7 @@ import { access } from "node:fs/promises";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
 import { WebPageCache } from "../src/web/cache";
-import { parseDuckDuckGoResults } from "../src/web/network";
+import { canonicalSearchUrl, parseDuckDuckGoResults, searchDuckDuckGo, type DownloadedText, type NetworkOptions } from "../src/web/network";
 import { extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
 import { WebToolManager } from "../src/web/tools";
 
@@ -82,14 +82,85 @@ test("image payloads are excluded while nearby captions and prose remain searcha
 });
 
 test("DuckDuckGo provider parsing normalizes redirect URLs and deduplicates results", () => {
-  const html = `<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fcities">Cities</a><div class="result__snippet">Population data</div></div>
-  <div class="result"><a class="result__a" href="https://example.com/cities">Duplicate</a></div>`;
+  const html = `<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.example.com%2Fcities%2F%3Futm_source%3Dsearch%26b%3D2%26a%3D1">Cities</a><span class="result__timestamp">Aug 22, 2026</span><div class="result__snippet">Population data for the largest cities in the country.</div></div>
+  <div class="result"><a class="result__a" href="http://example.com/cities?a=1&amp;b=2#table">Duplicate</a></div>
+  <div class="result"><a class="result__a" href="https://example.org/short">Short</a><div class="result__snippet">with residents.</div></div>
+  <div class="result"><a class="result__a" href="https://dated.example/report">Dated</a><div class="result__snippet">Aug 21, 2026 — A complete provider excerpt with a date prefix and enough context to be useful.</div></div>`;
   assert.deepEqual(parseDuckDuckGoResults(html, 10), [{
     rank: 1,
     title: "Cities",
-    url: "https://example.com/cities",
-    snippet: "Population data",
+    url: "https://www.example.com/cities/?a=1&b=2",
+    hostname: "www.example.com",
+    snippet: "Population data for the largest cities in the country.",
+    dateText: "Aug 22, 2026",
+    dateSource: "provider",
+  }, {
+    rank: 2,
+    title: "Short",
+    url: "https://example.org/short",
+    hostname: "example.org",
+    snippet: "with residents.",
+    snippetQuality: "weak",
+  }, {
+    rank: 3,
+    title: "Dated",
+    url: "https://dated.example/report",
+    hostname: "dated.example",
+    snippet: "Aug 21, 2026 — A complete provider excerpt with a date prefix and enough context to be useful.",
+    dateText: "Aug 21, 2026",
+    dateSource: "provider",
   }]);
+  assert.equal(canonicalSearchUrl("https://www.example.com/cities/?b=2&utm_medium=x&a=1"), "example.com/cities?a=1&b=2");
+});
+
+test("WebSearch continues within a provider page, then follows its opaque next-page form", async () => {
+  const result = (url: string, title: string) => `<div class="result"><a class="result__a" href="${url}">${title}</a><div class="result__snippet">A sufficiently complete provider snippet describing ${title} for search testing.</div></div>`;
+  const firstPage = `${result("https://one.example/a", "One")}${result("https://two.example/b", "Two")}${result("https://three.example/c", "Three")}
+    <form action="/html/" method="post"><input type="submit" value="Next"><input type="hidden" name="q" value="cities -site:noise.example"><input type="hidden" name="s" value="30"><input type="hidden" name="vqd" value="opaque-provider-state"></form>`;
+  const secondPage = `${result("https://four.example/d", "Four")}${result("https://five.example/e", "Five")}`;
+  const calls: Array<{ url: string; options: NetworkOptions }> = [];
+  const download = async (url: string, options: NetworkOptions): Promise<DownloadedText> => {
+    calls.push({ url, options });
+    const text = options.method === "POST" ? secondPage : firstPage;
+    return { requestedUrl: url, finalUrl: url, contentType: "text/html", text, bytes: text.length, fetchedAt: "2026-08-23T00:00:00.000Z" };
+  };
+  const common = {
+    query: "cities",
+    maxResults: 2,
+    excludeDomains: ["noise.example", "NOISE.EXAMPLE"],
+    options: { timeoutMs: 1_000, maxBytes: 100_000, userAgent: "test" },
+    download,
+  };
+
+  const first = await searchDuckDuckGo(common);
+  assert.deepEqual(first.results.map((item) => [item.rank, item.title]), [[1, "One"], [2, "Two"]]);
+  assert.deepEqual(first.excludedDomains, ["noise.example"]);
+  assert.ok(first.nextCursor);
+  assert.match(calls[0]!.url, /q=cities\+-site%3Anoise\.example/);
+
+  const withinPage = await searchDuckDuckGo({ ...common, cursor: first.nextCursor });
+  assert.deepEqual(withinPage.results.map((item) => [item.rank, item.title]), [[3, "Three"]]);
+  assert.ok(withinPage.nextCursor);
+  assert.equal(calls[1]!.options.method, "GET");
+
+  const nextPage = await searchDuckDuckGo({ ...common, cursor: withinPage.nextCursor });
+  assert.deepEqual(nextPage.results.map((item) => [item.rank, item.title]), [[4, "Four"], [5, "Five"]]);
+  assert.equal(calls[2]!.options.method, "POST");
+  assert.match(calls[2]!.options.body ?? "", /vqd=opaque-provider-state/);
+  assert.equal(nextPage.nextCursor, undefined);
+
+  await assert.rejects(
+    searchDuckDuckGo({ ...common, query: "different", cursor: first.nextCursor }),
+    /cursor does not match/,
+  );
+  await assert.rejects(
+    searchDuckDuckGo({ ...common, freshness: "day", cursor: first.nextCursor }),
+    /cursor does not match/,
+  );
+  await assert.rejects(
+    searchDuckDuckGo({ ...common, domain: "noise.example" }),
+    /cannot also be excluded/,
+  );
 });
 
 test("WebFetch reuses its session cache, exposes table indexes, and removes the cache on shutdown", async () => {
@@ -115,6 +186,8 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   manager.register();
   assert.deepEqual([...tools.keys()], ["WebSearch", "WebFetch"]);
   assert.equal(tools.has("WebRead"), false);
+  assert.ok(tools.get("WebSearch").parameters.properties.excludeDomains);
+  assert.ok(tools.get("WebSearch").parameters.properties.cursor);
 
   const first = await tools.get("WebFetch").execute("one", { url: "https://example.com/cities", maxChars: 1_000 });
   const firstText = first.content[0].text as string;

@@ -12,8 +12,10 @@ interface CliRequest {
   maxChars?: number;
   maxResults?: number;
   domain?: string;
+  excludeDomains?: string[];
   region?: string;
   freshness?: "day" | "week" | "month" | "year";
+  cursor?: string;
   refresh?: boolean;
   find?: string;
   columns?: string[];
@@ -76,8 +78,10 @@ async function runRequest(request: CliRequest, cache: WebPageCache, config: CliC
         query: request.query,
         maxResults: bounded(request.maxResults, 1, config.web.search.maxResults, config.web.search.maxResults, "maxResults"),
         ...(request.domain ? { domain: request.domain } : {}),
+        ...(request.excludeDomains ? { excludeDomains: request.excludeDomains } : {}),
         ...(request.region ? { region: request.region } : {}),
         ...(request.freshness ? { freshness: request.freshness } : {}),
+        ...(request.cursor ? { cursor: request.cursor } : {}),
         options: {
           timeoutMs: config.web.search.timeoutMs,
           maxBytes: 2 * 1024 * 1024,
@@ -118,8 +122,10 @@ function parseSearchArgs(args: string[]): CliRequest {
     query,
     maxResults: numberOption(parsed.options, "max-results"),
     domain: parsed.options.domain,
+    excludeDomains: parsed.options["exclude-domains"]?.split(",").map((value) => value.trim()).filter(Boolean),
     region: parsed.options.region,
     freshness: parsed.options.freshness as CliRequest["freshness"],
+    cursor: parsed.options.cursor,
   };
 }
 

@@ -98,6 +98,41 @@ test("embedded script data alone does not imply missing rendered content", () =>
   assert.deepEqual(page.dynamicContentReasons, []);
 });
 
+test("dynamic-content suspicion detects a modern hydration shell from extraction outcome", () => {
+  const page = extractWebPage(`
+    <html><head><title>Modern application</title></head><body>
+      <div class="application-shell"></div>
+      <script type="application/json">${JSON.stringify({ hydration: "data".repeat(2_000) })}</script>
+      <script type="module" src="/assets/runtime.js"></script>
+      <script type="module" src="/assets/application.js"></script>
+    </body></html>
+  `, "https://example.com/modern");
+  assert.equal(page.dynamicContentSuspected, true);
+  assert.deepEqual(page.dynamicContentReasons, ["no readable content despite executable scripts"]);
+});
+
+test("an empty static page or structured-data-only page does not imply dynamic rendering", () => {
+  const empty = extractWebPage("<html><body></body></html>", "https://example.com/empty");
+  const structured = extractWebPage(
+    `<html><body><script type="application/ld+json">${JSON.stringify({ name: "Metadata only" })}</script></body></html>`,
+    "https://example.com/structured",
+  );
+  assert.equal(empty.dynamicContentSuspected, false);
+  assert.equal(structured.dynamicContentSuspected, false);
+});
+
+test("dynamic-content suspicion compares executable payload with sparse readable output", () => {
+  const hydration = `self.__application_chunks.push(${JSON.stringify("rendered content ".repeat(300))});`;
+  const page = extractWebPage(`
+    <html><body>
+      <nav><p><a href="/login">Login</a></p></nav>
+      <script>${hydration}</script>
+    </body></html>
+  `, "https://example.com/hydrated");
+  assert.equal(page.dynamicContentSuspected, true);
+  assert.ok(page.dynamicContentReasons.includes("executable script payload greatly exceeds extracted readable content"));
+});
+
 test("image payloads are excluded while nearby captions and prose remain searchable", () => {
   const page = extractWebPage(
     `<html><body><main><h1>Atlas</h1><figure><img alt="Phoenix map marker" src="marker.svg"><figcaption>Map of major cities</figcaption></figure><p>Phoenix population details are tabulated below.</p></main></body></html>`,

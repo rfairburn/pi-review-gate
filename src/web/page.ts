@@ -75,6 +75,7 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
   const document = parsed.document as unknown as Document;
   absolutizeLinks(document, url);
   const dynamicContentReasons = dynamicReasons(document, html);
+  const scriptSignals = executableScriptSignals(document);
   for (const element of [...document.querySelectorAll("script,style,noscript,template,svg,img,picture,source")]) element.remove();
 
   const readable = readArticle(document, url);
@@ -130,6 +131,7 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
       headers: table.headers,
     });
   }
+  dynamicContentReasons.push(...extractionDynamicReasons(blocks, scriptSignals));
 
   return {
     url,
@@ -481,6 +483,36 @@ function dynamicReasons(document: Document, html: string): string[] {
   }
   if (/enable javascript|javascript is required|please turn on javascript/i.test(bodyText)) reasons.push("page explicitly requires JavaScript");
   return reasons;
+}
+
+interface ExecutableScriptSignals {
+  count: number;
+  inlineBytes: number;
+}
+
+function executableScriptSignals(document: Document): ExecutableScriptSignals {
+  const scripts = [...document.querySelectorAll("script")].filter(isExecutableScript);
+  return {
+    count: scripts.length,
+    inlineBytes: scripts.reduce((total, script) => total + Buffer.byteLength(script.textContent ?? "", "utf8"), 0),
+  };
+}
+
+function isExecutableScript(script: Element): boolean {
+  const type = (script.getAttribute("type") ?? "").trim().toLowerCase();
+  return type === "" || type === "module" || /^(?:text|application)\/(?:java|ecma)script$/.test(type);
+}
+
+function extractionDynamicReasons(blocks: WebPageBlock[], scripts: ExecutableScriptSignals): string[] {
+  if (scripts.count === 0) return [];
+  const readableChars = blocks.reduce((total, block) => total + block.markdown.length, 0);
+  if (readableChars === 0) {
+    return ["no readable content despite executable scripts"];
+  }
+  if (readableChars < 500 && scripts.inlineBytes >= 4_096 && scripts.inlineBytes / Math.max(1, readableChars) >= 4) {
+    return ["executable script payload greatly exceeds extracted readable content"];
+  }
+  return [];
 }
 
 function cleanText(value: string): string {

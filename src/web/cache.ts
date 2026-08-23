@@ -54,6 +54,7 @@ export class WebPageCache {
     maxChars?: number;
     refresh?: boolean;
     find?: string;
+    columns?: string[];
     signal?: AbortSignal;
   }): Promise<WebFetchResult> {
     const requestedUrl = normalizedUrl(input.url);
@@ -69,10 +70,11 @@ export class WebPageCache {
     entry.lastAccessedAt = Date.now();
     const maxChars = Math.max(1_000, Math.min(input.maxChars ?? this.config.maxOutputChars, this.config.maxOutputChars));
     const requestedIndex = input.index ?? 0;
+    if (input.find && input.columns) throw new Error("find and columns cannot be used together; find the table first, then fetch its index with columns.");
     const found = input.find ? findInWebPage(entry.page, input.find, requestedIndex) : undefined;
     const rendered = found
       ? { content: "", startIndex: requestedIndex, endIndex: requestedIndex, totalBlocks: entry.page.blocks.length }
-      : renderWebPage(entry.page, requestedIndex, maxChars);
+      : renderWebPage(entry.page, requestedIndex, maxChars, input.columns);
     return {
       ...rendered,
       requestedUrl,

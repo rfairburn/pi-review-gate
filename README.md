@@ -106,6 +106,9 @@ locate text anywhere in the indexed page; an accompanying `index` starts the
 case-insensitive search at that block. Continue at a returned match, table, or
 `nextIndex`; while the page remains cached, no second network request is made.
 A site-pagination URL is a different document and therefore a new fetch.
+When reading a table index, `columns` projects exact case-insensitive header
+names in the requested order; `#N` selects a 1-based column when headers are
+duplicated or inconvenient.
 
 The page cache is bounded by entry count and total bytes and is force-removed
 on session/application shutdown. Shutdown also removes settled subtask wave
@@ -142,7 +145,8 @@ For independent manual testing, use the same implementation outside Pi:
 ./scripts/pi-review-web.sh search "largest US cities census wikipedia" --max-results 10
 ./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population
 ./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --find Phoenix
-./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --index 110
+./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --index 36
+./scripts/pi-review-web.sh fetch https://en.wikipedia.org/wiki/List_of_United_States_cities_by_population --index 36 --columns 'Municipality,2025estimate'
 ```
 
 The CLI emits versioned JSON. `batch` accepts NDJSON and keeps one cache alive

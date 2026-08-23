@@ -90,8 +90,8 @@ export class WebToolManager {
     this.pi.registerTool({
       name: "WebFetch",
       label: "WebFetch",
-      description: "Fetch, search, and read a public page at a structural index. Reuse the same URL with find, nextIndex, or a reported table index; cached navigation avoids another network request.",
-      promptSnippet: "Use WebFetch on selected sources. Search within the cached page with find, continue with nextIndex, or jump directly to a reported table index using the same tool.",
+      description: "Fetch, search, and read a public page at a structural index. Reuse the same URL with find, nextIndex, or a reported table index; table reads can project selected columns.",
+      promptSnippet: "Use WebFetch on selected sources. Search within the cached page with find, continue with nextIndex, jump to a table index, or project table columns by exact header name.",
       promptGuidelines: [
         "WebFetch indexes the whole downloaded page before returning a bounded view, so inspect its table inventory even when a table is beyond the current view.",
         "If dynamic_content_suspected is true, prefer a separately authorized browser rather than repeatedly refetching the same static HTML.",
@@ -102,17 +102,20 @@ export class WebToolManager {
         url: stringSchema("Absolute http or https URL."),
         index: integerSchema("Structural block index to start reading at; omit for 0."),
         find: stringSchema("Optional case-insensitive text to find across the indexed page. index limits the search to that block and later."),
+        columns: stringArraySchema("Optional table projection. Each selector is an exact case-insensitive header or a 1-based fallback such as #3. Requires index to point to a table block; cannot be combined with find."),
         maxChars: integerSchema(`Maximum content characters, 1000-${this.webConfig.fetch.maxOutputChars}.`),
         refresh: booleanSchema("Force a network refresh instead of using the session cache."),
       }, ["url"]),
       execute: async (_id, params, signal) => {
         try {
+          const columns = optionalStringArray(params.columns, "columns");
           const fetched = await this.cache.fetch({
             url: requiredString(params.url, "url"),
             index: boundedInteger(params.index, 0, Number.MAX_SAFE_INTEGER, 0, "index"),
             maxChars: boundedInteger(params.maxChars, 1_000, this.webConfig.fetch.maxOutputChars, this.webConfig.fetch.maxOutputChars, "maxChars"),
             refresh: optionalBoolean(params.refresh, false, "refresh"),
             ...(optionalString(params.find) ? { find: optionalString(params.find) } : {}),
+            ...(columns ? { columns } : {}),
             signal,
           });
           return textResult(formatFetch(fetched), { response: fetched });
@@ -179,6 +182,7 @@ function formatFetch(value: WebFetchResult): string {
     if (value.find.matchesTruncated) lines.push("- Additional matches omitted; repeat WebFetch with the same find text and an index after the last reported match.");
     if (value.find.totalMatches === 0) lines.push("- No matching content was found in the cached page at or after that index.");
   }
+  if (value.projectedColumns) lines.push("", `Projected columns: ${value.projectedColumns.join(" | ")}`);
   if (value.find) {
     lines.push("", "Read a selected match by calling WebFetch with the same URL and its index.");
   } else {
@@ -212,6 +216,10 @@ function booleanSchema(description: string): Record<string, unknown> {
   return { type: "boolean", description };
 }
 
+function stringArraySchema(description: string): Record<string, unknown> {
+  return { type: "array", items: { type: "string" }, minItems: 1, maxItems: 64, description };
+}
+
 function enumSchema(values: string[], description: string): Record<string, unknown> {
   return { type: "string", enum: values, description };
 }
@@ -223,6 +231,14 @@ function requiredString(value: unknown, field: string): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function optionalStringArray(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
+    throw new Error(`${field} must be an array containing 1-64 strings.`);
+  }
+  return value.map((item) => requiredString(item, field));
 }
 
 function boundedInteger(value: unknown, min: number, max: number, fallback: number, field: string): number {

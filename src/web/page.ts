@@ -11,6 +11,9 @@ export interface WebPageBlock {
   kind: "text" | "code" | "table";
   markdown: string;
   tableId?: string;
+  tableLabel?: string;
+  tableHeaders?: string[];
+  tableRows?: string[][];
 }
 
 export interface WebTableDescriptor {
@@ -48,6 +51,7 @@ export interface RenderedWebPage {
   endIndex: number;
   nextIndex?: number;
   totalBlocks: number;
+  projectedColumns?: string[];
 }
 
 export interface WebPageMatch {
@@ -105,8 +109,16 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
     if (!table || table.rows.length < 2 || table.columns < 2) continue;
     const start = blocks.length;
     const chunks = tableMarkdownChunks(table.label, table.headers, table.rows, MAX_BLOCK_CHARS);
-    for (const markdown of chunks) {
-      blocks.push({ index: blocks.length, kind: "table", markdown, tableId: table.id });
+    for (const chunk of chunks) {
+      blocks.push({
+        index: blocks.length,
+        kind: "table",
+        markdown: chunk.markdown,
+        tableId: table.id,
+        tableLabel: table.label,
+        tableHeaders: table.headers,
+        tableRows: chunk.rows,
+      });
     }
     tables.push({
       id: table.id,
@@ -133,31 +145,91 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
   };
 }
 
-export function renderWebPage(page: ExtractedWebPage, index: number, maxChars: number): RenderedWebPage {
+export function renderWebPage(page: ExtractedWebPage, index: number, maxChars: number, columns?: string[]): RenderedWebPage {
   if (!Number.isInteger(index) || index < 0) throw new Error("index must be a non-negative integer.");
   if (page.blocks.length === 0) {
+    if (columns) throw new Error("columns can only be used when index points directly to a table block.");
     if (index !== 0) throw new Error("This page has no readable block at the requested index.");
     return { content: "", startIndex: 0, endIndex: 0, totalBlocks: 0 };
   }
   if (index >= page.blocks.length) throw new Error(`index ${index} is beyond the final block ${page.blocks.length - 1}.`);
+  const projection = columns ? resolveColumnProjection(page.blocks[index]!, columns) : undefined;
   const selected: WebPageBlock[] = [];
+  const rendered: string[] = [];
   let chars = 0;
   for (let position = index; position < page.blocks.length; position += 1) {
     const block = page.blocks[position]!;
-    const addition = block.markdown.length + (selected.length > 0 ? 2 : 0);
+    if (projection && block.tableId !== projection.tableId) break;
+    const markdown = projection ? projectTableBlock(block, projection) : block.markdown;
+    const addition = markdown.length + (selected.length > 0 ? 2 : 0);
     if (selected.length > 0 && chars + addition > maxChars) break;
     selected.push(block);
+    rendered.push(markdown);
     chars += addition;
     if (chars >= maxChars) break;
   }
   const endIndex = selected.at(-1)?.index ?? index;
   return {
-    content: selected.map((block) => block.markdown).join("\n\n"),
+    content: rendered.join("\n\n"),
     startIndex: index,
     endIndex,
     ...(endIndex + 1 < page.blocks.length ? { nextIndex: endIndex + 1 } : {}),
     totalBlocks: page.blocks.length,
+    ...(projection ? { projectedColumns: projection.headers } : {}),
   };
+}
+
+interface ResolvedColumnProjection {
+  tableId: string;
+  tableLabel: string;
+  indexes: number[];
+  headers: string[];
+}
+
+function resolveColumnProjection(block: WebPageBlock, selectors: string[]): ResolvedColumnProjection {
+  if (block.kind !== "table" || !block.tableId || !block.tableHeaders || !block.tableRows) {
+    throw new Error("columns can only be used when index points directly to a table block.");
+  }
+  if (selectors.length === 0) throw new Error("columns must contain at least one selector.");
+  const indexes = selectors.map((selector) => resolveColumnSelector(block.tableHeaders!, selector));
+  if (new Set(indexes).size !== indexes.length) throw new Error("columns must not select the same table column more than once.");
+  return {
+    tableId: block.tableId,
+    tableLabel: block.tableLabel ?? block.tableId,
+    indexes,
+    headers: indexes.map((column) => block.tableHeaders![column]!),
+  };
+}
+
+function resolveColumnSelector(headers: string[], rawSelector: string): number {
+  const selector = rawSelector.trim();
+  if (!selector) throw new Error("column selectors must be non-empty strings.");
+  const ordinal = /^#([1-9]\d*)$/.exec(selector);
+  if (ordinal) {
+    const index = Number(ordinal[1]) - 1;
+    if (index >= headers.length) throw new Error(`column selector ${JSON.stringify(selector)} is beyond the final column #${headers.length}.`);
+    return index;
+  }
+  const normalized = normalizeHeader(selector);
+  const matches = headers
+    .map((header, index) => normalizeHeader(header) === normalized ? index : -1)
+    .filter((index) => index >= 0);
+  if (matches.length === 1) return matches[0]!;
+  const available = headers.map((header, index) => `#${index + 1} ${header}`).join("; ");
+  if (matches.length > 1) {
+    throw new Error(`column selector ${JSON.stringify(selector)} is ambiguous; use a numbered selector. Available columns: ${available}`);
+  }
+  throw new Error(`unknown column selector ${JSON.stringify(selector)}. Available columns: ${available}`);
+}
+
+function normalizeHeader(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+}
+
+function projectTableBlock(block: WebPageBlock, projection: ResolvedColumnProjection): string {
+  if (!block.tableRows) throw new Error("The cached table block has no structured rows for projection.");
+  const descriptorRows = block.tableRows.map((row) => projection.indexes.map((column) => row[column] ?? ""));
+  return tableMarkdown(projection.tableLabel, projection.headers, descriptorRows, MAX_BLOCK_CHARS);
 }
 
 export function findInWebPage(
@@ -332,21 +404,33 @@ function nearestHeading(element: Element): string {
   return "";
 }
 
-function tableMarkdownChunks(label: string, headers: string[], rows: string[][], limit: number): string[] {
+interface TableMarkdownChunk {
+  markdown: string;
+  rows: string[][];
+}
+
+function tableMarkdownChunks(label: string, headers: string[], rows: string[][], limit: number): TableMarkdownChunk[] {
   const heading = `### ${label}`;
   const header = `| ${headers.map(escapeCell).join(" | ")} |\n| ${headers.map(() => "---").join(" | ")} |`;
-  const chunks: string[] = [];
+  const chunks: TableMarkdownChunk[] = [];
   let lines = [heading, header];
+  let chunkRows: string[][] = [];
   for (const row of rows) {
     const line = `| ${row.map(escapeCell).join(" | ")} |`;
     if (lines.join("\n").length + line.length + 1 > limit && lines.length > 2) {
-      chunks.push(lines.join("\n"));
+      chunks.push({ markdown: lines.join("\n"), rows: chunkRows });
       lines = [heading, header];
+      chunkRows = [];
     }
     lines.push(line.length > limit ? `${line.slice(0, limit - 1)}…` : line);
+    chunkRows.push(row);
   }
-  if (lines.length > 2 || chunks.length === 0) chunks.push(lines.join("\n"));
+  if (lines.length > 2 || chunks.length === 0) chunks.push({ markdown: lines.join("\n"), rows: chunkRows });
   return chunks;
+}
+
+function tableMarkdown(label: string, headers: string[], rows: string[][], limit: number): string {
+  return tableMarkdownChunks(label, headers, rows, limit)[0]!.markdown;
 }
 
 function escapeCell(value: string): string {

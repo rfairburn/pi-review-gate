@@ -43,6 +43,27 @@ test("within-page search locates structural and table blocks without another too
   assert.ok(later.matches.every((match) => match.index >= 10));
 });
 
+test("table reads project semantic columns and retain numeric fallback for ambiguous headers", () => {
+  const page = extractWebPage(fixture, "https://example.com/cities");
+  const tableIndex = page.tables[0]!.index;
+  const projected = renderWebPage(page, tableIndex, 4_000, ["City", "population 2025"]);
+  assert.deepEqual(projected.projectedColumns, ["City", "Population 2025"]);
+  assert.match(projected.content, /New York.*8,584,629/);
+  assert.doesNotMatch(projected.content, /8,804,190|3,898,747/);
+
+  const duplicatePage = extractWebPage(
+    `<html><body><h1>Areas</h1><table><tr><th>Area</th><th>Area</th></tr><tr><td>10</td><td>20</td></tr><tr><td>30</td><td>40</td></tr></table></body></html>`,
+    "https://example.com/areas",
+  );
+  const duplicateIndex = duplicatePage.tables[0]!.index;
+  assert.throws(() => renderWebPage(duplicatePage, duplicateIndex, 4_000, ["Area"]), /ambiguous.*#1 Area; #2 Area/);
+  const secondArea = renderWebPage(duplicatePage, duplicateIndex, 4_000, ["#2"]);
+  assert.match(secondArea.content, /\| 20 \|/);
+  assert.doesNotMatch(secondArea.content, /\| 10 \|/);
+  assert.throws(() => renderWebPage(page, 0, 4_000, ["City"]), /index points directly to a table block/);
+  assert.throws(() => renderWebPage(page, tableIndex, 4_000, ["Unknown"]), /unknown column selector.*#1 City/);
+});
+
 test("dynamic-content suspicion is explicit for script-heavy empty application shells", () => {
   const page = extractWebPage(`<html><body><div id="root"></div>${"<script>void 0</script>".repeat(8)}</body></html>`, "https://example.com/app");
   assert.equal(page.dynamicContentSuspected, true);
@@ -106,6 +127,24 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.match(second.content[0].text as string, /New York/);
   assert.match(second.content[0].text as string, /session cache/);
   assert.equal(downloads, 1);
+
+  const projected = await tools.get("WebFetch").execute("project", {
+    url: "https://example.com/cities",
+    index: tableIndex,
+    columns: ["City", "Population 2025"],
+  });
+  assert.match(projected.content[0].text as string, /Projected columns: City \| Population 2025/);
+  assert.match(projected.content[0].text as string, /New York.*8,584,629/s);
+  assert.doesNotMatch(projected.content[0].text as string, /8,804,190/);
+  assert.equal(downloads, 1);
+
+  const invalidProjection = await tools.get("WebFetch").execute("invalid-project", {
+    url: "https://example.com/cities",
+    find: "New York",
+    columns: ["City"],
+  });
+  assert.equal(invalidProjection.isError, true);
+  assert.match(invalidProjection.content[0].text as string, /find and columns cannot be used together/);
 
   const found = await tools.get("WebFetch").execute("find", { url: "https://example.com/cities", find: "Los Angeles" });
   assert.match(found.content[0].text as string, /Find "Los Angeles"/);

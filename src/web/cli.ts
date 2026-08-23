@@ -16,6 +16,7 @@ interface CliRequest {
   freshness?: "day" | "week" | "month" | "year";
   refresh?: boolean;
   find?: string;
+  columns?: string[];
 }
 
 type CliConfig = ReviewGateConfig & { web: WebConfig };
@@ -93,6 +94,7 @@ async function runRequest(request: CliRequest, cache: WebPageCache, config: CliC
         maxChars: bounded(request.maxChars, 1_000, config.web.fetch.maxOutputChars, config.web.fetch.maxOutputChars, "maxChars"),
         refresh: request.refresh === true,
         ...(request.find?.trim() ? { find: request.find.trim() } : {}),
+        ...(request.columns ? { columns: request.columns } : {}),
       });
       return envelope(request, data);
     }
@@ -130,6 +132,7 @@ function parseFetchArgs(args: string[]): CliRequest {
     maxChars: numberOption(parsed.options, "max-chars"),
     refresh: parsed.options.refresh === "true",
     find: parsed.options.find,
+    columns: parsed.options.columns?.split(",").map((value) => value.trim()).filter(Boolean),
   };
 }
 

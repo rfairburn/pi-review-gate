@@ -12,6 +12,7 @@ const executionToolNames = [
   "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue",
   "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
 ];
+const backgroundShellToolNames = ["ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"];
 
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
@@ -232,11 +233,11 @@ test("delegated execution tool activation waits for session_start", async () => 
     };
 
     await activate(pi);
-    assert.deepEqual(registeredTools, []);
+    assert.deepEqual(registeredTools, backgroundShellToolNames);
 
     runtimeInitialized = true;
     await trigger(hooks, "session_start", { cwd: dir });
-    assert.deepEqual(registeredTools, executionToolNames);
+    assert.deepEqual(registeredTools, [...backgroundShellToolNames, ...executionToolNames]);
     assert.deepEqual(activeTools, ["read", ...executionToolNames]);
   } finally {
     await rm(dir, { recursive: true, force: true });

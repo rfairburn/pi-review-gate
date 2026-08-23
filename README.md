@@ -227,14 +227,17 @@ also reports wall time, summed task time, and peak concurrent workers.
 Internal `CAPTURING`, `ACCEPTED`, `WAITING_TO_LAND`, and `LANDING` progress
 remains durable and user-visible without starting model turns.
 
-`ShellStart` remains a deliberate compatibility seam. At the top level,
-review-gate reads its returned detached process-group id, defers automatic
-review while the group is alive, and triggers the orchestrator to inspect and
-finish the work after it clears. Pi does not currently provide the executor
-integration needed to keep an idle RPC task alive across that boundary. A Pi
-executor that observes background work therefore fails explicitly instead of
-silently reviewing or exiting early. The retained red integration test is the
-specification for the missing native replacement.
+The extension provides `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
+`ShellStop` directly through Pi. Background jobs are detached process groups,
+wake the agent on configured output or exit events, survive ordinary turn
+settlement, and are reaped when the Pi session ends. At the top level,
+review-gate reads the process-group identity returned by `ShellStart`, defers
+automatic review while the group is alive, and triggers the orchestrator to
+inspect and finish the work after it clears. A Pi executor likewise keeps its
+RPC session alive while tracked background work runs, accepts steering during
+that interval, and performs a final inspection turn before review. Executor
+timeouts are suspended while a verified process group remains active;
+unparseable `ShellStart` success responses fail closed.
 
 The same top-level review-readiness gate covers execution and research subtasks: automatic
 review of the primary orchestrator is deferred while any task is queued,
@@ -739,3 +742,11 @@ When recovery returns `manual_required`:
 
 This module does not provide automatic crash recovery on startup. Recovery is
 an explicit operation invoked by the caller when a crashed manifest is detected.
+
+## Third-party notices
+
+The background-shell implementation and its tests are modified from Little
+Coder by Itay Inbar and are used under the Apache License, Version 2.0. The
+source files carry modification notices. See [NOTICE](NOTICE) and
+[LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) for attribution and the full
+license text.

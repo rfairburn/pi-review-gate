@@ -14,7 +14,9 @@
     "scripts",
     "examples",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "LICENSES",
+    "NOTICE"
   ],
   "scripts": {
     "clean:build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",

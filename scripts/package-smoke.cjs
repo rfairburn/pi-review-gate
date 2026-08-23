@@ -30,6 +30,8 @@ try {
     "scripts/pi-review-gate.sh",
     "scripts/orchestrator-system-prompt.md",
     "scripts/fake-reviewer.cjs",
+    "LICENSES/Apache-2.0.txt",
+    "NOTICE",
   ]) {
     assert.ok(fs.statSync(path.join(installed, required)).isFile(), `missing packed file: ${required}`);
   }

@@ -34,6 +34,7 @@ import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliv
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
 import { configDigest, replaceReviewGateState, sessionPersistenceIdentity, SessionStateStore } from "./session-state";
 import { BackgroundProcessReadiness } from "./background-process-readiness";
+import { registerBackgroundShell, type BackgroundShellHost } from "./background-shell";
 
 declare const module: {
   exports: unknown;
@@ -47,6 +48,11 @@ const orchestratorBackgroundCompletionPrompt = [
 ].join(" ");
 
 export async function activate(pi: unknown): Promise<void> {
+  if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor") {
+    if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
+    return;
+  }
+
   let loaded;
   try {
     loaded = loadConfig();
@@ -60,6 +66,8 @@ export async function activate(pi: unknown): Promise<void> {
     await sendNotice(pi, `review gate: disabled (${loaded.disabledReason ?? "environment kill switch"})`);
     return;
   }
+
+  if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
 
   const state = createState();
   let currentCwd = process.cwd();
@@ -650,6 +658,10 @@ export async function activate(pi: unknown): Promise<void> {
     const choices = scopedModelChoices(extractContext(args) ?? args.find((arg) => scopedModelChoices(arg) !== undefined));
     if (choices) currentScopedModels = choices.map((choice) => choice.model);
   }
+}
+
+function canRegisterBackgroundShell(value: unknown): value is BackgroundShellHost {
+  return typeof (value as { registerTool?: unknown } | undefined)?.registerTool === "function";
 }
 
 function executionPromptInjection(content: string | undefined): { message: { customType: string; content: string; display: boolean } } | undefined {

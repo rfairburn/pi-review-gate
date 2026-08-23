@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext, type Route } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Response, type Route } from "playwright";
 import type { DownloadedText, NetworkOptions } from "./network";
 import { validatedPublicUrl } from "./network";
 
@@ -50,6 +50,12 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
     await context.routeWebSocket("**/*", (socket) => socket.close());
 
     const page = await context.newPage();
+    let latestMainNavigation: Response | null = null;
+    page.on("response", (candidate) => {
+      if (candidate.request().isNavigationRequest() && candidate.frame() === page.mainFrame()) {
+        latestMainNavigation = candidate;
+      }
+    });
     page.on("dialog", (dialog) => void dialog.dismiss());
     page.on("download", (download) => void download.cancel());
     const response = await abortable(
@@ -63,6 +69,8 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
       controller.signal,
     );
     const finalUrl = await validatedPublicUrl(page.url());
+    const finalResponse = latestMainNavigation ?? response;
+    assertSuccessfulBrowserNavigation(finalResponse?.status(), finalResponse?.url() ?? finalUrl);
     const text = await abortable(page.content(), controller.signal);
     const bytes = Buffer.byteLength(text, "utf8");
     if (bytes > options.maxBytes) {
@@ -71,7 +79,7 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
     return {
       requestedUrl,
       finalUrl,
-      contentType: response?.headers()["content-type"] ?? "text/html; charset=utf-8",
+      contentType: finalResponse?.headers()["content-type"] ?? "text/html; charset=utf-8",
       text,
       bytes,
       fetchedAt: new Date().toISOString(),
@@ -82,6 +90,11 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
     await context?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
   }
+}
+
+export function assertSuccessfulBrowserNavigation(status: number | undefined, url: string): void {
+  if (status === undefined) throw new Error(`Browser navigation returned no HTTP response for ${url}.`);
+  if (status < 200 || status >= 300) throw new Error(`Browser navigation returned HTTP ${status} for ${url}.`);
 }
 
 async function allowBrowserRoute(route: Route, approvedOrigins: Set<string>): Promise<boolean> {

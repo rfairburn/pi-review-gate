@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { access } from "node:fs/promises";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
+import { assertSuccessfulBrowserNavigation } from "../src/web/browser";
 import { WebPageCache } from "../src/web/cache";
 import { canonicalSearchUrl, parseDuckDuckGoResults, searchDuckDuckGo, type DownloadedText, type NetworkOptions } from "../src/web/network";
 import { extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
@@ -13,6 +14,19 @@ const fixture = `<!doctype html><html><head><title>Population fixture</title></h
 <table><thead><tr><th rowspan="2">City</th><th colspan="2">Population</th></tr><tr><th>2020</th><th>2025</th></tr></thead>
 <tbody><tr><td>New York</td><td>8,804,190</td><td>8,584,629</td></tr><tr><td>Los Angeles</td><td>3,898,747</td><td>3,869,089</td></tr></tbody></table>
 <nav class="pagination"><a rel="next" href="/page/2">Next</a></nav></body></html>`;
+
+test("BrowserExtract accepts only successful final main-document responses", () => {
+  assert.doesNotThrow(() => assertSuccessfulBrowserNavigation(200, "https://example.com/page"));
+  assert.doesNotThrow(() => assertSuccessfulBrowserNavigation(204, "https://example.com/no-content"));
+  assert.throws(
+    () => assertSuccessfulBrowserNavigation(404, "https://example.com/missing"),
+    /HTTP 404.*https:\/\/example\.com\/missing/,
+  );
+  assert.throws(
+    () => assertSuccessfulBrowserNavigation(undefined, "https://example.com/no-response"),
+    /no HTTP response/,
+  );
+});
 
 test("full-page extraction reports tables beyond the current view and supports direct indexed reads", () => {
   const page = extractWebPage(fixture, "https://example.com/cities");

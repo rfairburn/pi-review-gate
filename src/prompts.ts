@@ -11,7 +11,7 @@ export const REVIEW_TEST_POLICY = `Targeted tests are the expected verification 
 const REVIEW_CONTEXT_POLICY = `Review policy:
 ${REVIEW_AUTHORIZATION_POLICY}
 ${REVIEW_TEST_POLICY}
-- Submitted workspace changes are the primary implementation under review.
+- Submitted workspace changes define the parent exchange's review scope, not a delivery artifact. Independently reviewed subtask landings may be present in the live workspace but intentionally absent; do not flag that absence alone.
 - Captured side-effect changes are evidence from tool activity that was not detected as submitted workspace changes. They may include temp-like process artifacts, generated files, or real outside-workspace side effects.
 - A temp-like side-effect classification is a heuristic, not a guarantee. Do not block solely because a temp-like external file exists, but do block if it is referenced by submitted code, contains secrets, stores meaningful user content, changes persistent behavior, or indicates unsafe/unmanaged side effects.
 - Persistent-looking external side effects deserve scrutiny, but do not block solely because they are outside the workspace or not explicitly named in the user request. Block only when they are unrelated to the task, modify user/environment configuration, create or change executable/runtime content, store meaningful user data in an unmanaged location, leak secrets, or leave state that affects future behavior.

@@ -35,6 +35,9 @@ test("reviewer prompt treats orchestrator direction as authorized and forbids us
   assert.match(prompt, /Targeted tests are the expected verification inside delegated implementation and correction loops/);
   assert.match(prompt, /Do not return "needs_changes" merely because the full repository test suite was not run/);
   assert.match(prompt, /full-suite final orchestration run only as a non_blocking observation/);
+  assert.match(prompt, /Submitted workspace changes define the parent exchange's review scope, not a delivery artifact/);
+  assert.match(prompt, /Independently reviewed subtask landings may be present in the live workspace but intentionally absent/);
+  assert.match(prompt, /do not flag that absence alone/);
 });
 
 test("every review prompt requests implementation-ready Markdown guidance", () => {

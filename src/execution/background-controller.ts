@@ -747,7 +747,6 @@ export class BackgroundExecutionController {
       transitionTaskState(task, "landing");
       const landing = await executeWaveLanding(plan, capture);
       if (landing.status !== "landed") throw new Error(`Force-merge landing ended in ${landing.status}.`);
-      transitionTaskState(task, "landed");
       const paths = [...landing.appliedPaths, ...landing.alreadyAppliedPaths];
       task.summary = paths.length > 0
         ? "Stopped task force-merged mechanically into the main workspace; manual workspace inspection is still required to confirm the requested changes are present and correct."
@@ -755,6 +754,7 @@ export class BackgroundExecutionController {
       command.status = "acknowledged";
       command.acknowledgedAt = new Date().toISOString();
       await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
+      transitionTaskState(task, "landed");
       await this.save(group);
       await this.publishAssociations();
       await this.wake(task, "completion", `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`);
@@ -796,7 +796,7 @@ export class BackgroundExecutionController {
         maxSnapshotBytes: this.input.config.maxSnapshotBytes,
         reuseUnchangedFrom: baseline,
       });
-      checkpointReviewWindow(this.input.state, selectiveCheckpoint(baseline, baseline, resolved, gate.paths, gate.sourceRoot));
+      checkpointReviewWindow(this.input.state, selectiveCheckpoint(baseline, baseline, baseline, resolved, gate.paths, gate.sourceRoot));
     }
     this.conflictGate = undefined;
     this.releaseConflictBlock?.();
@@ -1261,11 +1261,11 @@ export class BackgroundExecutionController {
       return;
     }
     if (result.landing?.status === "landed") {
+      const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
+      await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
       transitionTaskState(task, "landed");
       const completionSnapshot = transitionEventSnapshot(group, task);
       this.updateIndicator();
-      const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
-      await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
       const persisted = await this.save(group);
       await this.publishAssociations();
       synchronizeEventSnapshot(completionSnapshot, persisted);
@@ -1363,12 +1363,12 @@ export class BackgroundExecutionController {
         return;
       }
       if (result.landing?.status === "landed") {
-        transitionTaskState(task, "landed");
-        const completionSnapshot = transitionEventSnapshot(group, task);
-        this.updateIndicator();
         task.summary = "Continued task landed independently in the main workspace.";
         const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
+        transitionTaskState(task, "landed");
+        const completionSnapshot = transitionEventSnapshot(group, task);
+        this.updateIndicator();
         const persisted = await this.save(group);
         await this.publishAssociations();
         synchronizeEventSnapshot(completionSnapshot, persisted);
@@ -1491,18 +1491,21 @@ export class BackgroundExecutionController {
 
   private async checkpointParent(
     reviewWindowId: number | undefined,
-    baseline: WorkspaceSnapshot | undefined,
+    taskBaseline: WorkspaceSnapshot | undefined,
     before: WorkspaceSnapshot | undefined,
     sourceRoot: string,
     landedPaths: string[],
   ): Promise<void> {
-    if (!baseline || !before || reviewWindowId === undefined || this.input.state.reviewWindow?.id !== reviewWindowId || landedPaths.length === 0) return;
+    if (!taskBaseline || !before || reviewWindowId === undefined || this.input.state.reviewWindow?.id !== reviewWindowId || landedPaths.length === 0) return;
     const after = await createWorkspaceSnapshot(sourceRoot, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
       reuseUnchangedFrom: before,
     });
-    checkpointReviewWindow(this.input.state, selectiveCheckpoint(baseline, before, after, landedPaths, sourceRoot));
+    if (this.input.state.reviewWindow?.id !== reviewWindowId) return;
+    const accumulatedBaseline = activeExchangeBaseline(this.input.state);
+    if (!accumulatedBaseline) return;
+    checkpointReviewWindow(this.input.state, selectiveCheckpoint(accumulatedBaseline, taskBaseline, before, after, landedPaths, sourceRoot));
   }
 
   private async acknowledgeInterrupt(task: BackgroundTaskRecord): Promise<void> {
@@ -2132,23 +2135,24 @@ async function atomicWrite(path: string, body: string): Promise<void> {
 }
 
 function selectiveCheckpoint(
-  baseline: WorkspaceSnapshot,
+  accumulatedBaseline: WorkspaceSnapshot,
+  taskBaseline: WorkspaceSnapshot,
   before: WorkspaceSnapshot,
   after: WorkspaceSnapshot,
   paths: string[],
   sourceRoot: string,
 ): WorkspaceSnapshot {
   const absolute = new Set(paths.map((path) => resolve(sourceRoot, path)));
-  const files = new Map(baseline.files);
+  const files = new Map(accumulatedBaseline.files);
   for (const [key, afterFile] of after.files) {
     if (!absolute.has(afterFile.absolutePath)) continue;
-    if (!parentChanged(baseline.files.get(key), before.files.get(key))) files.set(key, afterFile);
+    if (!parentChanged(taskBaseline.files.get(key), before.files.get(key))) files.set(key, afterFile);
   }
-  for (const [key, baselineFile] of baseline.files) {
+  for (const [key, baselineFile] of accumulatedBaseline.files) {
     if (!absolute.has(baselineFile.absolutePath) || after.files.has(key)) continue;
-    if (!parentChanged(baselineFile, before.files.get(key))) files.delete(key);
+    if (!parentChanged(taskBaseline.files.get(key), before.files.get(key))) files.delete(key);
   }
-  return { cwd: baseline.cwd, capturedAt: after.capturedAt, files };
+  return { cwd: accumulatedBaseline.cwd, capturedAt: after.capturedAt, files };
 }
 
 function parentChanged(a: FileSnapshot | undefined, b: FileSnapshot | undefined): boolean {

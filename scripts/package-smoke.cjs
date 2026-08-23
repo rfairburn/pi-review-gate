@@ -27,17 +27,15 @@ try {
   const installed = path.join(consumer, "node_modules", "pi-review-gate");
   for (const required of [
     "dist/src/index.js",
-    "scripts/little-coder-review-gate.sh",
-    "scripts/little-coder-review.sh",
-    "scripts/little-coder-tool-policy.sh",
+    "scripts/pi-review-gate.sh",
     "scripts/orchestrator-system-prompt.md",
     "scripts/fake-reviewer.cjs",
+    "LICENSES/Apache-2.0.txt",
+    "NOTICE",
   ]) {
     assert.ok(fs.statSync(path.join(installed, required)).isFile(), `missing packed file: ${required}`);
   }
-  for (const binary of ["pi-review-gate-little-coder", "pi-review-gate-preset"]) {
-    fs.accessSync(path.join(consumer, "node_modules", ".bin", binary), fs.constants.X_OK);
-  }
+  fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate"), fs.constants.X_OK);
   process.stdout.write(`package smoke passed: ${packedName}\n`);
 } finally {
   fs.rmSync(scratch, { recursive: true, force: true });

@@ -222,7 +222,7 @@ test("wave-worker runs one executor turn and normalizes to candidate", async () 
     const config = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "little-coder", model: "test-model" },
+        activeExecutor: { source: "pi", model: "test-model" },
       },
       externalAgents: [{
         id: "fake-exec",

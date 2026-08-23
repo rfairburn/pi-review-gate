@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { reviewerEnv, terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
@@ -9,10 +9,10 @@ import { writeExecutorArtifacts } from "../artifacts";
 import { PiJsonlActivityExtractor } from "../progress";
 import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorInteractionAcknowledgement, type ExecutorRequest, type ExecutorTurn } from "../types";
 import type { ThinkingLevel } from "../../config";
-import { withLittleCoderThinkingBudget } from "../../little-coder-thinking";
 import { BackgroundProcessReadiness } from "../../background-process-readiness";
+import { assertNoPiToolPolicyArgs } from "../../pi-tool-policy";
 
-export interface LittleCoderExecutorOptions {
+export interface PiExecutorOptions {
   model: string;
   thinkingLevel?: ThinkingLevel;
   command?: string;
@@ -20,16 +20,18 @@ export interface LittleCoderExecutorOptions {
   timeoutMs?: number;
 }
 
-export class LittleCoderExecutorAdapter implements ExecutorAdapter {
-  readonly kind = "little-coder-model";
+export class PiExecutorAdapter implements ExecutorAdapter {
+  readonly kind = "pi-model";
   readonly model: string;
 
-  constructor(private readonly options: LittleCoderExecutorOptions) {
+  constructor(private readonly options: PiExecutorOptions) {
     this.model = options.model;
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    assertNoPiToolPolicyArgs(this.options.args ?? [], "Pi executor arguments");
     const thinkingLevel = this.options.thinkingLevel ?? "high";
+    const allowedTools = requireAllowedTools(request.allowedTools);
     const sessionId = request.session?.id ?? randomUUID();
     const sessionDir = join(request.artifactDir, "executor-sessions");
     await mkdir(sessionDir, { recursive: true });
@@ -39,9 +41,8 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       }
       request.onUpdate?.("reopening executor session for context compaction");
       try {
-        const allowedTools = normalizeAllowedTools(request.allowedTools);
         await compactInterruptedSession({
-          command: this.options.command ?? "little-coder",
+          command: this.options.command ?? "pi",
           model: this.options.model,
           thinkingLevel,
           sessionId,
@@ -49,7 +50,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
           cwd: request.cwd,
           args: childArgs(this.options.args ?? [], allowedTools),
           timeoutMs: Math.min(this.options.timeoutMs ?? 1_800_000, 300_000),
-          env: executorEnv(this.options.model, thinkingLevel, allowedTools),
+          env: executorEnv(),
           signal: request.signal,
           onProcessStart: request.onProcessStart,
           onProcessExit: request.onProcessExit,
@@ -66,22 +67,20 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
     }
     const extractor = new PiJsonlReviewExtractor();
     const activity = new PiJsonlActivityExtractor((message) => request.onUpdate?.(message));
-    const allowedTools = normalizeAllowedTools(request.allowedTools);
     const args = [
       "--model", this.options.model,
       "--mode", "rpc",
       "--thinking", thinkingLevel,
       "--session-id", sessionId,
       "--session-dir", sessionDir,
-      "--approve",
       ...childArgs(this.options.args ?? [], allowedTools),
     ];
-    const proc = spawn(this.options.command ?? "little-coder", args, {
+    const proc = spawn(this.options.command ?? "pi", args, {
       cwd: request.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: executorEnv(this.options.model, thinkingLevel, allowedTools),
+      env: executorEnv(),
     });
     const identity = proc.pid === undefined ? undefined : {
       pid: proc.pid,
@@ -89,7 +88,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
     };
     if (identity) await request.onProcessStart?.(identity);
     const backgroundReadiness = new BackgroundProcessReadiness();
-    const rpc = new LittleCoderRpc(proc, backgroundReadiness, (chunk) => {
+    const rpc = new PiRpc(proc, backgroundReadiness, (chunk) => {
       extractor.push(chunk);
       activity.push(chunk);
     });
@@ -129,12 +128,12 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
             const state = await rpc.request("get_state", {});
             if (rpcState(state).isStreaming) {
               await rpc.request("steer", { message: instruction }, instructionId);
-              return { status: "acknowledged", message: "Little Coder RPC acknowledged live steering." };
+              return { status: "acknowledged", message: "Pi RPC acknowledged live steering." };
             }
             await rpc.request("prompt", { message: instruction }, instructionId);
             return {
               status: "acknowledged",
-              message: "Little Coder RPC resumed the idle executor with the steering instruction while background work remained active.",
+              message: "Pi RPC resumed the idle executor with the steering instruction while background work remained active.",
             };
           } catch (error) {
             return { status: "failed", message: messageOf(error) };
@@ -146,12 +145,12 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
             const state = await rpc.request("get_state", {});
             if (!rpcState(state).isStreaming) {
               rpc.terminate();
-              return { status: "acknowledged", message: "Little Coder RPC interruption terminated the idle executor and its background processes." };
+              return { status: "acknowledged", message: "Pi RPC interruption terminated the idle executor and its background processes." };
             }
             const beforeInterrupt = rpc.settledGeneration;
             await rpc.request("abort", {});
             await rpc.waitForSettled(beforeInterrupt);
-            return { status: "acknowledged", message: "Little Coder RPC acknowledged interruption and the agent settled." };
+            return { status: "acknowledged", message: "Pi RPC acknowledged interruption and the agent settled." };
           } catch (error) {
             return { status: "failed", message: messageOf(error) };
           }
@@ -221,7 +220,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
       failure: protocolFailure
         ? { category: "protocol", message: protocolFailure }
         : interruptedByControl
-          ? { category: "interruption", message: "Little Coder RPC turn was interrupted." }
+          ? { category: "interruption", message: "Pi RPC turn was interrupted." }
         : extracted.lifecycle.compaction.status === "in_progress"
         ? { category: "interruption", message: "Executor process ended while context compaction was in progress." }
         : extracted.lifecycle.compaction.status === "failed" || extracted.lifecycle.compaction.status === "aborted"
@@ -233,7 +232,7 @@ export class LittleCoderExecutorAdapter implements ExecutorAdapter {
   }
 }
 
-class LittleCoderRpc {
+class PiRpc {
   private nextId = 1;
   private buffer = "";
   private pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
@@ -252,7 +251,7 @@ class LittleCoderRpc {
     proc.stderr?.on("data", (value: Buffer) => { this.stderr.append(value.toString("utf8")); });
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
-        const error = new Error(`Little Coder RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`);
+        const error = new Error(`Pi RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`);
         for (const pending of this.pending.values()) pending.reject(error);
         this.pending.clear();
         for (const waiter of this.settledWaiters) waiter.reject(error);
@@ -272,7 +271,7 @@ class LittleCoderRpc {
       this.pending.set(id, { resolve: resolvePromise, reject });
       if (!this.proc.stdin?.writable) {
         this.pending.delete(id);
-        reject(new Error("Little Coder RPC stdin is not writable."));
+        reject(new Error("Pi RPC stdin is not writable."));
         return;
       }
       this.proc.stdin.write(`${JSON.stringify({ id, type, ...fields })}\n`);
@@ -339,7 +338,7 @@ class LittleCoderRpc {
         else pending.reject(new Error(rpcError(event)));
       } else if (event.type === "tool_execution_end" && typeof event.toolName === "string") {
         this.backgroundReadiness.observeToolResult(event.toolName, event.result, event.isError === true);
-      } else if (event.type === "agent_settled") {
+      } else if (event.type === "agent_end") {
         this.settledCount += 1;
         const ready = this.settledWaiters.filter((waiter) => waiter.after < this.settledCount);
         this.settledWaiters = this.settledWaiters.filter((waiter) => waiter.after >= this.settledCount);
@@ -370,7 +369,6 @@ async function compactInterruptedSession(input: {
     "--thinking", input.thinkingLevel,
     "--session-id", input.sessionId,
     "--session-dir", input.sessionDir,
-    "--approve",
     ...input.args,
   ];
 
@@ -540,28 +538,24 @@ function abortError(signal?: AbortSignal): Error {
   return signal?.reason instanceof Error ? signal.reason : new Error("Executor recovery was cancelled.");
 }
 
-function normalizeAllowedTools(tools: readonly string[] | undefined): string[] | undefined {
-  if (!tools) return undefined;
+function requireAllowedTools(tools: readonly string[] | undefined): string[] {
+  if (!tools) {
+    throw new Error("Pi executor launch requires an authoritative tool allowlist for native --tools enforcement.");
+  }
   return [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
 }
 
-function childArgs(args: readonly string[], allowedTools: readonly string[] | undefined): string[] {
+function childArgs(args: readonly string[], allowedTools: readonly string[]): string[] {
   return [
     ...args,
-    ...(allowedTools ? ["--tools", allowedTools.join(",")] : []),
+    "--extension", resolve(__dirname, "../../index.js"),
+    "--tools", allowedTools.join(","),
   ];
 }
 
-function executorEnv(model: string, thinkingLevel: ThinkingLevel, allowedTools?: readonly string[]): NodeJS.ProcessEnv {
-  const env = reviewerEnv(process.env);
-  // Keep normal little-coder extensions except this gate; the kill-switch is
-  // authoritative and prevents nested automatic review.
-  if (process.env.LITTLE_CODER_EXTRA_EXTENSIONS) {
-    env.LITTLE_CODER_EXTRA_EXTENSIONS = process.env.LITTLE_CODER_EXTRA_EXTENSIONS;
-  }
-  if (process.env.PI_EXTRA_EXTENSIONS) {
-    env.PI_EXTRA_EXTENSIONS = process.env.PI_EXTRA_EXTENSIONS;
-  }
-  if (allowedTools) env.LITTLE_CODER_ALLOWED_TOOLS = allowedTools.join(",");
-  return withLittleCoderThinkingBudget(env, model, thinkingLevel);
+function executorEnv(): NodeJS.ProcessEnv {
+  return {
+    ...reviewerEnv(process.env),
+    PI_REVIEW_GATE_RUNTIME_ROLE: "executor",
+  };
 }

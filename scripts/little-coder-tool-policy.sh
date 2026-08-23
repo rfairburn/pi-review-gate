@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-
-# Launch-time inventory from Pi, bundled Little Coder extensions, and
-# pi-review-gate. ShellSession and dispatch are intentionally absent. ShellSession's local
-# execSync backend freezes the foreground UI. ShellSessionCwd and
-# ShellSessionReset remain allowed because the policy excludes only the
-# blocking command tool. First-class research subtasks replace dispatch.
-export LITTLE_CODER_ALLOWED_TOOLS="read,bash,edit,write,grep,find,ls,glob,webfetch,websearch,EvidenceAdd,EvidenceGet,EvidenceList,BrowserNavigate,BrowserClick,BrowserType,BrowserScroll,BrowserExtract,BrowserBack,BrowserHistory,ShellStart,ShellList,ShellLog,ShellSend,ShellStop,ShellSessionCwd,ShellSessionReset,SubtasksStart,SubtasksAdd,SubtasksInspect,SubtasksContinue,SubtasksSteer,SubtasksInterrupt,SubtasksForceMerge,SubtasksMarkClean"

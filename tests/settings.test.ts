@@ -219,16 +219,16 @@ test("internal executor uses the exact Pi model label and canonical value", asyn
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.deepEqual(saved.execution.workerResources, [{
-    resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s",
+    resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s",
     selection: {
-      source: "little-coder",
+      source: "pi",
       model: "openai-codex/gpt-5.6-sol",
     },
     maxConcurrent: 1,
   }]);
   assert.deepEqual(saved.execution.routes, {
-    execute: [{ resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s", thinkingLevel: "high" }],
-    research: [{ resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s", thinkingLevel: "high" }],
+    execute: [{ resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s", thinkingLevel: "high" }],
+    research: [{ resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s", thinkingLevel: "high" }],
   });
 });
 
@@ -295,7 +295,7 @@ test("reviewer picker includes scoped models and shared review-capable external 
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.deepEqual(saved.review.activeReviewers, [
-    { source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
+    { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
     { source: "external", id: "codex" },
   ]);
 });
@@ -428,15 +428,15 @@ test("internal executor and reviewers persist independent per-model reasoning le
   await writeFile(configPath, JSON.stringify({
     // This test exercises settings serialization, not executable discovery.
     // Keep the master gate disabled so it is portable to hosts where the
-    // little-coder launcher is not installed on PATH.
+    // pi launcher is not installed on PATH.
     enabled: false,
     execution: {
-      activeExecutor: { source: "little-coder", model: "openai-codex/gpt-5.6-luna" },
+      activeExecutor: { source: "pi", model: "openai-codex/gpt-5.6-luna" },
     },
     review: {
       activeReviewers: [
-        { source: "little-coder", model: "openai-codex/gpt-5.6-luna" },
-        { source: "little-coder", model: "openai-codex/gpt-5.6-sol" },
+        { source: "pi", model: "openai-codex/gpt-5.6-luna" },
+        { source: "pi", model: "openai-codex/gpt-5.6-sol" },
       ],
     },
   }), "utf8");
@@ -464,25 +464,25 @@ test("internal executor and reviewers persist independent per-model reasoning le
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.deepEqual(saved.execution.workerResources, [{
-    resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+    resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
     selection: {
-      source: "little-coder",
+      source: "pi",
       model: "openai-codex/gpt-5.6-luna",
     },
     maxConcurrent: 4,
   }]);
   assert.deepEqual(saved.execution.routes, {
     execute: [{
-      resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+      resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
       thinkingLevel: "max",
     }],
     research: [{
-      resourceId: "little-coder-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
+      resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
     }],
   });
   assert.deepEqual(saved.review.activeReviewers, [
-    { source: "little-coder", model: "openai-codex/gpt-5.6-luna", thinkingLevel: "max" },
-    { source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
+    { source: "pi", model: "openai-codex/gpt-5.6-luna", thinkingLevel: "max" },
+    { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
   ]);
 });
 

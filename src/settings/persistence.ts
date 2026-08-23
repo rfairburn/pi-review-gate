@@ -43,7 +43,7 @@ export async function persistReviewSettings(
     const resources = selection.workerResources ?? selection.executorPool ?? [];
     const defaultRoute = resources.map((entry) => ({
       resourceId: entry.entryId,
-      ...(entry.selection.source === "little-coder" && entry.selection.thinkingLevel
+      ...(entry.selection.source === "pi" && entry.selection.thinkingLevel
         ? { thinkingLevel: entry.selection.thinkingLevel }
         : {}),
     }));

@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { compareSnapshots, createWorkspaceSnapshot } from "../src/capture";
 import { normalizeConfig } from "../src/config";
 import { BackgroundExecutionController } from "../src/execution/background-controller";
-import { createState } from "../src/state";
+import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
 
 const execFileAsync = promisify(execFile);
 
@@ -112,12 +113,91 @@ test("background tasks return immediately, land independently, and additions cap
     await controller.detach();
     const restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
     await restored.restore(associations);
-    const restoredInspection = restored.inspect(first.executionId);
-    assert.equal(restoredInspection.tasks.filter((task) => task.state === "landed").length, 3);
-    assert.equal(restoredInspection.peakConcurrency, 2);
-    assert.ok(restoredInspection.tasks.every((task) => (task.stateHistory?.length ?? 0) >= 3));
+    const restoredAssociations = restored.associations();
+    assert.deepEqual(restoredAssociations.waveRoots, []);
+    assert.deepEqual(restoredAssociations.bundles, []);
+    assert.deepEqual(restoredAssociations.groupRoots, []);
+    assert.throws(() => restored.inspect(first.executionId), /Unknown execution group/);
     await restored.shutdown();
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("parallel independent landings accumulate in the parent review checkpoint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-checkpoint-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+
+    const executor = join(root, "checkpoint-executor.cjs");
+    await writeFile(executor, [
+      "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+      "process.stdin.on('end',()=>{",
+      "const task=prompt.includes('FIRST_CHECKPOINT')?['first.txt',100]:prompt.includes('SECOND_CHECKPOINT')?['second.txt',200]:['third.txt',350];",
+      "setTimeout(()=>{fs.writeFileSync(task[0],task[0]+' landed\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
+      "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));},task[1]);",
+      "});",
+    ].join("\n"), "utf8");
+
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "checkpoint",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
+      }],
+      execution: {
+        activeExecutor: { source: "external", id: "checkpoint" },
+        maxWorkers: 3,
+      },
+    });
+    const state = createState();
+    rememberUserRequest(state, "create three files with parallel subtasks and one parent file");
+    beginAgentRun(state);
+    const originalBaseline = await createWorkspaceSnapshot(root, {
+      maxFileBytes: config.maxFileBytes,
+      maxSnapshotBytes: config.maxSnapshotBytes,
+    });
+    setReviewWindowBaseline(state, originalBaseline);
+    await writeFile(join(root, "parent.txt"), "parent-authored\n", "utf8");
+
+    controller = new BackgroundExecutionController({ config, state, cwd: () => root, pi: {} });
+    const started = await controller.start([
+      { title: "first", instructions: "FIRST_CHECKPOINT", acceptanceCriteria: ["first.txt exists"] },
+      { title: "second", instructions: "SECOND_CHECKPOINT", acceptanceCriteria: ["second.txt exists"] },
+      { title: "third", instructions: "THIRD_CHECKPOINT", acceptanceCriteria: ["third.txt exists"] },
+    ]);
+    await waitFor(() => controller!.inspect(started.executionId).tasks.every((task) => task.state === "landed"), 30_000);
+
+    const checkpoint = activeExchangeBaseline(state);
+    assert.ok(checkpoint);
+    const current = await createWorkspaceSnapshot(root, {
+      maxFileBytes: config.maxFileBytes,
+      maxSnapshotBytes: config.maxSnapshotBytes,
+      reuseUnchangedFrom: checkpoint,
+    });
+    assert.deepEqual(compareSnapshots(checkpoint, current).map((change) => change.path), ["parent.txt"]);
+    const owned = controller.associations();
+    assert.equal(owned.groupRoots?.length, 1);
+    assert.equal(owned.waveRoots.length, 3);
+    await controller.shutdown();
+    await controller.cleanupSettledArtifacts();
+    assert.deepEqual(controller.associations().groupRoots, []);
+    assert.deepEqual(controller.associations().waveRoots, []);
+    for (const path of [...(owned.groupRoots ?? []), ...owned.waveRoots]) {
+      await assert.rejects(access(path), /ENOENT/);
+    }
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

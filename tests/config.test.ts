@@ -24,40 +24,11 @@ test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
 
     const loaded = loadConfig({
       PI_REVIEW_GATE_CONFIG: path,
-      LITTLE_CODER_REVIEW_CONFIG: "/should/not/use.json",
     });
 
     assert.equal(loaded.path, path);
     assert.equal(loaded.config.enabled, true);
     assert.equal(loaded.config.decider?.id, "fake");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("loadConfig supports little-coder config env as compatibility alias", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-config-alias-"));
-  try {
-    const path = join(dir, "config.json");
-    await writeFile(
-      path,
-      JSON.stringify({
-        enabled: true,
-        decider: {
-          id: "alias",
-          adapter: "generic-cli",
-          command: "node",
-        },
-      }),
-      "utf8",
-    );
-
-    const loaded = loadConfig({
-      LITTLE_CODER_REVIEW_CONFIG: path,
-    });
-
-    assert.equal(loaded.path, path);
-    assert.equal(loaded.config.decider?.id, "alias");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -70,6 +41,26 @@ test("loadConfig supports PI_REVIEW_GATE_DISABLED", () => {
 
   assert.equal(loaded.config.enabled, false);
   assert.equal(loaded.disabledReason, "PI_REVIEW_GATE_DISABLED is set");
+});
+
+test("native web tooling has bounded defaults and validates overrides", () => {
+  const defaults = normalizeConfig({}).web!;
+  assert.equal(defaults.enabled, true);
+  assert.equal(defaults.search.provider, "duckduckgo");
+  assert.equal(defaults.search.maxResults, 10);
+  assert.equal(defaults.fetch.cacheMaxEntries, 32);
+  assert.equal(defaults.fetch.cacheMaxBytes, 64 * 1024 * 1024);
+
+  const configured = normalizeConfig({ web: {
+    search: { timeoutMs: 1234, maxResults: 7 },
+    fetch: { maxOutputChars: 9000, cacheMaxEntries: 4 },
+  } }).web!;
+  assert.equal(configured.search.timeoutMs, 1234);
+  assert.equal(configured.search.maxResults, 7);
+  assert.equal(configured.fetch.maxOutputChars, 9000);
+  assert.equal(configured.fetch.cacheMaxEntries, 4);
+  assert.throws(() => normalizeConfig({ web: { search: { provider: "unknown" } } }), /provider must be duckduckgo/);
+  assert.throws(() => normalizeConfig({ web: { fetch: { cacheMaxBytes: 0 } } }), /web\.fetch\.cacheMaxBytes/);
 });
 
 test("normalizeConfig preserves the global subtasks view preference", () => {
@@ -141,7 +132,7 @@ test("configured timeouts apply to internal models and unoverridden external rol
     executorTimeoutMs: 3600000,
     review: {
       activeReviewers: [
-        { source: "little-coder", model: "openai-codex/gpt-5.6-luna" },
+        { source: "pi", model: "openai-codex/gpt-5.6-luna" },
         { source: "external", id: "codex" },
       ],
     },
@@ -190,12 +181,12 @@ test("normalizeConfig rejects coercible booleans and invalid retention values", 
   }), /args must be an array of strings/);
 });
 
-test("normalizeConfig keeps little-coder model selection generic", () => {
+test("normalizeConfig keeps pi model selection generic", () => {
   const loaded = normalizeConfig({
     enabled: true,
     decider: {
       id: "glm",
-      adapter: "little-coder-model",
+      adapter: "pi-model",
       model: "ollama/glm-5.2",
       thinkingLevel: "medium",
     },
@@ -203,8 +194,8 @@ test("normalizeConfig keeps little-coder model selection generic", () => {
 
   assert.deepEqual(loaded.decider, {
     id: "glm",
-    adapter: "little-coder-model",
-    command: "little-coder",
+    adapter: "pi-model",
+    command: "pi",
     args: [],
     model: "ollama/glm-5.2",
     thinkingLevel: "medium",
@@ -212,12 +203,21 @@ test("normalizeConfig keeps little-coder model selection generic", () => {
   });
 });
 
+test("normalizeConfig rejects competing Pi tool-policy arguments", () => {
+  for (const flag of ["--tools", "--tools=read", "-t", "--exclude-tools", "-xt", "--no-tools", "-nt", "--no-builtin-tools", "-nbt"]) {
+    assert.throws(() => normalizeConfig({
+      enabled: true,
+      decider: { id: "pi", adapter: "pi-model", model: "provider/model", args: [flag] },
+    }), /one native --tools allowlist/, flag);
+  }
+});
+
 test("normalizeConfig rejects unsupported internal thinking levels", () => {
   assert.throws(() => normalizeConfig({
     enabled: true,
     review: {
       activeReviewers: [{
-        source: "little-coder",
+        source: "pi",
         model: "openai-codex/gpt-5.6-sol",
         thinkingLevel: "ultra",
       }],
@@ -326,7 +326,7 @@ test("normalizeConfig preserves internal and external executor selections", () =
     enabled: true,
     enabledReviewerIds: [],
     execution: {
-      activeExecutor: { source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
+      activeExecutor: { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
       externalExecutors: [
         { id: "codex", adapter: "codex-cli", command: "codex", model: "gpt-5.6-sol" },
         {
@@ -340,7 +340,7 @@ test("normalizeConfig preserves internal and external executor selections", () =
   });
 
   assert.deepEqual(internal.execution?.activeExecutor, {
-    source: "little-coder",
+    source: "pi",
     model: "openai-codex/gpt-5.6-sol",
     thinkingLevel: "high",
   });
@@ -354,7 +354,7 @@ test("normalizeConfig preserves an ordered executor pool with per-model capacity
       executorPool: [
         {
           entryId: "local-primary",
-          selection: { source: "little-coder", model: "qwen/local", thinkingLevel: "high" },
+          selection: { source: "pi", model: "qwen/local", thinkingLevel: "high" },
           maxConcurrent: 1,
         },
         {
@@ -369,7 +369,7 @@ test("normalizeConfig preserves an ordered executor pool with per-model capacity
   assert.deepEqual(resolvedExecutorPool(config), [
     {
       entryId: "local-primary",
-      selection: { source: "little-coder", model: "qwen/local", thinkingLevel: "high" },
+      selection: { source: "pi", model: "qwen/local", thinkingLevel: "high" },
       maxConcurrent: 1,
     },
     {
@@ -415,7 +415,7 @@ test("worker resources have shared capacity and independently ordered, excluding
       workerResources: [
         {
           resourceId: "qwen",
-          selection: { source: "little-coder", model: "qwen/local", thinkingLevel: "high" },
+          selection: { source: "pi", model: "qwen/local", thinkingLevel: "high" },
           maxConcurrent: 1,
         },
         {
@@ -446,12 +446,12 @@ test("worker resources have shared capacity and independently ordered, excluding
     ["qwen", 1], ["deepseek", 3], ["luna", 4],
   ]);
   assert.deepEqual(resolvedWorkerRoute(config, "execute").map((entry) => [entry.entryId, entry.selection]), [
-    ["qwen", { source: "little-coder", model: "qwen/local", thinkingLevel: "max" }],
+    ["qwen", { source: "pi", model: "qwen/local", thinkingLevel: "max" }],
     ["deepseek", { source: "external", id: "deepseek" }],
   ]);
   assert.deepEqual(resolvedWorkerRoute(config, "research").map((entry) => [entry.entryId, entry.selection]), [
     ["luna", { source: "external", id: "luna" }],
-    ["qwen", { source: "little-coder", model: "qwen/local", thinkingLevel: "medium" }],
+    ["qwen", { source: "pi", model: "qwen/local", thinkingLevel: "medium" }],
   ]);
   assert.equal(resolvedWorkerRoute(config, "research").some((entry) => entry.entryId === "deepseek"), false);
 });
@@ -542,19 +542,19 @@ test("shared external agents resolve independently for review and execution", ()
   });
 });
 
-test("scoped little-coder models resolve as reviewers only when currently available", () => {
+test("scoped pi models resolve as reviewers only when currently available", () => {
   const config = normalizeConfig({
     enabled: true,
     review: {
-      activeReviewers: [{ source: "little-coder", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "max" }],
+      activeReviewers: [{ source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "max" }],
     },
   });
 
   assert.equal(automaticReviewEnabled(config), false);
-  assert.deepEqual(resolveReviewers(config).unknownIds, ["little-coder:openai-codex/gpt-5.6-sol"]);
+  assert.deepEqual(resolveReviewers(config).unknownIds, ["pi:openai-codex/gpt-5.6-sol"]);
   const resolved = resolveReviewers(config, ["openai-codex/gpt-5.6-sol"]);
   assert.equal(resolved.unknownIds.length, 0);
-  assert.equal(resolved.reviewers[0]?.adapter, "little-coder-model");
+  assert.equal(resolved.reviewers[0]?.adapter, "pi-model");
   assert.equal("model" in resolved.reviewers[0]! ? resolved.reviewers[0].model : undefined, "openai-codex/gpt-5.6-sol");
   assert.equal("thinkingLevel" in resolved.reviewers[0]! ? resolved.reviewers[0].thinkingLevel : undefined, "max");
   assert.equal(automaticReviewEnabled(config, ["openai-codex/gpt-5.6-sol"]), true);

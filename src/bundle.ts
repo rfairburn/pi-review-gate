@@ -11,6 +11,7 @@ import {
   buildReviewerQuestionPrompt,
   buildReviewerInstructions,
   REVIEW_AUTHORIZATION_POLICY,
+  REVIEW_OUTCOME_POLICY,
   REVIEW_RESPONSE_FORMAT,
   REVIEW_TEST_POLICY,
   type ImplementationGuidanceEscalation,
@@ -280,6 +281,7 @@ function buildBundlePrompt(dir: string, invocationDir: string, question: boolean
   return [
     `You are an independent read-only ${question ? "reviewer answering a question" : "code reviewer"}.`,
     REVIEW_AUTHORIZATION_POLICY,
+    REVIEW_OUTCOME_POLICY,
     REVIEW_TEST_POLICY,
     `The authoritative evidence bundle is ${dir}.`,
     `Read ${join(dir, "REVIEW.md")} and ${join(invocationDir, "reviewer-instructions.md")} first, then follow the targeted evidence routing. Inspect the current workspace and the latest exchange files before expanding into historical or complete fallback context.`,

@@ -10,7 +10,7 @@ import { createState, getReviewerQuestionWindow, recordReviewerFeedback, remembe
 import { fakeNeedsChangesConfig } from "./helpers";
 
 test("reviewer command output shows internal model labels instead of encoded reviewer ids", async () => {
-  const reviewerId = "little-coder-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ";
+  const reviewerId = "pi-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ";
   const displayLabel = "ollama/deepseek-v4-flash:0731-cloud";
   const answer = formatReviewerAnswer("is this safe?", [{
     reviewerId,
@@ -20,7 +20,7 @@ test("reviewer command output shows internal model labels instead of encoded rev
   }], { [reviewerId]: displayLabel });
 
   assert.match(answer, /## ollama\/deepseek-v4-flash:0731-cloud — pass/);
-  assert.doesNotMatch(answer, /little-coder-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ/);
+  assert.doesNotMatch(answer, /pi-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ/);
 
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
   const notices: string[] = [];
@@ -35,7 +35,7 @@ test("reviewer command output shows internal model labels instead of encoded rev
       ...fakeNeedsChangesConfig(),
       decider: {
         id: reviewerId,
-        adapter: "little-coder-model",
+        adapter: "pi-model",
         model: displayLabel,
         timeoutMs: 15000,
       },
@@ -45,7 +45,7 @@ test("reviewer command output shows internal model labels instead of encoded rev
   await commands.get("review-gate-ping")?.("", { notify(message: string) { notices.push(message); } });
 
   assert.match(notices[0] ?? "", /reviewers=ollama\/deepseek-v4-flash:0731-cloud/);
-  assert.doesNotMatch(notices[0] ?? "", /little-coder-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ/);
+  assert.doesNotMatch(notices[0] ?? "", /pi-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ/);
 });
 
 test("/review-pause and /review-unpause gate explicit reviewer commands", async () => {

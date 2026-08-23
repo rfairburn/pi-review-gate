@@ -11,6 +11,7 @@ import {
   recordAcceptedReviewerQuestion,
   recordToolCallEvidence,
   rememberFinalAssistantSummary,
+  rememberFinalAssistantSummaryText,
   shouldRecordToolCallEvidence,
   shouldRecordToolResultEvidence,
 } from "../src/evidence";
@@ -190,6 +191,21 @@ test("rememberFinalAssistantSummary keeps multiple turn summaries for continued 
   assert.match(bundle.markdown, /first summary/);
   assert.match(bundle.markdown, /Summary 2/);
   assert.match(bundle.markdown, /second summary/);
+});
+
+test("rememberFinalAssistantSummaryText bounds and redacts adapter-extracted responses", () => {
+  const state = createEvidenceState();
+
+  rememberFinalAssistantSummaryText(
+    state,
+    `  Completion reported with api_key=${"x".repeat(48)}. ${"a".repeat(5000)}  `,
+  );
+
+  assert.equal(state.finalAssistantSummaries.length, 1);
+  assert.ok(state.finalAssistantSummaries[0]!.length <= 4020);
+  assert.match(state.finalAssistantSummaries[0]!, /\[\.\.\. truncated \.\.\.\]$/);
+  assert.doesNotMatch(state.finalAssistantSummaries[0]!, /x{48}/);
+  assert.match(state.finalAssistantSummaries[0]!, /Completion reported/);
 });
 
 test("review-window evidence does not discard older assistant summaries", () => {

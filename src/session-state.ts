@@ -217,6 +217,7 @@ export function replaceReviewGateState(target: ReviewGateState, restored: Review
   target.nextReviewWindowId = restored.nextReviewWindowId;
   target.reviewWindow = restored.reviewWindow;
   target.lastQuestionWindow = restored.lastQuestionWindow;
+  target.ownedBundleDirs = restored.ownedBundleDirs;
   target.pendingAcceptedReviewerQuestions = restored.pendingAcceptedReviewerQuestions;
   target.reviewsPaused = restored.reviewsPaused;
   // A prior process cannot still own an in-process review in this runtime.
@@ -249,6 +250,7 @@ function serializeState(state: ReviewGateState): PersistedReviewGateState {
 function deserializeState(state: PersistedReviewGateState): ReviewGateState {
   return {
     nextReviewWindowId: state.nextReviewWindowId,
+    ownedBundleDirs: new Set(),
     reviewWindow: state.reviewWindow ? deserializeWindow(state.reviewWindow) : undefined,
     lastQuestionWindow: state.lastQuestionWindow ? deserializeWindow(state.lastQuestionWindow) : undefined,
     pendingAcceptedReviewerQuestions: state.pendingAcceptedReviewerQuestions.map((entry) => ({ ...entry })),

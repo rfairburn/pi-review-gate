@@ -340,7 +340,7 @@ function initialWorkerRoute(
   return resolved.flatMap((entry) => resources.some((resource) => resource.entryId === entry.entryId)
     ? [{
         resourceId: entry.entryId,
-        thinkingLevel: entry.selection.source === "little-coder" ? entry.selection.thinkingLevel : undefined,
+        thinkingLevel: entry.selection.source === "pi" ? entry.selection.thinkingLevel : undefined,
       }]
     : []);
 }
@@ -352,7 +352,7 @@ function reconcileWorkerRoute(route: WorkerRouteEntry[], resources: ExecutorPool
 
 function defaultWorkerRouteEntry(resource: ExecutorPoolEntry, scoped: ScopedModelChoice[]): WorkerRouteEntry {
   const selection = resource.selection;
-  const choice = selection.source === "little-coder"
+  const choice = selection.source === "pi"
     ? scoped.find((candidate) => candidate.model === selection.model)
     : undefined;
   return {
@@ -384,7 +384,7 @@ async function selectWorkerRoute(
         const resource = available[index]!;
         route.push({
           resourceId: resource.entryId,
-          thinkingLevel: resource.selection.source === "little-coder" ? resource.selection.thinkingLevel : undefined,
+          thinkingLevel: resource.selection.source === "pi" ? resource.selection.thinkingLevel : undefined,
         });
       }
       continue;
@@ -398,7 +398,7 @@ async function selectWorkerRoute(
         ["Thinking", routeThinkingSummary(entry, resource, scoped)],
       ]);
       const options = [
-        ...(resource.selection.source === "little-coder" ? [thinkingRow] : []),
+        ...(resource.selection.source === "pi" ? [thinkingRow] : []),
         ...(index > 0 ? ["Move up"] : []),
         ...(index < route.length - 1 ? ["Move down"] : []),
         "Exclude from this route",
@@ -406,7 +406,7 @@ async function selectWorkerRoute(
       ];
       const edit = await ui.select(`${title} — ${executorSelectionLabel(resource.selection, agents, scoped)}`, options);
       if (!edit || edit === "Back") break;
-      if (edit === thinkingRow && resource.selection.source === "little-coder") {
+      if (edit === thinkingRow && resource.selection.source === "pi") {
         const selection = resource.selection;
         const model = scoped.find((candidate) => candidate.model === selection.model);
         if (model) entry.thinkingLevel = await selectThinkingLevel(
@@ -492,7 +492,7 @@ async function selectExecutorModel(
   const choices: Array<{ label: string; selection: ExecutorSelection; model?: ScopedModelChoice }> = [
     ...scoped.map((model) => ({
       label: model.label,
-      selection: { source: "little-coder" as const, model: model.model },
+      selection: { source: "pi" as const, model: model.model },
       model,
     })),
     ...agents.filter(externalAgentSupportsExecution).map((agent) => ({
@@ -524,8 +524,8 @@ async function selectReviewers(
   let selected = initial.map(cloneReviewerSelection);
   const availableRows = (): Array<{ key: string; value: ActiveReviewerSelection; label: string }> => [
     ...scoped.map((choice) => ({
-      key: reviewerKey({ source: "little-coder", model: choice.model }),
-      value: { source: "little-coder" as const, model: choice.model },
+      key: reviewerKey({ source: "pi", model: choice.model }),
+      value: { source: "pi" as const, model: choice.model },
       label: choice.label,
     })),
     ...agents.filter(externalAgentSupportsReview).map((agent) => ({
@@ -539,11 +539,11 @@ async function selectReviewers(
     const availableKeys = new Set(rows.map((row) => row.key));
     const unavailable = selected.filter((selection) => !availableKeys.has(reviewerKey(selection)));
     const reasoningRows = rows.flatMap((row) => {
-      if (row.value.source !== "little-coder" || !hasReviewer(selected, row.value)) return [];
+      if (row.value.source !== "pi" || !hasReviewer(selected, row.value)) return [];
       const model = row.value.model;
       const selection = selected.find((candidate) => reviewerKey(candidate) === row.key);
       const choice = scoped.find((candidate) => candidate.model === model);
-      if (!selection || selection.source !== "little-coder" || !choice) return [];
+      if (!selection || selection.source !== "pi" || !choice) return [];
       const level = effectiveThinkingLevel(selection.thinkingLevel, choice);
       return [{ label: `Reasoning · ${row.label}  ${thinkingLevelLabel(level)}`, selection, choice }];
     });
@@ -559,11 +559,11 @@ async function selectReviewers(
     if (!choice || choice === "Back") return selected;
     if (choice === "Enable all") {
       selected = rows.map((row) => {
-        if (row.value.source !== "little-coder") return cloneReviewerSelection(row.value);
+        if (row.value.source !== "pi") return cloneReviewerSelection(row.value);
         const model = row.value.model;
         const modelChoice = scoped.find((candidate) => candidate.model === model)!;
         const existing = selected.find((candidate) => reviewerKey(candidate) === row.key);
-        const existingLevel = existing?.source === "little-coder" ? existing.thinkingLevel : undefined;
+        const existingLevel = existing?.source === "pi" ? existing.thinkingLevel : undefined;
         return { ...row.value, thinkingLevel: effectiveThinkingLevel(existingLevel, modelChoice) };
       });
       continue;
@@ -590,7 +590,7 @@ async function selectReviewers(
     if (value) {
       if (hasReviewer(selected, value)) {
         selected = selected.filter((candidate) => reviewerKey(candidate) !== reviewerKey(value));
-      } else if (value.source === "little-coder") {
+      } else if (value.source === "pi") {
         const modelChoice = scoped.find((candidate) => candidate.model === value.model);
         const thinkingLevel = modelChoice
           ? await selectThinkingLevel(ui, modelChoice, effectiveThinkingLevel(value.thinkingLevel, modelChoice))
@@ -717,10 +717,10 @@ async function validateSelection(
       if (kind === "Research" && !workerResourceSupportsResearch(config, resource)) {
         return `Research priority resource is not research-capable: ${entry.resourceId}`;
       }
-      if (entry.thinkingLevel && resource.selection.source !== "little-coder") {
+      if (entry.thinkingLevel && resource.selection.source !== "pi") {
         return `${kind} priority cannot override thinking for external resource: ${entry.resourceId}`;
       }
-      if (entry.thinkingLevel && resource.selection.source === "little-coder") {
+      if (entry.thinkingLevel && resource.selection.source === "pi") {
         const selection = resource.selection;
         const model = scoped.find((candidate) => candidate.model === selection.model);
         if (!model?.supportedThinkingLevels.includes(entry.thinkingLevel)) {
@@ -734,13 +734,13 @@ async function validateSelection(
       return `Executor maximum concurrency must be between 1 and ${MAX_EXECUTION_WORKERS}: ${entry.entryId}`;
     }
     const selection = entry.selection;
-    if (selection.source === "little-coder") {
+    if (selection.source === "pi") {
       const choice = scoped.find((candidate) => candidate.model === selection.model);
-      if (!choice) return `Little-coder executor model is not currently scoped: ${selection.model}`;
+      if (!choice) return `Pi executor model is not currently scoped: ${selection.model}`;
       if (selection.thinkingLevel && !choice.supportedThinkingLevels.includes(selection.thinkingLevel)) {
-        return `Little-coder executor reasoning is unsupported for ${selection.model}: ${selection.thinkingLevel}`;
+        return `Pi executor reasoning is unsupported for ${selection.model}: ${selection.thinkingLevel}`;
       }
-      if (config.enabled && !await commandAvailable("little-coder")) return "Executor executable is unavailable: little-coder";
+      if (config.enabled && !await commandAvailable("pi")) return "Executor executable is unavailable: pi";
       continue;
     }
     const agent = agentsById.get(selection.id);
@@ -748,13 +748,13 @@ async function validateSelection(
     if (!await commandAvailable(agent.command!)) return `Executor executable is unavailable: ${agent.command}`;
   }
   for (const reviewer of reviewers) {
-    if (reviewer.source === "little-coder") {
+    if (reviewer.source === "pi") {
       const choice = scoped.find((candidate) => candidate.model === reviewer.model);
-      if (!scopedModels.has(reviewer.model) || !choice) return `Little-coder reviewer model is not currently scoped: ${reviewer.model}`;
+      if (!scopedModels.has(reviewer.model) || !choice) return `Pi reviewer model is not currently scoped: ${reviewer.model}`;
       if (reviewer.thinkingLevel && !choice.supportedThinkingLevels.includes(reviewer.thinkingLevel)) {
-        return `Little-coder reviewer reasoning is unsupported for ${reviewer.model}: ${reviewer.thinkingLevel}`;
+        return `Pi reviewer reasoning is unsupported for ${reviewer.model}: ${reviewer.thinkingLevel}`;
       }
-      if (config.enabled && !await commandAvailable("little-coder")) return "Reviewer executable is unavailable: little-coder";
+      if (config.enabled && !await commandAvailable("pi")) return "Reviewer executable is unavailable: pi";
       continue;
     }
     const agent = agentsById.get(reviewer.id);
@@ -768,8 +768,8 @@ function initialReviewerSelections(config: ReviewGateConfig): ActiveReviewerSele
   if (config.review?.activeReviewers !== undefined) {
     return config.review.activeReviewers.map(cloneReviewerSelection);
   }
-  return resolveReviewers(config).reviewers.map((reviewer) => reviewer.adapter === "little-coder-model"
-    ? { source: "little-coder" as const, model: reviewer.model, thinkingLevel: reviewer.thinkingLevel }
+  return resolveReviewers(config).reviewers.map((reviewer) => reviewer.adapter === "pi-model"
+    ? { source: "pi" as const, model: reviewer.model, thinkingLevel: reviewer.thinkingLevel }
     : { source: "external" as const, id: reviewer.id });
 }
 
@@ -813,7 +813,7 @@ function executorPoolEntrySummary(entry: ExecutorPoolEntry, agents: ExternalAgen
 }
 
 function executorSelectionLabel(selection: ExecutorSelection, agents: ExternalAgentConfig[], scoped: ScopedModelChoice[]): string {
-  if (selection.source === "little-coder") {
+  if (selection.source === "pi") {
     return scoped.find((candidate) => candidate.model === selection.model)?.label ?? `${selection.model} [unavailable]`;
   }
   const agent = agents.find((candidate) => candidate.id === selection.id && externalAgentSupportsExecution(candidate));
@@ -829,11 +829,11 @@ function executorThinkingSummary(selection: ExecutorSelection, scoped: ScopedMod
 }
 
 function reviewerSelectionLabel(selection: ActiveReviewerSelection): string {
-  return selection.source === "little-coder" ? selection.model : selection.id;
+  return selection.source === "pi" ? selection.model : selection.id;
 }
 
 function reviewerKey(selection: ActiveReviewerSelection): string {
-  return selection.source === "little-coder" ? `little-coder:${selection.model}` : `external:${selection.id}`;
+  return selection.source === "pi" ? `pi:${selection.model}` : `external:${selection.id}`;
 }
 
 function hasReviewer(values: ActiveReviewerSelection[], target: ActiveReviewerSelection): boolean {
@@ -850,7 +850,7 @@ function cloneExecutorPoolEntry(entry: ExecutorPoolEntry): ExecutorPoolEntry {
 
 function withoutResourceThinking(entry: ExecutorPoolEntry): ExecutorPoolEntry {
   const cloned = cloneExecutorPoolEntry(entry);
-  if (cloned.selection.source === "little-coder") delete cloned.selection.thinkingLevel;
+  if (cloned.selection.source === "pi") delete cloned.selection.thinkingLevel;
   return cloned;
 }
 
@@ -861,7 +861,7 @@ function materializeExecutorPool(
   return entries.map((entry) => {
     const cloned = cloneExecutorPoolEntry(entry);
     const selection = cloned.selection;
-    if (selection.source !== "little-coder") return cloned;
+    if (selection.source !== "pi") return cloned;
     const choice = scoped.find((candidate) => candidate.model === selection.model);
     return choice
       ? {
@@ -880,7 +880,7 @@ function materializeReviewerThinking(
   scoped: ScopedModelChoice[],
 ): ActiveReviewerSelection[] {
   return values.map((value) => {
-    if (value.source !== "little-coder") return cloneReviewerSelection(value);
+    if (value.source !== "pi") return cloneReviewerSelection(value);
     const choice = scoped.find((candidate) => candidate.model === value.model);
     return choice ? { ...value, thinkingLevel: effectiveThinkingLevel(value.thinkingLevel, choice) } : { ...value };
   });

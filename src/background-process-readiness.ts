@@ -13,7 +13,7 @@ export interface BackgroundReadinessSnapshot {
 const SHELL_START_RESULT = /Started\s+"([^"]*)"\s+as\s+(\S+)\s+\(pid\s+(\d+)\)\./i;
 
 /**
- * Best-effort readiness tracking for Little Coder's ShellStart tool. The
+ * Best-effort readiness tracking for the ShellStart tool contract. The
  * detached child pid is also its process-group id, so group liveness remains
  * authoritative even when the shell leader exits before a descendant.
  */

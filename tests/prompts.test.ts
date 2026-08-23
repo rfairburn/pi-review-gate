@@ -35,6 +35,25 @@ test("reviewer prompt treats orchestrator direction as authorized and forbids us
   assert.match(prompt, /Targeted tests are the expected verification inside delegated implementation and correction loops/);
   assert.match(prompt, /Do not return "needs_changes" merely because the full repository test suite was not run/);
   assert.match(prompt, /full-suite final orchestration run only as a non_blocking observation/);
+  assert.match(prompt, /Submitted workspace changes define the parent exchange's review scope, not a delivery artifact/);
+  assert.match(prompt, /Independently reviewed subtask landings may be present in the live workspace but intentionally absent/);
+  assert.match(prompt, /do not flag that absence alone/);
+});
+
+test("reviewer prompt judges verified outcomes instead of preferred process", () => {
+  const prompt = buildReviewerPrompt({
+    request: "produce the requested final output",
+    submittedChanges: [],
+    patch: "",
+    cwd: "/tmp/project",
+  });
+
+  assert.match(prompt, /Judge the delivered outcome against the explicit request and acceptance criteria, not against a preferred implementation or process/);
+  assert.match(prompt, /current workspace and independently verifiable final behavior are authoritative/);
+  assert.match(prompt, /Missing evidence that an intermediate step occurred is not a defect when the final state proves the required outcome/);
+  assert.match(prompt, /method as material only when the request makes it part of the deliverable or when safety, security, migration, destructive-operation, or audit semantics depend on it/);
+  assert.match(prompt, /Missing verification is blocking only when it leaves a concrete material risk/);
+  assert.match(prompt, /recommend the smallest targeted verification that would resolve it; do not demand redundant proof/);
 });
 
 test("every review prompt requests implementation-ready Markdown guidance", () => {
@@ -128,6 +147,8 @@ test("agentic reviewer bundle prompt permits only read-only filesystem commands 
 
     assert.match(bundle.bundlePrompt, /strictly read-only commands such as pwd, ls, find, rg, grep, sed, cat/);
     assert.match(bundle.bundlePrompt, /Never modify files, run commands with persistent side effects/);
+    assert.match(bundle.bundlePrompt, /current workspace and independently verifiable final behavior are authoritative/);
+    assert.match(bundle.bundlePrompt, /smallest targeted verification that would resolve it/);
     assert.doesNotMatch(bundle.bundlePrompt, /Do not modify files, run shell commands/);
     assert.match(bundle.bundlePrompt, /"verdict": "pass" \| "needs_changes" \| "error"/);
     assert.match(bundle.bundlePrompt, /targeted evidence routing/);

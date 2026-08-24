@@ -78,6 +78,8 @@ describe("bg-shell against real processes", () => {
       label: "quick",
     }));
     expect(started).toContain("Started \"quick\"");
+    expect(started).toContain("currently running");
+    expect(started).toContain("Future wake triggers (not current events): exit.");
     // The description promises the model it does not need to poll; the start
     // message must say so too or the model will poll anyway.
     expect(started).toContain("do not poll");

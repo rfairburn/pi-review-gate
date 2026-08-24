@@ -8,7 +8,7 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 export type ThinkingLevel = typeof THINKING_LEVELS[number];
 
 export interface WebSearchConfig {
-  provider: "duckduckgo";
+  provider: "ddgs";
   timeoutMs: number;
   maxResults: number;
 }
@@ -237,7 +237,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   retainBundles: "on-failure",
   web: {
     enabled: true,
-    search: { provider: "duckduckgo", timeoutMs: 20_000, maxResults: 10 },
+    search: { provider: "ddgs", timeoutMs: 20_000, maxResults: 10 },
     fetch: {
       timeoutMs: 30_000,
       maxDownloadBytes: 50 * 1024 * 1024,
@@ -339,8 +339,9 @@ function normalizeWeb(value: unknown): WebConfig {
   const fetch = value.fetch === undefined ? {} : value.fetch;
   if (!isRecord(search)) throw new Error("web.search must be an object");
   if (!isRecord(fetch)) throw new Error("web.fetch must be an object");
-  const provider = search.provider ?? defaults.search.provider;
-  if (provider !== "duckduckgo") throw new Error("web.search.provider must be duckduckgo");
+  const configuredProvider = search.provider ?? defaults.search.provider;
+  if (configuredProvider !== "ddgs" && configuredProvider !== "duckduckgo") throw new Error("web.search.provider must be ddgs");
+  const provider = "ddgs" as const;
   const userAgent = fetch.userAgent ?? defaults.fetch.userAgent;
   if (typeof userAgent !== "string" || userAgent.trim().length === 0) throw new Error("web.fetch.userAgent must be a non-empty string");
   return {

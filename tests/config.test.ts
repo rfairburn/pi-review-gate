@@ -46,7 +46,7 @@ test("loadConfig supports PI_REVIEW_GATE_DISABLED", () => {
 test("native web tooling has bounded defaults and validates overrides", () => {
   const defaults = normalizeConfig({}).web!;
   assert.equal(defaults.enabled, true);
-  assert.equal(defaults.search.provider, "duckduckgo");
+  assert.equal(defaults.search.provider, "ddgs");
   assert.equal(defaults.search.maxResults, 10);
   assert.equal(defaults.fetch.maxDownloadBytes, 50 * 1024 * 1024);
   assert.equal(defaults.fetch.cacheMaxEntries, 32);
@@ -61,7 +61,8 @@ test("native web tooling has bounded defaults and validates overrides", () => {
   assert.equal(configured.fetch.maxDownloadBytes, 75 * 1024 * 1024);
   assert.equal(configured.fetch.maxOutputChars, 9000);
   assert.equal(configured.fetch.cacheMaxEntries, 4);
-  assert.throws(() => normalizeConfig({ web: { search: { provider: "unknown" } } }), /provider must be duckduckgo/);
+  assert.equal(normalizeConfig({ web: { search: { provider: "duckduckgo" } } }).web!.search.provider, "ddgs");
+  assert.throws(() => normalizeConfig({ web: { search: { provider: "unknown" } } }), /provider must be ddgs/);
   assert.throws(() => normalizeConfig({ web: { fetch: { cacheMaxBytes: 0 } } }), /web\.fetch\.cacheMaxBytes/);
 });
 

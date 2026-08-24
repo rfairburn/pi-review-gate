@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG, type ReviewGateConfig, type WebConfig } from "../config";
 import { renderWithChromium } from "./browser";
 import { WebPageCache, type WebFetchResult } from "./cache";
-import { searchDuckDuckGo, type SearchResponse } from "./network";
+import { searchDdgs, type SearchResponse } from "./network";
 
 interface PiWebTool {
   name: string;
@@ -67,7 +67,7 @@ export class WebToolManager {
         maxResults: integerSchema(`Maximum results, 1-${this.webConfig.search.maxResults}.`),
         domain: stringSchema("Optional domain to constrain with a site: filter."),
         excludeDomains: stringArraySchema("Optional domains to exclude from the search."),
-        region: stringSchema("Optional DuckDuckGo region such as us-en."),
+        region: stringSchema("Optional search region such as us-en."),
         freshness: enumSchema(["day", "week", "month", "year"], "Optional freshness window."),
         cursor: stringSchema("Opaque continuation cursor from a previous WebSearch response. Repeat the same query and filters."),
       }, ["query"]),
@@ -76,7 +76,7 @@ export class WebToolManager {
           const query = requiredString(params.query, "query");
           const maxResults = boundedInteger(params.maxResults, 1, this.webConfig.search.maxResults, this.webConfig.search.maxResults, "maxResults");
           const excludeDomains = optionalStringArray(params.excludeDomains, "excludeDomains");
-          const response = await searchDuckDuckGo({
+          const response = await searchDdgs({
             query,
             maxResults,
             ...(optionalString(params.domain) ? { domain: optionalString(params.domain) } : {}),
@@ -86,8 +86,6 @@ export class WebToolManager {
             ...(optionalString(params.cursor) ? { cursor: optionalString(params.cursor) } : {}),
             options: {
               timeoutMs: this.webConfig.search.timeoutMs,
-              maxBytes: 2 * 1024 * 1024,
-              userAgent: this.webConfig.fetch.userAgent,
               signal,
             },
           });

@@ -4,7 +4,7 @@ import test from "node:test";
 import { normalizeConfig } from "../src/config";
 import { assertSuccessfulBrowserNavigation } from "../src/web/browser";
 import { WebPageCache } from "../src/web/cache";
-import { canonicalSearchUrl, parseDuckDuckGoResults, searchDuckDuckGo, type DownloadedText, type NetworkOptions } from "../src/web/network";
+import { canonicalSearchUrl, normalizeDdgsResults, searchDdgs, type DdgsRunner } from "../src/web/network";
 import { extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
 import { extractPdfDocument, isPdfResponse } from "../src/web/pdf";
 import { formatSearch, WebToolManager } from "../src/web/tools";
@@ -306,12 +306,25 @@ test("WebFetch keeps its existing tool contract while formatting PDF navigation"
   await manager.cleanup();
 });
 
-test("DuckDuckGo provider parsing normalizes redirect URLs and deduplicates results", () => {
-  const html = `<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.example.com%2Fcities%2F%3Futm_source%3Dsearch%26b%3D2%26a%3D1">Cities</a><span class="result__timestamp">Aug 22, 2026</span><div class="result__snippet">Population data for the largest cities in the country.</div></div>
-  <div class="result"><a class="result__a" href="http://example.com/cities?a=1&amp;b=2#table">Duplicate</a></div>
-  <div class="result"><a class="result__a" href="https://example.org/short">Short</a><div class="result__snippet">with residents.</div></div>
-  <div class="result"><a class="result__a" href="https://dated.example/report">Dated</a><div class="result__snippet">Aug 21, 2026 — A complete provider excerpt with a date prefix and enough context to be useful.</div></div>`;
-  assert.deepEqual(parseDuckDuckGoResults(html, 10), [{
+test("DDGS result normalization removes tracking, deduplicates URLs, and retains available dates", () => {
+  assert.deepEqual(normalizeDdgsResults([{
+    title: "Cities",
+    href: "https://www.example.com/cities/?utm_source=search&b=2&a=1",
+    body: "Population data for the largest cities in the country.",
+    date: "Aug 22, 2026",
+  }, {
+    title: "Duplicate",
+    href: "http://example.com/cities?a=1&b=2#table",
+    body: "Duplicate result.",
+  }, {
+    title: "Short",
+    href: "https://example.org/short",
+    body: "with residents.",
+  }, {
+    title: "Dated",
+    href: "https://dated.example/report",
+    body: "Aug 21, 2026 — A complete provider excerpt with a date prefix and enough context to be useful.",
+  }]), [{
     rank: 1,
     title: "Cities",
     url: "https://www.example.com/cities/?a=1&b=2",
@@ -338,59 +351,53 @@ test("DuckDuckGo provider parsing normalizes redirect URLs and deduplicates resu
   assert.equal(canonicalSearchUrl("https://www.example.com/cities/?b=2&utm_medium=x&a=1"), "example.com/cities?a=1&b=2");
 });
 
-test("WebSearch continues within a provider page, then follows its opaque next-page form", async () => {
-  const result = (url: string, title: string) => `<div class="result"><a class="result__a" href="${url}">${title}</a><div class="result__snippet">A sufficiently complete provider snippet describing ${title} for search testing.</div></div>`;
-  const firstPage = `${result("https://one.example/a", "One")}${result("https://two.example/b", "Two")}${result("https://three.example/c", "Three")}
-    <form action="/html/" method="post"><input type="submit" value="Next"><input type="hidden" name="q" value="cities -site:noise.example"><input type="hidden" name="s" value="30"><input type="hidden" name="vqd" value="opaque-provider-state"></form>`;
-  const secondPage = `${result("https://four.example/d", "Four")}${result("https://five.example/e", "Five")}`;
-  const calls: Array<{ url: string; options: NetworkOptions }> = [];
-  const download = async (url: string, options: NetworkOptions): Promise<DownloadedText> => {
-    calls.push({ url, options });
-    const text = options.method === "POST" ? secondPage : firstPage;
-    return { requestedUrl: url, finalUrl: url, contentType: "text/html", text, bytes: text.length, fetchedAt: "2026-08-23T00:00:00.000Z" };
+test("WebSearch uses an opaque DDGS page cursor bound to its query and filters", async () => {
+  const result = (href: string, title: string) => ({ href, title, body: `A sufficiently complete provider snippet describing ${title} for search testing.` });
+  const calls: Parameters<DdgsRunner>[0][] = [];
+  const run: DdgsRunner = async (request) => {
+    calls.push(request);
+    return request.page === 1
+      ? { results: [result("https://one.example/a", "One"), result("https://two.example/b", "Two")], hasMore: true }
+      : { results: [result("https://three.example/c", "Three"), result("https://four.example/d", "Four")], hasMore: false };
   };
   const common = {
     query: "cities",
     maxResults: 2,
     excludeDomains: ["noise.example", "NOISE.EXAMPLE"],
-    options: { timeoutMs: 1_000, maxBytes: 100_000, userAgent: "test" },
-    download,
+    options: { timeoutMs: 1_000 },
+    run,
   };
 
-  const first = await searchDuckDuckGo(common);
+  const first = await searchDdgs(common);
   assert.deepEqual(first.results.map((item) => [item.rank, item.title]), [[1, "One"], [2, "Two"]]);
   assert.deepEqual(first.excludedDomains, ["noise.example"]);
   assert.ok(first.nextCursor);
-  assert.match(calls[0]!.url, /q=cities\+-site%3Anoise\.example/);
+  assert.equal(calls[0]!.query, "cities -site:noise.example");
+  assert.equal(calls[0]!.page, 1);
+  assert.equal(calls[0]!.region, "us-en");
 
-  const withinPage = await searchDuckDuckGo({ ...common, cursor: first.nextCursor });
-  assert.deepEqual(withinPage.results.map((item) => [item.rank, item.title]), [[3, "Three"]]);
-  assert.ok(withinPage.nextCursor);
-  assert.equal(calls[1]!.options.method, "GET");
-
-  const nextPage = await searchDuckDuckGo({ ...common, cursor: withinPage.nextCursor });
-  assert.deepEqual(nextPage.results.map((item) => [item.rank, item.title]), [[4, "Four"], [5, "Five"]]);
-  assert.equal(calls[2]!.options.method, "POST");
-  assert.match(calls[2]!.options.body ?? "", /vqd=opaque-provider-state/);
+  const nextPage = await searchDdgs({ ...common, cursor: first.nextCursor });
+  assert.deepEqual(nextPage.results.map((item) => [item.rank, item.title]), [[3, "Three"], [4, "Four"]]);
+  assert.equal(calls[1]!.page, 2);
   assert.equal(nextPage.nextCursor, undefined);
 
   await assert.rejects(
-    searchDuckDuckGo({ ...common, query: "different", cursor: first.nextCursor }),
+    searchDdgs({ ...common, query: "different", cursor: first.nextCursor }),
     /cursor does not match/,
   );
   await assert.rejects(
-    searchDuckDuckGo({ ...common, freshness: "day", cursor: first.nextCursor }),
+    searchDdgs({ ...common, freshness: "day", cursor: first.nextCursor }),
     /cursor does not match/,
   );
   await assert.rejects(
-    searchDuckDuckGo({ ...common, domain: "noise.example" }),
+    searchDdgs({ ...common, domain: "noise.example" }),
     /cannot also be excluded/,
   );
 });
 
 test("WebSearch reports provider date coverage without inferring missing dates", () => {
   const base = {
-    provider: "duckduckgo" as const,
+    provider: "ddgs" as const,
     query: "cities",
     fetchedAt: "2026-08-23T00:00:00.000Z",
     durationMs: 12,

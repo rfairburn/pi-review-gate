@@ -2,7 +2,7 @@
 import { loadConfig, normalizeConfig, type ReviewGateConfig, type WebConfig } from "../config";
 import { renderWithChromium } from "./browser";
 import { WebPageCache } from "./cache";
-import { searchDuckDuckGo } from "./network";
+import { searchDdgs } from "./network";
 
 interface CliRequest {
   id?: string;
@@ -84,7 +84,7 @@ async function runRequest(request: CliRequest, cache: WebPageCache, browserCache
   try {
     if (request.operation === "search") {
       if (!request.query?.trim()) throw new Error("search requires query");
-      const data = await searchDuckDuckGo({
+      const data = await searchDdgs({
         query: request.query,
         maxResults: bounded(request.maxResults, 1, config.web.search.maxResults, config.web.search.maxResults, "maxResults"),
         ...(request.domain ? { domain: request.domain } : {}),
@@ -94,8 +94,6 @@ async function runRequest(request: CliRequest, cache: WebPageCache, browserCache
         ...(request.cursor ? { cursor: request.cursor } : {}),
         options: {
           timeoutMs: config.web.search.timeoutMs,
-          maxBytes: 2 * 1024 * 1024,
-          userAgent: config.web.fetch.userAgent,
         },
       });
       return envelope(request, data);

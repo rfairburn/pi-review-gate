@@ -65,11 +65,11 @@ export class WebToolManager {
       parameters: objectSchema({
         query: stringSchema("Focused web search query."),
         maxResults: integerSchema(`Maximum results, 1-${this.webConfig.search.maxResults}.`),
+        page: integerSchema("Result page, 1-100. Omit for the first page; use nextPage from a prior response to continue."),
         domain: stringSchema("Optional domain to constrain with a site: filter."),
         excludeDomains: stringArraySchema("Optional domains to exclude from the search."),
         region: stringSchema("Optional search region such as us-en."),
         freshness: enumSchema(["day", "week", "month", "year"], "Optional freshness window."),
-        cursor: stringSchema("Opaque continuation cursor from a previous WebSearch response. Repeat the same query and filters."),
       }, ["query"]),
       execute: async (_id, params, signal) => {
         try {
@@ -79,11 +79,11 @@ export class WebToolManager {
           const response = await searchDdgs({
             query,
             maxResults,
+            page: boundedInteger(params.page, 1, 100, 1, "page"),
             ...(optionalString(params.domain) ? { domain: optionalString(params.domain) } : {}),
             ...(excludeDomains ? { excludeDomains } : {}),
             ...(optionalString(params.region) ? { region: optionalString(params.region) } : {}),
             ...(freshness(params.freshness) ? { freshness: freshness(params.freshness) } : {}),
-            ...(optionalString(params.cursor) ? { cursor: optionalString(params.cursor) } : {}),
             options: {
               timeoutMs: this.webConfig.search.timeoutMs,
               signal,
@@ -193,7 +193,7 @@ export class WebToolManager {
 export function formatSearch(response: SearchResponse): string {
   const lines = [
     `Web search via ${response.provider}: ${response.query}`,
-    `Returned ${response.results.length} result(s) in ${response.durationMs}ms.`,
+    `Page ${response.page}; returned ${response.results.length} result(s) in ${response.durationMs}ms.`,
   ];
   if (response.results.length > 0) {
     const datedResults = response.results.filter((result) => result.dateText).length;
@@ -208,7 +208,7 @@ export function formatSearch(response: SearchResponse): string {
     if (result.snippetQuality === "weak") metadata.push("snippet quality: weak");
     lines.push("", `${result.rank}. ${result.title}`, result.url, metadata.join(" · "), result.snippet || "[No snippet supplied.]");
   }
-  if (response.nextCursor !== undefined) lines.push("", `Continue with the same WebSearch query and cursor ${response.nextCursor}.`);
+  if (response.nextPage !== undefined) lines.push("", `More results are available. Repeat the same WebSearch query and filters with page: ${response.nextPage}.`);
   return lines.join("\n").trim();
 }
 

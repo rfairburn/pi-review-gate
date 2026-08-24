@@ -37,7 +37,8 @@ export interface SearchResult {
 export interface SearchResponse {
   provider: "ddgs";
   query: string;
-  nextCursor?: string;
+  page: number;
+  nextPage?: number;
   excludedDomains?: string[];
   results: SearchResult[];
   fetchedAt: string;
@@ -137,7 +138,7 @@ export async function searchDdgs(input: {
   freshness?: "day" | "week" | "month" | "year";
   domain?: string;
   excludeDomains?: string[];
-  cursor?: string;
+  page?: number;
   options: Pick<NetworkOptions, "timeoutMs" | "signal">;
   run?: DdgsRunner;
 }): Promise<SearchResponse> {
@@ -151,24 +152,23 @@ export async function searchDdgs(input: {
     .filter(Boolean)
     .join(" ");
   const region = input.region?.trim() || "us-en";
-  const identity = JSON.stringify({ query, region, freshness: input.freshness ?? "", maxResults: input.maxResults });
-  const cursor = input.cursor ? decodeSearchCursor(input.cursor, identity) : { page: 1, rankOffset: 0, identity };
+  const page = input.page ?? 1;
+  if (!Number.isInteger(page) || page < 1 || page > 100) throw new Error("Search page must be an integer from 1 through 100.");
   const output = await (input.run ?? runDdgsSearch)({
     query,
     maxResults: input.maxResults,
-    page: cursor.page,
+    page,
     timeoutMs: input.options.timeoutMs,
     region,
     ...(input.freshness ? { timelimit: freshnessCode(input.freshness) } : {}),
   }, input.options.signal);
-  const results = normalizeDdgsResults(output.results, cursor.rankOffset);
-  const continuation = output.hasMore && results.length > 0
-    ? encodeSearchCursor({ page: cursor.page + 1, rankOffset: cursor.rankOffset + results.length, identity })
-    : undefined;
+  const results = normalizeDdgsResults(output.results, (page - 1) * input.maxResults);
+  const nextPage = output.hasMore && results.length > 0 ? page + 1 : undefined;
   return {
     provider: "ddgs",
     query: requestedQuery,
-    ...(continuation ? { nextCursor: continuation } : {}),
+    page,
+    ...(nextPage ? { nextPage } : {}),
     ...(excludedDomains.length > 0 ? { excludedDomains } : {}),
     results,
     fetchedAt: new Date().toISOString(),
@@ -232,34 +232,6 @@ export async function runDdgsSearch(request: DdgsSearchRequest, signal?: AbortSi
     });
     child.stdin.end(JSON.stringify(request));
   });
-}
-
-interface SearchCursor {
-  page: number;
-  rankOffset: number;
-  identity: string;
-}
-
-function encodeSearchCursor(value: SearchCursor): string {
-  return Buffer.from(JSON.stringify({ v: 2, ...value }), "utf8").toString("base64url");
-}
-
-function decodeSearchCursor(value: string, identity: string): SearchCursor {
-  if (value.length > 12_000) throw new Error("Search cursor is too large.");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
-  } catch {
-    throw new Error("Search cursor is invalid.");
-  }
-  if (!isRecord(parsed) || parsed.v !== 2) throw new Error("Search cursor is invalid.");
-  const page = parsed.page;
-  const rankOffset = parsed.rankOffset;
-  if (typeof page !== "number" || !Number.isInteger(page) || page < 1 || page > 100 || typeof rankOffset !== "number" || !Number.isInteger(rankOffset) || rankOffset < 0 || rankOffset > 10_000) {
-    throw new Error("Search cursor is invalid.");
-  }
-  if (parsed.identity !== identity) throw new Error("Search cursor does not match this query or its filters.");
-  return { page, rankOffset, identity };
 }
 
 export function normalizeDdgsResults(rawResults: DdgsRawResult[], rankOffset = 0): SearchResult[] {

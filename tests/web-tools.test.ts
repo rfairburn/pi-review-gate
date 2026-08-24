@@ -542,3 +542,24 @@ test("WebFetch gives a direct BrowserExtract escalation when static extraction s
   assert.match(staticResult.content[0].text as string, /use BrowserExtract/i);
   await manager.cleanup();
 });
+
+test("web cache configuration updates apply to subsequent acquisitions", async () => {
+  const config = normalizeConfig({});
+  const observedLimits: number[] = [];
+  const cache = new WebPageCache(config.web!.fetch, async (url, options) => {
+    observedLimits.push(options.maxBytes);
+    return {
+      requestedUrl: url,
+      finalUrl: url,
+      contentType: "text/html",
+      text: "<html><body><p>Configuration update fixture.</p></body></html>",
+      bytes: 64,
+      fetchedAt: "2026-08-23T00:00:00.000Z",
+    };
+  });
+  await cache.fetch({ url: "https://example.com/first" });
+  cache.updateConfig({ ...config.web!.fetch, maxDownloadBytes: 96 * 1024 * 1024 });
+  await cache.fetch({ url: "https://example.com/second" });
+  assert.deepEqual(observedLimits, [50 * 1024 * 1024, 96 * 1024 * 1024]);
+  await cache.cleanup();
+});

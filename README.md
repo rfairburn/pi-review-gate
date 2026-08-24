@@ -136,6 +136,10 @@ unlanded recovery checkpoints are preserved for exact-session restart.
 
 Defaults can be overridden under `web`:
 
+The maximum acquisition size is also available under **Web** in
+`/review-settings`; saves apply to subsequent WebFetch and BrowserExtract
+acquisitions without restarting the application.
+
 ```json
 {
   "web": {
@@ -143,7 +147,7 @@ Defaults can be overridden under `web`:
     "search": { "provider": "duckduckgo", "timeoutMs": 20000, "maxResults": 10 },
     "fetch": {
       "timeoutMs": 30000,
-      "maxDownloadBytes": 8388608,
+      "maxDownloadBytes": 52428800,
       "maxOutputChars": 12000,
       "cacheMaxBytes": 67108864,
       "cacheMaxEntries": 32,

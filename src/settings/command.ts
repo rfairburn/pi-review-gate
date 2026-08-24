@@ -47,7 +47,7 @@ interface UiContext {
 export function registerReviewSettings(input: RegisterSettingsInput): void {
   if (!isRecord(input.pi) || typeof input.pi.registerCommand !== "function") return;
   input.pi.registerCommand("review-settings", {
-    description: "Configure delegated execution, reviewers, reasoning, review policy, and bundle retention.",
+    description: "Configure delegated execution, reviewers, reasoning, review policy, web tools, and bundle retention.",
     handler: async (_args: string, ctx: unknown) => {
       const ui = extractUi(ctx);
       if (!ui) {
@@ -81,13 +81,14 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
   let subtaskNotifications = input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
+  let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
 
   while (true) {
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const [resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, subtasksViewRow] = alignedSettingsRows([
+    const [resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, subtasksViewRow, webRow] = alignedSettingsRows([
       ["Worker resources", executorPoolSummary(workerResources)],
       ["Execution priority", workerRouteSummary(executeRoute, workerResources, agents, input.scoped)],
       ["Research priority", workerRouteSummary(researchRoute, workerResources, agents, input.scoped)],
@@ -99,6 +100,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ["Retry policy", `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base`],
       ["Subtask notifications", subtaskNotifications === "quiet" ? "Quiet" : "Noisy"],
       ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
+      ["Web", `${formatByteSize(webMaxDownloadBytes)} max download`],
     ]);
     const choice = await input.ui.select("Review settings", [
       resourcesRow,
@@ -112,6 +114,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retryRow,
       notificationsRow,
       subtasksViewRow,
+      webRow,
       "Save changes",
       "Cancel",
     ]);
@@ -187,6 +190,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       subtasksViewExpanded = !subtasksViewExpanded;
       continue;
     }
+    if (choice === webRow) {
+      webMaxDownloadBytes = await selectWebSettings(input.ui, webMaxDownloadBytes);
+      continue;
+    }
     const error = await validateSelection(workerResources, activeReviewers, agents, input.config, input.scoped, executeRoute, researchRoute);
     if (error) {
       await notify(input.ui, error, "error");
@@ -206,11 +213,35 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       retryPolicy,
       subtaskNotifications,
       subtasksViewExpanded,
+      webMaxDownloadBytes,
     });
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config);
     await notify(input.ui, "Review settings saved.", "info");
     return;
+  }
+}
+
+async function selectWebSettings(ui: UiContext, initialMaxDownloadBytes: number): Promise<number> {
+  let maxDownloadBytes = initialMaxDownloadBytes;
+  while (true) {
+    const [downloadRow] = alignedSettingsRows([
+      ["Maximum download", formatByteSize(maxDownloadBytes)],
+    ]);
+    const choice = await ui.select("Web settings", [downloadRow, "Back"]);
+    if (!choice || choice === "Back") return maxDownloadBytes;
+    if (!ui.input) {
+      await notify(ui, "This UI does not support numeric input.", "error");
+      continue;
+    }
+    const entered = await ui.input("Maximum download size in MiB", String(maxDownloadBytes / (1024 * 1024)));
+    if (entered === undefined) continue;
+    const mebibytes = Number(entered.trim());
+    if (!Number.isSafeInteger(mebibytes) || mebibytes < 1 || mebibytes > 2_048) {
+      await notify(ui, "Enter a whole number from 1 through 2048 MiB.", "error");
+      continue;
+    }
+    maxDownloadBytes = mebibytes * 1024 * 1024;
   }
 }
 
@@ -690,6 +721,12 @@ function formatDuration(milliseconds: number): string {
   if (milliseconds % 60_000 === 0) return `${milliseconds / 60_000}m`;
   if (milliseconds % 1_000 === 0) return `${milliseconds / 1_000}s`;
   return `${milliseconds}ms`;
+}
+
+function formatByteSize(bytes: number): string {
+  if (bytes % (1024 * 1024) === 0) return `${bytes / (1024 * 1024)} MiB`;
+  if (bytes % 1024 === 0) return `${bytes / 1024} KiB`;
+  return `${bytes} bytes`;
 }
 
 async function validateSelection(

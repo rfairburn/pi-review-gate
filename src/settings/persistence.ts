@@ -29,6 +29,7 @@ export interface ReviewSettingsSelection {
   retryPolicy: ExecutionRetryPolicy;
   subtaskNotifications: SubtaskNotificationMode;
   subtasksViewExpanded: boolean;
+  webMaxDownloadBytes?: number;
 }
 
 const configUpdateTails = new Map<string, Promise<void>>();
@@ -75,6 +76,13 @@ export async function persistReviewSettings(
     const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
     ui.subtasksViewExpanded = selection.subtasksViewExpanded;
     parsed.ui = ui;
+    if (selection.webMaxDownloadBytes !== undefined) {
+      const web = isRecord(parsed.web) ? { ...parsed.web } : {};
+      const fetch = isRecord(web.fetch) ? { ...web.fetch } : {};
+      fetch.maxDownloadBytes = selection.webMaxDownloadBytes;
+      web.fetch = fetch;
+      parsed.web = web;
+    }
     parsed.externalAgents = catalog;
     delete parsed.decider;
     delete parsed.reviewers;

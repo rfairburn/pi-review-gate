@@ -49,9 +49,13 @@ export class WebPageCache {
   private totalBytes = 0;
 
   constructor(
-    private readonly config: WebFetchConfig,
+    private config: WebFetchConfig,
     private readonly downloader: typeof downloadText = downloadText,
   ) {}
+
+  updateConfig(config: WebFetchConfig): void {
+    this.config = config;
+  }
 
   async fetch(input: {
     url: string;

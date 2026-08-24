@@ -422,6 +422,31 @@ test("subtask notification mode is staged and saved with quiet as the default", 
   assert.equal(config.execution?.subtaskNotifications, "noisy");
 });
 
+test("web settings stage and save the maximum download size in MiB", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-web-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    web: { search: { maxResults: 7 } },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download"),
+    webSettingsRow("Maximum download", "50 MiB"),
+    "Back",
+    "Save changes",
+  ], [], ["96"]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.fetch.maxDownloadBytes, 96 * 1024 * 1024);
+  assert.equal(saved.web.search.maxResults, 7);
+  assert.equal(config.web?.fetch.maxDownloadBytes, 96 * 1024 * 1024);
+});
+
 test("internal executor and reviewers persist independent per-model reasoning levels", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-reasoning-"));
   const configPath = join(dir, "review-gate.json");
@@ -550,18 +575,28 @@ test("/review-settings aligns every settings value column from the full label se
   registerReviewSettings({ pi: registered.pi, config, configPath: "/unused/review-gate.json" });
   let rootRows: string[] = [];
   let retryRows: string[] = [];
+  let webRows: string[] = [];
   let selection = 0;
 
   await registered.handler("", {
     scopedModels: [],
     ui: {
       async select(title: string, options: string[]) {
-        if (title === "Review settings" && selection++ === 0) {
-          rootRows = options.slice(0, ROOT_SETTING_LABELS.length);
-          return rootSettingsRow("Retry policy", "2 retries · 1s base");
+        if (title === "Review settings") {
+          const rootSelection = selection++;
+          if (rootSelection === 0) {
+            rootRows = options.slice(0, ROOT_SETTING_LABELS.length);
+            return rootSettingsRow("Retry policy", "2 retries · 1s base");
+          }
+          if (rootSelection === 1) return rootSettingsRow("Web", "50 MiB max download");
+          return undefined;
         }
         if (title === "Executor retry policy") {
           retryRows = options.slice(0, RETRY_SETTING_LABELS.length);
+          return undefined;
+        }
+        if (title === "Web settings") {
+          webRows = options.slice(0, WEB_SETTING_LABELS.length);
           return undefined;
         }
         return undefined;
@@ -572,6 +607,7 @@ test("/review-settings aligns every settings value column from the full label se
 
   assertAlignedValueColumn(rootRows, ROOT_SETTING_LABELS);
   assertAlignedValueColumn(retryRows, RETRY_SETTING_LABELS);
+  assertAlignedValueColumn(webRows, WEB_SETTING_LABELS);
 });
 
 const ROOT_SETTING_LABELS = [
@@ -586,6 +622,7 @@ const ROOT_SETTING_LABELS = [
   "Retry policy",
   "Subtask notifications",
   "Subtasks view",
+  "Web",
 ] as const;
 
 const RETRY_SETTING_LABELS = [
@@ -596,12 +633,18 @@ const RETRY_SETTING_LABELS = [
   "Delay jitter",
 ] as const;
 
+const WEB_SETTING_LABELS = ["Maximum download"] as const;
+
 function rootSettingsRow(label: typeof ROOT_SETTING_LABELS[number], value: string): string {
   return alignedTestRow(label, value, ROOT_SETTING_LABELS);
 }
 
 function retrySettingsRow(label: typeof RETRY_SETTING_LABELS[number], value: string): string {
   return alignedTestRow(label, value, RETRY_SETTING_LABELS);
+}
+
+function webSettingsRow(label: typeof WEB_SETTING_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, WEB_SETTING_LABELS);
 }
 
 function alignedTestRow(label: string, value: string, labels: readonly string[]): string {

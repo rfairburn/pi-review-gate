@@ -34,7 +34,7 @@ function registerProcessExitCleanup(cache: WebPageCache): void {
 export class WebToolManager {
   private readonly cache: WebPageCache;
   private readonly browserCache: WebPageCache;
-  private readonly webConfig: WebConfig;
+  private webConfig: WebConfig;
   private registered = false;
 
   constructor(
@@ -171,6 +171,12 @@ export class WebToolManager {
     });
     this.pi.on?.("session_shutdown", async () => this.cleanup());
     this.registered = true;
+  }
+
+  sync(config: ReviewGateConfig): void {
+    this.webConfig = config.web ?? DEFAULT_CONFIG.web!;
+    this.cache.updateConfig(this.webConfig.fetch);
+    this.browserCache.updateConfig(this.webConfig.fetch);
   }
 
   async cleanup(): Promise<void> {

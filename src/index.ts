@@ -667,7 +667,10 @@ export async function activate(pi: unknown): Promise<void> {
     pi,
     config,
     configPath: loaded.path,
-    onSaved: () => executionTools.sync(),
+    onSaved: () => {
+      executionTools.sync();
+      webTools?.sync(config);
+    },
     onScopedModels: (models) => {
       currentScopedModels = [...models];
       executionTools.setScopedModels(currentScopedModels);

@@ -48,15 +48,17 @@ test("native web tooling has bounded defaults and validates overrides", () => {
   assert.equal(defaults.enabled, true);
   assert.equal(defaults.search.provider, "duckduckgo");
   assert.equal(defaults.search.maxResults, 10);
+  assert.equal(defaults.fetch.maxDownloadBytes, 50 * 1024 * 1024);
   assert.equal(defaults.fetch.cacheMaxEntries, 32);
   assert.equal(defaults.fetch.cacheMaxBytes, 64 * 1024 * 1024);
 
   const configured = normalizeConfig({ web: {
     search: { timeoutMs: 1234, maxResults: 7 },
-    fetch: { maxOutputChars: 9000, cacheMaxEntries: 4 },
+    fetch: { maxDownloadBytes: 75 * 1024 * 1024, maxOutputChars: 9000, cacheMaxEntries: 4 },
   } }).web!;
   assert.equal(configured.search.timeoutMs, 1234);
   assert.equal(configured.search.maxResults, 7);
+  assert.equal(configured.fetch.maxDownloadBytes, 75 * 1024 * 1024);
   assert.equal(configured.fetch.maxOutputChars, 9000);
   assert.equal(configured.fetch.cacheMaxEntries, 4);
   assert.throws(() => normalizeConfig({ web: { search: { provider: "unknown" } } }), /provider must be duckduckgo/);

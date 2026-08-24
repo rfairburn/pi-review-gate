@@ -16,6 +16,8 @@ export interface DownloadedText {
   finalUrl: string;
   contentType: string;
   text: string;
+  /** Raw response bytes when the acquisition came directly from the network. */
+  data?: Uint8Array;
   bytes: number;
   fetchedAt: string;
 }
@@ -92,6 +94,7 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
         finalUrl: current,
         contentType: response.headers.get("content-type") ?? "application/octet-stream",
         text: new TextDecoder(charsetOf(response.headers.get("content-type"))).decode(bytes),
+        data: bytes,
         bytes: bytes.byteLength,
         fetchedAt: new Date().toISOString(),
       };

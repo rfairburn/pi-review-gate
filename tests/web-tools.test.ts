@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
 import { assertSuccessfulBrowserNavigation } from "../src/web/browser";
 import { WebPageCache } from "../src/web/cache";
 import { canonicalSearchUrl, parseDuckDuckGoResults, searchDuckDuckGo, type DownloadedText, type NetworkOptions } from "../src/web/network";
 import { extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
+import { extractPdfDocument, isPdfResponse } from "../src/web/pdf";
 import { formatSearch, WebToolManager } from "../src/web/tools";
 
 const fixture = `<!doctype html><html><head><title>Population fixture</title></head><body>
@@ -14,6 +15,37 @@ const fixture = `<!doctype html><html><head><title>Population fixture</title></h
 <table><thead><tr><th rowspan="2">City</th><th colspan="2">Population</th></tr><tr><th>2020</th><th>2025</th></tr></thead>
 <tbody><tr><td>New York</td><td>8,804,190</td><td>8,584,629</td></tr><tr><td>Los Angeles</td><td>3,898,747</td><td>3,869,089</td></tr></tbody></table>
 <nav class="pagination"><a rel="next" href="/page/2">Next</a></nav></body></html>`;
+
+function pdfFixture(pages: string[], title = "Population report"): Uint8Array {
+  const objects: string[] = [];
+  const pageObjectNumbers = pages.map((_, index) => 3 + index * 2);
+  const fontObjectNumber = 3 + pages.length * 2;
+  const infoObjectNumber = fontObjectNumber + 1;
+  objects.push("<< /Type /Catalog /Pages 2 0 R >>");
+  objects.push(`<< /Type /Pages /Kids [${pageObjectNumbers.map((number) => `${number} 0 R`).join(" ")}] /Count ${pages.length} >>`);
+  for (const [index, text] of pages.entries()) {
+    const pageObjectNumber = pageObjectNumbers[index]!;
+    const contentObjectNumber = pageObjectNumber + 1;
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 ${fontObjectNumber} 0 R >> >> /Contents ${contentObjectNumber} 0 R >>`);
+    const lines = text.split("\n").map((line) => line.replace(/([\\()])/g, "\\$1"));
+    const stream = text ? `BT /F1 12 Tf 14 TL 72 720 Td ${lines.map((line) => `(${line}) Tj T*`).join(" ")} ET` : "";
+    objects.push(`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`);
+  }
+  objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  objects.push(`<< /Title (${title.replace(/([\\()])/g, "\\$1")}) /Author (Review Gate Tests) >>`);
+
+  let body = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(body));
+    body += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(body);
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets.slice(1)) body += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R /Info ${infoObjectNumber} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return Buffer.from(body, "latin1");
+}
 
 test("BrowserExtract accepts only successful final main-document responses", () => {
   assert.doesNotThrow(() => assertSuccessfulBrowserNavigation(200, "https://example.com/page"));
@@ -156,6 +188,122 @@ test("image payloads are excluded while nearby captions and prose remain searcha
   assert.doesNotMatch(markdown, /marker\.svg|Phoenix map marker|!\[/);
   assert.match(markdown, /Map of major cities|Phoenix population details/);
   assert.equal(findInWebPage(page, "Phoenix").totalMatches, 1);
+});
+
+test("PDF detection accepts either response metadata or file magic", () => {
+  const pdf = pdfFixture(["First page"]);
+  assert.equal(isPdfResponse("application/octet-stream", pdf), true);
+  assert.equal(isPdfResponse("application/pdf", pdf), true);
+  assert.equal(isPdfResponse("text/html", Buffer.from("<html></html>")), false);
+  assert.equal(isPdfResponse("application/pdf", undefined, "<html></html>"), false);
+});
+
+test("invalid PDF data produces a document-specific extraction error", async () => {
+  await assert.rejects(
+    extractPdfDocument(Buffer.from("%PDF-1.4\nnot a valid document", "latin1"), "https://example.com/broken.pdf"),
+    /PDF extraction failed.*(?:invalid|corrupt|Invalid PDF structure)/i,
+  );
+});
+
+test("WebFetch parses PDFs into cached page-aware blocks with find and continuation", async () => {
+  const config = normalizeConfig({});
+  const pdf = pdfFixture([
+    ["The first page discusses New York.", ...Array.from({ length: 80 }, (_, index) => `Supporting population context line ${index}.`)].join("\n"),
+    "The second page discusses Phoenix.",
+  ], "City estimates");
+  let downloads = 0;
+  const cache = new WebPageCache(config.web!.fetch, async (url) => {
+    downloads += 1;
+    return {
+      requestedUrl: url,
+      finalUrl: url,
+      contentType: "application/octet-stream",
+      text: new TextDecoder("latin1").decode(pdf),
+      data: pdf,
+      bytes: pdf.byteLength,
+      fetchedAt: "2026-08-23T00:00:00.000Z",
+    };
+  });
+
+  const first = await cache.fetch({ url: "https://example.com/report.pdf", maxChars: 1_000 });
+  assert.equal(first.documentType, "pdf");
+  assert.equal(first.title, "City estimates");
+  assert.equal(first.pageCount, 2);
+  assert.equal(first.startPage, 1);
+  assert.equal(first.endPage, 1);
+  assert.equal(first.scannedOrImageOnlySuspected, false);
+  assert.equal(first.pdfMetadata?.author, "Review Gate Tests");
+  assert.match(first.content, /## Page 1[\s\S]*New York/);
+  assert.equal(first.nextIndex, 1);
+
+  const second = await cache.fetch({ url: "https://example.com/report.pdf", index: first.nextIndex });
+  assert.equal(second.cacheHit, true);
+  assert.equal(second.startPage, 2);
+  assert.match(second.content, /## Page 2[\s\S]*Phoenix/);
+  assert.equal(downloads, 1);
+
+  const found = await cache.fetch({ url: "https://example.com/report.pdf", find: "Phoenix" });
+  assert.equal(found.find?.matches[0]?.index, 1);
+  assert.equal(found.find?.matches[0]?.pageNumber, 2);
+  const cacheRoot = cache.cacheRoot()!;
+  const sourceFile = (await readdir(cacheRoot)).find((name) => name.endsWith(".source"));
+  assert.ok(sourceFile);
+  assert.equal((await readFile(`${cacheRoot}/${sourceFile}`)).subarray(0, 5).toString("latin1"), "%PDF-");
+  await assert.rejects(
+    cache.fetch({ url: "https://example.com/report.pdf", index: 0, columns: ["City"] }),
+    /columns are not available for PDF documents/,
+  );
+  await cache.cleanup();
+});
+
+test("WebFetch reports PDFs with no extractable text as likely scanned or image-only", async () => {
+  const config = normalizeConfig({});
+  const pdf = pdfFixture([""]);
+  const cache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "application/pdf",
+    text: new TextDecoder("latin1").decode(pdf),
+    data: pdf,
+    bytes: pdf.byteLength,
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const fetched = await cache.fetch({ url: "https://example.com/scan.pdf" });
+  assert.equal(fetched.documentType, "pdf");
+  assert.equal(fetched.pageCount, 1);
+  assert.equal(fetched.scannedOrImageOnlySuspected, true);
+  assert.equal(fetched.content, "");
+  await cache.cleanup();
+});
+
+test("WebFetch keeps its existing tool contract while formatting PDF navigation", async () => {
+  const config = normalizeConfig({});
+  const pdf = pdfFixture(["A PDF page containing Phoenix population evidence."], "PDF navigation");
+  const cache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "application/pdf",
+    text: new TextDecoder("latin1").decode(pdf),
+    data: pdf,
+    bytes: pdf.byteLength,
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, cache);
+  manager.register();
+  assert.deepEqual(Object.keys(tools.get("WebFetch").parameters.properties), ["url", "index", "find", "columns", "maxChars", "refresh"]);
+
+  const fetched = await tools.get("WebFetch").execute("pdf", { url: "https://example.com/report.pdf" });
+  const output = fetched.content[0].text as string;
+  assert.match(output, /PDF document: PDF navigation/);
+  assert.match(output, /PDF pages: 1/);
+  assert.match(output, /Showing index 0-0 of 0 · page 1/);
+  assert.match(output, /scanned_or_image_only_suspected: false/);
+  assert.match(output, /## Page 1[\s\S]*Phoenix/);
+
+  const found = await tools.get("WebFetch").execute("pdf-find", { url: "https://example.com/report.pdf", find: "Phoenix" });
+  assert.match(found.content[0].text as string, /index 0 · text · page 1/);
+  await manager.cleanup();
 });
 
 test("DuckDuckGo provider parsing normalizes redirect URLs and deduplicates results", () => {
@@ -393,4 +541,25 @@ test("WebFetch gives a direct BrowserExtract escalation when static extraction s
   assert.match(staticResult.content[0].text as string, /dynamic_content_suspected: true/);
   assert.match(staticResult.content[0].text as string, /use BrowserExtract/i);
   await manager.cleanup();
+});
+
+test("web cache configuration updates apply to subsequent acquisitions", async () => {
+  const config = normalizeConfig({});
+  const observedLimits: number[] = [];
+  const cache = new WebPageCache(config.web!.fetch, async (url, options) => {
+    observedLimits.push(options.maxBytes);
+    return {
+      requestedUrl: url,
+      finalUrl: url,
+      contentType: "text/html",
+      text: "<html><body><p>Configuration update fixture.</p></body></html>",
+      bytes: 64,
+      fetchedAt: "2026-08-23T00:00:00.000Z",
+    };
+  });
+  await cache.fetch({ url: "https://example.com/first" });
+  cache.updateConfig({ ...config.web!.fetch, maxDownloadBytes: 96 * 1024 * 1024 });
+  await cache.fetch({ url: "https://example.com/second" });
+  assert.deepEqual(observedLimits, [50 * 1024 * 1024, 96 * 1024 * 1024]);
+  await cache.cleanup();
 });

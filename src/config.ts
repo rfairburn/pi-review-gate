@@ -240,7 +240,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
     search: { provider: "duckduckgo", timeoutMs: 20_000, maxResults: 10 },
     fetch: {
       timeoutMs: 30_000,
-      maxDownloadBytes: 8 * 1024 * 1024,
+      maxDownloadBytes: 50 * 1024 * 1024,
       maxOutputChars: 12_000,
       cacheMaxBytes: 64 * 1024 * 1024,
       cacheMaxEntries: 32,

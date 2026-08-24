@@ -10,6 +10,7 @@ export interface WebPageBlock {
   index: number;
   kind: "text" | "code" | "table";
   markdown: string;
+  pageNumber?: number;
   tableId?: string;
   tableLabel?: string;
   tableHeaders?: string[];
@@ -35,6 +36,7 @@ export interface WebPaginationLink {
 export interface ExtractedWebPage {
   url: string;
   title: string;
+  documentType: "html" | "pdf";
   byline?: string;
   siteName?: string;
   excerpt?: string;
@@ -43,6 +45,18 @@ export interface ExtractedWebPage {
   pagination: WebPaginationLink[];
   dynamicContentSuspected: boolean;
   dynamicContentReasons: string[];
+  pageCount?: number;
+  pdfMetadata?: PdfMetadata;
+  scannedOrImageOnlySuspected?: boolean;
+}
+
+export interface PdfMetadata {
+  author?: string;
+  subject?: string;
+  creator?: string;
+  producer?: string;
+  creationDate?: string;
+  modificationDate?: string;
 }
 
 export interface RenderedWebPage {
@@ -52,6 +66,8 @@ export interface RenderedWebPage {
   nextIndex?: number;
   totalBlocks: number;
   projectedColumns?: string[];
+  startPage?: number;
+  endPage?: number;
 }
 
 export interface WebPageMatch {
@@ -60,6 +76,7 @@ export interface WebPageMatch {
   snippet: string;
   tableId?: string;
   tableLabel?: string;
+  pageNumber?: number;
 }
 
 export interface WebPageFindResult {
@@ -136,6 +153,7 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
   return {
     url,
     title: readable?.title?.trim() || cleanText(document.title || "Untitled page"),
+    documentType: "html",
     ...(readable?.byline ? { byline: readable.byline } : {}),
     ...(readable?.siteName ? { siteName: readable.siteName } : {}),
     ...(readable?.excerpt ? { excerpt: readable.excerpt } : {}),
@@ -178,6 +196,8 @@ export function renderWebPage(page: ExtractedWebPage, index: number, maxChars: n
     ...(endIndex + 1 < page.blocks.length ? { nextIndex: endIndex + 1 } : {}),
     totalBlocks: page.blocks.length,
     ...(projection ? { projectedColumns: projection.headers } : {}),
+    ...(selected[0]?.pageNumber ? { startPage: selected[0].pageNumber } : {}),
+    ...(selected.at(-1)?.pageNumber ? { endPage: selected.at(-1)!.pageNumber } : {}),
   };
 }
 
@@ -262,6 +282,7 @@ export function findInWebPage(
         snippet: matchSnippet(block.markdown, normalizedNeedle),
         ...(block.tableId ? { tableId: block.tableId } : {}),
         ...(descriptor ? { tableLabel: descriptor.label } : {}),
+        ...(block.pageNumber ? { pageNumber: block.pageNumber } : {}),
       };
     }),
     matchesTruncated: matching.length > maxMatches,

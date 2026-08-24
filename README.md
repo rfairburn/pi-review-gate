@@ -98,17 +98,23 @@ capture truncation.
 ### Native web research
 
 `WebSearch` performs normalized DuckDuckGo HTML search without an API key. It canonicalizes duplicate URLs, reports optional provider-supplied dates and weak snippets without inventing missing data, supports `excludeDomains`, and returns an opaque cursor for continuation with the same query and filters.
-`WebFetch` downloads and indexes the complete selected page, but returns only a
-bounded structural range. Its result includes `nextIndex` when more blocks
-remain, a whole-page table inventory with directly readable indexes, possible
-site-pagination URLs, and `dynamic_content_suspected`. Use `find` on that same `WebFetch` URL to
-locate text anywhere in the indexed page; an accompanying `index` starts the
-case-insensitive search at that block. Continue at a returned match, table, or
-`nextIndex`; while the page remains cached, no second network request is made.
+`WebFetch` downloads and indexes the complete selected HTML page or PDF, but
+returns only a bounded structural range. Its result includes `nextIndex` when
+more blocks remain. HTML results include a whole-page table inventory, possible
+site-pagination URLs, and `dynamic_content_suspected`; PDF results preserve page
+numbers, expose document metadata, and identify likely scanned/image-only files
+when little or no text can be extracted. Use `find` on that same `WebFetch` URL
+to locate text anywhere in the indexed document; an accompanying `index` starts
+the case-insensitive search at that block. Continue at a returned match, table,
+or `nextIndex`; while the document remains cached, no second network request is made.
 A site-pagination URL is a different document and therefore a new fetch.
 When reading a table index, `columns` projects exact case-insensitive header
 names in the requested order; `#N` selects a 1-based column when headers are
 duplicated or inconvenient.
+PDFs use the same `url`, `find`, `index`, `nextIndex`, `maxChars`, and `refresh`
+flow; table-column projection is currently HTML-only. PDF detection uses both
+the HTTP content type and file magic, and password-protected, corrupt, or
+oversized documents fail explicitly.
 
 `BrowserExtract` is the phase-one rendered-page fallback. Use it only after
 `WebFetch` reports `dynamic_content_suspected` or plausibly fails because the
@@ -130,6 +136,10 @@ unlanded recovery checkpoints are preserved for exact-session restart.
 
 Defaults can be overridden under `web`:
 
+The maximum acquisition size is also available under **Web** in
+`/review-settings`; saves apply to subsequent WebFetch and BrowserExtract
+acquisitions without restarting the application.
+
 ```json
 {
   "web": {
@@ -137,7 +147,7 @@ Defaults can be overridden under `web`:
     "search": { "provider": "duckduckgo", "timeoutMs": 20000, "maxResults": 10 },
     "fetch": {
       "timeoutMs": 30000,
-      "maxDownloadBytes": 8388608,
+      "maxDownloadBytes": 52428800,
       "maxOutputChars": 12000,
       "cacheMaxBytes": 67108864,
       "cacheMaxEntries": 32,

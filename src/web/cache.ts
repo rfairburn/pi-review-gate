@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { WebFetchConfig } from "../config";
 import { downloadText } from "./network";
 import { extractWebPage, findInWebPage, renderWebPage, type ExtractedWebPage, type RenderedWebPage, type WebPageFindResult } from "./page";
+import { extractPdfDocument, isPdfResponse } from "./pdf";
 
 interface CacheEntry {
   requestedUrl: string;
@@ -35,6 +36,10 @@ export interface WebFetchResult extends RenderedWebPage {
   pagination: ExtractedWebPage["pagination"];
   dynamicContentSuspected: boolean;
   dynamicContentReasons: string[];
+  documentType: ExtractedWebPage["documentType"];
+  pageCount?: number;
+  pdfMetadata?: ExtractedWebPage["pdfMetadata"];
+  scannedOrImageOnlySuspected?: boolean;
   find?: WebPageFindResult;
 }
 
@@ -44,9 +49,13 @@ export class WebPageCache {
   private totalBytes = 0;
 
   constructor(
-    private readonly config: WebFetchConfig,
+    private config: WebFetchConfig,
     private readonly downloader: typeof downloadText = downloadText,
   ) {}
+
+  updateConfig(config: WebFetchConfig): void {
+    this.config = config;
+  }
 
   async fetch(input: {
     url: string;
@@ -71,6 +80,9 @@ export class WebPageCache {
     const maxChars = Math.max(1_000, Math.min(input.maxChars ?? this.config.maxOutputChars, this.config.maxOutputChars));
     const requestedIndex = input.index ?? 0;
     if (input.find && input.columns) throw new Error("find and columns cannot be used together; find the table first, then fetch its index with columns.");
+    if (input.columns && entry.page.documentType === "pdf") {
+      throw new Error("columns are not available for PDF documents; use find and index to locate and read page-aware text blocks.");
+    }
     const found = input.find ? findInWebPage(entry.page, input.find, requestedIndex) : undefined;
     const rendered = found
       ? { content: "", startIndex: requestedIndex, endIndex: requestedIndex, totalBlocks: entry.page.blocks.length }
@@ -91,6 +103,12 @@ export class WebPageCache {
       pagination: entry.page.pagination,
       dynamicContentSuspected: entry.page.dynamicContentSuspected,
       dynamicContentReasons: entry.page.dynamicContentReasons,
+      documentType: entry.page.documentType,
+      ...(entry.page.pageCount !== undefined ? { pageCount: entry.page.pageCount } : {}),
+      ...(entry.page.pdfMetadata ? { pdfMetadata: entry.page.pdfMetadata } : {}),
+      ...(entry.page.scannedOrImageOnlySuspected !== undefined
+        ? { scannedOrImageOnlySuspected: entry.page.scannedOrImageOnlySuspected }
+        : {}),
       ...(found ? { find: found } : {}),
     };
   }
@@ -122,7 +140,12 @@ export class WebPageCache {
       userAgent: this.config.userAgent,
       signal,
     });
-    const page = extractWebPage(downloaded.text, downloaded.finalUrl);
+    const rawData = downloaded.data
+      ?? (downloaded.text.slice(0, 1_024).includes("%PDF-") ? Buffer.from(downloaded.text, "latin1") : undefined);
+    const pdf = isPdfResponse(downloaded.contentType, rawData, downloaded.text);
+    const page = pdf
+      ? await extractPdfDocument(rawData!, downloaded.finalUrl)
+      : extractWebPage(downloaded.text, downloaded.finalUrl);
     const root = await this.ensureRoot();
     const key = createHash("sha256").update(requestedUrl).digest("hex");
     const rawPath = join(root, `${key}.source`);
@@ -135,7 +158,9 @@ export class WebPageCache {
       page,
     })}\n`;
     await Promise.all([
-      writeFile(rawPath, downloaded.text, { encoding: "utf8", mode: 0o600 }),
+      rawData
+        ? writeFile(rawPath, rawData, { mode: 0o600 })
+        : writeFile(rawPath, downloaded.text, { encoding: "utf8", mode: 0o600 }),
       writeFile(indexPath, serialized, { encoding: "utf8", mode: 0o600 }),
     ]);
     return {
@@ -144,7 +169,7 @@ export class WebPageCache {
       fetchedAt: downloaded.fetchedAt,
       contentType: downloaded.contentType,
       bytes: downloaded.bytes,
-      diskBytes: Buffer.byteLength(downloaded.text, "utf8") + Buffer.byteLength(serialized, "utf8"),
+      diskBytes: (rawData?.byteLength ?? Buffer.byteLength(downloaded.text, "utf8")) + Buffer.byteLength(serialized, "utf8"),
       lastAccessedAt: Date.now(),
       page,
       rawPath,

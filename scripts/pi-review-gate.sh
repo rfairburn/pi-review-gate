@@ -34,6 +34,8 @@ elif [[ ! -f "$REVIEW_GATE_EXTENSION" ]]; then
   exit 2
 fi
 
+source "$REVIEW_GATE_ROOT/scripts/ensure-ddgs.sh"
+
 export PI_REVIEW_GATE_CONFIG="$REVIEW_GATE_CONFIG"
 
 echo "pi-review-gate config: $REVIEW_GATE_CONFIG"

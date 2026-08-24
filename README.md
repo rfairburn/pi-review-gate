@@ -97,7 +97,7 @@ capture truncation.
 
 ### Native web research
 
-`WebSearch` performs normalized DuckDuckGo HTML search without an API key. It canonicalizes duplicate URLs, reports optional provider-supplied dates and weak snippets without inventing missing data, supports `excludeDomains`, and returns an opaque cursor for continuation with the same query and filters.
+`WebSearch` uses the API-key-free DDGS metasearch library. It passes the requested result count directly to DDGS, retries one empty or failed attempt, canonicalizes duplicate URLs, reports optional provider-supplied dates and weak snippets without inventing missing data, and supports `excludeDomains`. The launcher provisions the pinned Python dependency in a private cache environment and every Pi process invokes it on demand.
 `WebFetch` downloads and indexes the complete selected HTML page or PDF, but
 returns only a bounded structural range. Its result includes `nextIndex` when
 more blocks remain. HTML results include a whole-page table inventory, possible
@@ -144,7 +144,7 @@ acquisitions without restarting the application.
 {
   "web": {
     "enabled": true,
-    "search": { "provider": "duckduckgo", "timeoutMs": 20000, "maxResults": 10 },
+    "search": { "provider": "ddgs", "timeoutMs": 20000, "maxResults": 10 },
     "fetch": {
       "timeoutMs": 30000,
       "maxDownloadBytes": 52428800,

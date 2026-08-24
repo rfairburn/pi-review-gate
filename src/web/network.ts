@@ -1,6 +1,7 @@
+import { spawn } from "node:child_process";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { parseHTML } from "linkedom";
+import { resolve } from "node:path";
 
 export interface NetworkOptions {
   timeoutMs: number;
@@ -34,9 +35,8 @@ export interface SearchResult {
 }
 
 export interface SearchResponse {
-  provider: "duckduckgo";
+  provider: "ddgs";
   query: string;
-  nextCursor?: string;
   excludedDomains?: string[];
   results: SearchResult[];
   fetchedAt: string;
@@ -106,16 +106,36 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
   }
 }
 
-export async function searchDuckDuckGo(input: {
+export interface DdgsRawResult {
+  title: string;
+  href: string;
+  body: string;
+  date?: string;
+}
+
+export interface DdgsSearchRequest {
+  query: string;
+  maxResults: number;
+  timeoutMs: number;
+  region?: string;
+  timelimit?: "d" | "w" | "m" | "y";
+}
+
+export interface DdgsSearchOutput {
+  results: DdgsRawResult[];
+}
+
+export type DdgsRunner = (request: DdgsSearchRequest, signal?: AbortSignal) => Promise<DdgsSearchOutput>;
+
+export async function searchDdgs(input: {
   query: string;
   maxResults: number;
   region?: string;
   freshness?: "day" | "week" | "month" | "year";
   domain?: string;
   excludeDomains?: string[];
-  cursor?: string;
-  options: NetworkOptions;
-  download?: typeof downloadText;
+  options: Pick<NetworkOptions, "timeoutMs" | "signal">;
+  run?: DdgsRunner;
 }): Promise<SearchResponse> {
   const startedAt = Date.now();
   const requestedQuery = input.query.trim();
@@ -126,132 +146,119 @@ export async function searchDuckDuckGo(input: {
   const query = [requestedQuery, domain ? `site:${domain}` : "", ...excludedDomains.map((value) => `-site:${value}`)]
     .filter(Boolean)
     .join(" ");
-  const identity = JSON.stringify({ query, region: input.region?.trim() ?? "", freshness: input.freshness ?? "" });
-  const initialParameters = new URLSearchParams({ q: query });
-  if (input.region) initialParameters.set("kl", input.region);
-  if (input.freshness) initialParameters.set("df", freshnessCode(input.freshness));
-  const request = input.cursor
-    ? decodeSearchCursor(input.cursor, query, identity)
-    : { method: "GET" as const, parameters: Object.fromEntries(initialParameters), start: 0, rankOffset: 0, identity };
-  const target = new URL("https://html.duckduckgo.com/html/");
-  const requestParameters = new URLSearchParams(request.parameters);
-  if (request.method === "GET") target.search = requestParameters.toString();
-  const downloaded = await (input.download ?? downloadText)(target.href, {
-    ...input.options,
-    maxBytes: Math.min(input.options.maxBytes, 2 * 1024 * 1024),
-    method: request.method,
-    ...(request.method === "POST" ? { body: requestParameters.toString() } : {}),
-  });
-  const pageResults = parseDuckDuckGoResults(downloaded.text, 100);
-  const results = pageResults.slice(request.start, request.start + input.maxResults).map((result, index) => ({
-    ...result,
-    rank: request.rankOffset + request.start + index + 1,
-  }));
-  if (pageResults.length === 0) {
-    const { document } = parseHTML(downloaded.text);
-    const body = cleanText(document.body?.textContent ?? "");
-    if (/captcha|automated|unusual traffic|challenge/i.test(body)) {
-      throw new Error("DuckDuckGo rejected the request with an automated-traffic challenge.");
-    }
-  }
-  const nextStart = request.start + results.length;
-  const continuation = nextStart < pageResults.length
-    ? { ...request, start: nextStart }
-    : parseDuckDuckGoContinuation(downloaded.text, query, request.rankOffset + pageResults.length, identity);
+  const region = input.region?.trim() || "us-en";
+  const request: DdgsSearchRequest = {
+    query,
+    maxResults: input.maxResults,
+    timeoutMs: input.options.timeoutMs,
+    region,
+    ...(input.freshness ? { timelimit: freshnessCode(input.freshness) } : {}),
+  };
+  const output = await runDdgsWithRetry(input.run ?? runDdgsSearch, request, input.options.signal);
+  const results = normalizeDdgsResults(output.results).slice(0, input.maxResults);
   return {
-    provider: "duckduckgo",
+    provider: "ddgs",
     query: requestedQuery,
-    ...(continuation ? { nextCursor: encodeSearchCursor(continuation) } : {}),
     ...(excludedDomains.length > 0 ? { excludedDomains } : {}),
     results,
-    fetchedAt: downloaded.fetchedAt,
+    fetchedAt: new Date().toISOString(),
     durationMs: Date.now() - startedAt,
   };
 }
 
-interface SearchCursor {
-  method: "GET" | "POST";
-  parameters: Record<string, string>;
-  start: number;
-  rankOffset: number;
-  identity: string;
-}
-
-export function parseDuckDuckGoContinuation(html: string, query: string, rankOffset: number, identity: string): SearchCursor | undefined {
-  const { document } = parseHTML(html);
-  for (const form of [...document.querySelectorAll("form")]) {
-    const submit = form.querySelector('input[type="submit"]') as HTMLInputElement | null;
-    if (!/^next$/i.test(cleanText(submit?.getAttribute("value") ?? ""))) continue;
-    const parameters: Record<string, string> = {};
-    for (const input of [...form.querySelectorAll('input[type="hidden"], input:not([type])')]) {
-      const name = input.getAttribute("name");
-      if (name) parameters[name] = input.getAttribute("value") ?? "";
+async function runDdgsWithRetry(run: DdgsRunner, request: DdgsSearchRequest, signal?: AbortSignal): Promise<DdgsSearchOutput> {
+  let firstError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const output = await run(request, signal);
+      if (output.results.length > 0) return output;
+      firstError ??= new Error("DDGS returned no results.");
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      firstError ??= error;
     }
-    if (parameters.q && parameters.q !== query) continue;
-    parameters.q = query;
-    return { method: "POST", parameters, start: 0, rankOffset, identity };
   }
-  return undefined;
+  throw firstError instanceof Error ? firstError : new Error(String(firstError ?? "DDGS returned no results."));
 }
 
-function encodeSearchCursor(value: SearchCursor): string {
-  return Buffer.from(JSON.stringify({ v: 1, ...value }), "utf8").toString("base64url");
+export async function runDdgsSearch(request: DdgsSearchRequest, signal?: AbortSignal): Promise<DdgsSearchOutput> {
+  if (signal?.aborted) throw new Error("DDGS search was cancelled.");
+  const python = process.env.PI_REVIEW_GATE_DDGS_PYTHON || "python3";
+  const helper = process.env.PI_REVIEW_GATE_DDGS_HELPER || resolve(__dirname, "../../../scripts/ddgs-search.py");
+  return await new Promise<DdgsSearchOutput>((resolveResult, reject) => {
+    const child = spawn(python, [helper], { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let failure: Error | undefined;
+    const terminate = (error: Error) => {
+      failure ??= error;
+      child.kill("SIGTERM");
+    };
+    const timer = setTimeout(() => terminate(new Error(`DDGS search timed out after ${request.timeoutMs}ms.`)), request.timeoutMs);
+    timer.unref?.();
+    const onAbort = () => terminate(new Error("DDGS search was cancelled."));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      if (stdout.length > 2 * 1024 * 1024) terminate(new Error("DDGS helper returned too much data."));
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+      if (stderr.length > 64 * 1024) terminate(new Error("DDGS helper returned too much diagnostic output."));
+    });
+    child.stdin.on("error", (error) => { failure ??= error; });
+    child.on("error", (error) => { failure ??= error; });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (failure) {
+        reject(failure);
+        return;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(stdout);
+      } catch {
+        reject(new Error(`DDGS helper returned invalid JSON${stderr.trim() ? `: ${stderr.trim()}` : "."}`));
+        return;
+      }
+      if (!isRecord(parsed) || parsed.ok !== true) {
+        const message = isRecord(parsed) && typeof parsed.error === "string" ? parsed.error : stderr.trim();
+        reject(new Error(message || `DDGS helper exited with status ${code ?? "unknown"}.`));
+        return;
+      }
+      try {
+        resolveResult(parseDdgsOutput(parsed));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    child.stdin.end(JSON.stringify(request));
+  });
 }
 
-function decodeSearchCursor(value: string, query: string, identity: string): SearchCursor {
-  if (value.length > 12_000) throw new Error("Search cursor is too large.");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
-  } catch {
-    throw new Error("Search cursor is invalid.");
-  }
-  if (!isCursorRecord(parsed) || parsed.v !== 1 || (parsed.method !== "GET" && parsed.method !== "POST")) {
-    throw new Error("Search cursor is invalid.");
-  }
-  const start = parsed.start;
-  const rankOffset = parsed.rankOffset;
-  if (typeof start !== "number" || !Number.isInteger(start) || start < 0 || start > 100 || typeof rankOffset !== "number" || !Number.isInteger(rankOffset) || rankOffset < 0 || rankOffset > 10_000) {
-    throw new Error("Search cursor is invalid.");
-  }
-  if (!isCursorRecord(parsed.parameters) || Object.keys(parsed.parameters).length > 32) throw new Error("Search cursor is invalid.");
-  const parameters: Record<string, string> = {};
-  for (const [name, field] of Object.entries(parsed.parameters)) {
-    if (typeof field !== "string" || name.length > 80 || field.length > 4_000) throw new Error("Search cursor is invalid.");
-    parameters[name] = field;
-  }
-  if (parsed.identity !== identity || parameters.q !== query) throw new Error("Search cursor does not match this query or its filters.");
-  return { method: parsed.method, parameters, start, rankOffset, identity };
-}
-
-function isCursorRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-export function parseDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
-  const { document } = parseHTML(html);
+export function normalizeDdgsResults(rawResults: DdgsRawResult[], rankOffset = 0): SearchResult[] {
   const seen = new Set<string>();
   const results: SearchResult[] = [];
-  for (const result of [...document.querySelectorAll(".result")]) {
-    const link = result.querySelector("a.result__a") as HTMLAnchorElement | null;
-    if (!link) continue;
-    const url = unwrapDuckDuckGoUrl(link.getAttribute("href") ?? "");
+  for (const raw of rawResults) {
+    const url = normalizedSearchResultUrl(raw.href);
     if (!url) continue;
     const canonical = canonicalSearchUrl(url);
     if (seen.has(canonical)) continue;
     seen.add(canonical);
-    const snippet = cleanText(result.querySelector(".result__snippet")?.textContent ?? "");
-    const dateText = providerDateText(result, snippet);
+    const snippet = cleanText(raw.body);
+    const dateText = cleanText(raw.date ?? "") || providerDateFromSnippet(snippet);
     results.push({
-      rank: results.length + 1,
-      title: cleanText(link.textContent ?? ""),
+      rank: rankOffset + results.length + 1,
+      title: cleanText(raw.title) || new URL(url).hostname,
       url,
       hostname: new URL(url).hostname,
       snippet,
       ...(isWeakSnippet(snippet) ? { snippetQuality: "weak" as const } : {}),
       ...(dateText ? { dateText, dateSource: "provider" as const } : {}),
     });
-    if (results.length >= maxResults) break;
   }
   return results;
 }
@@ -335,27 +342,43 @@ function isBlockedAddress(address: string): boolean {
   return false;
 }
 
-function unwrapDuckDuckGoUrl(value: string): string | undefined {
-  try {
-    const url = new URL(value, "https://duckduckgo.com");
-    const redirected = url.searchParams.get("uddg");
-    const target = redirected ? new URL(redirected) : url;
-    if (target.protocol !== "http:" && target.protocol !== "https:") return undefined;
-    target.hash = "";
-    for (const name of [...target.searchParams.keys()]) {
-      if (isTrackingParameter(name)) target.searchParams.delete(name);
+function parseDdgsOutput(value: Record<string, unknown>): DdgsSearchOutput {
+  if (!Array.isArray(value.results)) throw new Error("DDGS helper returned an invalid result payload.");
+  const results = value.results.map((item) => {
+    if (!isRecord(item) || typeof item.title !== "string" || typeof item.href !== "string" || typeof item.body !== "string") {
+      throw new Error("DDGS helper returned an invalid search result.");
     }
-    target.searchParams.sort();
-    return target.href;
+    if (item.date !== undefined && typeof item.date !== "string") throw new Error("DDGS helper returned an invalid provider date.");
+    return {
+      title: item.title,
+      href: item.href,
+      body: item.body,
+      ...(typeof item.date === "string" && item.date ? { date: item.date } : {}),
+    };
+  });
+  return { results };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizedSearchResultUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    url.hash = "";
+    for (const name of [...url.searchParams.keys()]) {
+      if (isTrackingParameter(name)) url.searchParams.delete(name);
+    }
+    url.searchParams.sort();
+    return url.href;
   } catch {
     return undefined;
   }
 }
 
-function providerDateText(result: Element, snippet: string): string | undefined {
-  const dateElement = result.querySelector(".result__timestamp, .result__date, time");
-  const explicit = cleanText(dateElement?.getAttribute("datetime") ?? dateElement?.textContent ?? "");
-  if (explicit) return explicit;
+function providerDateFromSnippet(snippet: string): string | undefined {
   const month = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
   const prefix = new RegExp(`^(?:Updated\\s+|Published\\s+)?(${month}\\s+\\d{1,2},\\s+\\d{4}|\\d{1,2}\\s+${month}\\s+\\d{4}|\\d{4}-\\d{2}-\\d{2}|\\d+\\s+(?:hours?|days?|weeks?|months?|years?)\\s+ago)(?:\\s*[-–—·|]\\s*)?`, "i");
   return snippet.match(prefix)?.[1];
@@ -386,8 +409,8 @@ function cleanText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function freshnessCode(value: "day" | "week" | "month" | "year"): string {
-  return { day: "d", week: "w", month: "m", year: "y" }[value];
+function freshnessCode(value: "day" | "week" | "month" | "year"): "d" | "w" | "m" | "y" {
+  return ({ day: "d", week: "w", month: "m", year: "y" } as const)[value];
 }
 
 function charsetOf(contentType: string | null): string {

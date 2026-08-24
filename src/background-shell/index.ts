@@ -440,9 +440,9 @@ export function registerBackgroundShell(pi: BackgroundShellHost): void {
       ].filter(Boolean);
 
       return textResult(
-        `Started "${label}" as ${id} (pid ${proc.pid ?? "?"}).\n` +
-          `Waking you on: ${watching.join(", ") || "nothing"}.\n` +
-          `You will be told automatically — do not poll. Carry on with other work.`,
+        `Started "${label}" as ${id} (pid ${proc.pid ?? "?"}); currently running.\n` +
+          `Future wake triggers (not current events): ${watching.join(", ") || "nothing"}.\n` +
+          `You will be notified automatically; do not poll.`,
       );
     },
   });

@@ -2,7 +2,7 @@
 import { loadConfig, normalizeConfig, type ReviewGateConfig, type WebConfig } from "../config";
 import { renderWithChromium } from "./browser";
 import { WebPageCache } from "./cache";
-import { searchDuckDuckGo } from "./network";
+import { searchDdgs } from "./network";
 
 interface CliRequest {
   id?: string;
@@ -16,7 +16,6 @@ interface CliRequest {
   excludeDomains?: string[];
   region?: string;
   freshness?: "day" | "week" | "month" | "year";
-  cursor?: string;
   refresh?: boolean;
   find?: string;
   columns?: string[];
@@ -84,18 +83,15 @@ async function runRequest(request: CliRequest, cache: WebPageCache, browserCache
   try {
     if (request.operation === "search") {
       if (!request.query?.trim()) throw new Error("search requires query");
-      const data = await searchDuckDuckGo({
+      const data = await searchDdgs({
         query: request.query,
         maxResults: bounded(request.maxResults, 1, config.web.search.maxResults, config.web.search.maxResults, "maxResults"),
         ...(request.domain ? { domain: request.domain } : {}),
         ...(request.excludeDomains ? { excludeDomains: request.excludeDomains } : {}),
         ...(request.region ? { region: request.region } : {}),
         ...(request.freshness ? { freshness: request.freshness } : {}),
-        ...(request.cursor ? { cursor: request.cursor } : {}),
         options: {
           timeoutMs: config.web.search.timeoutMs,
-          maxBytes: 2 * 1024 * 1024,
-          userAgent: config.web.fetch.userAgent,
         },
       });
       return envelope(request, data);
@@ -135,7 +131,6 @@ function parseSearchArgs(args: string[]): CliRequest {
     excludeDomains: parsed.options["exclude-domains"]?.split(",").map((value) => value.trim()).filter(Boolean),
     region: parsed.options.region,
     freshness: parsed.options.freshness as CliRequest["freshness"],
-    cursor: parsed.options.cursor,
   };
 }
 

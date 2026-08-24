@@ -28,6 +28,8 @@ try {
   for (const required of [
     "dist/src/index.js",
     "scripts/pi-review-gate.sh",
+    "scripts/ensure-ddgs.sh",
+    "scripts/ddgs-search.py",
     "scripts/orchestrator-system-prompt.md",
     "scripts/fake-reviewer.cjs",
     "LICENSES/Apache-2.0.txt",

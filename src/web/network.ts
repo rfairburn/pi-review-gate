@@ -37,8 +37,6 @@ export interface SearchResult {
 export interface SearchResponse {
   provider: "ddgs";
   query: string;
-  page: number;
-  nextPage?: number;
   excludedDomains?: string[];
   results: SearchResult[];
   fetchedAt: string;
@@ -118,7 +116,6 @@ export interface DdgsRawResult {
 export interface DdgsSearchRequest {
   query: string;
   maxResults: number;
-  page: number;
   timeoutMs: number;
   region?: string;
   timelimit?: "d" | "w" | "m" | "y";
@@ -126,7 +123,6 @@ export interface DdgsSearchRequest {
 
 export interface DdgsSearchOutput {
   results: DdgsRawResult[];
-  hasMore: boolean;
 }
 
 export type DdgsRunner = (request: DdgsSearchRequest, signal?: AbortSignal) => Promise<DdgsSearchOutput>;
@@ -138,7 +134,6 @@ export async function searchDdgs(input: {
   freshness?: "day" | "week" | "month" | "year";
   domain?: string;
   excludeDomains?: string[];
-  page?: number;
   options: Pick<NetworkOptions, "timeoutMs" | "signal">;
   run?: DdgsRunner;
 }): Promise<SearchResponse> {
@@ -152,28 +147,38 @@ export async function searchDdgs(input: {
     .filter(Boolean)
     .join(" ");
   const region = input.region?.trim() || "us-en";
-  const page = input.page ?? 1;
-  if (!Number.isInteger(page) || page < 1 || page > 100) throw new Error("Search page must be an integer from 1 through 100.");
-  const output = await (input.run ?? runDdgsSearch)({
+  const request: DdgsSearchRequest = {
     query,
     maxResults: input.maxResults,
-    page,
     timeoutMs: input.options.timeoutMs,
     region,
     ...(input.freshness ? { timelimit: freshnessCode(input.freshness) } : {}),
-  }, input.options.signal);
-  const results = normalizeDdgsResults(output.results, (page - 1) * input.maxResults);
-  const nextPage = output.hasMore && results.length > 0 ? page + 1 : undefined;
+  };
+  const output = await runDdgsWithRetry(input.run ?? runDdgsSearch, request, input.options.signal);
+  const results = normalizeDdgsResults(output.results).slice(0, input.maxResults);
   return {
     provider: "ddgs",
     query: requestedQuery,
-    page,
-    ...(nextPage ? { nextPage } : {}),
     ...(excludedDomains.length > 0 ? { excludedDomains } : {}),
     results,
     fetchedAt: new Date().toISOString(),
     durationMs: Date.now() - startedAt,
   };
+}
+
+async function runDdgsWithRetry(run: DdgsRunner, request: DdgsSearchRequest, signal?: AbortSignal): Promise<DdgsSearchOutput> {
+  let firstError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const output = await run(request, signal);
+      if (output.results.length > 0) return output;
+      firstError ??= new Error("DDGS returned no results.");
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      firstError ??= error;
+    }
+  }
+  throw firstError instanceof Error ? firstError : new Error(String(firstError ?? "DDGS returned no results."));
 }
 
 export async function runDdgsSearch(request: DdgsSearchRequest, signal?: AbortSignal): Promise<DdgsSearchOutput> {
@@ -338,7 +343,7 @@ function isBlockedAddress(address: string): boolean {
 }
 
 function parseDdgsOutput(value: Record<string, unknown>): DdgsSearchOutput {
-  if (!Array.isArray(value.results) || typeof value.hasMore !== "boolean") throw new Error("DDGS helper returned an invalid result payload.");
+  if (!Array.isArray(value.results)) throw new Error("DDGS helper returned an invalid result payload.");
   const results = value.results.map((item) => {
     if (!isRecord(item) || typeof item.title !== "string" || typeof item.href !== "string" || typeof item.body !== "string") {
       throw new Error("DDGS helper returned an invalid search result.");
@@ -351,7 +356,7 @@ function parseDdgsOutput(value: Record<string, unknown>): DdgsSearchOutput {
       ...(typeof item.date === "string" && item.date ? { date: item.date } : {}),
     };
   });
-  return { results, hasMore: value.hasMore };
+  return { results };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

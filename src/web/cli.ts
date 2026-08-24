@@ -16,7 +16,6 @@ interface CliRequest {
   excludeDomains?: string[];
   region?: string;
   freshness?: "day" | "week" | "month" | "year";
-  page?: number;
   refresh?: boolean;
   find?: string;
   columns?: string[];
@@ -87,7 +86,6 @@ async function runRequest(request: CliRequest, cache: WebPageCache, browserCache
       const data = await searchDdgs({
         query: request.query,
         maxResults: bounded(request.maxResults, 1, config.web.search.maxResults, config.web.search.maxResults, "maxResults"),
-        page: bounded(request.page, 1, 100, 1, "page"),
         ...(request.domain ? { domain: request.domain } : {}),
         ...(request.excludeDomains ? { excludeDomains: request.excludeDomains } : {}),
         ...(request.region ? { region: request.region } : {}),
@@ -133,7 +131,6 @@ function parseSearchArgs(args: string[]): CliRequest {
     excludeDomains: parsed.options["exclude-domains"]?.split(",").map((value) => value.trim()).filter(Boolean),
     region: parsed.options.region,
     freshness: parsed.options.freshness as CliRequest["freshness"],
-    page: numberOption(parsed.options, "page"),
   };
 }
 

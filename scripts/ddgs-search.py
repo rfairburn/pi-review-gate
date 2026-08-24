@@ -34,7 +34,6 @@ def main() -> None:
     if query is None:
         raise ValueError("query is required")
     max_results = required_int(request, "maxResults", 1, 100)
-    page = required_int(request, "page", 1, 100)
     timeout_ms = required_int(request, "timeoutMs", 1, 3_600_000)
     region = optional_string(request, "region") or "us-en"
     timelimit = optional_string(request, "timelimit")
@@ -46,7 +45,6 @@ def main() -> None:
         region=region,
         timelimit=timelimit,
         max_results=max_results,
-        page=page,
         backend="auto",
     )
     results = []
@@ -63,7 +61,7 @@ def main() -> None:
             result["date"] = row["date"]
         results.append(result)
 
-    json.dump({"ok": True, "results": results, "hasMore": len(rows) >= max_results}, sys.stdout)
+    json.dump({"ok": True, "results": results}, sys.stdout)
 
 
 if __name__ == "__main__":

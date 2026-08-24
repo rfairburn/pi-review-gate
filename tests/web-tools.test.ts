@@ -351,14 +351,12 @@ test("DDGS result normalization removes tracking, deduplicates URLs, and retains
   assert.equal(canonicalSearchUrl("https://www.example.com/cities/?b=2&utm_medium=x&a=1"), "example.com/cities?a=1&b=2");
 });
 
-test("WebSearch continues with an ordinary DDGS page number", async () => {
+test("WebSearch passes the requested result count directly without pagination", async () => {
   const result = (href: string, title: string) => ({ href, title, body: `A sufficiently complete provider snippet describing ${title} for search testing.` });
   const calls: Parameters<DdgsRunner>[0][] = [];
   const run: DdgsRunner = async (request) => {
     calls.push(request);
-    return request.page === 1
-      ? { results: [result("https://one.example/a", "One"), result("https://two.example/b", "Two")], hasMore: true }
-      : { results: [result("https://three.example/c", "Three"), result("https://four.example/d", "Four")], hasMore: false };
+    return { results: [result("https://one.example/a", "One"), result("https://two.example/b", "Two")] };
   };
   const common = {
     query: "cities",
@@ -371,33 +369,41 @@ test("WebSearch continues with an ordinary DDGS page number", async () => {
   const first = await searchDdgs(common);
   assert.deepEqual(first.results.map((item) => [item.rank, item.title]), [[1, "One"], [2, "Two"]]);
   assert.deepEqual(first.excludedDomains, ["noise.example"]);
-  assert.equal(first.page, 1);
-  assert.equal(first.nextPage, 2);
   assert.equal(calls[0]!.query, "cities -site:noise.example");
-  assert.equal(calls[0]!.page, 1);
+  assert.equal(calls[0]!.maxResults, 2);
   assert.equal(calls[0]!.region, "us-en");
-
-  const nextPage = await searchDdgs({ ...common, page: first.nextPage });
-  assert.deepEqual(nextPage.results.map((item) => [item.rank, item.title]), [[3, "Three"], [4, "Four"]]);
-  assert.equal(calls[1]!.page, 2);
-  assert.equal(nextPage.page, 2);
-  assert.equal(nextPage.nextPage, undefined);
-
-  await assert.rejects(
-    searchDdgs({ ...common, page: 101 }),
-    /page must be an integer from 1 through 100/i,
-  );
   await assert.rejects(
     searchDdgs({ ...common, domain: "noise.example" }),
     /cannot also be excluded/,
   );
 });
 
+test("WebSearch retries one empty DDGS provider result", async () => {
+  let attempts = 0;
+  const requestedCounts: number[] = [];
+  const run: DdgsRunner = async (request) => {
+    attempts += 1;
+    requestedCounts.push(request.maxResults);
+    if (attempts === 1) return { results: [] };
+    return {
+      results: [{ title: "Recovered", href: "https://example.com/recovered", body: "A valid result returned by the retry attempt." }],
+    };
+  };
+  const response = await searchDdgs({
+    query: "known good query",
+    maxResults: 5,
+    options: { timeoutMs: 1_000 },
+    run,
+  });
+  assert.equal(attempts, 2);
+  assert.deepEqual(requestedCounts, [5, 5]);
+  assert.equal(response.results[0]?.title, "Recovered");
+});
+
 test("WebSearch reports provider date coverage without inferring missing dates", () => {
   const base = {
     provider: "ddgs" as const,
     query: "cities",
-    page: 1,
     fetchedAt: "2026-08-23T00:00:00.000Z",
     durationMs: 12,
   };
@@ -411,7 +417,6 @@ test("WebSearch reports provider date coverage without inferring missing dates",
   });
 
   assert.match(formatSearch({ ...base, results: [result(1), result(2)] }), /unavailable for all 2 result\(s\); dates were not inferred/);
-  assert.match(formatSearch({ ...base, nextPage: 2, results: [result(1)] }), /same WebSearch query and filters with page: 2/);
   assert.match(formatSearch({ ...base, results: [result(1, "Aug 23, 2026"), result(2)] }), /supplied for 1\/2 result\(s\); absent dates were not inferred/);
   assert.match(formatSearch({ ...base, results: [result(1, "Aug 23, 2026"), result(2, "Aug 22, 2026")] }), /supplied for all 2 result\(s\)/);
 });
@@ -453,7 +458,7 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.deepEqual([...tools.keys()], ["WebSearch", "WebFetch", "BrowserExtract"]);
   assert.equal(tools.has("WebRead"), false);
   assert.ok(tools.get("WebSearch").parameters.properties.excludeDomains);
-  assert.ok(tools.get("WebSearch").parameters.properties.page);
+  assert.equal(tools.get("WebSearch").parameters.properties.page, undefined);
   assert.equal(tools.get("WebSearch").parameters.properties.cursor, undefined);
   assert.deepEqual(
     Object.keys(tools.get("BrowserExtract").parameters.properties),

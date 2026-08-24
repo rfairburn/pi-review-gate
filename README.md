@@ -97,7 +97,7 @@ capture truncation.
 
 ### Native web research
 
-`WebSearch` uses the API-key-free DDGS metasearch library. It canonicalizes duplicate URLs, reports optional provider-supplied dates and weak snippets without inventing missing data, supports `excludeDomains`, and continues with an ordinary numeric `page`. The launcher provisions the pinned Python dependency in a private cache environment and every Pi process invokes it on demand.
+`WebSearch` uses the API-key-free DDGS metasearch library. It passes the requested result count directly to DDGS, retries one empty or failed attempt, canonicalizes duplicate URLs, reports optional provider-supplied dates and weak snippets without inventing missing data, and supports `excludeDomains`. The launcher provisions the pinned Python dependency in a private cache environment and every Pi process invokes it on demand.
 `WebFetch` downloads and indexes the complete selected HTML page or PDF, but
 returns only a bounded structural range. Its result includes `nextIndex` when
 more blocks remain. HTML results include a whole-page table inventory, possible

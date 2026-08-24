@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+case "${1:-}" in
+  update|install|remove|uninstall|list|config|auth)
+    exec pi "$@"
+    ;;
+esac
+
 REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
 ORCHESTRATOR_PROMPT="$REVIEW_GATE_ROOT/scripts/orchestrator-system-prompt.md"

@@ -19,6 +19,37 @@ import type { ExecutorAdapter, ExecutorInteractionAcknowledgement, ExecutorReque
 
 const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<typeof import("@anthropic-ai/claude-agent-sdk")>;
 
+const CLAUDE_RESEARCH_TOOL_MAP = new Map([
+  ["read", "Read"],
+  ["grep", "Grep"],
+  ["glob", "Glob"],
+  ["find", "Glob"],
+  ["ls", "Glob"],
+  ["WebFetch", "WebFetch"],
+  ["WebSearch", "WebSearch"],
+]);
+
+const CLAUDE_RESEARCH_POLICY_FLAGS = [
+  "--add-dir",
+  "--agent",
+  "--agents",
+  "--allow-dangerously-skip-permissions",
+  "--allowed-tools",
+  "--allowedTools",
+  "--chrome",
+  "--dangerously-skip-permissions",
+  "--disallowed-tools",
+  "--disallowedTools",
+  "--mcp-config",
+  "--no-chrome",
+  "--permission-mode",
+  "--plugin-dir",
+  "--setting-sources",
+  "--settings",
+  "--strict-mcp-config",
+  "--tools",
+] as const;
+
 export interface ClaudeExecutorDependencies {
   loadSdk?: () => Promise<{ query: typeof import("@anthropic-ai/claude-agent-sdk")["query"] }>;
 }
@@ -36,6 +67,9 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    const readOnly = request.workspaceAccess === "read-only";
+    const researchTools = readOnly ? claudeResearchTools(request.allowedTools) : [];
+    if (readOnly) assertClaudeResearchArgsSafe(this.config.args);
     const requestedSessionId = request.session?.id ?? randomUUID();
     const initialUuid = randomUUID();
     const input = new AsyncMessageQueue();
@@ -63,7 +97,12 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
     const sdk = await (this.dependencies.loadSdk?.() ?? dynamicImport("@anthropic-ai/claude-agent-sdk"));
     const abortController = new AbortController();
     const spawnClaudeCodeProcess = (options: SpawnOptions): SpawnedProcess => {
-      child = spawn(options.command, [...options.args, ...(this.config.args ?? [])], {
+      // The SDK-generated policy flags must be final for read-only turns so
+      // arbitrary external-agent arguments cannot widen the research profile.
+      const args = readOnly
+        ? [...(this.config.args ?? []), ...options.args]
+        : [...options.args, ...(this.config.args ?? [])];
+      child = spawn(options.command, args, {
         cwd: options.cwd,
         env: reviewerEnv({ ...options.env, ...this.config.env }),
         detached: process.platform !== "win32",
@@ -91,8 +130,23 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
     const options: ClaudeOptions = {
       cwd: request.cwd,
       model: this.config.model,
-      permissionMode: "auto",
-      tools: { type: "preset", preset: "claude_code" },
+      permissionMode: readOnly ? "dontAsk" : "auto",
+      tools: readOnly ? researchTools : { type: "preset", preset: "claude_code" },
+      ...(readOnly ? {
+        allowedTools: researchTools,
+        settingSources: [],
+        skills: [] as string[],
+        plugins: [],
+        mcpServers: {},
+        strictMcpConfig: true,
+        canUseTool: async (toolName: string) => researchTools.includes(toolName)
+          ? { behavior: "allow" as const }
+          : {
+              behavior: "deny" as const,
+              message: `Tool ${toolName} is outside the read-only research profile.`,
+              interrupt: false,
+            },
+      } : {}),
       includePartialMessages: true,
       persistSession: true,
       pathToClaudeCodeExecutable: this.config.command ?? "claude",
@@ -237,6 +291,25 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
           ? { category: "provider", message: resultError }
           : undefined,
     };
+  }
+}
+
+function claudeResearchTools(allowedTools: readonly string[] | undefined): string[] {
+  if (!allowedTools) {
+    throw new Error("Claude research launch requires an authoritative parent tool allowlist.");
+  }
+  return [...new Set(allowedTools.flatMap((tool) => {
+    const mapped = CLAUDE_RESEARCH_TOOL_MAP.get(tool);
+    return mapped ? [mapped] : [];
+  }))];
+}
+
+function assertClaudeResearchArgsSafe(args: readonly string[] | undefined): void {
+  const unsafe = args?.find((arg) => CLAUDE_RESEARCH_POLICY_FLAGS.some(
+    (flag) => arg === flag || arg.startsWith(`${flag}=`),
+  ));
+  if (unsafe) {
+    throw new Error(`Claude research launch rejects tool-policy argument ${unsafe}; the read-only profile is authoritative.`);
   }
 }
 

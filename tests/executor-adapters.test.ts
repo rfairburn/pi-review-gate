@@ -176,6 +176,8 @@ test("Codex executor uses app-server turn steering with exact thread and turn id
       prompt: "work",
       artifactDir,
       turn: 1,
+      workspaceAccess: "read-only",
+      allowedTools: ["read", "WebSearch"],
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
@@ -188,6 +190,13 @@ test("Codex executor uses app-server turn steering with exact thread and turn id
     assert.equal(steer.params.threadId, "thread-1");
     assert.equal(steer.params.expectedTurnId, "turn-1");
     assert.equal(steer.params.clientUserMessageId, "durable-steer-id");
+    const threadStart = calls.find((call) => call.method === "thread/start");
+    assert.equal(threadStart.params.sandbox, "read-only");
+    assert.equal(threadStart.params.config.web_search, "live");
+    assert.deepEqual(threadStart.params.config.mcp_servers, {});
+    assert.equal(threadStart.params.config.apps._default.enabled, false);
+    assert.deepEqual(threadStart.params.environments, []);
+    assert.deepEqual(threadStart.params.dynamicTools, []);
     assert.ok(calls.some((call) => call.method === "initialized"));
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -228,6 +237,60 @@ test("Codex interrupt waits for the active turn terminal notification", async ()
     assert.ok(Date.now() - startedAt >= 30, "interrupt acknowledgement must await turn completion");
     const result = await run;
     assert.equal(result.failure?.category, "interruption");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex research executor rejects launch arguments that could bypass its sandbox", async () => {
+  const adapter = new CodexExecutorAdapter({
+    id: "codex",
+    adapter: "codex-cli",
+    command: "must-not-launch",
+    model: "gpt-test",
+    args: ["--dangerously-bypass-approvals-and-sandbox"],
+  });
+  await assert.rejects(adapter.run({
+    cwd: process.cwd(),
+    prompt: "research",
+    artifactDir: join(tmpdir(), "pi-review-codex-policy-override"),
+    turn: 1,
+    workspaceAccess: "read-only",
+  }), /rejects CLI argument --dangerously-bypass-approvals-and-sandbox/);
+});
+
+test("Codex research executor retains safe model reasoning configuration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-safe-config-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "codex-safe-config.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "let input='';process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);if(!c.id)continue;",
+      "if(c.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));",
+      "else if(c.method==='thread/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-safe'}}}));",
+      "else if(c.method==='turn/start'){console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turn:{id:'turn-safe'}}}));console.log(JSON.stringify({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text:'done'}}}));console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-safe',turn:{id:'turn-safe',status:'completed'}}}));}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const adapter = new CodexExecutorAdapter({
+      id: "codex",
+      adapter: "codex-cli",
+      command,
+      model: "gpt-test",
+      args: ["-c", "model_reasoning_effort=\"high\""],
+    });
+    const result = await adapter.run({
+      cwd: root,
+      prompt: "research",
+      artifactDir,
+      turn: 1,
+      workspaceAccess: "read-only",
+      allowedTools: ["read"],
+    });
+    assert.equal(result.text, "done");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

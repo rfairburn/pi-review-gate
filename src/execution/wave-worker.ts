@@ -729,6 +729,7 @@ async function runWithPoolFailover(input: {
       request: {
         cwd: input.worker.worktree.effectiveCwd,
         artifactDir: input.resolvedArtifactDir,
+        workspaceAccess: input.worker.task.backgroundKind === "research" ? "read-only" : "workspace-write",
         allowedTools: input.worker.task.executorAllowedTools,
         signal: input.worker.signal,
         onUpdate: (message) => reportProgress(input.worker, {

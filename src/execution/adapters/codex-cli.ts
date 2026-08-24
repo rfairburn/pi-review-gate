@@ -21,6 +21,15 @@ interface PendingRequest {
   reject: (error: Error) => void;
 }
 
+const CODEX_RESEARCH_CONFIG_KEYS = new Set([
+  "model_auto_compact_token_limit",
+  "model_context_window",
+  "model_reasoning_effort",
+  "model_reasoning_summary",
+  "model_verbosity",
+  "service_tier",
+]);
+
 /** Codex executor backed by the official long-lived app-server protocol. */
 export class CodexExecutorAdapter implements ExecutorAdapter {
   readonly kind = "codex-cli";
@@ -32,6 +41,9 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
     const startedAt = Date.now();
+    const sandbox = request.workspaceAccess === "read-only" ? "read-only" : "workspace-write";
+    if (sandbox === "read-only") assertCodexResearchArgsSafe(this.config.args);
+    const researchConfig = sandbox === "read-only" ? codexResearchThreadConfig(request.allowedTools) : undefined;
     const proc = spawn(this.config.command ?? "codex", [
       ...(this.config.args ?? []),
       "app-server",
@@ -94,15 +106,22 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
             threadId: request.session.id,
             cwd: request.cwd,
             model: this.config.model,
-            sandbox: "workspace-write",
+            sandbox,
             approvalPolicy: "never",
+            config: researchConfig,
           })
         : await rpc.request("thread/start", {
             cwd: request.cwd,
             model: this.config.model,
-            sandbox: "workspace-write",
+            sandbox,
             approvalPolicy: "never",
             ephemeral: false,
+            ...(researchConfig ? {
+              config: researchConfig,
+              environments: [],
+              dynamicTools: [],
+              selectedCapabilityRoots: [],
+            } : {}),
           });
       threadId = stringAt(threadResponse, "thread", "id") ?? threadId;
       if (!threadId) throw new Error("Codex app-server did not return a thread id.");
@@ -112,6 +131,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
         cwd: request.cwd,
         model: this.config.model,
         approvalPolicy: "never",
+        ...(researchConfig ? { environments: [] } : {}),
         input: [{ type: "text", text: request.prompt }],
       });
       turnId = stringAt(turnResponse, "turn", "id");
@@ -204,6 +224,53 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       failure,
     };
   }
+}
+
+function assertCodexResearchArgsSafe(args: readonly string[] | undefined): void {
+  for (let index = 0; index < (args?.length ?? 0); index += 1) {
+    const arg = args![index]!;
+    if (arg === "--strict-config") continue;
+    if (arg === "-c" || arg === "--config") {
+      const value = args![index + 1];
+      if (!value || !isSafeCodexResearchConfig(value)) {
+        throw new Error(`Codex research launch rejects configuration ${value ?? arg}; the read-only profile is authoritative.`);
+      }
+      index += 1;
+      continue;
+    }
+    const inline = arg.startsWith("-c=")
+      ? arg.slice(3)
+      : arg.startsWith("--config=")
+        ? arg.slice("--config=".length)
+        : undefined;
+    if (inline !== undefined && isSafeCodexResearchConfig(inline)) continue;
+    throw new Error(`Codex research launch rejects CLI argument ${arg}; the read-only profile is authoritative.`);
+  }
+}
+
+function isSafeCodexResearchConfig(value: string): boolean {
+  const separator = value.indexOf("=");
+  return separator > 0 && CODEX_RESEARCH_CONFIG_KEYS.has(value.slice(0, separator).trim());
+}
+
+function codexResearchThreadConfig(allowedTools: readonly string[] | undefined): Record<string, unknown> {
+  if (!allowedTools) {
+    throw new Error("Codex research launch requires an authoritative parent tool allowlist.");
+  }
+  return {
+    web_search: allowedTools.includes("WebSearch") ? "live" : "disabled",
+    mcp_servers: {},
+    apps: {
+      _default: {
+        enabled: false,
+        approvals_reviewer: null,
+        destructive_enabled: false,
+        open_world_enabled: false,
+        default_tools_approval_mode: null,
+        default_tools_enabled: false,
+      },
+    },
+  };
 }
 
 class AppServerRpc {

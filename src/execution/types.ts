@@ -27,6 +27,8 @@ export interface ExecutorRequest {
   prompt: string;
   artifactDir: string;
   turn: number;
+  /** Filesystem capability assigned by the parent worker role. Defaults to workspace-write. */
+  workspaceAccess?: "read-only" | "workspace-write";
   /** Durable parent tool allowlist. Required by Pi-native child launches. */
   allowedTools?: readonly string[];
   signal?: AbortSignal;

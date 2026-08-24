@@ -41,12 +41,85 @@ test("Claude executor uses Agent SDK streaming input for acknowledged live steer
     assert.equal(inputs.length, 2);
     assert.equal(inputs[1]?.priority, "now");
     assert.equal(capturedOptions?.permissionMode, "auto");
+    assert.deepEqual(capturedOptions?.tools, { type: "preset", preset: "claude_code" });
     assert.equal(capturedOptions?.includePartialMessages, true);
     assert.ok(activity.some((message) => /streaming session initialized/.test(message)));
     assert.ok(activity.some((message) => /bash/.test(message)));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("Claude research executor exposes only parent-authorized read-only tools", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-research-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    let capturedOptions: Record<string, any> | undefined;
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage>; options: Record<string, unknown> }) => {
+      capturedOptions = params.options;
+      return createFakeQuery(params.prompt, inputs);
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "research",
+      artifactDir,
+      turn: 1,
+      workspaceAccess: "read-only",
+      allowedTools: ["read", "grep", "find", "WebFetch", "BrowserExtract", "bash"],
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    await control.steer("finish", "instruction-1");
+    await run;
+
+    assert.equal(capturedOptions?.permissionMode, "dontAsk");
+    assert.deepEqual(capturedOptions?.tools, ["Read", "Grep", "Glob", "WebFetch"]);
+    assert.deepEqual(capturedOptions?.allowedTools, ["Read", "Grep", "Glob", "WebFetch"]);
+    assert.deepEqual(capturedOptions?.settingSources, []);
+    assert.deepEqual(capturedOptions?.plugins, []);
+    assert.deepEqual(capturedOptions?.mcpServers, {});
+    assert.equal(capturedOptions?.strictMcpConfig, true);
+    assert.equal((await capturedOptions?.canUseTool("Read", {}, {})).behavior, "allow");
+    assert.equal((await capturedOptions?.canUseTool("Bash", {}, {})).behavior, "deny");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude research executor fails closed without a parent tool allowlist", async () => {
+  const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" });
+  await assert.rejects(adapter.run({
+    cwd: process.cwd(),
+    prompt: "research",
+    artifactDir: join(tmpdir(), "pi-review-claude-missing-tools"),
+    turn: 1,
+    workspaceAccess: "read-only",
+  }), /requires an authoritative parent tool allowlist/);
+});
+
+test("Claude research executor rejects configured arguments that could widen its tools", async () => {
+  const adapter = new ClaudeExecutorAdapter({
+    id: "claude",
+    adapter: "claude-cli",
+    command: "claude",
+    model: "sonnet",
+    args: ["--effort", "high", "--tools=Bash,Read"],
+  });
+  await assert.rejects(adapter.run({
+    cwd: process.cwd(),
+    prompt: "research",
+    artifactDir: join(tmpdir(), "pi-review-claude-policy-override"),
+    turn: 1,
+    workspaceAccess: "read-only",
+    allowedTools: ["read"],
+  }), /rejects tool-policy argument --tools=Bash,Read/);
 });
 
 test("Claude interrupt waits for a terminal SDK result and reports interruption", async () => {

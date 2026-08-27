@@ -116,7 +116,7 @@ flow; table-column projection is currently HTML-only. PDF detection uses both
 the HTTP content type and file magic, and password-protected, corrupt, or
 oversized documents fail explicitly.
 
-`BrowserExtract` is the phase-one rendered-page fallback. Use it only after
+`BrowserExtract` is the rendered-page extraction fallback. Use it only after
 `WebFetch` reports `dynamic_content_suspected` or plausibly fails because the
 result requires JavaScript rendering, asynchronous page population,
 browser-managed cookies/bootstrap, or browser-style delivery. Missing expected
@@ -125,9 +125,12 @@ means no static heuristic fired, not that the page is proven complete. It launch
 isolated headless Playwright Chromium process for an uncached URL, captures the
 rendered HTML, closes Chromium, and exposes the same `find`, `index`,
 `nextIndex`, table inventory, and `columns` operations as `WebFetch`. It does
-not yet click, type, authenticate, scroll, capture screenshots, or maintain an
-interactive browser session. Installation verifies and, when necessary,
-downloads Playwright's compatible Chromium build.
+not click, type, authenticate, interactively scroll, capture screenshots, or
+maintain a browser session. Those capabilities belong to a separate interactive
+browser tool family, including tools that can expose rendered pages to a
+vision-capable model; they are not future modes of `BrowserExtract`.
+Installation verifies and, when necessary, downloads Playwright's compatible
+Chromium build.
 
 The page cache is bounded by entry count and total bytes and is force-removed
 on session/application shutdown. Shutdown also removes settled subtask wave
@@ -834,10 +837,18 @@ When recovery returns `manual_required`:
 4. Remove backup artifacts (`.pi-backup-*` suffix) once resolved.
 5. Remove temp artifacts (`.pi-landing-tmp-*` prefix) if any remain.
 
-### No automatic startup recovery
+### Session-scoped restart recovery
 
-This module does not provide automatic crash recovery on startup. Recovery is
-an explicit operation invoked by the caller when a crashed manifest is detected.
+The extension does not globally scan the filesystem for arbitrary landing
+manifests at startup. Review and execution associations restore only when the
+same Pi conversation and session file are resumed from the matching cwd. A
+stopped task with a durable bundle is then queued for continuation, and that
+continuation reconciles verified in-progress or recovery-required landing
+manifests before allowing further source mutation.
+
+Manifests outside that exact restored association remain explicit recovery
+operations through `recoverLandingManifest()`. A different conversation,
+session file, or cwd never silently adopts them.
 
 ## Third-party notices
 

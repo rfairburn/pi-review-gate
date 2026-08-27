@@ -33,6 +33,7 @@ Describe what must be true without over-prescribing incidental implementation de
 - Add work to an existing execution when completed tasks free capacity and more planned work remains.
 - For a stopped task, diagnose its failure packet and prefer continuation from its verified checkpoint over recreating work. Retry infrastructure failures without pretending they are implementation verdicts.
 - Treat reviewer feedback as a technical diagnosis to evaluate against the effective request and current workspace. Blocking findings require correction before ordinary landing; passing and non-blocking observations are information, not mandatory scope expansion.
+- When a task is conflicted, interrupted, failed, `paused_recoverable`, `stopped_for_application_exit`, or otherwise reports recovery-required state, read [references/recovery.md](references/recovery.md) before acting.
 
 ## Integrate and conclude
 

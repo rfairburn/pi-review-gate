@@ -32,6 +32,7 @@ try {
     "scripts/ddgs-search.py",
     "scripts/orchestrator-system-prompt.md",
     "skills/orchestrator/SKILL.md",
+    "skills/orchestrator/references/recovery.md",
     "scripts/fake-reviewer.cjs",
     "LICENSES/Apache-2.0.txt",
     "NOTICE",

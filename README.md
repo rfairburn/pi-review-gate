@@ -585,7 +585,8 @@ launcher:
 It builds the extension, selects the first existing config from
 `~/.config/pi-review-gate/config.json` or `~/.config/pi/review-gate.json`, and
 refreshes the discoverable orchestration skill at
-`~/.agents/skills/orchestrator/SKILL.md` before executing the installed `pi`
+`~/.agents/skills/orchestrator/SKILL.md`, including its progressively loaded
+recovery runbook, before executing the installed `pi`
 with the extension and orchestrator prompt. The always-loaded prompt establishes
 the role and subtask protocol; the skill provides deeper guidance for
 decomposition, supervision, reviewer interpretation, integration, and synthesis.

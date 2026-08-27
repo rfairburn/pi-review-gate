@@ -11,6 +11,7 @@ REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
 ORCHESTRATOR_PROMPT="$REVIEW_GATE_ROOT/scripts/orchestrator-system-prompt.md"
 ORCHESTRATOR_SKILL_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/SKILL.md"
+ORCHESTRATOR_RECOVERY_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/references/recovery.md"
 ORCHESTRATOR_SKILL_DIR="$HOME/.agents/skills/orchestrator"
 
 unset PI_REVIEW_GATE_CONFIG
@@ -48,10 +49,17 @@ if [[ ! -f "$ORCHESTRATOR_SKILL_SOURCE" ]]; then
   echo "pi-review-gate: packaged orchestrator skill is missing: $ORCHESTRATOR_SKILL_SOURCE" >&2
   exit 2
 fi
+if [[ ! -f "$ORCHESTRATOR_RECOVERY_SOURCE" ]]; then
+  echo "pi-review-gate: packaged orchestrator recovery reference is missing: $ORCHESTRATOR_RECOVERY_SOURCE" >&2
+  exit 2
+fi
 
-mkdir -p "$ORCHESTRATOR_SKILL_DIR"
+mkdir -p "$ORCHESTRATOR_SKILL_DIR/references"
 if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/SKILL.md" ]] || ! cmp -s "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md"; then
   install -m 0644 "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md"
+fi
+if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/references/recovery.md" ]] || ! cmp -s "$ORCHESTRATOR_RECOVERY_SOURCE" "$ORCHESTRATOR_SKILL_DIR/references/recovery.md"; then
+  install -m 0644 "$ORCHESTRATOR_RECOVERY_SOURCE" "$ORCHESTRATOR_SKILL_DIR/references/recovery.md"
 fi
 
 export PI_REVIEW_GATE_CONFIG="$REVIEW_GATE_CONFIG"

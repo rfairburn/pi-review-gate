@@ -55,6 +55,10 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
     await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
   );
   assert.equal(
+    await readFile(join(home, ".agents", "skills", "orchestrator", "references", "recovery.md"), "utf8"),
+    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+  );
+  assert.equal(
     await readFile(join(capture, "args"), "utf8"),
     `--extension\n${resolve("dist/src/index.js")}\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n--tools\nread,bash\n`,
   );
@@ -67,15 +71,17 @@ test("persistent launcher refreshes a stale installed orchestrator skill", async
   const capture = join(root, "capture");
   const ddgsVenv = join(root, "ddgs");
   const installedSkill = join(home, ".agents", "skills", "orchestrator", "SKILL.md");
+  const installedRecovery = join(home, ".agents", "skills", "orchestrator", "references", "recovery.md");
   await Promise.all([
     mkdir(join(home, ".config", "pi"), { recursive: true }),
-    mkdir(join(home, ".agents", "skills", "orchestrator"), { recursive: true }),
+    mkdir(join(home, ".agents", "skills", "orchestrator", "references"), { recursive: true }),
     mkdir(bin, { recursive: true }),
     mkdir(capture, { recursive: true }),
     mkdir(join(ddgsVenv, "bin"), { recursive: true }),
   ]);
   await writeFile(join(home, ".config", "pi", "review-gate.json"), "{}\n", "utf8");
   await writeFile(installedSkill, "stale\n", "utf8");
+  await writeFile(installedRecovery, "stale recovery\n", "utf8");
   await writeFile(join(bin, "npm"), "#!/usr/bin/env bash\nexit 0\n", "utf8");
   await writeFile(join(bin, "pi"), "#!/usr/bin/env bash\nexit 0\n", "utf8");
   const ddgsPythonPath = join(ddgsVenv, "bin", "python");
@@ -99,6 +105,10 @@ test("persistent launcher refreshes a stale installed orchestrator skill", async
   assert.equal(
     await readFile(installedSkill, "utf8"),
     await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+  );
+  assert.equal(
+    await readFile(installedRecovery, "utf8"),
+    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
   );
 });
 
@@ -128,6 +138,26 @@ test("orchestrator skill explains worktree isolation and three-way landing", asy
   assert.match(skill, /guarded three-way merge\/integration/);
   assert.match(skill, /captured base, the current main workspace, and the accepted worker result/);
   assert.match(skill, /diff3 conflict markers/);
+  assert.match(skill, /references\/recovery\.md/);
+});
+
+test("orchestrator recovery reference covers recoverable execution states", async () => {
+  const recovery = await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8");
+  for (const phrase of [
+    "SubtasksInspect",
+    "SubtasksContinue",
+    "SubtasksSteer",
+    "SubtasksInterrupt",
+    "SubtasksForceMerge",
+    "SubtasksMarkClean",
+    "paused_recoverable",
+    "stopped_for_application_exit",
+    "recovery_required",
+    "interrupt_with_merge",
+    "three-way",
+    "diff3",
+    "same session file",
+  ]) assert.match(recovery, new RegExp(phrase));
 });
 
 test("persistent launcher fails clearly when no fallback config exists", async () => {

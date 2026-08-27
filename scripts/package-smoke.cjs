@@ -31,6 +31,7 @@ try {
     "scripts/ensure-ddgs.sh",
     "scripts/ddgs-search.py",
     "scripts/orchestrator-system-prompt.md",
+    "skills/orchestrator/SKILL.md",
     "scripts/fake-reviewer.cjs",
     "LICENSES/Apache-2.0.txt",
     "NOTICE",

@@ -10,6 +10,8 @@ esac
 REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
 ORCHESTRATOR_PROMPT="$REVIEW_GATE_ROOT/scripts/orchestrator-system-prompt.md"
+ORCHESTRATOR_SKILL_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/SKILL.md"
+ORCHESTRATOR_SKILL_DIR="$HOME/.agents/skills/orchestrator"
 
 unset PI_REVIEW_GATE_CONFIG
 unset PI_REVIEW_GATE_DISABLED
@@ -42,9 +44,20 @@ fi
 
 source "$REVIEW_GATE_ROOT/scripts/ensure-ddgs.sh"
 
+if [[ ! -f "$ORCHESTRATOR_SKILL_SOURCE" ]]; then
+  echo "pi-review-gate: packaged orchestrator skill is missing: $ORCHESTRATOR_SKILL_SOURCE" >&2
+  exit 2
+fi
+
+mkdir -p "$ORCHESTRATOR_SKILL_DIR"
+if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/SKILL.md" ]] || ! cmp -s "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md"; then
+  install -m 0644 "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md"
+fi
+
 export PI_REVIEW_GATE_CONFIG="$REVIEW_GATE_CONFIG"
 
 echo "pi-review-gate config: $REVIEW_GATE_CONFIG"
 echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"
+echo "pi-review-gate orchestrator skill: $ORCHESTRATOR_SKILL_DIR/SKILL.md"
 
 exec pi --extension "$REVIEW_GATE_EXTENSION" --append-system-prompt "$ORCHESTRATOR_PROMPT" "$@"

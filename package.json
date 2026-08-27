@@ -13,6 +13,7 @@
   "files": [
     "dist/src",
     "scripts",
+    "skills",
     "examples",
     "README.md",
     "LICENSE",

@@ -584,8 +584,12 @@ launcher:
 
 It builds the extension, selects the first existing config from
 `~/.config/pi-review-gate/config.json` or `~/.config/pi/review-gate.json`, and
-executes the installed `pi` with the extension and orchestrator prompt. All
-remaining arguments are forwarded unchanged. Pi remains independently
+refreshes the discoverable orchestration skill at
+`~/.agents/skills/orchestrator/SKILL.md` before executing the installed `pi`
+with the extension and orchestrator prompt. The always-loaded prompt establishes
+the role and subtask protocol; the skill provides deeper guidance for
+decomposition, supervision, reviewer interpretation, integration, and synthesis.
+All remaining arguments are forwarded unchanged. Pi remains independently
 installed and upgradeable; this project consumes its public extension and
 CLI/RPC surfaces rather than patching or bundling Pi.
 

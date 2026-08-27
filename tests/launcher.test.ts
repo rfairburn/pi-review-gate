@@ -13,23 +13,27 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
   const home = join(root, "home");
   const bin = join(root, "bin");
   const capture = join(root, "capture");
+  const ddgsVenv = join(root, "ddgs");
   await Promise.all([
     mkdir(join(home, ".config", "pi"), { recursive: true }),
     mkdir(bin, { recursive: true }),
     mkdir(capture, { recursive: true }),
+    mkdir(join(ddgsVenv, "bin"), { recursive: true }),
   ]);
   const configPath = join(home, ".config", "pi", "review-gate.json");
   await writeFile(configPath, "{}\n", "utf8");
   const npmPath = join(bin, "npm");
   const piPath = join(bin, "pi");
+  const ddgsPythonPath = join(ddgsVenv, "bin", "python");
   await writeFile(npmPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  await writeFile(ddgsPythonPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
   await writeFile(piPath, [
     "#!/usr/bin/env bash",
     "printf '%s' \"${PI_REVIEW_GATE_CONFIG:-unset}\" > \"$CAPTURE_DIR/config-env\"",
     "printf '%s' \"${PI_REVIEW_GATE_DISABLED:-unset}\" > \"$CAPTURE_DIR/disabled-env\"",
     "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
   ].join("\n"), "utf8");
-  await Promise.all([chmod(npmPath, 0o755), chmod(piPath, 0o755)]);
+  await Promise.all([chmod(npmPath, 0o755), chmod(piPath, 0o755), chmod(ddgsPythonPath, 0o755)]);
 
   const result = await execFileAsync(resolve("scripts/pi-review-gate.sh"), ["--model", "example", "--tools", "read,bash"], {
     env: {
@@ -37,6 +41,7 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
       HOME: home,
       PATH: `${bin}:${process.env.PATH ?? ""}`,
       CAPTURE_DIR: capture,
+      PI_REVIEW_GATE_DDGS_VENV: ddgsVenv,
       PI_REVIEW_GATE_CONFIG: "/wrong/config.json",
       PI_REVIEW_GATE_DISABLED: "1",
     },
@@ -46,8 +51,54 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
   assert.equal(await readFile(join(capture, "config-env"), "utf8"), configPath);
   assert.equal(await readFile(join(capture, "disabled-env"), "utf8"), "unset");
   assert.equal(
+    await readFile(join(home, ".agents", "skills", "orchestrator", "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+  );
+  assert.equal(
     await readFile(join(capture, "args"), "utf8"),
     `--extension\n${resolve("dist/src/index.js")}\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n--tools\nread,bash\n`,
+  );
+});
+
+test("persistent launcher refreshes a stale installed orchestrator skill", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-launcher-skill-"));
+  const home = join(root, "home");
+  const bin = join(root, "bin");
+  const capture = join(root, "capture");
+  const ddgsVenv = join(root, "ddgs");
+  const installedSkill = join(home, ".agents", "skills", "orchestrator", "SKILL.md");
+  await Promise.all([
+    mkdir(join(home, ".config", "pi"), { recursive: true }),
+    mkdir(join(home, ".agents", "skills", "orchestrator"), { recursive: true }),
+    mkdir(bin, { recursive: true }),
+    mkdir(capture, { recursive: true }),
+    mkdir(join(ddgsVenv, "bin"), { recursive: true }),
+  ]);
+  await writeFile(join(home, ".config", "pi", "review-gate.json"), "{}\n", "utf8");
+  await writeFile(installedSkill, "stale\n", "utf8");
+  await writeFile(join(bin, "npm"), "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  await writeFile(join(bin, "pi"), "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  const ddgsPythonPath = join(ddgsVenv, "bin", "python");
+  await writeFile(ddgsPythonPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  await Promise.all([
+    chmod(join(bin, "npm"), 0o755),
+    chmod(join(bin, "pi"), 0o755),
+    chmod(ddgsPythonPath, 0o755),
+  ]);
+
+  await execFileAsync(resolve("scripts/pi-review-gate.sh"), [], {
+    env: {
+      ...process.env,
+      HOME: home,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      CAPTURE_DIR: capture,
+      PI_REVIEW_GATE_DDGS_VENV: ddgsVenv,
+    },
+  });
+
+  assert.equal(
+    await readFile(installedSkill, "utf8"),
+    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
   );
 });
 

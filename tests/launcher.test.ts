@@ -109,6 +109,9 @@ test("orchestrator prompt names the operation-specific tools and current steerin
   assert.match(prompt, /`SubtasksInspect`/);
   assert.match(prompt, /`SubtasksContinue`/);
   assert.match(prompt, /`SubtasksSteer`/);
+  assert.match(prompt, /separate, isolated Git worktree/);
+  assert.match(prompt, /guarded three-way merge\/integration/);
+  assert.match(prompt, /captured base, the current main workspace, and the accepted task result/);
   assert.doesNotMatch(prompt, /ExecuteSubtasks/);
   assert.doesNotMatch(prompt, /`dispatch`/);
   assert.match(prompt, /durably queued for the next executor handoff/);
@@ -116,6 +119,15 @@ test("orchestrator prompt names the operation-specific tools and current steerin
   assert.doesNotMatch(prompt, /live-turn-only/);
   assert.doesNotMatch(prompt, /delegation overhead/);
   assert.doesNotMatch(prompt, /You may directly handle/);
+});
+
+test("orchestrator skill explains worktree isolation and three-way landing", async () => {
+  const skill = await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8");
+  assert.match(skill, /separate, isolated Git worktree/);
+  assert.match(skill, /Siblings do not share a working directory/);
+  assert.match(skill, /guarded three-way merge\/integration/);
+  assert.match(skill, /captured base, the current main workspace, and the accepted worker result/);
+  assert.match(skill, /diff3 conflict markers/);
 });
 
 test("persistent launcher fails clearly when no fallback config exists", async () => {

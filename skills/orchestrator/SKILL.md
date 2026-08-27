@@ -11,7 +11,7 @@ Treat delegation as an execution strategy, not a transfer of responsibility. Kee
 
 - Use concurrent foreground reads, searches, fetches, and shell calls for quick discovery that immediately informs a decision.
 - Use read-only research subtasks for deeper independent investigation whose detailed exploration would consume the primary context. Consume their reports and sources instead of repeating the investigation.
-- Use execution subtasks for substantive workspace-writing phases. A cohesive deliverable can be one bounded worker task; parallelism is useful but is not required for delegation.
+- Use execution subtasks for substantive workspace-writing phases. Every execution task receives a separate, isolated Git worktree at its captured base. Siblings do not share a working directory and cannot see or build on one another's unlanded edits. A cohesive deliverable can be one bounded worker task; parallelism is useful but is not required for delegation.
 - Parallelize work with genuinely independent outputs or ownership. Do not manufacture concurrency by splitting tightly coupled changes across workers that must continuously coordinate.
 - Keep making useful decisions or performing independent discovery while workers run. Rely on event notifications; do not create polling loops, sleeps, or background wait jobs.
 
@@ -36,7 +36,8 @@ Describe what must be true without over-prescribing incidental implementation de
 
 ## Integrate and conclude
 
-- Only `landed` proves that a worker changed the source workspace. Never claim or validate a sibling's output before it lands.
+- Only `landed` proves that a worker changed the source workspace. Before that state, its changes exist only in its separate worktree/checkpoint. Never claim or validate a sibling's output before it lands.
+- Landing is a guarded three-way merge/integration using the captured base, the current main workspace, and the accepted worker result. Clean paths apply transactionally. When both main and the worker diverged on a path, normal landing reports a conflict instead of silently overwriting main or automatically line-merging the file; an explicit merge-anyhow operation can materialize diff3 conflict markers for manual resolution.
 - Independently landed tasks need combined validation because individually correct changes can interact. Resolve cross-task inconsistencies in the primary workspace and run the smallest verification that establishes the integrated outcome.
 - Treat landing conflicts and recovery-required states as immediate orchestration work. A force-merge is only a mechanical attempt and always requires manual workspace inspection.
 - Report the combined result, relevant validation, unresolved warnings, and any task that did not land. Worker summaries are evidence to use, not conclusions to repeat without checking.

@@ -9,6 +9,8 @@ import {
   isActiveTaskState,
   isForceMergeCandidateTaskState,
   isInterruptibleTaskState,
+  stateFromContinuationProgress,
+  stateFromWaveProgress,
 } from "../src/execution/background-controller";
 import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
@@ -137,6 +139,19 @@ test("background task state predicates classify every durable state consistently
     assert.equal(isInterruptibleTaskState(state), active.has(state), state);
     assert.equal(isForceMergeCandidateTaskState(state), !active.has(state), state);
   }
+});
+
+test("typed progress phases determine task state independently of display prose", () => {
+  assert.equal(stateFromContinuationProgress({ phase: "executing", message: "review accepted; begin landing" }), "running");
+  assert.equal(stateFromContinuationProgress({ phase: "correcting", message: "ordinary executor work" }), "running");
+  assert.equal(stateFromContinuationProgress({ phase: "confirming", message: "ordinary executor work" }), "running");
+  assert.equal(stateFromContinuationProgress({ phase: "reviewing", message: "executor is running" }), "reviewing");
+  assert.equal(stateFromContinuationProgress({ phase: "accepted", message: "executor is running" }), "accepted");
+  assert.equal(stateFromContinuationProgress({ phase: "integrating", message: "review activity" }), "waiting_to_land");
+  assert.equal(stateFromContinuationProgress({ phase: "landing", message: "executor is running" }), "landing");
+
+  assert.equal(stateFromWaveProgress({ phase: "working", message: "landing now", subtask: { phase: "executing", message: "reviewing" } }), "running");
+  assert.equal(stateFromWaveProgress({ phase: "working", message: "executor running", subtask: { phase: "reviewing", message: "running" } }), "reviewing");
 });
 
 test("subtask launch fails closed when Pi cannot provide its native active-tool allowlist", async () => {

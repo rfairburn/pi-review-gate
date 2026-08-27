@@ -263,16 +263,19 @@ test("research tasks report without review or landing and quarantine accidental 
         title: "clean research",
         instructions: "Inspect base.txt and report evidence.",
         acceptanceCriteria: ["Return an evidence-backed report"],
+        executorAllowedTools: ["read"],
       },
       {
         title: "dirty research",
         instructions: "DIRTY_RESEARCH",
         acceptanceCriteria: ["Return an evidence-backed report"],
+        executorAllowedTools: ["read"],
       },
       {
         title: "long research",
         instructions: "LONG_RESEARCH",
         acceptanceCriteria: ["Return a detailed report with a bounded summary"],
+        executorAllowedTools: ["read"],
       },
     ], "research");
     assert.equal(started.kind, "research");

@@ -13,6 +13,7 @@ import { continueOperation, inspectOperation } from "./operation-actions";
 import type { ReattachmentBundle } from "./operation-record";
 import { readOperationRecord } from "./operation-record";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
+import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskProgressPhase } from "./types";
 import { executeWave, type WaveProgressUpdate, type WaveResult } from "./wave-controller";
 import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
 import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
@@ -20,7 +21,6 @@ import { executeWaveLanding, planWaveLanding } from "./wave-landing";
 import { researchWorkspaceChanges } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
 import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
-import type { ExecutorInteractionAcknowledgement, ExecutorLiveControl } from "./types";
 
 const GROUP_VERSION = 1;
 const MAX_ACTIVITY = 5_000;
@@ -1372,7 +1372,7 @@ export class BackgroundExecutionController {
           await this.publishAssociations();
           await this.wake(task, "failure", this.criticalPrompt()!);
         },
-        onUpdate: (message) => this.progressMessage(group, task, message),
+        onUpdate: (update) => this.continuationProgress(group, task, update),
       });
       task.bundle = result.inspection.bundle;
       const undeliveredSteering = this.failUndeliveredSteering(task, "The continuation ended before the queued steering instruction reached a verified transport.");
@@ -1445,7 +1445,7 @@ export class BackgroundExecutionController {
   }
 
   private progress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: WaveProgressUpdate): void {
-    const next = stateFromProgress(update);
+    const next = stateFromWaveProgress(update);
     const previous = next ? transitionTaskState(task, next) : task.state;
     if (!next) task.updatedAt = new Date().toISOString();
     this.updateReviewStatus(task, update, next);
@@ -1493,10 +1493,10 @@ export class BackgroundExecutionController {
     task.reviewStatus.updatedAt = new Date().toISOString();
   }
 
-  private progressMessage(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, message: string): void {
-    const next = /review/i.test(message) ? "reviewing" : /land|integrat/i.test(message) ? "landing" : "running";
+  private continuationProgress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: ContinuationProgressUpdate): void {
+    const next = stateFromContinuationProgress(update);
     const previous = transitionTaskState(task, next);
-    addActivity(task, task.state, message);
+    addActivity(task, update.phase, update.message);
     task.updatedAt = new Date().toISOString();
     const saved = this.save(group);
     void saved.catch(() => undefined);
@@ -2083,15 +2083,28 @@ function addActivity(task: BackgroundTaskRecord, phase: string, message: string)
   if (task.activity.length > MAX_ACTIVITY) task.activity.splice(0, task.activity.length - MAX_ACTIVITY);
 }
 
-function stateFromProgress(update: WaveProgressUpdate): BackgroundTaskState | undefined {
+export function stateFromWaveProgress(update: WaveProgressUpdate): BackgroundTaskState | undefined {
   if (update.phase === "capturing") return "capturing";
   if (update.phase === "integrating" || update.phase === "planning") return "waiting_to_land";
   if (update.phase === "landing") return "landing";
   if (update.phase === "completed" || update.phase === "aborted" || update.phase === "settling") return undefined;
   const phase = update.subtask?.phase ?? update.taskStatuses?.[0]?.phase;
-  if (phase === "reviewing" || phase === "correcting" || phase === "confirming") return "reviewing";
-  if (phase === "executing" || phase === "starting") return "running";
+  const workerState = stateFromWorkerProgressPhase(phase);
+  if (workerState) return workerState;
   if (update.phase === "working" && (phase === "accepted" || phase === "accepted_with_warnings" || phase === "completed_unreviewed" || phase === "no_changes")) return "accepted";
+  return undefined;
+}
+
+export function stateFromContinuationProgress(update: ContinuationProgressUpdate): BackgroundTaskState {
+  if (update.phase === "accepted") return "accepted";
+  if (update.phase === "integrating") return "waiting_to_land";
+  if (update.phase === "landing") return "landing";
+  return stateFromWorkerProgressPhase(update.phase) ?? "running";
+}
+
+function stateFromWorkerProgressPhase(phase: SubtaskProgressPhase | string | undefined): BackgroundTaskState | undefined {
+  if (phase === "reviewing") return "reviewing";
+  if (phase === "starting" || phase === "executing" || phase === "correcting" || phase === "confirming" || phase === "completing") return "running";
   return undefined;
 }
 

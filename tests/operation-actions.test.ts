@@ -9,6 +9,7 @@ import { normalizeConfig } from "../src/config";
 import { continueOperation, inspectOperation, inspectWaveRoot } from "../src/execution/operation-actions";
 import { executeWave } from "../src/execution/wave-controller";
 import { readOperationRecord, writeOperationRecord } from "../src/execution/operation-record";
+import type { ContinuationProgressUpdate } from "../src/execution/types";
 
 const execFileAsync = promisify(execFile);
 
@@ -61,15 +62,21 @@ test("landed operation can rehydrate its checkpoint, continue, land, and dedupli
     assert.equal(inspection.record.state, "completed");
     assert.equal(inspection.record.checkpoint?.verified, true);
 
+    const progress: ContinuationProgressUpdate[] = [];
     const continued = await continueOperation({
       bundle: inspection.bundle,
       instructions: "append the next turn marker",
       instructionId: "continuation-1",
       config,
+      onUpdate: (update) => progress.push(update),
     });
     assert.equal(continued.landing?.status, "landed", JSON.stringify(continued, null, 2));
     assert.equal(await readFile(join(root, "continued.txt"), "utf8"), "turn-1\nturn-2\n");
     assert.equal(continued.inspection.record.instructions[0].status, "acknowledged");
+    assert.ok(progress.some((update) => update.phase === "executing"));
+    assert.ok(progress.some((update) => update.phase === "accepted"));
+    assert.ok(progress.some((update) => update.phase === "integrating"));
+    assert.ok(progress.some((update) => update.phase === "landing"));
 
     const duplicate = await continueOperation({
       bundle: continued.inspection.bundle,

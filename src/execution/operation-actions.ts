@@ -29,7 +29,7 @@ import {
 import type { WaveManifest, WaveManifestTask } from "./wave-controller";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { acquireWaveOwner, heartbeatWaveOwner, inspectWaveOwner, releaseWaveOwner } from "./wave-owner";
-import type { ExecutorLiveControl } from "./types";
+import type { ContinuationProgressUpdate, ExecutorLiveControl } from "./types";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 
 export interface OperationInspection {
@@ -270,7 +270,7 @@ export async function continueOperation(input: {
   config: ReviewGateConfig;
   scopedModels?: string[];
   signal?: AbortSignal;
-  onUpdate?: (message: string) => void;
+  onUpdate?: (update: ContinuationProgressUpdate) => void;
   executorAssignment?: ExecutorPoolLease;
   executorPool?: ExecutorPoolScheduler;
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
@@ -457,7 +457,7 @@ export async function continueOperation(input: {
     executorAssignment: input.executorAssignment,
     acquireFailover,
     onLiveControl: publishLiveControl,
-    onUpdate: (update) => input.onUpdate?.(update.message),
+    onUpdate: (update) => input.onUpdate?.(update),
     });
     if (continued.status === "completed") {
       await steeringEvidence.record(input.instructions, input.instructionId, "continue");
@@ -493,7 +493,7 @@ export async function continueOperation(input: {
       acquireFailover,
       onLiveControl: publishLiveControl,
       takeDeferredSteering: input.takeDeferredSteering,
-      onUpdate: (update) => input.onUpdate?.(update.message),
+      onUpdate: (update) => input.onUpdate?.(update),
       initialResult: continued,
     });
   } finally {
@@ -514,13 +514,23 @@ export async function continueOperation(input: {
     return { inspection: await inspectOperation(createReattachmentBundle(record, waveRoot)), lifecycle };
   }
 
+  input.onUpdate?.({
+    phase: "accepted",
+    message: `continuation became eligible for independent landing (${lifecycle.status})`,
+    artifactDir: record.artifactDir,
+  });
+
   const integration = await retryOperationStage<WaveIntegrationResult>(
     record,
     input.config,
     "integrating",
     "integration_error",
     async () => {
-      input.onUpdate?.("preparing the accepted continuation for independent landing");
+      input.onUpdate?.({
+        phase: "integrating",
+        message: "preparing the accepted continuation for independent landing",
+        artifactDir: record.artifactDir,
+      });
       const integratedRef = await pinCommit(
         continuationCapture,
         lifecycle.acceptedCommitSha!,
@@ -555,7 +565,11 @@ export async function continueOperation(input: {
     "landing",
     "landing_error",
     async () => {
-      input.onUpdate?.("landing the accepted continuation into the source workspace");
+      input.onUpdate?.({
+        phase: "landing",
+        message: "landing the accepted continuation into the source workspace",
+        artifactDir: record.artifactDir,
+      });
       const landingCapture = continuationLandingBase
         ? { ...continuationCapture, baseCommit: continuationLandingBase }
         : continuationCapture;

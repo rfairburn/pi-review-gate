@@ -99,3 +99,14 @@ export interface SubtaskProgressUpdate {
   reviewCycle?: number;
   reviewers?: string[];
 }
+
+export type ContinuationProgressPhase =
+  | SubtaskProgressPhase
+  | "accepted"
+  | "integrating"
+  | "landing";
+
+/** Typed progress emitted while a durable operation is continued and landed. */
+export interface ContinuationProgressUpdate extends Omit<SubtaskProgressUpdate, "phase"> {
+  phase: ContinuationProgressPhase;
+}

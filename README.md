@@ -126,9 +126,7 @@ isolated headless Playwright Chromium process for an uncached URL, captures the
 rendered HTML, closes Chromium, and exposes the same `find`, `index`,
 `nextIndex`, table inventory, and `columns` operations as `WebFetch`. It does
 not click, type, authenticate, interactively scroll, capture screenshots, or
-maintain a browser session. Those capabilities belong to a separate interactive
-browser tool family, including tools that can expose rendered pages to a
-vision-capable model; they are not future modes of `BrowserExtract`.
+maintain a browser session; it is not an interactive browser or vision tool.
 Installation verifies and, when necessary, downloads Playwright's compatible
 Chromium build.
 
@@ -159,11 +157,6 @@ acquisitions without restarting the application.
   }
 }
 ```
-
-Search providers own their integration and configuration. Future providers
-that require credentials must accept the key through review-gate configuration
-or an environment-variable reference; credentials will not be embedded in tool
-arguments.
 
 For independent manual testing, use the same implementation outside Pi:
 
@@ -288,9 +281,12 @@ worktree, session, checkpoint, review, and landing outcome; there is no
 wave-wide shared base or all-workers integration barrier. Research tasks skip
 review and landing, validate that their private worktree stayed unchanged, and
 finish as `reported` with a durable report path. Pi enforces the
-read-only tool intersection; Codex and Claude are initially best-effort inside
-the disposable private worktree, with any writes quarantined. Generic binary
-adapters are ineligible for research until their protocol can acknowledge the
+read-only tool intersection through `--tools`. Codex uses its read-only sandbox
+and rejects configuration that could weaken the research profile. Claude uses
+an explicit read-only tool allowlist and permission callback while disabling
+user settings, skills, plugins, and MCP. Every adapter also receives a private
+worktree check that quarantines any detected write. Generic binary adapters are
+ineligible for research because their protocol does not acknowledge the
 restriction.
 
 `SubtasksContinue` accepts either an associated task handle or a verified

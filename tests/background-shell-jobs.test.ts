@@ -248,5 +248,6 @@ describe("wrapWithParentWatchdog", () => {
 
   it("stops the watchdog on the normal path so nothing is left behind", () => {
     expect(wrapped).toContain('kill "$__pi_review_watchdog"');
+    expect(wrapped).toContain('wait "$__pi_review_watchdog"');
   });
 });

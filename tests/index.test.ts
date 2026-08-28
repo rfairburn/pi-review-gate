@@ -88,7 +88,7 @@ test("automatic review waits for ShellStart process groups and resumes the orche
     await trigger(hooks, "tool_result", {
       cwd: dir,
       toolName: "ShellStart",
-      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}).\nWaking you on: exit.` }] },
+      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}); currently running.\nFuture wake triggers (not current events): exit.\nYou will be notified automatically; do not poll.` }] },
       isError: false,
     });
     await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });

@@ -10,7 +10,7 @@ export interface BackgroundReadinessSnapshot {
   unverifiable: string[];
 }
 
-const SHELL_START_RESULT = /Started\s+"([^"]*)"\s+as\s+(\S+)\s+\(pid\s+(\d+)\)\./i;
+const SHELL_START_RESULT = /Started\s+"([^"]*)"\s+as\s+(\S+)\s+\(pid\s+(\d+)\)(?:[.;]|(?=\s|$))/i;
 
 /**
  * Best-effort readiness tracking for the ShellStart tool contract. The
@@ -23,6 +23,11 @@ export class BackgroundProcessReadiness {
 
   observeToolResult(toolName: string, result: unknown, isError = false): TrackedBackgroundProcess | undefined {
     if (toolName !== "ShellStart" || isError) return undefined;
+    const structured = structuredShellStart(result);
+    if (structured) {
+      this.processes.set(structured.processGroupId, structured);
+      return structured;
+    }
     const text = textFromToolResult(result);
     if (!/\bStarted\b/i.test(text)) return undefined;
     const match = text.match(SHELL_START_RESULT);
@@ -41,7 +46,7 @@ export class BackgroundProcessReadiness {
       pid,
       processGroupId: pid,
     };
-    this.processes.set(pid, tracked);
+    this.processes.set(tracked.processGroupId, tracked);
     return tracked;
   }
 
@@ -59,6 +64,42 @@ export class BackgroundProcessReadiness {
     this.processes.clear();
     this.unverifiable.clear();
   }
+}
+
+function structuredShellStart(value: unknown): TrackedBackgroundProcess | undefined {
+  const seen = new Set<unknown>();
+  const visit = (candidate: unknown): TrackedBackgroundProcess | undefined => {
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return undefined;
+    seen.add(candidate);
+    if (Array.isArray(candidate)) {
+      for (const entry of candidate) {
+        const found = visit(entry);
+        if (found) return found;
+      }
+      return undefined;
+    }
+    const record = candidate as Record<string, unknown>;
+    if (record.kind === "pi-review-bg-shell" && record.event === "started") {
+      const id = typeof record.id === "string" ? record.id : undefined;
+      const label = typeof record.label === "string" ? record.label : undefined;
+      const pid = typeof record.pid === "number" ? record.pid : undefined;
+      const processGroupId = typeof record.processGroupId === "number" ? record.processGroupId : pid;
+      if (id && label && positiveSafeInteger(pid) && positiveSafeInteger(processGroupId) && process.platform !== "win32") {
+        return { id, label, pid, processGroupId };
+      }
+      return undefined;
+    }
+    for (const key of ["result", "details", "content"]) {
+      const found = visit(record[key]);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return visit(value);
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 export function textFromToolResult(value: unknown): string {

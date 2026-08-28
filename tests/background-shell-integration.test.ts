@@ -7,6 +7,7 @@ import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
 import { execFileSync } from "node:child_process";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
+import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 
 // Drives the real extension against real processes. The pure-logic tests in
 // jobs.test.ts cover the wake rules; everything that can only break against an
@@ -73,16 +74,20 @@ describe("bg-shell against real processes", () => {
   const T = 20_000;
   it("starts a job, buffers its output, and wakes on clean exit", async () => {
     const { sent, call } = wire();
-    const started = textOf(await call("ShellStart", {
-      command: "echo first; echo second; exit 0",
+    const readiness = new BackgroundProcessReadiness();
+    const result = await call("ShellStart", {
+      command: "echo first; echo second; sleep 0.5; exit 0",
       label: "quick",
-    }));
+    });
+    const started = textOf(result);
     expect(started).toContain("Started \"quick\"");
     expect(started).toContain("currently running");
     expect(started).toContain("Future wake triggers (not current events): exit.");
     // The description promises the model it does not need to poll; the start
     // message must say so too or the model will poll anyway.
     expect(started).toContain("do not poll");
+    readiness.observeToolResult("ShellStart", result);
+    expect(readiness.snapshot().running.length).toBe(1);
 
     expect(await until(() => sent.length > 0)).toBe(true);
     const wake = sent[0];
@@ -90,6 +95,7 @@ describe("bg-shell against real processes", () => {
     expect(wake.content).toContain("second");
     // A clean exit is worth delivering, not worth interrupting a tool call for.
     expect(wake.delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(await until(() => readiness.snapshot().running.length === 0, T)).toBe(true);
   });
 
   it("gives a crash the urgent lane", async () => {
@@ -171,6 +177,34 @@ describe("bg-shell against real processes", () => {
 
     await call("ShellStop", { id });
     expect(await until(() => !pidAlive(grandchild), 8000)).toBe(true);
+  });
+
+  it("ShellStop accepts a unique label", async () => {
+    const { call } = wire();
+    const started = textOf(await call("ShellStart", { command: "sleep 300", label: "unique-stop" }));
+    const id = started.match(/as (job\d+)/)![1];
+
+    const stopped = await call("ShellStop", { id: "unique-stop" });
+    expect(stopped.isError).toBe(false);
+    expect(textOf(stopped)).toContain(`Stopping ${id}`);
+  });
+
+  it("ShellStop lists every matching job ID when a label is ambiguous", async () => {
+    const { call } = wire();
+    const first = textOf(await call("ShellStart", { command: "sleep 300", label: "duplicate-stop" })).match(/as (job\d+)/)![1];
+    const second = textOf(await call("ShellStart", { command: "sleep 300", label: "duplicate-stop" })).match(/as (job\d+)/)![1];
+
+    const ambiguous = await call("ShellStop", { id: "duplicate-stop" });
+    expect(ambiguous.isError).toBe(true);
+    expect(textOf(ambiguous)).toContain("is ambiguous");
+    expect(textOf(ambiguous)).toContain(first);
+    expect(textOf(ambiguous)).toContain(second);
+    expect(textOf(ambiguous)).toContain(`{"id":"${first}"}`);
+
+    const retry = await call("ShellStop", { id: first });
+    expect(retry.isError).toBe(false);
+    expect(textOf(retry)).toContain(`Stopping ${first}`);
+    await call("ShellStop", { id: second });
   });
 
   it("reapAll leaves nothing running", async () => {

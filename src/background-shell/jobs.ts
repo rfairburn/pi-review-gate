@@ -282,16 +282,20 @@ export function wrapWithParentWatchdog(command: string, parentPid: number, pollS
     // that sleep, the pipes stay open after the command finishes — Node's
     // `close` fires only once stdio is done, so the exit wake would arrive
     // seconds late or, if the sleep outlives us, not at all.
-    `( while kill -0 "$__pi_review_parent" 2>/dev/null; do sleep ${pollSeconds}; done; kill -TERM 0 2>/dev/null ) >/dev/null 2>&1 </dev/null &`,
+    `( __pi_review_sleep=; trap 'if [ -n "$__pi_review_sleep" ]; then kill "$__pi_review_sleep" 2>/dev/null; fi; exit 0' TERM; while kill -0 "$__pi_review_parent" 2>/dev/null; do sleep ${pollSeconds} & __pi_review_sleep=$!; wait "$__pi_review_sleep"; __pi_review_sleep=; done; trap - TERM; kill -TERM 0 2>/dev/null ) >/dev/null 2>&1 </dev/null &`,
     `__pi_review_watchdog=$!`,
-    // The braces must be newline-separated, not `{ cmd ; }` on one line: the
-    // command is arbitrary user text and may legitimately end in a comment, a
-    // heredoc, or a trailing backslash, any of which would swallow a `;`.
-    `{`,
+    // Run arbitrary user text in a child shell so an explicit `exit` cannot
+    // skip the watchdog cleanup below. The delimiters remain newline-separated
+    // because a comment, heredoc, or trailing backslash may end the command.
+    `(`,
     command,
-    `}`,
+    `)`,
     `__pi_review_rc=$?`,
     `kill "$__pi_review_watchdog" 2>/dev/null`,
+    // Bash can defer terminating the watchdog while it waits for its current
+    // sleep child. Waiting here keeps the process group authoritative: the
+    // ShellStart exit event is not emitted until the watchdog tree is gone.
+    `wait "$__pi_review_watchdog" 2>/dev/null`,
     `exit $__pi_review_rc`,
   ].join("\n");
 }
@@ -339,4 +343,3 @@ export function formatWakePayload(p: WakePayloadInput): string {
       : [`ShellLog({"id":"${p.id}"}) for more. The job is still running.`];
   return [...head, "", ...body, ...tail].join("\n");
 }
-

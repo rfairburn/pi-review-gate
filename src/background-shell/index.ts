@@ -151,8 +151,26 @@ function nextId(): string {
   return `job${seq}`;
 }
 
-function textResult(text: string, isError = false) {
-  return { content: [{ type: "text" as const, text }], details: {}, isError };
+function textResult(text: string, isError = false, details: Record<string, unknown> = {}) {
+  return { content: [{ type: "text" as const, text }], details, isError };
+}
+
+function resolveJob(target: string): { job?: Job; error?: ReturnType<typeof textResult> } {
+  const exact = jobs.get(target);
+  if (exact) return { job: exact };
+  const matches = [...jobs.values()].filter((job) => job.label === target);
+  if (matches.length === 1) return { job: matches[0] };
+  if (matches.length > 1) {
+    const choices = matches.map((job) => `- ${job.id} (${statusOf(job)})`).join("\n");
+    return {
+      error: textResult(
+        `Error: label ${JSON.stringify(target)} is ambiguous. Matching job IDs:\n${choices}\n` +
+          `Retry ShellStop with one exact job ID, for example: {"id":${JSON.stringify(matches[0].id)}}`,
+        true,
+      ),
+    };
+  }
+  return { error: textResult(`Error: no such job id or label ${JSON.stringify(target)}. Use ShellList to see available job IDs.`, true) };
 }
 
 /** Deliver a wake event to the agent through the lane its urgency earns. */
@@ -443,6 +461,15 @@ export function registerBackgroundShell(pi: BackgroundShellHost): void {
         `Started "${label}" as ${id} (pid ${proc.pid ?? "?"}); currently running.\n` +
           `Future wake triggers (not current events): ${watching.join(", ") || "nothing"}.\n` +
           `You will be notified automatically; do not poll.`,
+        false,
+        {
+          kind: "pi-review-bg-shell",
+          event: "started",
+          id,
+          label,
+          pid: proc.pid,
+          processGroupId: process.platform === "win32" ? undefined : proc.pid,
+        },
       );
     },
   });
@@ -521,9 +548,9 @@ export function registerBackgroundShell(pi: BackgroundShellHost): void {
   pi.registerTool({
     name: "ShellStop",
     label: "ShellStop",
-    description: "Stop a background job (SIGTERM, then SIGKILL if it ignores that).",
+    description: "Stop a background job by exact job ID or unique label (SIGTERM, then SIGKILL if it ignores that).",
     parameters: objectSchema({
-      id: stringSchema("Job id, or 'all'"),
+      id: stringSchema("Exact job ID, unique label, or 'all'"),
     }, ["id"]),
     async execute(_id, params) {
       const target = String(params.id ?? "");
@@ -532,8 +559,9 @@ export function registerBackgroundShell(pi: BackgroundShellHost): void {
         for (const job of jobs.values()) if (!job.exited) killJob(job);
         return textResult(`Stopping ${n} job(s).`);
       }
-      const job = jobs.get(target);
-      if (!job) return textResult(`Error: no such job "${target}"`, true);
+      const resolved = resolveJob(target);
+      if (resolved.error) return resolved.error;
+      const job = resolved.job!;
       if (job.exited) return textResult(`Job ${job.id} had already exited (${statusOf(job)}).`);
       killJob(job);
       return textResult(`Stopping ${job.id} ("${job.label}").`);

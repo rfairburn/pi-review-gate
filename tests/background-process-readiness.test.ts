@@ -39,3 +39,40 @@ test("an unparseable ShellStart success fails closed", () => {
   assert.equal(snapshot.running.length, 0);
   assert.equal(snapshot.unverifiable.length, 1);
 });
+
+test("current ShellStart prose is accepted when structured details are unavailable", () => {
+  const readiness = new BackgroundProcessReadiness();
+  const tracked = readiness.observeToolResult(
+    "ShellStart",
+    'Started "mysql-test" as job1 (pid 96410); currently running.\nFuture wake triggers (not current events): exit.',
+  );
+  assert.deepEqual(tracked, {
+    id: "job1",
+    label: "mysql-test",
+    pid: 96410,
+    processGroupId: 96410,
+  });
+  assert.equal(readiness.snapshot().unverifiable.length, 0);
+});
+
+test("structured ShellStart details are authoritative over display prose", () => {
+  const readiness = new BackgroundProcessReadiness();
+  const tracked = readiness.observeToolResult("ShellStart", {
+    content: [{ type: "text", text: "Started output wording may change freely." }],
+    details: {
+      kind: "pi-review-bg-shell",
+      event: "started",
+      id: "job7",
+      label: "structured",
+      pid: 12345,
+      processGroupId: 12345,
+    },
+  });
+  assert.deepEqual(tracked, {
+    id: "job7",
+    label: "structured",
+    pid: 12345,
+    processGroupId: 12345,
+  });
+  assert.equal(readiness.snapshot().unverifiable.length, 0);
+});

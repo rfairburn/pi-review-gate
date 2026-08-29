@@ -22,8 +22,12 @@ import { researchWorkspaceChanges } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
 import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
 
-const GROUP_VERSION = 1;
-const MAX_ACTIVITY = 5_000;
+const GROUP_VERSION = 2;
+const LEGACY_GROUP_VERSION = 1;
+const TASK_ARCHIVE_VERSION = 1;
+const MAX_ACTIVITY = 200;
+const MAX_STATE_HISTORY = 64;
+const RECENT_ACTIVITY_LIMIT = 10;
 
 export const BACKGROUND_TASK_STATES = [
   "queued",
@@ -105,6 +109,16 @@ export interface BackgroundTaskTimingSummary {
   totalMs: number;
 }
 
+interface BackgroundTaskTimingAccumulator {
+  queueMs: number;
+  captureMs: number;
+  executionMs: number;
+  reviewMs: number;
+  landingMs: number;
+  stateEnteredAt: string;
+  terminalAt?: string;
+}
+
 export interface BackgroundSchedulingSnapshot {
   configuredWorkerLimit: number;
   configuredPoolCapacity: number;
@@ -139,6 +153,7 @@ export interface BackgroundTaskRecord {
   nextActivitySequence: number;
   stateHistory?: BackgroundStateTransition[];
   nextStateSequence?: number;
+  timingAccumulator?: BackgroundTaskTimingAccumulator;
   commands: BackgroundCommandRecord[];
   pendingContinuation?: { instructions: string; instructionId: string };
   interruptionMode?: "interrupt_as_failure" | "interrupt_with_merge";
@@ -151,7 +166,7 @@ export interface BackgroundTaskRecord {
 }
 
 export interface BackgroundExecutionGroup {
-  version: 1;
+  version: 2;
   revision: number;
   integritySha256: string;
   executionId: string;
@@ -162,6 +177,44 @@ export interface BackgroundExecutionGroup {
   updatedAt: string;
   peakConcurrency?: number;
   tasks: BackgroundTaskRecord[];
+}
+
+interface ArchivedBackgroundTaskReference {
+  archived: true;
+  taskId: string;
+  title: string;
+  state: "landed" | "reported";
+  createdAt: string;
+  updatedAt: string;
+  summary?: string;
+  error?: string;
+  timing: BackgroundTaskTimingSummary;
+  archivePath: string;
+  archiveIntegritySha256: string;
+}
+
+interface PersistedBackgroundExecutionGroup extends Omit<BackgroundExecutionGroup, "tasks" | "version"> {
+  version: 1 | 2;
+  tasks: Array<BackgroundTaskRecord | ArchivedBackgroundTaskReference>;
+}
+
+interface PersistedBackgroundTaskArchive {
+  version: 1;
+  taskId: string;
+  archivedAt: string;
+  integritySha256: string;
+  task: BackgroundTaskRecord;
+}
+
+interface RecentBackgroundActivity {
+  taskId: string;
+  title: string;
+  event: BackgroundActivityEvent;
+}
+
+interface ReadGroupResult {
+  group: BackgroundExecutionGroup;
+  archives: Map<string, { updatedAt: string; integritySha256: string }>;
 }
 
 export interface BackgroundConflictGate {
@@ -232,6 +285,8 @@ export class BackgroundExecutionController {
   private readonly runtimes = new Map<string, RuntimeTask>();
   private readonly saveTails = new Map<string, Promise<void>>();
   private readonly steeringTails = new Map<string, Promise<void>>();
+  private readonly archivedTasks = new Map<string, { updatedAt: string; integritySha256: string }>();
+  private recentActivity: RecentBackgroundActivity[] = [];
   private pool: ExecutorPoolScheduler;
   private active = 0;
   private shuttingDown = false;
@@ -301,7 +356,9 @@ export class BackgroundExecutionController {
     const roots = associations.groupRoots ?? [];
     for (const root of roots) {
       try {
-        const group = await readGroup(root);
+        const restored = await readGroup(root);
+        const group = restored.group;
+        for (const [taskId, archive] of restored.archives) this.archivedTasks.set(taskId, archive);
         if (resolve(group.cwd) !== resolve(this.input.cwd())) {
           throw new Error(`execution cwd ${group.cwd} does not match ${resolve(this.input.cwd())}`);
         }
@@ -363,6 +420,7 @@ export class BackgroundExecutionController {
       );
     }
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(this.input.config));
+    this.rebuildRecentActivity();
     this.updateIndicator();
     void this.pump();
   }
@@ -534,7 +592,7 @@ export class BackgroundExecutionController {
       task.waveRoot = inspection.bundle.waveRoot;
       transitionTaskState(task, "paused_recoverable");
       task.summary = `Adopted durable operation ${inspection.bundle.operationId} for triage-style continuation.`;
-      addActivity(task, "recovery", task.summary);
+      this.addActivity(task, "recovery", task.summary);
       group.tasks.push(task);
       await this.save(group);
       await this.publishAssociations();
@@ -561,7 +619,7 @@ export class BackgroundExecutionController {
       createdAt: new Date().toISOString(),
     };
     task.commands.push(command);
-    addActivity(task, "steer", `Steering queued (${input.instructionId}).`);
+    this.addActivity(task, "steer", `Steering queued (${input.instructionId}).`);
     await this.save(group);
     const runtime = this.runtimes.get(task.taskId);
     const control = runtime?.control;
@@ -615,7 +673,7 @@ export class BackgroundExecutionController {
       task.summary = input.mode === "interrupt_with_merge"
         ? "Interrupted before executor startup; there was no task checkpoint to merge."
         : "Interrupted before executor startup; the source workspace is unchanged.";
-      addActivity(task, "interrupt", task.summary);
+      this.addActivity(task, "interrupt", task.summary);
       await this.save(group);
       await this.publishAssociations();
       this.updateIndicator();
@@ -633,21 +691,21 @@ export class BackgroundExecutionController {
       try {
         const acknowledgement = await transport;
         transportMessage = acknowledgement.message;
-        addActivity(task, "interrupt", `Executor interrupt ${acknowledgement.status}: ${acknowledgement.message}`);
+        this.addActivity(task, "interrupt", `Executor interrupt ${acknowledgement.status}: ${acknowledgement.message}`);
       } catch (error) {
         transportMessage = `Executor interrupt transport failed: ${messageOf(error)}; terminated the owned process group.`;
-        addActivity(task, "interrupt", transportMessage);
+        this.addActivity(task, "interrupt", transportMessage);
       }
     }
     await runtime.promise;
     command.status = "acknowledged";
     command.acknowledgedAt = new Date().toISOString();
     command.error = undefined;
-    addActivity(task, "interrupt", `Writer quiesced. ${transportMessage}`);
+    this.addActivity(task, "interrupt", `Writer quiesced. ${transportMessage}`);
     task.interruptionMode = undefined;
     await this.save(group);
     if (input.mode === "interrupt_with_merge") {
-      addActivity(task, "interrupt", "Interrupt-with-merge is attempting a mechanical checkpoint landing; workspace contents still require manual inspection afterward regardless of landing status.");
+      this.addActivity(task, "interrupt", "Interrupt-with-merge is attempting a mechanical checkpoint landing; workspace contents still require manual inspection afterward regardless of landing status.");
       await this.save(group);
       return this.forceMerge({
         executionId: group.executionId,
@@ -709,7 +767,7 @@ export class BackgroundExecutionController {
       command.status = "delivered";
       command.deliveredAt = new Date().toISOString();
       transitionTaskState(task, "waiting_to_land");
-      addActivity(task, "force_merge", `Force-merge requested from ${commitSha}. This is a mechanical landing attempt; manual inspection of the main workspace is required afterward in every outcome.`);
+      this.addActivity(task, "force_merge", `Force-merge requested from ${commitSha}. This is a mechanical landing attempt; manual inspection of the main workspace is required afterward in every outcome.`);
       await this.save(group);
 
       await pinCommit(capture, commitSha, { type: "integration" });
@@ -803,7 +861,7 @@ export class BackgroundExecutionController {
     this.releaseConflictBlock = undefined;
     await this.publishAssociations();
     if (task) {
-      addActivity(task, "landed", "Conflict resolution validated; queued landing attempts released.");
+      this.addActivity(task, "landed", "Conflict resolution validated; queued landing attempts released.");
       await this.save(group!);
       await this.wake(task, "completion", `Task ${task.taskId} conflict resolution was validated and landed.`);
     }
@@ -852,11 +910,12 @@ export class BackgroundExecutionController {
         if (task.waveRoot) await removeOwnedWaveRoot(task.waveRoot);
         task.waveRoot = undefined;
         task.bundle = undefined;
-        task.result = undefined;
+        task.updatedAt = new Date().toISOString();
       }
       if (settled.length === group.tasks.length) {
         await removeOwnedExecutionRoot(group.root);
         this.groups.delete(executionId);
+        for (const task of settled) this.archivedTasks.delete(task.taskId);
       } else if (settled.length > 0) {
         await this.save(group);
       }
@@ -867,6 +926,8 @@ export class BackgroundExecutionController {
   async detach(): Promise<void> {
     this.groups.clear();
     this.runtimes.clear();
+    this.archivedTasks.clear();
+    this.recentActivity = [];
     this.active = 0;
     this.shuttingDown = false;
     this.pumpRequested = false;
@@ -909,7 +970,7 @@ export class BackgroundExecutionController {
               ? `Current /review-settings no longer selects prior executor ${requiredEntry}; restarting ${queued.task.taskId} with ${lease.entry.entryId} from its durable checkpoint may change behavior.`
               : `Current /review-settings differ from the settings used by the prior ${queued.task.taskId} run; the restart will use the current values and may behave differently.`;
             queued.task.summary = warning;
-            addActivity(queued.task, "configuration", warning);
+            this.addActivity(queued.task, "configuration", warning);
             await this.save(queued.group);
             await this.input.notify?.(`review gate: ${warning}`);
           }
@@ -948,7 +1009,7 @@ export class BackgroundExecutionController {
           transitionTaskState(task, "interrupted");
           task.error = undefined;
           task.summary = `Executor acknowledged ${task.interruptionMode} during startup or capture; its writer is quiesced.`;
-          addActivity(task, "interrupt", task.summary);
+          this.addActivity(task, "interrupt", task.summary);
         } else {
           this.failUndeliveredSteering(task, "Task failed before the queued steering instruction was delivered.");
           if (task.state !== "stopped_for_application_exit") transitionTaskState(task, "failed");
@@ -981,7 +1042,7 @@ export class BackgroundExecutionController {
     await this.incorporatePrestartSteering(group, task);
     task.generation += 1;
     const priorState = transitionTaskState(task, "capturing");
-    addActivity(task, "capturing", "Capturing a stable private workspace for read-only research.");
+    this.addActivity(task, "capturing", "Capturing a stable private workspace for read-only research.");
     await this.save(group);
     const activation = stateTransitionNotice(task, priorState, task.state);
     if (activation) await this.wake(task, "state", activation);
@@ -1025,7 +1086,7 @@ export class BackgroundExecutionController {
     const previous = transitionTaskState(task, "running");
     command.status = "delivered";
     command.deliveredAt = new Date().toISOString();
-    addActivity(task, "running", `Continuing research from its durable session (${pending.instructionId}).`);
+    this.addActivity(task, "running", `Continuing research from its durable session (${pending.instructionId}).`);
     await this.save(group);
     const activation = stateTransitionNotice(task, previous, task.state);
     if (activation) await this.wake(task, "state", activation);
@@ -1122,7 +1183,7 @@ export class BackgroundExecutionController {
       ? "running"
       : undefined;
     const previous = next ? transitionTaskState(task, next) : task.state;
-    addActivity(task, `research:${update.phase}`, update.message);
+    this.addActivity(task, `research:${update.phase}`, update.message);
     const saved = this.save(group);
     void saved.catch((error) => this.input.notify?.(`review gate: failed to persist research progress: ${messageOf(error)}`));
     const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
@@ -1155,7 +1216,7 @@ export class BackgroundExecutionController {
       transitionTaskState(task, "failed");
       task.error = `Research worker modified its private workspace in violation of the read-only contract; nothing was landed. Detected entries: ${workspaceChanges.slice(0, 20).join(", ") || "candidate tree changed"}`;
       task.summary = task.error;
-      addActivity(task, "research:policy_failure", task.error);
+      this.addActivity(task, "research:policy_failure", task.error);
       await this.wake(task, "failure", `Research task ${task.taskId} violated its read-only workspace contract. Its private changes were quarantined and main is unchanged.`);
     } else if ((result.status === "no_changes" || result.status === "completed") && report && undelivered.length === 0) {
       task.report = report;
@@ -1215,7 +1276,7 @@ export class BackgroundExecutionController {
     await this.incorporatePrestartSteering(group, task);
     task.generation += 1;
     const priorState = transitionTaskState(task, "capturing");
-    addActivity(task, "capturing", "Capturing an independent task base from current main.");
+    this.addActivity(task, "capturing", "Capturing an independent task base from current main.");
     await this.save(group);
     const activation = stateTransitionNotice(task, priorState, task.state);
     if (activation) await this.wake(task, "state", activation);
@@ -1261,7 +1322,7 @@ export class BackgroundExecutionController {
         };
         this.releaseConflictBlock = sourceMutationCoordinator.block(group.cwd, this.conflictGate.reason);
         transitionTaskState(task, "conflicted");
-        addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
+        this.addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
         await this.save(group);
         await this.publishAssociations();
         await this.wake(task, "failure", this.criticalPrompt()!);
@@ -1339,7 +1400,7 @@ export class BackgroundExecutionController {
     const priorState = transitionTaskState(task, "running");
     command.status = "delivered";
     command.deliveredAt = new Date().toISOString();
-    addActivity(task, "running", `Continuing from durable checkpoint (${pending.instructionId}).`);
+    this.addActivity(task, "running", `Continuing from durable checkpoint (${pending.instructionId}).`);
     await this.save(group);
     const activation = stateTransitionNotice(task, priorState, task.state);
     if (activation) await this.wake(task, "state", activation);
@@ -1367,7 +1428,7 @@ export class BackgroundExecutionController {
           const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
           await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths);
           this.activateConflictGate(group, task, materialized.paths, materialized.manifestPath, `Continued task ${task.taskId} requires immediate conflict resolution.`);
-          addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
+          this.addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
           await this.save(group);
           await this.publishAssociations();
           await this.wake(task, "failure", this.criticalPrompt()!);
@@ -1449,7 +1510,7 @@ export class BackgroundExecutionController {
     const previous = next ? transitionTaskState(task, next) : task.state;
     if (!next) task.updatedAt = new Date().toISOString();
     this.updateReviewStatus(task, update, next);
-    for (const message of update.activity ?? [update.message]) addActivity(task, update.phase, message);
+    for (const message of update.activity ?? [update.message]) this.addActivity(task, update.phase, message);
     const saved = this.save(group);
     void saved.catch((error) => this.input.notify?.(`review gate: failed to persist task progress: ${messageOf(error)}`));
     const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
@@ -1496,7 +1557,7 @@ export class BackgroundExecutionController {
   private continuationProgress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: ContinuationProgressUpdate): void {
     const next = stateFromContinuationProgress(update);
     const previous = transitionTaskState(task, next);
-    addActivity(task, update.phase, update.message);
+    this.addActivity(task, update.phase, update.message);
     task.updatedAt = new Date().toISOString();
     const saved = this.save(group);
     void saved.catch(() => undefined);
@@ -1546,7 +1607,7 @@ export class BackgroundExecutionController {
       command.deliveredAt = now;
       command.acknowledgedAt = now;
     }
-    addActivity(task, "steer", `${pending.length} queued steering instruction(s) incorporated into the initial executor prompt.`);
+    this.addActivity(task, "steer", `${pending.length} queued steering instruction(s) incorporated into the initial executor prompt.`);
     await this.save(group);
   }
 
@@ -1564,7 +1625,7 @@ export class BackgroundExecutionController {
       command.deliveredAt = now;
       command.acknowledgedAt = now;
     }
-    addActivity(task, "steer", `${pending.length} queued steering instruction(s) incorporated into continuation startup.`);
+    this.addActivity(task, "steer", `${pending.length} queued steering instruction(s) incorporated into continuation startup.`);
     await this.save(group);
     return `${instructions}\n\nSteering received before continuation startup (later instructions take precedence):\n${steering}`;
   }
@@ -1575,7 +1636,7 @@ export class BackgroundExecutionController {
       command.status = "failed";
       command.error = reason;
     }
-    if (pending.length > 0) addActivity(task, "steer", `${pending.length} steering instruction(s) failed: ${reason}`);
+    if (pending.length > 0) this.addActivity(task, "steer", `${pending.length} steering instruction(s) failed: ${reason}`);
     return pending;
   }
 
@@ -1592,7 +1653,7 @@ export class BackgroundExecutionController {
       command.acknowledgedAt = now;
       command.error = undefined;
     }
-    addActivity(task, "steer", `${pending.length} deferred steering instruction(s) claimed for the next executor turn.`);
+    this.addActivity(task, "steer", `${pending.length} deferred steering instruction(s) claimed for the next executor turn.`);
     await this.save(group);
     return pending.map((command) => ({ instruction: command.text!, instructionId: command.instructionId }));
   }
@@ -1609,7 +1670,7 @@ export class BackgroundExecutionController {
         if (command.action !== "steer" || command.status !== "queued" || !command.text) continue;
         if (!control.capabilities.steer) {
           command.error = undefined;
-          addActivity(task, "steer", `The active ${control.adapter} turn cannot accept live steering; ${command.instructionId} remains queued for the next executor handoff.`);
+          this.addActivity(task, "steer", `The active ${control.adapter} turn cannot accept live steering; ${command.instructionId} remains queued for the next executor handoff.`);
           await this.save(group);
           continue;
         }
@@ -1626,12 +1687,12 @@ export class BackgroundExecutionController {
             command.status = acknowledgement.status === "acknowledged" ? "acknowledged" : "failed";
             command.acknowledgedAt = acknowledgement.status === "acknowledged" ? new Date().toISOString() : undefined;
             command.error = acknowledgement.status === "acknowledged" ? undefined : acknowledgement.message;
-            addActivity(task, "steer", `Steering ${acknowledgement.status}: ${acknowledgement.message}`);
+            this.addActivity(task, "steer", `Steering ${acknowledgement.status}: ${acknowledgement.message}`);
           }
         } catch (error) {
           command.status = "failed";
           command.error = messageOf(error);
-          addActivity(task, "steer", `Steering failed: ${command.error}`);
+          this.addActivity(task, "steer", `Steering failed: ${command.error}`);
         }
         await this.save(group);
         if (command.status === "failed") {
@@ -1753,15 +1814,83 @@ export class BackgroundExecutionController {
     return candidates[0]!;
   }
 
+  private addActivity(task: BackgroundTaskRecord, phase: string, message: string): void {
+    const event = appendActivity(task, phase, message);
+    if (!event) return;
+    this.recentActivity.push({ taskId: task.taskId, title: task.definition.title, event });
+    if (this.recentActivity.length > RECENT_ACTIVITY_LIMIT) {
+      this.recentActivity.splice(0, this.recentActivity.length - RECENT_ACTIVITY_LIMIT);
+    }
+  }
+
+  private rebuildRecentActivity(): void {
+    this.recentActivity = [...this.groups.values()]
+      .flatMap((group) => group.tasks.flatMap((task) => task.activity.map((event) => ({
+        taskId: task.taskId,
+        title: task.definition.title,
+        event,
+      }))))
+      .sort((left, right) => left.event.at.localeCompare(right.event.at) || left.event.sequence - right.event.sequence)
+      .slice(-RECENT_ACTIVITY_LIMIT);
+  }
+
   private async save(group: BackgroundExecutionGroup): Promise<PersistedGroupRevision> {
     group.revision += 1;
     group.updatedAt = new Date().toISOString();
-    const snapshot = JSON.parse(JSON.stringify(group)) as BackgroundExecutionGroup;
+    const archiveWrites: Array<{
+      taskId: string;
+      updatedAt: string;
+      integritySha256: string;
+      path: string;
+      body: string;
+    }> = [];
+    const persistedTasks = group.tasks.map((task): BackgroundTaskRecord | ArchivedBackgroundTaskReference => {
+      normalizeTaskHistory(task);
+      if (!isArchivableTaskState(task.state)) return cloneTask(task);
+      const priorArchive = this.archivedTasks.get(task.taskId);
+      let archiveIntegritySha256 = priorArchive?.updatedAt === task.updatedAt
+        ? priorArchive.integritySha256
+        : undefined;
+      if (!archiveIntegritySha256) {
+        const archive = createTaskArchive(task);
+        archiveIntegritySha256 = archive.snapshot.integritySha256;
+        archiveWrites.push({
+          taskId: task.taskId,
+          updatedAt: task.updatedAt,
+          integritySha256: archiveIntegritySha256,
+          path: join(group.root, taskArchivePath(task.taskId)),
+          body: `${JSON.stringify(archive.snapshot, null, 2)}\n`,
+        });
+      }
+      return {
+        archived: true,
+        taskId: task.taskId,
+        title: task.definition.title,
+        state: task.state,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+        summary: task.summary ? clipActivity(task.summary, 500) : undefined,
+        error: task.error ? clipActivity(task.error, 500) : undefined,
+        timing: taskTiming(task),
+        archivePath: taskArchivePath(task.taskId),
+        archiveIntegritySha256,
+      };
+    });
+    const snapshot = JSON.parse(JSON.stringify({ ...group, version: GROUP_VERSION, tasks: persistedTasks })) as PersistedBackgroundExecutionGroup;
     const unsigned = { ...snapshot, integritySha256: undefined };
     snapshot.integritySha256 = createHash("sha256").update(JSON.stringify(unsigned)).digest("hex");
     group.integritySha256 = snapshot.integritySha256;
     const prior = this.saveTails.get(group.executionId) ?? Promise.resolve();
-    const next = prior.then(() => atomicWrite(join(group.root, "execution.json"), `${JSON.stringify(snapshot, null, 2)}\n`));
+    const next = prior.then(async () => {
+      for (const archive of archiveWrites) await atomicWrite(archive.path, archive.body);
+      await atomicWrite(join(group.root, "execution.json"), `${JSON.stringify(snapshot, null, 2)}\n`);
+      for (const archive of archiveWrites) {
+        this.archivedTasks.set(archive.taskId, {
+          updatedAt: archive.updatedAt,
+          integritySha256: archive.integritySha256,
+        });
+      }
+    });
     this.saveTails.set(group.executionId, next.catch(() => undefined));
     await next;
     return {
@@ -1801,14 +1930,11 @@ export class BackgroundExecutionController {
           lines.push(`  ${group.kind} · ${task.definition.title} [${task.state}] · ${executorDisplayLabel(task, this.input.config, group.kind)}${reviewers}${latestCommand}`);
         }
         if (activeTasks.length > shown.length) lines.push(`  … ${activeTasks.length - shown.length} additional active task${activeTasks.length - shown.length === 1 ? "" : "s"} omitted`);
-        const recent = all
-          .flatMap(({ task }) => task.activity.map((event) => ({ task, event })))
-          .sort((left, right) => left.event.at.localeCompare(right.event.at))
-          .slice(-10);
+        const recent = this.recentActivity;
         lines.push("  Recent activity (10 newest events across all tasks):");
         if (recent.length === 0) lines.push("    no activity recorded yet");
-        for (const { task, event } of recent) {
-          lines.push(`    ${task.definition.title} · ${event.phase} · ${clipActivity(event.message)}`);
+        for (const { title, event } of recent) {
+          lines.push(`    ${title} · ${event.phase} · ${clipActivity(event.message)}`);
         }
         ctx.ui.setWidget("review-gate-subtasks", () => liveViewComponent(lines), { placement: "belowEditor" });
         return;
@@ -1999,6 +2125,7 @@ function newTask(definition: BackgroundTaskDefinition): BackgroundTaskRecord {
     nextActivitySequence: 1,
     stateHistory: [{ sequence: 1, state: "queued", at: now, generation: 0 }],
     nextStateSequence: 2,
+    timingAccumulator: emptyTimingAccumulator(now),
     commands: [],
   };
 }
@@ -2043,33 +2170,29 @@ function transitionTaskState(task: BackgroundTaskRecord, next: BackgroundTaskSta
   const previous = task.state;
   task.updatedAt = at;
   if (previous === next) return previous;
+  const timing = ensureTimingAccumulator(task);
+  accumulateStateDuration(timing, previous, timing.stateEnteredAt, at);
+  timing.stateEnteredAt = at;
+  timing.terminalAt = isActiveTaskState(next) ? undefined : at;
   task.stateHistory ??= [{ sequence: 1, state: previous, at: task.createdAt, generation: task.generation }];
   task.nextStateSequence ??= (task.stateHistory.at(-1)?.sequence ?? 0) + 1;
   task.state = next;
   task.stateHistory.push({ sequence: task.nextStateSequence++, state: next, at, generation: task.generation });
-  if (task.stateHistory.length > MAX_ACTIVITY) task.stateHistory.splice(0, task.stateHistory.length - MAX_ACTIVITY);
+  if (task.stateHistory.length > MAX_STATE_HISTORY) task.stateHistory.splice(0, task.stateHistory.length - MAX_STATE_HISTORY);
   return previous;
 }
 
 function taskTiming(task: BackgroundTaskRecord, now = Date.now()): BackgroundTaskTimingSummary {
-  const history = task.stateHistory?.length
-    ? task.stateHistory
-    : [{ sequence: 1, state: task.state, at: task.createdAt, generation: task.generation }];
-  const totals = { queueMs: 0, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0 };
-  for (let index = 0; index < history.length; index += 1) {
-    const transition = history[index]!;
-    if (!isActiveTaskState(transition.state)) continue;
-    const start = Date.parse(transition.at);
-    const next = history[index + 1];
-    const end = next ? Date.parse(next.at) : now;
-    const elapsed = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : 0;
-    if (transition.state === "queued") totals.queueMs += elapsed;
-    else if (transition.state === "capturing") totals.captureMs += elapsed;
-    else if (transition.state === "running") totals.executionMs += elapsed;
-    else if (transition.state === "reviewing") totals.reviewMs += elapsed;
-    else totals.landingMs += elapsed;
-  }
-  const terminalAt = !isActiveTaskState(task.state) ? Date.parse(history.at(-1)?.at ?? task.updatedAt) : now;
+  const timing = ensureTimingAccumulator(task);
+  const totals = {
+    queueMs: timing.queueMs,
+    captureMs: timing.captureMs,
+    executionMs: timing.executionMs,
+    reviewMs: timing.reviewMs,
+    landingMs: timing.landingMs,
+  };
+  if (isActiveTaskState(task.state)) accumulateStateDuration(totals, task.state, timing.stateEnteredAt, now);
+  const terminalAt = !isActiveTaskState(task.state) ? Date.parse(timing.terminalAt ?? task.updatedAt) : now;
   const createdAt = Date.parse(task.createdAt);
   return {
     ...totals,
@@ -2077,10 +2200,50 @@ function taskTiming(task: BackgroundTaskRecord, now = Date.now()): BackgroundTas
   };
 }
 
-function addActivity(task: BackgroundTaskRecord, phase: string, message: string): void {
-  if (task.activity.at(-1)?.message === message) return;
-  task.activity.push({ sequence: task.nextActivitySequence++, at: new Date().toISOString(), phase, message });
+function emptyTimingAccumulator(stateEnteredAt: string): BackgroundTaskTimingAccumulator {
+  return { queueMs: 0, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0, stateEnteredAt };
+}
+
+function ensureTimingAccumulator(task: BackgroundTaskRecord): BackgroundTaskTimingAccumulator {
+  if (task.timingAccumulator) return task.timingAccumulator;
+  const history = task.stateHistory?.length
+    ? task.stateHistory
+    : [{ sequence: 1, state: task.state, at: task.createdAt, generation: task.generation }];
+  const timing = emptyTimingAccumulator(history[0]?.at ?? task.createdAt);
+  for (let index = 0; index < history.length - 1; index += 1) {
+    const transition = history[index]!;
+    accumulateStateDuration(timing, transition.state, transition.at, history[index + 1]!.at);
+  }
+  timing.stateEnteredAt = history.at(-1)?.at ?? task.updatedAt;
+  timing.terminalAt = isActiveTaskState(task.state) ? undefined : timing.stateEnteredAt;
+  task.timingAccumulator = timing;
+  return timing;
+}
+
+function accumulateStateDuration(
+  totals: Pick<BackgroundTaskTimingAccumulator, "queueMs" | "captureMs" | "executionMs" | "reviewMs" | "landingMs">,
+  state: BackgroundTaskState,
+  startAt: string,
+  endAt: string | number,
+): void {
+  if (!isActiveTaskState(state)) return;
+  const start = Date.parse(startAt);
+  const end = typeof endAt === "number" ? endAt : Date.parse(endAt);
+  const elapsed = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : 0;
+  if (state === "queued") totals.queueMs += elapsed;
+  else if (state === "capturing") totals.captureMs += elapsed;
+  else if (state === "running") totals.executionMs += elapsed;
+  else if (state === "reviewing") totals.reviewMs += elapsed;
+  else totals.landingMs += elapsed;
+}
+
+function appendActivity(task: BackgroundTaskRecord, phase: string, message: string): BackgroundActivityEvent | undefined {
+  if (task.activity.at(-1)?.message === message) return undefined;
+  const event = { sequence: task.nextActivitySequence++, at: new Date().toISOString(), phase, message };
+  task.activity.push(event);
+  task.updatedAt = event.at;
   if (task.activity.length > MAX_ACTIVITY) task.activity.splice(0, task.activity.length - MAX_ACTIVITY);
+  return event;
 }
 
 export function stateFromWaveProgress(update: WaveProgressUpdate): BackgroundTaskState | undefined {
@@ -2120,27 +2283,60 @@ async function continuationEntryId(task: BackgroundTaskRecord): Promise<string |
   return operation.assignments.at(-1)?.entryId;
 }
 
-async function readGroup(root: string): Promise<BackgroundExecutionGroup> {
+async function readGroup(root: string): Promise<ReadGroupResult> {
   const resolved = await realpath(resolve(root));
   if (!basename(resolved).startsWith("pi-review-execution-")) throw new Error("Invalid background execution root.");
-  const parsed = JSON.parse(await readFile(join(resolved, "execution.json"), "utf8")) as BackgroundExecutionGroup;
-  if (parsed.version !== GROUP_VERSION || parsed.root !== resolved || !parsed.executionId || !Array.isArray(parsed.tasks)) {
+  const parsed = JSON.parse(await readFile(join(resolved, "execution.json"), "utf8")) as PersistedBackgroundExecutionGroup;
+  if ((parsed.version !== GROUP_VERSION && parsed.version !== LEGACY_GROUP_VERSION) || parsed.root !== resolved || !parsed.executionId || !Array.isArray(parsed.tasks)) {
     throw new Error("Invalid background execution manifest.");
   }
   const { integritySha256, ...unsigned } = parsed;
   const actual = createHash("sha256").update(JSON.stringify({ ...unsigned, integritySha256: undefined })).digest("hex");
   if (!integritySha256 || integritySha256 !== actual) throw new Error("Background execution manifest failed its integrity check.");
-  for (const task of parsed.tasks) {
+  const archives = new Map<string, { updatedAt: string; integritySha256: string }>();
+  const tasks: BackgroundTaskRecord[] = [];
+  for (const persistedTask of parsed.tasks) {
+    const task = isArchivedTaskReference(persistedTask)
+      ? await readTaskArchive(resolved, persistedTask)
+      : persistedTask;
     delete (task as BackgroundTaskRecord & { matchedWakePatterns?: string[] }).matchedWakePatterns;
     delete (task.definition as BackgroundTaskDefinition & { wakeOn?: unknown }).wakeOn;
-    if (!Array.isArray(task.stateHistory) || task.stateHistory.length === 0) {
-      task.stateHistory = [{ sequence: 1, state: task.state, at: task.createdAt, generation: task.generation }];
+    normalizeTaskHistory(task);
+    tasks.push(task);
+    if (isArchivedTaskReference(persistedTask)) {
+      archives.set(task.taskId, { updatedAt: task.updatedAt, integritySha256: persistedTask.archiveIntegritySha256 });
     }
-    task.nextStateSequence = Math.max(task.nextStateSequence ?? 1, (task.stateHistory.at(-1)?.sequence ?? 0) + 1);
   }
-  parsed.kind ??= parsed.tasks.some((task) => task.definition.backgroundKind === "research") ? "research" : "execute";
-  parsed.peakConcurrency ??= 0;
-  return parsed;
+  const group = {
+    ...parsed,
+    version: GROUP_VERSION,
+    tasks,
+    kind: parsed.kind ?? (tasks.some((task) => task.definition.backgroundKind === "research") ? "research" : "execute"),
+    peakConcurrency: parsed.peakConcurrency ?? 0,
+  } as BackgroundExecutionGroup;
+  return { group, archives };
+}
+
+function isArchivedTaskReference(task: BackgroundTaskRecord | ArchivedBackgroundTaskReference): task is ArchivedBackgroundTaskReference {
+  return "archived" in task && task.archived === true;
+}
+
+async function readTaskArchive(root: string, reference: ArchivedBackgroundTaskReference): Promise<BackgroundTaskRecord> {
+  const expectedPath = taskArchivePath(reference.taskId);
+  if (reference.archivePath !== expectedPath) throw new Error(`Invalid archive path for task ${reference.taskId}.`);
+  const parsed = JSON.parse(await readFile(join(root, expectedPath), "utf8")) as PersistedBackgroundTaskArchive;
+  if (parsed.version !== TASK_ARCHIVE_VERSION || parsed.taskId !== reference.taskId || parsed.task?.taskId !== reference.taskId) {
+    throw new Error(`Invalid background task archive for ${reference.taskId}.`);
+  }
+  const { integritySha256, ...unsigned } = parsed;
+  const actual = createHash("sha256").update(JSON.stringify(unsigned)).digest("hex");
+  if (!integritySha256 || integritySha256 !== actual || integritySha256 !== reference.archiveIntegritySha256) {
+    throw new Error(`Background task archive failed its integrity check: ${reference.taskId}.`);
+  }
+  if (!isArchivableTaskState(parsed.task.state) || parsed.task.state !== reference.state) {
+    throw new Error(`Background task archive state does not match its execution manifest: ${reference.taskId}.`);
+  }
+  return parsed.task;
 }
 
 async function removeOwnedWaveRoot(root: string): Promise<void> {
@@ -2210,6 +2406,41 @@ function parentChanged(a: FileSnapshot | undefined, b: FileSnapshot | undefined)
   if (!a && !b) return false;
   if (!a || !b) return true;
   return a.content !== b.content || a.sha256 !== b.sha256 || a.isBinary !== b.isBinary;
+}
+
+function isArchivableTaskState(state: BackgroundTaskState): state is "landed" | "reported" {
+  return state === "landed" || state === "reported";
+}
+
+function taskArchivePath(taskId: string): string {
+  return join("tasks", `${taskId}.json`);
+}
+
+function createTaskArchive(task: BackgroundTaskRecord): { snapshot: PersistedBackgroundTaskArchive } {
+  const unsigned = {
+    version: TASK_ARCHIVE_VERSION as 1,
+    taskId: task.taskId,
+    archivedAt: new Date().toISOString(),
+    task: cloneTask(task),
+  };
+  const snapshot: PersistedBackgroundTaskArchive = {
+    ...unsigned,
+    integritySha256: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex"),
+  };
+  return { snapshot };
+}
+
+function normalizeTaskHistory(task: BackgroundTaskRecord): void {
+  task.activity ??= [];
+  task.commands ??= [];
+  if (task.activity.length > MAX_ACTIVITY) task.activity.splice(0, task.activity.length - MAX_ACTIVITY);
+  task.nextActivitySequence = Math.max(task.nextActivitySequence ?? 1, (task.activity.at(-1)?.sequence ?? 0) + 1);
+  if (!Array.isArray(task.stateHistory) || task.stateHistory.length === 0) {
+    task.stateHistory = [{ sequence: 1, state: task.state, at: task.createdAt, generation: task.generation }];
+  }
+  ensureTimingAccumulator(task);
+  if (task.stateHistory.length > MAX_STATE_HISTORY) task.stateHistory.splice(0, task.stateHistory.length - MAX_STATE_HISTORY);
+  task.nextStateSequence = Math.max(task.nextStateSequence ?? 1, (task.stateHistory.at(-1)?.sequence ?? 0) + 1);
 }
 
 function cloneTask(task: BackgroundTaskRecord): BackgroundTaskRecord {

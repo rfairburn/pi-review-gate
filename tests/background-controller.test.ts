@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -120,6 +121,163 @@ test("background tasks return immediately, land independently, and additions cap
     assert.throws(() => restored.inspect(first.executionId), /Unknown execution group/);
     await restored.shutdown();
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("settled tasks move to bounded archives and restore through stable task handles", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-archive-"));
+  let controller: BackgroundExecutionController | undefined;
+  let restored: BackgroundExecutionController | undefined;
+  const ownedRoots = new Set<string>();
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "archive-executor.cjs");
+    await writeFile(executor, [
+      "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+      "process.stdin.on('end',()=>setTimeout(()=>{",
+      "if(prompt.includes('ARCHIVE_FAST'))fs.writeFileSync('archived.txt','archived landing\\n');",
+      "else fs.writeFileSync('still-running.txt','eventually landed\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
+      "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
+      "},prompt.includes('ARCHIVE_FAST')?25:30000));",
+    ].join("\n"), "utf8");
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "archive",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
+      }],
+      execution: {
+        activeExecutor: { source: "external", id: "archive" },
+        maxWorkers: 2,
+      },
+      retainBundles: "always",
+    });
+    controller = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    const started = await controller.start([
+      { title: "archive me", instructions: "ARCHIVE_FAST", acceptanceCriteria: ["archived.txt exists"] },
+      { title: "remain active", instructions: "ARCHIVE_SLOW", acceptanceCriteria: ["still-running.txt exists"] },
+    ]);
+    ownedRoots.add(started.root);
+    const archivedTaskId = started.tasks[0]!.taskId;
+    await waitFor(() => controller!.inspect(started.executionId, archivedTaskId).tasks[0]?.state === "landed", 30_000);
+    await waitForAsync(async () => {
+      const current = JSON.parse(await readFile(join(started.root, "execution.json"), "utf8")) as {
+        tasks: Array<Record<string, unknown>>;
+      };
+      return current.tasks.some((task) => task.taskId === archivedTaskId && task.archived === true);
+    });
+
+    const manifest = JSON.parse(await readFile(join(started.root, "execution.json"), "utf8")) as {
+      version: number;
+      tasks: Array<Record<string, unknown>>;
+    };
+    assert.equal(manifest.version, 2);
+    const reference = manifest.tasks.find((task) => task.taskId === archivedTaskId)!;
+    assert.equal(reference.archived, true);
+    assert.equal(reference.state, "landed");
+    assert.equal("activity" in reference, false);
+    assert.equal("definition" in reference, false);
+    assert.match(String(reference.archivePath), /^tasks\/task-[0-9a-f-]+\.json$/);
+    const archive = JSON.parse(await readFile(join(started.root, String(reference.archivePath)), "utf8")) as {
+      task: { taskId: string; activity: unknown[]; result?: unknown };
+    };
+    assert.equal(archive.task.taskId, archivedTaskId);
+    assert.ok(archive.task.activity.length > 0);
+    assert.ok(archive.task.result);
+
+    await controller.shutdown();
+    const associations = controller.associations();
+    for (const value of [...associations.groupRoots ?? [], ...associations.waveRoots]) ownedRoots.add(value);
+    await controller.detach();
+    controller = undefined;
+    config.execution!.maxWorkers = 0;
+    restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    await restored.restore(associations);
+    const restoredTask = restored.inspect(started.executionId, archivedTaskId).tasks[0]!;
+    assert.equal(restoredTask.state, "landed");
+    assert.equal(restoredTask.taskId, archivedTaskId);
+    assert.ok(restoredTask.result, "task-specific inspection hydrates the settled archive after restart");
+    assert.ok(restoredTask.timing.totalMs > 0);
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await controller?.shutdown().catch(() => undefined);
+    for (const owned of ownedRoots) await rm(owned, { recursive: true, force: true }).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restored active tasks bound routine history without losing cumulative timing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-bounds-"));
+  let executionRoot: string | undefined;
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "never-started",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", "process.stdin.resume()"] },
+      }],
+      execution: { activeExecutor: { source: "external", id: "never-started" }, maxWorkers: 1 },
+    });
+    config.execution!.maxWorkers = 0;
+    const controller = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    const started = await controller.start([{ title: "bounded", instructions: "wait", acceptanceCriteria: ["remain queued"] }]);
+    executionRoot = started.root;
+    const associations = controller.associations();
+    await controller.detach();
+
+    const manifestPath = join(started.root, "execution.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, any>;
+    const task = manifest.tasks[0] as Record<string, any>;
+    const startMs = Date.now() - 100_000;
+    task.createdAt = new Date(startMs).toISOString();
+    task.updatedAt = new Date(startMs + 100_000).toISOString();
+    task.state = "queued";
+    task.activity = Array.from({ length: 350 }, (_, index) => ({
+      sequence: index + 1,
+      at: new Date(startMs + index).toISOString(),
+      phase: "routine",
+      message: `routine progress ${index}`,
+    }));
+    task.nextActivitySequence = 351;
+    task.stateHistory = Array.from({ length: 101 }, (_, index) => ({
+      sequence: index + 1,
+      state: index % 2 === 0 ? "queued" : "running",
+      at: new Date(startMs + index * 1_000).toISOString(),
+      generation: 0,
+    }));
+    task.nextStateSequence = 102;
+    delete task.timingAccumulator;
+    const unsigned = { ...manifest, integritySha256: undefined };
+    manifest.integritySha256 = createHash("sha256").update(JSON.stringify(unsigned)).digest("hex");
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+    restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    await restored.restore(associations);
+    const inspection = restored.inspect(started.executionId, started.tasks[0]!.taskId).tasks[0]!;
+    assert.equal(inspection.activity.length, 200);
+    assert.equal(inspection.activity[0]?.sequence, 151);
+    assert.equal(inspection.stateHistory?.length, 64);
+    assert.equal(inspection.stateHistory?.[0]?.sequence, 38);
+    assert.ok(inspection.timing.queueMs >= 50_000, "timing includes queued intervals discarded from detailed history");
+    assert.ok(inspection.timing.executionMs >= 50_000, "timing includes execution intervals discarded from detailed history");
+    assert.ok(inspection.timing.totalMs >= 100_000);
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    if (executionRoot) await rm(executionRoot, { recursive: true, force: true }).catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

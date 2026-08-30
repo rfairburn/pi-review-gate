@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +56,66 @@ test("snapshot omits binary content but still detects changes", async () => {
     assert.equal(change.path, "nested/blob.bin");
     assert.equal(change.binary, true);
     assert.equal(change.diffOmittedReason, "binary");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot recognizes text-safe binary magic, retains exact hashes, and ignores filename extensions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-binary-magic-"));
+  try {
+    const binaryFixtures = new Map<string, Buffer>([
+      ["archive.data", Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from("ASCII ZIP payload")])],
+      ["document.data", Buffer.from("%PDF-1.7\nASCII-only fixture\n", "ascii")],
+      ["image.data", Buffer.from("GIF89aASCII-only fixture", "ascii")],
+      ["audio.data", Buffer.from([0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, ...Buffer.from("audio", "ascii")])],
+    ]);
+    for (const [name, content] of binaryFixtures) await writeFile(join(dir, name), content);
+    await writeFile(join(dir, "plain.zip"), "ordinary UTF-8 text despite its extension\n", "utf8");
+    const magicLikeText = new Map([
+      ["initials.txt", "MZ is a pair of initials, not an executable.\n"],
+      ["bitmap-notes.txt", "BM can also begin an ordinary text sentence.\n"],
+      ["metadata-notes.txt", "ID3 metadata is described here as text.\n"],
+      ["compression-notes.txt", "BZh9 is only a header fragment here.\n"],
+    ]);
+    for (const [name, content] of magicLikeText) await writeFile(join(dir, name), content, "utf8");
+
+    const snapshot = await createWorkspaceSnapshot(dir, snapshotOptions);
+    for (const [name, content] of binaryFixtures) {
+      const file = snapshot.files.get(name);
+      assert.equal(file?.isBinary, true, `${name} should be classified from magic bytes`);
+      assert.equal(file?.omittedReason, "binary");
+      assert.equal(file?.content, undefined);
+      assert.equal(file?.sha256, createHash("sha256").update(content).digest("hex"));
+    }
+    assert.equal(snapshot.files.get("plain.zip")?.isBinary, false);
+    assert.equal(snapshot.files.get("plain.zip")?.content, "ordinary UTF-8 text despite its extension\n");
+    for (const [name, content] of magicLikeText) {
+      assert.equal(snapshot.files.get(name)?.isBinary, false, `${name} should not match a partial signature`);
+      assert.equal(snapshot.files.get(name)?.content, content);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("oversized magic-identified binaries remain binary and hash-only", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-binary-oversized-"));
+  try {
+    const content = Buffer.concat([
+      Buffer.from("%PDF-1.7\n", "ascii"),
+      Buffer.alloc(128, 0x41),
+    ]);
+    await writeFile(join(dir, "large.pdf"), content);
+    const snapshot = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: 32,
+      maxSnapshotBytes: 1024,
+    });
+    const file = snapshot.files.get("large.pdf");
+    assert.equal(file?.isBinary, true);
+    assert.equal(file?.omittedReason, "binary");
+    assert.equal(file?.content, undefined);
+    assert.equal(file?.sha256, createHash("sha256").update(content).digest("hex"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

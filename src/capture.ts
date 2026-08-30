@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, type Stats } from "node:fs";
-import { lstat, readlink, readdir, readFile } from "node:fs/promises";
+import { lstat, readlink, readdir } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -114,7 +114,9 @@ export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOpti
       continue;
     }
 
-    const sha256 = await hashFile(absolutePath, options.signal);
+    const contentEligible = fileStat.size <= options.maxFileBytes
+      && capturedBytes + fileStat.size <= options.maxSnapshotBytes;
+    const inspected = await inspectFile(absolutePath, contentEligible, options.signal);
     const base: FileSnapshot = {
       relativePath,
       absolutePath,
@@ -126,9 +128,14 @@ export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOpti
       ino: fileStat.ino,
       mode: fileStat.mode,
       entryType: "file",
-      sha256,
-      isBinary: false,
+      sha256: inspected.sha256,
+      isBinary: inspected.isBinary,
     };
+
+    if (inspected.isBinary) {
+      files.set(relativePath, { ...base, omittedReason: "binary" });
+      continue;
+    }
 
     if (fileStat.size > options.maxFileBytes) {
       files.set(relativePath, { ...base, omittedReason: "oversized" });
@@ -140,17 +147,10 @@ export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOpti
       continue;
     }
 
-    const buffer = await readFile(absolutePath, { signal: options.signal });
-    const isBinary = looksBinary(buffer);
-    if (isBinary) {
-      files.set(relativePath, { ...base, isBinary: true, omittedReason: "binary" });
-      continue;
-    }
-
     capturedBytes += fileStat.size;
     files.set(relativePath, {
       ...base,
-      content: buffer.toString("utf8"),
+      content: inspected.content,
     });
   }
 
@@ -185,7 +185,10 @@ export async function createPathSnapshot(cwd: string, pathLike: string, options:
     return symlinkSnapshot(relativePath, absolutePath, fileStat, linkTarget);
   }
 
-  const sha256 = await hashFile(absolutePath, options.signal);
+  const withinWorkspace = isPathWithin(root, absolutePath);
+  const contentEligible = (withinWorkspace || options.captureOutsideWorkspaceContent === true)
+    && fileStat.size <= options.maxFileBytes;
+  const inspected = await inspectFile(absolutePath, contentEligible, options.signal);
   const base: FileSnapshot = {
     relativePath,
     absolutePath,
@@ -197,27 +200,25 @@ export async function createPathSnapshot(cwd: string, pathLike: string, options:
     ino: fileStat.ino,
     mode: fileStat.mode,
     entryType: "file",
-    sha256,
-    isBinary: false,
+    sha256: inspected.sha256,
+    isBinary: inspected.isBinary,
   };
 
-  if (!isPathWithin(root, absolutePath) && options.captureOutsideWorkspaceContent !== true) {
+  if (!withinWorkspace && options.captureOutsideWorkspaceContent !== true) {
     return { ...base, omittedReason: "outside_workspace" };
+  }
+
+  if (inspected.isBinary) {
+    return { ...base, omittedReason: "binary" };
   }
 
   if (fileStat.size > options.maxFileBytes) {
     return { ...base, omittedReason: "oversized" };
   }
 
-  const buffer = await readFile(absolutePath, { signal: options.signal });
-  const isBinary = looksBinary(buffer);
-  if (isBinary) {
-    return { ...base, isBinary: true, omittedReason: "binary" };
-  }
-
   return {
     ...base,
-    content: buffer.toString("utf8"),
+    content: inspected.content,
   };
 }
 
@@ -328,15 +329,43 @@ function fileChange(
   };
 }
 
-async function hashFile(path: string, signal?: AbortSignal): Promise<string> {
+interface InspectedFile {
+  sha256: string;
+  isBinary: boolean;
+  content?: string;
+}
+
+const BINARY_SAMPLE_BYTES = 8192;
+
+/** Hash a file exactly once while retaining content only when it is bounded text. */
+async function inspectFile(path: string, retainTextContent: boolean, signal?: AbortSignal): Promise<InspectedFile> {
   throwIfAborted(signal);
   const hash = createHash("sha256");
+  const contentChunks: Buffer[] = [];
+  const sampleChunks: Buffer[] = [];
+  let sampleBytes = 0;
+  let binary: boolean | undefined;
   await new Promise<void>((resolvePromise, reject) => {
-    const stream = createReadStream(path);
+    // Bound the undecided prefix retained for binary classification. Once the
+    // prefix is classified, binary content is discarded while hashing continues.
+    const stream = createReadStream(path, { highWaterMark: BINARY_SAMPLE_BYTES });
     const onAbort = () => stream.destroy(abortError(signal));
     signal?.addEventListener("abort", onAbort, { once: true });
     const cleanup = () => signal?.removeEventListener("abort", onAbort);
-    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("data", (chunk: string | Buffer) => {
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      hash.update(bytes);
+      if (retainTextContent && binary !== true) contentChunks.push(bytes);
+      if (binary !== undefined || sampleBytes >= BINARY_SAMPLE_BYTES) return;
+      const remaining = BINARY_SAMPLE_BYTES - sampleBytes;
+      const sample = bytes.length <= remaining ? bytes : bytes.subarray(0, remaining);
+      sampleChunks.push(sample);
+      sampleBytes += sample.length;
+      if (sampleBytes >= BINARY_SAMPLE_BYTES) {
+        binary = looksBinary(Buffer.concat(sampleChunks, sampleBytes));
+        if (binary) contentChunks.length = 0;
+      }
+    });
     stream.on("error", (error) => {
       cleanup();
       reject(error);
@@ -346,7 +375,15 @@ async function hashFile(path: string, signal?: AbortSignal): Promise<string> {
       resolvePromise();
     });
   });
-  return hash.digest("hex");
+  if (binary === undefined) {
+    binary = looksBinary(Buffer.concat(sampleChunks, sampleBytes));
+    if (binary) contentChunks.length = 0;
+  }
+  return {
+    sha256: hash.digest("hex"),
+    isBinary: binary,
+    content: retainTextContent && !binary ? Buffer.concat(contentChunks).toString("utf8") : undefined,
+  };
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -361,6 +398,7 @@ function abortError(signal?: AbortSignal): Error {
 }
 
 function looksBinary(buffer: Buffer): boolean {
+  if (hasKnownBinaryMagic(buffer)) return true;
   const sampleLength = Math.min(buffer.length, 8192);
   for (let index = 0; index < sampleLength; index += 1) {
     if (buffer[index] === 0) {
@@ -368,6 +406,90 @@ function looksBinary(buffer: Buffer): boolean {
     }
   }
   return buffer.toString("utf8", 0, sampleLength).includes("\uFFFD");
+}
+
+function hasKnownBinaryMagic(buffer: Buffer): boolean {
+  const starts = (...bytes: number[]) => buffer.length >= bytes.length
+    && bytes.every((byte, index) => buffer[index] === byte);
+  const ascii = (value: string, offset = 0) => {
+    if (buffer.length < offset + value.length) return false;
+    for (let index = 0; index < value.length; index += 1) {
+      if (buffer[offset + index] !== value.charCodeAt(index)) return false;
+    }
+    return true;
+  };
+  const bzip2 = ascii("BZh") && buffer.length >= 10
+    && buffer[3]! >= 0x31 && buffer[3]! <= 0x39
+    && ascii("1AY&SY", 4);
+  const portableExecutable = ascii("MZ") && buffer.length >= 0x40
+    && (() => {
+      const peOffset = buffer.readUInt32LE(0x3c);
+      return peOffset + 4 <= buffer.length && ascii("PE\0\0", peOffset);
+    })();
+  const bitmap = ascii("BM") && buffer.length >= 14
+    && buffer.subarray(6, 10).every((byte) => byte === 0)
+    && buffer.readUInt32LE(10) >= 14;
+  const riff = ascii("RIFF") && buffer.length >= 12
+    && ["WAVE", "AVI ", "WEBP", "ACON", "CDXA"].some((kind) => ascii(kind, 8));
+  const id3 = ascii("ID3") && buffer.length >= 10
+    && buffer[3]! >= 2 && buffer[3]! <= 4
+    && buffer[4] !== 0xff
+    && buffer.subarray(6, 10).every((byte) => (byte & 0x80) === 0);
+  const isoBaseMedia = ascii("ftyp", 4) && buffer.length >= 8
+    && buffer.readUInt32BE(0) >= 8 && buffer.readUInt32BE(0) <= 4096;
+
+  return (
+    // Archives and compressed streams.
+    starts(0x50, 0x4b, 0x03, 0x04) // zip and ZIP-based formats
+    || starts(0x50, 0x4b, 0x05, 0x06)
+    || starts(0x50, 0x4b, 0x07, 0x08)
+    || starts(0x1f, 0x8b) // gzip
+    || bzip2
+    || starts(0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00) // xz
+    || starts(0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c) // 7z
+    || starts(0x52, 0x61, 0x72, 0x21, 0x1a, 0x07) // rar
+    || starts(0x28, 0xb5, 0x2f, 0xfd) // zstd
+    || ascii("ustar", 257) // tar
+    || ascii("!<arch>\n") // Unix archive / static library
+
+    // Executables, bytecode, and object formats.
+    || starts(0x7f, 0x45, 0x4c, 0x46) // ELF
+    || portableExecutable
+    || starts(0x00, 0x61, 0x73, 0x6d) // WebAssembly
+    || starts(0xfe, 0xed, 0xfa, 0xce) // Mach-O, both widths/endian orders
+    || starts(0xce, 0xfa, 0xed, 0xfe)
+    || starts(0xfe, 0xed, 0xfa, 0xcf)
+    || starts(0xcf, 0xfa, 0xed, 0xfe)
+    || starts(0xca, 0xfe, 0xba, 0xbe) // Mach-O universal / Java class
+    || starts(0xbe, 0xba, 0xfe, 0xca)
+
+    // Images and document containers.
+    || starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a) // PNG
+    || starts(0xff, 0xd8, 0xff) // JPEG
+    || ascii("GIF87a")
+    || ascii("GIF89a")
+    || bitmap
+    || starts(0x49, 0x49, 0x2a, 0x00) // TIFF
+    || starts(0x4d, 0x4d, 0x00, 0x2a)
+    || starts(0x00, 0x00, 0x01, 0x00) // ICO
+    || ascii("8BPS") // Photoshop
+    || ascii("%PDF-")
+
+    // Audio/video containers and fonts.
+    || riff
+    || ascii("OggS")
+    || ascii("fLaC")
+    || id3
+    || isoBaseMedia // ISO base media: MP4, HEIF/HEIC, AVIF, etc.
+    || ascii("wOFF")
+    || ascii("wOF2")
+    || ascii("OTTO")
+    || ascii("ttcf")
+    || starts(0x00, 0x01, 0x00, 0x00) // TrueType
+
+    // Recognizable binary stores.
+    || ascii("SQLite format 3\0")
+  );
 }
 
 function normalizeRelativePath(path: string): string {

@@ -430,6 +430,11 @@ always captured regardless of repository size. During task capture,
 `maxSnapshotBytes` limits only the cumulative size of non-ignored untracked
 files (50 MiB by default). For ordinary serial review snapshots, the same
 setting continues to bound the textual file content retained for diffing.
+Ordinary snapshots stream files once to retain an exact SHA-256 identity.
+Recognizable archives, executables, media, fonts, PDFs, and other binary data
+are classified from content signatures with a binary-content fallback; their
+bytes are not retained or decoded for textual diffs, and filename extensions
+alone never determine classification.
 
 **Artifacts**: Each task produces a `waveRoot` containing its operation record,
 bounded executor/reviewer protocol streams, worktree/checkpoint metadata, manifest, and

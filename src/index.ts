@@ -34,7 +34,11 @@ import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliv
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
 import { configDigest, replaceReviewGateState, sessionPersistenceIdentity, SessionStateStore } from "./session-state";
 import { BackgroundProcessReadiness } from "./background-process-readiness";
-import { registerBackgroundShell, type BackgroundShellHost } from "./background-shell";
+import {
+  registerBackgroundShell,
+  type BackgroundShellHost,
+  type BackgroundShellLifecycleEvent,
+} from "./background-shell";
 import { WebToolManager, type PiWebHost } from "./web/tools";
 
 declare const module: {
@@ -42,9 +46,10 @@ declare const module: {
 };
 
 const orchestratorBackgroundCompletionPrompt = [
-  "[pi-review-background-ready] All tracked ShellStart process groups have finished.",
+  "[pi-review-background-ready] ShellStart work that previously blocked review reached an idle transition.",
   "Automatic review was deliberately deferred while they were active.",
-  "Inspect their results and the workspace, address any failure, and finish the original request.",
+  "Re-check ShellList because a newer job may have started after this event was queued.",
+  "Inspect the completed results and workspace, address any failure, and finish the original request when current background readiness permits.",
   "Do not claim success from process exit alone; verify the requested outcome before completing this turn.",
 ].join(" ");
 
@@ -71,7 +76,9 @@ export async function activate(pi: unknown): Promise<void> {
     return;
   }
 
-  if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
+  const backgroundShellController = canRegisterBackgroundShell(pi)
+    ? registerBackgroundShell(pi)
+    : undefined;
 
   const state = createState();
   let currentCwd = process.cwd();
@@ -85,6 +92,9 @@ export async function activate(pi: unknown): Promise<void> {
   let stateStore: SessionStateStore | undefined;
   let backgroundCompletionMonitor: Promise<void> | undefined;
   let backgroundMonitorGeneration = 0;
+  let backgroundReviewDeferred = false;
+  let pendingNativeCompletionRevision: number | undefined;
+  let unsubscribeBackgroundLifecycle: (() => void) | undefined;
   const pendingEvidenceCaptures = new Set<Promise<void>>();
   const orchestratorBackgroundReadiness = new BackgroundProcessReadiness();
   const reviewerQuestionPauseWaiters = new Set<() => void>();
@@ -139,17 +149,23 @@ export async function activate(pi: unknown): Promise<void> {
     reviewerQuestionPauseWaiters.clear();
   };
 
+  const currentBackgroundReadiness = () => {
+    if (!backgroundShellController) return orchestratorBackgroundReadiness.snapshot();
+    const snapshot = backgroundShellController.snapshot();
+    return { revision: snapshot.revision, running: snapshot.running, unverifiable: [] as string[] };
+  };
+
   const scheduleBackgroundCompletion = (noticeTarget: unknown) => {
     if (backgroundCompletionMonitor) return;
     const generation = backgroundMonitorGeneration;
     backgroundCompletionMonitor = (async () => {
       while (sessionActive && generation === backgroundMonitorGeneration) {
-        const readiness = orchestratorBackgroundReadiness.snapshot();
+        const readiness = currentBackgroundReadiness();
         if (readiness.unverifiable.length > 0 || readiness.running.length === 0) break;
         await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
       }
       if (!sessionActive || generation !== backgroundMonitorGeneration) return;
-      const readiness = orchestratorBackgroundReadiness.snapshot();
+      const readiness = currentBackgroundReadiness();
       if (readiness.unverifiable.length > 0) {
         await sendNotice(
           noticeTarget,
@@ -158,8 +174,20 @@ export async function activate(pi: unknown): Promise<void> {
         return;
       }
       if (executionTools.reviewReadiness().length > 0) return;
+      const idleRevision = readiness.revision;
       await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 250));
-      if (!sessionActive || generation !== backgroundMonitorGeneration || agentRunActive || state.reviewInProgress || !state.reviewWindow || executionTools.reviewReadiness().length > 0) return;
+      const confirmed = currentBackgroundReadiness();
+      if (
+        !sessionActive
+        || generation !== backgroundMonitorGeneration
+        || confirmed.revision !== idleRevision
+        || confirmed.running.length > 0
+        || confirmed.unverifiable.length > 0
+        || agentRunActive
+        || state.reviewInProgress
+        || !state.reviewWindow
+        || executionTools.reviewReadiness().length > 0
+      ) return;
       const delivered = await sendTriggeredFollowUp(pi, orchestratorBackgroundCompletionPrompt);
       if (!delivered) {
         await sendNotice(noticeTarget, "review gate: background work completed, but the orchestrator could not be resumed automatically; review remains deferred until the next turn");
@@ -168,6 +196,36 @@ export async function activate(pi: unknown): Promise<void> {
       backgroundCompletionMonitor = undefined;
     });
   };
+
+  const handleBackgroundLifecycle = (event: BackgroundShellLifecycleEvent) => {
+    if (event.type === "started") {
+      pendingNativeCompletionRevision = undefined;
+      return;
+    }
+    if (
+      !sessionActive
+      || !backgroundReviewDeferred
+      || event.running.length > 0
+      || event.exitWakeScheduled
+    ) return;
+
+    const revision = event.revision;
+    pendingNativeCompletionRevision = revision;
+    queueMicrotask(() => {
+      void (async () => {
+        if (!sessionActive || pendingNativeCompletionRevision !== revision) return;
+        const current = backgroundShellController?.snapshot();
+        if (!current || current.revision !== revision || current.running.length > 0) return;
+        if (!state.reviewWindow || state.reviewInProgress || executionTools.reviewReadiness().length > 0) return;
+        const delivered = await sendTriggeredFollowUp(pi, orchestratorBackgroundCompletionPrompt);
+        if (!delivered) {
+          await sendNotice(pi, "review gate: background work completed, but the orchestrator could not be resumed automatically; review remains deferred until the next turn");
+        }
+      })();
+    });
+  };
+
+  unsubscribeBackgroundLifecycle = backgroundShellController?.subscribe(handleBackgroundLifecycle);
 
   registerHook(pi, "session_shutdown", async (...args) => {
     sessionActive = false;
@@ -182,7 +240,11 @@ export async function activate(pi: unknown): Promise<void> {
     agentRunActive = false;
     reviewerQuestionPausePending = false;
     backgroundMonitorGeneration += 1;
+    backgroundReviewDeferred = false;
+    pendingNativeCompletionRevision = undefined;
     orchestratorBackgroundReadiness.clear();
+    unsubscribeBackgroundLifecycle?.();
+    unsubscribeBackgroundLifecycle = undefined;
     releaseReviewerQuestionPauseWaiters();
     await executionTools.shutdown();
     await webTools?.cleanup();
@@ -199,7 +261,12 @@ export async function activate(pi: unknown): Promise<void> {
     currentCwd = extractCwd(args, currentCwd);
     backgroundMonitorGeneration += 1;
     backgroundCompletionMonitor = undefined;
+    backgroundReviewDeferred = false;
+    pendingNativeCompletionRevision = undefined;
     orchestratorBackgroundReadiness.clear();
+    if (backgroundShellController && !unsubscribeBackgroundLifecycle) {
+      unsubscribeBackgroundLifecycle = backgroundShellController.subscribe(handleBackgroundLifecycle);
+    }
     updateScopedModels(args);
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(extractContext(args) ?? pi);
@@ -320,7 +387,9 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "tool_result", async (...args) => {
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
-    orchestratorBackgroundReadiness.observeToolResult(name, args[0], isToolError(args[0]));
+    if (!backgroundShellController) {
+      orchestratorBackgroundReadiness.observeToolResult(name, args[0], isToolError(args[0]));
+    }
     const window = state.reviewWindow;
     const toolError = isToolError(args[0]);
     if (!window || !shouldRecordToolResultEvidence(name, toolError)) {
@@ -369,7 +438,7 @@ export async function activate(pi: unknown): Promise<void> {
       }
       return;
     }
-    const backgroundReadiness = orchestratorBackgroundReadiness.snapshot();
+    const backgroundReadiness = currentBackgroundReadiness();
     const executionReadiness = executionTools.reviewReadiness();
     if (backgroundReadiness.unverifiable.length > 0) {
       await sendNotice(
@@ -380,6 +449,7 @@ export async function activate(pi: unknown): Promise<void> {
       return;
     }
     if (backgroundReadiness.running.length > 0 || executionReadiness.length > 0) {
+      if (backgroundReadiness.running.length > 0) backgroundReviewDeferred = true;
       const blockers = [
         backgroundReadiness.running.length > 0
           ? `${backgroundReadiness.running.length} background process group(s) remain active (${backgroundReadiness.running.map((job) => `${job.id}: ${job.label}`).join(", ")})`
@@ -392,10 +462,14 @@ export async function activate(pi: unknown): Promise<void> {
         noticeTarget,
         `review gate: automatic review deferred while ${blockers.join(" and ")}`,
       );
-      if (backgroundReadiness.running.length > 0) scheduleBackgroundCompletion(noticeTarget);
+      if (backgroundReadiness.running.length > 0 && !backgroundShellController) {
+        scheduleBackgroundCompletion(noticeTarget);
+      }
       await persistSessionState();
       return;
     }
+    backgroundReviewDeferred = false;
+    pendingNativeCompletionRevision = undefined;
     if (!window.baseline) {
       closeReviewWindow(state);
       return;

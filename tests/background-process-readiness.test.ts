@@ -76,3 +76,34 @@ test("structured ShellStart details are authoritative over display prose", () =>
   });
   assert.equal(readiness.snapshot().unverifiable.length, 0);
 });
+
+test("readiness revisions invalidate a previously observed idle state", { skip: process.platform === "win32" }, async () => {
+  const readiness = new BackgroundProcessReadiness();
+  const first = spawn(process.execPath, ["-e", "setTimeout(()=>{},150)"], {
+    detached: true,
+    stdio: "ignore",
+  });
+  const firstPid = first.pid;
+  assert.ok(firstPid);
+  readiness.observeToolResult("ShellStart", `Started "first" as job1 (pid ${firstPid}).`);
+  const runningRevision = readiness.snapshot().revision;
+  await once(first, "close");
+  const idle = readiness.snapshot();
+  assert.equal(idle.running.length, 0);
+  assert.ok(idle.revision > runningRevision);
+
+  const second = spawn(process.execPath, ["-e", "setTimeout(()=>{},150)"], {
+    detached: true,
+    stdio: "ignore",
+  });
+  const secondPid = second.pid;
+  assert.ok(secondPid);
+  readiness.observeToolResult("ShellStart", `Started "second" as job2 (pid ${secondPid}).`);
+  try {
+    const restarted = readiness.snapshot();
+    assert.equal(restarted.running.length, 1);
+    assert.ok(restarted.revision > idle.revision);
+  } finally {
+    try { process.kill(-secondPid, "SIGKILL"); } catch { /* already exited */ }
+  }
+});

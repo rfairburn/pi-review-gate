@@ -170,9 +170,15 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         );
         await waitForBackgroundProcesses(backgroundReadiness, request.signal);
         if (request.signal?.aborted || timedOut || interruptedByControl) break;
+        const idleRevision = backgroundReadiness.snapshot().revision;
 
         settledGeneration = rpc.settledGeneration;
         const state = rpcState(await rpc.request("get_state", {}));
+        const confirmed = backgroundReadiness.snapshot();
+        if (confirmed.revision !== idleRevision || confirmed.running.length > 0) {
+          request.onUpdate?.("background readiness changed before executor resumption; waiting for the current process groups");
+          continue;
+        }
         if (state.isStreaming || state.pendingMessageCount > 0) {
           request.onUpdate?.("background process completed; waiting for the executor's automatic completion turn");
           await rpc.waitForSettled(settledGeneration);
@@ -496,8 +502,9 @@ const recoveryCompactionInstructions = [
 ].join(" ");
 
 const backgroundCompletionPrompt = [
-  "All ShellStart background process groups are now finished.",
-  "Inspect their results and the workspace, address any failure, and finish the original task.",
+  "ShellStart work that previously blocked this executor reached an idle transition.",
+  "Re-check ShellList because a newer job may have started after the transition was observed.",
+  "Inspect completed results and the workspace, address any failure, and finish the original task when current background readiness permits.",
   "Do not claim success from process exit alone; verify the requested outcome before responding.",
 ].join(" ");
 

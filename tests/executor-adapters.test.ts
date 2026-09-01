@@ -140,7 +140,7 @@ test("Pi stays alive for ShellStart work and accepts steering while its agent is
     assert.deepEqual(prompts, [
       "start background work",
       "replace true with false",
-      "All ShellStart background process groups are now finished. Inspect their results and the workspace, address any failure, and finish the original task. Do not claim success from process exit alone; verify the requested outcome before responding.",
+      "ShellStart work that previously blocked this executor reached an idle transition. Re-check ShellList because a newer job may have started after the transition was observed. Inspect completed results and the workspace, address any failure, and finish the original task when current background readiness permits. Do not claim success from process exit alone; verify the requested outcome before responding.",
     ]);
     assert.ok(updates.some((message) => message.includes("final inspection before review")));
   } finally {

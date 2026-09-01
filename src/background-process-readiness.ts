@@ -6,6 +6,7 @@ export interface TrackedBackgroundProcess {
 }
 
 export interface BackgroundReadinessSnapshot {
+  revision: number;
   running: TrackedBackgroundProcess[];
   unverifiable: string[];
 }
@@ -20,12 +21,14 @@ const SHELL_START_RESULT = /Started\s+"([^"]*)"\s+as\s+(\S+)\s+\(pid\s+(\d+)\)(?
 export class BackgroundProcessReadiness {
   private readonly processes = new Map<number, TrackedBackgroundProcess>();
   private readonly unverifiable = new Set<string>();
+  private revision = 0;
 
   observeToolResult(toolName: string, result: unknown, isError = false): TrackedBackgroundProcess | undefined {
     if (toolName !== "ShellStart" || isError) return undefined;
     const structured = structuredShellStart(result);
     if (structured) {
       this.processes.set(structured.processGroupId, structured);
+      this.revision += 1;
       return structured;
     }
     const text = textFromToolResult(result);
@@ -33,11 +36,13 @@ export class BackgroundProcessReadiness {
     const match = text.match(SHELL_START_RESULT);
     if (!match) {
       this.unverifiable.add(singleLine(text).slice(0, 500) || "ShellStart returned an unparseable success result.");
+      this.revision += 1;
       return undefined;
     }
     const pid = Number(match[3]);
     if (!Number.isSafeInteger(pid) || pid <= 0 || process.platform === "win32") {
       this.unverifiable.add(singleLine(text).slice(0, 500));
+      this.revision += 1;
       return undefined;
     }
     const tracked = {
@@ -47,20 +52,26 @@ export class BackgroundProcessReadiness {
       processGroupId: pid,
     };
     this.processes.set(tracked.processGroupId, tracked);
+    this.revision += 1;
     return tracked;
   }
 
   snapshot(): BackgroundReadinessSnapshot {
     for (const [processGroupId] of this.processes) {
-      if (!processGroupIsAlive(processGroupId)) this.processes.delete(processGroupId);
+      if (!processGroupIsAlive(processGroupId)) {
+        this.processes.delete(processGroupId);
+        this.revision += 1;
+      }
     }
     return {
+      revision: this.revision,
       running: [...this.processes.values()],
       unverifiable: [...this.unverifiable],
     };
   }
 
   clear(): void {
+    if (this.processes.size > 0 || this.unverifiable.size > 0) this.revision += 1;
     this.processes.clear();
     this.unverifiable.clear();
   }

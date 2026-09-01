@@ -45,6 +45,32 @@ export interface BackgroundShellHost {
   sendMessage(message: Record<string, unknown>, delivery: Record<string, unknown>): unknown;
 }
 
+export interface BackgroundShellJobSnapshot {
+  id: string;
+  label: string;
+  pid?: number;
+  processGroupId?: number;
+}
+
+export interface BackgroundShellLifecycleSnapshot {
+  revision: number;
+  running: BackgroundShellJobSnapshot[];
+}
+
+export interface BackgroundShellLifecycleEvent {
+  type: "started" | "settled";
+  revision: number;
+  job: BackgroundShellJobSnapshot;
+  running: BackgroundShellJobSnapshot[];
+  /** The ordinary per-job exit notification already resumed the model. */
+  exitWakeScheduled: boolean;
+}
+
+export interface BackgroundShellController {
+  snapshot(): BackgroundShellLifecycleSnapshot;
+  subscribe(listener: (event: BackgroundShellLifecycleEvent) => void): () => void;
+}
+
 function objectSchema(
   properties: Record<string, unknown>,
   required: readonly string[] = [],
@@ -104,6 +130,8 @@ interface Job {
 const jobs = new Map<string, Job>();
 let seq = 0;
 let stallTimer: ReturnType<typeof setInterval> | null = null;
+let lifecycleRevision = 0;
+const lifecycleListeners = new Set<(event: BackgroundShellLifecycleEvent) => void>();
 /** Kept so the indicator can repaint from process events that carry no ctx. */
 let uiCtx: any = null;
 
@@ -114,6 +142,53 @@ const gray = (s: string) => `\x1b[90m${s}\x1b[39m`;
 function runningJobs(): Job[] {
   return [...jobs.values()].filter((j) => !j.exited);
 }
+
+function jobSnapshot(job: Job): BackgroundShellJobSnapshot {
+  return {
+    id: job.id,
+    label: job.label,
+    pid: job.proc.pid,
+    processGroupId: process.platform === "win32" ? undefined : job.proc.pid,
+  };
+}
+
+function lifecycleSnapshot(): BackgroundShellLifecycleSnapshot {
+  return {
+    revision: lifecycleRevision,
+    running: runningJobs().map(jobSnapshot),
+  };
+}
+
+function publishLifecycle(
+  type: BackgroundShellLifecycleEvent["type"],
+  job: Job,
+  exitWakeScheduled = false,
+): void {
+  lifecycleRevision += 1;
+  const snapshot = lifecycleSnapshot();
+  const event: BackgroundShellLifecycleEvent = {
+    type,
+    revision: snapshot.revision,
+    job: jobSnapshot(job),
+    running: snapshot.running,
+    exitWakeScheduled,
+  };
+  for (const listener of lifecycleListeners) {
+    try {
+      listener(event);
+    } catch {
+      /* lifecycle observers must not break process event handlers */
+    }
+  }
+}
+
+const controller: BackgroundShellController = {
+  snapshot: lifecycleSnapshot,
+  subscribe(listener) {
+    lifecycleListeners.add(listener);
+    return () => lifecycleListeners.delete(listener);
+  },
+};
 
 /**
  * One line under the input showing what is running in the background, so a job
@@ -174,7 +249,7 @@ function resolveJob(target: string): { job?: Job; error?: ReturnType<typeof text
 }
 
 /** Deliver a wake event to the agent through the lane its urgency earns. */
-function deliverWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: number): void {
+function deliverWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: number): boolean {
   job.wake.lastWakeAt = now;
   const delivery = laneDelivery(event.lane);
   const payload = formatWakePayload({
@@ -192,9 +267,11 @@ function deliverWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: n
       { customType: "pi-review-bg-shell", content: payload, display: true, details: { id: job.id } },
       delivery as any,
     );
+    return true;
   } catch {
     // A delivery mode can be rejected while pi is mid-transition. Losing a
     // status wake is survivable; throwing out of a process event handler is not.
+    return false;
   }
 }
 
@@ -260,7 +337,11 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
     }
     setIndicator();
     const event = evaluateExit(code, job.rules);
-    if (event) deliverWake(pi, job, event, Date.now());
+    const exitWakeScheduled = event ? deliverWake(pi, job, event, Date.now()) : false;
+    // reapAll() removes jobs before their asynchronous close callbacks arrive.
+    // Such callbacks belong to a dead session and must not wake lifecycle
+    // consumers in a newly started one.
+    if (jobs.get(job.id) === job) publishLifecycle("settled", job, exitWakeScheduled);
   };
   job.proc.on("close", (code) => finish(code ?? 0));
   job.proc.on("error", (err) => {
@@ -374,7 +455,7 @@ function statusOf(job: Job): string {
   return job.exitCode === 0 ? "done" : `failed(${job.exitCode})`;
 }
 
-export function registerBackgroundShell(pi: BackgroundShellHost): void {
+export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShellController {
   pi.registerTool({
     name: "ShellStart",
     label: "ShellStart",
@@ -445,6 +526,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): void {
         pending: "",
       };
       jobs.set(id, job);
+      publishLifecycle("started", job);
       attachStreams(pi, job);
       ensureStallTimer(pi);
       installExitHooks();
@@ -586,6 +668,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): void {
     if (runningJobs().length > 0) setIndicator();
   }, 5_000);
   (tick as any).unref?.();
+  return controller;
 }
 
 export default registerBackgroundShell;

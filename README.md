@@ -312,13 +312,14 @@ The extension provides `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
 `ShellStop` directly through Pi. Background jobs are detached process groups,
 wake the agent on configured output or exit events, survive ordinary turn
 settlement, and are reaped when the Pi session ends. At the top level,
-review-gate reads the process-group identity returned by `ShellStart`, defers
-automatic review while the group is alive, and triggers the orchestrator to
-inspect and finish the work after it clears. A Pi executor likewise keeps its
+review-gate consumes the shell controller's typed lifecycle state and defers
+automatic review while any job is alive. The last job's ordinary exit wake
+resumes the orchestrator without a duplicate aggregate notification; jobs with
+exit waking disabled still receive a review-readiness wake. A Pi executor likewise keeps its
 RPC session alive while tracked background work runs, accepts steering during
 that interval, and performs a final inspection turn before review. Executor
 timeouts are suspended while a verified process group remains active;
-unparseable `ShellStart` success responses fail closed.
+external or unparseable `ShellStart` success responses fail closed.
 
 The same top-level review-readiness gate covers execution and research subtasks: automatic
 review of the primary orchestrator is deferred while any task is queued,

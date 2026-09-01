@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
+import { reapAll } from "../src/background-shell";
 import { queueModelDelivery } from "../src/durable-delivery";
 import { SessionStateStore } from "../src/session-state";
 
@@ -96,7 +97,8 @@ test("automatic review waits for ShellStart process groups and resumes the orche
     await assert.rejects(access(invocationMarker), /ENOENT/);
     assert.match(notices.join("\n"), /automatic review deferred while 1 background process group/);
     await waitForCondition(() => followUps.length === 1);
-    assert.match(followUps[0]?.message ?? "", /All tracked ShellStart process groups have finished/);
+    assert.match(followUps[0]?.message ?? "", /previously blocked review reached an idle transition/);
+    assert.match(followUps[0]?.message ?? "", /Re-check ShellList because a newer job may have started/);
     assert.deepEqual(followUps[0]?.options, { deliverAs: "followUp", triggerTurn: true });
 
     await trigger(hooks, "before_agent_start", { cwd: dir });
@@ -106,6 +108,142 @@ test("automatic review waits for ShellStart process groups and resumes the orche
     if (background?.pid) {
       try { process.kill(-background.pid, "SIGKILL"); } catch { /* already exited */ }
     }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("native ShellStart exit wake replaces the redundant aggregate-ready wake", { skip: process.platform === "win32" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-native-background-readiness-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const invocationMarker = join(dir, "reviewer-invoked.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'background work reviewed',findings:[]})))`,
+        ],
+        timeoutMs: 15_000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
+    const notices: string[] = [];
+    const messages: Array<{ customType?: unknown; content?: unknown }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerTool(tool: { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }) {
+        tools.set(tool.name, tool);
+      },
+      registerCommand() {},
+      notify(message: string) { notices.push(message); },
+      sendMessage(message: { customType?: unknown; content?: unknown }) { messages.push(message); },
+      sendUserMessage() {},
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "make a background-assisted change", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const shellStart = tools.get("ShellStart");
+    assert.ok(shellStart);
+    await shellStart.execute("id", { command: "sleep 0.25", label: "native-tests" }, undefined, undefined, { hasUI: false });
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
+
+    assert.match(notices.join("\n"), /automatic review deferred while 1 background process group/);
+    await waitForCondition(() => messages.some((message) => message.customType === "pi-review-bg-shell"));
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
+    assert.equal(messages.filter((message) => message.customType === "pi-review-background-ready").length, 0);
+
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
+    assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
+  } finally {
+    reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a replacement ShellStart job keeps review blocked after an earlier idle-transition wake", { skip: process.platform === "win32" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-background-restart-race-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const invocationMarker = join(dir, "reviewer-invoked.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked')`],
+        timeoutMs: 15_000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
+    const notices: string[] = [];
+    const messages: Array<{ customType?: unknown; content?: unknown }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerTool(tool: { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }) {
+        tools.set(tool.name, tool);
+      },
+      registerCommand() {},
+      notify(message: string) { notices.push(message); },
+      sendMessage(message: { customType?: unknown; content?: unknown }) { messages.push(message); },
+      sendUserMessage() {},
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "restart a background validation until it is useful", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const shellStart = tools.get("ShellStart");
+    assert.ok(shellStart);
+    await shellStart.execute("id", {
+      command: "sleep 0.2",
+      label: "first-run",
+      wake_on: { exit: false },
+    }, undefined, undefined, { hasUI: false });
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "first run active" }] });
+
+    await waitForCondition(() => messages.filter((message) => message.customType === "pi-review-background-ready").length === 1);
+    const firstWake = String(messages.find((message) => message.customType === "pi-review-background-ready")?.content ?? "");
+    assert.match(firstWake, /idle transition/);
+    assert.match(firstWake, /newer job may have started/);
+
+    // The completion wake begins a new turn, which immediately replaces the
+    // finished job. The old wake must not authorize review of this newer state.
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await shellStart.execute("id", {
+      command: "sleep 0.35",
+      label: "replacement-run",
+      wake_on: { exit: false },
+    }, undefined, undefined, { hasUI: false });
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "replacement run active" }] });
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+    assert.match(notices.at(-1) ?? "", /replacement-run/);
+
+    await waitForCondition(() => messages.filter((message) => message.customType === "pi-review-background-ready").length === 2);
+    await assert.rejects(access(invocationMarker), /ENOENT/);
+  } finally {
+    reapAll();
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -28,11 +28,11 @@ function wire() {
     on: (n: string, h: any) => { handlers[n] = h; },
     sendMessage: (msg: any, delivery: any) => { sent.push({ content: msg.content, delivery }); },
   };
-  registerBackgroundShell(pi);
+  const controller = registerBackgroundShell(pi);
   const ctx = { hasUI: false, ui: {} };
   const call = (name: string, params: any) =>
     tools[name].execute("id", params, undefined, undefined, ctx);
-  return { sent, tools, handlers, call };
+  return { sent, tools, handlers, call, controller };
 }
 
 const textOf = (r: any) => r.content[0].text as string;
@@ -96,6 +96,66 @@ describe("bg-shell against real processes", () => {
     // A clean exit is worth delivering, not worth interrupting a tool call for.
     expect(wake.delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(await until(() => readiness.snapshot().running.length === 0, T)).toBe(true);
+  });
+
+  it("publishes authoritative typed lifecycle revisions", async () => {
+    const { call, controller } = wire();
+    const events: Array<{
+      type: string;
+      revision: number;
+      running: string[];
+      exitWakeScheduled: boolean;
+    }> = [];
+    const unsubscribe = controller.subscribe((event) => {
+      events.push({
+        type: event.type,
+        revision: event.revision,
+        running: event.running.map((job) => job.id),
+        exitWakeScheduled: event.exitWakeScheduled,
+      });
+    });
+    try {
+      const started = await call("ShellStart", {
+        command: "sleep 0.25",
+        label: "lifecycle",
+      });
+      const id = textOf(started).match(/as (job\d+)/)![1];
+      expect(controller.snapshot().running.map((job) => job.id)).toEqual([id]);
+      expect(await until(() => controller.snapshot().running.length === 0)).toBe(true);
+
+      expect(events.map((event) => event.type)).toEqual(["started", "settled"]);
+      expect(events[0].running).toEqual([id]);
+      expect(events[0].exitWakeScheduled).toBe(false);
+      expect(events[1].running).toEqual([]);
+      expect(events[1].exitWakeScheduled).toBe(true);
+      expect(events[1].revision).toBe(events[0].revision + 1);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("reports an idle transition without an exit wake when exit notification is disabled", async () => {
+    const { call, controller, sent } = wire();
+    const events: Array<{ type: string; running: number; exitWakeScheduled: boolean }> = [];
+    const unsubscribe = controller.subscribe((event) => {
+      events.push({
+        type: event.type,
+        running: event.running.length,
+        exitWakeScheduled: event.exitWakeScheduled,
+      });
+    });
+    try {
+      await call("ShellStart", {
+        command: "sleep 0.2",
+        label: "silent-lifecycle",
+        wake_on: { exit: false },
+      });
+      expect(await until(() => controller.snapshot().running.length === 0)).toBe(true);
+      expect(sent).toEqual([]);
+      expect(events.at(-1)).toEqual({ type: "settled", running: 0, exitWakeScheduled: false });
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("gives a crash the urgent lane", async () => {

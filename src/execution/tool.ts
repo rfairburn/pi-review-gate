@@ -14,14 +14,16 @@ import {
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
 import { randomUUID } from "node:crypto";
+import { parseDuration } from "../background-shell/jobs";
 
-const ACTIONS = ["start", "add", "inspect", "continue", "steer", "interrupt", "force_merge", "mark_clean"] as const;
+const ACTIONS = ["start", "add", "inspect", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean"] as const;
 type Action = typeof ACTIONS[number];
 
 export const EXECUTION_TOOL_NAMES: Record<Action, string> = {
   start: "SubtasksStart",
   add: "SubtasksAdd",
   inspect: "SubtasksInspect",
+  watch: "SubtasksWatch",
   continue: "SubtasksContinue",
   steer: "SubtasksSteer",
   interrupt: "SubtasksInterrupt",
@@ -38,6 +40,7 @@ const SHARED_PROMPT_GUIDELINES = [
   "Use SubtasksAdd to top off a running execution without waiting for slower tasks.",
   "Each task captures main independently when dispatched and lands independently when accepted.",
   "Use SubtasksInspect for durable state and recent activity; artifact paths permit deeper rg-based investigation.",
+  "Use SubtasksWatch only when a future one-shot checkpoint would be decision-relevant. It returns immediately, replaces any prior watch for that execution, cancels when an earlier completion/failure/conflict/recovery event arrives, and must be explicitly rearmed after firing. It is not a polling loop or recurring heartbeat.",
   "Use SubtasksSteer for queued, starting, or live tasks: queued steering is durably incorporated before startup and live steering uses the executor transport.",
   "Steering wins over review: a steer received while reviewing interrupts that review, resumes the executor with the changed request, and reviews the replacement result.",
   "If an active adapter cannot steer its current long-running command, keep the steer queued for the next executor handoff; do not treat that transport limitation as rejection.",
@@ -59,6 +62,8 @@ function toolDescription(action: Action): string {
       return "Add 1–16 durable background subtasks to an existing execution so freed capacity can be topped off.";
     case "inspect":
       return "Inspect durable execution-subtask state, recent activity, live controls, and artifact locations.";
+    case "watch":
+      return "Request one future one-shot checkpoint if an execution is still active after a specified duration.";
     case "continue":
       return "Continue a stopped background subtask from its verified checkpoint, optionally using an explicit reattachment bundle.";
     case "steer":
@@ -77,6 +82,7 @@ function toolPromptSnippet(action: Action): string {
     case "start": return "Start bounded background implementation work with SubtasksStart.";
     case "add": return "Top off an existing background execution with SubtasksAdd.";
     case "inspect": return "Use SubtasksInspect for a decision-relevant diagnostic snapshot, never as a polling loop.";
+    case "watch": return "Use SubtasksWatch for one deliberate future checkpoint; it is one-shot and must be explicitly rearmed.";
     case "continue": return "Resume stopped work from a verified checkpoint with SubtasksContinue.";
     case "steer": return "Change queued or in-flight work with SubtasksSteer; steering supersedes review.";
     case "interrupt": return "Stop work with SubtasksInterrupt and choose the requested landing semantics explicitly.";
@@ -114,6 +120,7 @@ interface NormalizedInput {
   mergeAnyhow?: boolean;
   offset?: number;
   lines?: number;
+  afterMs?: number;
 }
 
 export class ExecutionToolManager {
@@ -365,6 +372,15 @@ export class ExecutionToolManager {
           const inspection = this.controller.inspect(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines);
           return backgroundResult("inspect", inspection, false);
         }
+        case "watch": {
+          const subscription = this.controller.watch(normalized.executionId, normalized.afterMs!);
+          const replacement = subscription.replaced ? " It replaced the prior watch for this execution." : "";
+          return result(
+            `SubtasksWatch armed for ${subscription.executionId}; if work is still active after ${formatDuration(subscription.afterMs)}, one checkpoint notification will trigger a turn.${replacement} An earlier completion, failure, conflict, or recovery notification cancels it. Call SubtasksWatch again after it fires if another checkpoint is useful.`,
+            { action: "watch", ...subscription },
+            false,
+          );
+        }
         case "continue": {
           const inspection = await this.controller.continueTask({
             executionId: normalized.executionId,
@@ -511,6 +527,15 @@ function toolSchema(action: Action): Record<string, unknown> {
       properties.offset = { type: "integer", minimum: 0, description: "Absolute activity offset for detailed inspection." };
       properties.lines = { type: "integer", minimum: 1, maximum: 500, description: "Activity lines to return, up to 500." };
       break;
+    case "watch":
+      properties.executionId = executionId;
+      properties.after = {
+        type: "string",
+        minLength: 1,
+        description: "One-shot delay such as 30s, 15m, or 2h. Allowed range: 1 second through 7 days.",
+      };
+      required.push("executionId", "after");
+      break;
     case "continue":
       properties.executionId = executionId;
       properties.taskId = taskId;
@@ -581,6 +606,14 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     offset: optionalInteger(value.offset, "offset", 0, Number.MAX_SAFE_INTEGER),
     lines: optionalInteger(value.lines, "lines", 1, 500),
   };
+  if (value.after !== undefined) {
+    if (typeof value.after !== "string") throw new Error("after must be a duration string such as 30s, 15m, or 2h");
+    const afterMs = parseDuration(value.after);
+    if (afterMs === null || afterMs < 1_000 || afterMs > 7 * 24 * 60 * 60 * 1000) {
+      throw new Error("after must be a duration from 1s through 168h");
+    }
+    normalized.afterMs = afterMs;
+  }
   if (value.kind !== undefined) {
     if (value.kind !== "execute" && value.kind !== "research") throw new Error("kind must be execute or research");
     normalized.kind = value.kind;
@@ -603,6 +636,7 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     throw new Error(`${action} requires executionId or taskId`);
   }
   if (action === "interrupt" && !normalized.interruptMode) throw new Error("interrupt requires interruptMode");
+  if (action === "watch" && (!normalized.executionId || normalized.afterMs === undefined)) throw new Error("watch requires executionId and after");
   return normalized;
 }
 
@@ -611,6 +645,7 @@ function allowedKeys(action: Action): Set<string> {
     case "start": return new Set(["kind", "tasks"]);
     case "add": return new Set(["executionId", "tasks"]);
     case "inspect": return new Set(["executionId", "taskId", "offset", "lines"]);
+    case "watch": return new Set(["executionId", "after"]);
     case "continue": return new Set(["executionId", "taskId", "bundle", "instructions", "instructionId"]);
     case "steer": return new Set(["executionId", "taskId", "instructions", "instructionId"]);
     case "interrupt": return new Set(["executionId", "taskId", "interruptMode", "instructionId"]);
@@ -809,6 +844,12 @@ function requiredString(value: unknown, field: string): string {
 
 function optionalInteger(value: unknown, field: string, min: number, max: number): number | undefined {
   return value === undefined ? undefined : requiredInteger(value, field, min, max);
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds % 3_600_000 === 0) return `${milliseconds / 3_600_000}h`;
+  if (milliseconds % 60_000 === 0) return `${milliseconds / 60_000}m`;
+  return `${milliseconds / 1_000}s`;
 }
 
 function requiredInteger(value: unknown, field: string, min: number, max: number): number {

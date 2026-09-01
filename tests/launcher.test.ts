@@ -117,6 +117,7 @@ test("orchestrator prompt names the operation-specific tools and current steerin
   assert.match(prompt, /`SubtasksStart`/);
   assert.match(prompt, /kind: "research"/);
   assert.match(prompt, /`SubtasksInspect`/);
+  assert.match(prompt, /`SubtasksWatch`/);
   assert.match(prompt, /`SubtasksContinue`/);
   assert.match(prompt, /`SubtasksSteer`/);
   assert.match(prompt, /separate, isolated Git worktree/);

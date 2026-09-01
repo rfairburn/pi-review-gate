@@ -272,6 +272,14 @@ export interface BackgroundInspection {
   }>;
 }
 
+export interface BackgroundWatchSubscription {
+  executionId: string;
+  afterMs: number;
+  armedAt: string;
+  dueAt: string;
+  replaced: boolean;
+}
+
 export interface BackgroundReviewReadinessTask {
   executionId: string;
   kind: BackgroundTaskKind;
@@ -297,6 +305,9 @@ export class BackgroundExecutionController {
   private releaseConflictBlock?: () => void;
   private uiContext: unknown;
   private expandedView = false;
+  private readonly watches = new Map<string, { timer: ReturnType<typeof setTimeout>; subscription: BackgroundWatchSubscription }>();
+  private pendingWatchInspections: BackgroundInspection[] = [];
+  private watchDeliveryTimer?: ReturnType<typeof setTimeout>;
 
   constructor(private readonly input: BackgroundControllerInput) {
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
@@ -506,6 +517,27 @@ export class BackgroundExecutionController {
 
   list(): BackgroundInspection[] {
     return [...this.groups.values()].map((group) => this.inspect(group.executionId));
+  }
+
+  watch(executionId: string | undefined, afterMs: number): BackgroundWatchSubscription {
+    const group = this.resolveGroup(executionId);
+    if (resolve(group.cwd) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
+    if (!group.tasks.some((task) => isActiveTaskState(task.state))) {
+      throw new Error(`Execution ${group.executionId} has no active tasks to watch.`);
+    }
+    const replaced = this.cancelWatch(group.executionId);
+    const armedAt = new Date().toISOString();
+    const subscription: BackgroundWatchSubscription = {
+      executionId: group.executionId,
+      afterMs,
+      armedAt,
+      dueAt: new Date(Date.parse(armedAt) + afterMs).toISOString(),
+      replaced,
+    };
+    const timer = setTimeout(() => this.queueWatchDelivery(group.executionId, subscription), afterMs);
+    timer.unref?.();
+    this.watches.set(group.executionId, { timer, subscription });
+    return subscription;
   }
 
   reviewReadiness(): BackgroundReviewReadinessTask[] {
@@ -883,6 +915,7 @@ export class BackgroundExecutionController {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.clearWatches();
     for (const group of this.groups.values()) {
       for (const task of group.tasks) {
         if (!isActiveTaskState(task.state)) continue;
@@ -924,6 +957,7 @@ export class BackgroundExecutionController {
   }
 
   async detach(): Promise<void> {
+    this.clearWatches();
     this.groups.clear();
     this.runtimes.clear();
     this.archivedTasks.clear();
@@ -1714,6 +1748,11 @@ export class BackgroundExecutionController {
     content: string,
     eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
   ): Promise<void> {
+    if (kind === "completion" || kind === "failure") {
+      const owner = eventSnapshot?.group
+        ?? [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
+      if (owner) this.cancelWatch(owner.executionId);
+    }
     if (kind === "state"
       && (this.input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE) === "quiet") {
       return;
@@ -1754,6 +1793,61 @@ export class BackgroundExecutionController {
       }, delivery);
     } catch (error) {
       await this.input.notify?.(`review gate: task notification could not be delivered: ${messageOf(error)}`);
+    }
+  }
+
+  private cancelWatch(executionId: string): boolean {
+    const current = this.watches.get(executionId);
+    if (current) clearTimeout(current.timer);
+    this.watches.delete(executionId);
+    this.pendingWatchInspections = this.pendingWatchInspections.filter((inspection) => inspection.executionId !== executionId);
+    return current !== undefined;
+  }
+
+  private clearWatches(): void {
+    for (const watch of this.watches.values()) clearTimeout(watch.timer);
+    this.watches.clear();
+    this.pendingWatchInspections = [];
+    if (this.watchDeliveryTimer) clearTimeout(this.watchDeliveryTimer);
+    this.watchDeliveryTimer = undefined;
+  }
+
+  private queueWatchDelivery(executionId: string, expected: BackgroundWatchSubscription): void {
+    const current = this.watches.get(executionId);
+    if (!current || current.subscription !== expected) return;
+    this.watches.delete(executionId);
+    let inspection: BackgroundInspection;
+    try {
+      inspection = this.inspect(executionId);
+    } catch {
+      return;
+    }
+    if (inspection.activeCount === 0) return;
+    this.pendingWatchInspections.push(inspection);
+    if (this.watchDeliveryTimer) return;
+    this.watchDeliveryTimer = setTimeout(() => {
+      this.watchDeliveryTimer = undefined;
+      const pending = this.pendingWatchInspections.splice(0);
+      if (pending.length > 0) void this.deliverWatchInspections(pending);
+    }, 25);
+    this.watchDeliveryTimer.unref?.();
+  }
+
+  private async deliverWatchInspections(inspections: BackgroundInspection[]): Promise<void> {
+    const content = formatWatchEvent(inspections, this.input.config);
+    if (!isRecord(this.input.pi) || typeof this.input.pi.sendMessage !== "function") {
+      await this.input.notify?.(content);
+      return;
+    }
+    try {
+      this.input.pi.sendMessage({
+        customType: "pi-review-subtask-watch",
+        content,
+        display: true,
+        details: { executions: inspections },
+      }, { deliverAs: "followUp", triggerTurn: true });
+    } catch (error) {
+      await this.input.notify?.(`review gate: subtask watch notification could not be delivered: ${messageOf(error)}`);
     }
   }
 
@@ -1961,6 +2055,48 @@ export class BackgroundExecutionController {
 function clipActivity(value: string, max = 180): string {
   const compact = value.replace(/\s+/g, " ").trim();
   return compact.length <= max ? compact : `${compact.slice(0, Math.max(1, max - 1))}…`;
+}
+
+function formatWatchEvent(inspections: BackgroundInspection[], config: ReviewGateConfig): string {
+  const lines = [
+    "[pi-review-subtask-watch]",
+    inspections.length === 1
+      ? `The requested one-shot checkpoint for execution ${inspections[0]!.executionId} is due while work remains active.`
+      : `${inspections.length} requested one-shot subtask checkpoints became due together while work remains active.`,
+    "This is a deliberate checkpoint, not a completion or failure event. Act only if the snapshot warrants it; call SubtasksWatch again to request another checkpoint.",
+  ];
+  const now = Date.now();
+  for (const inspection of inspections) {
+    const active = inspection.tasks.filter((task) => isActiveTaskState(task.state));
+    lines.push("", `${inspection.kind === "research" ? "Research" : "Execution"} ${inspection.executionId}: ${active.length} active task(s), revision ${inspection.revision}.`);
+    for (const task of active) {
+      const lastActivity = task.activity.at(-1);
+      const lastAt = lastActivity?.at ?? task.updatedAt;
+      const live = task.liveControl;
+      lines.push(`- ${task.taskId} · ${task.definition.title} · ${task.state} · ${executorDisplayLabel(task, config, inspection.kind)}`);
+      lines.push(`  elapsed ${formatElapsed(task.timing.totalMs)}; last recorded activity ${formatElapsedSince(lastAt, now)}; controls: inspect yes, steer yes (live ${live?.steer === true ? "yes" : "no"}), interrupt ${isInterruptibleTaskState(task.state) ? "yes" : "no"}`);
+      lines.push(lastActivity
+        ? `  recent: ${lastActivity.phase} · ${clipActivity(lastActivity.message, 240)}`
+        : "  recent: no recorded activity yet");
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatElapsed(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) return remainingSeconds === 0 ? `${minutes}m` : `${minutes}m${remainingSeconds}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes === 0 ? `${hours}h` : `${hours}h${remainingMinutes}m`;
+}
+
+function formatElapsedSince(at: string, now: number): string {
+  const parsed = Date.parse(at);
+  return Number.isFinite(parsed) ? `${formatElapsed(Math.max(0, now - parsed))} ago` : "unknown";
 }
 
 const SHORT_RESEARCH_REPORT_MAX_CHARS = 900;

@@ -10,7 +10,7 @@ import { queueModelDelivery } from "../src/durable-delivery";
 import { SessionStateStore } from "../src/session-state";
 
 const executionToolNames = [
-  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue",
+  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
   "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
 ];
 const backgroundShellToolNames = ["ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"];

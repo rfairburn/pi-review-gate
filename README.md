@@ -271,7 +271,7 @@ disable configured worker routes. The environment kill switches disable the whol
 extension, including delegated execution.
 
 With at least one worker resource selected, the plugin exposes one exact-schema tool per
-operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`,
+operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch`,
 `SubtasksContinue`, `SubtasksSteer`, `SubtasksInterrupt`,
 `SubtasksForceMerge`, and `SubtasksMarkClean`. `SubtasksStart` accepts an
 optional immutable group-level `kind`: `execute` (the default) or `research`.
@@ -307,6 +307,13 @@ and estimated post-settlement capacity after already-queued work. Final completi
 also reports wall time, summed task time, and peak concurrent workers.
 Internal `CAPTURING`, `ACCEPTED`, `WAITING_TO_LAND`, and `LANDING` progress
 remains durable and user-visible without starting model turns.
+`SubtasksWatch` optionally arms one future checkpoint for an active execution.
+It returns immediately, replaces any prior watch for that execution, and wakes
+once with active-task state, timing, recent activity, executor identity, and
+available controls if work is still active at the deadline. An earlier
+completion, failure, conflict, or recovery notification cancels the watch;
+another checkpoint must be explicitly rearmed, so this never becomes a polling
+loop or recurring heartbeat.
 
 The extension provides `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
 `ShellStop` directly through Pi. Background jobs are detached process groups,

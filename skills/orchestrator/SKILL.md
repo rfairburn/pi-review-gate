@@ -29,6 +29,7 @@ Describe what must be true without over-prescribing incidental implementation de
 ## Supervise deliberately
 
 - Retain execution and task handles. Inspect only when a current diagnostic snapshot will inform a decision; ordinary state changes arrive as events.
+- When a long-running execution warrants one deliberate future checkpoint, use `SubtasksWatch`. It returns immediately, replaces the execution's prior watch, cancels on an earlier completion/failure/conflict/recovery event, and fires at most once; explicitly rearm it only when another checkpoint remains useful. Never turn it into a recurring heartbeat.
 - Steer promptly when new information changes direction. Steering supersedes an in-flight review and remains queued when live delivery is temporarily unavailable.
 - Add work to an existing execution when completed tasks free capacity and more planned work remains.
 - For a stopped task, diagnose its failure packet and prefer continuation from its verified checkpoint over recreating work. Retry infrastructure failures without pretending they are implementation verdicts.

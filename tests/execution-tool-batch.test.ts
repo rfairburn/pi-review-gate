@@ -16,7 +16,7 @@ import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
 
 const executionToolNames = [
-  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue",
+  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
   "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
 ];
 
@@ -102,6 +102,7 @@ test("operation-specific execution tools expose exact durable schemas", () => {
     SubtasksStart: ["kind", "tasks"],
     SubtasksAdd: ["executionId", "tasks"],
     SubtasksInspect: ["executionId", "taskId", "offset", "lines"],
+    SubtasksWatch: ["executionId", "after"],
     SubtasksContinue: ["executionId", "taskId", "bundle", "instructions", "instructionId"],
     SubtasksSteer: ["executionId", "taskId", "instructions", "instructionId"],
     SubtasksInterrupt: ["executionId", "taskId", "interruptMode", "instructionId"],
@@ -125,6 +126,9 @@ test("operation-specific execution tools expose exact durable schemas", () => {
   assert.equal(forceMerge.properties.bundle, undefined);
   assert.match(forceMerge.properties.mergeAnyhow.description, /manual workspace inspection/i);
   assert.match(executionTool(tools, "SubtasksInterrupt").parameters.properties.interruptMode.description, /must always be inspected afterward/i);
+  const watch = executionTool(tools, "SubtasksWatch").parameters;
+  assert.deepEqual(watch.required, ["executionId", "after"]);
+  assert.match(watch.properties.after.description, /one-shot delay/i);
 });
 
 test("runtime synchronization never widens the orchestrator's native --tools allowlist", () => {
@@ -187,6 +191,70 @@ test("execution review readiness reports every unfinished task and omits termina
     await manager.detach();
   }
   assert.deepEqual(manager.reviewReadiness(), []);
+});
+
+test("SubtasksWatch replaces an earlier watch and emits one bounded checkpoint while work remains active", async () => {
+  const { tools, notices, manager } = harness({ slowExecutor: true });
+  try {
+    const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+    const watch = executionTool(tools, "SubtasksWatch").execute as ExecuteTool;
+    const started = await start("watch-start", {
+      tasks: [{ title: "watched work", instructions: "remain active", acceptanceCriteria: ["eventually finish"] }],
+    }, undefined, undefined, {});
+    const executionId = started.details.executionId;
+
+    const first = await watch("watch-first", { executionId, after: "2s" }, undefined, undefined, {});
+    assert.equal(first.isError, false);
+    assert.equal(first.details.replaced, false);
+    const replacement = await watch("watch-replacement", { executionId, after: "1s" }, undefined, undefined, {});
+    assert.equal(replacement.isError, false);
+    assert.equal(replacement.details.replaced, true);
+    assert.match(replacement.content[0].text, /one checkpoint notification/);
+
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_200));
+    const watchNotices = notices.filter((notice) => notice.includes("[pi-review-subtask-watch]"));
+    assert.equal(watchNotices.length, 1);
+    assert.match(watchNotices[0]!, /watched work · (queued|capturing|running)/);
+    assert.match(watchNotices[0]!, /controls: inspect yes, steer yes/);
+    assert.match(watchNotices[0]!, /call SubtasksWatch again to request another checkpoint/);
+
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_050));
+    assert.equal(notices.filter((notice) => notice.includes("[pi-review-subtask-watch]")).length, 1);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("SubtasksWatch validates its duration and cancels on an earlier task failure", async () => {
+  const { tools, notices, manager } = harness({ slowExecutor: true });
+  try {
+    const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+    const watch = executionTool(tools, "SubtasksWatch").execute as ExecuteTool;
+    const interrupt = executionTool(tools, "SubtasksInterrupt").execute as ExecuteTool;
+    const invalid = await watch("watch-invalid", { executionId: "exec-missing", after: "10ms" }, undefined, undefined, {});
+    assert.equal(invalid.isError, true);
+    assert.match(invalid.content[0].text, /duration from 1s through 168h/);
+
+    const started = await start("watch-cancel-start", {
+      tasks: [{ title: "cancel watched work", instructions: "remain active", acceptanceCriteria: ["eventually finish"] }],
+    }, undefined, undefined, {});
+    const executionId = started.details.executionId;
+    const taskId = started.details.tasks[0].taskId;
+    const armed = await watch("watch-cancel-arm", { executionId, after: "1s" }, undefined, undefined, {});
+    assert.equal(armed.isError, false);
+    const interrupted = await interrupt("watch-cancel-interrupt", {
+      executionId,
+      taskId,
+      interruptMode: "interrupt_as_failure",
+    }, undefined, undefined, {});
+    assert.equal(interrupted.isError, false);
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_100));
+    assert.equal(notices.some((notice) => notice.includes("[pi-review-subtask-watch]")), false);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
 });
 
 test("saved executor settings govern queued dispatch while existing leases keep running", async () => {

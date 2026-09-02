@@ -6,6 +6,17 @@ import { gfm } from "turndown-plugin-gfm";
 const MAX_BLOCK_CHARS = 7_000;
 const MAX_TABLES = 64;
 
+// Conservative adversarial-input budgets for HTML table extraction. All are
+// enforced before any dense allocation or span-fill loop, so attacker-controlled
+// numeric spans and cell counts can never drive unbounded memory work.
+const MAX_TABLE_ROWS = 2_000;
+const MAX_TABLE_COLUMNS = 256;
+const MAX_TABLE_CELLS = 65_536;
+const MAX_TABLE_SPAN = 1_000;
+const MAX_CELL_TEXT_CHARS = 2_000;
+const MAX_TABLE_LABEL_CHARS = 500;
+const MAX_TABLE_MARKDOWN_CHARS = 512_000;
+
 export interface WebPageBlock {
   index: number;
   kind: "text" | "code" | "table";
@@ -25,6 +36,9 @@ export interface WebTableDescriptor {
   rows: number;
   columns: number;
   headers: string[];
+  /** Present when any extraction budget (rows, columns, cells, spans, cell text, Markdown) truncated this table. */
+  truncated?: boolean;
+  truncationNotes?: string[];
 }
 
 export interface WebPaginationLink {
@@ -122,11 +136,15 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
   }
 
   const tables: WebTableDescriptor[] = [];
-  for (const element of [...document.querySelectorAll("table")].slice(0, MAX_TABLES)) {
+  // Bounded traversal: never materializes a collection proportional to the
+  // document's table count.
+  const tableElements = collectBoundedElements(document, "table", MAX_TABLES);
+  for (const element of tableElements.elements) {
     const table = tableData(element, tables.length + 1);
     if (!table || table.rows.length < 2 || table.columns < 2) continue;
     const start = blocks.length;
-    const chunks = tableMarkdownChunks(table.label, table.headers, table.rows, MAX_BLOCK_CHARS);
+    const markdownNotes = [...table.truncationNotes];
+    const chunks = tableMarkdownChunks(table.label, table.headers, table.rows, MAX_BLOCK_CHARS, markdownNotes);
     for (const chunk of chunks) {
       blocks.push({
         index: blocks.length,
@@ -138,6 +156,7 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
         tableRows: chunk.rows,
       });
     }
+    const truncated = [...new Set(markdownNotes)];
     tables.push({
       id: table.id,
       label: table.label,
@@ -146,6 +165,7 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
       rows: table.rows.length,
       columns: table.columns,
       headers: table.headers,
+      ...(truncated.length > 0 ? { truncated: true, truncationNotes: truncated } : {}),
     });
   }
   dynamicContentReasons.push(...extractionDynamicReasons(blocks, scriptSignals));
@@ -345,13 +365,20 @@ interface ParsedTable {
   headers: string[];
   rows: string[][];
   columns: number;
+  truncationNotes: string[];
 }
 
 function tableData(table: Element, ordinal: number): ParsedTable | undefined {
-  const expanded = expandTableRows([...table.querySelectorAll("tr")]);
+  const notes: string[] = [];
+  // Bounded traversal: collect at most MAX_TABLE_ROWS rows without building a
+  // NodeList of every attacker-controlled <tr>; expandTableRows enforces the
+  // same budget.
+  const trs = collectBoundedElements(table, "tr", MAX_TABLE_ROWS);
+  if (trs.overflow) notes.push(`table rows capped at ${MAX_TABLE_ROWS}`);
+  const expanded = expandTableRows(trs.elements, notes);
   const allRows = expanded.map((row) => row.values).filter((row) => row.some(Boolean));
   if (allRows.length < 2) return undefined;
-  const columns = Math.max(...allRows.map((row) => row.length));
+  const columns = Math.min(Math.max(...allRows.map((row) => row.length)), MAX_TABLE_COLUMNS);
   if (columns < 2) return undefined;
   let headerCount = 0;
   for (const row of expanded) {
@@ -359,20 +386,34 @@ function tableData(table: Element, ordinal: number): ParsedTable | undefined {
     headerCount += 1;
   }
   headerCount = Math.min(Math.max(1, headerCount), Math.max(1, allRows.length - 1));
+  // The dense result pads every retained row to `columns` cells, so bound the
+  // padded total (including rowspan carry-over slots already counted during
+  // expansion) against MAX_TABLE_CELLS before the per-row allocation.
+  const maxBodyRows = Math.max(1, Math.floor(MAX_TABLE_CELLS / columns) - headerCount);
+  let bodyRows = allRows.slice(headerCount);
+  if (bodyRows.length > maxBodyRows) {
+    bodyRows = bodyRows.slice(0, maxBodyRows);
+    notes.push(`expanded table cells capped at ${MAX_TABLE_CELLS}`);
+  }
   const headerRows = allRows.slice(0, headerCount);
   const headers = Array.from({ length: columns }, (_, column) => {
     const values = headerRows.map((row) => row[column]).filter((value): value is string => Boolean(value));
-    const unique = values.filter((value, index) => values.indexOf(value) === index);
-    return unique.join(" ") || `Column ${column + 1}`;
+    return boundedHeaderText(values, notes) || `Column ${column + 1}`;
   });
   const caption = cleanText(table.querySelector("caption")?.textContent ?? "");
   const heading = nearestHeading(table);
+  const rawLabel = caption || heading || `Table ${ordinal}`;
+  const label = rawLabel.length > MAX_TABLE_LABEL_CHARS
+    ? `${rawLabel.slice(0, MAX_TABLE_LABEL_CHARS - 1)}…`
+    : rawLabel;
+  if (label !== rawLabel) notes.push(`table label truncated to ${MAX_TABLE_LABEL_CHARS} characters`);
   return {
     id: `table-${ordinal}`,
-    label: caption || heading || `Table ${ordinal}`,
+    label,
     headers,
-    rows: allRows.slice(headerCount).map((row) => Array.from({ length: columns }, (_, column) => row[column] ?? "")),
+    rows: bodyRows.map((row) => Array.from({ length: columns }, (_, column) => row[column] ?? "")),
     columns,
+    truncationNotes: [...new Set(notes)],
   };
 }
 
@@ -381,41 +422,145 @@ interface ExpandedTableRow {
   tags: string[];
 }
 
-function expandTableRows(rows: Element[]): ExpandedTableRow[] {
+function expandTableRows(rows: Element[], notes: string[]): ExpandedTableRow[] {
   const output: ExpandedTableRow[] = [];
   const spans = new Map<number, { value: string; tag: string; remaining: number }>();
+  let cellCount = 0;
+  let cellTextTruncated = false;
   for (const row of rows) {
+    if (output.length >= MAX_TABLE_ROWS) {
+      notes.push(`table rows capped at ${MAX_TABLE_ROWS}`);
+      break;
+    }
     const values: string[] = [];
     const tags: string[] = [];
-    for (const [column, span] of [...spans]) {
-      values[column] = span.value;
-      tags[column] = span.tag;
-      span.remaining -= 1;
-      if (span.remaining <= 0) spans.delete(column);
+    // Rowspan carry-over cells are emitted cells too: count them against the
+    // total-cell budget before replaying, and stop expanding once exhausted.
+    if (spans.size > 0) {
+      if (cellCount + spans.size > MAX_TABLE_CELLS) {
+        notes.push(`expanded table cells capped at ${MAX_TABLE_CELLS}`);
+        break;
+      }
+      for (const [column, span] of [...spans]) {
+        values[column] = span.value;
+        tags[column] = span.tag;
+        span.remaining -= 1;
+        if (span.remaining <= 0) spans.delete(column);
+        cellCount += 1;
+      }
     }
     let column = 0;
-    const cells = [...row.children].filter((child) => ["th", "td"].includes(child.tagName.toLowerCase()));
-    for (const cell of cells) {
+    // Walk sibling pointers directly: linkedom's `children` getter materializes
+    // a NodeList of every child, so a huge physical cell list would otherwise
+    // still be allocated. The budget checks below stop the walk early.
+    for (let cell = row.firstElementChild; cell; cell = cell.nextElementSibling) {
+      const tag = cell.tagName.toLowerCase();
+      if (tag !== "th" && tag !== "td") continue;
       while (values[column] !== undefined) column += 1;
       const value = cleanText(cell.textContent ?? "");
-      const tag = cell.tagName.toLowerCase();
-      const colspan = positiveSpan(cell.getAttribute("colspan"));
-      const rowspan = positiveSpan(cell.getAttribute("rowspan"));
-      for (let offset = 0; offset < colspan; offset += 1) {
-        values[column + offset] = value;
-        tags[column + offset] = tag;
-        if (rowspan > 1) spans.set(column + offset, { value, tag, remaining: rowspan - 1 });
+      let text = value;
+      if (text.length > MAX_CELL_TEXT_CHARS) {
+        text = `${text.slice(0, MAX_CELL_TEXT_CHARS - 1)}…`;
+        cellTextTruncated = true;
       }
-      column += colspan;
+      const colspan = clampedSpan(cell.getAttribute("colspan"), "colspan", notes);
+      const rowspan = clampedSpan(cell.getAttribute("rowspan"), "rowspan", notes);
+      // Clamp width against the column and total-cell budgets before the
+      // span-fill loop so no attacker-controlled span can allocate or loop
+      // beyond the caps.
+      let width = colspan;
+      if (column + width > MAX_TABLE_COLUMNS) {
+        width = MAX_TABLE_COLUMNS - column;
+        notes.push(`table columns capped at ${MAX_TABLE_COLUMNS}`);
+        if (width <= 0) break;
+      }
+      const remainingCells = MAX_TABLE_CELLS - cellCount;
+      if (width > remainingCells) {
+        width = remainingCells;
+        notes.push(`expanded table cells capped at ${MAX_TABLE_CELLS}`);
+        if (width <= 0) break;
+      }
+      cellCount += width;
+      for (let offset = 0; offset < width; offset += 1) {
+        values[column + offset] = text;
+        tags[column + offset] = tag;
+        if (rowspan > 1) spans.set(column + offset, { value: text, tag, remaining: rowspan - 1 });
+      }
+      column += width;
     }
     if (values.some(Boolean)) output.push({ values, tags });
+  }
+  if (cellTextTruncated) notes.push(`cell text truncated to ${MAX_CELL_TEXT_CHARS} characters`);
+  return output;
+}
+
+/**
+ * Joins distinct header-row values for one column into at most
+ * MAX_CELL_TEXT_CHARS characters (including the ellipsis), so multi-row
+ * spanned headers cannot amplify a small table into oversized synthesized
+ * header strings.
+ */
+function boundedHeaderText(values: string[], notes: string[]): string {
+  const seen = new Set<string>();
+  let output = "";
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    const addition = `${output ? " " : ""}${value}`;
+    if (output.length + addition.length > MAX_CELL_TEXT_CHARS) {
+      output = `${`${output}${addition}`.slice(0, MAX_CELL_TEXT_CHARS - 1)}…`;
+      notes.push(`combined table header text truncated to ${MAX_CELL_TEXT_CHARS} characters`);
+      break;
+    }
+    output += addition;
   }
   return output;
 }
 
-function positiveSpan(value: string | null): number {
+function clampedSpan(value: string | null, name: string, notes: string[]): number {
   const parsed = Number(value ?? "1");
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : 1;
+  if (!Number.isInteger(parsed) || parsed < 1) return 1;
+  if (parsed > MAX_TABLE_SPAN) {
+    notes.push(`${name} clamped to ${MAX_TABLE_SPAN}`);
+    return MAX_TABLE_SPAN;
+  }
+  return parsed;
+}
+
+interface BoundedElements {
+  elements: Element[];
+  overflow: boolean;
+}
+
+/**
+ * Collects up to `limit` descendant elements with the given tag in document
+ * order via depth-first traversal, without materializing a full NodeList of
+ * every match. `overflow` reports that additional matches exist beyond the
+ * budget. Iterative by design: nesting depth cannot overflow the call stack.
+ * Exported for tests.
+ */
+export function collectBoundedElements(root: Element | Document, tag: string, limit: number): BoundedElements {
+  const elements: Element[] = [];
+  const start: Element | null =
+    root.nodeType === 9 /* Document */ ? (root as Document).documentElement : (root as Element);
+  if (!start) return { elements, overflow: false };
+  // Iterative pre-order walk over first-child / next-sibling / parent pointers:
+  // no recursion (nesting depth cannot overflow the call stack) and no
+  // allocation proportional to the number of descendants or matches.
+  let node: Element | null = start.firstElementChild;
+  while (node) {
+    if (node.tagName.toLowerCase() === tag) {
+      if (elements.length >= limit) return { elements, overflow: true };
+      elements.push(node);
+    }
+    if (node.firstElementChild) {
+      node = node.firstElementChild;
+      continue;
+    }
+    while (node && node !== start && !node.nextElementSibling) node = node.parentElement;
+    node = node && node !== start ? node.nextElementSibling : null;
+  }
+  return { elements, overflow: false };
 }
 
 function nearestHeading(element: Element): string {
@@ -432,21 +577,54 @@ interface TableMarkdownChunk {
   rows: string[][];
 }
 
-function tableMarkdownChunks(label: string, headers: string[], rows: string[][], limit: number): TableMarkdownChunk[] {
-  const heading = `### ${label}`;
-  const header = `| ${headers.map(escapeCell).join(" | ")} |\n| ${headers.map(() => "---").join(" | ")} |`;
+function tableMarkdownChunks(label: string, headers: string[], rows: string[][], limit: number, notes: string[] = []): TableMarkdownChunk[] {
+  // Bound the heading and repeated header preamble first so even a huge label
+  // or many wide headers can never produce an oversized block.
+  let heading = `### ${label}`;
+  const maxHeadingChars = Math.max(1, limit - 4);
+  if (heading.length > maxHeadingChars) {
+    heading = `${heading.slice(0, Math.max(0, maxHeadingChars - 1))}…`;
+    notes.push("table heading truncated");
+  }
+  let header = `| ${headers.map(escapeCell).join(" | ")} |\n| ${headers.map(() => "---").join(" | ")} |`;
+  // Leave room for at least one row line plus its separator in every block.
+  const maxHeaderChars = Math.max(1, limit - heading.length - 3);
+  if (header.length > maxHeaderChars) {
+    header = `${header.slice(0, Math.max(0, maxHeaderChars - 1))}…`;
+    notes.push("table header Markdown truncated");
+  }
+  const preambleLength = heading.length + 1 + header.length;
   const chunks: TableMarkdownChunk[] = [];
   let lines = [heading, header];
   let chunkRows: string[][] = [];
-  for (const row of rows) {
-    const line = `| ${row.map(escapeCell).join(" | ")} |`;
-    if (lines.join("\n").length + line.length + 1 > limit && lines.length > 2) {
+  let chunkChars = preambleLength;
+  let totalChars = preambleLength;
+  for (const [index, row] of rows.entries()) {
+    const raw = `| ${row.map(escapeCell).join(" | ")} |`;
+    let line = raw.length > limit ? `${raw.slice(0, limit - 1)}…` : raw;
+    if (chunkChars + line.length + 1 > limit && lines.length > 2) {
       chunks.push({ markdown: lines.join("\n"), rows: chunkRows });
       lines = [heading, header];
       chunkRows = [];
+      chunkChars = preambleLength;
+      totalChars += preambleLength;
     }
-    lines.push(line.length > limit ? `${line.slice(0, limit - 1)}…` : line);
+    if (chunkChars + line.length + 1 > limit) {
+      // The chunk still holds only the preamble; trim the line so every
+      // emitted block stays within the block limit.
+      line = `${line.slice(0, Math.max(0, limit - chunkChars - 2))}…`;
+      notes.push("table row Markdown truncated to fit the block limit");
+    }
+    if (totalChars + line.length + 1 > MAX_TABLE_MARKDOWN_CHARS) {
+      // Stop entirely: no further lines are built or discarded past the cap.
+      const omittedRows = rows.length - index;
+      notes.push(`generated table Markdown capped at ${MAX_TABLE_MARKDOWN_CHARS} characters; ${omittedRows} row(s) omitted`);
+      break;
+    }
+    lines.push(line);
     chunkRows.push(row);
+    chunkChars += line.length + 1;
+    totalChars += line.length + 1;
   }
   if (lines.length > 2 || chunks.length === 0) chunks.push({ markdown: lines.join("\n"), rows: chunkRows });
   return chunks;

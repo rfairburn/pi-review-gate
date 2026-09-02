@@ -1,8 +1,8 @@
 # Slop and cleanup review inventory
 
 Date: 2026-09-02
-Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0, 1, 2, 3, and 4 are
-RESOLVED work-history entries (fixes landed 2026-09-02); remaining findings are
+Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0, 1, 2, 3, 4, and 5
+are RESOLVED work-history entries (fixes landed 2026-09-02); remaining findings are
 recommendations only with no product code changes.
 
 Scope: `pi-review-gate` (extension + execution subsystem + web tools + scripts). Severity
@@ -302,23 +302,43 @@ the execution suite (59/59); dependency smoke — `re2-wasm@1.0.2` in package.js
 packed tarball installs it as a prod dep and CommonJS `require("re2-wasm")` passes an
 linear-time RE2 check. No `dist/` output touched (`npm pack --ignore-scripts` for packaging).
 
-### 5. MEDIUM — Web table parser DoS via unbounded colspan/rowspan
+### 5. MEDIUM — RESOLVED (2026-09-02): Web table parser DoS via unbounded colspan/rowspan
 
-Refs: `src/web/page.ts` `positiveSpan` (`:416-419`, accepts any positive integer),
-`expandTableRows` (`:384-414`, per-cell `for (offset < colspan)` fill), `tableData`
-(`:350-377`; `columns = Math.max(...row lengths)`, then `Array.from({ length: columns })` at
-`:363` and `:374`).
+**Root cause (confirmed).** `src/web/page.ts` table extraction accepted any positive integer
+for `colspan`/`rowspan`, filled each cell span in an unbounded loop, and sized the column
+array from the maximum expanded row length, so a few-byte page with
+`<td colspan="999999999">` drove ~1e9-wide array allocations that OOM the research worker.
+Row counts, cell text, and generated table Markdown were likewise unbounded.
 
-Impact: a few-byte page with `<td colspan="999999999">` yields `columns ≈ 1e9`; the dense
-`Array.from` allocations OOM the research worker. Download is bounded (50 MiB) but parsing is
-not.
+**Fix.** `src/web/page.ts` now enforces conservative budgets before any dense allocation or
+span-fill loop: per-table row cap (2,000), column cap (256), total expanded-cell cap (65,536,
+counting rowspan carry-over slots and the padded dense result), per-cell `colspan`/`rowspan`
+cap (1,000), per-cell text cap (2,000 characters including the ellipsis), synthesized combined
+header text capped at the same 2,000 characters per column while composing it, table labels
+capped at 500 characters, inventory labels/headers summarized under tighter display caps, and a 512,000-character cap on generated
+table Markdown (counting every repeated chunk heading/header, whose own length is bounded so
+every block stays within the 7,000-character block limit). Rows and cells are collected via
+bounded depth-first traversal that never materializes a NodeList or array proportional to
+attacker-controlled row/cell counts, and cell/row iteration stops early once budgets are
+exhausted; oversized values are clamped/truncated rather than thrown. Truncation is reported
+via new `WebTableDescriptor.truncated`/`truncationNotes` fields, which flow through the
+session-cache result and are rendered in the `formatPage` table inventory (`· truncated: …`)
+for both WebFetch and BrowserExtract. Ordinary tables are unchanged.
 
-Recommendation:
-- [ ] Cap colspan/rowspan in `positiveSpan` (e.g., ≤ 1000) and cap total expanded cells per
-      table.
-- [ ] Add an adversarial-table test asserting bounded parse cost/memory.
+**Tests.** `tests/web-tools.test.ts` adds adversarial coverage — billion `colspan`/`rowspan`
+clamping with bounded blocks and a sub-5-second runtime budget, physical-row and physical-
+cell list traversal that stops at the budgets, sparse-wide and rowspan-heavy tables bounding
+the padded dense result, per-cell text truncation, long-header block-limit enforcement,
+generated-Markdown capping with an exact ≤512,000 aggregate assertion and the descriptor
+signal, formatted-output surfacing through the WebFetch cache result — plus regression
+coverage that modest-span tables keep full extraction with no truncation signal.
 
-Test status: none — no adversarial table tests in `tests/web-tools.test.ts`.
+**Validation.** `npm run check:static`; targeted `npm run build:test` run of
+dist-test/tests/web-tools.test.js (39/39, ~8s). No `dist/` output touched.
+
+**Impact.** Attacker-controlled numeric spans and cell counts can no longer drive enormous
+loops or array allocations during HTML table extraction; clamped/truncated output remains
+usable and visibly flagged to the model.
 
 ### 6. MEDIUM (defense-in-depth) — DNS validation/connect TOCTOU
 
@@ -608,7 +628,7 @@ Test status: caps/archiving tested; soak test missing.
   there. Remaining nits: `test:fast` membership (which suites are in the fast tier; it omits
   e.g. `commands.test.ts` and the background-shell tests) is only visible in `package.json`,
   and `test:integration` is just an alias of `npm test`.
-- **Highest-value missing tests** (from findings above): post-landing fault injection (2), ShellSend stdin lifecycle (3), adversarial table spans (5), receipt race (11), delivery-failure notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync durability (7), snapshot concurrency (9). (Finding 1's SSRF-control coverage gap was resolved 2026-09-02 by `tests/web-network.test.ts`; finding 4's LineBuffer byte bounds and matcher cost were resolved 2026-09-02 by the bounded-output/RE2 tests in `tests/background-shell-jobs.test.ts` and `tests/background-shell-integration.test.ts`.)
+- **Highest-value missing tests** (from findings above): receipt race (11), delivery-failure notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync durability (7), and snapshot concurrency (9). Post-landing fault injection (2), ShellSend stdin lifecycle (3), table bounds (5), SSRF controls (1), and background-shell matcher/output bounds (4) now have dedicated regression coverage.
 - **Docs drift**: README documents `PI_REVIEW_GATE_DISABLED=1` while the launcher strips it
   (L3); keep kill-switch docs and behavior in sync.
 - **Dependency posture is good**: only 8 runtime deps, `package-lock.json` present, and the

@@ -234,8 +234,11 @@ function formatPage(value: WebFetchResult, toolName: "WebFetch" | "BrowserExtrac
     lines.push("", `Tables discovered across the full page (${value.tables.length}):`);
     for (const table of value.tables.slice(0, 40)) {
       const range = table.index === table.endIndex ? `${table.index}` : `${table.index}-${table.endIndex}`;
-      const headers = table.headers.slice(0, 8).join(" | ");
-      lines.push(`- index ${range}: ${table.label} · ${table.rows} rows × ${table.columns} columns${headers ? ` · ${headers}` : ""}`);
+      // Descriptor fields remain useful for direct indexed reads, while the
+      // inventory summary gets its own tight context budget.
+      const label = summarizeInventoryField(table.label, 160);
+      const headers = table.headers.slice(0, 8).map((header) => summarizeInventoryField(header, 80)).join(" | ");
+      lines.push(`- index ${range}: ${label} · ${table.rows} rows × ${table.columns} columns${headers ? ` · ${headers}` : ""}${table.truncated ? ` · truncated: ${(table.truncationNotes ?? []).join("; ")}` : ""}`);
     }
     if (value.tables.length > 40) lines.push(`- ${value.tables.length - 40} additional table(s) omitted from this inventory.`);
   }
@@ -263,6 +266,10 @@ function formatPage(value: WebFetchResult, toolName: "WebFetch" | "BrowserExtrac
     lines.push("End of cached document.");
   }
   return lines.join("\n");
+}
+
+function summarizeInventoryField(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 1)}…`;
 }
 
 function pageParameters(maxOutputChars: number): Record<string, unknown> {

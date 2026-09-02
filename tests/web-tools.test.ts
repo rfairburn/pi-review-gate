@@ -5,7 +5,8 @@ import { normalizeConfig } from "../src/config";
 import { assertChromiumAvailable, assertSuccessfulBrowserNavigation, missingChromiumError } from "../src/web/browser";
 import { WebPageCache } from "../src/web/cache";
 import { canonicalSearchUrl, normalizeDdgsResults, searchDdgs, type DdgsRunner } from "../src/web/network";
-import { extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
+import { parseHTML } from "linkedom";
+import { collectBoundedElements, extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
 import { extractPdfDocument, isPdfResponse } from "../src/web/pdf";
 import { formatSearch, WebToolManager } from "../src/web/tools";
 
@@ -583,4 +584,257 @@ test("web cache configuration updates apply to subsequent acquisitions", async (
   await cache.fetch({ url: "https://example.com/second" });
   assert.deepEqual(observedLimits, [50 * 1024 * 1024, 96 * 1024 * 1024]);
   await cache.cleanup();
+});
+
+test("adversarial billion colspan and rowspan are clamped before expansion", () => {
+  const html = `<html><body><h1>Spans</h1><table><tr><th>A</th><th>B</th></tr>`
+    + `<tr><td colspan="1000000000">wide</td><td>tail</td></tr>`
+    + `<tr><td rowspan="9999999999">tall</td><td>v2</td></tr></table></body></html>`;
+  const startedAt = Date.now();
+  const page = extractWebPage(html, "https://example.com/spans");
+  const table = page.tables[0]!;
+  assert.equal(table.columns, 256);
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.includes("colspan clamped to 1000"));
+  assert.ok(table.truncationNotes!.includes("rowspan clamped to 1000"));
+  assert.ok(table.truncationNotes!.includes("table columns capped at 256"));
+  assert.equal(table.rows, 2);
+  const bodyRows = page.blocks.filter((block) => block.tableId === table.id).flatMap((block) => block.tableRows ?? []);
+  const wideRow = bodyRows[0]!;
+  assert.equal(wideRow.length, 256);
+  assert.ok(wideRow.every((cell) => cell === "wide"));
+  const tallRow = bodyRows[1]!;
+  assert.equal(tallRow[0], "tall");
+  assert.equal(tallRow[1], "v2");
+  for (const block of page.blocks) assert.ok(block.markdown.length <= 7_000);
+  assert.ok(Date.now() - startedAt < 5_000);
+});
+
+test("table row budget caps expanded rows and reports the truncation", () => {
+  const rows = Array.from({ length: 5_000 }, (_, index) => `<tr><td>r${index}</td><td>${index}</td></tr>`).join("");
+  const page = extractWebPage(
+    `<html><body><h1>Wide rows</h1><table><tr><th>Name</th><th>Value</th></tr>${rows}</table></body></html>`,
+    "https://example.com/many-rows",
+  );
+  const table = page.tables[0]!;
+  assert.equal(table.rows, 1_999);
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.includes("table rows capped at 2000"));
+  const lastBodyRow = page.blocks[table.endIndex]!.tableRows!.at(-1)!;
+  assert.equal(lastBodyRow[0], "r1998");
+});
+
+test("table cell budget caps total expanded cells before allocation", () => {
+  const headerRow = `<tr>${Array.from({ length: 256 }, (_, index) => `<th>H${index}</th>`).join("")}</tr>`;
+  const bodyRows = Array.from({ length: 300 }, (_, index) => `<tr><td colspan="256">row ${index}</td></tr>`).join("");
+  const page = extractWebPage(
+    `<html><body><h1>Dense</h1><table>${headerRow}${bodyRows}</table></body></html>`,
+    "https://example.com/dense",
+  );
+  const table = page.tables[0]!;
+  assert.equal(table.columns, 256);
+  assert.equal(table.rows, 255);
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.includes("expanded table cells capped at 65536"));
+});
+
+test("oversized cell text is truncated to the per-cell budget", () => {
+  const page = extractWebPage(
+    `<html><body><h1>Long cells</h1><table><tr><th>Text</th><th>N</th></tr>`
+      + `<tr><td>${"x".repeat(3_000)}</td><td>1</td></tr><tr><td>${"y".repeat(3_100)}</td><td>2</td></tr></table></body></html>`,
+    "https://example.com/long-cells",
+  );
+  const table = page.tables[0]!;
+  const cell = page.blocks[table.index]!.tableRows![0]![0]!;
+  assert.equal(cell.length, 2_000);
+  assert.ok(cell.endsWith("…"));
+  const secondCell = page.blocks[table.index]!.tableRows![1]![0]!;
+  assert.equal(secondCell.length, 2_000);
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.includes("cell text truncated to 2000 characters"));
+});
+
+test("generated table Markdown is capped with a descriptor-level truncation signal", () => {
+  const rows = Array.from(
+    { length: 300 },
+    (_, index) => `<tr><td>${"x".repeat(2_000)}</td><td>row ${index}</td></tr>`,
+  ).join("");
+  const page = extractWebPage(
+    `<html><body><h1>Heavy markdown</h1><table><tr><th>Big</th><th>N</th></tr>${rows}</table></body></html>`,
+    "https://example.com/heavy",
+  );
+  const table = page.tables[0]!;
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.some((note) => /generated table Markdown capped at 512000 characters/.test(note)));
+  const markdownChars = page.blocks
+    .filter((block) => block.tableId === table.id)
+    .reduce((total, block) => total + block.markdown.length, 0);
+  assert.ok(markdownChars <= 512_000);
+  assert.ok(page.blocks.filter((block) => block.tableId === table.id).length > 1);
+});
+
+test("adversarial table truncation surfaces through the formatted table inventory and cache result", async () => {
+  const config = normalizeConfig({});
+  const html = `<html><body><h1>Spans</h1><table><tr><th>A</th><th>B</th></tr>`
+    + `<tr><td colspan="1000000">wide</td><td>tail</td></tr><tr><td>plain</td><td>2</td></tr></table></body></html>`;
+  const cache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "text/html",
+    text: html,
+    bytes: Buffer.byteLength(html),
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, cache, cache);
+  manager.register();
+  const result = await tools.get("WebFetch").execute("adversarial", { url: "https://example.com/spans", maxChars: 1_000 });
+  assert.equal(result.isError, false);
+  const response = result.details.response as { tables: Array<{ truncated?: boolean; truncationNotes?: string[] }> };
+  assert.equal(response.tables[0]?.truncated, true);
+  assert.ok(response.tables[0]?.truncationNotes!.includes("colspan clamped to 1000"));
+  assert.match(result.content[0].text as string, /truncated: .*colspan clamped to 1000/);
+  await manager.cleanup();
+});
+
+test("ordinary tables with modest spans keep full extraction without a truncation signal", () => {
+  const page = extractWebPage(fixture, "https://example.com/cities");
+  const table = page.tables[0]!;
+  assert.equal(table.truncated, undefined);
+  assert.equal(table.truncationNotes, undefined);
+  assert.deepEqual(table.headers, ["City", "Population 2020", "Population 2025"]);
+  assert.equal(table.rows, 2);
+  assert.equal(table.columns, 3);
+  const modest = extractWebPage(
+    `<html><body><h1>Merged</h1><table><tr><th rowspan="2">Region</th><th colspan="2">Sales</th></tr>`
+      + `<tr><th>2024</th><th>2025</th></tr><tr><td>West</td><td>10</td><td>20</td></tr>`
+      + `<tr><td>East</td><td>30</td><td>40</td></tr></table></body></html>`,
+    "https://example.com/merged",
+  );
+  const merged = modest.tables[0]!;
+  assert.equal(merged.truncated, undefined);
+  assert.deepEqual(merged.headers, ["Region", "Sales 2024", "Sales 2025"]);
+  assert.deepEqual(modest.blocks[merged.index]!.tableRows, [["West", "10", "20"], ["East", "30", "40"]]);
+});
+
+test("huge physical cell lists stop iterating once budgets are exhausted", () => {
+  const row = Array.from({ length: 50_000 }, (_, index) => `<td>c${index}</td>`).join("");
+  const startedAt = Date.now();
+  const page = extractWebPage(
+    `<html><body><h1>Physical cells</h1><table><tr><th>A</th><th>B</th></tr><tr>${row}</tr><tr><td>tail1</td><td>tail2</td></tr></table></body></html>`,
+    "https://example.com/physical-cells",
+  );
+  const table = page.tables[0]!;
+  assert.equal(table.columns, 256);
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.includes("table columns capped at 256"));
+  const bodyRow = page.blocks[table.index]!.tableRows![0]!;
+  assert.ok(bodyRow.length <= 256);
+  assert.ok(Date.now() - startedAt < 5_000);
+});
+
+test("sparse wide tables bound the padded dense result against the cell budget", () => {
+  const headerRow = `<tr>${Array.from({ length: 256 }, (_, index) => `<th>H${index}</th>`).join("")}</tr>`;
+  const bodyRows = Array.from({ length: 1_999 }, (_, index) => `<tr><td>v${index}</td></tr>`).join("");
+  const page = extractWebPage(
+    `<html><body><h1>Sparse</h1><table>${headerRow}${bodyRows}</table></body></html>`,
+    "https://example.com/sparse-wide",
+  );
+  const table = page.tables[0]!;
+  assert.equal(table.columns, 256);
+  assert.equal(table.rows, 255);
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.includes("expanded table cells capped at 65536"));
+  for (const row of page.blocks[table.index]!.tableRows!) assert.equal(row.length, 256);
+});
+
+test("rowspan carry-over cells count against the total-cell budget", () => {
+  const headerRow = `<tr>${Array.from({ length: 256 }, (_, index) => `<th>H${index}</th>`).join("")}</tr>`;
+  const spanRows = `<tr><td colspan="256" rowspan="1000">span</td></tr>`.repeat(2);
+  const fillerRows = "<tr></tr>".repeat(1_000);
+  const startedAt = Date.now();
+  const page = extractWebPage(
+    `<html><body><h1>Carry over</h1><table>${headerRow}${spanRows}${fillerRows}</table></body></html>`,
+    "https://example.com/rowspan-heavy",
+  );
+  const table = page.tables[0]!;
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.includes("expanded table cells capped at 65536"));
+  assert.ok(table.rows <= 256);
+  assert.ok(Date.now() - startedAt < 5_000);
+});
+
+test("oversized table headers are truncated and every block stays within the block limit", () => {
+  const headerRow = `<tr>${Array.from({ length: 8 }, () => `<th>${"H".repeat(2_000)}</th>`).join("")}</tr>`;
+  const bodyRows = Array.from({ length: 2 }, (_, index) => `<tr><td>row ${index}</td><td>x</td><td>y</td><td>z</td><td>a</td><td>b</td><td>c</td><td>d</td></tr>`).join("");
+  const page = extractWebPage(
+    `<html><body><h1>Wide headers</h1><table>${headerRow}${bodyRows}</table></body></html>`,
+    "https://example.com/wide-headers",
+  );
+  const table = page.tables[0]!;
+  assert.equal(table.truncated, true);
+  assert.ok(table.truncationNotes!.includes("table header Markdown truncated"));
+  for (const block of page.blocks) assert.ok(block.markdown.length <= 7_000);
+});
+
+test("bounded element collection walks deeply nested markup iteratively", () => {
+  // A recursive traversal overflows the call stack at roughly 8-12k depth;
+  // 25k depth must therefore fail any recursive implementation and pass here.
+  const depth = 25_000;
+  const { document } = parseHTML(
+    `<html><body>${"<div>".repeat(depth)}<table><tr><td>x</td></tr></table>${"</div>".repeat(depth)}</body></html>`,
+  );
+  const collected = collectBoundedElements(document, "table", 64);
+  assert.equal(collected.elements.length, 1);
+  assert.equal(collected.overflow, false);
+});
+
+test("deeply nested markup does not overflow the stack while extracting tables", () => {
+  const depth = 12_000;
+  const page = extractWebPage(
+    `<html><body><h1>Deep</h1>${"<div>".repeat(depth)}<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr><tr><td>3</td><td>4</td></tr></table>${"</div>".repeat(depth)}</body></html>`,
+    "https://example.com/deep",
+  );
+  assert.equal(page.tables.length, 1);
+  assert.equal(page.tables[0]!.rows, 2);
+  assert.equal(page.tables[0]!.truncated, undefined);
+});
+
+test("combined oversized table labels and headers remain within Markdown budgets", () => {
+  const headers = Array.from(
+    { length: 256 },
+    () => `<th>${"H".repeat(2_000)}</th>`,
+  ).join("");
+  const page = extractWebPage(
+    `<html><body><table><caption>${"L".repeat(10_000)}</caption>`
+      + `<tr>${headers}</tr><tr><td>a</td><td>b</td></tr>`
+      + `<tr><td>c</td><td>d</td></tr></table></body></html>`,
+    "https://example.com/oversized-preamble",
+  );
+  const table = page.tables[0]!;
+  const blocks = page.blocks.filter((block) => block.tableId === table.id);
+  assert.equal(table.label.length, 500);
+  assert.ok(table.label.endsWith("…"));
+  assert.ok(table.truncationNotes!.includes("table label truncated to 500 characters"));
+  assert.ok(table.truncationNotes!.includes("table header Markdown truncated"));
+  assert.ok(blocks.every((block) => block.markdown.length <= 7_000));
+  assert.ok(blocks.reduce((total, block) => total + block.markdown.length, 0) <= 512_000);
+});
+
+test("multi-row spanned headers cannot amplify past text and Markdown budgets", () => {
+  const headerRows = Array.from(
+    { length: 64 },
+    (_, index) => `<tr><th colspan="256">${`${index}-`.padEnd(2_000, "H")}</th></tr>`,
+  ).join("");
+  const page = extractWebPage(
+    `<html><body><table>${headerRows}`
+      + `<tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr>`
+      + `</table></body></html>`,
+    "https://example.com/spanned-headers",
+  );
+  const table = page.tables[0]!;
+  assert.ok(table.headers.every((header) => header.length <= 2_000));
+  assert.ok(table.truncationNotes!.includes("combined table header text truncated to 2000 characters"));
+  assert.ok(table.headers.reduce((total, header) => total + header.length, 0) <= 512_000);
+  assert.ok(page.blocks.filter((block) => block.tableId === table.id).every((block) => block.markdown.length <= 7_000));
 });

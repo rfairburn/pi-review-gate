@@ -359,6 +359,9 @@ export class BackgroundExecutionController {
   private pool: ExecutorPoolScheduler;
   private active = 0;
   private shuttingDown = false;
+  /** Depth of in-flight detach() calls; > 0 fences group attachment. */
+  private detaching = 0;
+  private detachEpoch = 0;
   private pumping = false;
   private pumpRequested = false;
   private scopedModels: string[] = [];
@@ -433,11 +436,19 @@ export class BackgroundExecutionController {
   }
 
   async restore(associations: ExecutionAssociationsSnapshot): Promise<void> {
-    await this.detach();
+    const initialDetach = this.detach();
+    const restoreEpoch = this.detachEpoch;
+    await initialDetach;
+    // A detach superseding this restore must win: never reattach a group (or
+    // register a save tail) after a later detach completed its quiescence.
+    const restoreIsCurrent = () =>
+      !this.shuttingDown && this.detaching === 0 && this.detachEpoch === restoreEpoch;
     const roots = associations.groupRoots ?? [];
     for (const root of roots) {
+      if (!restoreIsCurrent()) return;
       try {
         const restored = await readGroup(root);
+        if (!restoreIsCurrent()) return;
         const group = restored.group;
         if (resolve(group.cwd) !== resolve(this.input.cwd())) {
           throw new Error(`execution cwd ${group.cwd} does not match ${resolve(this.input.cwd())}`);
@@ -481,6 +492,7 @@ export class BackgroundExecutionController {
       [...this.groups.values()].flatMap((group) => group.tasks.map((task) => task.bundle?.operationId).filter((value): value is string => Boolean(value))),
     );
     for (const bundle of associations.bundles) {
+      if (!restoreIsCurrent()) return;
       if (restoredOperations.has(bundle.operationId)) continue;
       try {
         await this.resolveOrAdoptTask(undefined, undefined, bundle);
@@ -489,6 +501,7 @@ export class BackgroundExecutionController {
         await this.input.notify?.(`review gate: legacy execution bundle was not adopted (${bundle.operationId}): ${messageOf(error)}`);
       }
     }
+    if (!restoreIsCurrent()) return;
     if (associations.conflictGate) {
       const gate: BackgroundConflictGate = {
         ...associations.conflictGate,
@@ -507,11 +520,20 @@ export class BackgroundExecutionController {
   }
 
   async start(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind = "execute"): Promise<BackgroundInspection> {
-    if (this.shuttingDown) throw new Error("Application shutdown is in progress.");
+    const detachEpoch = this.detachEpoch;
+    if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
     if (resolvedWorkerRoute(this.input.config, kind).length === 0) {
       throw new Error(`No ${kind} worker route is configured. Add at least one eligible resource in /review-settings.`);
     }
     const root = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
+    // Group creation awaited the filesystem: a detach/shutdown may have begun
+    // (and completed its quiescence) meanwhile. Never attach a group — and
+    // never register a save tail — after lifecycle completion; discard the
+    // unused root instead.
+    if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== detachEpoch) {
+      await rm(root, { recursive: true, force: true });
+      throw new Error("Application shutdown or controller detach began while the execution group was being created.");
+    }
     const executionId = `exec-${randomUUID()}`;
     const now = new Date().toISOString();
     const group: BackgroundExecutionGroup = {
@@ -662,7 +684,14 @@ export class BackgroundExecutionController {
       return this.resolveTask(executionId, taskId, bundle);
     } catch (error) {
       if (!bundle || taskId) throw error;
+      const adoptionEpoch = this.detachEpoch;
+      if (this.shuttingDown || this.detaching > 0) {
+        throw new Error("Application shutdown or controller detach is in progress.");
+      }
       const inspection = await inspectOperation(bundle);
+      if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== adoptionEpoch) {
+        throw new Error("Application shutdown or controller detach began while the execution bundle was being adopted.");
+      }
       if (resolve(inspection.manifest.sourceRoot) !== resolve(this.input.cwd())) {
         throw new Error(`Recovery bundle belongs to ${inspection.manifest.sourceRoot}, not ${resolve(this.input.cwd())}.`);
       }
@@ -673,6 +702,10 @@ export class BackgroundExecutionController {
         group = this.resolveGroup(executionId);
       } else {
         const root = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
+        if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== adoptionEpoch) {
+          await rm(root, { recursive: true, force: true });
+          throw new Error("Application shutdown or controller detach began while the execution bundle was being adopted.");
+        }
         const now = new Date().toISOString();
         group = {
           version: GROUP_VERSION,
@@ -1107,9 +1140,38 @@ export class BackgroundExecutionController {
     }
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.promise));
     await Promise.allSettled([...this.pendingForceMerges.values()].map((pending) => pending.done));
-    await Promise.all([...this.saveTails.values()].map((tail) => tail.catch(() => undefined)));
+    await this.quiesceSaveTails();
     await this.cleanupSettledArtifacts();
+    // cleanupSettledArtifacts may itself save; quiesce again so shutdown alone
+    // guarantees no save-tail entries remain (settled tails prune themselves,
+    // but the prune callback can still be queued when cleanup returns).
+    await this.quiesceSaveTails();
     this.updateIndicator();
+  }
+
+  /**
+   * L9: wait for every pending save tail so all required durable writes have
+   * quiesced (each settled tail also prunes itself), then drop any remaining
+   * tail bookkeeping. Must only be called once no further saves for the
+   * affected groups can be started, so clearing cannot strand an in-flight
+   * write or let a later write overtake an earlier one.
+   */
+  private async quiesceSaveTails(onQuiesced?: () => void): Promise<void> {
+    for (;;) {
+      const entries = [...this.saveTails.entries()];
+      if (entries.length === 0) break;
+      await Promise.all(entries.map(([, tail]) => tail.catch(() => undefined)));
+      // Delete each awaited tail by exact identity so the loop makes progress
+      // even if a settled tail never ran its own self-prune callback.
+      for (const [executionId, tail] of entries) {
+        if (this.saveTails.get(executionId) === tail) this.saveTails.delete(executionId);
+      }
+    }
+    this.saveTails.clear();
+    // Run lifecycle finalization in the same synchronous turn as the final
+    // empty check, leaving no gap in which an attached group could start a
+    // save that would register a tail only after quiescence ended.
+    onQuiesced?.();
   }
 
   async cleanupSettledArtifacts(): Promise<void> {
@@ -1133,19 +1195,33 @@ export class BackgroundExecutionController {
   }
 
   async detach(): Promise<void> {
+    this.detaching += 1;
+    this.detachEpoch += 1;
     this.clearWatches();
-    this.groups.clear();
-    this.runtimes.clear();
-    this.pendingForceMerges.clear();
-    this.archivedTasks.clear();
-    this.recentActivity = [];
-    this.active = 0;
-    this.shuttingDown = false;
-    this.pumpRequested = false;
-    this.conflictGate = undefined;
-    this.releaseConflictBlock?.();
-    this.releaseConflictBlock = undefined;
-    this.updateIndicator();
+    // L9: let in-flight save tails finish their durable writes (preserving
+    // write ordering) before dropping the group state and tail bookkeeping, so
+    // no stale save-tail entry survives detach and no later write can overtake
+    // an earlier one. The clearing runs as the helper's synchronous finalizer,
+    // in the same turn as its final empty-tail check; saves attempted through
+    // detached groups are rejected by save()'s attachment guard.
+    try {
+      await this.quiesceSaveTails(() => {
+        this.groups.clear();
+        this.runtimes.clear();
+        this.pendingForceMerges.clear();
+        this.archivedTasks.clear();
+        this.recentActivity = [];
+        this.active = 0;
+        this.shuttingDown = false;
+        this.pumpRequested = false;
+        this.conflictGate = undefined;
+        this.releaseConflictBlock?.();
+        this.releaseConflictBlock = undefined;
+        this.updateIndicator();
+      });
+    } finally {
+      this.detaching -= 1;
+    }
   }
 
   private async pump(): Promise<void> {
@@ -2327,12 +2403,14 @@ export class BackgroundExecutionController {
   }
 
   private async save(group: BackgroundExecutionGroup): Promise<PersistedGroupRevision> {
+    if (this.groups.get(group.executionId) !== group) {
+      throw new Error(`Execution ${group.executionId} was detached before it could be saved.`);
+    }
+    // Everything up to the tail registration is synchronous: once save() has
+    // been entered, its tail is registered before any other code can run, so
+    // quiescing the tail map can never miss a save that is already in flight.
     group.revision += 1;
     group.updatedAt = new Date().toISOString();
-    await this.input.faults?.save?.({
-      executionId: group.executionId,
-      taskStates: group.tasks.map((candidate) => candidate.state),
-    });
     const archiveWrites: Array<{
       taskId: string;
       updatedAt: string;
@@ -2376,8 +2454,18 @@ export class BackgroundExecutionController {
     const unsigned = { ...snapshot, integritySha256: undefined };
     snapshot.integritySha256 = createHash("sha256").update(JSON.stringify(unsigned)).digest("hex");
     group.integritySha256 = snapshot.integritySha256;
+    // Freeze the hook context with the snapshot it guards; the hook itself
+    // still runs inside the serialized chain so it can gate the write.
+    const faultContext: BackgroundFaultContext = {
+      executionId: group.executionId,
+      taskStates: group.tasks.map((candidate) => candidate.state),
+    };
     const prior = this.saveTails.get(group.executionId) ?? Promise.resolve();
     const next = prior.then(async () => {
+      // The fault hook runs inside the serialized chain, immediately before
+      // this save's durable writes; a throwing hook rejects `next` while the
+      // registered tail (its caught twin) still settles and prunes itself.
+      await this.input.faults?.save?.(faultContext);
       for (const archive of archiveWrites) await atomicWrite(archive.path, archive.body);
       await atomicWrite(join(group.root, "execution.json"), `${JSON.stringify(snapshot, null, 2)}\n`);
       for (const archive of archiveWrites) {
@@ -2387,7 +2475,16 @@ export class BackgroundExecutionController {
         });
       }
     });
-    this.saveTails.set(group.executionId, next.catch(() => undefined));
+    const tail = next.catch(() => undefined);
+    this.saveTails.set(group.executionId, tail);
+    // L9: prune the tail once it settles so the map stays bounded. The prune
+    // fires only while this exact promise is still the registered tail, so an
+    // older save can never delete a newer tail: the caller-visible `next`
+    // promise still propagates failures, and later saves keep chaining on the
+    // registered tail, preserving write ordering.
+    void tail.then(() => {
+      if (this.saveTails.get(group.executionId) === tail) this.saveTails.delete(group.executionId);
+    });
     await next;
     return {
       revision: snapshot.revision,

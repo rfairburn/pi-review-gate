@@ -1779,6 +1779,266 @@ test("force-merge publish and wake failures after landing are recorded durably",
   }
 });
 
+test("settled save tails prune by exact identity and overlapping saves serialize without loss", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-save-tails-"));
+  try {
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "tail-fake",
+        adapter: "run-as-binary",
+        command: join(root, "unused-executor.cjs"),
+        execution: { protocol: "pi-review-executor-jsonl-v1" },
+      }],
+      execution: { activeExecutor: { source: "external", id: "tail-fake" }, maxWorkers: 1 },
+    });
+    // Keep every task queued: saves happen without dispatching any executor.
+    config.execution!.maxWorkers = 0;
+    const controller = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    const internals = () => controller as unknown as {
+      saveTails: Map<string, Promise<void>>;
+      groups: Map<string, BackgroundExecutionGroup>;
+    };
+    const settle = () => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 0));
+    const started = await controller.start([{ title: "tail base", instructions: "work", acceptanceCriteria: ["done"] }]);
+    await settle();
+    assert.equal(internals().saveTails.size, 0, "a settled save tail must prune itself");
+
+    // Overlapping saves chain onto the registered tail: the older tail must
+    // never delete a newer one, and every write must land in revision order.
+    const additions = await Promise.all([
+      controller.add(started.executionId, [{ title: "tail a", instructions: "a", acceptanceCriteria: ["a"] }]),
+      controller.add(started.executionId, [{ title: "tail b", instructions: "b", acceptanceCriteria: ["b"] }]),
+      controller.add(started.executionId, [{ title: "tail c", instructions: "c", acceptanceCriteria: ["c"] }]),
+    ]);
+    assert.equal(additions.length, 3);
+    await settle();
+    assert.equal(internals().saveTails.size, 0, "overlapping settled tails must all prune");
+    const group = internals().groups.get(started.executionId)!;
+    const persisted = JSON.parse(await readFile(join(started.root, "execution.json"), "utf8")) as {
+      revision: number;
+      tasks: Array<{ definition: { title: string } }>;
+    };
+    assert.equal(persisted.tasks.length, 4, "every overlapping save must be durably recorded");
+    assert.equal(persisted.revision, group.revision, "the final persisted revision must match the latest save");
+
+    await controller.shutdown();
+    await controller.detach();
+    assert.equal(internals().saveTails.size, 0, "shutdown and detach must leave no stale save-tail entries");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed save tail propagates to its caller, prunes, and does not wedge later saves", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-save-tail-failure-"));
+  try {
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "tail-fail-fake",
+        adapter: "run-as-binary",
+        command: join(root, "unused-executor.cjs"),
+        execution: { protocol: "pi-review-executor-jsonl-v1" },
+      }],
+      execution: { activeExecutor: { source: "external", id: "tail-fail-fake" }, maxWorkers: 1 },
+    });
+    // Keep every task queued: saves happen without dispatching any executor.
+    config.execution!.maxWorkers = 0;
+    const controller = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    const internals = () => controller as unknown as {
+      saveTails: Map<string, Promise<void>>;
+      groups: Map<string, BackgroundExecutionGroup>;
+    };
+    const settle = () => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 0));
+    let failSaves = false;
+    controller.setFaultHooks({
+      save: () => {
+        if (failSaves) throw new Error("durable save exploded");
+      },
+    });
+    const started = await controller.start([{ title: "failure base", instructions: "work", acceptanceCriteria: ["done"] }]);
+    await settle();
+    assert.equal(internals().saveTails.size, 0);
+
+    failSaves = true;
+    await assert.rejects(
+      () => controller.add(started.executionId, [{ title: "doomed", instructions: "x", acceptanceCriteria: ["x"] }]),
+      /durable save exploded/,
+      "a save failure must remain visible to its caller",
+    );
+    await settle();
+    assert.equal(internals().saveTails.size, 0, "a failed tail must also prune instead of lingering");
+
+    failSaves = false;
+    const recovered = await controller.add(started.executionId, [{ title: "recovered", instructions: "y", acceptanceCriteria: ["y"] }]);
+    assert.equal(recovered.tasks.length, 3);
+    await settle();
+    assert.equal(internals().saveTails.size, 0);
+    const group = internals().groups.get(started.executionId)!;
+    const persisted = JSON.parse(await readFile(join(started.root, "execution.json"), "utf8")) as {
+      revision: number;
+      tasks: Array<{ definition: { title: string } }>;
+    };
+    assert.equal(persisted.revision, group.revision, "the recovery save must persist the current revision");
+    assert.deepEqual(persisted.tasks.map((task) => task.definition.title).sort(), ["doomed", "failure base", "recovered"]);
+
+    await controller.shutdown();
+    await controller.detach();
+    assert.equal(internals().saveTails.size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("repeated group creation and detach/shutdown quiesce save tails before clearing bookkeeping", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-save-tail-detach-"));
+  try {
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "tail-detach-fake",
+        adapter: "run-as-binary",
+        command: join(root, "unused-executor.cjs"),
+        execution: { protocol: "pi-review-executor-jsonl-v1" },
+      }],
+      execution: { activeExecutor: { source: "external", id: "tail-detach-fake" }, maxWorkers: 1 },
+    });
+    // Keep every task queued: saves happen without dispatching any executor.
+    config.execution!.maxWorkers = 0;
+    const controller = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    const internals = () => controller as unknown as {
+      saveTails: Map<string, Promise<void>>;
+      groups: Map<string, BackgroundExecutionGroup>;
+    };
+    const settle = () => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 0));
+
+    // Repeated group creation and removal must keep the tail map bounded.
+    for (let round = 0; round < 3; round += 1) {
+      const started = await controller.start([{ title: `round ${round}`, instructions: "work", acceptanceCriteria: ["done"] }]);
+      await settle();
+      assert.equal(internals().saveTails.size, 0);
+      await controller.detach();
+      assert.equal(internals().saveTails.size, 0, "detach must leave no save-tail entries");
+      assert.equal(controller.list().length, 0);
+      assert.equal(internals().groups.size, 0);
+    }
+
+    // A group creation already awaiting filesystem setup must not attach after
+    // detach has completed its empty-map quiescence check.
+    const startingDuringDetach = controller.start([
+      { title: "starting during detach", instructions: "work", acceptanceCriteria: ["done"] },
+    ]);
+    const detachDuringStart = controller.detach();
+    await assert.rejects(startingDuringDetach, /shutdown or controller detach/);
+    await detachDuringStart;
+    await settle();
+    assert.equal(internals().saveTails.size, 0);
+    assert.equal(internals().groups.size, 0);
+
+    // A later detach must supersede a restore already awaiting its own
+    // initial detach; restore must not reattach a group afterward.
+    await controller.start([
+      { title: "restore race", instructions: "work", acceptanceCriteria: ["done"] },
+    ]);
+    const associations = controller.associations();
+    await controller.detach();
+    const restoring = controller.restore(associations);
+    const supersedingDetach = controller.detach();
+    await Promise.all([restoring, supersedingDetach]);
+    await settle();
+    assert.equal(internals().groups.size, 0);
+    assert.equal(internals().saveTails.size, 0);
+
+    // The attachment guard rejects saves through a stale group reference.
+    const stale = await controller.start([{ title: "stale ref", instructions: "work", acceptanceCriteria: ["done"] }]);
+    await settle();
+    const staleGroup = internals().groups.get(stale.executionId)!;
+    await controller.detach();
+    await assert.rejects(
+      () => (controller as unknown as { save: (group: BackgroundExecutionGroup) => Promise<unknown> }).save(staleGroup),
+      /was detached before it could be saved/,
+    );
+    assert.equal(internals().saveTails.size, 0);
+
+    // An operation invoked right after detach must not register a save in any
+    // await gap between the final empty-tail check and group removal; saves
+    // through detached groups are rejected by the attachment guard.
+    const race = await controller.start([{ title: "detach race", instructions: "work", acceptanceCriteria: ["done"] }]);
+    await settle();
+    let racedSaveHooks = 0;
+    controller.setFaultHooks({ save: () => { racedSaveHooks += 1; } });
+    const detachingEmptyMap = controller.detach();
+    const racedAdd = controller.add(race.executionId, [{ title: "too late", instructions: "work", acceptanceCriteria: ["done"] }]);
+    await assert.rejects(racedAdd);
+    await detachingEmptyMap;
+    await settle();
+    assert.equal(racedSaveHooks, 0, "no save may start after detach's final empty-tail check");
+    assert.equal(internals().saveTails.size, 0);
+    assert.equal(internals().groups.size, 0);
+    controller.setFaultHooks(undefined);
+
+    // Detach must quiesce an already-registered, still-pending save tail
+    // before dropping its bookkeeping and group state: gate the save fault
+    // hook, which runs inside the registered chain before the durable write.
+    const gated = await controller.start([{ title: "gated base", instructions: "work", acceptanceCriteria: ["done"] }]);
+    await settle();
+    let releaseDetachSave!: () => void;
+    let detachGateCalls = 0;
+    controller.setFaultHooks({
+      save: () => {
+        detachGateCalls += 1;
+        if (detachGateCalls === 1) return new Promise<void>((resolveGate) => { releaseDetachSave = resolveGate; });
+        return undefined;
+      },
+    });
+    const pendingAdd = controller.add(gated.executionId, [{ title: "late writer", instructions: "z", acceptanceCriteria: ["z"] }]);
+    await settle();
+    assert.equal(internals().saveTails.size, 1, "the in-flight save's tail must be registered while it writes");
+    let detached = false;
+    const detaching = controller.detach().then(() => { detached = true; });
+    await settle();
+    assert.equal(detached, false, "detach must wait for an in-flight save tail");
+    assert.equal(internals().groups.size, 1, "group state must not be dropped before tails quiesce");
+    releaseDetachSave();
+    await pendingAdd;
+    await detaching;
+    controller.setFaultHooks(undefined);
+    await settle();
+    assert.equal(internals().saveTails.size, 0, "detach must clear tail bookkeeping once writes quiesce");
+    assert.equal(internals().groups.size, 0);
+
+    // Shutdown must also wait for a registered in-flight tail: gate the save
+    // fault hook, which now runs inside the registered chain before the write.
+    const resumed = await controller.start([{ title: "shutdown base", instructions: "work", acceptanceCriteria: ["done"] }]);
+    await settle();
+    let releaseSave!: () => void;
+    controller.setFaultHooks({
+      save: () => new Promise<void>((resolveGate) => { releaseSave = resolveGate; }),
+    });
+    let shutdownDone = false;
+    const shuttingDown = controller.shutdown().then(() => { shutdownDone = true; });
+    await settle();
+    assert.equal(shutdownDone, false, "shutdown must wait for the in-flight registered save tail");
+    assert.equal(internals().saveTails.size, 1, "the gated save's tail must be registered while in flight");
+    releaseSave();
+    controller.setFaultHooks(undefined);
+    await shuttingDown;
+    assert.equal(internals().saveTails.size, 0, "shutdown must leave no save-tail entries after writes quiesce");
+    const persisted = JSON.parse(await readFile(join(resumed.root, "execution.json"), "utf8")) as {
+      tasks: Array<{ state: string }>;
+    };
+    assert.equal(persisted.tasks[0]?.state, "stopped_for_application_exit", "the gated shutdown save must land in order");
+    await controller.detach();
+    assert.equal(internals().saveTails.size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function setupInterruptedMergeTask(unique: string): Promise<{
   root: string;
   controller: BackgroundExecutionController;

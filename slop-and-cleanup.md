@@ -677,10 +677,14 @@ Test status: caps/archiving tested; soak test missing.
   notice text. Failure wording remains truthful for conflicted and other non-`failed` states.
   Adversarial secret, escape-amplification, conflict-path, quiet/noisy, structured-details, and
   parseability tests pass in the 28/28 focused controller suite.
-- L9. `saveTails` entries are never pruned (set at `background-controller.ts:1988`, awaited
-  only at shutdown `:934`) and neither map is cleared in `detach()`; `steeringTails` entries
-  *are* deleted when their tail settles (`:1741`). Functional impact nil today since new
-  groups get fresh UUIDs — prune `saveTails` on group detach.
+- L9. **RESOLVED (2026-09-02):** each serialized group-save tail now self-prunes after
+  settlement using exact promise identity, so an older completion cannot delete a newer tail and
+  failed writes remain visible to their caller without wedging the next save. Shutdown and detach
+  quiesce all registered tails before clearing bookkeeping; lifecycle epochs and attachment guards
+  prevent an awaited start, restore, or bundle adoption from attaching a group after a superseding
+  detach. Tests cover overlapping saves and final revision order, failed-tail recovery, repeated
+  groups, start/restore/detach races, stale-group rejection, and gated detach/shutdown writes. The
+  focused controller/tool suites pass 51/51; `steeringTails` behavior is unchanged.
 - L10. **RESOLVED (2026-09-02):** production no longer honors the
   `PI_REVIEW_GATE_DDGS_HELPER` override; it resolves only the packaged bridge and runs it with
   Python isolated mode. Provisioning now uses isolated mode throughout, installs the exact DDGS

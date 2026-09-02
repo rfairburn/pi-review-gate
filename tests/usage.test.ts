@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  combineTokenUsage,
   extractPiUsageFromMessages,
   extractCodexSessionId,
   extractReviewTextFromCodexJsonl,
@@ -241,6 +242,45 @@ test("extractPiUsageFromMessages sums acting model usage from agent_end args", (
   assert.equal(usage?.outputTokens, 90);
   assert.equal(usage?.totalTokens, 450);
   assert.equal(usage?.costTotal, 0.003);
+});
+
+test("combineTokenUsage accumulates automatic retry usage", () => {
+  const usage = combineTokenUsage(
+    {
+      scope: "invocation",
+      inputTokens: 100,
+      totalInputTokens: 120,
+      cachedInputTokens: 20,
+      outputTokens: 30,
+      totalTokens: 150,
+      costTotal: 0.001,
+    },
+    {
+      scope: "invocation",
+      inputTokens: 200,
+      totalInputTokens: 240,
+      cacheWriteTokens: 40,
+      outputTokens: 60,
+      reasoningOutputTokens: 10,
+      totalTokens: 300,
+      costTotal: 0.002,
+    },
+  );
+
+  assert.deepEqual(usage, {
+    scope: "invocation",
+    inputTokens: 300,
+    totalInputTokens: 360,
+    uncachedInputTokens: undefined,
+    cachedInputTokens: 20,
+    outputTokens: 90,
+    reasoningOutputTokens: 10,
+    cacheWriteTokens: 40,
+    totalTokens: 450,
+    costTotal: 0.003,
+  });
+  assert.equal(combineTokenUsage(undefined, usage), usage);
+  assert.equal(combineTokenUsage(usage, undefined), usage);
 });
 
 test("formatTokenUsage returns compact user-facing summary", () => {

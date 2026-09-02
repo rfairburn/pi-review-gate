@@ -29,7 +29,7 @@ import { registerReviewSettings } from "./settings/command";
 import { scopedModelChoices } from "./settings/models";
 import { persistSubtasksViewPreference, replaceConfig } from "./settings/persistence";
 import { ExecutionToolManager } from "./execution/tool";
-import { extractPiUsageFromMessages, formatTokenUsage } from "./usage";
+import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
 import { configDigest, replaceReviewGateState, sessionPersistenceIdentity, SessionStateStore } from "./session-state";
@@ -97,6 +97,14 @@ export async function activate(pi: unknown): Promise<void> {
   let activeReviewSettled: Promise<void> | undefined;
   let activeStatusTracker: ReturnType<typeof createStatusTracker> | undefined;
   let agentRunActive = false;
+  // Records accumulated from each low-level run's agent_end until Pi confirms
+  // via agent_settled that no automatic retry, compaction retry, or queued
+  // continuation remains. Finalization must not happen at agent_end: Pi can
+  // still mutate the workspace after it (e.g. a retried provider overload),
+  // so closing or reviewing the window there would race the real outcome.
+  let pendingSettlementUsage: TokenUsage | undefined;
+  let pendingSettlementAborted = false;
+  let pendingSettlementPausedForQuestion = false;
   let reviewerQuestionPausePending = false;
   let stateStore: SessionStateStore | undefined;
   let backgroundCompletionMonitor: Promise<void> | undefined;
@@ -356,6 +364,9 @@ export async function activate(pi: unknown): Promise<void> {
   registerHook(pi, "before_agent_start", async (...args) => {
     agentRunActive = true;
     currentCwd = extractCwd(args, currentCwd);
+    pendingSettlementUsage = undefined;
+    pendingSettlementAborted = false;
+    pendingSettlementPausedForQuestion = false;
     updateScopedModels(args);
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(extractContext(args) ?? pi);
@@ -416,35 +427,74 @@ export async function activate(pi: unknown): Promise<void> {
 
   registerHook(pi, "agent_end", async (...args) => {
     try {
+    // Pi emits agent_end for every low-level run and may still auto-retry,
+    // auto-compact and retry, or continue with queued follow-up messages
+    // afterwards. This hook therefore only records what the finished run
+    // produced; review finalization happens once at agent_settled, where Pi
+    // guarantees no automatic continuation remains (docs/extensions.md).
+    // Detecting "this end is retryable" from provider error strings would be
+    // brittle — the lifecycle boundary is the source of truth.
+    currentCwd = extractCwd(args, currentCwd);
+    const signal = extractSignal(args);
+    const window = state.reviewWindow;
+    if (window) {
+      rememberFinalAssistantSummary(window.evidence, args);
+    }
+    pendingSettlementUsage = combineTokenUsage(pendingSettlementUsage, extractPiUsageFromMessages(args));
+    if (signal?.aborted) {
+      pendingSettlementAborted = true;
+    }
+
+    const pauseForReviewerQuestion = reviewerQuestionPausePending;
+    reviewerQuestionPausePending = false;
+    if (!pauseForReviewerQuestion) {
+      return;
+    }
+    // The turn ended exactly at the /ask-reviewer steering boundary and the
+    // command is waiting on this event, so collect the paused exchange now
+    // instead of at settlement. Marking the cycle keeps agent_settled from
+    // also running an automatic review over the same boundary.
+    pendingSettlementPausedForQuestion = true;
+    try {
+      if (window?.baseline && !signal?.aborted) {
+        await collectPausedReviewExchange({
+          cwd: currentCwd,
+          config: window.reviewConfig ?? config,
+          evidence: window.evidence,
+          actingUsage: pendingSettlementUsage,
+          window,
+        });
+      }
+    } finally {
+      releaseReviewerQuestionPauseWaiters();
+    }
+    } finally {
+      await persistSessionState();
+    }
+  });
+
+  registerHook(pi, "agent_settled", async (...args) => {
+    try {
+    // agent_settled is the only point where Pi guarantees that no automatic
+    // retry, compaction retry, or queued continuation remains for this turn,
+    // so the review window may be finalized here and only here. Consume this
+    // cycle's accumulated records first: running a review can queue follow-up
+    // runs, whose before_agent_start resets the accumulators.
+    const actingUsage = pendingSettlementUsage;
+    const runAborted = pendingSettlementAborted;
+    const pausedForReviewerQuestion = pendingSettlementPausedForQuestion;
+    pendingSettlementUsage = undefined;
+    pendingSettlementAborted = false;
+    pendingSettlementPausedForQuestion = false;
     agentRunActive = false;
     currentCwd = extractCwd(args, currentCwd);
     const noticeTarget = extractContext(args) ?? pi;
-    const signal = extractSignal(args);
-    const window = state.reviewWindow;
-    const pauseForReviewerQuestion = reviewerQuestionPausePending;
-    reviewerQuestionPausePending = false;
-    if (!window) {
-      if (pauseForReviewerQuestion) {
-        releaseReviewerQuestionPauseWaiters();
-      }
+    if (pausedForReviewerQuestion) {
+      // The /ask-reviewer consultation already reviewed this boundary.
       return;
     }
-    rememberFinalAssistantSummary(window.evidence, args);
-    const actingUsage = extractPiUsageFromMessages(args);
-    if (pauseForReviewerQuestion) {
-      try {
-        if (window.baseline && !signal?.aborted) {
-          await collectPausedReviewExchange({
-            cwd: currentCwd,
-            config: window.reviewConfig ?? config,
-            evidence: window.evidence,
-            actingUsage,
-            window,
-          });
-        }
-      } finally {
-        releaseReviewerQuestionPauseWaiters();
-      }
+    const window = state.reviewWindow;
+    if (!window) {
       return;
     }
     const backgroundReadiness = currentBackgroundReadiness();
@@ -497,7 +547,9 @@ export async function activate(pi: unknown): Promise<void> {
       closeReviewWindow(state, true);
       return;
     }
-    if (signal?.aborted) {
+    if (runAborted) {
+      // A user abort of the run supersedes automatic review; the window and
+      // its baseline survive for the next turn, exactly as before.
       state.reviewInProgress = false;
       state.queuedUserInputsDuringReview = [];
       return;
@@ -525,8 +577,11 @@ export async function activate(pi: unknown): Promise<void> {
       if (activeReviewSettled === reviewSettled) activeReviewSettled = undefined;
       return;
     }
+    // No run signal exists at settlement time (the last low-level run has
+    // already finished); cancellation still flows through escape terminal
+    // input and session shutdown.
     const reviewAbort = createReviewAbortController({
-      signal,
+      signal: undefined,
       noticeTarget,
       state,
       isSessionActive: () => sessionActive,

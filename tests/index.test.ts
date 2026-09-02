@@ -92,7 +92,7 @@ test("automatic review waits for ShellStart process groups and resumes the orche
       result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}); currently running.\nFuture wake triggers (not current events): exit.\nYou will be notified automatically; do not poll.` }] },
       isError: false,
     });
-    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
+    await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
 
     await assert.rejects(access(invocationMarker), /ENOENT/);
     assert.match(notices.join("\n"), /automatic review deferred while 1 background process group/);
@@ -102,7 +102,7 @@ test("automatic review waits for ShellStart process groups and resumes the orche
     assert.deepEqual(followUps[0]?.options, { deliverAs: "followUp", triggerTurn: true });
 
     await trigger(hooks, "before_agent_start", { cwd: dir });
-    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
+    await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
     assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
   } finally {
     if (background?.pid) {
@@ -158,7 +158,7 @@ test("native ShellStart exit wake replaces the redundant aggregate-ready wake", 
     const shellStart = tools.get("ShellStart");
     assert.ok(shellStart);
     await shellStart.execute("id", { command: "sleep 0.25", label: "native-tests" }, undefined, undefined, { hasUI: false });
-    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
+    await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
 
     assert.match(notices.join("\n"), /automatic review deferred while 1 background process group/);
     await waitForCondition(() => messages.some((message) => message.customType === "pi-review-bg-shell"));
@@ -166,8 +166,83 @@ test("native ShellStart exit wake replaces the redundant aggregate-ready wake", 
     assert.equal(messages.filter((message) => message.customType === "pi-review-background-ready").length, 0);
 
     await trigger(hooks, "before_agent_start", { cwd: dir });
-    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
+    await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
     assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
+  } finally {
+    reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a clean native exit wake is queued before settlement review begins", { skip: process.platform === "win32" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-clean-exit-order-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const reviewerStarted = join(dir, "reviewer-started.txt");
+    const reviewerRelease = join(dir, "reviewer-release.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `fs.writeFileSync(${JSON.stringify(reviewerStarted)},'started');`,
+            "const timer=setInterval(()=>{",
+            `if(!fs.existsSync(${JSON.stringify(reviewerRelease)}))return;`,
+            "clearInterval(timer);",
+            "process.stdout.write(JSON.stringify({verdict:'pass',summary:'ordered review',findings:[]}));",
+            "},10);",
+          ].join(""),
+        ],
+        timeoutMs: 15_000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const tools = new Map<string, { execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
+    const messages: Array<{ customType?: unknown; content?: unknown }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerTool(tool: { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }) {
+        tools.set(tool.name, tool);
+      },
+      registerCommand() {},
+      notify() {},
+      sendMessage(message: { customType?: unknown; content?: unknown }) { messages.push(message); },
+      sendUserMessage() {},
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "finish after the build", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await trigger(hooks, "agent_start");
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const shellStart = tools.get("ShellStart");
+    assert.ok(shellStart);
+    await shellStart.execute("id", { command: "exit 0", label: "clean-exit-order" }, undefined, undefined, { hasUI: false });
+
+    await waitForCondition(() => messages.some((message) => message.customType === "pi-review-bg-shell"));
+    assert.equal(messages.filter((message) => message.customType === "pi-review-bg-shell").length, 1);
+    await assert.rejects(access(reviewerStarted), /ENOENT/);
+
+    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "build completed" }] });
+    const settlement = trigger(hooks, "agent_settled", { cwd: dir });
+    await waitForFile(reviewerStarted);
+    // The clean-exit follow-up was already queued during the active run; the
+    // shell settlement hook cannot start a competing turn beside this review.
+    assert.equal(messages.filter((message) => message.customType === "pi-review-bg-shell").length, 1);
+
+    await writeFile(reviewerRelease, "release\n", "utf8");
+    await settlement;
   } finally {
     reapAll();
     await rm(dir, { recursive: true, force: true });
@@ -221,7 +296,7 @@ test("a replacement ShellStart job keeps review blocked after an earlier idle-tr
       label: "first-run",
       wake_on: { exit: false },
     }, undefined, undefined, { hasUI: false });
-    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "first run active" }] });
+    await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "first run active" }] });
 
     await waitForCondition(() => messages.filter((message) => message.customType === "pi-review-background-ready").length === 1);
     const firstWake = String(messages.find((message) => message.customType === "pi-review-background-ready")?.content ?? "");
@@ -236,7 +311,7 @@ test("a replacement ShellStart job keeps review blocked after an earlier idle-tr
       label: "replacement-run",
       wake_on: { exit: false },
     }, undefined, undefined, { hasUI: false });
-    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "replacement run active" }] });
+    await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "replacement run active" }] });
     await assert.rejects(access(invocationMarker), /ENOENT/);
     assert.match(notices.at(-1) ?? "", /replacement-run/);
 
@@ -314,7 +389,7 @@ test("automatic review waits while execution subtasks remain active", async () =
       }],
     }, undefined, undefined, { cwd: dir });
 
-    await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "subtask still active" }] });
+    await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "subtask still active" }] });
 
     await assert.rejects(access(invocationMarker), /ENOENT/);
     assert.match(notices.join("\n"), /automatic review deferred while 1 background subtask\(s\) remain active/);
@@ -542,7 +617,7 @@ test("cap status is concise while reviewer results are delivered once in the tra
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
-    await trigger(hooks, "agent_end", { cwd: dir });
+    await triggerAgentEnd(hooks, { cwd: dir });
 
     const noticeText = notices.join("\n\n");
     assert.match(noticeText, /automatic correction cap reached/);
@@ -610,7 +685,7 @@ test("review pause collects separate exchanges and defers reviewer execution unt
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "paused one\n", "utf8");
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo paused-tool-one" } });
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "completed first paused change" }],
     });
@@ -619,7 +694,7 @@ test("review pause collects separate exchanges and defers reviewer execution unt
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "paused two\n", "utf8");
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo paused-tool-two" } });
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "completed second paused change" }],
     });
@@ -630,7 +705,7 @@ test("review pause collects separate exchanges and defers reviewer execution unt
     await commands.get("review-unpause")?.("", pi);
     await trigger(hooks, "input", { cwd: dir, text: "review the accumulated work", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "ready for accumulated review" }],
     });
@@ -694,7 +769,10 @@ test("user steering during review is held until reviewer feedback is queued", as
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
-    const reviewPromise = trigger(hooks, "agent_end", { cwd: dir });
+    // Automatic finalization starts at agent_settled, so steer the input in
+    // between the two hooks to land it inside the active review window.
+    await trigger(hooks, "agent_end", { cwd: dir });
+    const reviewPromise = trigger(hooks, "agent_settled", { cwd: dir });
     const inputResults = await triggerResults(hooks, "input", { cwd: dir, text: "also keep the API name stable", source: "user" });
     await reviewPromise;
 
@@ -766,7 +844,7 @@ test("agent end skips reviewer when primary turn signal is already aborted", asy
 
     const controller = new AbortController();
     controller.abort();
-    await trigger(hooks, "agent_end", { cwd: dir, signal: controller.signal });
+    await triggerAgentEnd(hooks, { cwd: dir, signal: controller.signal });
 
     await assert.rejects(access(markerPath), /ENOENT/);
     assert.doesNotMatch(notices.join("\n"), /reviewing changes/);
@@ -774,7 +852,7 @@ test("agent end skips reviewer when primary turn signal is already aborted", asy
     await trigger(hooks, "input", { cwd: dir, text: "redirect to finish safely", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after redirected\n", "utf8");
-    await trigger(hooks, "agent_end", { cwd: dir });
+    await triggerAgentEnd(hooks, { cwd: dir });
 
     await access(markerPath);
     assert.match(notices.join("\n"), /review gate: passed/);
@@ -852,7 +930,8 @@ test("/new shutdown silently aborts review work before its context becomes stale
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
-    const reviewPromise = trigger(hooks, "agent_end", ctx);
+    await trigger(hooks, "agent_end", ctx);
+    const reviewPromise = trigger(hooks, "agent_settled", ctx);
     await waitForFile(markerPath);
     assert.equal(terminalHandlers.length, 1);
 
@@ -951,7 +1030,8 @@ test("escape terminal input aborts an active reviewer process", async () => {
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
-    const reviewPromise = trigger(hooks, "agent_end", { cwd: dir, ui: pi.ui });
+    await trigger(hooks, "agent_end", { cwd: dir, ui: pi.ui });
+    const reviewPromise = trigger(hooks, "agent_settled", { cwd: dir, ui: pi.ui });
     await waitForFile(markerPath);
 
     assert.equal(terminalHandlers.length, 1);
@@ -970,7 +1050,7 @@ test("escape terminal input aborts an active reviewer process", async () => {
     await trigger(hooks, "input", { cwd: dir, text: "redirect after cancelling review", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after redirected\n", "utf8");
-    await trigger(hooks, "agent_end", { cwd: dir, ui: pi.ui });
+    await triggerAgentEnd(hooks, { cwd: dir, ui: pi.ui });
 
     assert.match(notices.join("\n"), /review gate: passed/);
     assert.doesNotMatch(notices.join("\n"), /lost cancelled review context/);
@@ -1056,7 +1136,7 @@ test("automatic correction turns preserve original baseline and accumulated evid
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo original-tool-evidence" } });
     await writeFile(join(dir, "index.ts"), "broken\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "first assistant summary" }],
     });
@@ -1067,7 +1147,7 @@ test("automatic correction turns preserve original baseline and accumulated evid
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo fix-tool-evidence" } });
     await writeFile(join(dir, "index.ts"), "fixed\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "second assistant summary" }],
     });
@@ -1154,7 +1234,7 @@ test("automatic correction is reviewed when it exactly restores the original bas
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "incorrect\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "changed the original content" }],
     });
@@ -1165,7 +1245,7 @@ test("automatic correction is reviewed when it exactly restores the original bas
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo correction-tool-evidence" } });
     await writeFile(join(dir, "index.ts"), "original\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "restored the original content" }],
     });
@@ -1238,12 +1318,12 @@ test("automatic correction starts each reviewer in a fresh session against the s
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "broken\n", "utf8");
-    await trigger(hooks, "agent_end", { cwd: dir });
+    await triggerAgentEnd(hooks, { cwd: dir });
     assert.equal(followUps.length, 1);
 
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "fixed\n", "utf8");
-    await trigger(hooks, "agent_end", { cwd: dir });
+    await triggerAgentEnd(hooks, { cwd: dir });
 
     const history = JSON.parse(await readFile(argvPath, "utf8"));
     assert.equal(history.length, 2);
@@ -1344,7 +1424,7 @@ test("/review-continue after cap preserves original baseline and accumulated evi
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo capped-original-evidence" } });
     await writeFile(join(dir, "index.ts"), "broken\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "first capped summary" }],
     });
@@ -1370,7 +1450,7 @@ test("/review-continue after cap preserves original baseline and accumulated evi
 
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo continued-fix-evidence" } });
     await writeFile(join(dir, "index.ts"), "fixed after continue\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "continued summary" }],
     });
@@ -1457,7 +1537,7 @@ test("normal user input after cap continues the unresolved review window with co
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo old-capped-evidence" } });
     await writeFile(join(dir, "index.ts"), "broken\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "first capped summary" }],
     });
@@ -1468,7 +1548,7 @@ test("normal user input after cap continues the unresolved review window with co
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo fresh-task-evidence" } });
     await writeFile(join(dir, "index.ts"), "fresh change\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "fresh task summary" }],
     });
@@ -1551,12 +1631,12 @@ test("a passed review remains available to /ask-reviewer-interactive but is chec
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: outside } });
     await writeFile(outside, "rewritten review document\n", "utf8");
     await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.20\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "finished first Docker task and review document" }],
     });
 
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "acknowledged the passing review" }],
     });
@@ -1576,7 +1656,7 @@ test("a passed review remains available to /ask-reviewer-interactive but is chec
     await trigger(hooks, "input", { cwd: dir, text: "second Docker task", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "Dockerfile"), "FROM alpine:3.21\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "finished second Docker task" }],
     });
@@ -1651,7 +1731,7 @@ test("repeated no-progress reviewer feedback stops automatic correction loop", a
     await trigger(hooks, "input", { cwd: dir, text: "write hello world and flag review-gate", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "wrote the file and flagged review-gate" }],
     });
@@ -1659,7 +1739,7 @@ test("repeated no-progress reviewer feedback stops automatic correction loop", a
     assert.equal(followUps.length, 1);
     assert.match(followUps[0]?.message ?? "", /sentinel flag/);
 
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "no implementation change is required" }],
     });
@@ -1740,7 +1820,7 @@ test("a passing multi-model review discloses every result and reviews changes ma
     await trigger(hooks, "input", { cwd: dir, text: "implement the change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "first implementation\n", "utf8");
-    await trigger(hooks, "agent_end", { cwd: dir });
+    await triggerAgentEnd(hooks, { cwd: dir });
 
     assert.equal(followUps.length, 1);
     assert.match(followUps[0] ?? "", /Gate verdict: pass/);
@@ -1768,7 +1848,7 @@ test("a passing multi-model review discloses every result and reviews changes ma
     assert.equal(delivery.deliveries[0].message, undefined);
 
     await writeFile(join(dir, "index.ts"), "follow-up implementation\n", "utf8");
-    await trigger(hooks, "agent_end", { cwd: dir });
+    await triggerAgentEnd(hooks, { cwd: dir });
 
     assert.equal(await readFile(alphaCount, "utf8"), "2");
     assert.equal(await readFile(betaCount, "utf8"), "2");
@@ -1823,10 +1903,10 @@ test("an unchanged response to a passing transmission closes without another rev
     await trigger(hooks, "input", { cwd: dir, text: "implement the change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "implemented\n", "utf8");
-    await trigger(hooks, "agent_end", { cwd: dir });
+    await triggerAgentEnd(hooks, { cwd: dir });
     const bundleDir = extractBundleDir(followUps[0] ?? "", 1);
 
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "acknowledged the review without changing files" }],
     });
@@ -1915,7 +1995,7 @@ test("/ask-reviewer pauses an active turn before invoking the reviewer and then 
     assert.match(userMessages[0]?.message ?? "", /Pause implementation at this steering boundary/);
     await assert.rejects(access(invocationMarker), /ENOENT/);
 
-    await trigger(hooks, "agent_end", {
+    await triggerAgentEnd(hooks, {
       cwd: dir,
       messages: [{ role: "assistant", content: "paused at a stable boundary" }],
     });
@@ -1928,6 +2008,95 @@ test("/ask-reviewer pauses an active turn before invoking the reviewer and then 
     assert.match(userMessages[1]?.message ?? "", /Reviewer note from \/ask-reviewer:/);
     assert.match(userMessages[1]?.message ?? "", /reviewed the paused workspace/);
     assert.doesNotMatch(userMessages[1]?.message ?? "", /Review pass .* transmission/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("provider-error agent_end followed by a successful retry keeps the original baseline until agent_settled", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-retry-settlement-"));
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const invocationPath = join(dir, "review-invocations.txt");
+    const promptPath = join(dir, "review-prompt.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `const invocationPath=${JSON.stringify(invocationPath)};`,
+            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+            "fs.writeFileSync(invocationPath,String(count+1));",
+            "process.stdin.resume();",
+            "let input='';",
+            "process.stdin.on('data',chunk=>input+=chunk);",
+            "process.stdin.on('end',()=>{",
+            `fs.writeFileSync(${JSON.stringify(promptPath)},input);`,
+            "process.stdout.write(JSON.stringify({verdict:'pass',summary:'retry mutation reviewed against the original baseline',findings:[]}));",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 15000,
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const followUps: Array<{ message: string; options: unknown }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify(message: string) { notices.push(message); },
+      sendUserMessage(message: string, options: unknown) { followUps.push({ message, options }); },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+
+    // The first low-level run ends with a retryable provider error and no
+    // file changes. Pi has not settled yet: it will automatically retry the
+    // same turn, so neither the reviewer nor the window may be finalized.
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "", stopReason: "error", errorMessage: "overloaded" }],
+    });
+    await assert.rejects(access(invocationPath), /ENOENT/);
+
+    // The retry makes the actual edit. Retries do not re-fire
+    // before_agent_start, and no review may run between this agent_end and
+    // agent_settled either — the workspace is still mutable until then.
+    await writeFile(join(dir, "index.ts"), "after retry\n", "utf8");
+    await trigger(hooks, "agent_end", {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "applied the change after the provider recovered" }],
+    });
+    await assert.rejects(access(invocationPath), /ENOENT/);
+
+    // Settlement is the boundary where the automatic reviewer may run, and it
+    // must still see the diff against the pre-error baseline.
+    await trigger(hooks, "agent_settled", { cwd: dir });
+
+    assert.equal(await readFile(invocationPath, "utf8"), "1");
+    const reviewerPrompt = await readFile(promptPath, "utf8");
+    assert.match(reviewerPrompt, /User request context:/);
+    assert.match(reviewerPrompt, /change index/);
+    assert.match(reviewerPrompt, /-before/);
+    assert.match(reviewerPrompt, /\+after retry/);
+    assert.match(notices.join("\n"), /review gate: passed/);
+    assert.equal(followUps.length, 1);
+    assert.match(followUps[0]?.message ?? "", /Gate verdict: pass/);
+    assert.match(followUps[0]?.message ?? "", /retry mutation reviewed against the original baseline/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1946,6 +2115,14 @@ async function trigger(hooks: Map<string, Array<(...args: unknown[]) => unknown>
   for (const handler of hooks.get(name) ?? []) {
     await handler(...args);
   }
+}
+
+/** Fire the hook pair Pi emits when a turn has no further automatic work:
+ *  agent_end (one per low-level run) followed by agent_settled (once, after
+ *  retries, compaction retries, and queued continuations have drained). */
+async function triggerAgentEnd(hooks: Map<string, Array<(...args: unknown[]) => unknown>>, ...args: unknown[]): Promise<void> {
+  await trigger(hooks, "agent_end", ...args);
+  await trigger(hooks, "agent_settled", ...args);
 }
 
 async function triggerResults(hooks: Map<string, Array<(...args: unknown[]) => unknown>>, name: string, ...args: unknown[]): Promise<unknown[]> {

@@ -362,4 +362,107 @@ describe("wake coalescing", () => {
     expect(sent[0].content).toContain("matched");
     expect(sent[0].content).toContain("still running");
   });
+
+  // The observed production ordering: several nonurgent matches while the
+  // agent is busy, a failed exit in between, then stale "still running" match
+  // messages delivered after the exit steer. Nonurgent wakes must now be held
+  // internally and superseded by the exit.
+  it("a failed exit supersedes nonurgent matches that fired while the agent was busy", async () => {
+    const { sent, call, handlers } = wire();
+    handlers.agent_start?.(); // the agent stays busy for the whole window
+    await call("ShellStart", {
+      command:
+        "echo checkpoint one; sleep 1.7; echo checkpoint two; sleep 1.7; " +
+        "echo checkpoint three; sleep 0.6; exit 7",
+      label: "stale-matches",
+      wake_on: { match: ["checkpoint"] },
+    });
+    // Each match survives its 1.5s exit-coalesce window while the agent is
+    // busy, so each one lands in the internal hold instead of Pi's queue.
+    expect(await until(() => sent.length === 1 && sent[0].content.includes("exited 7"), 8000)).toBe(true);
+    expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
+    // Settlement must not resurrect the stale matches.
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(1);
+    for (const message of sent) {
+      expect(message.content).not.toContain("still running");
+    }
+  });
+
+  it("sends a clean exit before settlement so Pi can drain its continuation first", async () => {
+    const { sent, call, handlers } = wire();
+    handlers.agent_start?.();
+    await call("ShellStart", {
+      command: "echo complete; exit 0",
+      label: "clean-exit-before-settlement",
+    });
+
+    expect(await until(() => sent.length === 1)).toBe(true);
+    expect(sent[0].content).toContain("exited 0");
+    expect(sent[0].delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+
+    // The exit was queued while Pi was still processing the active run. It is
+    // not held until agent_settled, where triggerTurn would start a competing
+    // turn alongside the gate's automatic review.
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(1);
+  });
+
+  it("delivers exactly one coalesced match wake at settlement while the job stays alive", async () => {
+    const { sent, call, handlers } = wire();
+    handlers.agent_start?.();
+    const started = await call("ShellStart", {
+      command: "for i in 1 2 3 4; do echo \"checkpoint $i\"; sleep 0.7; done",
+      label: "live-coalesce",
+      wake_on: { exit: false, match: ["checkpoint"] },
+    });
+    const id = textOf(started).match(/as (job\d+)/)![1];
+    // Wait until several matches have fired while the agent is busy; none may
+    // reach Pi yet.
+    expect(await until(async () => textOf(await call("ShellLog", { id })).includes("checkpoint 3"))).toBe(true);
+    expect(sent).toEqual([]);
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(1);
+    expect(sent[0].content).toContain("matched");
+    expect(sent[0].content).toContain("coalesced");
+    // The wake is current, not a replay of the first held match: it carries
+    // the newest matching line still in the buffer.
+    expect(sent[0].content).toContain("checkpoint 3");
+    expect(sent[0].content).toContain("still running");
+    expect(sent[0].delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    // The job keeps running after settlement; nothing stale or duplicated may
+    // follow the single coalesced wake.
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(sent.length).toBe(1);
+    await call("ShellStop", { id: "live-coalesce" });
+  });
+
+  it("keeps errorish matches urgent and lets them supersede held routine wakes", async () => {
+    const { sent, call, handlers } = wire();
+    handlers.agent_start?.();
+    await call("ShellStart", {
+      command: "echo checkpoint; sleep 0.2; echo 'Traceback (most recent call last)'; sleep 1.5",
+      label: "busy-errorish",
+      wake_on: { exit: false, match: ["checkpoint", "Traceback"] },
+    });
+    expect(await until(() => sent.length > 0)).toBe(true);
+    expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
+    handlers.agent_settled?.(); // the older routine wake must not follow it
+    expect(sent.length).toBe(1);
+  });
+});
+
+describe("ShellStop races", () => {
+  it("ShellStop on an already-exited job is an idempotent no-op", async () => {
+    const { sent, call } = wire();
+    const started = textOf(await call("ShellStart", { command: "exit 0", label: "stop-after-exit" }));
+    const id = started.match(/as (job\d+)/)![1];
+    expect(await until(() => sent.length > 0)).toBe(true); // natural exit observed
+    const first = await call("ShellStop", { id });
+    expect(first.isError).toBe(false);
+    expect(textOf(first)).toContain("had already exited");
+    const second = await call("ShellStop", { id });
+    expect(second.isError).toBe(false);
+    expect(textOf(second)).toContain("had already exited");
+  });
 });

@@ -87,10 +87,17 @@ test("executor role registers web tools and background shell without orchestrati
     for (const tool of executionToolNames) {
       assert.equal(captured.tools.has(tool), false, `executor child must not register ${tool}`);
     }
-    // Only the background shell's own session lifecycle hooks may be present;
-    // the review machinery (agent_end, before_agent_start, input, tool_call,
-    // tool_result) and command surface must stay out of executor children.
-    assert.deepEqual([...captured.hooks.keys()].sort(), ["session_shutdown", "session_start"]);
+    // Only the background shell's own lifecycle hooks may be present (its
+    // session hooks plus agent_start/agent_settled, which gate nonurgent wake
+    // coalescing); the review machinery (agent_end, before_agent_start,
+    // input, tool_call, tool_result) and command surface must stay out of
+    // executor children.
+    assert.deepEqual([...captured.hooks.keys()].sort(), [
+      "agent_settled",
+      "agent_start",
+      "session_shutdown",
+      "session_start",
+    ]);
     assert.deepEqual(captured.commands, [], "executor child must not register review commands");
     assert.ok(!captured.notices.some((notice) => notice.includes("disabled")), "executor child must not report the gate disabled");
   } finally {

@@ -191,6 +191,32 @@ export function parsePiUsage(value: unknown): TokenUsage | undefined {
   };
 }
 
+/** Sum per-run usage records accumulated across the low-level runs of one
+ *  settlement cycle (automatic retries, compaction retries, queued
+ *  continuations). All fields are additive counters, so summing them reports
+ *  what the acting model actually cost for the whole settled turn. */
+export function combineTokenUsage(
+  accumulated: TokenUsage | undefined,
+  next: TokenUsage | undefined,
+): TokenUsage | undefined {
+  if (!accumulated) return next;
+  if (!next) return accumulated;
+  const sum = (a?: number, b?: number): number | undefined =>
+    a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+  return {
+    scope: "invocation",
+    inputTokens: sum(accumulated.inputTokens, next.inputTokens),
+    totalInputTokens: sum(accumulated.totalInputTokens, next.totalInputTokens),
+    uncachedInputTokens: sum(accumulated.uncachedInputTokens, next.uncachedInputTokens),
+    cachedInputTokens: sum(accumulated.cachedInputTokens, next.cachedInputTokens),
+    outputTokens: sum(accumulated.outputTokens, next.outputTokens),
+    reasoningOutputTokens: sum(accumulated.reasoningOutputTokens, next.reasoningOutputTokens),
+    cacheWriteTokens: sum(accumulated.cacheWriteTokens, next.cacheWriteTokens),
+    totalTokens: sum(accumulated.totalTokens, next.totalTokens),
+    costTotal: sum(accumulated.costTotal, next.costTotal),
+  };
+}
+
 export function extractPiUsageFromMessages(args: unknown[]): TokenUsage | undefined {
   const combined: Required<Pick<TokenUsage, "inputTokens" | "totalInputTokens" | "uncachedInputTokens" | "cachedInputTokens" | "cacheWriteTokens" | "outputTokens" | "totalTokens" | "costTotal">> = {
     inputTokens: 0,

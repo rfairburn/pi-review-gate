@@ -732,6 +732,7 @@ export class BackgroundExecutionController {
         pending.status = "failed";
         pending.error = "Task was interrupted before executor startup.";
       }
+      this.failUndeliveredContinuation(task, "Task was interrupted before the queued continuation was dispatched to an executor.");
       transitionTaskState(task, "interrupted");
       task.summary = input.mode === "interrupt_with_merge"
         ? "Interrupted before executor startup; there was no task checkpoint to merge."
@@ -743,6 +744,10 @@ export class BackgroundExecutionController {
       return this.inspect(group.executionId, task.taskId);
     }
     task.interruptionMode = input.mode;
+    // A registered runtime does not imply the continuation was dispatched: a
+    // restored/queued continuation may still be queued behind startup. Fail it
+    // now so an interrupt during preprocessing cannot dispatch afterwards.
+    this.failUndeliveredContinuation(task, "Task was interrupted before the queued continuation was dispatched to an executor.");
     await this.save(group);
     let transportMessage = "No verified adapter interrupt was available; terminated the owned executor process group.";
     let transport: Promise<ExecutorInteractionAcknowledgement> | undefined;
@@ -1031,7 +1036,8 @@ export class BackgroundExecutionController {
         for (const queued of this.queuedTasks()) {
           const route = resolvedWorkerRoute(this.input.config, queued.group.kind);
           if (route.length === 0) continue;
-          const requiredEntry = queued.task.pendingContinuation
+          const pendingContinuation = queued.task.pendingContinuation;
+          const requiredEntry = pendingContinuation
             ? await continuationEntryId(queued.task).catch(() => undefined)
             : undefined;
           const lease = requiredEntry && route.some((entry) => entry.entryId === requiredEntry)
@@ -1053,6 +1059,17 @@ export class BackgroundExecutionController {
             this.addActivity(queued.task, "configuration", warning);
             await this.save(queued.group);
             await this.input.notify?.(`review gate: ${warning}`);
+          }
+          // Queue inspection and continuation routing can await. An interrupt
+          // may have terminalized this task or replaced its pending work while
+          // the scheduler was suspended; never launch the stale selection.
+          if (
+            queued.task.state !== "queued"
+            || this.runtimes.has(queued.task.taskId)
+            || queued.task.pendingContinuation !== pendingContinuation
+          ) {
+            lease.release();
+            continue;
           }
           queued.task.lastRuntimeConfigDigest = currentConfigDigest;
           this.launch(queued.group, queued.task, lease);
@@ -1109,17 +1126,20 @@ export class BackgroundExecutionController {
     const preserved = task.state === "landed" || task.state === "reported" || task.state === "conflicted";
     if (preserved) {
       this.failUndeliveredSteering(task, "Task reached a terminal state before the queued steering instruction was delivered; the terminal outcome is preserved.");
+      this.failUndeliveredContinuation(task, "Task reached a terminal state before the queued continuation was dispatched to an executor; the terminal outcome is preserved.");
       task.error = messageOf(error);
       task.summary = `Task ${task.taskId} already reached ${task.state}; a later bookkeeping step failed and the ${task.state} outcome is preserved: ${task.error}`;
       this.addActivity(task, "bookkeeping", task.summary);
     } else if (task.interruptionMode) {
       this.failUndeliveredSteering(task, "Task was interrupted before the queued steering instruction was delivered.");
+      this.failUndeliveredContinuation(task, "Task was interrupted before the queued continuation was dispatched to an executor.");
       transitionTaskState(task, "interrupted");
       task.error = undefined;
       task.summary = `Executor acknowledged ${task.interruptionMode} during startup or capture; its writer is quiesced.`;
       this.addActivity(task, "interrupt", task.summary);
     } else {
       this.failUndeliveredSteering(task, "Task failed before the queued steering instruction was delivered.");
+      this.failUndeliveredContinuation(task, "Task failed before the queued continuation was dispatched to an executor.");
       if (task.state !== "stopped_for_application_exit") transitionTaskState(task, "failed");
       task.error = messageOf(error);
       task.summary = `Background controller failure: ${task.error}`;
@@ -1185,9 +1205,15 @@ export class BackgroundExecutionController {
     if (!task.waveRoot || !task.researchResult?.candidate) {
       throw new Error("Research continuation requires its persisted private workspace and prior candidate checkpoint.");
     }
-    const pending = task.pendingContinuation!;
+    const pending = task.pendingContinuation;
+    if (!pending) throw new Error("Continuation was interrupted before executor dispatch.");
     pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
-    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId)!;
+    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId);
+    // An interrupt during preprocessing terminalizes the queued continuation
+    // and clears pendingContinuation; never dispatch a failed continuation.
+    if (!command || task.pendingContinuation !== pending || command.status !== "queued") {
+      throw new Error("Continuation was interrupted before executor dispatch.");
+    }
     task.pendingContinuation = undefined;
     task.generation += 1;
     const previous = transitionTaskState(task, "running");
@@ -1517,9 +1543,15 @@ export class BackgroundExecutionController {
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
       reuseUnchangedFrom: parentBaseline,
     }) : undefined;
-    const pending = task.pendingContinuation!;
+    const pending = task.pendingContinuation;
+    if (!pending) throw new Error("Continuation was interrupted before executor dispatch.");
     pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
-    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId)!;
+    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId);
+    // An interrupt during preprocessing terminalizes the queued continuation
+    // and clears pendingContinuation; never dispatch a failed continuation.
+    if (!command || task.pendingContinuation !== pending || command.status !== "queued") {
+      throw new Error("Continuation was interrupted before executor dispatch.");
+    }
     task.pendingContinuation = undefined;
     task.generation += 1;
     const priorState = transitionTaskState(task, "running");
@@ -1809,6 +1841,17 @@ export class BackgroundExecutionController {
       command.error = reason;
     }
     if (pending.length > 0) this.addActivity(task, "steer", `${pending.length} steering instruction(s) failed: ${reason}`);
+    return pending;
+  }
+
+  private failUndeliveredContinuation(task: BackgroundTaskRecord, reason: string): BackgroundCommandRecord[] {
+    const pending = task.commands.filter((command) => command.action === "continue" && command.status === "queued");
+    for (const command of pending) {
+      command.status = "failed";
+      command.error = reason;
+    }
+    if (pending.length > 0) this.addActivity(task, "continue", `${pending.length} queued continuation instruction(s) failed: ${reason}`);
+    if (task.pendingContinuation) task.pendingContinuation = undefined;
     return pending;
   }
 

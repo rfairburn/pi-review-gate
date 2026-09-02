@@ -450,23 +450,26 @@ restrictive modes, and temp cleanup. Writer regressions cover operation sequenci
 owner acquisition/heartbeat/release, task metadata preservation, and wave/continuation manifests.
 The focused durable/execution/landing suites pass 166/166 with static checks; `dist/` was untouched.
 
-### 8. MEDIUM-LOW — Interrupt never fails queued `continue` commands
+### 8. MEDIUM-LOW — RESOLVED (2026-09-02): Interrupt left queued `continue` commands impossible to dispatch
 
-Refs: `src/execution/background-controller.ts:697-703` (pre-dispatch interrupt rewrites only
-`steer` commands); `restore()` auto-queues a durable continuation for
-`stopped_for_application_exit` tasks with `status: "queued"` and sets
-`task.pendingContinuation` (`:375-392`); `failUndeliveredSteering` likewise handles only
-`steer`.
+**Root cause.** Pre-dispatch interruption and launch-rejection cleanup terminalized queued
+steering but not queued continuation records. Restored automatic continuations could therefore
+leave both a permanently `queued` command and a populated `pendingContinuation` after the task
+became interrupted.
 
-Impact: if the user interrupts before the auto-queued continuation dispatches, the task is
-`interrupted` but the `continue` command stays `queued` forever and `pendingContinuation`
-stays populated (later silently overwritten by any `continueTask`). Diagnostics/tooling that
-surface "queued commands" report pending work that can never be delivered.
+**Fix.** `BackgroundExecutionController` now terminalizes every definitely undelivered queued
+continuation with a durable reason and clears `pendingContinuation` during pre-start interrupts,
+registered-runtime preprocessing interrupts, launch rejection, and preserved terminal outcomes.
+Scheduler and continuation-entry guards re-check the exact queued work after awaited routing,
+steering, and snapshot preparation so a stale selection cannot launch. Already delivered or
+acknowledged commands retain their recorded reality.
 
-Recommendation:
-- [ ] In the pre-dispatch interrupt path (and the launch catch), fail or cancel `continue`
-      commands and clear `pendingContinuation`.
-- [ ] Test status: none — interrupt tests assert task state and steering failure only.
+**Tests.** Four deterministic regressions cover restored auto-continuation interruption, an
+ordinary queued continuation interrupted while scheduler routing is suspended, all launch
+rejection branches, and interruption while a runtime exists but before executor dispatch. They
+assert terminal command/task state, cleared pending work, durable persistence, retained
+acknowledged steering, and zero continuation launches. The focused controller suite passes 21/21
+with static checks; `dist/` was untouched.
 
 ### 9. MEDIUM — RESOLVED (2026-09-02): Snapshots failed on concurrent filesystem changes
 

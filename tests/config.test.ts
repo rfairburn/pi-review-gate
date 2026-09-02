@@ -3,7 +3,21 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { activeExternalExecutor, automaticReviewEnabled, loadConfig, materializeReviewConfig, normalizeConfig, resolveReviewers, resolvedExecutorPool, resolvedWorkerResources, resolvedWorkerRoute } from "../src/config";
+import {
+  activeExternalExecutor,
+  automaticReviewEnabled,
+  loadConfig,
+  materializeReviewConfig,
+  MAX_WEB_CACHE_BYTES,
+  MAX_WEB_CACHE_ENTRIES,
+  MAX_WEB_OUTPUT_CHARS,
+  MAX_WEB_SEARCH_RESULTS,
+  normalizeConfig,
+  resolveReviewers,
+  resolvedExecutorPool,
+  resolvedWorkerResources,
+  resolvedWorkerRoute,
+} from "../src/config";
 
 test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-config-"));
@@ -49,6 +63,7 @@ test("native web tooling has bounded defaults and validates overrides", () => {
   assert.equal(defaults.search.provider, "ddgs");
   assert.equal(defaults.search.maxResults, 10);
   assert.equal(defaults.fetch.maxDownloadBytes, 50 * 1024 * 1024);
+  assert.equal(defaults.fetch.maxOutputChars, 12_000);
   assert.equal(defaults.fetch.cacheMaxEntries, 32);
   assert.equal(defaults.fetch.cacheMaxBytes, 64 * 1024 * 1024);
 
@@ -64,6 +79,40 @@ test("native web tooling has bounded defaults and validates overrides", () => {
   assert.equal(normalizeConfig({ web: { search: { provider: "duckduckgo" } } }).web!.search.provider, "ddgs");
   assert.throws(() => normalizeConfig({ web: { search: { provider: "unknown" } } }), /provider must be ddgs/);
   assert.throws(() => normalizeConfig({ web: { fetch: { cacheMaxBytes: 0 } } }), /web\.fetch\.cacheMaxBytes/);
+});
+
+test("native web resource limits accept exact caps and reject oversized values", () => {
+  const atMaximum = normalizeConfig({
+    web: {
+      search: { maxResults: MAX_WEB_SEARCH_RESULTS },
+      fetch: {
+        maxOutputChars: MAX_WEB_OUTPUT_CHARS,
+        cacheMaxBytes: MAX_WEB_CACHE_BYTES,
+        cacheMaxEntries: MAX_WEB_CACHE_ENTRIES,
+      },
+    },
+  }).web!;
+
+  assert.equal(atMaximum.search.maxResults, MAX_WEB_SEARCH_RESULTS);
+  assert.equal(atMaximum.fetch.maxOutputChars, MAX_WEB_OUTPUT_CHARS);
+  assert.equal(atMaximum.fetch.cacheMaxBytes, MAX_WEB_CACHE_BYTES);
+  assert.equal(atMaximum.fetch.cacheMaxEntries, MAX_WEB_CACHE_ENTRIES);
+
+  const cases = [
+    ["web.search.maxResults", { web: { search: { maxResults: MAX_WEB_SEARCH_RESULTS + 1 } } }],
+    ["web.fetch.maxOutputChars", { web: { fetch: { maxOutputChars: MAX_WEB_OUTPUT_CHARS + 1 } } }],
+    ["web.fetch.cacheMaxBytes", { web: { fetch: { cacheMaxBytes: MAX_WEB_CACHE_BYTES + 1 } } }],
+    ["web.fetch.cacheMaxEntries", { web: { fetch: { cacheMaxEntries: MAX_WEB_CACHE_ENTRIES + 1 } } }],
+  ] as const;
+
+  for (const [field, value] of cases) {
+    assert.throws(() => normalizeConfig(value), new RegExp(`${field} must be between 1 and`), field);
+  }
+
+  assert.throws(() => normalizeConfig({ web: { search: { maxResults: 1_000_000_000 } } }), /web\.search\.maxResults must be between 1 and/);
+  assert.throws(() => normalizeConfig({ web: { fetch: { maxOutputChars: 1_000_000_000 } } }), /web\.fetch\.maxOutputChars must be between 1 and/);
+  assert.throws(() => normalizeConfig({ web: { fetch: { cacheMaxBytes: 1_000_000_000 } } }), /web\.fetch\.cacheMaxBytes must be between 1 and/);
+  assert.throws(() => normalizeConfig({ web: { fetch: { cacheMaxEntries: 1_000_000_000 } } }), /web\.fetch\.cacheMaxEntries must be between 1 and/);
 });
 
 test("normalizeConfig preserves the global subtasks view preference", () => {

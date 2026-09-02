@@ -166,6 +166,14 @@ export interface ExecutionRetryPolicy {
 
 export const DEFAULT_MAX_WORKERS = 4;
 export const MAX_EXECUTION_WORKERS = 16;
+/** Maximum number of results a single web search may request. */
+export const MAX_WEB_SEARCH_RESULTS = 100;
+/** Maximum number of characters a single web fetch may return. */
+export const MAX_WEB_OUTPUT_CHARS = 100_000;
+/** Maximum aggregate bytes retained by a web page cache. */
+export const MAX_WEB_CACHE_BYTES = 256 * 1024 * 1024;
+/** Maximum number of pages retained by a web page cache. */
+export const MAX_WEB_CACHE_ENTRIES = 256;
 export type SubtaskNotificationMode = "quiet" | "noisy";
 export const DEFAULT_SUBTASK_NOTIFICATION_MODE: SubtaskNotificationMode = "quiet";
 export const DEFAULT_EXECUTION_RETRY_POLICY: ExecutionRetryPolicy = {
@@ -349,14 +357,34 @@ function normalizeWeb(value: unknown): WebConfig {
     search: {
       provider,
       timeoutMs: positiveIntegerOrDefault(search.timeoutMs, defaults.search.timeoutMs, "web.search.timeoutMs"),
-      maxResults: positiveIntegerOrDefault(search.maxResults, defaults.search.maxResults, "web.search.maxResults"),
+      maxResults: boundedPositiveIntegerOrDefault(
+        search.maxResults,
+        defaults.search.maxResults,
+        MAX_WEB_SEARCH_RESULTS,
+        "web.search.maxResults",
+      ),
     },
     fetch: {
       timeoutMs: positiveIntegerOrDefault(fetch.timeoutMs, defaults.fetch.timeoutMs, "web.fetch.timeoutMs"),
       maxDownloadBytes: positiveIntegerOrDefault(fetch.maxDownloadBytes, defaults.fetch.maxDownloadBytes, "web.fetch.maxDownloadBytes"),
-      maxOutputChars: positiveIntegerOrDefault(fetch.maxOutputChars, defaults.fetch.maxOutputChars, "web.fetch.maxOutputChars"),
-      cacheMaxBytes: positiveIntegerOrDefault(fetch.cacheMaxBytes, defaults.fetch.cacheMaxBytes, "web.fetch.cacheMaxBytes"),
-      cacheMaxEntries: positiveIntegerOrDefault(fetch.cacheMaxEntries, defaults.fetch.cacheMaxEntries, "web.fetch.cacheMaxEntries"),
+      maxOutputChars: boundedPositiveIntegerOrDefault(
+        fetch.maxOutputChars,
+        defaults.fetch.maxOutputChars,
+        MAX_WEB_OUTPUT_CHARS,
+        "web.fetch.maxOutputChars",
+      ),
+      cacheMaxBytes: boundedPositiveIntegerOrDefault(
+        fetch.cacheMaxBytes,
+        defaults.fetch.cacheMaxBytes,
+        MAX_WEB_CACHE_BYTES,
+        "web.fetch.cacheMaxBytes",
+      ),
+      cacheMaxEntries: boundedPositiveIntegerOrDefault(
+        fetch.cacheMaxEntries,
+        defaults.fetch.cacheMaxEntries,
+        MAX_WEB_CACHE_ENTRIES,
+        "web.fetch.cacheMaxEntries",
+      ),
       userAgent: userAgent.trim(),
     },
   };
@@ -1289,6 +1317,14 @@ function positiveIntegerOrDefault(value: unknown, fallback: number, field: strin
     throw new Error(`${field} must be a positive safe integer`);
   }
   return value;
+}
+
+function boundedPositiveIntegerOrDefault(value: unknown, fallback: number, maximum: number, field: string): number {
+  const normalized = positiveIntegerOrDefault(value, fallback, field);
+  if (normalized > maximum) {
+    throw new Error(`${field} must be between 1 and ${maximum}`);
+  }
+  return normalized;
 }
 
 function nonNegativeIntegerOrDefault(value: unknown, fallback: number, field: string): number {

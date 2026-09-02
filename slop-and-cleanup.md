@@ -544,8 +544,10 @@ Test status: caps/archiving tested; soak test missing.
 - L3. `scripts/pi-review-gate.sh:17-18` unconditionally `unset`s `PI_REVIEW_GATE_CONFIG` and
   `PI_REVIEW_GATE_DISABLED`, silently overriding the kill switch documented at
   `README.md:36-40`. Honor an already-set `PI_REVIEW_GATE_DISABLED` (or warn loudly).
-- L4. `normalizeWeb` (`src/config.ts:333-360`) imposes no upper bounds on
-  `maxResults`/`maxOutputChars`/`cacheMaxBytes`/`cacheMaxEntries` — `1e9` passes validation.
+- L4. **RESOLVED (2026-09-02):** `normalizeWeb` now rejects values above explicit exported
+  caps for search results (100), output characters (100,000), cache bytes (256 MiB), and cache
+  entries (256). Boundary and billion-scale regression tests cover every setting while defaults
+  remain unchanged.
   Bound them in the config contract.
 - L5. ~~`isBlockedAddress` also misses reserved IPv4 ranges (192.0.0.0/24, 198.18.0.0/15,
   192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) and deprecated site-local `fec0::/10`

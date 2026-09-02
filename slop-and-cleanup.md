@@ -667,8 +667,16 @@ Test status: caps/archiving tested; soak test missing.
   `decodeResponseText`, which honors supported declared charsets and falls back to UTF-8 when
   `TextDecoder` rejects an unknown label. Focused tests cover supported, unknown, malformed,
   absent, and unquoted charset declarations without changing the existing byte limit.
-- L8. `wake()` failure diagnostics embed a full `inspect()` clone as pretty-printed JSON in
-  the notification (`background-controller.ts:1776`) — use a curated diagnostic subset.
+- L8. **RESOLVED (2026-09-02):** failure wakes now use a typed curated recovery diagnostic
+  instead of serializing `inspect()`. It includes stable task/execution handles, current state,
+  aggregate progress, bounded summary/error/recent activity, and only the durable bundle or
+  conflict-gate fields needed for explicit recovery actions. Instructions, acceptance criteria,
+  command text, model results, full task arrays, and generic event bodies are excluded. Every
+  model-controlled field, recovery action, encoded JSON payload, and final notification has a
+  visible hard cap; conflict recovery retains `SubtasksMarkClean` independently of truncated
+  notice text. Failure wording remains truthful for conflicted and other non-`failed` states.
+  Adversarial secret, escape-amplification, conflict-path, quiet/noisy, structured-details, and
+  parseability tests pass in the 28/28 focused controller suite.
 - L9. `saveTails` entries are never pruned (set at `background-controller.ts:1988`, awaited
   only at shutdown `:934`) and neither map is cleared in `detach()`; `steeringTails` entries
   *are* deleted when their tail settles (`:1741`). Functional impact nil today since new

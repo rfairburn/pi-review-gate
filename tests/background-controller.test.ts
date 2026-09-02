@@ -2013,3 +2013,308 @@ function renderWidget(content: unknown, width = 240): string[] {
   const component = (content as () => { render(width: number): string[] })();
   return component.render(width);
 }
+
+const WAKE_FAILURE_SECRET_SENTINEL = "WAKE_FAILURE_SECRET_SENTINEL_9f2b";
+const WAKE_FAILURE_ERROR_SENTINEL = "WAKE_FAILURE_ERROR_SENTINEL_start";
+
+/** Harness with a deliberately unresponsive executor so task state can be injected deterministically. */
+async function setupBlockingFailureHarness(options: { notifications: "quiet" | "noisy" }): Promise<{
+  root: string;
+  controller: BackgroundExecutionController;
+  started: BackgroundInspection;
+  messages: string[];
+  sentMessages: Array<{ content: string; details?: { diagnostic?: unknown } }>;
+  internals: {
+    groups: Map<string, BackgroundExecutionGroup>;
+    handleLaunchRejection: (group: BackgroundExecutionGroup, task: BackgroundTaskRecord, error: unknown) => Promise<void>;
+    wake: (task: BackgroundTaskRecord, kind: "completion" | "failure" | "state", content: string, eventSnapshot?: unknown) => Promise<void>;
+    conflictGate?: unknown;
+  };
+  cleanup: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-wake-diag-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "blocking-executor.cjs");
+    await writeFile(executor, [
+      "#!/usr/bin/env node",
+      "process.stdin.resume();",
+    ].join("\n"), "utf8");
+    await chmod(executor, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "blocking-fake",
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" },
+      }],
+      execution: {
+        activeExecutor: { source: "external", id: "blocking-fake" },
+        maxWorkers: 1,
+        subtaskNotifications: options.notifications,
+      },
+      retainBundles: "always",
+    });
+    const messages: string[] = [];
+    const sentMessages: Array<{ content: string; details?: { diagnostic?: unknown } }> = [];
+    controller = new BackgroundExecutionController({
+      pi: { sendMessage: (message: { content: string; details?: { diagnostic?: unknown } }) => {
+        messages.push(message.content);
+        sentMessages.push(message);
+      } },
+      config,
+      state: createState(),
+      cwd: () => root,
+      notify: (message) => {
+        messages.push(message);
+      },
+    });
+    const started = await controller.start([{
+      title: "wake diagnostic target",
+      instructions: "write draft.txt",
+      acceptanceCriteria: ["draft.txt exists"],
+    }]);
+    await waitFor(() => controller!.inspect(started.executionId).tasks[0]?.state === "running", 30_000);
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      handleLaunchRejection: (group: BackgroundExecutionGroup, task: BackgroundTaskRecord, error: unknown) => Promise<void>;
+      wake: (task: BackgroundTaskRecord, kind: "completion" | "failure" | "state", content: string, eventSnapshot?: unknown) => Promise<void>;
+      conflictGate?: unknown;
+    };
+    return {
+      root,
+      controller,
+      started,
+      messages,
+      sentMessages,
+      internals,
+      cleanup: async () => {
+        await controller?.shutdown().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await controller?.shutdown().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function injectAdversarialTaskData(root: string, group: BackgroundExecutionGroup, task: BackgroundTaskRecord): void {
+  const now = new Date().toISOString();
+  task.bundle = {
+    version: 1,
+    operationId: "op-wake-diagnostic",
+    waveId: "wave-wake-diagnostic",
+    taskId: task.taskId,
+    waveRoot: join(root, "wave-root"),
+    expectedRevision: group.revision,
+  };
+  task.executorEntryId = `entry-${"x".repeat(5_000)}`;
+  task.definition = {
+    title: "t".repeat(5_000),
+    instructions: WAKE_FAILURE_SECRET_SENTINEL.repeat(500),
+    acceptanceCriteria: [WAKE_FAILURE_SECRET_SENTINEL.repeat(400)],
+  } as unknown as BackgroundTaskRecord["definition"];
+  task.summary = "s".repeat(90_000);
+  task.error = `e${"e".repeat(90_000)} ${WAKE_FAILURE_SECRET_SENTINEL} ${"x".repeat(90_000)}`;
+  task.result = { taskResults: [{ summary: WAKE_FAILURE_SECRET_SENTINEL.repeat(2_000) }] } as unknown as BackgroundTaskRecord["result"];
+  task.commands = Array.from({ length: 60 }, (_unused, index) => ({
+    instructionId: `steer-${index}`,
+    action: "steer" as const,
+    actor: "model" as const,
+    text: WAKE_FAILURE_SECRET_SENTINEL.repeat(300),
+    status: "queued" as const,
+    createdAt: now,
+  }));
+  task.activity = Array.from({ length: 60 }, (_unused, index) => ({
+    sequence: index + 1,
+    at: now,
+    // The last injected event survives the recent-activity window, so its
+    // adversarial phase exercises the phase bound deterministically.
+    phase: index === 59 ? "ph".repeat(5_000) : "executor",
+    message: "a".repeat(2_000),
+  }));
+}
+
+test("wake failure diagnostics are curated, bounded, and exclude secret task and command content", async () => {
+  const scenario = await setupBlockingFailureHarness({ notifications: "noisy" });
+  const { controller, started, messages, internals, cleanup } = scenario;
+  try {
+    const group = internals.groups.get(started.executionId)!;
+    const task = group.tasks[0]!;
+    injectAdversarialTaskData(scenario.root, group, task);
+    internals.conflictGate = {
+      executionId: group.executionId,
+      taskId: task.taskId,
+      sourceRoot: scenario.root,
+      paths: [...Array.from({ length: 24 }, (_unused, index) => `conflict-${index}-${"p".repeat(400)}`), "conflict-final.txt"],
+      activatedAt: new Date().toISOString(),
+      manifestPath: join(scenario.root, "conflict-manifest.json"),
+      reason: `Forced task ${task.taskId} materialized conflicts.`,
+    };
+    const jsonEscapeTail = "\u0000".repeat(80_000);
+    await internals.handleLaunchRejection(group, task, new Error(`${WAKE_FAILURE_ERROR_SENTINEL} worker exploded: ${jsonEscapeTail}`));
+
+    const failureMessages = messages.filter((message) => message.includes("Failure recovery diagnostic"));
+    assert.equal(failureMessages.length, 1, "exactly one failure wake with a curated diagnostic");
+    const failureMessage = failureMessages[0]!;
+
+    // The failure preamble is dedicated and bounded: no raw unbounded wake
+    // content, no task-title or incomplete-task lists from the generic event.
+    assert.match(failureMessage, /requires recovery attention at state FAILED/);
+    assert.ok(!failureMessage.includes("Tasks not yet landed"), "the incomplete-task list is not part of failure notifications");
+    assert.ok(!/t{500}/.test(failureMessage), "the adversarial task title run is truncated away");
+
+    // Secret exclusion: instructions, acceptance criteria, command text, and
+    // model output never reach the notification, even at field starts.
+    for (const message of messages) {
+      assert.ok(!message.includes(WAKE_FAILURE_SECRET_SENTINEL), "the secret sentinel must never appear in any notification");
+      assert.ok(!/"instructions":/.test(message), "task instructions must not be serialized");
+      assert.ok(!/"acceptanceCriteria":/.test(message), "acceptance criteria must not be serialized");
+      assert.ok(!/"commands":/.test(message), "command records must not be serialized");
+      assert.ok(!/"result":/.test(message), "model result output must not be serialized");
+      assert.ok(!/"definition":/.test(message), "task definitions must not be serialized");
+    }
+
+    // The sentinel at the start of the worker error is allowed bounded error
+    // content: it survives only inside per-field caps, never as a large run.
+    const errorSentinelOccurrences = failureMessage.split(WAKE_FAILURE_ERROR_SENTINEL).length - 1;
+    assert.ok(errorSentinelOccurrences >= 1, "the bounded worker error remains actionable");
+    assert.ok(errorSentinelOccurrences <= 6, `the error sentinel appears only inside bounded fields, got ${errorSentinelOccurrences}`);
+    assert.ok(!failureMessage.includes(jsonEscapeTail.slice(0, 1_000)), "the JSON-escaping error tail is truncated away");
+
+    // Hard size bounds with visible truncation markers.
+    assert.ok(failureMessage.length <= 16_100, `the final notification must stay under the cap, got ${failureMessage.length}`);
+    const diagnosticJson = failureMessage.slice(failureMessage.indexOf("{", failureMessage.indexOf("Failure recovery diagnostic")));
+    assert.ok(diagnosticJson.length <= 7_000, `the serialized diagnostic must stay under the JSON cap, got ${diagnosticJson.length}`);
+    assert.ok(failureMessage.includes("…[truncated]"), "bounded fields carry a visible truncation marker");
+
+    // The structured details payload is bounded by construction and identical
+    // to the delivered (parseable) JSON text.
+    const failureDetails = scenario.sentMessages.find((message) => message.content === failureMessage)?.details;
+    assert.ok(failureDetails?.diagnostic, "the structured diagnostic is delivered via sendMessage details");
+    const detailsJson = JSON.stringify(failureDetails.diagnostic);
+    assert.ok(detailsJson.length <= 7_000, `the structured details diagnostic must stay bounded, got ${detailsJson.length}`);
+    assert.ok(!detailsJson.includes(WAKE_FAILURE_SECRET_SENTINEL), "the secret sentinel never reaches the structured details");
+    assert.deepEqual(JSON.parse(diagnosticJson), failureDetails.diagnostic, "the delivered JSON is parseable and matches the structured details");
+    const detailsDiagnostic = failureDetails.diagnostic as {
+      activity: Array<{ phase: string }>;
+      recovery: { executorEntryId?: string };
+    };
+    for (const event of detailsDiagnostic.activity) {
+      assert.ok(event.phase.length <= 113, `activity phases are field-bounded, got ${event.phase.length}`);
+    }
+    assert.ok((detailsDiagnostic.recovery.executorEntryId ?? "").length <= 133, "executorEntryId is field-bounded");
+
+    // Positive controls: stable IDs, state, and recovery handles are present.
+    assert.ok(failureMessage.includes(started.executionId), "the execution handle is present");
+    assert.ok(failureMessage.includes(task.taskId), "the task handle is present");
+    assert.match(failureMessage, /"taskState": "failed"/);
+    assert.match(failureMessage, /"hasDurableBundle": true/);
+    assert.ok(failureMessage.includes("SubtasksInspect"), "an inspect recovery action is present");
+    assert.ok(failureMessage.includes("SubtasksContinue"), "a continue recovery action is present");
+    assert.ok(failureMessage.includes("SubtasksForceMerge"), "a force-merge recovery action is present");
+    assert.ok(failureMessage.includes("SubtasksInterrupt"), "an interrupt recovery action is present");
+    assert.ok(failureMessage.includes("SubtasksMarkClean"), "the conflict-gate recovery action survives independent of the bounded message");
+    assert.ok(
+      detailsJson.includes("SubtasksMarkClean"),
+      "the structured details carry the conflict-gate recovery action",
+    );
+    assert.ok(failureMessage.includes(join(scenario.root, "wave-root")), "the durable bundle wave root is present");
+    assert.ok(failureMessage.includes("conflict-manifest.json"), "the conflict manifest path is present");
+    assert.match(failureMessage, /"taskCount": 1/);
+
+    // Bounded activity and conflict paths: counts, not full arrays, and each entry capped.
+    const sequenceMatches = diagnosticJson.match(/"sequence":/g) ?? [];
+    assert.ok(sequenceMatches.length <= 8, `activity is bounded to the most recent entries, got ${sequenceMatches.length}`);
+    const pathMatches = diagnosticJson.match(/"conflict-\d+/g) ?? [];
+    assert.ok(pathMatches.length <= 10, `conflict paths are bounded in count, got ${pathMatches.length}`);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("conflict-gate failure wakes keep SubtasksMarkClean recovery even when the bounded message truncates it away", async () => {
+  const scenario = await setupBlockingFailureHarness({ notifications: "noisy" });
+  const { controller, started, messages, internals, cleanup } = scenario;
+  try {
+    const group = internals.groups.get(started.executionId)!;
+    const task = group.tasks[0]!;
+    task.bundle = {
+      version: 1,
+      operationId: "op-conflict-wake",
+      waveId: "wave-conflict-wake",
+      taskId: task.taskId,
+      waveRoot: join(scenario.root, "wave-root"),
+      expectedRevision: group.revision,
+    };
+    internals.conflictGate = {
+      executionId: group.executionId,
+      taskId: task.taskId,
+      sourceRoot: scenario.root,
+      // ~320 chars of fixed prompt prose plus 8 x 70-char paths exceeds the
+      // 600-char message budget, so the free-text prompt truncates before the
+      // SubtasksMarkClean instruction — exactly the regression scenario.
+      paths: Array.from({ length: 8 }, (_unused, index) => `deeply/nested/conflicted/path/number-${index}-of-eight/` + "p".repeat(40)),
+      activatedAt: new Date().toISOString(),
+      manifestPath: join(scenario.root, "conflict-manifest.json"),
+      reason: `Forced task ${task.taskId} materialized conflicts.`,
+    };
+    const prompt = controller.criticalPrompt()!;
+    assert.ok(prompt.includes("SubtasksMarkClean"), "the raw critical prompt names the recovery action");
+    assert.ok(prompt.length > 600, "the critical prompt exceeds the message budget so its tail is truncated");
+    await internals.wake(task, "failure", prompt);
+
+    const failureMessage = messages.find((message) => message.includes("Failure recovery diagnostic"));
+    assert.ok(failureMessage, "the conflict-gate failure wake delivers the curated diagnostic");
+    const messageField = failureMessage!.match(/"message": "([^"]*)"/)?.[1] ?? "";
+    assert.ok(!messageField.includes("SubtasksMarkClean"), "the prompt tail (and its MarkClean instruction) is truncated out of the message field");
+    assert.ok(failureMessage.includes("SubtasksMarkClean"), "the rendered recovery actions still name SubtasksMarkClean");
+    const failureDetails = scenario.sentMessages.find((message) => message.content === failureMessage)?.details;
+    assert.ok(failureDetails?.diagnostic, "the structured diagnostic is delivered");
+    const detailsJson = JSON.stringify(failureDetails.diagnostic);
+    assert.ok(detailsJson.includes("SubtasksMarkClean"), "the structured details carry the conflict-gate recovery action");
+    assert.ok(detailsJson.length <= 7_000, `the structured details stay bounded, got ${detailsJson.length}`);
+    const diagnosticJson = failureMessage!.slice(failureMessage!.indexOf("{", failureMessage!.indexOf("Failure recovery diagnostic")));
+    assert.doesNotThrow(() => JSON.parse(diagnosticJson), "the delivered diagnostic stays parseable JSON");
+    assert.ok(failureMessage!.includes("conflict-manifest.json"), "the conflict manifest path is present");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("quiet and noisy subtask notification modes both retain actionable wake failure recovery information", async () => {
+  for (const notifications of ["quiet", "noisy"] as const) {
+    const scenario = await setupBlockingFailureHarness({ notifications });
+    const { controller, started, messages, internals, cleanup } = scenario;
+    try {
+      const group = internals.groups.get(started.executionId)!;
+      const task = group.tasks[0]!;
+      injectAdversarialTaskData(scenario.root, group, task);
+      await internals.handleLaunchRejection(group, task, new Error("deterministic synthetic launch failure"));
+      const failureMessage = messages.find((message) => message.includes("Failure recovery diagnostic"));
+      assert.ok(failureMessage, `the ${notifications} mode delivers the failure notification with the curated diagnostic`);
+      assert.ok(!failureMessage!.includes(WAKE_FAILURE_SECRET_SENTINEL), "the sentinel never reaches the notification");
+      assert.ok(failureMessage!.includes(started.executionId), "the execution handle survives in both modes");
+      assert.ok(failureMessage!.includes(task.taskId), "the task handle survives in both modes");
+      assert.match(failureMessage!, /"taskState": "failed"/);
+      assert.ok(failureMessage!.includes("SubtasksContinue"), "a continue recovery action survives in both modes");
+      assert.ok(failureMessage!.includes("SubtasksInspect"), "an inspect recovery action survives in both modes");
+      assert.ok(failureMessage!.length <= 16_100, "the notification stays bounded in both modes");
+      const failureDetails = scenario.sentMessages.find((message) => message.content === failureMessage)?.details;
+      assert.ok(failureDetails?.diagnostic, "the structured diagnostic is delivered in both modes");
+      assert.ok(JSON.stringify(failureDetails.diagnostic).length <= 7_000, "the structured details diagnostic stays bounded in both modes");
+    } finally {
+      await cleanup();
+    }
+  }
+});

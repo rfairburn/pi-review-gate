@@ -30,6 +30,27 @@ const MAX_ACTIVITY = 200;
 const MAX_STATE_HISTORY = 64;
 const RECENT_ACTIVITY_LIMIT = 10;
 
+/**
+ * L8: wake failure notifications carry a curated, explicitly bounded diagnostic
+ * subset — never a full inspect() clone. Every attacker/model-controlled field
+ * is capped with a visible truncation marker, and the serialized diagnostic and
+ * the final notification have hard character caps.
+ */
+const WAKE_FAILURE_MAX_TITLE = 200;
+const WAKE_FAILURE_MAX_SUMMARY = 600;
+const WAKE_FAILURE_MAX_ERROR = 800;
+const WAKE_FAILURE_MAX_ACTIVITY_EVENTS = 8;
+const WAKE_FAILURE_MAX_ACTIVITY_MESSAGE = 300;
+const WAKE_FAILURE_MAX_PHASE = 100;
+const WAKE_FAILURE_MAX_EXECUTOR_ENTRY = 120;
+const WAKE_FAILURE_MAX_CONFLICT_PATHS = 10;
+const WAKE_FAILURE_MAX_CONFLICT_PATH = 200;
+const WAKE_FAILURE_MAX_CONFLICT_REASON = 300;
+const WAKE_FAILURE_MAX_ACTION = 600;
+const WAKE_FAILURE_JSON_CAP = 7_000;
+const WAKE_FAILURE_NOTIFICATION_CAP = 16_000;
+const TRUNCATION_MARKER = "…[truncated]";
+
 export const BACKGROUND_TASK_STATES = [
   "queued",
   "capturing",
@@ -2055,13 +2076,21 @@ export class BackgroundExecutionController {
     const scheduling = eventOwner
       ? this.schedulingSnapshot(eventOwner, kind === "completion" ? eventTask : undefined)
       : undefined;
-    const eventContent = eventOwner ? formatExecutionEvent(eventOwner, eventTask, kind, content, scheduling) : content;
+    // Failures never reuse the generic event body: it embeds raw wake content,
+    // task titles, landed paths, and the incomplete-task list. Failures get a
+    // dedicated preamble built only from the curated diagnostic, so every
+    // model-controlled character passes through field-level bounding first.
     const diagnostic = kind === "failure" && owner
-      ? this.inspect(owner.executionId, task.taskId)
+      ? this.wakeFailureDiagnostic(owner, eventTask, content)
       : undefined;
     const deliveredContent = diagnostic
-      ? `${eventContent}\n\nFull durable failure diagnostic:\n${JSON.stringify(diagnostic, null, 2)}`
-      : eventContent;
+      ? capNotificationText(
+        `${formatWakeFailurePreamble(diagnostic)}\n\nFailure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):\n${formatWakeFailureDiagnostic(diagnostic)}`,
+        WAKE_FAILURE_NOTIFICATION_CAP,
+      )
+      : eventOwner
+        ? formatExecutionEvent(eventOwner, eventTask, kind, content, scheduling)
+        : content;
     if (!isRecord(this.input.pi) || typeof this.input.pi.sendMessage !== "function") {
       await this.input.notify?.(deliveredContent);
       return;
@@ -2081,6 +2110,88 @@ export class BackgroundExecutionController {
     } catch (error) {
       await this.input.notify?.(`review gate: task notification could not be delivered: ${messageOf(error)}`);
     }
+  }
+
+  /**
+   * Curated recovery subset for wake failure notifications (L8). Contains only
+   * stable handles, current state, bounded summary/error/activity, and recovery
+   * actions. Task instructions, acceptance criteria, command text, model
+   * output, and full group/task arrays are never included.
+   */
+  private wakeFailureDiagnostic(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    content: string,
+  ): WakeFailureDiagnostic {
+    const live = group.tasks.find((candidate) => candidate.taskId === task.taskId) ?? task;
+    const conflictGate = this.conflictGate
+      && this.conflictGate.executionId === group.executionId
+      && this.conflictGate.taskId === task.taskId
+      ? this.conflictGate
+      : undefined;
+    const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
+    const conflictManifestPath = conflictGate
+      ? boundDiagnosticText(conflictGate.manifestPath, WAKE_FAILURE_MAX_CONFLICT_PATH) ?? ""
+      : undefined;
+    const suggestedActions = [
+      `SubtasksInspect (executionId ${group.executionId}, taskId ${task.taskId}) for the current bounded snapshot`,
+    ];
+    if (conflictGate) {
+      suggestedActions.push(`Resolve the conflict markers in recovery.conflictGate.paths (manifest: ${conflictManifestPath}), verify the workspace, then call SubtasksMarkClean (executionId ${group.executionId}, taskId ${task.taskId}); automatic landings stay blocked until then`);
+    }
+    if (live.bundle) {
+      suggestedActions.push(`SubtasksContinue (executionId ${group.executionId}, taskId ${task.taskId}) to resume from the durable checkpoint`);
+      if (group.kind === "execute" && !isActiveTaskState(live.state)) {
+        suggestedActions.push(`SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) to land the checkpoint mechanically; manual workspace inspection is still required afterward`);
+      }
+    } else {
+      suggestedActions.push("No durable continuation bundle is available; inspect the execution record and restart the task with SubtasksAdd if its outcome is still needed");
+    }
+    suggestedActions.push(`SubtasksInterrupt (executionId ${group.executionId}, taskId ${task.taskId}, interrupt_as_failure) to quiesce any live writer`);
+    // Recovery handles are serialized first so any final JSON truncation hits
+    // the verbose summary/error/activity tail, never the recovery block. Every
+    // field is individually bounded so the structured object passed via
+    // sendMessage details is bounded by construction, not only the rendered text.
+    return fitWakeFailureDiagnostic({
+      executionId: group.executionId,
+      kind: group.kind,
+      revision: group.revision,
+      taskId: task.taskId,
+      taskState: live.state,
+      message: boundDiagnosticText(content, WAKE_FAILURE_MAX_SUMMARY) ?? "",
+      groupSummary: {
+        taskCount: group.tasks.length,
+        settled: group.tasks.filter((candidate) => candidate.state === successState).length,
+        active: group.tasks.filter((candidate) => isActiveTaskState(candidate.state)).length,
+      },
+      recovery: {
+        hasDurableBundle: Boolean(live.bundle),
+        bundleWaveRoot: live.bundle ? boundDiagnosticText(live.bundle.waveRoot, WAKE_FAILURE_MAX_CONFLICT_PATH) : undefined,
+        executorEntryId: live.executorEntryId
+          ? boundDiagnosticText(live.executorEntryId, WAKE_FAILURE_MAX_EXECUTOR_ENTRY)
+          : undefined,
+        conflictGate: conflictGate
+          ? {
+            paths: conflictGate.paths
+              .slice(0, WAKE_FAILURE_MAX_CONFLICT_PATHS)
+              .map((path) => boundDiagnosticText(path, WAKE_FAILURE_MAX_CONFLICT_PATH) ?? ""),
+            manifestPath: conflictManifestPath ?? "",
+            reason: boundDiagnosticText(conflictGate.reason, WAKE_FAILURE_MAX_CONFLICT_REASON) ?? "",
+          }
+          : undefined,
+        suggestedActions: suggestedActions.map((action) => boundDiagnosticText(action, WAKE_FAILURE_MAX_ACTION) ?? ""),
+      },
+      title: boundDiagnosticText(task.definition.title, WAKE_FAILURE_MAX_TITLE) ?? "",
+      summary: boundDiagnosticText(live.summary, WAKE_FAILURE_MAX_SUMMARY),
+      error: boundDiagnosticText(live.error, WAKE_FAILURE_MAX_ERROR),
+      activity: live.activity
+        .slice(-WAKE_FAILURE_MAX_ACTIVITY_EVENTS)
+        .map((event) => ({
+          sequence: event.sequence,
+          phase: boundDiagnosticText(event.phase, WAKE_FAILURE_MAX_PHASE) ?? "",
+          message: boundDiagnosticText(event.message, WAKE_FAILURE_MAX_ACTIVITY_MESSAGE) ?? "",
+        })),
+    });
   }
 
   private cancelWatch(executionId: string): boolean {
@@ -2438,6 +2549,95 @@ function liveViewComponent(lines: readonly string[]): { render(width: number): s
 
 function clipWidgetLine(value: string, width: number): string {
   return value.length <= width ? value : `${value.slice(0, Math.max(1, width - 1))}…`;
+}
+
+/** Curated, bounded failure diagnostic delivered with wake failure notifications (L8). */
+export interface WakeFailureDiagnostic {
+  executionId: string;
+  kind: BackgroundTaskKind;
+  revision: number;
+  taskId: string;
+  taskState: BackgroundTaskState;
+  /** Bounded wake content (notice text); never the raw unbounded string. */
+  message: string;
+  groupSummary: { taskCount: number; settled: number; active: number };
+  recovery: {
+    hasDurableBundle: boolean;
+    bundleWaveRoot?: string;
+    executorEntryId?: string;
+    conflictGate?: { paths: string[]; manifestPath: string; reason: string };
+    suggestedActions: string[];
+  };
+  title: string;
+  summary?: string;
+  error?: string;
+  activity: Array<{ sequence: number; phase: string; message: string }>;
+}
+
+/** JSON-encoded length of a string's content, excluding the surrounding quotes. */
+function jsonEncodedTextLength(value: string): number {
+  // Control characters, quotes, and backslashes expand during JSON.stringify;
+  // field budgets apply to the encoded form so the serialized diagnostic cap
+  // cannot be bypassed with escape-heavy adversarial content.
+  return JSON.stringify(value).length - 2;
+}
+
+function boundDiagnosticText(value: string | undefined, max: number): string | undefined {
+  if (value === undefined) return undefined;
+  const flat = value.replace(/\s+/g, " ").trim();
+  if (jsonEncodedTextLength(flat) <= max) return flat;
+  // Binary-search the longest raw prefix whose JSON encoding (plus the visible
+  // truncation marker) still fits the encoded budget.
+  let low = 0;
+  let high = flat.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (jsonEncodedTextLength(`${flat.slice(0, mid)}${TRUNCATION_MARKER}`) <= max) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return `${flat.slice(0, low)}${TRUNCATION_MARKER}`;
+}
+
+/**
+ * Shed trailing activity entries until the serialized diagnostic fits the JSON
+ * cap, so the delivered diagnostic (and the structured object sent via
+ * sendMessage details) stays parseable JSON instead of a character-sliced tail.
+ */
+function fitWakeFailureDiagnostic(diagnostic: WakeFailureDiagnostic): WakeFailureDiagnostic {
+  let payload = diagnostic;
+  let text = JSON.stringify(payload, null, 2);
+  while (text.length > WAKE_FAILURE_JSON_CAP && payload.activity.length > 0) {
+    payload = { ...payload, activity: payload.activity.slice(0, -1) };
+    text = JSON.stringify(payload, null, 2);
+  }
+  return payload;
+}
+
+function formatWakeFailureDiagnostic(diagnostic: WakeFailureDiagnostic): string {
+  const text = JSON.stringify(diagnostic, null, 2);
+  if (text.length <= WAKE_FAILURE_JSON_CAP) return text;
+  return `${text.slice(0, Math.max(1, WAKE_FAILURE_JSON_CAP - TRUNCATION_MARKER.length))}${TRUNCATION_MARKER}`;
+}
+
+/** Dedicated bounded preamble for failure notifications; built only from the curated diagnostic. */
+function formatWakeFailurePreamble(diagnostic: WakeFailureDiagnostic): string {
+  const successVerb = diagnostic.kind === "research" ? "reported" : "landed";
+  const lines = [
+    `Task ${diagnostic.taskId} requires recovery attention at state ${diagnostic.taskState.toUpperCase()} in ${diagnostic.kind} execution ${diagnostic.executionId} (revision ${diagnostic.revision}).`,
+    `Execution progress: ${diagnostic.groupSummary.settled}/${diagnostic.groupSummary.taskCount} task(s) ${successVerb}, ${diagnostic.groupSummary.active} active.`,
+  ];
+  if (diagnostic.message) lines.push(`Notice: ${diagnostic.message}`);
+  if (diagnostic.summary) lines.push(`Summary: ${diagnostic.summary}`);
+  if (diagnostic.error) lines.push(`Error: ${diagnostic.error}`);
+  return lines.join("\n");
+}
+
+function capNotificationText(content: string, max: number): string {
+  if (content.length <= max) return content;
+  return `${content.slice(0, Math.max(1, max - TRUNCATION_MARKER.length))}${TRUNCATION_MARKER}`;
 }
 
 function formatExecutionEvent(

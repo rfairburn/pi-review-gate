@@ -541,9 +541,10 @@ Test status: caps/archiving tested; soak test missing.
 - L2. `restore()` merges `restored.archives` into `this.archivedTasks` **before** the
   cwd-mismatch validation throws (`background-controller.ts:370-374`) — cross-contaminates
   archive hashes across workspaces. Validate cwd before merging.
-- L3. `scripts/pi-review-gate.sh:17-18` unconditionally `unset`s `PI_REVIEW_GATE_CONFIG` and
-  `PI_REVIEW_GATE_DISABLED`, silently overriding the kill switch documented at
-  `README.md:36-40`. Honor an already-set `PI_REVIEW_GATE_DISABLED` (or warn loudly).
+- L3. **RESOLVED (2026-09-02):** the launcher still sanitizes and re-resolves inherited
+  `PI_REVIEW_GATE_CONFIG`, but now preserves the documented `PI_REVIEW_GATE_DISABLED` kill
+  switch, forwards it to Pi, and prints a clear non-activation notice for the same truthy values
+  recognized by `loadConfig`. Launcher tests cover enabled and disabled paths.
 - L4. **RESOLVED (2026-09-02):** `normalizeWeb` now rejects values above explicit exported
   caps for search results (100), output characters (100,000), cache bytes (256 MiB), and cache
   entries (256). Boundary and billion-scale regression tests cover every setting while defaults

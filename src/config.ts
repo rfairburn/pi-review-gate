@@ -1346,6 +1346,9 @@ function normalizeMaxWorkers(value: unknown): number | undefined {
   return value;
 }
 
+// Shared truthiness for PI_REVIEW_GATE_* kill switches. The launcher
+// (scripts/pi-review-gate.sh) duplicates this list for its warning; keep the
+// two in sync.
 function isTruthy(value: string | undefined): boolean {
   return value === "1" || value === "true" || value === "yes";
 }

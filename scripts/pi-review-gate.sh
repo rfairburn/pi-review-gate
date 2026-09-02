@@ -14,8 +14,15 @@ ORCHESTRATOR_SKILL_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/SKILL.md"
 ORCHESTRATOR_RECOVERY_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/references/recovery.md"
 ORCHESTRATOR_SKILL_DIR="$HOME/.agents/skills/orchestrator"
 
+# Deliberate environment sanitization: the persistent config is re-resolved
+# below and re-exported, so an inherited PI_REVIEW_GATE_CONFIG (e.g. from a
+# parent pi session) cannot silently redirect the gate to another config file.
 unset PI_REVIEW_GATE_CONFIG
-unset PI_REVIEW_GATE_DISABLED
+
+# PI_REVIEW_GATE_DISABLED is deliberately NOT unset: it is the documented kill
+# switch (README: PI_REVIEW_GATE_DISABLED=1 disables the gate) and must reach
+# the extension so loadConfig() cleanly refuses to activate. Unsetting it here
+# would silently defeat the kill switch.
 
 REVIEW_GATE_CONFIG=""
 for candidate in \
@@ -63,6 +70,15 @@ if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/references/recovery.md" ]] || ! cmp -s "$ORC
 fi
 
 export PI_REVIEW_GATE_CONFIG="$REVIEW_GATE_CONFIG"
+
+# Same truthy values the extension uses (loadConfig/firstTruthyEnv -> isTruthy
+# in src/config.ts): warn loudly when the kill switch is on instead of
+# silently swallowing it. Keep this list in sync with isTruthy there.
+case "${PI_REVIEW_GATE_DISABLED:-}" in
+  1|true|yes)
+    echo "pi-review-gate: PI_REVIEW_GATE_DISABLED is set; the review gate will not activate"
+    ;;
+esac
 
 echo "pi-review-gate config: $REVIEW_GATE_CONFIG"
 echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"

@@ -35,19 +35,22 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
   ].join("\n"), "utf8");
   await Promise.all([chmod(npmPath, 0o755), chmod(piPath, 0o755), chmod(ddgsPythonPath, 0o755)]);
 
-  const result = await execFileAsync(resolve("scripts/pi-review-gate.sh"), ["--model", "example", "--tools", "read,bash"], {
-    env: {
-      ...process.env,
-      HOME: home,
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
-      CAPTURE_DIR: capture,
-      PI_REVIEW_GATE_DDGS_VENV: ddgsVenv,
-      PI_REVIEW_GATE_CONFIG: "/wrong/config.json",
-      PI_REVIEW_GATE_DISABLED: "1",
-    },
-  });
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: home,
+    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    CAPTURE_DIR: capture,
+    PI_REVIEW_GATE_DDGS_VENV: ddgsVenv,
+    PI_REVIEW_GATE_CONFIG: "/wrong/config.json",
+  };
+  // Enabled case must be deterministic even if the surrounding environment
+  // happens to carry the kill switch.
+  delete env.PI_REVIEW_GATE_DISABLED;
+
+  const result = await execFileAsync(resolve("scripts/pi-review-gate.sh"), ["--model", "example", "--tools", "read,bash"], { env });
 
   assert.match(result.stdout, new RegExp(escapeRegExp(configPath)));
+  assert.doesNotMatch(result.stdout, /will not activate/);
   assert.equal(await readFile(join(capture, "config-env"), "utf8"), configPath);
   assert.equal(await readFile(join(capture, "disabled-env"), "utf8"), "unset");
   assert.equal(
@@ -62,6 +65,55 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
     await readFile(join(capture, "args"), "utf8"),
     `--extension\n${resolve("dist/src/index.js")}\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n--tools\nread,bash\n`,
   );
+});
+
+test("persistent launcher honors the PI_REVIEW_GATE_DISABLED kill switch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-launcher-disabled-"));
+  const home = join(root, "home");
+  const bin = join(root, "bin");
+  const capture = join(root, "capture");
+  const ddgsVenv = join(root, "ddgs");
+  await Promise.all([
+    mkdir(join(home, ".config", "pi"), { recursive: true }),
+    mkdir(bin, { recursive: true }),
+    mkdir(capture, { recursive: true }),
+    mkdir(join(ddgsVenv, "bin"), { recursive: true }),
+  ]);
+  const configPath = join(home, ".config", "pi", "review-gate.json");
+  await writeFile(configPath, "{}\n", "utf8");
+  const npmPath = join(bin, "npm");
+  const piPath = join(bin, "pi");
+  const ddgsPythonPath = join(ddgsVenv, "bin", "python");
+  await writeFile(npmPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  await writeFile(ddgsPythonPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  await writeFile(piPath, [
+    "#!/usr/bin/env bash",
+    "printf '%s' \"${PI_REVIEW_GATE_CONFIG:-unset}\" > \"$CAPTURE_DIR/config-env\"",
+    "printf '%s' \"${PI_REVIEW_GATE_DISABLED:-unset}\" > \"$CAPTURE_DIR/disabled-env\"",
+  ].join("\n"), "utf8");
+  await Promise.all([chmod(npmPath, 0o755), chmod(piPath, 0o755), chmod(ddgsPythonPath, 0o755)]);
+
+  const result = await execFileAsync(resolve("scripts/pi-review-gate.sh"), ["--model", "example"], {
+    env: {
+      ...process.env,
+      HOME: home,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      CAPTURE_DIR: capture,
+      PI_REVIEW_GATE_DDGS_VENV: ddgsVenv,
+      // Inherited from a parent session: sanitization must still override it
+      // even with the kill switch active.
+      PI_REVIEW_GATE_CONFIG: "/wrong/config.json",
+      // Kill switch set by the user:
+      PI_REVIEW_GATE_DISABLED: "1",
+    },
+  });
+
+  assert.match(result.stdout, /PI_REVIEW_GATE_DISABLED is set; the review gate will not activate/);
+  // The kill switch must reach the pi child (and therefore the extension),
+  // which disables the gate; the launcher must no longer strip it.
+  assert.equal(await readFile(join(capture, "disabled-env"), "utf8"), "1");
+  // Persistent config resolution/sanitization still applies while disabled.
+  assert.equal(await readFile(join(capture, "config-env"), "utf8"), configPath);
 });
 
 test("persistent launcher refreshes a stale installed orchestrator skill", async () => {

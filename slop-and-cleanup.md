@@ -439,26 +439,24 @@ Recommendation:
 - [ ] Test status: `tests/durable-delivery.test.ts` covers persistence transitions only;
       `tests/transmission.test.ts` covers message formatting only.
 
-### 11. MEDIUM-LOW — `delivery.json` receipt is a racy read-modify-write, written after send (review pipeline)
+### 11. MEDIUM-LOW — RESOLVED (2026-09-02): `delivery.json` receipt persistence was racy (review pipeline)
 
-Refs: `src/transmission.ts` `writeReviewDeliveryReceipt` (`:86-113`, readFile → parse → push →
-writeFile with no serialization or atomic rename); `deliverReviewTransmission` (`:115+`)
-writes the receipt only after `deliver()` returns true.
+**Root cause.** Concurrent deliveries to one invocation directory performed independent
+read-modify-write cycles, so a later write could overwrite an earlier receipt. Replacement was
+also direct, allowing a failed write to leave a partial target.
 
-Impact: two concurrent deliveries to the same invocation dir can both read the same
-`delivery.json` and lose one receipt (non-atomic read-modify-write). A crash between
-successful send and receipt write leaves the delivery `uncertain`; recovery refuses to
-re-dispatch it automatically, so no automatic duplicate occurs — but the follow-up requires
-manual uncertainty resolution instead of being surfaced in-session.
+**Fix.** `writeReviewDeliveryReceipt` now queues read-modify-write operations by the resolved
+invocation-directory path. Each tail recovers from the prior operation, and cleanup removes only
+the exact current tail after settlement. Receipt replacement stages a unique same-directory temp
+file, writes and syncs it, renames it into place atomically, and best-effort syncs the directory;
+all pre-rename failures close and remove the temp file without changing the prior target. Send,
+uncertain-state, receipt content/message, and idempotency-key behavior are unchanged.
 
-Recommendation:
-- [ ] Serialize receipt writes per invocation dir (reuse the `configUpdateTails` pattern from
-      `src/settings/persistence.ts:35,109-121`) and make the receipt write atomic (temp +
-      rename). The pre-send marker already effectively exists as the persisted `dispatching`
-      state; no protocol change is needed for crash semantics.
-- [ ] Test status: partial — `tests/index.test.ts:1443-1448` verifies multiple sequential
-      receipts in one invocation and `:1843+` verifies an initial receipt; no test covers
-      concurrent receipt writes or atomic-write failure.
+**Tests.** `tests/transmission.test.ts` runs 64 concurrent writes and verifies valid JSON,
+contiguous sequences, exact unique keys, and first-content/subsequent-message behavior. A
+deterministically delayed/interleaved write proves same-directory serialization and independent
+directory progress, including exact-tail pruning. A pre-rename failure seam verifies byte-for-byte
+prior-target preservation, temp cleanup, tail recovery, and a successful subsequent append.
 
 ### 12. LOW-MEDIUM — RESOLVED (2026-09-02): Cancellation silently discarded queued user input
 
@@ -637,7 +635,7 @@ Test status: caps/archiving tested; soak test missing.
   there. Remaining nits: `test:fast` membership (which suites are in the fast tier; it omits
   e.g. `commands.test.ts` and the background-shell tests) is only visible in `package.json`,
   and `test:integration` is just an alias of `npm test`.
-- **Highest-value missing tests** (from findings above): receipt race (11), delivery-failure notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync durability (7), and snapshot concurrency (9). Post-landing fault injection (2), ShellSend stdin lifecycle (3), table bounds (5), SSRF controls (1), and background-shell matcher/output bounds (4) now have dedicated regression coverage.
+- **Highest-value missing tests** (from findings above): delivery-failure notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync durability (7), and snapshot concurrency (9). Post-landing fault injection (2), ShellSend stdin lifecycle (3), table bounds (5), SSRF controls (1), background-shell matcher/output bounds (4), and the receipt race (11) now have dedicated regression coverage.
 - **Docs drift**: README documents `PI_REVIEW_GATE_DISABLED=1` while the launcher strips it
   (L3); keep kill-switch docs and behavior in sync.
 - **Dependency posture is good**: only 8 runtime deps, `package-lock.json` present, and the

@@ -1,5 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { redactSensitiveText } from "./redaction";
 import type { ReviewFinding, ReviewResult } from "./schema";
 
@@ -23,6 +24,25 @@ export interface ReviewTransmissionEnvelope {
     result: ReviewResult;
     findings: Array<{ id: string; finding: ReviewFinding }>;
   }>;
+}
+
+/** @internal Test-only fault and scheduling hooks for receipt persistence. */
+export interface ReviewDeliveryReceiptTestHooks {
+  afterRead?: (invocationDir: string) => Promise<void> | void;
+  beforeRename?: (temporaryPath: string, targetPath: string) => Promise<void> | void;
+}
+
+const reviewDeliveryTails = new Map<string, Promise<void>>();
+let reviewDeliveryReceiptTestHooks: ReviewDeliveryReceiptTestHooks | undefined;
+
+/** @internal Test-only hook installation; not part of the delivery protocol. */
+export function __testOnly_setReviewDeliveryReceiptHooks(hooks: ReviewDeliveryReceiptTestHooks | undefined): void {
+  reviewDeliveryReceiptTestHooks = hooks;
+}
+
+/** @internal Test-only visibility into receipt serialization state. */
+export function __testOnly_getReviewDeliveryReceiptTailCount(): number {
+  return reviewDeliveryTails.size;
 }
 
 export function buildReviewTransmission(input: {
@@ -89,27 +109,72 @@ export async function writeReviewDeliveryReceipt(
   message: string,
   idempotencyKey?: string,
 ): Promise<void> {
-  const path = join(invocationDir, "delivery.json");
-  const existing = await readFile(path, "utf8")
-    .then((content) => JSON.parse(content) as { deliveries?: unknown[] })
-    .catch(() => ({ deliveries: [] as unknown[] }));
-  const deliveries = Array.isArray(existing.deliveries) ? existing.deliveries : [];
-  const delivery: Record<string, unknown> = {
-    sequence: deliveries.length + 1,
-    deliveredAt: new Date().toISOString(),
-    action,
-    idempotencyKey,
-  };
-  if (deliveries.length === 0) {
-    delivery.content = "implementing-model-transmission.md";
-  } else {
-    delivery.message = message;
+  const canonicalInvocationDir = resolve(invocationDir);
+  const prior = reviewDeliveryTails.get(canonicalInvocationDir) ?? Promise.resolve();
+  const operation = prior.catch(() => undefined).then(async () => {
+    const path = join(canonicalInvocationDir, "delivery.json");
+    const existing = await readFile(path, "utf8")
+      .then((content) => JSON.parse(content) as { deliveries?: unknown[] })
+      .catch(() => ({ deliveries: [] as unknown[] }));
+    await reviewDeliveryReceiptTestHooks?.afterRead?.(canonicalInvocationDir);
+    const deliveries = Array.isArray(existing.deliveries) ? existing.deliveries : [];
+    const delivery: Record<string, unknown> = {
+      sequence: deliveries.length + 1,
+      deliveredAt: new Date().toISOString(),
+      action,
+      idempotencyKey,
+    };
+    if (deliveries.length === 0) {
+      delivery.content = "implementing-model-transmission.md";
+    } else {
+      delivery.message = message;
+    }
+    deliveries.push(delivery);
+    await writeReviewDeliveryReceiptAtomically(path, JSON.stringify({
+      recipient: "implementing_model",
+      deliveries,
+    }, null, 2));
+  });
+  const tail = operation.catch(() => undefined);
+  reviewDeliveryTails.set(canonicalInvocationDir, tail);
+  try {
+    await operation;
+  } finally {
+    if (reviewDeliveryTails.get(canonicalInvocationDir) === tail) {
+      reviewDeliveryTails.delete(canonicalInvocationDir);
+    }
   }
-  deliveries.push(delivery);
-  await writeFile(path, JSON.stringify({
-    recipient: "implementing_model",
-    deliveries,
-  }, null, 2), "utf8");
+}
+
+async function writeReviewDeliveryReceiptAtomically(path: string, content: string): Promise<void> {
+  // Preserve the prior target's mode so a manually tightened delivery.json is
+  // not reverted to the umask default by the next receipt write.
+  const mode = await stat(path).then((s) => s.mode & 0o777).catch(() => undefined);
+  const temporaryPath = join(
+    dirname(path),
+    `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporaryPath, "wx", mode);
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await reviewDeliveryReceiptTestHooks?.beforeRename?.(temporaryPath, path);
+    await rename(temporaryPath, path);
+
+    // Directory fsync is not portable across all supported platforms/filesystems.
+    const directory = await open(dirname(path), "r").catch(() => undefined);
+    if (directory) {
+      await directory.sync().catch(() => undefined);
+      await directory.close().catch(() => undefined);
+    }
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function deliverReviewTransmission(input: {

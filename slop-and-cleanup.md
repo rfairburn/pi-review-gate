@@ -123,7 +123,7 @@ IPv4 0.0.0.0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24,
 site-local `fec0::/10`, multicast `ff00::/8`. `src/web/network.ts`
 (`validatedPublicUrl`, used by WebFetch, BrowserExtract, redirect
 re-validation, and the CLI) now delegates to the new module; no new dependency.
-DNS TOCTOU (finding 6) is intentionally out of scope.
+DNS TOCTOU (finding 6) is now closed; see its RESOLVED entry below.
 
 **Tests.** New `tests/web-network.test.ts`: table tests rejecting all mapped
 (hex, dotted, zero-padded, uppercase), compatible, NAT64, 6to4, and L5 ranges
@@ -340,27 +340,94 @@ dist-test/tests/web-tools.test.js (39/39, ~8s). No `dist/` output touched.
 loops or array allocations during HTML table extraction; clamped/truncated output remains
 usable and visibly flagged to the model.
 
-### 6. MEDIUM (defense-in-depth) — DNS validation/connect TOCTOU
+### 6. MEDIUM (defense-in-depth) — RESOLVED (2026-09-02): DNS validation/connect TOCTOU
 
-Refs: `src/web/network.ts:304-323` (`validatedPublicUrl` resolves and checks the hostname),
-then `downloadText` (`:59`) re-resolves via `fetch`; redirects are re-validated per hop
-(`:79`, good); BrowserExtract caches an origin after one validation
-(`src/web/browser.ts:111-115`) and never re-checks it during the render.
+**Root cause (confirmed).** `src/web/network.ts` (`validatedPublicUrl`) resolved and checked the
+hostname, then `downloadText` re-resolved via `fetch` at connect time — a DNS rebinding window
+between validation and connection on every hop. `src/web/browser.ts` cached an origin after one
+validation (`approvedOrigins`) and never re-checked it during the render, so a rebinding hostname
+stayed approved for the whole render, enabling internal scanning/exfiltration from inside the
+browser context.
 
-Impact: an attacker-controlled hostname can answer public at validation time and internal at
-connect time (DNS rebinding); in the browser a rebinding hostname stays approved for the whole
-render, enabling internal scanning/exfiltration from inside the browser context.
+**Fix.**
+- `src/web/network.ts`: `validatePublicUrl` now returns the canonical href, hostname, and every
+  address from the single validation-time DNS answer (all pre-validated public). `downloadText`
+  was converted from global `fetch` to a direct Node-20-compatible `undici@^6.28.0` dependency
+  (7.x would raise the engine floor to ≥20.18.1) using one `undici.request` per hop through a
+  per-hop `Agent` whose custom `lookup` (`createPinnedLookup`) dials ONLY the addresses returned
+  by the immediately preceding validation for that exact hostname/hop; any other hostname —
+  including a re-resolution through real DNS — fails closed. The original hostname is preserved
+  for the HTTP Host header, TLS SNI, and certificate validation. Redirect hops are re-validated
+  and re-pinned before the next dial, an aborted redirect body plus every per-hop dispatcher is
+  destroyed reliably (including on error paths), and `readBoundedBody` was adapted to undici
+  request streams. Hostname resolution is injectable (`resolveHostname`) for deterministic tests.
+- `src/web/browser.ts`: the origin-approval cache is removed. The initially validated hostname is
+  pinned inside Chromium with `--host-resolver-rules=MAP <hostname> <validated address>` (IPv4
+  preferred; IPv6 literal bracketed) plus `--no-proxy-server`, because host-resolver rules do not
+  govern DNS performed by an HTTP/SOCKS/system proxy; neither Chromium nor a proxy can perform a
+  second destination lookup. The resolver is additionally made default-deny by appending an
+  ordered `MAP * ~NOTFOUND` rule after the admitted-host mapping, so sockets Chromium may create
+  without a routeable request — speculative preconnect and alternative-service endpoints — are
+  denied at the network layer before any connection to an unpinned endpoint. Requests to the
+  admitted hostname are allowed for every scheme and port (common http→https upgrade redirects
+  keep working). Actual response remote addresses are
+  verified where Playwright exposes them via `Response.serverAddr()`: every HTTP(S) response's
+  peer must equal the pinned validated address, and a blocked peer, a mismatched peer, or a
+  missing server address aborts the whole render immediately. Browser networking is closed before
+  the final pending-check drain, so a late response or shutdown-time check cannot be omitted from
+  the render result. The compensating control for destinations the MAP rule does not cover is
+  fail-closed: any HTTP(S) request or navigation to a different hostname — including
+  cross-hostname passive resources — or any non-HTTP protocol aborts the request and fails the
+  whole render with actionable compatibility text naming the blocked URL and suggesting direct
+  extraction of that final URL
+  (WebFetch/BrowserExtract on it). Local browser protocols (`about:`, `blob:`, `data:`) remain
+  narrowly allowed, images/media/fonts stay blocked, and WebSockets are closed via
+  `routeWebSocket`.
 
-Recommendation:
-- [ ] Pin the validated address to the actual connection (for Node, use a custom
-      dispatcher/lookup while preserving the original hostname for HTTP Host and TLS
-      SNI/certificate validation), and repeat validation/pinning for every redirect.
-- [ ] For Chromium, remove origin-only approval caching and enforce equivalent per-request
-      connection pinning, such as routing requests through a pinned validating proxy. A
-      second DNS lookup alone does not close the TOCTOU window; if pinning is deferred,
-      document the residual risk explicitly.
-- [ ] Test status: none. A deterministic test is hard (requires controlling DNS); document as
-      accepted residual risk if pinning is deferred.
+**Tests.** New `tests/web-dns-pinning.test.ts` (22 deterministic tests, no real DNS or external
+network): injected-resolver validation returning canonical href/hostname/all addresses and
+re-resolving on every call; DNS-answer-change simulation proving a private second answer is
+rejected; pinned-lookup table tests (only validated addresses, family filtering, fail-closed for
+any hostname outside the pin set including `localhost`, `127.0.0.1`, and a trailing-dot spelling);
+real-socket tests proving the pinned agent dials only the pinned address with a hostname-based
+Host header and refuses `localhost` without opening a connection (no second-resolution fallback);
+downloadText redirect e2e tests proving per-hop validation/pinning, hostname-based Host headers
+on both hops, exact validated pins passed to each dispatcher, reliable dispatcher destruction
+(including on HTTP 500 failures), a rebinding redirect hop rejected before any dispatcher or
+dial exists, and a same-hostname DNS flip rejected on the second resolution; no-loopback
+controls (loopback literals and private injected answers rejected with zero connections and zero
+dispatchers); Chromium host-resolver-rule formatting for IPv4/IPv6/literal pins with IPv4
+preference; pinned peer-address verification tests (pinned IPv4 match, bracketed IPv6 match,
+blocked/private peers, public-but-different peers, missing server address, non-HTTP(S) skipped);
+browser route policy table tests (same-hostname HTTP(S) allowed for every scheme and port,
+IPv6-literal hostnames compared without URL brackets, local protocols narrowly allowed,
+cross-hostname/`javascript:`/unparseable and cross-hostname passive requests blocked with
+actionable text, same-hostname passive requests blocked without tainting); launch-argument and
+resolver-rule tests asserting `--no-proxy-server`, the exact admitted-host MAP rule, and the
+ordered `MAP * ~NOTFOUND` default denial; a browser-finalization test proving a failing
+address check appended during network closure still aborts the render; renderWithChromium
+failing closed before any browser launch on invalid answers; and a Chromium-backed connection
+control (skipped automatically when Chromium is not installed) driving the pinned resolver rules
+through a real headless browser without any route interception installed against loopback
+listeners: the admitted hostname renders through the MAP rule while a direct-IP loopback
+endpoint — the route-blind speculative-preconnect and alternative-service vector — rejects with
+ERR_NAME_NOT_RESOLVED and receives zero new connections, proving the default denial applies to
+IP literals rather than merely to nonresolving names.
+
+**Validation.** `npm run check:static`; `npm run build:test`; focused `node --test` runs of
+dist-test/tests/web-dns-pinning.test.js (22/22, including the Chromium-backed connection control;
+that test skips automatically in environments without Playwright Chromium), web-network.test.js,
+web-tools.test.js, and ensure-playwright-chromium.test.js (75/75 combined with Chromium present;
+without Chromium the same run reports 75 tests, 74 pass, and 1 skipped). No `dist/` output
+touched; no `npm test`/`test:package` run.
+
+**Impact.** WebFetch sockets can only connect to addresses returned by the immediately preceding
+validation for that exact hop, and BrowserExtract pins the requested hostname in the browser while
+verifying each response's actual peer address, so it cannot contact an unpinned HTTP(S)
+destination; the DNS rebinding window is closed on every path instead of being accepted residual
+risk. Compatibility trade-off: BrowserExtract now refuses pages that require cross-hostname HTTP(S)
+subresources or cross-hostname redirects; the error names the blocked URL and directs the model to
+extract that final URL directly.
 
 ### 7. MEDIUM-LOW — Inconsistent fsync discipline across durable record writers
 

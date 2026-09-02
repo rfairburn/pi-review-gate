@@ -145,6 +145,17 @@ flow; table-column projection is currently HTML-only. PDF detection uses both
 the HTTP content type and file magic, and password-protected, corrupt, or
 oversized documents fail explicitly.
 
+Both download paths are DNS-rebinding-hardened. Every URL and every redirect
+hop is validated immediately before that hop is dialed: the URL is canonicalized,
+credentials are rejected, and the hostname is resolved exactly once with every
+returned address required to be public. The connection then dials only those
+validated addresses through a pinned DNS lookup (`undici` dispatcher with a
+custom `lookup`), while the request keeps the original hostname for the HTTP
+`Host` header, TLS SNI, and certificate validation. A DNS answer that changes
+between validation and connect cannot redirect a socket, a second resolution
+can never bypass the blocklist, and per-hop dispatchers are destroyed after
+each download so no unpinned connection survives.
+
 `BrowserExtract` is the rendered-page extraction fallback. Use it only after
 `WebFetch` reports `dynamic_content_suspected` or plausibly fails because the
 result requires JavaScript rendering, asynchronous page population,
@@ -156,6 +167,26 @@ rendered HTML, closes Chromium, and exposes the same `find`, `index`,
 `nextIndex`, table inventory, and `columns` operations as `WebFetch`. It does
 not click, type, authenticate, interactively scroll, capture screenshots, or
 maintain a browser session; it is not an interactive browser or vision tool.
+BrowserExtract also pins DNS inside the browser, in two layers. The initially
+validated hostname is mapped to one validated public address with Chromium
+host-resolver rules (IPv4 preferred), with browser proxying disabled so
+proxy-side DNS cannot bypass that mapping, and the resolver is then made
+default-deny (`MAP * ~NOTFOUND` after the admitted-host mapping), so sockets
+Chromium may create without a routeable request — speculative preconnect or
+alternative-service endpoints — cannot reach any other hostname either.
+Chromium therefore never performs a second, unpinnable DNS lookup, and requests
+to that hostname are allowed for every scheme and port (so common http→https
+upgrade redirects keep working). Every
+HTTP(S) response's actual remote address is then verified through Playwright's
+`Response.serverAddr()`: a response from a blocked address, a non-pinned
+address, or a response with no verifiable server address aborts the whole
+render immediately. Requests to any other hostname — which the MAP rule does
+not pin — fail the whole render closed with a message naming the blocked URL
+and suggesting direct extraction of that final URL with `WebFetch` instead.
+Local browser protocols (`about:`, `blob:`, `data:`) remain narrowly allowed,
+WebSockets are always closed, and images/media/fonts are blocked (and reported
+when cross-hostname), so a same-hostname page renders normally while any
+cross-hostname request fails with actionable compatibility text.
 By default, package installation verifies and, when necessary, downloads
 Playwright's compatible Chromium build. CI and server installs that do not need
 `BrowserExtract` can skip that browser download with the documented opt-in

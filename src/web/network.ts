@@ -1,7 +1,11 @@
 import { spawn } from "node:child_process";
 import { lookup } from "node:dns/promises";
+import type { IncomingHttpHeaders } from "node:http";
+import type { LookupFunction } from "node:net";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
+import type { Readable } from "node:stream";
+import { Agent, request, type Dispatcher } from "undici";
 import { isBlockedAddress } from "./ip";
 
 export interface NetworkOptions {
@@ -11,6 +15,18 @@ export interface NetworkOptions {
   signal?: AbortSignal;
   method?: "GET" | "POST";
   body?: string;
+  /**
+   * Seam for deterministic tests: hostname-to-address resolver used for every
+   * per-hop validation. Defaults to the operating system resolver. Production
+   * callers never set this.
+   */
+  resolveHostname?: HostResolver;
+  /**
+   * Seam for deterministic tests: builds the per-hop dispatcher. Production
+   * callers never set this; the default pins the connection to exactly the
+   * addresses returned by the immediately preceding validation.
+   */
+  createDispatcher?: (validated: ValidatedUrl) => Dispatcher;
 }
 
 export interface DownloadedText {
@@ -45,21 +61,30 @@ export interface SearchResponse {
 }
 
 export async function downloadText(url: string, options: NetworkOptions): Promise<DownloadedText> {
-  const requested = await validatedPublicUrl(url);
+  const resolve = options.resolveHostname ?? defaultHostResolver;
+  const createDispatcher = options.createDispatcher ?? createPinnedAgent;
+  const requested = await validatePublicUrl(url, resolve);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new Error(`Request timed out after ${options.timeoutMs}ms.`)), options.timeoutMs);
   timeout.unref?.();
   const onAbort = () => controller.abort(options.signal?.reason ?? new Error("Request cancelled."));
   options.signal?.addEventListener("abort", onAbort, { once: true });
+  const dispatchers: Dispatcher[] = [];
   try {
     let current = requested;
     let method = options.method ?? "GET";
     let body = options.body;
     for (let redirects = 0; redirects <= 5; redirects += 1) {
-      let response: Response;
+      // Each hop dials through a dispatcher whose lookup only knows the
+      // addresses validated immediately above for this exact hop; a per-hop
+      // dispatcher also guarantees earlier hops cannot be reused for a
+      // destination that was never validated.
+      const dispatcher = createDispatcher(current);
+      dispatchers.push(dispatcher);
+      let response: Dispatcher.ResponseData;
       try {
-        response = await fetch(current, {
-          redirect: "manual",
+        response = await request(current.href, {
+          dispatcher,
           signal: controller.signal,
           method,
           ...(method === "POST" && body !== undefined ? { body } : {}),
@@ -67,34 +92,46 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
             "user-agent": options.userAgent,
             accept: "text/html,application/xhtml+xml,text/plain,application/json;q=0.8,*/*;q=0.2",
             "accept-language": "en-US,en;q=0.8",
+            // Unlike global fetch, undici.request does not transparently
+            // decompress; never invite an encoding we cannot decode.
+            "accept-encoding": "identity",
             ...(method === "POST" ? { "content-type": "application/x-www-form-urlencoded" } : {}),
           },
         });
       } catch (error) {
-        throw new Error(`Network request failed for ${current}: ${errorDiagnostic(error)}`, { cause: error });
+        throw new Error(`Network request failed for ${current.href}: ${errorDiagnostic(error)}`, { cause: error });
       }
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get("location");
-        if (!location) throw new Error(`HTTP ${response.status} redirect omitted Location.`);
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        const location = headerValue(response.headers, "location");
+        if (!location) throw new Error(`HTTP ${response.statusCode} redirect omitted Location.`);
         if (redirects === 5) throw new Error("Redirect limit exceeded.");
-        current = await validatedPublicUrl(new URL(location, current).href);
-        if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === "POST")) {
+        // Abandon the redirect response body together with its connection so an
+        // unterminated stream cannot hold the dispatcher open; discarding an
+        // unread body surfaces as UND_ERR_ABORTED on the stream, which is
+        // intentionally swallowed.
+        response.body.on("error", () => undefined);
+        response.body.destroy();
+        current = await validatePublicUrl(new URL(location, current.href).href, resolve);
+        if (response.statusCode === 303 || ((response.statusCode === 301 || response.statusCode === 302) && method === "POST")) {
           method = "GET";
           body = undefined;
         }
         continue;
       }
-      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
-      const declared = Number(response.headers.get("content-length") ?? "0");
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw new Error(`HTTP ${response.statusCode}`.trim());
+      }
+      const declared = Number(headerValue(response.headers, "content-length") || "0");
       if (Number.isFinite(declared) && declared > options.maxBytes) {
         throw new Error(`Response declares ${declared} bytes; limit is ${options.maxBytes}.`);
       }
-      const bytes = await readBoundedBody(response, options.maxBytes, controller.signal);
+      const bytes = await readBoundedBody(response.body, options.maxBytes, controller.signal);
+      const contentType = headerValue(response.headers, "content-type");
       return {
-        requestedUrl: requested,
-        finalUrl: current,
-        contentType: response.headers.get("content-type") ?? "application/octet-stream",
-        text: decodeResponseText(response.headers.get("content-type"), bytes),
+        requestedUrl: requested.href,
+        finalUrl: current.href,
+        contentType: contentType || "application/octet-stream",
+        text: decodeResponseText(contentType || null, bytes),
         data: bytes,
         bytes: bytes.byteLength,
         fetchedAt: new Date().toISOString(),
@@ -104,6 +141,9 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
   } finally {
     clearTimeout(timeout);
     options.signal?.removeEventListener("abort", onAbort);
+    // Reliable teardown: every per-hop dispatcher (and its pinned sockets) is
+    // destroyed even when validation, connection, or body reading throws.
+    await Promise.allSettled(dispatchers.map((dispatcher) => dispatcher.destroy()));
   }
 }
 
@@ -284,22 +324,23 @@ export function canonicalSearchUrl(value: string): string {
   return `${hostname}${url.port ? `:${url.port}` : ""}${pathname}${search ? `?${search}` : ""}`;
 }
 
-async function readBoundedBody(response: Response, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
-  if (!response.body) return new Uint8Array();
-  const reader = response.body.getReader();
+async function readBoundedBody(body: Readable, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let size = 0;
+  // Errors on a body we intentionally abandon (timeout, size cap) must not
+  // become unhandled rejections.
+  body.on("error", () => undefined);
   try {
-    while (true) {
+    for await (const chunk of body) {
       if (signal.aborted) throw signal.reason;
-      const next = await reader.read();
-      if (next.done) break;
-      size += next.value.byteLength;
+      const next = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      size += next.byteLength;
       if (size > maxBytes) throw new Error(`Downloaded response exceeded ${maxBytes} bytes.`);
-      chunks.push(next.value);
+      chunks.push(next);
     }
   } finally {
-    reader.releaseLock();
+    // Never leave an unterminated response stream holding the connection.
+    body.destroy();
   }
   const output = new Uint8Array(size);
   let offset = 0;
@@ -310,7 +351,38 @@ async function readBoundedBody(response: Response, maxBytes: number, signal: Abo
   return output;
 }
 
-export async function validatedPublicUrl(value: string): Promise<string> {
+function headerValue(headers: IncomingHttpHeaders, name: string): string {
+  const value = headers[name.toLowerCase()];
+  const first = Array.isArray(value) ? value[0] : value;
+  return first ?? "";
+}
+
+/** Resolves one hostname to every address the DNS answer currently carries. */
+export type HostResolver = (hostname: string) => Promise<readonly string[]>;
+
+export const defaultHostResolver: HostResolver = async (hostname) => {
+  if (isIP(hostname)) return [hostname];
+  const records = await lookup(hostname, { all: true, verbatim: true });
+  return records.map((record) => record.address);
+};
+
+export interface ValidatedUrl {
+  /** Canonical URL (WHATWG-normalized, fragment stripped) for this hop. */
+  href: string;
+  /** Lowercase hostname without IPv6 brackets. */
+  hostname: string;
+  /** Every address the validation-time DNS answer contained, all pre-validated public. */
+  addresses: readonly string[];
+}
+
+/**
+ * SSRF gate for one exact URL/hop: validates the URL and resolves the hostname
+ * once, returning the canonical href, hostname, and every validated public
+ * address. Callers must dial only the returned addresses (see
+ * `createPinnedLookup` / `createPinnedAgent`); re-resolving later would reopen
+ * the DNS rebinding window.
+ */
+export async function validatePublicUrl(value: string, resolve: HostResolver = defaultHostResolver): Promise<ValidatedUrl> {
   let url: URL;
   try {
     url = new URL(value);
@@ -320,15 +392,68 @@ export async function validatedPublicUrl(value: string): Promise<string> {
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Only http and https URLs are supported.");
   if (url.username || url.password) throw new Error("URLs containing credentials are not allowed.");
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
-  const addresses = isIP(hostname)
-    ? [{ address: hostname }]
-    : await lookup(hostname, { all: true, verbatim: true });
+  const addresses = await resolve(hostname);
   if (addresses.length === 0) throw new Error(`Hostname did not resolve: ${hostname}`);
-  for (const { address } of addresses) {
+  for (const address of addresses) {
     if (isBlockedAddress(address)) throw new Error(`URL resolves to a non-public address: ${address}`);
   }
   url.hash = "";
-  return url.href;
+  return { href: url.href, hostname, addresses: [...addresses] };
+}
+
+/** Backwards-compatible convenience wrapper returning only the canonical href. */
+export async function validatedPublicUrl(value: string, resolve?: HostResolver): Promise<string> {
+  return (await validatePublicUrl(value, resolve)).href;
+}
+
+/**
+ * A net/tls-compatible `lookup` function (same contract as `dns.lookup`) that
+ * answers ONLY from the pinned address set. It never consults the operating
+ * system resolver, so a DNS answer that changes between validation and connect
+ * cannot redirect the socket: any hostname outside the pin set — including the
+ * same hostname resolved again through real DNS — fails closed.
+ */
+export type PinnedLookup = LookupFunction;
+
+export function createPinnedLookup(pins: ReadonlyMap<string, readonly string[]>): PinnedLookup {
+  return (hostname, options, callback) => {
+    const rawFamily = options.family;
+    const family = rawFamily === 4 || rawFamily === "IPv4" ? 4 : rawFamily === 6 || rawFamily === "IPv6" ? 6 : 0;
+    const pinned = pins.get(hostname.toLowerCase());
+    if (!pinned || pinned.length === 0) {
+      callback(
+        new Error(
+          `DNS pinning blocked resolution of ${hostname}: only addresses validated immediately before this request may be contacted.`,
+        ),
+        "",
+        0,
+      );
+      return;
+    }
+    const matches = pinned.filter((address) => family === 0 || isIP(address) === family);
+    if (matches.length === 0) {
+      callback(new Error(`No validated IPv${family} address is pinned for ${hostname}.`), "", 0);
+      return;
+    }
+    if (options.all) {
+      callback(null, matches.map((address) => ({ address, family: isIP(address) })));
+      return;
+    }
+    callback(null, matches[0]!, isIP(matches[0]!));
+  };
+}
+
+/**
+ * Production dispatcher for one validated hop: its socket lookup dials only
+ * the validated addresses while the request keeps the original hostname for
+ * the HTTP Host header, TLS SNI, and certificate validation.
+ */
+export function createPinnedAgent(validated: ValidatedUrl): Dispatcher {
+  return new Agent({
+    connect: {
+      lookup: createPinnedLookup(new Map([[validated.hostname, validated.addresses]])),
+    },
+  });
 }
 
 function parseDdgsOutput(value: Record<string, unknown>): DdgsSearchOutput {

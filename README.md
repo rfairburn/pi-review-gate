@@ -97,7 +97,36 @@ capture truncation.
 
 ### Native web research
 
-`WebSearch` uses the API-key-free DDGS metasearch library. It passes the requested result count directly to DDGS, retries one empty or failed attempt, canonicalizes duplicate URLs, reports optional provider-supplied dates and weak snippets without inventing missing data, and supports `excludeDomains`. The launcher provisions the pinned Python dependency in a private cache environment and every Pi process invokes it on demand.
+`WebSearch` uses the API-key-free DDGS metasearch library. It passes the requested result count directly to DDGS, retries one empty or failed attempt, canonicalizes duplicate URLs, reports optional provider-supplied dates and weak snippets without inventing missing data, and supports `excludeDomains`. The launcher provisions the pinned Python dependency in a per-user cache environment and every Pi process invokes it on demand.
+
+The Python bridge is deliberately not configurable: production always resolves
+the packaged `scripts/ddgs-search.py` relative to the loaded extension and
+invokes it with Python's isolated mode (`-I`). The
+legacy `PI_REVIEW_GATE_DDGS_HELPER` variable is ignored, so an inherited value
+cannot substitute an arbitrary helper. The launcher and web CLI wrapper export
+`PI_REVIEW_GATE_DDGS_PYTHON` to point at their isolated venv; direct extension
+invocation without those wrappers may set that interpreter override itself —
+this is required when DDGS is installed only via `PYTHONPATH` or user
+site-packages, because isolated mode ignores both, so the override must point
+at an interpreter whose own environment contains DDGS.
+`PI_REVIEW_GATE_DDGS_VENV` and `XDG_CACHE_HOME` (or `HOME` when the former is
+unset) select the venv/cache location. The default venv lives in a
+user-writable cache by design. These interpreter, environment, and cache
+controls are trusted-user boundaries, not safe inputs to accept from an
+untrusted repository, task, or process environment.
+
+DDGS setup fails closed: `scripts/ensure-ddgs.sh` provisions exactly
+`ddgs==9.15.0`, resolves all of its dependencies through pip, requires binary
+distributions, avoids pip's reusable download cache, runs every Python
+invocation (venv creation, pip, version validation) in isolated mode (`-I`) so
+a reviewed repository's local modules cannot shadow the interpreter or pip, and
+verifies both the installed DDGS distribution version and `pip check` before
+continuing. The
+version constraint and these checks are defense in depth, not cryptographic
+integrity: transitive dependencies and artifacts are not fully hash-pinned.
+The configured PyPI/index source and local pip configuration therefore remain
+part of the trusted setup boundary.
+
 `WebFetch` downloads and indexes the complete selected HTML page or PDF, but
 returns only a bounded structural range. Its result includes `nextIndex` when
 more blocks remain. HTML results include a whole-page table inventory, possible

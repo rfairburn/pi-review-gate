@@ -185,9 +185,12 @@ async function runDdgsWithRetry(run: DdgsRunner, request: DdgsSearchRequest, sig
 export async function runDdgsSearch(request: DdgsSearchRequest, signal?: AbortSignal): Promise<DdgsSearchOutput> {
   if (signal?.aborted) throw new Error("DDGS search was cancelled.");
   const python = process.env.PI_REVIEW_GATE_DDGS_PYTHON || "python3";
-  const helper = process.env.PI_REVIEW_GATE_DDGS_HELPER || resolve(__dirname, "../../../scripts/ddgs-search.py");
+  const helper = resolveDdgsHelperPath();
   return await new Promise<DdgsSearchOutput>((resolveResult, reject) => {
-    const child = spawn(python, [helper], { stdio: ["pipe", "pipe", "pipe"] });
+    // -I keeps Python from honoring PYTHON* environment variables and from
+    // placing the current directory on sys.path, matching the isolated-mode
+    // posture used by scripts/ensure-ddgs.sh during provisioning.
+    const child = spawn(python, ["-I", helper], { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let failure: Error | undefined;
@@ -238,6 +241,11 @@ export async function runDdgsSearch(request: DdgsSearchRequest, signal?: AbortSi
     });
     child.stdin.end(JSON.stringify(request));
   });
+}
+
+/** Resolve the packaged DDGS bridge relative to this compiled module. */
+export function resolveDdgsHelperPath(): string {
+  return resolve(__dirname, "../../../scripts/ddgs-search.py");
 }
 
 export function normalizeDdgsResults(rawResults: DdgsRawResult[], rankOffset = 0): SearchResult[] {

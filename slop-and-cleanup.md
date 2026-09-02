@@ -594,10 +594,14 @@ Test status: caps/archiving tested; soak test missing.
   only at shutdown `:934`) and neither map is cleared in `detach()`; `steeringTails` entries
   *are* deleted when their tail settles (`:1741`). Functional impact nil today since new
   groups get fresh UUIDs — prune `saveTails` on group detach.
-- L10. `scripts/ensure-ddgs.sh` pip-installs `ddgs==9.15.0` without hash pinning into a
-  user-writable venv, and `runDdgsSearch` honors `PI_REVIEW_GATE_DDGS_PYTHON`/
-  `PI_REVIEW_GATE_DDGS_HELPER` env overrides — trusted-environment assumption; document or
-  pin harder (defense-in-depth).
+- L10. **RESOLVED (2026-09-02):** production no longer honors the
+  `PI_REVIEW_GATE_DDGS_HELPER` override; it resolves only the packaged bridge and runs it with
+  Python isolated mode. Provisioning now uses isolated mode throughout, installs the exact DDGS
+  version with binary-only/no-cache/noninteractive eager dependency resolution, and verifies
+  both installed metadata and `pip check` before continuing. README documents the remaining
+  trusted-user boundaries (`PI_REVIEW_GATE_DDGS_PYTHON`, venv/cache path, package index/pip
+  configuration) and explicitly states that version pinning is not cryptographic hash pinning.
+  Launcher and web-network tests verify isolated invocation and that helper injection is ignored.
 - L11. A same-conversation/different-cwd session start overwrites and loses the prior
   persisted state (data-loss/durability debt — kept in lower-priority cleanup, not
   observability-only). On `session_start`, `discardSessionState(state)`

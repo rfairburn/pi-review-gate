@@ -231,6 +231,59 @@ test("persistent launcher fails clearly when no fallback config exists", async (
   );
 });
 
+test("ensure-ddgs provisions and validates Python in isolated mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-ddgs-provision-"));
+  const home = join(root, "home");
+  const capture = join(root, "capture");
+  const ddgsVenv = join(root, "ddgs");
+  await Promise.all([
+    mkdir(capture, { recursive: true }),
+    mkdir(join(ddgsVenv, "bin"), { recursive: true }),
+  ]);
+  const callsPath = join(capture, "python-calls");
+  // Recording stub: fails the first version validation so the install path
+  // also runs, then succeeds; pip invocations always succeed.
+  const ddgsPythonPath = join(ddgsVenv, "bin", "python");
+  await writeFile(ddgsPythonPath, [
+    "#!/usr/bin/env bash",
+    "{ printf 'CALL\\t'; printf '%s\\t' \"$@\"; printf '\\n'; } \u003e\u003e \"$CAPTURE_DIR/python-calls\"",
+    'if [[ "$1" == "-I" && "$2" == "-c" ]]; then',
+    '  count=$(cat "$CAPTURE_DIR/check-count" 2>/dev/null || echo 0)',
+    '  count=$((count + 1))',
+    '  printf \'%s\\n\' "$count" \u003e "$CAPTURE_DIR/check-count"',
+    '  [[ "$count" -ge 2 ]] && exit 0',
+    "  exit 1",
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n"), "utf8");
+  await chmod(ddgsPythonPath, 0o755);
+
+  await execFileAsync("bash", [resolve("scripts/ensure-ddgs.sh")], {
+    env: {
+      ...process.env,
+      HOME: home,
+      CAPTURE_DIR: capture,
+      PI_REVIEW_GATE_DDGS_VENV: ddgsVenv,
+    },
+  });
+
+  const calls = (await readFile(callsPath, "utf8")).split("\n").filter((line) => line.length > 0);
+  // The stub fails the first validation, so all three command shapes run:
+  // version validation (-c), pip install, and pip check (plus revalidation).
+  assert.ok(calls.length >= 4, `expected all Python invocations to be recorded, got: ${calls.join(" | ")}`);
+  for (const call of calls) {
+    const args = call.split("\t").slice(1);
+    // Isolated mode must come first: the launcher's working directory may be
+    // an untrusted reviewed repository, so cwd must not be on sys.path.
+    assert.equal(args[0], "-I", `Python invocation not in isolated mode: ${call}`);
+  }
+  const pipCalls = calls.filter((call) => call.includes("\tpip\t"));
+  assert.ok(pipCalls.some((call) => call.includes("\tinstall\t")), "expected a pip install invocation");
+  assert.ok(pipCalls.some((call) => call.includes("\tcheck\t")), "expected a pip check invocation");
+  assert.ok(calls.some((call) => call.includes("\t-c\t")), "expected a -c validation invocation");
+});
+
 function isExecError(value: unknown): value is Error & { code: number; stderr: string } {
   return typeof value === "object" && value !== null && "code" in value && "stderr" in value;
 }

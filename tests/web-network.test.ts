@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { isBlockedAddress, parseIp } from "../src/web/ip";
-import { decodeResponseText, downloadText, validatedPublicUrl, type NetworkOptions } from "../src/web/network";
+import { decodeResponseText, downloadText, resolveDdgsHelperPath, runDdgsSearch, validatedPublicUrl, type NetworkOptions } from "../src/web/network";
 
 // Unit table tests for the canonical, fail-closed SSRF range check.
 
@@ -225,3 +228,49 @@ test("decodeResponseText decodes absent charset declarations as UTF-8", () => {
     assert.equal(decodeResponseText(contentType, utf8Hello), "héllo", `expected ${JSON.stringify(contentType)} to decode as UTF-8`);
   }
 });
+
+test("runDdgsSearch ignores helper overrides and invokes the packaged bridge", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-ddgs-helper-"));
+  const fakePython = join(root, "python");
+  const injectedHelper = join(root, "injected-helper.py");
+  const capturedHelper = join(root, "captured-helper");
+  await writeFile(injectedHelper, "this helper must never execute\n", "utf8");
+  await writeFile(fakePython, [
+    "#!/usr/bin/env bash",
+    // With -I, the packaged helper path is argv[2].
+    "printf '%s' \"$2\" > \"$CAPTURED_HELPER\"",
+    "cat >/dev/null",
+    "printf '%s' '{\"ok\":true,\"results\":[]}'",
+    "",
+  ].join("\n"), "utf8");
+  await chmod(fakePython, 0o755);
+
+  const previousPython = process.env.PI_REVIEW_GATE_DDGS_PYTHON;
+  const previousHelper = process.env.PI_REVIEW_GATE_DDGS_HELPER;
+  const previousCapture = process.env.CAPTURED_HELPER;
+  process.env.PI_REVIEW_GATE_DDGS_PYTHON = fakePython;
+  process.env.PI_REVIEW_GATE_DDGS_HELPER = injectedHelper;
+  process.env.CAPTURED_HELPER = capturedHelper;
+  try {
+    assert.deepEqual(
+      await runDdgsSearch({ query: "trust boundary", maxResults: 1, timeoutMs: 2_000 }),
+      { results: [] },
+    );
+  } finally {
+    restoreEnvironment("PI_REVIEW_GATE_DDGS_PYTHON", previousPython);
+    restoreEnvironment("PI_REVIEW_GATE_DDGS_HELPER", previousHelper);
+    restoreEnvironment("CAPTURED_HELPER", previousCapture);
+  }
+
+  const helper = await readFile(capturedHelper, "utf8");
+  assert.equal(helper, resolveDdgsHelperPath());
+  // Anchored to the compiled test file (dist-test/tests/) so the expectation
+  // does not depend on the test process working directory.
+  assert.equal(helper, resolve(__dirname, "../../scripts/ddgs-search.py"));
+  assert.notEqual(helper, injectedHelper);
+});
+
+function restoreEnvironment(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}

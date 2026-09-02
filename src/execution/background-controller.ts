@@ -87,6 +87,14 @@ export interface BackgroundCommandRecord {
   error?: string;
 }
 
+export interface BackgroundForceMergeInput {
+  executionId?: string;
+  taskId?: string;
+  mergeAnyhow: boolean;
+  instructionId: string;
+  actor: "model" | "user" | "system";
+}
+
 export interface BackgroundActivityEvent {
   sequence: number;
   at: string;
@@ -235,6 +243,15 @@ interface RuntimeTask {
   controlStatus: "pending" | "registered" | "closed";
 }
 
+/** A force-merge request that is not a runtime task but must stay cancellable. */
+interface PendingForceMerge {
+  abort: AbortController;
+  /** Resolves once the force-merge settles and its durable outcome is saved. */
+  done: Promise<void>;
+  /** True once the source mutation lease has been acquired. */
+  acquired: boolean;
+}
+
 interface PersistedGroupRevision {
   revision: number;
   updatedAt: string;
@@ -313,6 +330,7 @@ export interface BackgroundReviewReadinessTask {
 export class BackgroundExecutionController {
   private readonly groups = new Map<string, BackgroundExecutionGroup>();
   private readonly runtimes = new Map<string, RuntimeTask>();
+  private readonly pendingForceMerges = new Map<string, PendingForceMerge>();
   private readonly saveTails = new Map<string, Promise<void>>();
   private readonly steeringTails = new Map<string, Promise<void>>();
   private readonly archivedTasks = new Map<string, { updatedAt: string; integritySha256: string }>();
@@ -713,6 +731,40 @@ export class BackgroundExecutionController {
     }
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) return this.inspect(group.executionId, task.taskId);
+    // A force-merge waiting for source workspace access has no runtime, but it
+    // must still be quiesceable: cancel it instead of blocking or failing.
+    const pendingMerge = this.pendingForceMerges.get(task.taskId);
+    if (pendingMerge && !pendingMerge.acquired && !this.runtimes.has(task.taskId)) {
+      const command: BackgroundCommandRecord = {
+        instructionId: input.instructionId,
+        action: "interrupt",
+        actor: input.actor,
+        mode: input.mode,
+        status: "delivered",
+        createdAt: new Date().toISOString(),
+        deliveredAt: new Date().toISOString(),
+      };
+      task.commands.push(command);
+      pendingMerge.abort.abort(new Error(
+        `Force-merge cancelled by a ${input.actor} interrupt while it waited for source workspace access; no checkpoint landed and the main workspace is unchanged.`,
+      ));
+      await pendingMerge.done;
+      // pendingMerge.acquired is set synchronously right after the lease was
+      // granted, so it is the authoritative signal for whether the merge had
+      // already entered the source workspace before the interrupt landed.
+      if (pendingMerge.acquired) {
+        command.status = "failed";
+        command.error = `The force-merge for task ${task.taskId} entered the source workspace before the interrupt could cancel it; inspect its durable outcome.`;
+      } else {
+        command.status = "acknowledged";
+        command.acknowledgedAt = new Date().toISOString();
+        this.addActivity(task, "interrupt", "Cancelled a force-merge that was waiting for source workspace access; no checkpoint landed and the main workspace is unchanged.");
+      }
+      await this.save(group);
+      await this.publishAssociations();
+      this.updateIndicator();
+      return this.inspect(group.executionId, task.taskId);
+    }
     const runtime = this.runtimes.get(task.taskId);
     if (!runtime && task.state !== "queued") throw new Error(`Task ${task.taskId} has no live or queued writer to interrupt.`);
     const command: BackgroundCommandRecord = {
@@ -786,13 +838,8 @@ export class BackgroundExecutionController {
     return this.inspect(group.executionId, task.taskId);
   }
 
-  async forceMerge(input: {
-    executionId?: string;
-    taskId?: string;
-    mergeAnyhow: boolean;
-    instructionId: string;
-    actor: "model" | "user" | "system";
-  }): Promise<BackgroundInspection> {
+  async forceMerge(input: BackgroundForceMergeInput): Promise<BackgroundInspection> {
+    if (this.shuttingDown) throw new Error("Application shutdown is in progress.");
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
     if (group.kind === "research") throw new Error("Research tasks have reports, not mergeable checkpoints; force-merge is unavailable.");
     if (this.runtimes.has(task.taskId) || isActiveTaskState(task.state)) {
@@ -801,6 +848,32 @@ export class BackgroundExecutionController {
     if (!task.bundle) throw new Error(`Task ${task.taskId} has no verified recovery bundle.`);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) return this.inspect(group.executionId, task.taskId);
+    if (this.pendingForceMerges.has(task.taskId)) {
+      throw new Error(`Task ${task.taskId} already has a force-merge in progress; await its outcome before retrying.`);
+    }
+    // Register before any await so shutdown or a later interrupt can always
+    // cancel the request while it waits for source workspace access, instead
+    // of blocking indefinitely behind another mutation or conflict gate.
+    let signalDone!: () => void;
+    const done = new Promise<void>((resolveDone) => { signalDone = resolveDone; });
+    const pending: PendingForceMerge = { abort: new AbortController(), done, acquired: false };
+    this.pendingForceMerges.set(task.taskId, pending);
+    try {
+      return await this.runForceMerge(input, group, task, pending);
+    } finally {
+      this.pendingForceMerges.delete(task.taskId);
+      signalDone();
+    }
+  }
+
+  private async runForceMerge(
+    input: BackgroundForceMergeInput,
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    pending: PendingForceMerge,
+  ): Promise<BackgroundInspection> {
+    const bundle = task.bundle;
+    if (!bundle) throw new Error(`Task ${task.taskId} has no verified recovery bundle.`);
     const command: BackgroundCommandRecord = {
       instructionId: input.instructionId,
       action: "force_merge",
@@ -812,7 +885,18 @@ export class BackgroundExecutionController {
     task.commands.push(command);
     await this.save(group);
 
-    const inspection = await inspectOperation(task.bundle);
+    // Never queue indefinitely behind an active conflict gate: refuse promptly
+    // with an actionable durable outcome instead of waiting for a mark-clean
+    // that may never arrive.
+    const blocked = sourceMutationCoordinator.blocked(group.cwd);
+    if (blocked.blocked) {
+      command.status = "failed";
+      command.error = `Force-merge refused: the source workspace is blocked by an active conflict gate (${blocked.reason ?? "unresolved conflicts"}). Resolve the conflicts and call SubtasksMarkClean before retrying force-merge.`;
+      await this.save(group);
+      throw new Error(command.error);
+    }
+
+    const inspection = await inspectOperation(bundle);
     const checkpoint = inspection.record.checkpoint;
     const accepted = task.result?.taskResults[0]?.acceptedCommitSha;
     const commitSha = accepted ?? checkpoint?.commitSha;
@@ -822,7 +906,7 @@ export class BackgroundExecutionController {
       await this.save(group);
       throw new Error(command.error);
     }
-    const capture = await readWaveCaptureRecord(task.bundle.waveRoot);
+    const capture = await readWaveCaptureRecord(bundle.waveRoot);
     const reviewWindowId = this.input.state.reviewWindow?.id;
     const parentBaseline = activeExchangeBaseline(this.input.state);
     const preTaskSnapshot = parentBaseline ? await createWorkspaceSnapshot(group.cwd, {
@@ -830,8 +914,10 @@ export class BackgroundExecutionController {
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
       reuseUnchangedFrom: parentBaseline,
     }) : undefined;
-    const release = await sourceMutationCoordinator.acquire(group.cwd);
+    let release: (() => void) | undefined;
     try {
+      release = await sourceMutationCoordinator.acquire(group.cwd, pending.abort.signal);
+      pending.acquired = true;
       command.status = "delivered";
       command.deliveredAt = new Date().toISOString();
       transitionTaskState(task, "waiting_to_land");
@@ -901,16 +987,26 @@ export class BackgroundExecutionController {
       });
       return this.inspect(group.executionId, task.taskId);
     } catch (error) {
+      const cancelledWhileWaiting = !pending.acquired && pending.abort.signal.aborted;
       if (command.status !== "failed") {
         command.status = "failed";
         command.error = messageOf(error);
       }
-      if (task.state !== "conflicted" && task.state !== "landed") transitionTaskState(task, "paused_recoverable");
-      task.error = messageOf(error);
+      if (cancelledWhileWaiting) {
+        // The request was cancelled before it ever entered the source
+        // workspace: nothing landed, so keep the pre-merge state and record a
+        // clear no-landing outcome instead of implying a merge or checkpoint.
+        task.summary = "Force-merge was cancelled while waiting for source workspace access; no checkpoint landed and the main workspace is unchanged.";
+        this.addActivity(task, "force_merge", task.summary);
+        task.error = undefined;
+      } else {
+        if (task.state !== "conflicted" && task.state !== "landed") transitionTaskState(task, "paused_recoverable");
+        task.error = messageOf(error);
+      }
       await this.save(group);
       throw error;
     } finally {
-      release();
+      release?.();
       this.updateIndicator();
     }
   }
@@ -967,6 +1063,13 @@ export class BackgroundExecutionController {
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     this.clearWatches();
+    // Quiesce force-merges that are waiting for source workspace access so
+    // shutdown cannot hang behind another mutation or conflict gate.
+    for (const pending of this.pendingForceMerges.values()) {
+      pending.abort.abort(new Error(
+        "Force-merge cancelled: the application is shutting down while the merge waited for source workspace access; no checkpoint landed and the main workspace is unchanged.",
+      ));
+    }
     for (const group of this.groups.values()) {
       for (const task of group.tasks) {
         if (!isActiveTaskState(task.state)) continue;
@@ -982,6 +1085,7 @@ export class BackgroundExecutionController {
       runtime.abort.abort(new Error("session_shutdown"));
     }
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.promise));
+    await Promise.allSettled([...this.pendingForceMerges.values()].map((pending) => pending.done));
     await Promise.all([...this.saveTails.values()].map((tail) => tail.catch(() => undefined)));
     await this.cleanupSettledArtifacts();
     this.updateIndicator();
@@ -1011,6 +1115,7 @@ export class BackgroundExecutionController {
     this.clearWatches();
     this.groups.clear();
     this.runtimes.clear();
+    this.pendingForceMerges.clear();
     this.archivedTasks.clear();
     this.recentActivity = [];
     this.active = 0;

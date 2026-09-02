@@ -42,8 +42,17 @@ export class SourceMutationCoordinator {
       const previous = Promise.all(predecessors).then(() => undefined);
       const tail = previous.then(() => lease);
       this.tails.set(key, tail);
+      const pruneTail = () => {
+        if (this.tails.get(key) !== tail) return;
+        void tail.then(() => {
+          if (this.tails.get(key) === tail) this.tails.delete(key);
+        });
+      };
       await waitFor(previous, signal).catch((error) => {
         releaseLease();
+        // An aborted waiter never returns a release callback, so arrange the
+        // same settled-tail cleanup here instead of retaining its cwd forever.
+        pruneTail();
         throw error;
       });
 
@@ -60,11 +69,7 @@ export class SourceMutationCoordinator {
         if (released) return;
         released = true;
         releaseLease();
-        if (this.tails.get(key) === tail) {
-          void tail.then(() => {
-            if (this.tails.get(key) === tail) this.tails.delete(key);
-          });
-        }
+        pruneTail();
       };
     }
   }

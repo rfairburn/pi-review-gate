@@ -631,11 +631,14 @@ Test status: caps/archiving tested; soak test missing.
 
 ## Lower-priority cleanup / general recommendations
 
-- L1. `forceMerge` acquires the source lease with no abort signal —
-  `background-controller.ts:797` vs. `:1085` (which passes `abort.signal`). Behind another
-  task's active conflict gate it blocks indefinitely with no timeout or cancel; the command
-  stays `queued` with no feedback. Pass an abort signal or fail fast when
-  `sourceMutationCoordinator.blocked(cwd)` is set. No test covers force-merge behind a gate.
+- L1. **RESOLVED (2026-09-02):** force-merge now fails promptly with a durable actionable
+  outcome when an active conflict gate blocks the source, and lease acquisition uses a dedicated
+  abort signal. Pending force-merges are registered before awaiting, so user interruption and
+  shutdown cancel and quiesce a request that is waiting behind another source mutation without
+  claiming a merge or changing the workspace. Acquired merges retain the existing serialized
+  landing path. Aborted coordinator waiters now prune their settled lease tails even though no
+  release callback was returned. Focused conflict-gate, held-lease interrupt/shutdown, no-mutation,
+  command-status, and tail-cleanup tests pass (27/27 with the controller and coordinator suites).
 - L2. `restore()` merges `restored.archives` into `this.archivedTasks` **before** the
   cwd-mismatch validation throws (`background-controller.ts:370-374`) — cross-contaminates
   archive hashes across workspaces. Validate cwd before merging.

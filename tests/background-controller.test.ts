@@ -16,6 +16,7 @@ import {
   type BackgroundTaskRecord,
 } from "../src/execution/background-controller";
 import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
+import { sourceMutationCoordinator } from "../src/execution/source-mutation-lease";
 
 const execFileAsync = promisify(execFile);
 
@@ -782,6 +783,109 @@ test("interrupt quiesces a writer and force-merge lands its verified checkpoint"
     await controller.shutdown();
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("force-merge fails promptly with an actionable outcome when a conflict gate blocks the source", async () => {
+  const scenario = await setupInterruptedMergeTask("gate-blocked");
+  const { root, controller, started, taskId } = scenario;
+  let releaseGate: (() => void) | undefined;
+  try {
+    releaseGate = sourceMutationCoordinator.block(root, "unresolved conflict markers hold the source workspace");
+    await assert.rejects(
+      controller.forceMerge({
+        executionId: started.executionId,
+        taskId,
+        mergeAnyhow: false,
+        instructionId: "force-blocked",
+        actor: "user",
+      }),
+      /conflict gate[\s\S]*SubtasksMarkClean/,
+    );
+    const task = controller.inspect(started.executionId, taskId).tasks[0]!;
+    assert.equal(task.state, "interrupted", "the pre-merge state must survive a refused force-merge");
+    const command = task.commands.find((candidate) => candidate.instructionId === "force-blocked")!;
+    assert.equal(command.status, "failed");
+    assert.match(command.error ?? "", /unresolved conflict markers hold the source workspace/);
+    assert.match(command.error ?? "", /SubtasksMarkClean/);
+    await assert.rejects(readFile(join(root, "draft.txt"), "utf8"), /ENOENT/);
+    assert.equal(await readFile(join(root, "base.txt"), "utf8"), "base\n");
+  } finally {
+    releaseGate?.();
+    await scenario.cleanup();
+  }
+});
+
+test("shutdown cancels a force-merge waiting behind a held source mutation lease", async () => {
+  const scenario = await setupInterruptedMergeTask("shutdown-cancel");
+  const { root, controller, started, taskId } = scenario;
+  const releaseLease = await sourceMutationCoordinator.acquire(root);
+  try {
+    const mergeOutcome = controller.forceMerge({
+      executionId: started.executionId,
+      taskId,
+      mergeAnyhow: false,
+      instructionId: "force-wait-shutdown",
+      actor: "user",
+    });
+    // The rejection is asserted below; attach a handler now so the rejection is
+    // never briefly unhandled while shutdown settles it.
+    mergeOutcome.catch(() => undefined);
+    await waitFor(() => controller.inspect(started.executionId, taskId).tasks[0]?.commands
+      .some((candidate) => candidate.instructionId === "force-wait-shutdown") === true);
+    await controller.shutdown();
+    await assert.rejects(mergeOutcome, /shutting down/);
+    const task = controller.inspect(started.executionId, taskId).tasks[0]!;
+    assert.equal(task.state, "interrupted", "a cancelled force-merge must not claim a landing");
+    const command = task.commands.find((candidate) => candidate.instructionId === "force-wait-shutdown")!;
+    assert.equal(command.status, "failed");
+    assert.match(command.error ?? "", /shutting down/);
+    assert.match(task.summary ?? "", /no checkpoint landed and the main workspace is unchanged/i);
+    await assert.rejects(readFile(join(root, "draft.txt"), "utf8"), /ENOENT/);
+    assert.equal(await readFile(join(root, "base.txt"), "utf8"), "base\n");
+  } finally {
+    releaseLease();
+    await scenario.cleanup();
+  }
+});
+
+test("interrupt cancels a force-merge waiting behind a held source mutation lease", async () => {
+  const scenario = await setupInterruptedMergeTask("interrupt-cancel");
+  const { root, controller, started, taskId } = scenario;
+  const releaseLease = await sourceMutationCoordinator.acquire(root);
+  try {
+    const mergeOutcome = controller.forceMerge({
+      executionId: started.executionId,
+      taskId,
+      mergeAnyhow: false,
+      instructionId: "force-wait-cancel",
+      actor: "model",
+    });
+    // The rejection is asserted below; attach a handler now so the rejection is
+    // never briefly unhandled while the interrupt quiesces the merge.
+    mergeOutcome.catch(() => undefined);
+    await waitFor(() => controller.inspect(started.executionId, taskId).tasks[0]?.commands
+      .some((candidate) => candidate.instructionId === "force-wait-cancel") === true);
+    const inspected = await controller.interrupt({
+      executionId: started.executionId,
+      taskId,
+      mode: "interrupt_as_failure",
+      instructionId: "interrupt-cancel-merge",
+      actor: "user",
+    });
+    assert.equal(inspected.tasks[0]?.state, "interrupted");
+    await assert.rejects(mergeOutcome, /interrupt/);
+    const task = controller.inspect(started.executionId, taskId).tasks[0]!;
+    const cancelCommand = task.commands.find((candidate) => candidate.instructionId === "interrupt-cancel-merge")!;
+    assert.equal(cancelCommand.status, "acknowledged");
+    const mergeCommand = task.commands.find((candidate) => candidate.instructionId === "force-wait-cancel")!;
+    assert.equal(mergeCommand.status, "failed");
+    assert.match(task.summary ?? "", /no checkpoint landed and the main workspace is unchanged/i);
+    await assert.rejects(readFile(join(root, "draft.txt"), "utf8"), /ENOENT/);
+    assert.equal(await readFile(join(root, "base.txt"), "utf8"), "base\n");
+  } finally {
+    releaseLease();
+    await scenario.cleanup();
   }
 });
 
@@ -1570,6 +1674,74 @@ test("force-merge publish and wake failures after landing are recorded durably",
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function setupInterruptedMergeTask(unique: string): Promise<{
+  root: string;
+  controller: BackgroundExecutionController;
+  started: BackgroundInspection;
+  taskId: string;
+  cleanup: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), `pi-review-background-merge-${unique}-`));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+  await writeFile(join(root, "base.txt"), "base\n", "utf8");
+  await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+  const executor = join(root, "merge-executor.cjs");
+  await writeFile(executor, [
+    "#!/usr/bin/env node",
+    "const fs=require('node:fs');process.stdin.resume();process.stdin.on('end',()=>{",
+    "fs.writeFileSync('draft.txt','recover me\\n');",
+    "setTimeout(()=>console.log(JSON.stringify({type:'assistant',text:'late completion'})),30000);",
+    "});",
+  ].join("\n"), "utf8");
+  await chmod(executor, 0o755);
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "slow-merge",
+      adapter: "run-as-binary",
+      command: executor,
+      execution: { protocol: "pi-review-executor-jsonl-v1" },
+    }],
+    execution: { activeExecutor: { source: "external", id: "slow-merge" }, maxWorkers: 1 },
+    retainBundles: "always",
+  });
+  const controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
+  const started = await controller.start([{
+    title: "merge target",
+    instructions: "write draft.txt",
+    acceptanceCriteria: ["draft.txt exists"],
+  }]);
+  const taskId = started.tasks[0]!.taskId;
+  await waitFor(() => controller.inspect(started.executionId, taskId).tasks[0]?.state === "running");
+  await waitForAsync(async () => {
+    const waveRoot = controller.inspect(started.executionId, taskId).tasks[0]?.waveRoot;
+    if (!waveRoot) return false;
+    return readFile(join(waveRoot, "workers", taskId, "draft.txt"), "utf8").then(() => true, () => false);
+  });
+  const interrupted = await controller.interrupt({
+    executionId: started.executionId,
+    taskId,
+    mode: "interrupt_as_failure",
+    instructionId: `setup-interrupt-${unique}`,
+    actor: "user",
+  });
+  assert.equal(interrupted.tasks[0]?.state, "interrupted");
+  return {
+    root,
+    controller,
+    started,
+    taskId,
+    cleanup: async () => {
+      await controller.shutdown().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
 
 async function setupFaultScenario(faults: BackgroundFaultHooks): Promise<{
   root: string;

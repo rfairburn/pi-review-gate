@@ -24,6 +24,24 @@ test("source mutation coordinator serializes writers and holds queued landings b
   assert.deepEqual(coordinator.blocked("/tmp/review-gate-lease-test"), { blocked: false });
 });
 
+test("an aborted queued lease is pruned after its predecessor settles", async () => {
+  const coordinator = new SourceMutationCoordinator();
+  const root = "/tmp/review-gate-aborted-lease";
+  const releaseFirst = await coordinator.acquire(root);
+  const abort = new AbortController();
+  const waiting = coordinator.acquire(root, abort.signal);
+  abort.abort(new Error("cancel waiting mutation"));
+  await assert.rejects(waiting, /cancel waiting mutation/);
+
+  releaseFirst();
+  await tick();
+  const tails = (coordinator as unknown as { tails: Map<string, Promise<void>> }).tails;
+  assert.equal(tails.size, 0, "an aborted waiter has no release callback, so acquire must prune its own settled tail");
+
+  const releaseNext = await coordinator.acquire(root);
+  releaseNext();
+});
+
 test("source mutation coordinator shares leases and gates across nested workspace paths", async () => {
   const coordinator = new SourceMutationCoordinator();
   const root = "/tmp/review-gate-nested/repo";

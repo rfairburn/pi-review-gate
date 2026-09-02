@@ -555,9 +555,10 @@ Test status: caps/archiving tested; soak test missing.
   (verified: `fec0::1` and `198.18.0.1` pass).~~ RESOLVED (2026-09-02): folded into the
   finding-1 fix (`src/web/ip.ts`); all listed ranges plus `fec0::/10` are blocked with
   regression tests in `tests/web-network.test.ts`.
-- L6. Secrets redaction misses PEM private-key blocks and raw JWTs without a `Bearer` prefix
-  (`src/redaction.ts:8-14`); such tool results persist unredacted in review evidence.
-  `tests/redaction.test.ts` covers only two basic cases.
+- L6. **RESOLVED (2026-09-02):** evidence redaction now recognizes bounded multiline and
+  JSON-escaped PEM private-key blocks plus structurally plausible raw JWTs without requiring a
+  `Bearer` prefix. Tests cover key-label variants, CRLF/escaped forms, JWT structure, near misses,
+  marker idempotence, and existing credential patterns.
 - L7. **RESOLVED (2026-09-02):** response decoding now routes through
   `decodeResponseText`, which honors supported declared charsets and falls back to UTF-8 when
   `TextDecoder` rejects an unknown label. Focused tests cover supported, unknown, malformed,

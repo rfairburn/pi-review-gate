@@ -149,6 +149,16 @@ export async function activate(pi: unknown): Promise<void> {
     if (!stateStore || (!sessionActive && !force)) return;
     await stateStore.save(state, executionTools.associations(), effectiveReviewConfig());
   };
+  // Automatic-delivery persistence reports whether a save actually happened:
+  // persistSessionState deliberately resolves without writing when there is no
+  // state store or the session has gone inactive, and the uncertain-delivery
+  // gate in deliverAutomaticTransmission must only treat a real durable write
+  // as proof of the uncertain transition.
+  const persistAutomaticDeliveryState = async (): Promise<boolean> => {
+    if (!stateStore || !sessionActive) return false;
+    await stateStore.save(state, executionTools.associations(), effectiveReviewConfig());
+    return true;
+  };
 
   const trackEvidenceCapture = async (operation: Promise<void>): Promise<void> => {
     pendingEvidenceCaptures.add(operation);
@@ -719,7 +729,7 @@ export async function activate(pi: unknown): Promise<void> {
         `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
-      await deliverAutomaticTransmission(pi, state, output, "passed", transmission, () => sessionActive, persistSessionState);
+      await deliverAutomaticTransmission(pi, noticeTarget, state, output, "passed", transmission, () => sessionActive, persistAutomaticDeliveryState);
       await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
       return;
     }
@@ -747,7 +757,7 @@ export async function activate(pi: unknown): Promise<void> {
           ].join("\n"),
           () => sessionActive,
         );
-        await deliverAutomaticTransmission(pi, state, output, "deferred", transmission, () => sessionActive, persistSessionState);
+        await deliverAutomaticTransmission(pi, noticeTarget, state, output, "deferred", transmission, () => sessionActive, persistAutomaticDeliveryState);
         await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
         return;
       }
@@ -778,7 +788,7 @@ export async function activate(pi: unknown): Promise<void> {
           ].join("\n"),
           () => sessionActive,
         );
-        await deliverAutomaticTransmission(pi, state, output, "deferred", deferredTransmission, () => sessionActive, persistSessionState);
+        await deliverAutomaticTransmission(pi, noticeTarget, state, output, "deferred", deferredTransmission, () => sessionActive, persistAutomaticDeliveryState);
         await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
         return;
       }
@@ -796,7 +806,7 @@ export async function activate(pi: unknown): Promise<void> {
         `review gate: changes requested (${formatTokenUsage(output.result.usage)})`,
         () => sessionActive,
       );
-      await deliverAutomaticTransmission(pi, state, output, "correction_required", transmission, () => sessionActive, persistSessionState);
+      await deliverAutomaticTransmission(pi, noticeTarget, state, output, "correction_required", transmission, () => sessionActive, persistAutomaticDeliveryState);
       await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
       return;
     }
@@ -810,7 +820,7 @@ export async function activate(pi: unknown): Promise<void> {
         disposition: "sent_review_error",
         action: "review_error",
       });
-      await deliverAutomaticTransmission(pi, state, output, "review_error", transmission, () => sessionActive, persistSessionState);
+      await deliverAutomaticTransmission(pi, noticeTarget, state, output, "review_error", transmission, () => sessionActive, persistAutomaticDeliveryState);
     }
     await sendNoticeWhileSessionActive(noticeTarget, failed, () => sessionActive);
     await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
@@ -938,14 +948,27 @@ async function transmitReviewPass(input: {
   return message;
 }
 
+const MAX_DELIVERY_DIAGNOSTIC_CHARS = 200;
+
+function boundDeliveryDiagnostic(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const singleLine = raw.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= MAX_DELIVERY_DIAGNOSTIC_CHARS) {
+    return singleLine;
+  }
+  const marker = "… (truncated)";
+  return `${singleLine.slice(0, MAX_DELIVERY_DIAGNOSTIC_CHARS - marker.length)}${marker}`;
+}
+
 async function deliverAutomaticTransmission(
   pi: unknown,
+  noticeTarget: unknown,
   state: ReviewGateState,
   output: ReviewRunOutput,
   action: ReviewTransmissionAction,
   message: string,
   isSessionActive: () => boolean,
-  persist: () => void | Promise<void>,
+  persist: () => boolean | Promise<boolean>,
 ): Promise<void> {
   if (!output.invocationDir) return;
   const delivery = queueModelDelivery(state, {
@@ -957,17 +980,39 @@ async function deliverAutomaticTransmission(
   });
   await persist();
   if (!isSessionActive()) return;
-  await dispatchModelDelivery({
-    delivery,
-    persist,
-    deliver: () => deliverReviewTransmission({
-      invocationDir: output.invocationDir!,
-      action,
-      message,
-      idempotencyKey: delivery.deliveryId,
-      deliver: () => isSessionActive() ? sendFollowUp(pi, message) : Promise.resolve(false),
-    }),
-  });
+  // dispatchModelDelivery mutates the in-memory status to uncertain before
+  // awaiting persistence, so only a persist that resolves while the record is
+  // uncertain proves this dispatch durably established the uncertain state.
+  // Without that proof the exception must keep propagating: queue/persist
+  // failures and pre-existing uncertain records are never masked as
+  // transport uncertainty, never noticed as a new uncertainty, and never
+  // retried or reverted to queued.
+  let durablyUncertain = false;
+  try {
+    await dispatchModelDelivery({
+      delivery,
+      persist: async () => {
+        const persisted = await persist();
+        if (persisted && delivery.status === "uncertain") durablyUncertain = true;
+      },
+      deliver: () => deliverReviewTransmission({
+        invocationDir: output.invocationDir!,
+        action,
+        message,
+        idempotencyKey: delivery.deliveryId,
+        deliver: () => isSessionActive() ? sendFollowUp(pi, message) : Promise.resolve(false),
+      }),
+    });
+  } catch (error) {
+    if (!durablyUncertain) {
+      throw error;
+    }
+    await sendNoticeWhileSessionActive(
+      noticeTarget,
+      `review gate: delivery ${delivery.deliveryId} is uncertain and was not retried automatically: ${boundDeliveryDiagnostic(error)}; inspect ${delivery.invocationDir ?? "the resumed session"}`,
+      isSessionActive,
+    );
+  }
 }
 
 async function recoverPendingModelDeliveries(input: {

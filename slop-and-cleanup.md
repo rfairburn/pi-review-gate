@@ -425,25 +425,25 @@ cleanup, stable-tree compatibility, session round trips, evidence classification
 and review/wave propagation. Focused capture, evidence, prompt, session/state, and wave-semantic
 suites plus static checks pass without touching `dist/`.
 
-### 10. MEDIUM — Transient delivery failures are not retried or surfaced in-session (review pipeline)
+### 10. MEDIUM — RESOLVED (2026-09-02): Uncertain deliveries were not surfaced in-session
 
-Refs: `src/index.ts` `deliverAutomaticTransmission` (`:888-918`, no try/catch around
-`dispatchModelDelivery`); `src/durable-delivery.ts:32-62` (`dispatchModelDelivery` marks the
-delivery `uncertain` and rethrows at `:60-62`).
+**Root cause.** A throwing automatic `sendFollowUp` escaped `agent_settled` after the durable
+delivery protocol classified the outcome as uncertain, leaving the user without an in-session
+explanation until restart recovery.
 
-Impact: if `sendFollowUp` throws on a transient Pi API failure, the exception escapes
-`agent_settled`, the review transmission is never delivered in that session, and the user gets
-no notice — only a restart surfaces it as a manual "uncertain" inspection.
+**Fix.** Automatic delivery now distinguishes a successfully persisted `uncertain` transition
+from queue/save failures, pre-existing uncertainty, and session-shutdown no-op persistence. Only
+the newly durable uncertainty is handled: `agent_settled` resolves and one session-active notice
+reports the delivery ID, invocation directory, and single-line diagnostic capped at 200 characters
+including its visible truncation marker. It never claims non-delivery, retries, or reverts the
+record to `queued`; all non-durable/pre-existing cases still propagate, and recovery retains its
+manual-inspection/no-duplicate protocol.
 
-Recommendation:
-- [ ] Catch in `deliverAutomaticTransmission` and notify the user that the delivery is
-      `uncertain` with its diagnostic, instead of letting the exception escape silently.
-- [ ] Preserve the existing `uncertain` protocol (recovery explicitly refuses to re-dispatch
-      uncertain deliveries): only auto-retry when the transport can prove no send occurred or
-      supports recipient-side idempotency; do not mark a possibly-sent delivery back to
-      `queued`, since that can duplicate a successfully sent message.
-- [ ] Test status: `tests/durable-delivery.test.ts` covers persistence transitions only;
-      `tests/transmission.test.ts` covers message formatting only.
+**Tests.** Five automatic-pipeline regressions cover a throwing transport with durable state and
+one visible notice, diagnostic truncation, uncertain-state persistence failure, shutdown during
+dispatch, and pre-existing uncertain-record deduplication. They assert exact send/notice counts,
+`agent_settled` resolution versus rejection, durable `dispatching`/`uncertain` status, restart
+behavior, and no automatic duplicate.
 
 ### 11. MEDIUM-LOW — RESOLVED (2026-09-02): `delivery.json` receipt persistence was racy (review pipeline)
 
@@ -641,7 +641,10 @@ Test status: caps/archiving tested; soak test missing.
   there. Remaining nits: `test:fast` membership (which suites are in the fast tier; it omits
   e.g. `commands.test.ts` and the background-shell tests) is only visible in `package.json`,
   and `test:integration` is just an alias of `npm test`.
-- **Highest-value missing tests** (from findings above): delivery-failure notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync durability (7), and snapshot concurrency (9). Post-landing fault injection (2), ShellSend stdin lifecycle (3), table bounds (5), SSRF controls (1), background-shell matcher/output bounds (4), and the receipt race (11) now have dedicated regression coverage.
+- **Highest-value missing tests** (from findings above): queued-continuation interrupt (8) and
+  fsync durability (7). Post-landing faults (2), ShellSend lifecycle (3), table bounds (5), DNS/IP
+  controls (1), background-shell bounds (4), snapshot concurrency (9), uncertain delivery (10),
+  and receipt races (11) now have dedicated regression coverage.
 - **Docs drift**: README documents `PI_REVIEW_GATE_DISABLED=1` while the launcher strips it
   (L3); keep kill-switch docs and behavior in sync.
 - **Dependency posture is good**: only 8 runtime deps, `package-lock.json` present, and the

@@ -817,7 +817,7 @@ async function recordCanceledInvocation(
   await rm(invocationDir, { recursive: true, force: true });
   await mkdir(invocationDir, { recursive: true });
   const canceledAt = new Date().toISOString();
-  const canceledBy = signal?.reason === "escape" ? "user" : "session";
+  const canceledBy = signal?.reason === "escape" || signal?.reason === "manual" ? "user" : "session";
   const summary = canceledBy === "user"
     ? `A ${kind} would have been run here but was canceled by the user.`
     : `A ${kind} would have been run here but was canceled with the active session.`;

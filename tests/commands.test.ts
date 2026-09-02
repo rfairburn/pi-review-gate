@@ -7,6 +7,7 @@ import { createWorkspaceSnapshot } from "../src/capture";
 import { formatReviewerAnswer, registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
 import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest } from "../src/state";
+import { createReviewCancellationCoordinator } from "../src/review-cancellation";
 import { fakeNeedsChangesConfig } from "./helpers";
 
 test("reviewer command output shows internal model labels instead of encoded reviewer ids", async () => {
@@ -286,6 +287,93 @@ test("Escape immediately aborts an active /review-now", async () => {
     assert.match(notices.join("\n"), /review gate: review cancelled/);
     assert.equal(terminalHandlers.length, 0);
     assert.equal(followUps.length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/review-cancel stops an active /review-now, reports quiescence, and works without terminal interception", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-cancel-now-"));
+  try {
+    const pidPath = join(dir, "reviewer-pid.txt");
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "change index");
+    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: 1_048_576,
+      maxSnapshotBytes: 52_428_800,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const notices: string[] = [];
+    const pi = {
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      sendUserMessage() {},
+    };
+    // The subscription throws when removed to prove cleanup is exception-safe
+    // and cannot mask the review outcome or deadlock the command.
+    const throwingUnsubscribe = () => {
+      throw new Error("stale ui context");
+    };
+    const ctx = {
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        setStatus() {},
+        onTerminalInput() {
+          return throwingUnsubscribe;
+        },
+      },
+    };
+    registerCommands({
+      pi,
+      cwd: () => dir,
+      cancellation: createReviewCancellationCoordinator(),
+      config: {
+        ...reviewConfig(),
+        decider: {
+          id: "slow",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [
+            "-e",
+            `require('node:fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`,
+          ],
+          timeoutMs: 300_000,
+        },
+      },
+      state,
+    });
+
+    const pending = commands.get("review-now")?.("", ctx);
+    await waitForPath(pidPath);
+    const reviewerPid = Number(await readFile(pidPath, "utf8"));
+    assert.doesNotThrow(() => process.kill(reviewerPid, 0));
+
+    await commands.get("review-cancel")?.("", ctx);
+    assert.match(notices.join("\n"), /review gate: cancelling the \/review-now review; waiting for reviewer processes to stop/);
+    assert.match(notices.join("\n"), /review gate: review cancelled; reviewer processes stopped/);
+    assert.equal(
+      notices.filter((notice) => notice === "review gate: review cancelled; reviewer processes stopped").length,
+      1,
+    );
+    await waitForCondition(() => {
+      try {
+        process.kill(reviewerPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    });
+
+    // The throwing terminal-input unsubscribe must not have masked the outcome.
+    await pending;
+
+    await commands.get("review-cancel")?.("", ctx);
+    assert.match(notices.join("\n"), /no active review to cancel/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1037,4 +1125,13 @@ async function waitForPath(path: string): Promise<void> {
     }
   }
   throw new Error(`Timed out waiting for ${path}`);
+}
+
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(condition(), "timed out waiting for condition");
 }

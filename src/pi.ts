@@ -80,7 +80,14 @@ export function onTerminalInput(pi: unknown, handler: TerminalInputHandler): (()
     if (!isRecord(target) || typeof target.onTerminalInput !== "function") {
       continue;
     }
-    const subscription = target.onTerminalInput(handler);
+    let subscription: unknown;
+    try {
+      subscription = target.onTerminalInput(handler);
+    } catch {
+      // A stale or hostile target must not crash review startup; try the next
+      // eligible target and otherwise report interception as unavailable.
+      continue;
+    }
     if (typeof subscription === "function") {
       return subscription as () => void;
     }
@@ -101,9 +108,33 @@ export function onTerminalInput(pi: unknown, handler: TerminalInputHandler): (()
   return undefined;
 }
 
+// Kitty keyboard protocol CSI u (matches pi-tui's parseKittySequence shape):
+//   \x1b[<codepoint>u
+//   \x1b[<codepoint>;<mod>u
+//   \x1b[<codepoint>;<mod>:<event>u   (1=press, 2=repeat, 3=release)
+//   \x1b[<codepoint>:<shifted>;<mod>u and \x1b[<codepoint>:<shifted>:<base>;<mod>u
+//   \x1b[<codepoint>::<base>;<mod>u
+// xterm modifyOtherKeys: \x1b[27;<mod>;<keycode>~
+const kittyCsiUSequenceRegex = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/;
+const modifyOtherKeysSequenceRegex = /^\x1b\[27;(\d+);(\d+)~$/;
+const ESCAPE_KEY_CODEPOINT = 27;
+const KITTY_LOCK_MODIFIER_MASK = 64 | 128;
+
+/**
+ * Recognizes unmodified Escape press/repeat input from the shapes Pi actually
+ * delivers to terminal-input listeners: the raw string for legacy terminals
+ * (bare ESC), and raw CSI-u / modifyOtherKeys sequences on Kitty-capable and
+ * modifyOtherKeys terminals, plus the legacy parsed-object shapes.
+ *
+ * Key-release events and modified Escape (shift/alt/ctrl/super + Escape) do
+ * not cancel a review.
+ */
 export function isEscapeTerminalInput(input: unknown): boolean {
   if (input === "\x1b" || input === "Escape" || input === "escape") {
     return true;
+  }
+  if (typeof input === "string") {
+    return isEscapeRawSequence(input);
   }
   if (!isRecord(input)) {
     return false;
@@ -115,6 +146,30 @@ export function isEscapeTerminalInput(input: unknown): boolean {
     return true;
   }
   return input.sequence === "\x1b";
+}
+
+function isEscapeRawSequence(data: string): boolean {
+  const kitty = data.match(kittyCsiUSequenceRegex);
+  if (kitty) {
+    if (Number.parseInt(kitty[1]!, 10) !== ESCAPE_KEY_CODEPOINT) {
+      return false;
+    }
+    const modifierValue = kitty[4] === undefined ? 1 : Number.parseInt(kitty[4], 10);
+    // Kitty modifier values are one-based. Caps Lock and Num Lock are state
+    // bits, not user modifiers, so mirror pi-tui and ignore them here.
+    const modifier = (modifierValue - 1) & ~KITTY_LOCK_MODIFIER_MASK;
+    if (modifier !== 0) {
+      return false;
+    }
+    const eventType = kitty[5] === undefined || kitty[5] === "" ? 1 : Number.parseInt(kitty[5], 10);
+    return eventType === 1 || eventType === 2;
+  }
+  const modifyOtherKeys = data.match(modifyOtherKeysSequenceRegex);
+  if (modifyOtherKeys) {
+    return Number.parseInt(modifyOtherKeys[2]!, 10) === ESCAPE_KEY_CODEPOINT
+      && Number.parseInt(modifyOtherKeys[1]!, 10) === 1;
+  }
+  return false;
 }
 
 export function extractCwd(args: unknown[], fallback: string = process.cwd()): string {

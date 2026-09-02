@@ -13,6 +13,11 @@ import {
 import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, isEscapeTerminalInput, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, sendTriggeredFollowUp, createStatusTracker, setStatus } from "./pi";
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
+  createReviewCancellationCoordinator,
+  type ActiveReviewCancellation,
+  type ReviewCancelReason,
+} from "./review-cancellation";
+import {
   activeExchangeHasBaseline,
   beginAgentRun,
   buildRequestContext,
@@ -111,6 +116,7 @@ export async function activate(pi: unknown): Promise<void> {
   let backgroundMonitorGeneration = 0;
   let backgroundReviewDeferred = false;
   let pendingNativeCompletionRevision: number | undefined;
+  const reviewCancellation = createReviewCancellationCoordinator();
   let unsubscribeBackgroundLifecycle: (() => void) | undefined;
   const pendingEvidenceCaptures = new Set<Promise<void>>();
   const orchestratorBackgroundReadiness = new BackgroundProcessReadiness();
@@ -569,24 +575,44 @@ export async function activate(pi: unknown): Promise<void> {
     let settleReview!: () => void;
     const reviewSettled = new Promise<void>((resolvePromise) => { settleReview = resolvePromise; });
     activeReviewSettled = reviewSettled;
-    await drainEvidenceCaptures();
-    await persistSessionState();
+    // The terminal-input listener must be installed before any await so Escape
+    // (and /review-cancel) can abort while evidence drains or state persists;
+    // the handler itself gates on reviewInProgress.
+    const reviewAbort = createReviewAbortController({
+      signal: undefined,
+      noticeTarget,
+      state,
+      isSessionActive: () => sessionActive,
+      cancellation: reviewCancellation,
+      settled: reviewSettled,
+      describe: () => "the automatic review",
+    });
+    activeReviewAbort = reviewAbort;
+    try {
+      await drainEvidenceCaptures();
+      await persistSessionState();
+    } catch (error) {
+      // Any failure after listener/coordinator registration must still
+      // unregister, settle the review, and clear active references so session
+      // shutdown and /review-cancel never observe stale state.
+      state.reviewInProgress = false;
+      reviewAbort.cleanup();
+      if (activeReviewAbort === reviewAbort) activeReviewAbort = undefined;
+      settleReview();
+      if (activeReviewSettled === reviewSettled) activeReviewSettled = undefined;
+      throw error;
+    }
     if (!sessionActive) {
       state.reviewInProgress = false;
+      reviewAbort.cleanup();
+      if (activeReviewAbort === reviewAbort) activeReviewAbort = undefined;
       settleReview();
       if (activeReviewSettled === reviewSettled) activeReviewSettled = undefined;
       return;
     }
     // No run signal exists at settlement time (the last low-level run has
     // already finished); cancellation still flows through escape terminal
-    // input and session shutdown.
-    const reviewAbort = createReviewAbortController({
-      signal: undefined,
-      noticeTarget,
-      state,
-      isSessionActive: () => sessionActive,
-    });
-    activeReviewAbort = reviewAbort;
+    // input, /review-cancel, and session shutdown.
     const statusTracker = createStatusTracker(noticeTarget, "review-gate", "reviewing changes");
     activeStatusTracker = statusTracker;
     let output: ReviewRunOutput;
@@ -640,7 +666,7 @@ export async function activate(pi: unknown): Promise<void> {
     }
 
     if (reviewAbort.signal.aborted || output.result?.error === "aborted") {
-      if (reviewAbort.getReason() === "escape") {
+      if (reviewAbort.getReason() === "escape" || reviewAbort.getReason() === "manual") {
         await reviewAbort.notifyCancellation();
       }
       state.reviewInProgress = false;
@@ -775,6 +801,7 @@ export async function activate(pi: unknown): Promise<void> {
     state,
     isSessionActive: () => sessionActive,
     sessionSignal: sessionAbortController.signal,
+    cancellation: reviewCancellation,
     onStateChanged: persistSessionState,
     releaseQueuedUserInputs: () => releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState),
     prepareReviewerQuestion: async (commandName, ctx) => {
@@ -1030,7 +1057,7 @@ async function releaseQueuedUserInputs(
   }
 }
 
-type ReviewAbortReason = "parent" | "escape" | "session_shutdown";
+type ReviewAbortReason = "parent" | "escape" | "manual" | "session_shutdown";
 
 interface ReviewAbortHandle {
   signal: AbortSignal;
@@ -1045,10 +1072,14 @@ function createReviewAbortController(input: {
   noticeTarget: unknown;
   state: ReviewGateState;
   isSessionActive: () => boolean;
+  cancellation: ReturnType<typeof createReviewCancellationCoordinator>;
+  settled: Promise<void>;
+  describe: () => string;
 }): ReviewAbortHandle {
   const controller = new AbortController();
   let abortReason: ReviewAbortReason | undefined;
   let cancellationNotice: Promise<void> | undefined;
+  let cancellationAcknowledgement: Promise<void> | undefined;
   let cleanedUp = false;
 
   const abortReview = (reason: ReviewAbortReason) => {
@@ -1057,12 +1088,27 @@ function createReviewAbortController(input: {
       controller.abort(reason);
     }
   };
+  const acknowledgeCancellation = () => {
+    if (!input.isSessionActive()) {
+      return Promise.resolve();
+    }
+    if (!cancellationAcknowledgement) {
+      cancellationAcknowledgement = sendNotice(
+        input.noticeTarget,
+        `review gate: cancelling ${input.describe()}; waiting for reviewer processes to stop`,
+      ).catch(() => undefined);
+    }
+    return cancellationAcknowledgement;
+  };
   const notifyCancellation = () => {
+    if (abortReason !== "escape" && abortReason !== "manual") {
+      return Promise.resolve();
+    }
     if (!input.isSessionActive()) {
       return Promise.resolve();
     }
     if (!cancellationNotice) {
-      cancellationNotice = sendNotice(input.noticeTarget, "review gate: review cancelled").catch(() => undefined);
+      cancellationNotice = sendNotice(input.noticeTarget, "review gate: review cancelled; reviewer processes stopped").catch(() => undefined);
     }
     return cancellationNotice;
   };
@@ -1078,17 +1124,40 @@ function createReviewAbortController(input: {
       return undefined;
     }
     abortReview("escape");
-    void notifyCancellation();
+    // Immediate acknowledgement only; the completion notice claims reviewer
+    // quiescence only after runReview has returned and cleanup ran.
+    void acknowledgeCancellation();
     return { action: "handled", consume: true };
   });
+  if (!unsubscribeTerminalInput) {
+    input.cancellation.noteTerminalInterceptionUnavailable((message) => sendNotice(input.noticeTarget, message));
+  }
+
+  const cancellationHandle: ActiveReviewCancellation = {
+    requestCancel: (reason: ReviewCancelReason = "manual") => abortReview(reason),
+    acknowledgeCancellation,
+    settled: input.settled,
+    describe: input.describe,
+    notifyCancellation,
+  };
+  const unregisterCancellation = input.cancellation.register(cancellationHandle);
 
   const cleanup = () => {
     if (cleanedUp) {
       return;
     }
     cleanedUp = true;
-    input.signal?.removeEventListener("abort", abortFromParent);
-    unsubscribeTerminalInput?.();
+    unregisterCancellation();
+    try {
+      input.signal?.removeEventListener("abort", abortFromParent);
+    } catch {
+      // Listener removal must never mask the review outcome.
+    }
+    try {
+      unsubscribeTerminalInput?.();
+    } catch {
+      // The UI context may already be stale; the review is settled either way.
+    }
   };
 
   return {

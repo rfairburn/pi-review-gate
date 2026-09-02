@@ -16,6 +16,7 @@ import {
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
 import { extractSignal, isEscapeTerminalInput, onTerminalInput, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
+import type { ActiveReviewCancellation, ReviewCancellationCoordinator } from "./review-cancellation";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { createReviewTransmissionMessage, deliverReviewTransmission, type ReviewTransmissionAction } from "./transmission";
@@ -29,6 +30,7 @@ export interface RegisterCommandsInput {
   state: ReviewGateState;
   isSessionActive?: () => boolean;
   sessionSignal?: AbortSignal;
+  cancellation?: ReviewCancellationCoordinator;
   prepareReviewerQuestion?: (commandName: string, ctx: unknown) => Promise<void>;
   onStateChanged?: () => void | Promise<void>;
   releaseQueuedUserInputs?: () => Promise<void>;
@@ -117,6 +119,26 @@ export function registerCommands(input: RegisterCommandsInput): void {
     },
   });
 
+  registerCommand("review-cancel", {
+    description: "Cancel the active automatic or command-driven review and wait for reviewer processes to stop.",
+    handler: async (_args: string, ctx: unknown) => {
+      if (!isSessionActive()) {
+        return;
+      }
+      const active = input.cancellation?.current();
+      if (!active) {
+        await sendCommandNotice(ctx, "review gate: no active review to cancel");
+        return;
+      }
+      active.requestCancel("manual");
+      await active.acknowledgeCancellation();
+      // Completion is reported only once the owning run has returned, which
+      // guarantees reviewer child processes are gone before quiescence is claimed.
+      await active.settled;
+      await active.notifyCancellation();
+    },
+  });
+
   registerCommand("review-now", {
     description: "Run pi-review-gate against the current turn baseline.",
     handler: async (_args: string, ctx: unknown) => {
@@ -138,7 +160,15 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       const statusTracker = createStatusTracker(ctx, "review-gate", "reviewing changes");
-      const reviewAbort = createCommandReviewAbort(ctx, input.sessionSignal);
+      let settleCommandReview!: () => void;
+      const commandReviewSettled = new Promise<void>((resolvePromise) => { settleCommandReview = resolvePromise; });
+      const reviewAbort = createCommandReviewAbort(ctx, input.sessionSignal, {
+        cancellation: input.cancellation,
+        isSessionActive,
+        settled: commandReviewSettled,
+        describe: () => "the /review-now review",
+        completionMessage: "review gate: review cancelled; reviewer processes stopped",
+      });
       const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
       let output;
       try {
@@ -158,6 +188,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       } finally {
         await statusTracker.clear({ immediate: reviewSignal?.aborted, signal: reviewSignal });
         reviewAbort.cleanup();
+        settleCommandReview();
       }
 
       if (!isSessionActive()) {
@@ -170,7 +201,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       if (reviewSignal?.aborted || output.result?.error === "aborted") {
-        await sendCommandNotice(ctx, "review gate: review cancelled");
+        await reviewAbort.notifyCancellation();
         return;
       }
       if (output.result?.verdict === "pass") {
@@ -283,7 +314,15 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const contextWindow = getReviewerQuestionWindow(input.state);
       const reviewConfig = contextWindow?.reviewConfig ?? currentConfig();
       const statusTracker = createStatusTracker(ctx, "review-gate", "asking reviewer");
-      const reviewAbort = createCommandReviewAbort(ctx, input.sessionSignal);
+      let settleCommandReview!: () => void;
+      const commandReviewSettled = new Promise<void>((resolvePromise) => { settleCommandReview = resolvePromise; });
+      const reviewAbort = createCommandReviewAbort(ctx, input.sessionSignal, {
+        cancellation: input.cancellation,
+        isSessionActive,
+        settled: commandReviewSettled,
+        describe: () => "the reviewer question",
+        completionMessage: "review gate: reviewer question cancelled; reviewer processes stopped",
+      });
       const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
       let output;
       try {
@@ -304,6 +343,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       } finally {
         await statusTracker.clear({ immediate: reviewSignal?.aborted, signal: reviewSignal });
         reviewAbort.cleanup();
+        settleCommandReview();
       }
 
       if (!isSessionActive()) {
@@ -314,7 +354,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         return;
       }
       if (reviewSignal?.aborted || output.result.error === "aborted") {
-        await sendCommandNotice(ctx, "review gate: reviewer question cancelled");
+        await reviewAbort.notifyCancellation();
         return;
       }
 
@@ -499,11 +539,43 @@ function combineAbortSignals(...signals: Array<AbortSignal | undefined>): AbortS
   return AbortSignal.any(activeSignals);
 }
 
+interface CommandReviewAbortOptions {
+  cancellation?: ReviewCancellationCoordinator;
+  isSessionActive: () => boolean;
+  settled: Promise<void>;
+  describe: () => string;
+  completionMessage: string;
+}
+
 function createCommandReviewAbort(
   ctx: unknown,
   sessionSignal: AbortSignal | undefined,
-): { signal: AbortSignal; cleanup: () => void } {
+  options: CommandReviewAbortOptions,
+): { signal: AbortSignal; cleanup: () => void; acknowledgeCancellation: () => Promise<void>; notifyCancellation: () => Promise<void> } {
   const controller = new AbortController();
+  let cancellationNotice: Promise<void> | undefined;
+  let cancellationAcknowledgement: Promise<void> | undefined;
+  const acknowledgeCancellation = () => {
+    if (!options.isSessionActive()) {
+      return Promise.resolve();
+    }
+    if (!cancellationAcknowledgement) {
+      cancellationAcknowledgement = sendNotice(
+        ctx,
+        `review gate: cancelling ${options.describe()}; waiting for reviewer processes to stop`,
+      ).catch(() => undefined);
+    }
+    return cancellationAcknowledgement;
+  };
+  const notifyCancellation = () => {
+    if (!options.isSessionActive()) {
+      return Promise.resolve();
+    }
+    if (!cancellationNotice) {
+      cancellationNotice = sendNotice(ctx, options.completionMessage).catch(() => undefined);
+    }
+    return cancellationNotice;
+  };
   const abortFromSession = () => {
     if (!controller.signal.aborted) controller.abort(sessionSignal?.reason ?? "session_shutdown");
   };
@@ -512,14 +584,45 @@ function createCommandReviewAbort(
   const unsubscribeTerminalInput = onTerminalInput(ctx, (terminalInput) => {
     if (!isEscapeTerminalInput(terminalInput)) return undefined;
     if (!controller.signal.aborted) controller.abort("escape");
+    // Immediate acknowledgement only; the completion notice is emitted after
+    // the run has returned and cleanup ran.
+    void acknowledgeCancellation();
     return { action: "handled", consume: true };
   });
+  if (!unsubscribeTerminalInput) {
+    options.cancellation?.noteTerminalInterceptionUnavailable((message) => sendNotice(ctx, message));
+  }
+  const cancellationHandle: ActiveReviewCancellation = {
+    requestCancel: (reason = "manual") => {
+      if (!controller.signal.aborted) controller.abort(reason);
+    },
+    acknowledgeCancellation,
+    settled: options.settled,
+    describe: options.describe,
+    notifyCancellation,
+  };
+  const unregisterCancellation = options.cancellation?.register(cancellationHandle);
   return {
     signal: controller.signal,
     cleanup: () => {
-      sessionSignal?.removeEventListener("abort", abortFromSession);
-      unsubscribeTerminalInput?.();
+      try {
+        unregisterCancellation?.();
+      } catch {
+        // Cancellation bookkeeping must never mask the review outcome.
+      }
+      try {
+        sessionSignal?.removeEventListener("abort", abortFromSession);
+      } catch {
+        // Listener removal is best-effort during shutdown.
+      }
+      try {
+        unsubscribeTerminalInput?.();
+      } catch {
+        // The UI context may already be stale; the review is settled either way.
+      }
     },
+    acknowledgeCancellation,
+    notifyCancellation,
   };
 }
 

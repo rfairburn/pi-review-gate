@@ -651,11 +651,23 @@ exchange, immediately preceding findings, and current files. Complete earlier
 history remains available for targeted inspection but is not read by default.
 
 Canceling a running review with Escape cancels the whole parallel review, even
-if one reviewer has already completed. Partial results are discarded and are
+if one reviewer has already completed. Escape is recognized in legacy terminals
+(raw ESC) and in Kitty-keyboard-protocol / CSI-u and xterm `modifyOtherKeys`
+terminals, where unmodified Escape arrives as `\x1b[27u`-style sequences; Escape
+key-release events and modified Escape (shift/alt/ctrl + Escape) are ignored.
+Partial results are discarded and are
 not transmitted. The numbered invocation remains as a `CANCELED.md` tombstone
 stating that a review would have run there but was canceled by the user, so pass
 order remains unambiguous. The next review keeps the same evidence bundle but
 starts fresh reviewer sessions.
+
+If the terminal input interception cannot be installed in the current context,
+the extension says so once and points at the `/review-cancel` command instead of
+failing silently. `/review-cancel` is the guaranteed hard stop: it cancels
+whichever automatic or command-driven review is currently active, immediately
+confirms the cancellation request, and only reports the review cancelled once
+the review run has returned and all reviewer child processes have stopped. With
+no review running it reports that clearly instead of pretending to cancel.
 
 Each review window uses one stable temporary evidence bundle. Every completed
 agent run is appended as a numbered exchange containing its snapshot-derived
@@ -784,6 +796,13 @@ without stopping evidence collection. Each primary-model turn is still captured
 as a separate exchange. `/review-unpause` resumes reviewer execution; the next
 eligible turn reviews the accumulated changes and evidence. `/review-now` and
 `/ask-reviewer*` remain unavailable while reviews are paused.
+
+`/review-cancel` cancels whichever review is currently active: an automatic
+review, `/review-now`, or a reviewer-question command. It acknowledges the
+cancellation request immediately, then reports the review as cancelled only
+after the review run has returned and every reviewer child process has stopped
+(a `CANCELED.md` tombstone marks the numbered invocation). With no active
+review it reports `no active review to cancel` instead of claiming success.
 
 Reaching the automatic correction cap does not hide reviewer information. The
 complete pass is transmitted with correction classified as deferred.

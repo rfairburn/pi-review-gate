@@ -1,8 +1,9 @@
 # Slop and cleanup review inventory
 
 Date: 2026-09-02
-Status: Final consolidated inventory replacing the 2026-08-27 draft. Recommendations only;
-no product code changes.
+Status: Final consolidated inventory replacing the 2026-08-27 draft. Finding 0 is a
+RESOLVED work-history entry (fix landed 2026-09-02); remaining findings are
+recommendations only with no product code changes.
 
 Scope: `pi-review-gate` (extension + execution subsystem + web tools + scripts). Severity
 legend: HIGH = security boundary bypass or host crash; MEDIUM = correctness/data-loss or
@@ -16,66 +17,80 @@ controller-decomposition and notification-contract items updated to current line
 
 ## Prioritized findings
 
-### 0. P0 (highest priority) — Escape no longer stops an active review on the main orchestrator thread (regression; root cause not yet confirmed)
+### 0. P0 — RESOLVED (2026-09-02): Escape cancellation on live Pi + /review-cancel fallback
 
-Observed behavior (user report, current tree): pressing Escape during a live review
-does not stop it on the main orchestrator thread, although the intended contract still
-exists and is documented. This is an investigation/fix item: **the root cause is not yet
-confirmed** — do not assume the source handler is absent; the nominal implementation below
-is present in this snapshot and its unit/harness tests pass.
+**Root cause (confirmed).** Installed Pi 0.84.4 enables the Kitty keyboard
+protocol on capable terminals, so its TUI input listeners receive raw CSI-u
+sequences — unmodified Escape arrives as `\x1b[27u` (with optional
+modifier/event sub-parameters), not bare ESC — while `isEscapeTerminalInput`
+(`src/pi.ts`) only recognized bare `"\x1b"` and legacy parsed-object shapes. On
+Kitty-capable terminals every real Escape press therefore fell through the
+terminal-input handler (`src/index.ts`, `createReviewAbortController`) and
+Escape could never cancel a live review. Secondary gaps: the listener was
+installed only after `drainEvidenceCaptures()`/`persistSessionState()` awaits
+inside the automatic-review handler, `cleanup()` had no exception isolation,
+and an uninstalled subscription (`onTerminalInput` returning undefined) failed
+open silently.
 
-Nominal implementation and evidence (all verified against this snapshot):
-- `src/index.ts:1043-1082` (`createReviewAbortController`): the terminal-input handler
-  checks `state.reviewInProgress`, calls `abortReview("escape")` +
-  `notifyCancellation()`, and returns `{ action: "handled", consume: true }` to consume
-  Escape.
-- `src/pi.ts:78-101` (`onTerminalInput`): walks `terminalInputTargets(pi)` (`pi.ui`
-  first, then `pi`) and installs the handler on the first target exposing
-  `onTerminalInput`; it silently returns `undefined` (no subscription) when no target
-  exposes it. `src/pi.ts:104-118` (`isEscapeTerminalInput`): recognizes the Escape shapes
-  (`"\x1b"`, `"Escape"`, `{name}`, `{key}`, nested `key.name`, `sequence`).
-- Tests passing against this nominal path: `tests/index.test.ts:953+` ("escape terminal
-  input aborts an active reviewer process") and `tests/commands.test.ts:222+` ("Escape
-  immediately aborts an active /review-now").
-- Documented contract at README around `:653`: "Canceling a running review with Escape
-  cancels the whole parallel review, even if one reviewer has already completed."
+**Fix.**
+- `src/pi.ts` (`isEscapeTerminalInput`): recognizes raw Kitty CSI-u Escape
+  (`\x1b[27u`, `\x1b[27;1u`, `\x1b[27;1:1u` press, `\x1b[27;1:2u` repeat,
+  optional alternate-key sub-parameters) and xterm `modifyOtherKeys` Escape
+  (`\x1b[27;1;27~`), while rejecting key-release (`:3` event type) and user
+  modifiers such as shift/alt/ctrl/super (lock-state bits are ignored, matching
+  pi-tui). Legacy string/object shapes retained; no
+  runtime dependency on pi-tui (raw-sequence parsing only, mirroring
+  pi-tui's documented CSI-u grammar).
+- `src/index.ts`: the automatic-review abort controller (including the
+  terminal-input listener and its session-wide registration) is now created
+  immediately after `state.reviewInProgress = true`, before the evidence-drain
+  and state-persist awaits, closing the startup registration gap; early-exit
+  and `finally` paths both clean it up. `cleanup()` is exception-safe
+  (per-listener try/catch, idempotent).
+- New `src/review-cancellation.ts`: a session-wide cancellation coordinator.
+  Every active review (automatic, `/review-now`, reviewer-question commands)
+  registers a handle exposing `requestCancel`/`settled`/`describe`/
+  `notifyCancellation`. It also owns the one-time fallback diagnostic emitted
+  when terminal interception is unavailable, pointing users at
+  `/review-cancel`.
+- `src/commands.ts`: new documented `/review-cancel` command — aborts whichever
+  review is currently registered, immediately acknowledges the cancellation
+  request (`cancelling … waiting for reviewer processes to stop`), awaits the
+  owning run's `settled` promise (resolved only after `runReview` returned and
+  the terminal listener was removed), then emits the idempotent completion
+  notice (`review gate: review cancelled; reviewer processes stopped`). With no
+  active review it reports `no active review to cancel`. Command-driven aborts
+  get the same completion-notice discipline; completion notices are cached so
+  Escape and `/review-cancel` can never double-report. `/review-now` and
+  reviewer-question commands surface the same one-time fallback diagnostic when
+  interception is unavailable.
+- `src/review.ts`: `/review-cancel` aborts (reason `manual`) now produce the
+  user-canceled `CANCELED.md`/`canceled.json` tombstone, same as Escape.
 
-Impact: external reviewers (Codex/Claude/Pi CLIs) can be long-running, costly, or stuck;
-when Escape fails, the main orchestrator thread is left without a reliable user-controlled
-hard stop for an active review — the user waits with no documented alternative. The
-current unit/harness tests drive hand-rolled `pi`/`ctx.ui` fakes that expose
-`onTerminalInput`, so they may not represent the live Pi TUI/event-context API (target
-shape, subscription lifecycle, or key-handling order).
+**Tests.** `tests/pi.test.ts` covers the real raw sequences (Kitty CSI-u
+press/repeat/alternate-key forms, xterm modifyOtherKeys; release and modified
+Escape rejected; non-Escape CSI-u rejected). `tests/index.test.ts` adds an
+automatic-review case where Kitty CSI-u Escape (`\x1b[27u`) cancels the active
+reviewer child, establishing reviewer-process quiescence (reviewer child PID
+no longer alive) plus the `CANCELED.md` aborted-process artifact, and asserts
+release (`\x1b[27;1:3u`) and modified (`\x1b[27;5u`) sequences do not cancel.
+Another index test cancels an active automatic review via `/review-cancel` and
+verifies the tombstone, process quiescence, and the `no active review to
+cancel` reply afterwards. `tests/commands.test.ts` adds a case for
+`/review-cancel` against an active `/review-now` (request feedback, completion
+notice only after the run returned, child quiescence) and the no-active review
+reply, and exercises exception-safe listener cleanup via a throwing
+unsubscribe; `tests/pi.test.ts` covers dispose/unsubscribe subscription
+unwrapping and a throwing registration target.
 
-Investigation and fix checklist:
-- [ ] Reproduce first in the actual current Pi TUI with each reviewer adapter
-      (Codex, Claude, Pi, generic-cli): start a review that stays active, press Escape,
-      and record whether the handler fires at all.
-- [ ] Trace whether `noticeTarget`/`ctx.ui` in the live event context actually exposes
-      `onTerminalInput`; if not, `onTerminalInput` (`src/pi.ts:78-101`) silently installs
-      nothing — surface a warning when no subscription is obtained instead of failing open.
-- [ ] Verify the subscription is installed during the exact live review phase (before any
-      reviewer child can run) and is not uninstalled early by a prior `cleanup()`/state
-      transition while `reviewInProgress` is still true.
-- [ ] Check whether another key handler (TUI default, extension, or an earlier
-      registration) consumes Escape before this handler runs; the
-      `{ action: "handled", consume: true }` contract only helps if this handler is
-      consulted first.
-- [ ] Confirm the abort signal reaches all parallel reviewer child processes and that no
-      adapter ignores it (fan-out in `src/review.ts`, each adapter's stdin/kill handling),
-      including a reviewer already past its startup window.
-- [ ] Add an end-to-end TUI/integration regression test that drives real terminal input
-      through the live Pi event context (not a hand-rolled fake) and asserts cancellation
-      plus process quiescence.
-- [ ] Provide an explicit fallback `/review-cancel` command (or equivalent) as a
-      guaranteed hard stop if terminal interception cannot be guaranteed, and document it
-      in the README alongside the Escape contract.
-- [ ] Make the status/notice confirm both cancellation and process quiescence (all
-      reviewer children exited), not just "review cancelled."
+**Validation.** `npm run check:static` (tsc no-emit + shellcheck); targeted
+dist-test runs of `pi`, `index`, and `commands` test files via
+`npm run build:test`; no `dist/` output touched.
 
-Test status: unit/harness coverage exists (`tests/index.test.ts:953+`,
-`tests/commands.test.ts:222+`) but is fake-driven; no live-TUI/integration test exercises
-real terminal input against a running review.
+**Impact.** Live Escape cancellation now matches the documented contract on
+Kitty-capable terminals, and `/review-cancel` provides a terminal-independent
+hard stop whose completion notice is emitted only after reviewer processes are
+gone.
 
 ### 1. HIGH — SSRF bypass: IPv4-mapped IPv6 literals bypass `isBlockedAddress` (loopback reachability confirmed end-to-end; compatible/NAT64/6to4 forms pass the check but reachability is routing-dependent)
 

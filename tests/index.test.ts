@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
@@ -1065,6 +1065,312 @@ test("escape terminal input aborts an active reviewer process", async () => {
     await assert.rejects(access(join(bundleDir, "reviews", "0001", "reviewers", "fake", "parsed-result.json")), /ENOENT/);
     assert.equal(terminalHandlers.length, 0);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("kitty CSI-u escape aborts an active reviewer process; release and modified escape do not", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-escape-csi-u-"));
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const pidPath = join(dir, "reviewer-pid.txt");
+    const invocationPath = join(dir, "review-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `const pidPath=${JSON.stringify(pidPath)};`,
+            `const invocationPath=${JSON.stringify(invocationPath)};`,
+            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+            "fs.writeFileSync(invocationPath,String(count+1));",
+            "fs.writeFileSync(pidPath,String(process.pid));",
+            "if(count===0){setInterval(()=>{},1000);}",
+            "else {",
+            "process.stdin.resume();",
+            "let input='';",
+            "process.stdin.on('data',chunk=>input+=chunk);",
+            "process.stdin.on('end',()=>{",
+            "const ok=input.includes('Initial user request:')",
+            "&& input.includes('change index')",
+            "&& input.includes('redirect after cancelling review')",
+            "&& input.includes('-before')",
+            "&& input.includes('+after redirected');",
+            "process.stdout.write(JSON.stringify(ok",
+            "?{verdict:'pass',summary:'kept cancelled review context',findings:[]}",
+            ":{verdict:'needs_changes',summary:'lost cancelled review context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing cancelled review context',recommendation:'preserve baseline and request history across review cancellation'}]}));",
+            "});",
+            "}",
+          ].join(""),
+        ],
+        timeoutMs: 300000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    const followUps: string[] = [];
+    const terminalHandlers: Array<(input: unknown) => unknown> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      sendUserMessage(message: string) {
+        followUps.push(message);
+      },
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        onTerminalInput(handler: (input: unknown) => unknown) {
+          terminalHandlers.push(handler);
+          return () => {
+            const index = terminalHandlers.indexOf(handler);
+            if (index >= 0) terminalHandlers.splice(index, 1);
+          };
+        },
+      },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    await trigger(hooks, "agent_end", { cwd: dir, ui: pi.ui });
+    const reviewPromise = trigger(hooks, "agent_settled", { cwd: dir, ui: pi.ui });
+    await waitForFile(pidPath);
+
+    assert.equal(terminalHandlers.length, 1);
+    const reviewerPid = Number(await readFile(pidPath, "utf8"));
+    assert.doesNotThrow(() => process.kill(reviewerPid, 0), "reviewer child should be running before cancellation");
+
+    // Key-release and modified Escape sequences must not cancel the review.
+    assert.deepEqual(terminalHandlers[0]?.("\x1b[27;1:3u"), undefined);
+    assert.deepEqual(terminalHandlers[0]?.("\x1b[27;5u"), undefined);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.doesNotThrow(() => process.kill(reviewerPid, 0), "release/modified escape must not stop the reviewer");
+    assert.doesNotMatch(notices.join("\n"), /review cancelled/);
+
+    // Unmodified Escape in Kitty CSI-u form must cancel it.
+    assert.deepEqual(terminalHandlers[0]?.("\x1b[27u"), { action: "handled", consume: true });
+    // Let the asynchronous acknowledgement notice land before asserting order.
+    await new Promise((resolve) => setImmediate(resolve));
+    // Immediate acknowledgement must not claim reviewer quiescence; the
+    // completion notice appears only after runReview returned and children died.
+    assert.match(notices.join("\n"), /review gate: cancelling the automatic review; waiting for reviewer processes to stop/);
+    assert.doesNotMatch(notices.join("\n"), /reviewer processes stopped/);
+    await reviewPromise;
+
+    await waitForCondition(() => {
+      try {
+        process.kill(reviewerPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    assert.match(notices.join("\n"), /review gate: review cancelled; reviewer processes stopped/);
+    assert.equal(terminalHandlers.length, 0);
+
+    // The aborted invocation leaves the user-canceled tombstone artifact.
+    await trigger(hooks, "input", { cwd: dir, text: "redirect after cancelling review", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after redirected\n", "utf8");
+    await triggerAgentEnd(hooks, { cwd: dir, ui: pi.ui });
+
+    assert.match(notices.join("\n"), /review gate: passed/);
+    const bundleDir = extractBundleDir(followUps[0] ?? "", 2);
+    assert.match(
+      await readFile(join(bundleDir, "reviews", "0001", "CANCELED.md"), "utf8"),
+      /A review would have been run here but was canceled by the user\./,
+    );
+    assert.equal(terminalHandlers.length, 0);
+  } finally {
+    reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/review-cancel stops an active automatic review and reports when no review is active", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-review-cancel-auto-"));
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const pidPath = join(dir, "reviewer-pid.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "slow",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`,
+        ],
+        timeoutMs: 300000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const notices: string[] = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      notify(message: string) {
+        notices.push(message);
+      },
+      sendUserMessage() {},
+    };
+
+    await activate(pi);
+    assert.equal(commands.has("review-cancel"), true);
+    await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await trigger(hooks, "agent_end", { cwd: dir, ui: pi });
+
+    // No review is active yet.
+    await commands.get("review-cancel")?.("", pi);
+    assert.match(notices.join("\n"), /no active review to cancel/);
+
+    const reviewPromise = trigger(hooks, "agent_settled", { cwd: dir, ui: pi });
+    await waitForFile(pidPath);
+    const reviewerPid = Number(await readFile(pidPath, "utf8"));
+    assert.doesNotThrow(() => process.kill(reviewerPid, 0));
+
+    await commands.get("review-cancel")?.("", pi);
+    await reviewPromise;
+
+    assert.match(notices.join("\n"), /review gate: cancelling the automatic review; waiting for reviewer processes to stop/);
+    assert.match(notices.join("\n"), /review gate: review cancelled; reviewer processes stopped/);
+    // The completion notice appears exactly once even though both the command
+    // and the automatic-review settlement path report cancellation.
+    assert.equal(
+      notices.filter((notice) => notice === "review gate: review cancelled; reviewer processes stopped").length,
+      1,
+    );
+    await waitForCondition(() => {
+      try {
+        process.kill(reviewerPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    });
+
+    await commands.get("review-cancel")?.("", pi);
+    assert.match(notices.join("\n"), /no active review to cancel/);
+  } finally {
+    reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failure after listener registration still unregisters, settles, and cleans up", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-registration-reject-"));
+  const sessionDir = await mkdtemp(join(tmpdir(), "pi-review-gate-reject-session-"));
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const markerPath = join(dir, "reviewer-started.txt");
+    const sessionFile = join(sessionDir, "session.jsonl");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
+        ],
+        timeoutMs: 300000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const notices: string[] = [];
+    const terminalHandlers: Array<(input: unknown) => unknown> = [];
+    const sessionManager = {
+      getSessionId: () => "reject-persist-session",
+      getSessionFile: () => sessionFile,
+      getCwd: () => dir,
+    };
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+        commands.set(name, options.handler);
+      },
+      notify(message: string) {
+        notices.push(message);
+      },
+      sendUserMessage() {},
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+        onTerminalInput(handler: (input: unknown) => unknown) {
+          terminalHandlers.push(handler);
+          return () => {
+            const index = terminalHandlers.indexOf(handler);
+            if (index >= 0) terminalHandlers.splice(index, 1);
+          };
+        },
+      },
+    };
+
+    await activate(pi);
+    await trigger(hooks, "session_start", { cwd: dir, ui: pi.ui, sessionManager });
+    await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await trigger(hooks, "agent_end", { cwd: dir, ui: pi.ui });
+
+    // Remove the persistence target so the post-registration
+    // persistSessionState() await inside the agent_settled review path rejects.
+    await rm(sessionDir, { recursive: true, force: true });
+    const reviewPromise = trigger(hooks, "agent_settled", { cwd: dir, ui: pi.ui });
+    await assert.rejects(reviewPromise);
+
+    // The terminal-input listener and coordinator handle were cleaned up, the
+    // reviewer never started, and neither session shutdown nor /review-cancel
+    // can hang on stale state.
+    assert.equal(terminalHandlers.length, 0);
+    await assert.rejects(access(markerPath), /ENOENT/);
+    await mkdir(sessionDir, { recursive: true });
+    await commands.get("review-cancel")?.("", pi);
+    assert.match(notices.join("\n"), /no active review to cancel/);
+    await trigger(hooks, "session_shutdown", { reason: "new" }, { cwd: dir, ui: pi.ui });
+  } finally {
+    reapAll();
+    await rm(sessionDir, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
   }
 });

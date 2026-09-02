@@ -1,7 +1,7 @@
 # Slop and cleanup review inventory
 
 Date: 2026-09-02
-Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0, 1, 2, and 3 are
+Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0, 1, 2, 3, and 4 are
 RESOLVED work-history entries (fixes landed 2026-09-02); remaining findings are
 recommendations only with no product code changes.
 
@@ -256,36 +256,51 @@ and `dist-test/tests/background-shell-jobs.test.js` + `background-process-readin
 destroyed/closed/write-callback failures are bounded, visible diagnostics with actionable
 tool results, while live-job writes behave exactly as before.
 
-### 4. MEDIUM — Background shell: unbounded line length and per-line regex compilation
+### 4. MEDIUM — RESOLVED (2026-09-02): Background shell output bounded end-to-end; model wake patterns moved to linear-time RE2
 
-Refs: `src/background-shell/jobs.ts` `LineBuffer.push` (`:118-124`; caps line **count** at
-`MAX_BUFFER_LINES = 5000`, `:46`, not line length); `compileMatcher` (`:98`) invoked per
-pattern per line by `findMatch` (`:179-184`; `evaluateMatch` does not compile — it only tests
-the fixed `ERROR_ISH` regex); `src/background-shell/index.ts` `onChunk` accumulates an
-arbitrarily long partial line in `job.pending` **before** any `LineBuffer.push` call;
-`formatWakePayload` embeds raw lines un-truncated.
+Refs: `src/background-shell/jobs.ts` (bounds + matching), `src/background-shell/index.ts`
+(stream plumbing), `src/background-shell/jobs.ts` `PendingLineBuffer`/`LineBuffer`,
+`tests/background-shell-jobs.test.ts`, `tests/background-shell-integration.test.ts`.
 
-Impact: a job emitting multi-MB output without newlines (base64 dump, progress bar) grows
-`job.pending` and host memory without bound — capping `LineBuffer.push` alone does not fix
-this because the bytes accumulate in `job.pending` first. Wake payloads and `ShellLog` tails
-can inject hundreds of MB into model context. Model-supplied wake regexes run synchronously
-in the host loop with a fresh `RegExp` compilation per pattern per line — a
-catastrophic-backtracking pattern (`(a+)+$`) can freeze the event loop for minutes on a
-single candidate line, and caching compiled matchers only removes the compilation cost, not
-the backtracking cost.
+**Changes.**
+- Every output surface now carries an explicit, exported character cap with a visible
+  `…[truncated]` marker: `MAX_PENDING_LINE_CHARS` (32 768, ≤ 96 KiB UTF-8 — a char cap is a
+  byte-equivalent bound since N UTF-16 units encode to ≤ 3N UTF-8 bytes), `MAX_STORED_LINE_CHARS`
+  (8 192) plus a `MAX_BUFFER_CHARS` (2 000 000) total retained-text budget that drops oldest
+  lines while keeping `total`/offsets stable, `MAX_WAKE_EXCERPT_LINE_CHARS` (512),
+  `MAX_WAKE_PAYLOAD_CHARS` (8 192), `MAX_LOG_LINE_CHARS` (2 048), `MAX_LOG_RESULT_CHARS`
+  (32 768), `MAX_LABEL_CHARS`, `MAX_COMMAND_DISPLAY_CHARS`.
+- The partial trailing line moved from an unbounded `job.pending` string to `PendingLineBuffer`,
+  which caps the partial before accumulation, marks the cut, still completes the line when the
+  newline finally arrives, and resets for the next line; `finish()` flushes it on close.
+- Model wake patterns never touch V8 `RegExp` in production: `compileMatcher`/`compileMatchers`
+  evaluate via `re2-wasm` (pure WebAssembly RE2, normal dependency, no native addon) with `iu`
+  flags. RE2-unsupported/invalid syntax — or a match-time error such as lone surrogates —
+  degrades to a bounded case-insensitive literal substring test, never `new RegExp`. Patterns
+  are compiled once per job (weak-map cache for the per-call entry point); `normalizeRules` and
+  `compileMatchers` cap count (`MAX_WAKE_PATTERNS` = 16) and length (`MAX_PATTERN_CHARS` = 512),
+  and candidate lines are capped at `MAX_MATCH_LINE_CHARS` (8 192) before matching.
+- Wake payloads bound label/command/excerpt lines and the whole payload; `ShellLog` bounds
+  per-line and total result text while preserving line-count/offset semantics; all tool error
+  text (job ids, labels, spawn exception messages — all model-supplied) goes through
+  `errorResult`, capped at `MAX_ERROR_DISPLAY_CHARS` (240) with the visible marker.
 
-Recommendation:
-- [ ] Add a byte-bounded streaming accumulator for `job.pending` (flush/truncate with a
-      marker once a partial line exceeds N bytes) in addition to capping stored lines in
-      `LineBuffer.push` and wake/log payload line sizes.
-- [ ] Use a genuinely bounded matching strategy for model-supplied patterns: safe-pattern
-      validation, a linear-time engine, or isolated execution with an enforceable timeout —
-      not merely per-job matcher caching.
-- [ ] Tests: long-line truncation, bounded wake payload, backtracking-pattern guard.
+**Tests.** Unit (`tests/background-shell-jobs.test.ts`): `PendingLineBuffer` no-newline 8 MB
+firehose bounds, stored-line and char-budget caps with stable offsets, `(a+)+$` over 200 000 a's
+in bounded time, candidate-line cap, pattern count/length caps, payload/field truncation,
+`truncateText` marker. Integration (`tests/background-shell-integration.test.ts`): 8 MB
+no-newline firehose produces bounded, marker-visible `ShellLog` and wake payloads with paging
+intact; a job printing a `(a+)+$`-failed line with the failing `!` inside the
+`MAX_MATCH_LINE_CHARS` candidate cap (4 000 a's) under that wake pattern exits with its wake
+in ~0.25 s with a responsive host, and oversized job ids passed to ShellLog/ShellSend/ShellStop
+return bounded error text with the visible marker. Existing finding-3 ShellSend tests stay green.
 
-Test status: partial — `tests/background-shell-jobs.test.ts` covers LineBuffer slicing/drop,
-matcher basics, and `formatWakePayload` shape, but not byte bounds or per-line regex cost;
-no adversarial test.
+**Validation.** `npm run check:static`; `npm run build:test`; targeted `node --test
+dist-test/tests/background-shell-jobs.test.js` (49/49) and `--test-concurrency=1
+dist-test/tests/background-shell-integration.test.js` (28/28); `test:fast:run` (179/179) plus
+the execution suite (59/59); dependency smoke — `re2-wasm@1.0.2` in package.json/package-lock,
+packed tarball installs it as a prod dep and CommonJS `require("re2-wasm")` passes an
+linear-time RE2 check. No `dist/` output touched (`npm pack --ignore-scripts` for packaging).
 
 ### 5. MEDIUM — Web table parser DoS via unbounded colspan/rowspan
 
@@ -587,10 +602,10 @@ Test status: caps/archiving tested; soak test missing.
   there. Remaining nits: `test:fast` membership (which suites are in the fast tier; it omits
   e.g. `commands.test.ts` and the background-shell tests) is only visible in `package.json`,
   and `test:integration` is just an alias of `npm test`.
-- **Highest-value missing tests** (from findings above): post-landing fault injection (2), ShellSend stdin lifecycle (3), LineBuffer byte bounds/matcher cost (4), adversarial table spans (5), receipt race (11), delivery-failure notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync durability (7), snapshot concurrency (9). (Finding 1's SSRF-control coverage gap was resolved 2026-09-02 by `tests/web-network.test.ts`.)
+- **Highest-value missing tests** (from findings above): post-landing fault injection (2), ShellSend stdin lifecycle (3), adversarial table spans (5), receipt race (11), delivery-failure notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync durability (7), snapshot concurrency (9). (Finding 1's SSRF-control coverage gap was resolved 2026-09-02 by `tests/web-network.test.ts`; finding 4's LineBuffer byte bounds and matcher cost were resolved 2026-09-02 by the bounded-output/RE2 tests in `tests/background-shell-jobs.test.ts` and `tests/background-shell-integration.test.ts`.)
 - **Docs drift**: README documents `PI_REVIEW_GATE_DISABLED=1` while the launcher strips it
   (L3); keep kill-switch docs and behavior in sync.
-- **Dependency posture is good**: only 7 runtime deps, `package-lock.json` present, and the
+- **Dependency posture is good**: only 8 runtime deps, `package-lock.json` present, and the
   baseline audit is clean (below). Keep lockfile discipline; note L10 for the pip side.
 
 ## Validation and positive controls

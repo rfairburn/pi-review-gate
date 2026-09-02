@@ -20,6 +20,61 @@
 
 export type WakeKind = "exit" | "match" | "silence" | "milestone";
 
+// ── Output bounds (finding 4) ───────────────────────────────────────────
+//
+// Every surface a job's output can reach — the pending partial line, the ring
+// buffer, ShellLog results, and the wake payload — carries an explicit
+// character bound enforced with a visible truncation marker. A character cap
+// is also a byte-equivalent bound: any string of N UTF-16 code units encodes
+// to at most 3N UTF-8 bytes (BMP code points ≤ 3 bytes, surrogate pairs 2
+// units → ≤ 4 bytes), so the byte cost of a bounded string is bounded too.
+
+/** Appended to anything cut short, so truncation is always visible. */
+export const TRUNCATION_MARKER = "…[truncated]";
+
+/** Character cap for a stored (ring-buffer) line. */
+export const MAX_STORED_LINE_CHARS = 8_192;
+/** Character cap for the pending partial line held between chunks.
+ *  ≤ 96 KiB UTF-8, so multi-MB output without newlines cannot accumulate. */
+export const MAX_PENDING_LINE_CHARS = 32_768;
+/** Character cap for one line inside a wake payload excerpt. */
+export const MAX_WAKE_EXCERPT_LINE_CHARS = 512;
+/** Total character cap for a whole wake payload. */
+export const MAX_WAKE_PAYLOAD_CHARS = 8_192;
+/** Character cap for one line in a ShellLog result. */
+export const MAX_LOG_LINE_CHARS = 2_048;
+/** Total character cap for a ShellLog result. */
+export const MAX_LOG_RESULT_CHARS = 32_768;
+/** Character cap for a job label (stored and displayed). */
+export const MAX_LABEL_CHARS = 80;
+/** Character cap for the displayed command (the stored command is the
+ *  executable text and is never altered). */
+export const MAX_COMMAND_DISPLAY_CHARS = 512;
+/** Character cap for error text returned to the model — job IDs, labels, and
+ *  spawn messages interpolated into tool errors are model-supplied and must
+ *  not be echoed wholesale into context. */
+export const MAX_ERROR_DISPLAY_CHARS = 240;
+/** Max model-supplied wake patterns per job. */
+export const MAX_WAKE_PATTERNS = 16;
+/** Character cap for a single model-supplied wake pattern. */
+export const MAX_PATTERN_CHARS = 512;
+/** Candidate-line cap before matching: patterns are evaluated against at
+ *  most this many characters of any line, so matching cost is bounded even
+ *  for a linear-time engine. */
+export const MAX_MATCH_LINE_CHARS = 8_192;
+/** Total character budget for all lines retained by a LineBuffer, on top of
+ *  the line-count cap — 5000 lines of 8 KiB each would otherwise be ~80 MB. */
+export const MAX_BUFFER_CHARS = 2_000_000;
+
+/** Cut `text` down to at most `max` characters, marking the cut. At a cap
+ *  too small to hold the marker itself, the plain cut wins: the bound is
+ *  the invariant, the marker is best-effort. */
+export function truncateText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  if (max <= TRUNCATION_MARKER.length) return text.slice(0, max);
+  return text.slice(0, max - TRUNCATION_MARKER.length) + TRUNCATION_MARKER;
+}
+
 /** How urgently a wake event reaches the agent. Maps onto pi's sendMessage
  *  delivery modes — see laneDelivery(). */
 export type Lane = "now" | "soon" | "idle";
@@ -83,6 +138,11 @@ export function normalizeRules(raw: any): WakeRules {
   const m = raw.match;
   if (typeof m === "string") out.match = [m];
   else if (Array.isArray(m)) out.match = m.filter((x: any) => typeof x === "string" && x.length > 0);
+  // Untrusted model input: cap the count and the length of every pattern
+  // before anything downstream sees it.
+  out.match = out.match
+    .slice(0, MAX_WAKE_PATTERNS)
+    .map((p) => (p.length > MAX_PATTERN_CHARS ? p.slice(0, MAX_PATTERN_CHARS) : p));
 
   const sil = parseDuration(raw.silence);
   if (sil) out.silenceMs = sil;
@@ -93,17 +153,112 @@ export function normalizeRules(raw: any): WakeRules {
   return out;
 }
 
-/** Compile a pattern to a matcher. Invalid regex degrades to a literal
- *  substring test rather than throwing — the model writes prose, not /re/. */
-export function compileMatcher(pattern: string): (line: string) => boolean {
-  try {
-    const re = new RegExp(pattern, "i");
-    return (line) => re.test(line);
-  } catch {
-    const needle = pattern.toLowerCase();
-    return (line) => line.toLowerCase().includes(needle);
-  }
+// ── Linear-time matching (finding 4) ────────────────────────────────────
+//
+// Model-supplied wake patterns are untrusted text, and V8's RegExp engine
+// backtracks: one `(a+)+$` against one unlucky line can freeze the host's
+// event loop for minutes. Production therefore NEVER compiles model text with
+// `new RegExp`. Patterns are evaluated by RE2 — a linear-time engine with no
+// backtracking — compiled once per job via re2-wasm (pure WebAssembly, no
+// native addon). Anything RE2 cannot compile (invalid syntax, unsupported
+// constructs) degrades to a case-insensitive literal substring test, which is
+// itself linear. The module is loaded through a guarded require: if re2-wasm
+// cannot load at all (no wasm support, exotic runtime), RE2 stays null and
+// every pattern degrades to the literal test — degraded matching beats a
+// module-load crash.
+
+type Re2Matcher = { test(s: string): boolean };
+type Re2Constructor = new (pattern: string, flags?: string) => Re2Matcher;
+let RE2: Re2Constructor | null = null;
+try {
+  RE2 = (require("re2-wasm") as { RE2: Re2Constructor }).RE2;
+} catch {
+  RE2 = null;
 }
+
+/** A compiled matcher for one pattern. */
+export interface CompiledPattern {
+  pattern: string;
+  test: (line: string) => boolean;
+}
+
+/** Compile one pattern to a predicate. Never throws; never touches V8's
+ *  RegExp on model text — invalid or unsupported syntax yields the literal
+ *  substring fallback. RE2 requires the unicode flag, so patterns using
+ *  non-unicode-only syntax that RE2 rejects fall back the same way. */
+export function compileMatcher(pattern: string): (line: string) => boolean {
+  const compiled = compilePattern(pattern);
+  return compiled.test;
+}
+
+function compilePattern(pattern: string): CompiledPattern {
+  if (RE2) {
+    try {
+      const re = new RE2(pattern, "iu");
+      return {
+        pattern,
+        test: (line) => {
+          // A construct-time-valid pattern can still fail at match time (e.g.
+          // unpaired surrogates in the candidate). Fall back to the literal
+          // test rather than throwing out of a stream handler.
+          try {
+            return re.test(line);
+          } catch {
+            return literalTest(pattern, line);
+          }
+        },
+      };
+    } catch {
+      return { pattern, test: (line) => literalTest(pattern, line) };
+    }
+  }
+  // re2-wasm unavailable: every pattern takes the bounded literal fallback.
+  return { pattern, test: (line) => literalTest(pattern, line) };
+}
+
+/** Bounded, linear, dependency-free fallback. */
+function literalTest(pattern: string, line: string): boolean {
+  return line.toLowerCase().includes(pattern.toLowerCase());
+}
+
+/** All of a job's patterns, compiled once. Replaces the old per-line
+ *  compile: `findMatch` used to build a fresh RegExp for every pattern on
+ *  every line of output. */
+export interface JobMatchers {
+  patterns: readonly string[];
+  /** The first pattern matching `line` (already capped to
+   *  MAX_MATCH_LINE_CHARS), or null. */
+  match(line: string): string | null;
+}
+
+export function compileMatchers(patterns: readonly string[]): JobMatchers {
+  // Belt-and-braces: normalizeRules already caps count and length.
+  const capped = patterns
+    .slice(0, MAX_WAKE_PATTERNS)
+    .map((p) => (p.length > MAX_PATTERN_CHARS ? p.slice(0, MAX_PATTERN_CHARS) : p));
+  const compiled = capped.map(compilePattern);
+  return {
+    patterns: capped,
+    match(line: string): string | null {
+      // Candidate cap: matching cost is bounded no matter how long the line
+      // is. Trade-off, documented: anchors like `$` and any content past the
+      // cap are evaluated against the PREFIX only — an end-anchored pattern
+      // can false-positive on a truncated line, and text beyond the cap is
+      // never seen by any matcher.
+      const bounded = line.length > MAX_MATCH_LINE_CHARS
+        ? line.slice(0, MAX_MATCH_LINE_CHARS)
+        : line;
+      for (const c of compiled) {
+        if (c.test(bounded)) return c.pattern;
+      }
+      return null;
+    },
+  };
+}
+
+/** Match cache so the per-call entry point stays cheap when a caller has not
+ *  pre-compiled (tests, one-off callers). Production compiles once per job. */
+const matcherCache = new WeakMap<WakeRules, JobMatchers>();
 
 // ── Ring buffer ─────────────────────────────────────────────────────────
 
@@ -112,15 +267,39 @@ export function compileMatcher(pattern: string): (line: string) => boolean {
 export class LineBuffer {
   private lines: string[] = [];
   private dropped = 0;
+  private chars = 0;
 
-  constructor(private max = MAX_BUFFER_LINES) {}
+  constructor(
+    private max = MAX_BUFFER_LINES,
+    private maxChars = MAX_BUFFER_CHARS,
+    private maxLineChars = MAX_STORED_LINE_CHARS,
+  ) {}
 
   push(line: string): void {
-    this.lines.push(line);
+    // Bound the stored length of a single line; the cut is visible. A custom
+    // total budget smaller than the normal line cap must still be honored by
+    // a buffer containing only one line.
+    const stored = truncateText(line, Math.min(this.maxLineChars, this.maxChars));
+    this.lines.push(stored);
+    this.chars += stored.length;
     if (this.lines.length > this.max) {
       this.dropped += this.lines.length - this.max;
       this.lines = this.lines.slice(-this.max);
+      this.recountChars();
     }
+    // Byte-equivalent accumulation bound: drop oldest lines until the retained
+    // text fits the character budget. `total`/`droppedCount`/offsets stay
+    // stable because dropped lines only ever move into `dropped`.
+    while (this.chars > this.maxChars && this.lines.length > 1) {
+      this.chars -= this.lines[0].length;
+      this.lines.shift();
+      this.dropped += 1;
+    }
+  }
+
+  private recountChars(): void {
+    this.chars = 0;
+    for (const l of this.lines) this.chars += l.length;
   }
 
   /** Total lines ever written, including dropped ones. */
@@ -152,6 +331,69 @@ export class LineBuffer {
   }
 }
 
+/**
+ * Bounded accumulator for a job's pending partial line.
+ *
+ * A job that emits multi-MB output without newlines (base64 dump, progress
+ * bar) must not grow host memory without bound, and capping the ring buffer
+ * alone does not help because the bytes sit in the partial line first. Once
+ * the partial exceeds MAX_PENDING_LINE_CHARS it is cut short with a visible
+ * marker and the rest of THAT line is discarded; newlines still complete the
+ * line, and the next line starts fresh.
+ */
+export class PendingLineBuffer {
+  private text = "";
+  private over = false;
+
+  constructor(private cap = MAX_PENDING_LINE_CHARS) {}
+
+  /** Feed one decoded chunk; returns every complete line it contains. */
+  push(chunk: string): string[] {
+    const lines: string[] = [];
+    let rest = chunk;
+    for (;;) {
+      const nl = rest.indexOf("\n");
+      if (nl === -1) break;
+      lines.push(this.complete(rest.slice(0, nl)));
+      rest = rest.slice(nl + 1);
+    }
+    this.append(rest);
+    return lines;
+  }
+
+  /** The remaining partial line when the job closes; resets the accumulator.
+   *  Empty string when there is no trailing partial. */
+  flush(): string {
+    const text = this.text;
+    this.text = "";
+    this.over = false;
+    return text;
+  }
+
+  private append(part: string): void {
+    if (this.over) return; // this line is already capped and marked; drop the rest
+    const combined = this.text + part;
+    if (combined.length <= this.cap) {
+      this.text = combined;
+      return;
+    }
+    this.text = truncateText(combined, this.cap);
+    this.over = true;
+  }
+
+  private complete(part: string): string {
+    if (this.over) {
+      const line = this.text;
+      this.text = "";
+      this.over = false;
+      return line;
+    }
+    const combined = this.text + part;
+    this.text = "";
+    return truncateText(combined, this.cap);
+  }
+}
+
 // ── Wake decisions ──────────────────────────────────────────────────────
 
 export interface JobWakeState {
@@ -178,12 +420,22 @@ const ERROR_ISH = /traceback|out of memory|oom|fatal|panic|segmentation fault|\b
 /** The first configured pattern this line matches, or null. Exported so the
  *  caller can decide-once: whether a line matched drives BOTH the match counter
  *  and the wake decision, and computing it twice with two different notions of
- *  "matches" is how every_n_matches quietly stops lining up with reality. */
-export function findMatch(line: string, rules: WakeRules): string | null {
-  for (const p of rules.match) {
-    if (compileMatcher(p)(line)) return p;
+ *  "matches" is how every_n_matches quietly stops lining up with reality.
+ *
+ *  Pass the job's pre-compiled matchers in production; without them the rules'
+ *  matchers are compiled once and cached on the rules object. */
+export function findMatch(line: string, rules: WakeRules, matchers?: JobMatchers): string | null {
+  const m = matchers ?? cacheMatchers(rules);
+  return m.match(line);
+}
+
+function cacheMatchers(rules: WakeRules): JobMatchers {
+  let m = matcherCache.get(rules);
+  if (!m) {
+    m = compileMatchers(rules.match);
+    matcherCache.set(rules, m);
   }
-  return null;
+  return m;
 }
 
 /**
@@ -327,19 +579,24 @@ export interface WakePayloadInput {
  * in — and the model can always pull more with ShellLog if the digest warrants.
  */
 export function formatWakePayload(p: WakePayloadInput): string {
+  // Every display field and excerpt line is individually bounded, and the
+  // whole payload has a total cap with a visible cut, so a wake can never
+  // inject an unbounded blob into model context.
   const head = [
-    `background job "${p.label}" (${p.id}) — ${p.event.reason}`,
-    `command: ${p.command}`,
+    `background job "${truncateText(p.label, MAX_LABEL_CHARS)}" (${p.id}) — ${p.event.reason}`,
+    `command: ${truncateText(p.command, MAX_COMMAND_DISPLAY_CHARS)}`,
     `running: ${formatElapsed(p.elapsedMs)}${
       p.exitCode !== undefined && p.exitCode !== null ? ` · exit ${p.exitCode}` : ""
     }`,
   ];
-  const body = p.lines.length > 0
-    ? [`last ${p.lines.length} of ${p.totalLines} lines:`, "```", ...p.lines, "```"]
+  const boundedLines = p.lines.map((l) => truncateText(l, MAX_WAKE_EXCERPT_LINE_CHARS));
+  const body = boundedLines.length > 0
+    ? [`last ${boundedLines.length} of ${p.totalLines} lines:`, "```", ...boundedLines, "```"]
     : ["(no output)"];
   const tail =
     p.event.kind === "exit"
       ? []
       : [`ShellLog({"id":"${p.id}"}) for more. The job is still running.`];
-  return [...head, "", ...body, ...tail].join("\n");
+  const out = [...head, "", ...body, ...tail].join("\n");
+  return truncateText(out, MAX_WAKE_PAYLOAD_CHARS);
 }

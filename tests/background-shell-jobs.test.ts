@@ -6,9 +6,17 @@
 import { describe, it } from "node:test";
 import { expect } from "./helpers/expect";
 import {
+  MAX_BUFFER_CHARS,
+  MAX_PENDING_LINE_CHARS,
+  MAX_STORED_LINE_CHARS,
+  MAX_WAKE_PATTERNS,
+  MAX_WAKE_PAYLOAD_CHARS,
+  PendingLineBuffer,
+  TRUNCATION_MARKER,
   LineBuffer,
   MIN_WAKE_INTERVAL_MS,
   compileMatcher,
+  compileMatchers,
   evaluateExit,
   evaluateMatch,
   evaluateSilence,
@@ -18,6 +26,7 @@ import {
   laneDelivery,
   normalizeRules,
   parseDuration,
+  truncateText,
   wrapWithParentWatchdog,
   type JobWakeState,
 } from "../src/background-shell/jobs";
@@ -71,16 +80,99 @@ describe("normalizeRules", () => {
   });
 });
 
-describe("compileMatcher", () => {
-  it("treats a valid pattern as a case-insensitive regex", () => {
+describe("compileMatcher (RE2-backed, finding 4)", () => {
+  it("treats a valid pattern as a case-insensitive unicode regex", () => {
     expect(compileMatcher("val_loss=[0-9.]+")("  val_loss=0.31")).toBe(true);
     expect(compileMatcher("^Epoch")("Epoch 3/50")).toBe(true);
+    // 'i' + 'u' flags: case-insensitive matching over unicode text.
+    expect(compileMatcher("héllo")("say HÉLLO there")).toBe(true);
   });
   // Models write prose far more often than they write anchors.
   it("degrades an invalid regex to a literal substring rather than throwing", () => {
     const m = compileMatcher("CUDA out of memory (");
     expect(() => m("x")).not.toThrow();
     expect(m("RuntimeError: CUDA out of memory (tried to allocate)")).toBe(true);
+  });
+  it("degrades RE2-unsupported constructs (lookahead) to the literal fallback", () => {
+    // RE2 has no lookahead, so construction throws and the pattern is matched
+    // as a literal substring — it must find the pattern text itself, and must
+    // NOT behave like a regex with lookahead semantics.
+    const m = compileMatcher("foo(?=bar)");
+    expect(() => m("x")).not.toThrow();
+    expect(m("use foo(?=bar) here")).toBe(true); // literal text is found
+    expect(m("foobar")).toBe(false); // no lookahead semantics
+  });
+
+  // The heart of finding 4: a catastrophic-backtracking pattern must be
+  // evaluated by the linear-time engine, NOT V8's backtracking RegExp — V8
+  // would grind on this input for far longer than any test deadline. The
+  // bound is generous so the assertion stays deterministic; RE2 finishes in
+  // microseconds, the literal fallback in milliseconds, V8 in hours.
+  it("evaluates a catastrophic pattern in bounded time", () => {
+    const m = compileMatcher("(a+)+$");
+    const line = "a".repeat(200_000) + "!";
+    const t0 = Date.now();
+    expect(m(line)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(1_000);
+  });
+
+  it("keeps matching linear in the candidate length via the line cap", () => {
+    const m = compileMatchers(["needle"]).match;
+    // A line far beyond MAX_MATCH_LINE_CHARS is only ever scanned up to the cap.
+    const huge = "x".repeat(5_000_000) + "needle";
+    const t0 = Date.now();
+    expect(m(huge)).toBeNull(); // 'needle' sits past the candidate cap
+    expect(Date.now() - t0).toBeLessThan(1_000);
+  });
+});
+
+describe("compileMatchers (compiled once per job)", () => {
+  it("returns the first matching pattern", () => {
+    const m = compileMatchers(["Traceback", "val_loss="]);
+    expect(m.match("  Traceback (most recent call last)")).toBe("Traceback");
+    expect(m.match("epoch 2 val_loss=0.4")).toBe("val_loss=");
+    expect(m.match("all quiet")).toBeNull();
+  });
+  it("caps pattern count and length defensively", () => {
+    const m = compileMatchers(Array.from({ length: 50 }, (_, i) => `p${i}`));
+    expect(m.patterns.length).toBe(MAX_WAKE_PATTERNS);
+    const long = compileMatchers(["a".repeat(10_000)]);
+    expect(long.patterns[0].length).toBeLessThanOrEqual(512);
+  });
+  it("caps the candidate line before matching", () => {
+    // 'needle' placed just past the cap must not match; the matcher only
+    // ever sees the first MAX_MATCH_LINE_CHARS characters.
+    const line = "x".repeat(8_192) + "needle";
+    expect(compileMatchers(["needle"]).match(line)).toBeNull();
+    expect(compileMatchers(["needle"]).match("x" + "needle")).toBe("needle");
+  });
+  it("findMatch honours pre-compiled matchers", () => {
+    const rules = { exit: true, match: ["Traceback"] };
+    const m = compileMatchers(rules.match);
+    expect(findMatch("Traceback here", rules, m)).toBe("Traceback");
+    expect(findMatch("quiet", rules, m)).toBeNull();
+  });
+
+  it("normalizeRules caps the pattern list", () => {
+    const many = normalizeRules({ match: Array.from({ length: 40 }, (_, i) => `p${i}`) });
+    expect(many.match.length).toBe(MAX_WAKE_PATTERNS);
+    const long = normalizeRules({ match: ["a".repeat(9_999)] });
+    expect(long.match[0].length).toBeLessThanOrEqual(512);
+  });
+});
+
+describe("truncateText", () => {
+  it("leaves short text alone", () => {
+    expect(truncateText("short", 100)).toBe("short");
+  });
+  it("cuts with a visible marker", () => {
+    const out = truncateText("a".repeat(500), 100);
+    expect(out.length).toBe(100);
+    expect(out.endsWith(TRUNCATION_MARKER)).toBe(true);
+  });
+  it("degenerates safely at tiny caps", () => {
+    const out = truncateText("abcdef", 4);
+    expect(out.length).toBe(4);
   });
 });
 
@@ -99,6 +191,78 @@ describe("LineBuffer", () => {
     expect(s.from).toBe(7); // clamped up to what is still retained
     expect(s.lines).toEqual(["line7", "line8"]);
     expect(s.nextOffset).toBe(9);
+  });
+
+  // Finding 4: stored line length is bounded, with a visible marker.
+  it("truncates an over-long stored line", () => {
+    const b = new LineBuffer(10, MAX_BUFFER_CHARS, 100);
+    b.push("a".repeat(10_000));
+    const [line] = b.tail(1);
+    expect(line.length).toBe(100);
+    expect(line.endsWith(TRUNCATION_MARKER)).toBe(true);
+  });
+
+  it("enforces a total character budget by dropping oldest lines", () => {
+    const b = new LineBuffer(100, 250, MAX_STORED_LINE_CHARS);
+    for (let i = 0; i < 50; i++) b.push("x".repeat(50)); // 2500 chars total
+    expect(b.tail(1)[0]).toBe("x".repeat(50));
+    // Retained text must fit the budget.
+    expect(b.tail(b.total - b.droppedCount).join("").length).toBeLessThanOrEqual(250);
+    // Offsets stay stable: total counts everything ever written.
+    expect(b.total).toBe(50);
+    const s = b.slice(48, 10);
+    expect(s.lines.length).toBe(2);
+    expect(s.nextOffset).toBe(50);
+  });
+
+  it("enforces the total character budget for a single retained line", () => {
+    const b = new LineBuffer(100, 250, MAX_STORED_LINE_CHARS);
+    b.push("x".repeat(10_000));
+    expect(b.tail(1)[0].length).toBe(250);
+    expect(b.tail(1)[0].endsWith(TRUNCATION_MARKER)).toBe(true);
+  });
+});
+
+describe("PendingLineBuffer (bounded partial line, finding 4)", () => {
+  it("assembles lines across chunks", () => {
+    const p = new PendingLineBuffer();
+    expect(p.push("hel")).toEqual([]);
+    expect(p.push("lo\nwor")).toEqual(["hello"]);
+    expect(p.push("ld\n")).toEqual(["world"]);
+    expect(p.flush()).toBe("");
+  });
+
+  it("bounds a no-newline firehose with a visible marker", () => {
+    const p = new PendingLineBuffer();
+    // 8 MB with no newline: memory must not grow with it.
+    const lines = p.push("a".repeat(8 * 1024 * 1024));
+    expect(lines).toEqual([]);
+    const held = p.flush();
+    expect(held.length).toBe(MAX_PENDING_LINE_CHARS);
+    expect(held.endsWith(TRUNCATION_MARKER)).toBe(true);
+    expect(p.flush()).toBe("");
+  });
+
+  it("still completes the line when bytes keep flowing, and starts fresh", () => {
+    const p = new PendingLineBuffer();
+    p.push("a".repeat(MAX_PENDING_LINE_CHARS * 2)); // over cap, marked
+    const done = p.push("\nnext line\n");
+    expect(done.length).toBe(2);
+    expect(done[0].length).toBe(MAX_PENDING_LINE_CHARS);
+    expect(done[0].endsWith(TRUNCATION_MARKER)).toBe(true);
+    expect(done[1]).toBe("next line");
+    // The next partial accumulates from zero, not from the marked line.
+    expect(p.push("fresh")).toEqual([]);
+    expect(p.flush()).toBe("fresh");
+  });
+
+  it("flushes the capped pending line when the job closes mid-line", () => {
+    const p = new PendingLineBuffer();
+    p.push("a".repeat(MAX_PENDING_LINE_CHARS + 5));
+    const last = p.flush();
+    expect(last.endsWith(TRUNCATION_MARKER)).toBe(true);
+    expect(last.length).toBe(MAX_PENDING_LINE_CHARS);
+    expect(p.flush()).toBe("");
   });
 });
 
@@ -219,6 +383,31 @@ describe("formatWakePayload", () => {
     });
     expect(done).toContain("exit 0");
     expect(done).not.toContain("still running");
+  });
+
+  // Finding 4: every field of the payload is bounded and every cut is visible.
+  it("truncates oversized display fields and excerpt lines", () => {
+    const out = formatWakePayload({
+      ...base,
+      label: "L".repeat(100_000),
+      command: "C".repeat(100_000),
+      lines: ["E".repeat(100_000)],
+      event: { kind: "match", lane: "soon", reason: "matched" },
+    });
+    expect(out).toContain(TRUNCATION_MARKER);
+    expect(out.length).toBeLessThanOrEqual(MAX_WAKE_PAYLOAD_CHARS);
+  });
+
+  it("enforces the total payload cap", () => {
+    // 30 short-ish lines (each under the per-line excerpt cap) whose joined
+    // body still exceeds the total payload cap.
+    const out = formatWakePayload({
+      ...base,
+      lines: Array.from({ length: 30 }, () => "E".repeat(400)),
+      event: { kind: "match", lane: "soon", reason: "matched" },
+    });
+    expect(out.length).toBe(MAX_WAKE_PAYLOAD_CHARS);
+    expect(out.endsWith(TRUNCATION_MARKER)).toBe(true);
   });
 });
 

@@ -10,16 +10,23 @@ import {
   DEFAULT_RULES,
   LineBuffer,
   MIN_WAKE_INTERVAL_MS,
+  MAX_ERROR_DISPLAY_CHARS,
+  MAX_LABEL_CHARS,
+  MAX_LOG_LINE_CHARS,
+  MAX_LOG_RESULT_CHARS,
+  PendingLineBuffer,
   WAKE_CONTEXT_LINES,
+  compileMatchers,
   evaluateExit,
   evaluateMatch,
   evaluateSilence,
-  findMatch,
   formatElapsed,
   formatWakePayload,
   laneDelivery,
   normalizeRules,
+  truncateText,
   wrapWithParentWatchdog,
+  type JobMatchers,
   type JobWakeState,
   type WakeEvent,
   type WakeRules,
@@ -114,6 +121,8 @@ interface Job {
   command: string;
   proc: ChildProcess;
   buffer: LineBuffer;
+  /** Wake patterns compiled once — never per line. */
+  matchers: JobMatchers;
   rules: WakeRules;
   wake: JobWakeState;
   startedAt: number;
@@ -121,8 +130,9 @@ interface Job {
   exitCode?: number | null;
   lastOutputAt: number | null;
   exited: boolean;
-  /** Partial trailing line, held until its newline arrives. */
-  pending: string;
+  /** Partial trailing line, held until its newline arrives. Bounded: see
+   *  PendingLineBuffer — a no-newline firehose cannot grow it past the cap. */
+  pending: PendingLineBuffer;
   /** Set the first time stdin reports an error (EPIPE, destroyed, …). Bounds
    *  the buffer to one diagnostic per job across a normal exit race. */
   stdinDead?: boolean;
@@ -241,6 +251,14 @@ function textResult(text: string, isError = false, details: Record<string, unkno
   return { content: [{ type: "text" as const, text }], details, isError };
 }
 
+/** Every error reaching the model goes through here. Error messages embed
+ *  model-supplied fragments (job ids, labels, spawn exception text); left
+ *  unbounded, a multi-megabyte argument would be echoed straight into model
+ *  context. Truncate with the visible marker before returning. */
+function errorResult(text: string, details: Record<string, unknown> = {}) {
+  return textResult(truncateText(text, MAX_ERROR_DISPLAY_CHARS), true, details);
+}
+
 function resolveJob(target: string): { job?: Job; error?: ReturnType<typeof textResult> } {
   const exact = jobs.get(target);
   if (exact) return { job: exact };
@@ -249,14 +267,13 @@ function resolveJob(target: string): { job?: Job; error?: ReturnType<typeof text
   if (matches.length > 1) {
     const choices = matches.map((job) => `- ${job.id} (${statusOf(job)})`).join("\n");
     return {
-      error: textResult(
+      error: errorResult(
         `Error: label ${JSON.stringify(target)} is ambiguous. Matching job IDs:\n${choices}\n` +
           `Retry ShellStop with one exact job ID, for example: {"id":${JSON.stringify(matches[0].id)}}`,
-        true,
       ),
     };
   }
-  return { error: textResult(`Error: no such job id or label ${JSON.stringify(target)}. Use ShellList to see available job IDs.`, true) };
+  return { error: errorResult(`Error: no such job id or label ${JSON.stringify(target)}. Use ShellList to see available job IDs.`) };
 }
 
 /** True while Pi reports an active agent run (agent_start … agent_settled).
@@ -380,7 +397,7 @@ function handleLine(pi: BackgroundShellHost, job: Job, line: string): void {
   job.wake.stallNotified = false; // output resumed — re-arm the stall detector
 
   // Match once. The same result drives both the counter and the wake decision.
-  const hit = findMatch(line, job.rules);
+  const hit = job.matchers.match(line);
   if (!hit) return;
   job.wake.matchCount += 1;
   const event = evaluateMatch(hit, line, job.rules, job.wake, job.wake.matchCount, now);
@@ -404,10 +421,11 @@ function handleLine(pi: BackgroundShellHost, job: Job, line: string): void {
 
 function attachStreams(pi: BackgroundShellHost, job: Job): void {
   const onChunk = (buf: Buffer) => {
-    const text = job.pending + buf.toString();
-    const parts = text.split("\n");
-    job.pending = parts.pop() ?? "";
-    for (const line of parts) handleLine(pi, job, line);
+    // Bound the pending partial line BEFORE accumulation (finding 4): a
+    // multi-MB no-newline stream is capped and marked, never held in full.
+    for (const line of job.pending.push(buf.toString())) {
+      handleLine(pi, job, line);
+    }
   };
   job.proc.stdout?.on("data", onChunk);
   job.proc.stderr?.on("data", onChunk);
@@ -426,9 +444,9 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
     job.exited = true;
     job.exitCode = code;
     job.endedAt = Date.now();
-    if (job.pending) {
-      handleLine(pi, job, job.pending);
-      job.pending = "";
+    const remaining = job.pending.flush();
+    if (remaining) {
+      handleLine(pi, job, remaining);
     }
     // Drop any held match wake: the exit wake below says everything it would
     // have, and the exit code besides. A nonurgent wake held for the agent's
@@ -588,18 +606,20 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
     }, ["command"]),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const command = String(params.command ?? "").trim();
-      if (!command) return textResult("Error: command is required", true);
+      if (!command) return errorResult("Error: command is required");
 
       const live = [...jobs.values()].filter((j) => !j.exited).length;
       if (live >= MAX_JOBS) {
-        return textResult(
+        return errorResult(
           `Error: ${live} background jobs already running (max ${MAX_JOBS}). Stop one with ShellStop first.`,
-          true,
         );
       }
 
       const id = nextId();
-      const label = String(params.label ?? "").trim() || command.split(/\s+/)[0] || id;
+      const label = truncateText(
+        String(params.label ?? "").trim() || truncateText(command.split(/\s+/)[0] || id, MAX_LABEL_CHARS),
+        MAX_LABEL_CHARS,
+      );
       const rules = params.wake_on ? normalizeRules(params.wake_on) : { ...DEFAULT_RULES };
 
       let proc: ChildProcess;
@@ -615,7 +635,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
           stdio: ["pipe", "pipe", "pipe"],
         });
       } catch (e) {
-        return textResult(`Error: could not start job: ${(e as Error)?.message ?? e}`, true);
+        return errorResult(`Error: could not start job: ${(e as Error)?.message ?? e}`);
       }
 
       const job: Job = {
@@ -624,12 +644,13 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         command,
         proc,
         buffer: new LineBuffer(),
+        matchers: compileMatchers(rules.match),
         rules,
         wake: { matchCount: 0, lastWakeAt: 0, stallNotified: false },
         startedAt: Date.now(),
         lastOutputAt: null,
         exited: false,
-        pending: "",
+        pending: new PendingLineBuffer(),
       };
       jobs.set(id, job);
       publishLifecycle("started", job);
@@ -692,19 +713,27 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
     }, ["id"]),
     async execute(_id, params) {
       const job = jobs.get(String(params.id ?? ""));
-      if (!job) return textResult(`Error: no such job "${params.id}"`, true);
+      if (!job) return errorResult(`Error: no such job "${params.id}"`);
       const want = Math.max(1, Math.min(Number(params.lines ?? 60), 400));
+
+      const render = (lines: string[], header: string): string => {
+        // Per-line and total bounds; line counts and offsets are untouched, so
+        // paging semantics survive even when long lines are cut.
+        let text = [header, "```", ...lines.map((l) => truncateText(l, MAX_LOG_LINE_CHARS)), "```"]
+          .join("\n");
+        return truncateText(text, MAX_LOG_RESULT_CHARS);
+      };
 
       if (params.offset === undefined) {
         const lines = job.buffer.tail(want);
         const header = `${job.id} "${job.label}" ${statusOf(job)} · ${job.buffer.total} lines total`;
-        return textResult([header, "```", ...lines, "```"].join("\n"));
+        return textResult(render(lines, header));
       }
       const { lines, from, nextOffset } = job.buffer.slice(Number(params.offset), want);
       const header =
         `${job.id} "${job.label}" ${statusOf(job)} · lines ${from}–${nextOffset} of ${job.buffer.total}` +
         (job.buffer.droppedCount > 0 ? ` (${job.buffer.droppedCount} oldest dropped)` : "");
-      return textResult([header, "```", ...lines, "```"].join("\n"));
+      return textResult(render(lines, header));
     },
   });
 
@@ -720,7 +749,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
     }, ["id", "text"]),
     async execute(_id, params) {
       const job = jobs.get(String(params.id ?? ""));
-      if (!job) return textResult(`Error: no such job "${params.id}"`, true);
+      if (!job) return errorResult(`Error: no such job "${params.id}"`);
       // A recorded stdin failure (EPIPE from an earlier write) is the more
       // precise answer for a retry, so it wins over the exit flag. Otherwise an
       // exited job keeps the definitive "already exited" message: Node destroys
@@ -728,13 +757,12 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
       // driven finish()), so without this guard every exited job would trip the
       // dead-stream precheck and get a spurious [stdin error] note.
       const exited = job.exited || job.proc.exitCode !== null || job.proc.signalCode !== null;
-      if (exited && !job.stdinDead) return textResult(`Error: job ${job.id} has already exited`, true);
+      if (exited && !job.stdinDead) return errorResult(`Error: job ${job.id} has already exited`);
       if (stdinIsDead(job)) {
         const reason = recordStdinFailure(job, job.stdinError ?? "closed");
-        return textResult(
+        return errorResult(
           `Error: stdin for ${job.id} is no longer writable (${reason}) — the job likely exited or ` +
             `closed its input. Check ShellLog/ShellList, and use ShellStop if it needs cleaning up.`,
-          true,
           { kind: "pi-review-bg-shell", event: "stdin-closed", id: job.id },
         );
       }
@@ -774,10 +802,9 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
       });
       if (outcome.error) {
         const reason = recordStdinFailure(job, outcome.error);
-        return textResult(
+        return errorResult(
           `Error: write to ${job.id} stdin failed (${reason}). The job likely exited mid-write; ` +
             `check ShellLog/ShellList, and use ShellStop if it needs cleaning up.`,
-          true,
           { kind: "pi-review-bg-shell", event: "stdin-write-failed", id: job.id },
         );
       }

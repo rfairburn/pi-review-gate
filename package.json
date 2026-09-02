@@ -53,6 +53,7 @@
     "linkedom": "^0.18.13",
     "pdf-parse": "^2.4.5",
     "playwright": "^1.62.1",
+    "re2-wasm": "^1.0.2",
     "turndown": "^7.2.4",
     "turndown-plugin-gfm": "^1.0.2"
   }

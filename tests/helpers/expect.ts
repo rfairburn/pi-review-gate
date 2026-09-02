@@ -13,6 +13,8 @@ export function expect(actual: unknown, message?: string) {
     toBeNull: () => assert.equal(actual, null, message),
     toBeUndefined: () => assert.equal(actual, undefined, message),
     toBeLessThan: (expected: number) => assert.ok(typeof actual === "number" && actual < expected, message),
+    toBeLessThanOrEqual: (expected: number) =>
+      assert.ok(typeof actual === "number" && actual <= expected, message),
     toContain: includes,
     toMatchObject: (expected: Record<string, unknown>) => {
       assert.ok(actual && typeof actual === "object", message);

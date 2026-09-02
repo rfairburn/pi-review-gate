@@ -7,6 +7,12 @@ import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
 import { execFileSync } from "node:child_process";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
+import {
+  MAX_ERROR_DISPLAY_CHARS,
+  MAX_LOG_RESULT_CHARS,
+  MAX_WAKE_PAYLOAD_CHARS,
+  TRUNCATION_MARKER,
+} from "../src/background-shell/jobs";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 
 // Drives the real extension against real processes. The pure-logic tests in
@@ -550,5 +556,92 @@ describe("ShellStop races", () => {
     const second = await call("ShellStop", { id });
     expect(second.isError).toBe(false);
     expect(textOf(second)).toContain("had already exited");
+  });
+});
+
+// Finding 4: every background-shell output surface is bounded, and model
+// wake patterns never touch V8's backtracking RegExp engine. The unit tests
+// in jobs.test.ts pin the pure logic; these run the real extension against
+// real process output to prove the host stays responsive and the payloads the
+// model actually sees stay small.
+describe("finding 4: bounded output and linear-time matching", () => {
+  const T = 20_000;
+
+  // A progress bar or base64 dump that emits megabytes without a newline used
+  // to accumulate in job.pending without bound, and the exit wake would have
+  // embedded it whole. Now: one bounded, marked line — and the log/wake
+  // payloads are capped with the truncation visible.
+  it("bounds a no-newline multi-MB firehose in log and wake payloads", async () => {
+    const { sent, call } = wire();
+    const id = textOf(await call("ShellStart", {
+      // 8 MB with no newline, then a final newline and a normal line.
+      command: "head -c 8000000 /dev/zero | tr '\\0' a; echo; echo tail-line; exit 0",
+      label: "firehose",
+    })).match(/as (job\d+)/)![1];
+
+    // The exit wake is the payload the model would receive.
+    expect(await until(() => sent.length > 0, T)).toBe(true);
+    const wake = sent[0];
+    expect(wake.content).toContain("exited 0");
+    expect(wake.content).toContain(TRUNCATION_MARKER);
+    expect(wake.content.length).toBeLessThanOrEqual(MAX_WAKE_PAYLOAD_CHARS);
+
+    const log = textOf(await call("ShellLog", { id }));
+    expect(log).toContain(TRUNCATION_MARKER);
+    expect(log).toContain("tail-line");
+    expect(log.length).toBeLessThanOrEqual(MAX_LOG_RESULT_CHARS);
+
+    // Paging semantics survive the bounding: offsets still resolve.
+    const paged = textOf(await call("ShellLog", { id, offset: 0, lines: 400 }));
+    expect(paged).toContain("lines 0–");
+    expect(pidAlive(process.pid)).toBe(true);
+  });
+
+  // The ReDoS half: `(a+)+$` against a line of a's ending in '!' would grind
+  // V8's backtracking engine for hours and freeze the whole pi host on one
+  // line of output. The 4 000 failing a's (yes emits "a\n" lines, so
+  // `head -c 8000 | tr -d '\n'` yields 4 000) sit INSIDE the
+  // MAX_MATCH_LINE_CHARS candidate cap, so the failure the pattern chokes on
+  // is actually evaluated — under a backtracking engine this test would miss
+  // the deadline by orders of magnitude; RE2 evaluates the failure in
+  // microseconds. (The uncapped unit-level 200k-char test in jobs.test.ts
+  // complements this.)
+  it("survives a catastrophic wake pattern with a responsive host", async () => {
+    const { sent, call } = wire();
+    const t0 = Date.now();
+    await call("ShellStart", {
+      command:
+        "yes a | head -c 8000 | tr -d '\\n'; printf '!\\n'; echo 'all done'; sleep 0.2; exit 0",
+      label: "redos",
+      wake_on: { match: ["(a+)+$"] },
+    });
+    expect(await until(() => sent.length > 0, 8000)).toBe(true);
+    expect(sent[0].content).toContain("exited 0");
+    expect(sent[0].content).toContain("all done");
+    // The whole flow — spawn, catastrophic-pattern line, exit wake — must
+    // complete in seconds, not hang.
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    expect(pidAlive(process.pid)).toBe(true);
+  });
+
+  // Displayed error text is bounded too: model-supplied job ids and labels
+  // embedded in tool errors are truncated with the visible marker instead of
+  // being echoed wholesale into model context.
+  it("bounds displayed error text for oversized ids and targets", async () => {
+    const { call } = wire();
+    const huge = "z".repeat(1_000_000);
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["ShellLog", { id: huge }],
+      ["ShellSend", { id: huge, text: "x" }],
+      ["ShellStop", { id: huge }],
+    ];
+    for (const [tool, params] of cases) {
+      const r = await call(tool, params);
+      expect(r.isError, tool).toBe(true);
+      const text = textOf(r);
+      expect(text.length, tool).toBeLessThanOrEqual(MAX_ERROR_DISPLAY_CHARS);
+      expect(text, tool).toContain(TRUNCATION_MARKER);
+    }
+    expect(pidAlive(process.pid)).toBe(true);
   });
 });

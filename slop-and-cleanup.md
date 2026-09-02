@@ -577,6 +577,57 @@ cleanup, executor labels, compact/expanded widgets, sorting, clipping, conflict 
 re-export compatibility. Controller/tool/session and new module suites pass 89/89 with static
 checks, with on-disk versions and existing lifecycle behavior unchanged.
 
+### 16. HIGH — BrowserExtract fails ordinary pages that use cross-hostname resources
+
+**Observed regression (2026-09-02).** BrowserExtract failed both tested
+`developers.openai.com` pages because they referenced fonts from `cdn.openai.com`. The current
+single-host DNS pin correctly prevented the cross-host connection, but then treated the blocked
+passive resource as fatal to the entire render. The same browser successfully rendered
+`https://example.com/`, which has no external resources. This proves the renderer itself works and
+the failure is an excessively conservative policy consequence, not evidence of an SSRF attempt.
+
+**Root cause.** `src/web/browser.ts` launches one Chromium instance with exactly one admitted host
+mapping plus `MAP * ~NOTFOUND`. Its route policy cannot pin a second hostname, so it aborts and
+taints every cross-host HTTP(S) request—including fonts/images/media that BrowserExtract already
+intends not to load—and refuses otherwise usable rendered HTML. External fonts, scripts, styles,
+analytics, API calls, and CDN-hosted assets are normal, so this will reject a large fraction of
+real documentation and application pages.
+
+**Required solution (preserve DNS-rebinding protection without failing common pages).**
+- [ ] Immediately separate **blocked** from **render-fatal** resources. Continue aborting passive
+      images/media/fonts before any connection, but do not fail the render merely because their
+      hostname differs. Return a bounded count/host/type warning so omissions stay visible.
+- [ ] Replace the one-destination Chromium mapping with a per-render loopback egress broker (HTTP
+      proxy plus HTTPS `CONNECT`) owned by BrowserExtract. For every requested destination, the
+      broker must canonicalize the URL/CONNECT authority, reject credentials and non-HTTP(S)
+      schemes, resolve once, require every answer to be public, and dial only that validated
+      address set. Each new connection and redirect is independently validated/pinned; there is no
+      fallback to system DNS.
+- [ ] Preserve normal browser semantics: the original hostname remains in HTTP `Host`, TLS SNI,
+      and certificate verification; HTTPS stays end-to-end through the CONNECT tunnel rather than
+      being MITM-decrypted. Keep WebSockets closed and service workers blocked.
+- [ ] Make direct Chromium egress impossible. Force the loopback proxy, disable Chromium's implicit
+      loopback proxy bypass and QUIC/alternative direct transports, and retain a default-deny host
+      resolver rule with only the exact broker endpoint excluded. Requests for loopback/private
+      destinations must still pass through the broker and be rejected there, never bypass it.
+- [ ] Bound the broker per render (distinct hostnames, requests/connections, response bytes,
+      redirect depth, header/authority lengths, idle and total time) and surface visible bounded
+      diagnostics. Budget exhaustion may omit a subresource; it must fail the render only when the
+      main document cannot be obtained or the remaining page is unusable.
+- [ ] Because `Response.serverAddr()` will identify the local proxy rather than the remote peer,
+      replace that check with a broker-owned connection ledger proving every outbound socket used
+      a validated pin. Close Chromium and all proxy sockets before the final ledger drain/result.
+
+**Acceptance tests.** Use deterministic resolver/dial seams and real loopback listeners to prove:
+(1) cross-host fonts/images are blocked with zero destination connections while useful rendering
+succeeds; (2) cross-host scripts/styles/XHR and redirects work through independently pinned public
+hosts; (3) public-at-validation/private-at-connect rebinding, private literals, unvalidated hosts,
+and proxy-bypass attempts receive zero connections; (4) Host/SNI/certificate behavior remains
+hostname-based; (5) speculative preconnect, Alt-Svc/QUIC, and direct-IP attempts cannot bypass the
+broker; and (6) host/request/byte/time budgets and diagnostics are bounded. Retain the simple
+`example.com` positive control. Update README's current single-host compatibility warning after
+these tests pass.
+
 ### 14. MEDIUM — Centralize the subtask notification contract (updated)
 
 Refs: policy is represented independently in `wake()` lanes (`background-controller.ts:1745-1790`,

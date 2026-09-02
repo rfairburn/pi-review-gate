@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
+import { queueModelDelivery } from "../src/durable-delivery";
 import { createEvidenceState } from "../src/evidence";
 import {
   configDigest,
   replaceReviewGateState,
   SESSION_STATE_ENTRY_TYPE,
+  SESSION_STATE_QUARANTINE_MARKER,
+  SessionStateCwdMismatchError,
+  SessionStateInvalidStateError,
+  SessionStateParseError,
   SessionStateStore,
 } from "../src/session-state";
 
@@ -183,6 +188,164 @@ test("session state preserves snapshot omission records through save and restore
     ]);
     assert.equal(baseline?.omissionsTruncated, true);
     assert.equal(baseline?.files.get("protected.txt")?.omittedReason, "unreadable");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cwd mismatch throws a typed error with safe metadata and no message content", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-cwd-mismatch-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "implement the durable change");
+    queueModelDelivery(state, {
+      kind: "review_authorization",
+      channel: "follow_up",
+      message: "secret pending message one",
+    });
+    queueModelDelivery(state, {
+      kind: "review_transmission",
+      channel: "steer",
+      message: "secret pending message two",
+    });
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: [], bundles: [] });
+
+    const other = join(root, "other");
+    await assert.rejects(
+      store.restore(other),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionStateCwdMismatchError);
+        assert.equal(error.storedCwd, root);
+        assert.equal(error.currentCwd, resolve(other));
+        assert.equal(error.revision, 1);
+        assert.deepEqual(error.pendingDeliveries, {
+          total: 2,
+          byStatus: { queued: 2 },
+          byKind: { review_authorization: 1, review_transmission: 1 },
+        });
+        assert.match(error.message, /does not match resumed cwd/);
+        assert.doesNotMatch(error.message, /secret pending message/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("quarantine moves the sidecar to a unique sibling path without clobbering prior quarantines", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-quarantine-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: [], bundles: [] });
+    const originalBytes = await readFile(store.path, "utf8");
+
+    const first = await store.quarantine();
+    assert.notEqual(first, store.path);
+    assert.equal(dirname(first), dirname(store.path), "quarantine is a sibling path");
+    assert.match(first, new RegExp(SESSION_STATE_QUARANTINE_MARKER));
+    assert.equal(await readFile(first, "utf8"), originalBytes, "quarantine preserves the exact bytes");
+    await assert.rejects(readFile(store.path), /ENOENT/);
+
+    // A fresh save at the original path, then a second quarantine must not
+    // clobber the first quarantine.
+    await store.save(state, { waveRoots: [], bundles: [] });
+    const secondBytes = await readFile(store.path, "utf8");
+    const second = await store.quarantine();
+    assert.notEqual(second, first);
+    assert.equal(await readFile(first, "utf8"), originalBytes, "first quarantine stays intact");
+    assert.equal(await readFile(second, "utf8"), secondBytes);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("quarantine rejects when the sidecar is missing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-quarantine-missing-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    await assert.rejects(store.quarantine());
+    const leftovers = (await readdir(root)).filter((name) => name.includes(SESSION_STATE_QUARANTINE_MARKER));
+    assert.deepEqual(leftovers, [], "no quarantine file may be left behind");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("quarantine failure leaves the original sidecar untouched", async (t) => {
+  if (process.platform === "win32" || process.getuid?.() === 0) {
+    t.skip("permission-based tests require a non-root POSIX user");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-quarantine-fail-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: [], bundles: [] });
+    const originalBytes = await readFile(store.path, "utf8");
+
+    await chmod(root, 0o555);
+    await assert.rejects(store.quarantine());
+    assert.equal(await readFile(store.path, "utf8"), originalBytes, "original must be untouched");
+    const leftovers = (await readdir(root)).filter((name) => name.includes(SESSION_STATE_QUARANTINE_MARKER));
+    assert.deepEqual(leftovers, [], "no quarantine file may be left behind");
+  } finally {
+    await chmod(root, 0o755).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable store refuses to save and reports no durable write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-unavailable-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    assert.equal(await store.save(state, { waveRoots: [], bundles: [] }), true, "a healthy store reports a durable write");
+    store.markUnavailable("restore failed: test");
+    assert.match(store.unavailableReasonText ?? "", /restore failed/);
+    const before = await readFile(store.path, "utf8");
+    assert.equal(await store.save(state, { waveRoots: [], bundles: [] }), false, "an unavailable store reports no durable write");
+    assert.equal(await readFile(store.path, "utf8"), before, "no write may occur while unavailable");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed sidecar JSON rejects with a typed error that never quotes file content", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-bad-json-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    // Truncated, invalid JSON whose raw text carries a secret sentinel. A raw
+    // JSON.parse error would quote this text; the typed error must not.
+    const sentinel = "SECRET-SIDECAR-SENTINEL-message-text";
+    await writeFile(store.path, `{ "state": { "pendingModelDeliveries": [{ "message": "${sentinel}`, "utf8");
+
+    await assert.rejects(
+      store.restore(root),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionStateParseError);
+        assert.doesNotMatch(error.message, new RegExp(sentinel));
+        return true;
+      },
+    );
+
+    // A structurally valid but wrong document also fails with a typed error.
+    await writeFile(store.path, `${JSON.stringify({ hello: "world" })}\n`, "utf8");
+    await assert.rejects(store.restore(root), SessionStateInvalidStateError);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

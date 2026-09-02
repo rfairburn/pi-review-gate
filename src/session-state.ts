@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, readFile, rename } from "node:fs/promises";
+import { link, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { ReviewGateConfig } from "./config";
 import type { EvidenceCandidate, EvidenceState } from "./evidence";
@@ -10,6 +10,115 @@ import type { ReviewerSession } from "./adapters/types";
 
 export const SESSION_STATE_ENTRY_TYPE = "pi-review-gate-session-state";
 const SESSION_STATE_VERSION = 1;
+
+/** Marker embedded in every quarantine sibling name; unique per quarantine. */
+export const SESSION_STATE_QUARANTINE_MARKER = ".quarantine-";
+
+/**
+ * Aggregate pending-delivery metadata safe to disclose in notices: counts by
+ * status and kind only. Never includes message text or delivery identifiers.
+ */
+export interface PendingDeliverySummary {
+  total: number;
+  byStatus: Record<string, number>;
+  byKind: Record<string, number>;
+}
+
+/**
+ * Typed restore failure for an otherwise authentic same-conversation sidecar
+ * whose persisted cwd does not match the resumed cwd. Carries only safe
+ * metadata (stored/current cwd, revision, aggregate pending-delivery counts)
+ * so callers can quarantine and report without exposing message content.
+ */
+export class SessionStateCwdMismatchError extends Error {
+  readonly storedCwd: string;
+  readonly currentCwd: string;
+  readonly revision: number;
+  readonly pendingDeliveries: PendingDeliverySummary;
+
+  constructor(input: {
+    storedCwd: string;
+    currentCwd: string;
+    revision: number;
+    pendingDeliveries: PendingDeliverySummary;
+  }) {
+    super(`Persisted review-gate cwd ${input.storedCwd} does not match resumed cwd ${input.currentCwd}.`);
+    this.name = "SessionStateCwdMismatchError";
+    this.storedCwd = input.storedCwd;
+    this.currentCwd = input.currentCwd;
+    this.revision = input.revision;
+    this.pendingDeliveries = input.pendingDeliveries;
+  }
+}
+
+/**
+ * Typed restore failure: the sidecar file is not valid JSON. The message names
+ * the sidecar path but never quotes the file's content, so it is safe to
+ * classify for notices (content is disclosed only via trusted categories).
+ */
+export class SessionStateParseError extends Error {
+  constructor(path: string) {
+    super(`Persisted review-gate session state is not valid JSON: ${path}`);
+    this.name = "SessionStateParseError";
+  }
+}
+
+/**
+ * Typed restore failure: the sidecar parsed but is not a valid persisted
+ * review-gate state document. Never quotes the document's content.
+ */
+export class SessionStateInvalidStateError extends Error {
+  constructor(path: string) {
+    super(`Invalid persisted review-gate session state: ${path}`);
+    this.name = "SessionStateInvalidStateError";
+  }
+}
+
+/** Typed restore failure: the sidecar failed its integrity check. */
+export class SessionStateIntegrityError extends Error {
+  constructor(path: string) {
+    super(`Persisted review-gate session state failed its integrity check: ${path}`);
+    this.name = "SessionStateIntegrityError";
+  }
+}
+
+/** Typed restore failure: the sidecar belongs to a different conversation. */
+export class SessionStateConversationMismatchError extends Error {
+  constructor() {
+    super("Persisted review-gate state belongs to a different conversation.");
+    this.name = "SessionStateConversationMismatchError";
+  }
+}
+
+/**
+ * Atomically move a session-state sidecar to a unique sibling path without
+ * clobbering any existing file. link() fails with EEXIST if the target already
+ * exists (no-clobber) and is atomic; unlink() then removes the original so the
+ * quarantine is the only copy. On any failure the original path is left intact
+ * and the caller must fail closed (never overwrite it).
+ */
+export async function quarantineSessionStateSidecar(path: string): Promise<string> {
+  const target = `${path}${SESSION_STATE_QUARANTINE_MARKER}${Date.now()}-${randomUUID()}.json`;
+  await link(path, target);
+  // Establish the no-clobber sibling in the directory before removing the
+  // authoritative name, reducing the crash window on filesystems that honor
+  // directory fsync.
+  await syncDirectoryBestEffort(dirname(path));
+  try {
+    await unlink(path);
+    await syncDirectoryBestEffort(dirname(path));
+  } catch (error) {
+    // Roll back the quarantine copy so the original remains the only copy.
+    try {
+      await unlink(target);
+      await syncDirectoryBestEffort(dirname(path));
+    } catch {
+      // Both copies remain; the original is intact. Fail closed at the caller.
+    }
+    throw error;
+  }
+  return target;
+}
 
 export interface ExecutionAssociationsSnapshot {
   waveRoots: string[];
@@ -115,6 +224,7 @@ export class SessionStateStore {
   private revision = 0;
   private tail: Promise<void> = Promise.resolve();
   private markerAppended = false;
+  private unavailableReason: string | undefined;
 
   constructor(
     readonly identity: SessionPersistenceIdentity,
@@ -129,11 +239,37 @@ export class SessionStateStore {
     this.revision = Math.max(this.revision, revision);
   }
 
+  /**
+   * Fail-closed guard: after a restore failure that must not be overwritten,
+   * mark the store unavailable so save() becomes a no-op that reports no
+   * durable write. The authoritative prior sidecar is preserved in place.
+   */
+  markUnavailable(reason: string): void {
+    this.unavailableReason = reason;
+  }
+
+  get unavailableReasonText(): string | undefined {
+    return this.unavailableReason;
+  }
+
+  /**
+   * Move the authoritative sidecar to a unique sibling path. Resolves with the
+   * quarantine path; rejects (leaving the original untouched) on any failure.
+   */
+  async quarantine(): Promise<string> {
+    return quarantineSessionStateSidecar(this.path);
+  }
+
+  /**
+   * Persist state. Resolves true only when a real durable write happened;
+   * resolves false without writing when the store is unavailable (fail closed).
+   */
   async save(
     state: ReviewGateState,
     execution: ExecutionAssociationsSnapshot,
     reviewConfig?: ReviewGateConfig,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    if (this.unavailableReason !== undefined) return false;
     const revision = ++this.revision;
     const unsigned = {
       version: SESSION_STATE_VERSION as 1,
@@ -166,6 +302,7 @@ export class SessionStateStore {
     });
     this.tail = operation.catch(() => undefined);
     await operation;
+    return true;
   }
 
   async drain(): Promise<void> {
@@ -180,20 +317,32 @@ export class SessionStateStore {
       if (isMissing(error)) return undefined;
       throw error;
     }
-    const parsed = JSON.parse(text) as unknown;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      // Replace JSON.parse's error (which quotes file content) with a typed
+      // error so raw sidecar text can never reach callers or notices.
+      throw new SessionStateParseError(this.path);
+    }
     if (!isPersistedSessionState(parsed)) {
-      throw new Error(`Invalid persisted review-gate session state: ${this.path}`);
+      throw new SessionStateInvalidStateError(this.path);
     }
     const { integritySha256, ...unsigned } = parsed;
     const actualIntegrity = createHash("sha256").update(stableJson(unsigned)).digest("hex");
     if (integritySha256 !== actualIntegrity) {
-      throw new Error(`Persisted review-gate session state failed its integrity check: ${this.path}`);
+      throw new SessionStateIntegrityError(this.path);
     }
     if (parsed.sessionId !== this.identity.sessionId || parsed.sessionFile !== this.identity.sessionFile) {
-      throw new Error("Persisted review-gate state belongs to a different conversation.");
+      throw new SessionStateConversationMismatchError();
     }
     if (resolve(parsed.cwd) !== resolve(currentCwd)) {
-      throw new Error(`Persisted review-gate cwd ${parsed.cwd} does not match resumed cwd ${resolve(currentCwd)}.`);
+      throw new SessionStateCwdMismatchError({
+        storedCwd: parsed.cwd,
+        currentCwd: resolve(currentCwd),
+        revision: parsed.revision,
+        pendingDeliveries: summarizePendingDeliveries(parsed.state.pendingModelDeliveries ?? []),
+      });
     }
     this.revision = parsed.revision;
     return {
@@ -457,6 +606,39 @@ function isPersistedSessionState(value: unknown): value is PersistedSessionState
       || typeof gate.reason !== "string") return false;
   }
   return true;
+}
+
+function summarizePendingDeliveries(deliveries: ReadonlyArray<{ status?: unknown; kind?: unknown }>): PendingDeliverySummary {
+  const byStatus = new Map<string, number>();
+  const byKind = new Map<string, number>();
+  for (const delivery of deliveries) {
+    if (delivery && typeof delivery.status === "string") {
+      byStatus.set(delivery.status, (byStatus.get(delivery.status) ?? 0) + 1);
+    }
+    if (delivery && typeof delivery.kind === "string") {
+      byKind.set(delivery.kind, (byKind.get(delivery.kind) ?? 0) + 1);
+    }
+  }
+  // Object.fromEntries uses own data properties even for adversarial keys such
+  // as "__proto__", unlike assignment into a normal object accumulator.
+  return {
+    total: deliveries.length,
+    byStatus: Object.fromEntries(byStatus),
+    byKind: Object.fromEntries(byKind),
+  };
+}
+
+async function syncDirectoryBestEffort(path: string): Promise<void> {
+  try {
+    const directory = await open(path, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  } catch {
+    // Some supported platforms and filesystems reject directory handles/fsync.
+  }
 }
 
 function stableJson(value: unknown): string {

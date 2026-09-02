@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
@@ -563,6 +563,311 @@ test("review state restores only when the same persisted conversation resumes", 
     await activate(fresh.pi);
     await trigger(fresh.hooks, "session_start", { type: "session_start", reason: "new" }, fresh.ctx);
     assert.doesNotMatch(fresh.notices.join("\n"), /restored conversation state revision/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("same-conversation/different-cwd session start quarantines the prior sidecar and starts fresh", async () => {
+  const dirA = await mkdtemp(join(tmpdir(), "pi-review-gate-cwd-mismatch-a-"));
+  const dirB = await mkdtemp(join(tmpdir(), "pi-review-gate-cwd-mismatch-b-"));
+  const dirC = await mkdtemp(join(tmpdir(), "pi-review-gate-cwd-mismatch-c-"));
+  try {
+    const configPath = join(dirA, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dirA, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    // First session in dirA persists state with a pending delivery.
+    const first = createSessionRuntime("conversation-a", sessionFile, dirA);
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: dirA, text: "preserve this request", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: dirA }, first.ctx);
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+
+    const statePath = `${sessionFile}.pi-review-gate-state.json`;
+    const targetStore = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dirA });
+    const targetState = await targetStore.restore(dirA);
+    assert.ok(targetState);
+    queueModelDelivery(targetState.state, {
+      kind: "review_authorization",
+      channel: "follow_up",
+      message: "durable pending message for the prior cwd",
+    });
+    await targetStore.save(targetState.state, targetState.execution);
+    const priorBytes = await readFile(statePath, "utf8");
+
+    // Second session: same conversation, different cwd (dirB).
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dirB);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+
+    assert.deepEqual(resumed.sent, [], "no old follow-up may be delivered into a different cwd");
+    const noticeText = resumed.notices.join("\n");
+    assert.match(noticeText, /different working directory/);
+    assert.match(noticeText, /quarantined to/);
+    assert.match(noticeText, /1 pending delivery record\(s\) preserved/);
+    assert.match(noticeText, /review_authorization 1/);
+    assert.doesNotMatch(noticeText, /durable pending message for the prior cwd/);
+    assert.doesNotMatch(noticeText, /restored conversation state revision/);
+
+    const quarantineFiles = (await readdir(dirA)).filter((name) => name.includes(".quarantine-"));
+    assert.equal(quarantineFiles.length, 1);
+    assert.equal(
+      await readFile(join(dirA, quarantineFiles[0]!), "utf8"),
+      priorBytes,
+      "quarantine preserves the exact prior sidecar bytes",
+    );
+
+    const freshText = await readFile(statePath, "utf8");
+    assert.doesNotMatch(freshText, /durable pending message for the prior cwd/);
+    assert.doesNotMatch(freshText, /preserve this request/);
+    assert.match(freshText, new RegExp(`"cwd":"${escapeRegExp(dirB)}"`));
+    const freshState = await targetStore.restore(dirB);
+    assert.ok(freshState);
+    assert.equal(freshState.state.pendingModelDeliveries.length, 0, "fresh state is isolated from prior pending records");
+
+    // Third session: repeated mismatch (dirC) must not clobber the first quarantine.
+    const secondBytes = freshText;
+    const again = createSessionRuntime("conversation-a", sessionFile, dirC);
+    await activate(again.pi);
+    await trigger(again.hooks, "session_start", { type: "session_start", reason: "resume" }, again.ctx);
+    assert.deepEqual(again.sent, []);
+    const quarantineFiles2 = (await readdir(dirA)).filter((name) => name.includes(".quarantine-"));
+    assert.equal(quarantineFiles2.length, 2, "repeated mismatch creates a new quarantine without clobbering prior ones");
+    const contents = new Set(await Promise.all(quarantineFiles2.map((name) => readFile(join(dirA, name), "utf8"))));
+    assert.ok(contents.has(priorBytes), "first quarantine keeps the exact prior bytes");
+    assert.ok(contents.has(secondBytes), "second quarantine holds the intermediate fresh state");
+    const finalText = await readFile(statePath, "utf8");
+    assert.match(finalText, new RegExp(`"cwd":"${escapeRegExp(dirC)}"`));
+  } finally {
+    await rm(dirA, { recursive: true, force: true });
+    await rm(dirB, { recursive: true, force: true });
+    await rm(dirC, { recursive: true, force: true });
+  }
+});
+
+test("quarantine failure leaves the prior sidecar untouched and disables persistence", async (t) => {
+  if (process.platform === "win32" || process.getuid?.() === 0) {
+    t.skip("permission-based tests require a non-root POSIX user");
+    return;
+  }
+  const dirA = await mkdtemp(join(tmpdir(), "pi-review-gate-quarantine-fail-a-"));
+  const dirB = await mkdtemp(join(tmpdir(), "pi-review-gate-quarantine-fail-b-"));
+  try {
+    const configPath = join(dirA, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dirA, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = createSessionRuntime("conversation-a", sessionFile, dirA);
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: dirA, text: "preserve this request", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: dirA }, first.ctx);
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+
+    const statePath = `${sessionFile}.pi-review-gate-state.json`;
+    const priorBytes = await readFile(statePath, "utf8");
+
+    // Make the sidecar's directory read-only so quarantine (link) fails.
+    await chmod(dirA, 0o555);
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dirB);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+
+    assert.deepEqual(resumed.sent, [], "no old follow-up may be delivered");
+    const noticeText = resumed.notices.join("\n");
+    assert.match(noticeText, /could not be quarantined/);
+    assert.match(noticeText, /left untouched/);
+    assert.match(noticeText, /persistence is disabled/);
+    assert.equal(await readFile(statePath, "utf8"), priorBytes, "original sidecar must be untouched");
+    const quarantineFiles = (await readdir(dirA)).filter((name) => name.includes(".quarantine-"));
+    assert.deepEqual(quarantineFiles, [], "no quarantine file may be created");
+
+    // No later save: a subsequent input must not overwrite the prior sidecar.
+    await trigger(resumed.hooks, "input", { cwd: dirB, text: "must not be persisted", source: "user" }, resumed.ctx);
+    assert.equal(await readFile(statePath, "utf8"), priorBytes, "no later save may overwrite the prior sidecar");
+  } finally {
+    await chmod(dirA, 0o755).catch(() => undefined);
+    await rm(dirA, { recursive: true, force: true });
+    await rm(dirB, { recursive: true, force: true });
+  }
+});
+
+test("a corrupted prior sidecar is preserved in place and persistence is disabled", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-corrupt-sidecar-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: dir, text: "preserve this request", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+
+    const statePath = `${sessionFile}.pi-review-gate-state.json`;
+    const priorBytes = await readFile(statePath, "utf8");
+
+    // Corrupt the sidecar so restore fails its integrity check.
+    const corrupted = JSON.parse(priorBytes) as { state: { reviewsPaused: boolean } };
+    corrupted.state.reviewsPaused = !corrupted.state.reviewsPaused;
+    const corruptedBytes = `${JSON.stringify(corrupted)}\n`;
+    await writeFile(statePath, corruptedBytes, "utf8");
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+
+    assert.deepEqual(resumed.sent, [], "no follow-up may be delivered from a failed restore");
+    const noticeText = resumed.notices.join("\n");
+    assert.match(noticeText, /was not restored/);
+    assert.match(noticeText, /left untouched/);
+    assert.match(noticeText, /persistence is disabled/);
+    assert.equal(await readFile(statePath, "utf8"), corruptedBytes, "corrupted sidecar must be preserved in place");
+
+    // No later save may overwrite the corrupted sidecar.
+    await trigger(resumed.hooks, "input", { cwd: dir, text: "must not be persisted", source: "user" }, resumed.ctx);
+    assert.equal(await readFile(statePath, "utf8"), corruptedBytes);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a throwing notifier cannot disable persistence after a successful quarantine", async () => {
+  const dirA = await mkdtemp(join(tmpdir(), "pi-review-gate-notice-fail-a-"));
+  const dirB = await mkdtemp(join(tmpdir(), "pi-review-gate-notice-fail-b-"));
+  try {
+    const configPath = join(dirA, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dirA, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = createSessionRuntime("conversation-a", sessionFile, dirA);
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: dirA, text: "preserve this request", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: dirA }, first.ctx);
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+
+    const statePath = `${sessionFile}.pi-review-gate-state.json`;
+    const priorBytes = await readFile(statePath, "utf8");
+
+    // Second session in dirB: the notifier throws exactly once (on the
+    // quarantine success notice), then recovers.
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dirB);
+    let notifyCalls = 0;
+    resumed.ctx.ui.notify = (message: string) => {
+      notifyCalls += 1;
+      if (notifyCalls === 1) throw new Error("notifier exploded");
+      return resumed.notices.push(message);
+    };
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+
+    assert.ok(notifyCalls >= 1, "the quarantine notice was attempted");
+    assert.deepEqual(resumed.sent, [], "no old follow-up may be delivered");
+    const quarantineFiles = (await readdir(dirA)).filter((name) => name.includes(".quarantine-"));
+    assert.equal(quarantineFiles.length, 1, "quarantine succeeds despite the throwing notifier");
+    assert.equal(
+      await readFile(join(dirA, quarantineFiles[0]!), "utf8"),
+      priorBytes,
+      "quarantine preserves the exact prior sidecar bytes",
+    );
+
+    // Notification failure must not disable the store after quarantine
+    // succeeded: the fresh save for the new cwd still proceeds.
+    const freshText = await readFile(statePath, "utf8");
+    assert.match(freshText, new RegExp(`"cwd":"${escapeRegExp(dirB)}"`));
+    await trigger(resumed.hooks, "input", { cwd: dirB, text: "later input persists", source: "user" }, resumed.ctx);
+    const laterText = await readFile(statePath, "utf8");
+    assert.notEqual(laterText, freshText, "persistence stays enabled after the notice failure");
+    assert.match(laterText, /later input persists/);
+  } finally {
+    await rm(dirA, { recursive: true, force: true });
+    await rm(dirB, { recursive: true, force: true });
+  }
+});
+
+test("malformed sidecar JSON never leaks content or unbounded paths into restore notices", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-bad-json-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    // A deeply nested session directory pushes the sidecar path past the
+    // notice-path bound so truncation can be asserted.
+    let deep = dir;
+    for (let i = 0; i < 3; i += 1) {
+      deep = join(deep, `segment-${i}-${"x".repeat(50)}`);
+    }
+    await mkdir(deep, { recursive: true });
+    const sessionFile = join(deep, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = createSessionRuntime("conversation-a", sessionFile, deep);
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: deep, text: "preserve this request", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: deep }, first.ctx);
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+
+    const statePath = `${sessionFile}.pi-review-gate-state.json`;
+    assert.ok(statePath.length > 160, "test setup: sidecar path exceeds the notice path bound");
+
+    // Corrupt the sidecar into invalid JSON that carries a secret sentinel:
+    // a raw JSON.parse error would quote this text into the notice.
+    const sentinel = "SECRET-SENTINEL-pending-message-text";
+    const corruptedBytes = `{ "state": { "pendingModelDeliveries": [{ "message": "${sentinel}`;
+    await writeFile(statePath, corruptedBytes, "utf8");
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, deep);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+
+    const noticeText = resumed.notices.join("\n");
+    assert.match(noticeText, /was not restored/);
+    assert.match(noticeText, /invalid JSON/);
+    assert.doesNotMatch(noticeText, new RegExp(sentinel), "sidecar content may never reach the notice");
+    assert.ok(statePath.length > 160 && !noticeText.includes(statePath), "unbounded paths may never reach the notice");
+    assert.match(noticeText, /… \(truncated\)/);
+    assert.match(noticeText, /persistence is disabled/);
+
+    // The malformed sidecar is preserved in place; no later save overwrites it.
+    assert.equal(await readFile(statePath, "utf8"), corruptedBytes, "malformed sidecar must be preserved in place");
+    await trigger(resumed.hooks, "input", { cwd: deep, text: "must not be persisted", source: "user" }, resumed.ctx);
+    assert.equal(await readFile(statePath, "utf8"), corruptedBytes, "no later save may overwrite the malformed sidecar");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -2923,6 +3228,41 @@ async function trigger(hooks: Map<string, Array<(...args: unknown[]) => unknown>
   for (const handler of hooks.get(name) ?? []) {
     await handler(...args);
   }
+}
+
+/** Escape a literal string for use inside a RegExp constructor. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Build a minimal Pi host + session context for session_start integration
+ * tests, mirroring the runtime helper used by the conversation-restore test.
+ */
+function createSessionRuntime(sessionId: string, file: string, cwd: string) {
+  const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+  const notices: string[] = [];
+  const entries: Array<{ type: string; data: unknown }> = [];
+  const sent: Array<{ message: string; options: unknown }> = [];
+  const pi = {
+    on(name: string, handler: (...args: unknown[]) => unknown) {
+      hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+    },
+    registerCommand() {},
+    appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
+    notify(message: string) { notices.push(message); },
+    sendUserMessage(message: string, options: unknown) { sent.push({ message, options }); },
+  };
+  const ctx = {
+    cwd,
+    ui: { notify: (message: string) => notices.push(message) },
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getSessionFile: () => file,
+      getCwd: () => cwd,
+    },
+  };
+  return { hooks, notices, entries, sent, pi, ctx };
 }
 
 /** Fire the hook pair Pi emits when a turn has no further automatic work:

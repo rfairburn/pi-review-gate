@@ -606,25 +606,19 @@ Test status: caps/archiving tested; soak test missing.
   trusted-user boundaries (`PI_REVIEW_GATE_DDGS_PYTHON`, venv/cache path, package index/pip
   configuration) and explicitly states that version pinning is not cryptographic hash pinning.
   Launcher and web-network tests verify isolated invocation and that helper injection is ignored.
-- L11. A same-conversation/different-cwd session start overwrites and loses the prior
-  persisted state (data-loss/durability debt — kept in lower-priority cleanup, not
-  observability-only). On `session_start`, `discardSessionState(state)`
-  (`src/index.ts:290`) clears in-memory state before restore; a same-conversation/
-  different-cwd restore then throws (`src/session-state.ts:193-195`); the catch notifies
-  (`src/index.ts:317-318`); and the unconditional `persistSessionState()`
-  (`src/index.ts:334`) writes fresh state through the same conversation sidecar — its path is
-  keyed by session file, not cwd (`src/session-state.ts:122-124`) — overwriting the rejected
-  persisted state. Pending deliveries, review windows, and execution associations are lost,
-  not merely stranded; `recoverPendingModelDeliveries` never runs because it is gated on a
-  successful restore (`src/index.ts:324-331`). The rejection itself is an intentional
-  isolation contract (mirrored by the execution recovery behavior) and cross-cwd delivery
-  must remain prohibited — do not recover or deliver project-specific messages into a
-  different cwd. Fix direction: preserve/quarantine the rejected sidecar before any
-  post-failure save, report the rejection and pending-record status in the notice without
-  exposing or delivering project-specific content into the new cwd, and add a session-start
-  test proving a cwd mismatch does not overwrite prior state or pending delivery records.
-  `tests/session-state.test.ts:129` asserts the unit-level cwd-mismatch rejection but no
-  session-start test covers the overwrite consequence.
+- L11. **RESOLVED (2026-09-02):** a same-conversation/different-cwd session start no
+  longer overwrites or delivers the prior persisted state. `restore()` throws typed errors
+  (`SessionStateCwdMismatchError` with only safe metadata: stored/current cwd, revision,
+  aggregate pending-delivery counts; plus typed parse/integrity/conversation errors whose
+  messages never quote sidecar content), `session_start` quarantines the rejected sidecar to
+  a unique no-clobber sibling before any fresh-state save, and every other restore failure is
+  fail-closed against overwrite. Notices disclose only fixed failure categories or errno codes
+  and bounded paths plus count summaries — never message text. A throwing notifier cannot
+  disable persistence after a successful quarantine; if quarantine itself fails the store is
+  disabled so the authoritative sidecar is never overwritten. Integration and unit tests cover
+  byte preservation, no delivery across cwds, isolated fresh state, non-clobbering repeated
+  quarantines, quarantine/notice failure, secret-sentinel content containment, and long-path
+  bounding.
 
 ## Packaging / docs / test strategy (independent review)
 

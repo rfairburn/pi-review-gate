@@ -1,8 +1,8 @@
 # Slop and cleanup review inventory
 
 Date: 2026-09-02
-Status: Final consolidated inventory replacing the 2026-08-27 draft. Finding 0 is a
-RESOLVED work-history entry (fix landed 2026-09-02); remaining findings are
+Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0 and 1 are
+RESOLVED work-history entries (fixes landed 2026-09-02); remaining findings are
 recommendations only with no product code changes.
 
 Scope: `pi-review-gate` (extension + execution subsystem + web tools + scripts). Severity
@@ -92,53 +92,59 @@ Kitty-capable terminals, and `/review-cancel` provides a terminal-independent
 hard stop whose completion notice is emitted only after reviewer processes are
 gone.
 
-### 1. HIGH — SSRF bypass: IPv4-mapped IPv6 literals bypass `isBlockedAddress` (loopback reachability confirmed end-to-end; compatible/NAT64/6to4 forms pass the check but reachability is routing-dependent)
+### 1. HIGH — RESOLVED (2026-09-02): SSRF bypass via IPv4-mapped/compatible/NAT64/6to4 literals — canonical, fail-closed IP validation
 
-Refs: `src/web/network.ts:304-323` (`validatedPublicUrl`), `src/web/network.ts:325-343`
-(`isBlockedAddress`; the mapped-IPv4 regex at `:331` matches only dotted-decimal
-`::ffff:a.b.c.d`), `src/web/network.ts:46-107` (`downloadText`). Affected fetch/browser
-paths: WebFetch (`src/web/tools.ts` → cache → `downloadText`), BrowserExtract initial URL
-(`src/web/browser.ts:16`), final-URL revalidation (`browser.ts:71`), subresource approval
-(`allowBrowserRoute`, `browser.ts:100-119`, with `approvedOrigins` cached after one
-validation at `:111-115`), redirect re-validation (`network.ts:79`), and the `pi-review-web`
-CLI (`src/web/cli.ts`).
+**Root cause (confirmed).** `isBlockedAddress` (`src/web/network.ts`) matched
+addresses with ad-hoc string prefixes and a regex that only recognized
+dotted-decimal `::ffff:a.b.c.d` mapped literals. The WHATWG URL parser
+serializes IPv6 literals in hex (`http://[::ffff:127.0.0.1]/` → hostname
+`[::ffff:7f00:1]`), so mapped (`::ffff:7f00:1`, `::ffff:a9fe:a9fe` cloud
+metadata, `::ffff:0a00:0001`, `::ffff:c0a8:0101`, `::ffff:ac1f:0001`),
+IPv4-compatible (`::7f00:1`), NAT64 (`64:ff9b::7f00:1`), and 6to4
+(`2002:7f00:1::`) literal forms all passed validation end to end; loopback
+reachability of the mapped form was reproduced in this review. IPv4
+documentation/benchmark/protocol ranges (192.0.0.0/24, 192.0.2.0/24,
+198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24) and deprecated site-local
+`fec0::/10` were also missing (former item L5).
 
-Impact: WebFetch/BrowserExtract are model-invoked tools and `isBlockedAddress` is the sole
-SSRF control. **Confirmed (IPv4-mapped IPv6):** `http://[::ffff:7f00:1]/` (hex form of
-127.0.0.1) passes the check and the OS routes it to loopback — reproduced two ways in this
-review: a Node v26 logic reproduction of the exact `isBlockedAddress` code, and an end-to-end
-in-process fetch where `http://[::ffff:7f00:1]:<port>/probe` returned HTTP 200 from a server
-bound to 127.0.0.1, i.e., `downloadText` reaches loopback. The same mapped-IPv4 gap admits
-`::ffff:a9fe:a9fe` (169.254.169.254 cloud metadata), `::ffff:0a00:0001`, `::ffff:c0a8:0101`,
-and `::ffff:ac1f:0001`; those pass the check and, like the loopback case, are delivered
-through the host's normal IPv4 stack, though only loopback was reproduced end to end.
-**Routing-dependent variants (pass the check; reachability not confirmed):** IPv4-compatible
-`::7f00:1`, NAT64 `64:ff9b::7f00:1`, and 6to4 `2002:7f00:1::` also pass `isBlockedAddress`,
-but whether the host actually routes them to the embedded IPv4 address depends on
-host/network configuration (NAT64 requires a NAT64 prefix and gateway, 6to4 a relay, and
-single-scope IPv4-compatible addressing is deprecated); none was reproduced end to end, so do
-not assume they reach their embedded targets. Note the WHATWG URL parser serializes IPv6
-literals in hex — `new URL("http://[::ffff:127.0.0.1]/").hostname` is `[::ffff:7f00:1]` — so
-the dotted-decimal regex at `:331` only protects DNS `lookup` results; literal forms (dotted
-**or** hex) bypass `validatedPublicUrl` end to end, which strengthens the case for canonical
-IP range validation. In BrowserExtract a rendered page can additionally drive subresource
-requests to these addresses via the route handler.
+**Fix.** New `src/web/ip.ts`: strict canonical IPv4 (dotted-decimal only, no
+hex/octal/leading-zero forms) and IPv6 parsing (WHATWG URL-standard algorithm:
+`::` compression, embedded dotted IPv4 tails, zone indexes stripped) into raw
+bytes, plus explicit special-purpose range checks. `isBlockedAddress` now
+fails closed — unparseable input is blocked — and extracts the embedded 32-bit
+IPv4 from mapped (`::ffff:0:0/96`), compatible (`::/96`), NAT64
+(`64:ff9b::/96`), and 6to4 (`2002::/16`) forms, running it through the IPv4
+blocklist so hex and dotted spellings behave identically. Blocked outright:
+IPv4 0.0.0.0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24,
+192.0.2/24, 192.88.99/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24,
+224/4, 240/4; IPv6 `::`, `::1`, NAT64 local-use
+`64:ff9b:1::/48` (RFC 8215), Teredo `2001::/32`, discard `100::/64`, doc
+`2001:db8::/32`, unique-local `fc00::/7`, link-local `fe80::/10`, deprecated
+site-local `fec0::/10`, multicast `ff00::/8`. `src/web/network.ts`
+(`validatedPublicUrl`, used by WebFetch, BrowserExtract, redirect
+re-validation, and the CLI) now delegates to the new module; no new dependency.
+DNS TOCTOU (finding 6) is intentionally out of scope.
 
-Recommendation:
-- [ ] Canonicalize before checking: expand the IPv6 literal; for `::ffff:x:y` (mapped),
-      `::x:y` (compatible), `64:ff9b::x:y` (NAT64), and `2002:…` (6to4) extract the embedded
-      32-bit IPv4 and run it through the existing blocklist.
-- [ ] Prefer a maintained IANA special-purpose range table over ad-hoc prefix checks; while
-      at it, add currently-missing ranges (see lower-priority item L5).
-- [ ] Regression tests: reject `[::ffff:7f00:1]`, `[::ffff:127.0.0.1]`, `[::ffff:a9fe:a9fe]`,
-      `[::ffff:0a00:0001]`, `[::ffff:c0a8:0101]`, `[::ffff:ac1f:0001]`, `[::7f00:1]`,
-      `[64:ff9b::7f00:1]`, `[2002:7f00:1::]`; accept a public literal (e.g.
-      `[2606:4700:4700::1111]`); integration test that `downloadText` cannot reach a
-      loopback server via the mapped form (inverts the reproduction above).
+**Tests.** New `tests/web-network.test.ts`: table tests rejecting all mapped
+(hex, dotted, zero-padded, uppercase), compatible, NAT64, 6to4, and L5 ranges
+plus boundary positives (public literals, `2606:4700:4700::1111`, public IPv4
+embedded in mapped/NAT64/6to4 wrappers, adjacent-octet boundaries such as
+`172.32.0.1`, `100.128.0.1`, `198.20.0.1`, `203.0.114.1`); fail-closed cases
+(malformed IPv4/IPv6); `validatedPublicUrl` literal tests proving
+WHATWG-normalized dotted mapped input (`[::ffff:127.0.0.1]`) is rejected; and
+an end-to-end integration test binding a server to 127.0.0.1 — a direct raw
+`fetch` control reaches it, then `downloadText` over
+`[::ffff:127.0.0.1]`, `[::ffff:7f00:1]`, `[::7f00:1]`, `[64:ff9b::7f00:1]`, and
+`[2002:7f00:1::]` rejects with `non-public address` and the server's
+connection count stays unchanged (zero new connections).
 
-Test status: **none** — `rg validatedPublicUrl|isBlockedAddress tests/` finds no references;
-`tests/web-tools.test.ts` covers cache/page/pdf/search only. This is the highest-priority
-test gap in the repo.
+**Validation.** `npm run check:static`; `npm run build:test` + targeted
+`node --test dist-test/tests/web-network.test.js` (5/5 pass) and
+`dist-test/tests/web-tools.test.js` (23/23 pass); no `dist/` output touched.
+
+**Impact.** The sole SSRF control for all web fetch/browser paths now
+canonicalizes before checking and cannot be bypassed by any spelling of an
+embedded-IPv4 or special-range address.
 
 ### 2. MEDIUM-HIGH — Post-landing bookkeeping failure flips a landed task to `failed`
 
@@ -472,9 +478,11 @@ Test status: caps/archiving tested; soak test missing.
 - L4. `normalizeWeb` (`src/config.ts:333-360`) imposes no upper bounds on
   `maxResults`/`maxOutputChars`/`cacheMaxBytes`/`cacheMaxEntries` — `1e9` passes validation.
   Bound them in the config contract.
-- L5. `isBlockedAddress` also misses reserved IPv4 ranges (192.0.0.0/24, 198.18.0.0/15,
+- L5. ~~`isBlockedAddress` also misses reserved IPv4 ranges (192.0.0.0/24, 198.18.0.0/15,
   192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) and deprecated site-local `fec0::/10`
-  (verified: `fec0::1` and `198.18.0.1` pass). Fold into the finding-1 fix.
+  (verified: `fec0::1` and `198.18.0.1` pass).~~ RESOLVED (2026-09-02): folded into the
+  finding-1 fix (`src/web/ip.ts`); all listed ranges plus `fec0::/10` are blocked with
+  regression tests in `tests/web-network.test.ts`.
 - L6. Secrets redaction misses PEM private-key blocks and raw JWTs without a `Bearer` prefix
   (`src/redaction.ts:8-14`); such tool results persist unredacted in review evidence.
   `tests/redaction.test.ts` covers only two basic cases.
@@ -525,11 +533,7 @@ Test status: caps/archiving tested; soak test missing.
   there. Remaining nits: `test:fast` membership (which suites are in the fast tier; it omits
   e.g. `commands.test.ts` and the background-shell tests) is only visible in `package.json`,
   and `test:integration` is just an alias of `npm test`.
-- **Highest-value missing tests** (from findings above): SSRF control (finding 1 — zero
-  coverage), post-landing fault injection (2), ShellSend stdin lifecycle (3), LineBuffer byte
-  bounds/matcher cost (4), adversarial table spans (5), receipt race (11), delivery-failure
-  notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync
-  durability (7), snapshot concurrency (9).
+- **Highest-value missing tests** (from findings above): post-landing fault injection (2), ShellSend stdin lifecycle (3), LineBuffer byte bounds/matcher cost (4), adversarial table spans (5), receipt race (11), delivery-failure notice and uncertain-state handling (10), queued-continuation interrupt (8), fsync durability (7), snapshot concurrency (9). (Finding 1's SSRF-control coverage gap was resolved 2026-09-02 by `tests/web-network.test.ts`.)
 - **Docs drift**: README documents `PI_REVIEW_GATE_DISABLED=1` while the launcher strips it
   (L3); keep kill-switch docs and behavior in sync.
 - **Dependency posture is good**: only 7 runtime deps, `package-lock.json` present, and the

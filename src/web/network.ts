@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
+import { isBlockedAddress } from "./ip";
 
 export interface NetworkOptions {
   timeoutMs: number;
@@ -320,26 +321,6 @@ export async function validatedPublicUrl(value: string): Promise<string> {
   }
   url.hash = "";
   return url.href;
-}
-
-function isBlockedAddress(address: string): boolean {
-  const normalized = address.toLowerCase().split("%")[0] ?? address.toLowerCase();
-  if (normalized === "::" || normalized === "::1") return true;
-  if (normalized.startsWith("fc") || normalized.startsWith("fd") || /^fe[89ab]/.test(normalized)) return true;
-  if (normalized.startsWith("ff")) return true;
-  if (normalized.startsWith("2001:db8:")) return true;
-  const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
-  const ipv4 = mapped ?? (isIP(normalized) === 4 ? normalized : undefined);
-  if (!ipv4) return false;
-  const parts = ipv4.split(".").map(Number);
-  const [a, b] = parts;
-  if (a === 0 || a === 10 || a === 127) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 172 && b !== undefined && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 100 && b !== undefined && b >= 64 && b <= 127) return true;
-  if (a !== undefined && a >= 224) return true;
-  return false;
 }
 
 function parseDdgsOutput(value: Record<string, unknown>): DdgsSearchOutput {

@@ -6,6 +6,7 @@ import {
   type FileSnapshot,
   type SnapshotOptions,
 } from "./capture";
+import { normalizeApplyPatchPathMarker } from "./apply-patch/tool";
 import { redactSensitiveText, redactSensitiveValue } from "./redaction";
 
 export interface EvidenceState {
@@ -61,6 +62,7 @@ export interface EvidenceBundle {
 
 const TRANSIENT_DISCOVERY_TOOLS = new Set(["read", "grep", "glob", "find", "ls", "websearch", "webfetch"]);
 const PATH_MUTATION_TOOLS = new Set(["write", "edit"]);
+const APPLY_PATCH_TOOL = "applypatch";
 const SHELL_TOOLS = new Set(["bash", "shellstart"]);
 
 export function shouldRecordToolCallEvidence(toolName: string): boolean {
@@ -247,6 +249,27 @@ export function extractCandidatePaths(
         for (const item of value) {
           if (typeof item === "string" && item.trim()) {
             paths.push({ path: item.trim(), source: `${toolName}:${key}` });
+          }
+        }
+      }
+    }
+  }
+
+  if (normalizedName === APPLY_PATCH_TOOL) {
+    // ApplyPatch carries its mutation targets in the nested structured
+    // operation argument: operation.path (all types) and operation.moveTo
+    // (update_file renames). Both are pre-captured as mutation candidates.
+    const operation = input.operation;
+    if (isRecord(operation)) {
+      for (const key of ["path", "moveTo"]) {
+        const value = operation[key];
+        if (typeof value === "string" && value.trim()) {
+          // Normalize the leading '@' convention marker exactly like the tool
+          // does, so candidates point at the files ApplyPatch actually mutates.
+          const normalized = normalizeApplyPatchPathMarker(value);
+          if (normalized) {
+            paths.push({ path: normalized, source: `${toolName}:operation.${key}` });
+            riskSignals.push("apply_patch_mutation");
           }
         }
       }

@@ -43,12 +43,14 @@ function buildFileDiff(change: ChangedFile): string {
   const newContent = change.status === "deleted" ? "" : change.newContent ?? "";
   const oldLines = splitLines(oldContent);
   const newLines = splitLines(newContent);
-  const oldPath = change.status === "added" ? "/dev/null" : `a/${change.path}`;
+  const sourcePath = change.renamedFrom ?? change.path;
+  const oldPath = change.status === "added" ? "/dev/null" : `a/${sourcePath}`;
   const newPath = change.status === "deleted" ? "/dev/null" : `b/${change.path}`;
   const body = buildHunks(oldLines, newLines);
 
   return [
-    `diff --git a/${change.path} b/${change.path}`,
+    `diff --git a/${sourcePath} b/${change.path}`,
+    ...(change.renamedFrom ? [`rename from ${change.renamedFrom}`, `rename to ${change.path}`] : []),
     `--- ${oldPath}`,
     `+++ ${newPath}`,
     ...body,

@@ -39,6 +39,7 @@ import {
   type BackgroundShellHost,
   type BackgroundShellLifecycleEvent,
 } from "./background-shell";
+import { registerApplyPatchTool } from "./apply-patch/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
 
 declare const module: {
@@ -70,6 +71,14 @@ export async function activate(pi: unknown): Promise<void> {
 
   const webTools = canRegisterWebTools(pi) ? new WebToolManager(pi, loaded.config) : undefined;
   webTools?.register();
+
+  // Register ApplyPatch in both the top-level orchestrator and Pi-native
+  // executor runtimes. It is active by default under Pi's registered-tool
+  // policy; an explicit Pi launch --tools allowlist remains authoritative, so
+  // this never force-enables the tool through setActiveTools.
+  if (canRegisterApplyPatchTool(pi)) {
+    registerApplyPatchTool(pi);
+  }
 
   if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor") {
     if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
@@ -776,6 +785,10 @@ function canRegisterBackgroundShell(value: unknown): value is BackgroundShellHos
 }
 
 function canRegisterWebTools(value: unknown): value is PiWebHost {
+  return typeof (value as { registerTool?: unknown } | undefined)?.registerTool === "function";
+}
+
+function canRegisterApplyPatchTool(value: unknown): boolean {
   return typeof (value as { registerTool?: unknown } | undefined)?.registerTool === "function";
 }
 

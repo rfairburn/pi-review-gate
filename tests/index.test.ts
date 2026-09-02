@@ -373,12 +373,12 @@ test("delegated execution tool activation waits for session_start", async () => 
     };
 
     await activate(pi);
-    assert.deepEqual(registeredTools, [...webToolNames, ...backgroundShellToolNames]);
+    assert.deepEqual(registeredTools, [...webToolNames, "ApplyPatch", ...backgroundShellToolNames]);
 
     runtimeInitialized = true;
     await trigger(hooks, "session_start", { cwd: dir });
-    assert.deepEqual(registeredTools, [...webToolNames, ...backgroundShellToolNames, ...executionToolNames]);
-    assert.deepEqual(activeTools, ["read", ...webToolNames, ...backgroundShellToolNames, ...executionToolNames]);
+    assert.deepEqual(registeredTools, [...webToolNames, "ApplyPatch", ...backgroundShellToolNames, ...executionToolNames]);
+    assert.deepEqual(activeTools, ["read", ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, ...executionToolNames]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

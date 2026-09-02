@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 interface Blocker {
   promise: Promise<void>;
@@ -9,7 +9,9 @@ interface Blocker {
 /**
  * Process-local serialization and critical-gate coordination for mutations of
  * a source workspace. Captures and executor work remain concurrent; only the
- * final revalidation/mutation section is serialized.
+ * final revalidation/mutation section is serialized. Ancestor and descendant
+ * roots (for example, the Git capture root and a session cwd inside it)
+ * participate in the same leases and conflict gates.
  */
 export class SourceMutationCoordinator {
   private readonly tails = new Map<string, Promise<void>>();
@@ -18,13 +20,26 @@ export class SourceMutationCoordinator {
   async acquire(sourceRoot: string, signal?: AbortSignal): Promise<() => void> {
     const key = resolve(sourceRoot);
     for (;;) {
-      await waitFor(this.blockers.get(key)?.promise, signal);
+      // Ancestor and descendant roots share conflict gates: a gate on the
+      // capture root must hold a session cwd inside it (and vice versa).
+      const blockerPromises = [...this.blockers.entries()]
+        .filter(([candidate]) => pathsOverlap(candidate, key))
+        .map(([, blocker]) => blocker.promise);
+      await waitFor(
+        blockerPromises.length > 0 ? Promise.all(blockerPromises).then(() => undefined) : undefined,
+        signal,
+      );
 
       let releaseLease!: () => void;
       const lease = new Promise<void>((resolveLease) => {
         releaseLease = resolveLease;
       });
-      const previous = this.tails.get(key) ?? Promise.resolve();
+      const predecessors = [...new Set(
+        [...this.tails.entries()]
+          .filter(([candidate]) => pathsOverlap(candidate, key))
+          .map(([, tail]) => tail),
+      )];
+      const previous = Promise.all(predecessors).then(() => undefined);
       const tail = previous.then(() => lease);
       this.tails.set(key, tail);
       await waitFor(previous, signal).catch((error) => {
@@ -35,7 +50,7 @@ export class SourceMutationCoordinator {
       // A conflict can activate while this waiter is queued behind the task
       // that discovered it. Yield the lease and wait for mark_clean instead of
       // entering the source workspace after the gate became active.
-      if (this.blockers.has(key)) {
+      if ([...this.blockers.keys()].some((candidate) => pathsOverlap(candidate, key))) {
         releaseLease();
         continue;
       }
@@ -74,9 +89,21 @@ export class SourceMutationCoordinator {
   }
 
   blocked(sourceRoot: string): { blocked: boolean; reason?: string } {
-    const blocker = this.blockers.get(resolve(sourceRoot));
+    const key = resolve(sourceRoot);
+    const blocker = [...this.blockers.entries()]
+      .find(([candidate]) => pathsOverlap(candidate, key))?.[1];
     return blocker ? { blocked: true, reason: blocker.reason } : { blocked: false };
   }
+}
+
+/** Ancestor and descendant workspace roots coordinate as one workspace. */
+function pathsOverlap(left: string, right: string): boolean {
+  return isWithin(left, right) || isWithin(right, left);
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 async function waitFor(promise: Promise<void> | undefined, signal?: AbortSignal): Promise<void> {

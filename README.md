@@ -685,6 +685,83 @@ becomes a new exchange in the same window and triggers another review. Later
 ordinary work starts a fresh window from current file contents and does not
 re-review changes that already passed.
 
+### ApplyPatch structured file mutation
+
+The extension registers a first-class `ApplyPatch` tool for both the top-level
+orchestrator and Pi-native executor runtimes. It performs one structured
+OpenAI apply_patch operation per call — `create_file`, `update_file`, or
+`delete_file` — against a single file inside the current workspace, following
+the V4A diff contract at
+https://developers.openai.com/api/docs/guides/tools-apply-patch.
+
+The tool takes one strict `operation` argument. `create_file` and `update_file`
+require `path` plus a headerless V4A `diff` body (because the operation type
+and paths are structured fields, the body carries no `*** Begin Patch`,
+`*** Add/Update/Delete File:`, or `*** Move to:` headers). `delete_file` takes
+only `path`. `update_file` additionally accepts the current protocol's optional
+non-empty `moveTo` destination for a safe rename. A leading `@` on a path is
+tolerated and stripped. The model-visible JSON schema exposes `operation` as a
+discriminated `oneOf` so each operation type advertises exactly its own
+required fields and forbids the rest; runtime validation enforces the same
+rules as defense in depth.
+
+Behavior and safety properties:
+
+- The V4A engine is adapted from the official OpenAI Agents JS
+  `applyDiff.ts` implementation (MIT-licensed; see [NOTICE](NOTICE) and
+  [LICENSES/MIT-openai-agents-js.txt](LICENSES/MIT-openai-agents-js.txt)). Its
+  anchor parsing, context matching, first-match selection, whitespace fuzz,
+  and `*** End of File` behavior are preserved.
+- Every source and destination path is confined to the current working
+  directory. Path traversal, absolute paths outside the workspace, symlink
+  escapes, symlinked targets, directories and other non-regular files, binary
+  or non-UTF-8 content, create-over-existing, update/delete-missing, and
+  unsafe move destinations are rejected with informative diagnostics.
+  V4A file-level header lines inside `operation.diff` (e.g. a stray
+  `*** End Patch`) are likewise rejected up front instead of being silently
+  treated as section terminators.
+- Validation and parsing complete before any mutation, and each mutation is
+  staged through a same-directory temporary file, so a failed call never
+  exposes a partial write. New files and move destinations are committed
+  through an atomic no-overwrite link, so a target that appears after
+  validation is rejected with `EEXIST` rather than overwritten; on filesystems
+  without hard-link support the commit fails safely instead of risking an
+  overwrite. With `moveTo`, the patched
+  content is committed at the destination before the source is removed, so a
+  failed move leaves the original source bytes in place (and a source-removal
+  failure rolls the destination back). `delete_file` validates that the full
+  source is UTF-8 text before removing it and rechecks cancellation after the
+  validation read. The declared `executionMode: "sequential"` additionally
+  prevents ApplyPatch from racing sibling built-in edit/write calls within one
+  parallel tool batch.
+- The complete validated mutation window runs under the same
+  source-mutation coordinator that serializes background-task landing, so a
+  foreground patch cannot interleave with a landing capture and an active
+  conflict gate blocks patching until it is cleared.
+- Updates preserve the original file's exact permission bits (independent of
+  the process umask), byte-order mark, and line-ending style (LF or CRLF)
+  where feasible; trailing-newline state is preserved by the upstream engine.
+  An update whose patch changes nothing succeeds as a true no-op: the file is
+  not rewritten, so its inode, timestamps, hard links, and extended metadata
+  are preserved.
+- Failures throw with an informative message so Pi marks the tool result as
+  an error and the model can correct the diff or path and retry. Each call
+  mutates at most one file; there is deliberately no cross-call or multi-file
+  rollback — retry the individual failed operation.
+- Review evidence pre-captures `operation.path` and `operation.moveTo` as
+  mutation candidates before execution (applying the same leading-`@`
+  normalization the tool uses) and successful and failed calls both remain
+  review evidence. Results expose bounded structured details including the
+  requested diff and a unified final diff — with `rename from`/`rename to`
+  headers for moves and the removed content for deletions — rendered compactly
+  by the tool's custom call/result renderers.
+- Research subtasks never receive ApplyPatch: research workers intersect the
+  parent's active tools with a read-only allowlist that excludes it.
+- There is no review-gate configuration gate for ApplyPatch and no
+  `setActiveTools` re-enabling: availability follows Pi's normal
+  registered-tool policy, and an explicit Pi launch `--tools` allowlist
+  remains authoritative.
+
 ## Commands
 
 `/review-clear` discards the active or retained review window, including its
@@ -866,3 +943,9 @@ Coder by Itay Inbar and are used under the Apache License, Version 2.0. The
 source files carry modification notices. See [NOTICE](NOTICE) and
 [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) for attribution and the full
 license text.
+
+The `ApplyPatch` V4A diff engine and its compatibility tests are adapted from
+the OpenAI Agents JS apply-patch implementation and are used under the MIT
+License. See [NOTICE](NOTICE) and
+[LICENSES/MIT-openai-agents-js.txt](LICENSES/MIT-openai-agents-js.txt) for
+attribution and the full license text.

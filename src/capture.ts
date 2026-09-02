@@ -49,6 +49,8 @@ export interface ChangedFile {
   status: ChangedFileStatus;
   binary: boolean;
   oversized: boolean;
+  /** Original path for renames; rendered as `rename from`/`rename to` headers. */
+  renamedFrom?: string;
   diffOmittedReason?: string;
   oldContent?: string;
   newContent?: string;

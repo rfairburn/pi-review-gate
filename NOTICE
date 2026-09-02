@@ -27,3 +27,22 @@ that did not fit the small-model focus have been removed.
 
 The background-shell source files carry prominent modification notices. The
 Apache License, Version 2.0 is reproduced in LICENSES/Apache-2.0.txt.
+
+--------------------------------------------------------------------------
+Attribution to OpenAI Agents JS (ApplyPatch V4A engine)
+--------------------------------------------------------------------------
+
+This product includes the file src/apply-patch/engine.ts (and its companion
+test file tests/apply-patch-engine.test.ts), which are substantially copied
+from and adapted to TypeScript from the OpenAI Agents JS apply-patch
+implementation:
+
+OpenAI Agents JS (https://github.com/openai/openai-agents-js)
+Copyright 2025 OpenAI
+
+Licensed under the MIT License; the full text is reproduced in
+LICENSES/MIT-openai-agents-js.txt. The adapted engine applies headerless V4A
+diffs for the ApplyPatch tool as documented at
+https://developers.openai.com/api/docs/guides/tools-apply-patch; the
+modifications are described in the header comment of
+src/apply-patch/engine.ts.

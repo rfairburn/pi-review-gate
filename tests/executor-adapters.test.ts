@@ -20,6 +20,65 @@ test("Pi executor refuses to launch without an authoritative native --tools allo
   );
 });
 
+test("Pi executor child loads the review-gate extension in executor role without inheriting disablement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-executor-env-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "capture.json");
+    const command = join(root, "env-capture-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      `fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({argv:process.argv.slice(2),env:process.env}));`,
+      "let input=''; process.stdin.setEncoding('utf8');",
+      "const out=(v)=>console.log(JSON.stringify(v));",
+      "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});out({type:'agent_end'});}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
+      "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'research complete'}});",
+      "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});out({type:'agent_end'});}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+    const previousExtraExtensions = process.env.PI_EXTRA_EXTENSIONS;
+    // Simulate a parent context where the review gate is disabled and extra
+    // extensions are configured; neither may reach the executor child.
+    process.env.PI_REVIEW_GATE_DISABLED = "1";
+    process.env.PI_EXTRA_EXTENSIONS = "/must/not/propagate.js";
+    try {
+      const adapter = new PiExecutorAdapter({ model: "provider/model", command });
+      const result = await adapter.run({
+        cwd: root,
+        prompt: "research task",
+        artifactDir,
+        turn: 1,
+        allowedTools: ["read", "WebSearch", "WebFetch", "BrowserExtract"],
+      });
+      assert.equal(result.text, "research complete");
+      const captured = JSON.parse(await readFile(capture, "utf8")) as { argv: string[]; env: Record<string, string | undefined> };
+      // The child must not inherit the review-gate kill switch from the parent
+      // or have it imposed by the adapter; with it set, activate() returns
+      // before the executor-role branch and no web tools are registered.
+      assert.equal(captured.env.PI_REVIEW_GATE_DISABLED, undefined);
+      assert.equal(captured.env.PI_REVIEW_GATE_RUNTIME_ROLE, "executor");
+      assert.equal(captured.env.PI_EXTRA_EXTENSIONS, undefined);
+      const tools = captured.argv[captured.argv.indexOf("--tools") + 1];
+      assert.equal(tools, "read,WebSearch,WebFetch,BrowserExtract");
+      const extension = captured.argv[captured.argv.indexOf("--extension") + 1];
+      assert.ok(extension.endsWith("index.js"), `expected the review-gate extension to load in the child, got ${extension}`);
+    } finally {
+      if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
+      else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+      if (previousExtraExtensions === undefined) delete process.env.PI_EXTRA_EXTENSIONS;
+      else process.env.PI_EXTRA_EXTENSIONS = previousExtraExtensions;
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Pi executor uses acknowledged RPC steering and a durable session", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-little-rpc-"));
   try {

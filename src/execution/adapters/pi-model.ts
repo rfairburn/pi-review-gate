@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { reviewerEnv, terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
+import { terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
 import { writeExecutorArtifacts } from "../artifacts";
@@ -561,8 +561,15 @@ function childArgs(args: readonly string[], allowedTools: readonly string[]): st
 }
 
 function executorEnv(): NodeJS.ProcessEnv {
-  return {
-    ...reviewerEnv(process.env),
-    PI_REVIEW_GATE_RUNTIME_ROLE: "executor",
-  };
+  const next = { ...process.env };
+  // The child must load the review-gate extension in its executor role so the
+  // already-designed registration of web tools and background shell runs.
+  // PI_REVIEW_GATE_DISABLED would short-circuit activate() before the
+  // executor-role branch, so it must never reach the child, even when the
+  // parent process itself is disabled. PI_EXTRA_EXTENSIONS is dropped so only
+  // the explicitly passed --extension loads in the child.
+  delete next.PI_REVIEW_GATE_DISABLED;
+  delete next.PI_EXTRA_EXTENSIONS;
+  next.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
+  return next;
 }

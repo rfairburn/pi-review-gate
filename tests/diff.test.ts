@@ -39,6 +39,29 @@ test("buildUnifiedPatch includes added, modified, and deleted text files", () =>
   assert.equal(result.truncated, false);
 });
 
+test("buildUnifiedPatch renders renames with rename from/to headers", () => {
+  const result = buildUnifiedPatch(
+    [
+      {
+        path: "b.txt",
+        status: "modified",
+        binary: false,
+        oversized: false,
+        renamedFrom: "a.txt",
+        oldContent: "one\ntwo\n",
+        newContent: "one\nTWO\n",
+      },
+    ],
+    10_000,
+  );
+
+  assert.match(result.patch, /diff --git a\/a\.txt b\/b\.txt/);
+  assert.match(result.patch, /rename from a\.txt/);
+  assert.match(result.patch, /rename to b\.txt/);
+  assert.match(result.patch, /--- a\/a\.txt\n\+\+\+ b\/b\.txt/);
+  assert.match(result.patch, /-two\n\+TWO/);
+});
+
 test("buildUnifiedPatch emits context hunks instead of whole-file replacement", () => {
   const oldContent = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n") + "\n";
   const newContent = oldContent.replace("line 10\n", "line ten\n");

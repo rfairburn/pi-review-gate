@@ -218,6 +218,92 @@ describe("bg-shell against real processes", () => {
     expect(textOf(await call("ShellLog", { id }))).toContain("got:hello");
   });
 
+  // Finding 3: a child that exits mid-write must not take the host down. The
+  // payload far exceeds the 64KB pipe buffer, so most of it is still queued in
+  // Node when the child exits and closes the read end — the resulting EPIPE
+  // arrives asynchronously on the stdin stream, where a plain try/catch around
+  // write() can never see it. Without a listener the test process would die
+  // with an uncaught exception; reaching the assertions below at all proves the
+  // host survived.
+  it("ShellSend returns a controlled error when the child exits mid-write", async () => {
+    const { sent, call } = wire();
+    const id = textOf(await call("ShellStart", {
+      // Still alive when the 4MB write is issued (which happens synchronously
+      // after spawn, before any event-loop turn observes the exit); exits well
+      // before WRITE_FLUSH_TIMEOUT_MS, so the EPIPE path is deterministic.
+      command: "sleep 0.2",
+      label: "exit-mid-write",
+    })).match(/as (job\d+)/)![1];
+
+    // Sent immediately, while the child is still alive.
+    const result = await call("ShellSend", { id, text: "x".repeat(4 * 1024 * 1024) });
+    expect(result.isError).toBe(true);
+    const text = textOf(result);
+    expect(text).toContain("stdin");
+    expect(text).toContain("ShellLog"); // actionable: where to look next
+
+    // The failure is recorded as exactly ONE bounded buffer note, even though
+    // both the write callback and the stream 'error' event fire.
+    expect(await until(() => sent.length > 0)).toBe(true); // exit wake = child gone
+    const log = textOf(await call("ShellLog", { id }));
+    expect(log).toContain("[stdin error]");
+    expect(log.split("[stdin error]").length - 1).toBe(1);
+
+    // A follow-up send hits the recorded stdin failure (EPIPE), which wins
+    // over the exit flag — the precheck's "no longer writable (EPIPE)" error is
+    // the precise answer, and recordStdinFailure is idempotent, so the log
+    // still shows exactly one note.
+    const retry = await call("ShellSend", { id, text: "again" });
+    expect(retry.isError).toBe(true);
+    expect(textOf(retry)).toContain("no longer writable");
+    const logAfterRetry = textOf(await call("ShellLog", { id }));
+    expect(logAfterRetry.split("[stdin error]").length - 1).toBe(1);
+
+    // The host is demonstrably still alive and answering.
+    expect(pidAlive(process.pid)).toBe(true);
+  });
+
+  // The other half of the timeout contract: when the write callback has not
+  // fired within WRITE_FLUSH_TIMEOUT_MS (child alive but not reading, payload
+  // stuck in Node's queue behind the full pipe), ShellSend must NOT claim the
+  // bytes were written — and the later EPIPE from the eventual exit must land
+  // as exactly one bounded note via the stdin 'error' listener, with the host
+  // intact.
+  it("ShellSend reports delivery unconfirmed when the child outlives the flush timeout", async () => {
+    const { sent, call } = wire();
+    const id = textOf(await call("ShellStart", {
+      command: "sleep 2", // outlives WRITE_FLUSH_TIMEOUT_MS, never reads stdin
+      label: "flush-timeout",
+    })).match(/as (job\d+)/)![1];
+
+    const result = await call("ShellSend", { id, text: "x".repeat(4 * 1024 * 1024) });
+    expect(result.isError).toBe(false); // not a failure — but not a success claim either
+    const text = textOf(result);
+    expect(text).toContain("NOT confirmed");
+    expect(text).not.toContain("Wrote ");
+
+    // The child eventually exits; the queued write fails with EPIPE and the
+    // listener records it. Exactly one note, no uncaught exception.
+    expect(await until(() => sent.length > 0, 8000)).toBe(true);
+    const log = textOf(await call("ShellLog", { id }));
+    expect(log).toContain("[stdin error]");
+    expect(log.split("[stdin error]").length - 1).toBe(1);
+    expect(pidAlive(process.pid)).toBe(true);
+  });
+
+  // An exited job's stdin is destroyed by Node itself; that must NOT be
+  // reported as a stdin failure. The definitive answer is "already exited",
+  // and the log must stay free of [stdin error] notes.
+  it("ShellSend against a cleanly exited job says so without a stdin note", async () => {
+    const { sent, call } = wire();
+    const id = textOf(await call("ShellStart", { command: "exit 0", label: "done" })).match(/as (job\d+)/)![1];
+    expect(await until(() => sent.length > 0)).toBe(true); // exit wake = child gone
+    const result = await call("ShellSend", { id, text: "hello" });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("has already exited");
+    expect(textOf(await call("ShellLog", { id }))).not.toContain("[stdin error]");
+  });
+
   // The one that matters most. `python train.py` runs as a GRANDCHILD under the
   // bash we spawn — killing only the shell would orphan the process actually
   // holding the GPU. Spawning detached and signalling the group is what makes

@@ -1,7 +1,7 @@
 # Slop and cleanup review inventory
 
 Date: 2026-09-02
-Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0, 1, and 2 are
+Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0, 1, 2, and 3 are
 RESOLVED work-history entries (fixes landed 2026-09-02); remaining findings are
 recommendations only with no product code changes.
 
@@ -198,28 +198,63 @@ no `dist/` output touched.
 checkpoint/save/publish/wake error; bookkeeping failures are visible as activity and
 notifications while the durable and in-memory task states stay consistent with main.
 
-### 3. HIGH — ShellSend can crash the pi host via unhandled async stdin EPIPE
+### 3. HIGH — RESOLVED (2026-09-02): ShellSend can crash the pi host via unhandled async stdin EPIPE
 
-Refs: `src/background-shell/index.ts` `ShellSend.execute` (`:681-687`, try/catch around
-`job.proc.stdin?.write(payload)`); `attachStreams` (`:368+`) attaches `job.proc.on("error")`
-(`:405`) but no listener on `job.proc.stdin`. Compare the reviewer path, which already fixed
-this class in `src/adapters/process.ts:285-290` (stdin error listener with explanatory
-comment).
+**Root cause (confirmed).** `ShellSend.execute` guarded `job.proc.stdin?.write(payload)` with a
+synchronous try/catch, but `attachStreams` never attached a listener to `job.proc.stdin`. A write
+to a pipe whose read end closed (job exits between the `job.exited` check and the write, or while
+an earlier large write is still queued beyond the 64KB pipe buffer) emits EPIPE/
+`ERR_STREAM_DESTROYED` **asynchronously** as an `'error'` event on the stdin stream — invisible to
+try/catch, and with no listener Node raises an uncaught exception that kills the whole pi host and
+every job/session in it.
 
-Impact: a write to a pipe whose read end closed (job exits between the `job.exited` check and
-the write, or while an earlier write is still flushing) emits EPIPE/`ERR_STREAM_DESTROYED`
-**asynchronously** as an `'error'` event on the stdin stream. try/catch cannot catch it; with
-no listener Node raises an uncaught exception that kills the whole pi host and every
-job/session in it.
+**Fix.** `src/background-shell/index.ts`:
+- `attachStreams` now attaches a `job.proc.stdin.on("error", …)` listener at job creation (the same
+class of fix the reviewer path shipped in `src/adapters/process.ts`).
+- A single idempotent `recordStdinFailure(job, reason)` helper funnels every dead-stdin path — the
+stream `'error'` event, the write-callback error, a synchronous write throw, and the already-
+destroyed/non-writable precheck — through one place: first reason wins, `stdinDead`/`stdinError`
+are marked, and exactly one bounded `[stdin error]` buffer note is recorded, so normal exit races
+(callback + stream event firing together, or repeated retries) never spam the log and ShellLog
+always explains an unwritable stdin.
+- `ShellSend` treats a **recorded** stdin failure (`stdinDead`, set only by a real EPIPE/callback/
+sync error via `recordStdinFailure`) as the more precise answer for a retry, so it wins over the
+exit flag with a controlled, actionable `stdin-closed` error result. Error reasons are capped at
+240 characters before entering the buffer or tool result. Exited jobs whose stdin never
+failed keep the definitive `has already exited` message with no note — important because Node
+destroys the child's stdin handle in its own exit handler, so a bare `stdin.destroyed` check alone
+would misreport every exited job. The write itself uses a bounded await
+on the write callback (`WRITE_FLUSH_TIMEOUT_MS = 1500`, unref'd timer). A callback error returns a
+controlled `stdin-write-failed` result; a callback that has not fired within the window returns an
+explicit `stdin-write-unconfirmed` result saying the bytes are queued but delivery was NOT
+confirmed — never claiming they were written — and any later EPIPE still lands via the listener.
+Resolution is settled-guarded, so the timeout and the callback can never double-resolve. Live-job
+writes are unchanged: small writes flush to the OS pipe buffer immediately, so the existing
+success text and wake/buffer behaviour are untouched.
 
-Recommendation:
-- [ ] Attach a `job.proc.stdin.on("error", …)` handler at job creation (bounded note in
-      `job.buffer`, mark stream dead) and/or use the write callback plus a
-      `stdin.destroyed` check before writing.
-- [ ] Test: `ShellSend` against a child that exits mid-write must not crash the host.
+**Tests.** `tests/background-shell-integration.test.ts` adds two deterministic cases. Exit-mid-
+write: a `sleep 0.2` child that never reads stdin receives a 4MB ShellSend (far beyond pipe
+capacity, so most of it is still queued when the child exits and closes the read end, well before
+the flush timeout). Asserts ShellSend returns a controlled `isError` result, the buffer records
+exactly one `[stdin error]` note despite the callback and stream event both firing, a follow-up
+send trips the dead-stream precheck with a `no longer writable` error while still showing only
+that one note (idempotent recording), and the host/test process is demonstrably still alive
+(reaching the assertions at all proves no uncaught exception fired). A cleanly exited job
+(`exit 0`) answers `has already exited` with **no** `[stdin error]` note, proving Node's own
+stdin destruction at exit is never misreported as a failure. Flush-timeout: a `sleep 2`
+child outlives the 1500ms window, so ShellSend reports the 4MB write as delivery-unconfirmed
+(`isError` false but no `Wrote …` success claim), and the EPIPE from the eventual exit is recorded
+as exactly one bounded note with the host intact. The pre-existing live-stdin write test covers
+the unchanged live-job path.
 
-Test status: none — `tests/background-shell-integration.test.ts:208` writes to a *live* job
-only; no test exercises an exiting child.
+**Validation.** `npm run check:static`; `npm run build:test` + targeted
+`node --test --test-concurrency=1 dist-test/tests/background-shell-integration.test.js` (25/25)
+and `dist-test/tests/background-shell-jobs.test.js` + `background-process-readiness.test.js`
+(34/34); no `dist/` output touched.
+
+**Impact.** No stdin error from ShellSend can surface as an unhandled event or crash the pi host;
+destroyed/closed/write-callback failures are bounded, visible diagnostics with actionable
+tool results, while live-job writes behave exactly as before.
 
 ### 4. MEDIUM — Background shell: unbounded line length and per-line regex compilation
 

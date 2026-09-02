@@ -123,6 +123,10 @@ interface Job {
   exited: boolean;
   /** Partial trailing line, held until its newline arrives. */
   pending: string;
+  /** Set the first time stdin reports an error (EPIPE, destroyed, …). Bounds
+   *  the buffer to one diagnostic per job across a normal exit race. */
+  stdinDead?: boolean;
+  stdinError?: string;
   /** A match wake held back to see whether the job exits first. */
   pendingWake?: ReturnType<typeof setTimeout>;
   /**
@@ -336,6 +340,39 @@ function flushHeldWakes(pi: BackgroundShellHost): void {
  *  for the exit — and spends two turns learning one thing. */
 const EXIT_COALESCE_MS = 1500;
 
+/** How long ShellSend waits for the write callback before reporting the write
+ *  as delivery-UNCONFIRMED (never as written). Live jobs flush small writes to
+ *  the OS pipe buffer immediately, so this only bounds the backpressure case —
+ *  a payload larger than the pipe capacity that the child is not reading. Any
+ *  later failure still lands via the stdin 'error' listener. */
+const WRITE_FLUSH_TIMEOUT_MS = 1500;
+const MAX_STDIN_ERROR_CHARS = 240;
+
+function boundedStdinError(reason: string): string {
+  if (reason.length <= MAX_STDIN_ERROR_CHARS) return reason;
+  return `${reason.slice(0, MAX_STDIN_ERROR_CHARS - 14)}…[truncated]`;
+}
+
+/** True when the job's stdin cannot accept writes any more. */
+function stdinIsDead(job: Job): boolean {
+  const stdin = job.proc.stdin;
+  return job.stdinDead === true || !stdin || stdin.destroyed || !stdin.writable;
+}
+
+/** Record a stdin failure exactly once per job — first reason wins, one
+ *  bounded buffer note. Every dead-stdin path (stream 'error' event, write
+ *  callback error, synchronous throw, already-destroyed precheck) funnels
+ *  through here so ShellLog always explains an unwritable stdin without ever
+ *  accumulating repeated notes during exit races. Returns the stored reason. */
+function recordStdinFailure(job: Job, reason: string): string {
+  if (job.stdinDead) return job.stdinError!;
+  const boundedReason = boundedStdinError(reason);
+  job.stdinDead = true;
+  job.stdinError = boundedReason;
+  job.buffer.push(`[stdin error] write to job stdin failed: ${boundedReason}`);
+  return boundedReason;
+}
+
 function handleLine(pi: BackgroundShellHost, job: Job, line: string): void {
   job.buffer.push(line);
   const now = Date.now();
@@ -374,6 +411,15 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
   };
   job.proc.stdout?.on("data", onChunk);
   job.proc.stderr?.on("data", onChunk);
+
+  // A child may exit (or close stdin) while an earlier ShellSend write is still
+  // queued; the resulting EPIPE/ERR_STREAM_DESTROYED arrives ASYNCHRONOUSLY as
+  // an 'error' event on the stdin stream. try/catch around write() can never
+  // see it — without this listener Node raises it as an uncaught exception and
+  // kills the whole pi host. Recorded once, as a bounded buffer note.
+  job.proc.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+    recordStdinFailure(job, err.code || err.message || "stdin write failed");
+  });
 
   const finish = (code: number | null) => {
     if (job.exited) return;
@@ -675,13 +721,76 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
     async execute(_id, params) {
       const job = jobs.get(String(params.id ?? ""));
       if (!job) return textResult(`Error: no such job "${params.id}"`, true);
-      if (job.exited) return textResult(`Error: job ${job.id} has already exited`, true);
+      // A recorded stdin failure (EPIPE from an earlier write) is the more
+      // precise answer for a retry, so it wins over the exit flag. Otherwise an
+      // exited job keeps the definitive "already exited" message: Node destroys
+      // the child's stdin handle in its own exit handler (before our 'close'
+      // driven finish()), so without this guard every exited job would trip the
+      // dead-stream precheck and get a spurious [stdin error] note.
+      const exited = job.exited || job.proc.exitCode !== null || job.proc.signalCode !== null;
+      if (exited && !job.stdinDead) return textResult(`Error: job ${job.id} has already exited`, true);
+      if (stdinIsDead(job)) {
+        const reason = recordStdinFailure(job, job.stdinError ?? "closed");
+        return textResult(
+          `Error: stdin for ${job.id} is no longer writable (${reason}) — the job likely exited or ` +
+            `closed its input. Check ShellLog/ShellList, and use ShellStop if it needs cleaning up.`,
+          true,
+          { kind: "pi-review-bg-shell", event: "stdin-closed", id: job.id },
+        );
+      }
       const text = String(params.text ?? "");
       const payload = text.endsWith("\n") ? text : `${text}\n`;
-      try {
-        job.proc.stdin?.write(payload);
-      } catch (e) {
-        return textResult(`Error: could not write to ${job.id}: ${(e as Error)?.message ?? e}`, true);
+      const stdin = job.proc.stdin!;
+      // Wait briefly for the write callback: a child that exits mid-write makes
+      // the flush fail with EPIPE, which surfaces HERE (as a controlled result)
+      // rather than as an unhandled 'error' event on the stdin stream. If the
+      // callback has not fired within the window (payload larger than the pipe
+      // buffer that the child is not reading), report delivery as UNCONFIRMED —
+      // never as written — and leave any later failure to the stdin 'error'
+      // listener via recordStdinFailure.
+      const outcome = await new Promise<{ flushed: boolean; error?: string }>((resolve) => {
+        let done = false;
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          resolve({ flushed: false });
+        }, WRITE_FLUSH_TIMEOUT_MS);
+        (timer as any).unref?.();
+        try {
+          stdin.write(payload, (err: NodeJS.ErrnoException | null | undefined) => {
+            if (done) return; // timeout already resolved; listener records the failure
+            done = true;
+            clearTimeout(timer);
+            if (err) resolve({ flushed: false, error: err.code || err.message || "stdin write failed" });
+            else resolve({ flushed: true });
+          });
+        } catch (e) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          const err = e as NodeJS.ErrnoException;
+          resolve({ flushed: false, error: err.code || err.message || "stdin write failed" });
+        }
+      });
+      if (outcome.error) {
+        const reason = recordStdinFailure(job, outcome.error);
+        return textResult(
+          `Error: write to ${job.id} stdin failed (${reason}). The job likely exited mid-write; ` +
+            `check ShellLog/ShellList, and use ShellStop if it needs cleaning up.`,
+          true,
+          { kind: "pi-review-bg-shell", event: "stdin-write-failed", id: job.id },
+        );
+      }
+      if (!outcome.flushed) {
+        // The callback never fired inside the window — the bytes are queued in
+        // Node's internal buffer, not yet in the pipe. Never claim success.
+        return textResult(
+          `Queued ${payload.length} bytes to ${job.id} stdin, but delivery was NOT confirmed within ` +
+            `1.5s (the child may not be reading; the write may be lost if the job exits soon). ` +
+            `Check ShellLog, and resend if the data never arrives.`,
+          false,
+          { kind: "pi-review-bg-shell", event: "stdin-write-unconfirmed", id: job.id },
+        );
       }
       return textResult(`Wrote ${payload.length} bytes to ${job.id} stdin.`);
     },

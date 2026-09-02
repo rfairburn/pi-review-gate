@@ -51,7 +51,7 @@ export interface EvidenceBundle {
     path: string;
     absolutePath: string;
     sources: string[];
-    baseline: "captured" | "missing" | "error";
+    baseline: "captured" | "missing" | "unreadable" | "error";
     baselineSnapshot?: FileSnapshot;
   }>;
   finalAssistantSummaries: string[];
@@ -192,8 +192,12 @@ export function buildEvidenceBundle(
     baseline: candidate.baselineError
       ? "error" as const
       : candidate.baseline?.exists
-        ? "captured" as const
-        : "missing" as const,
+        ? candidate.baseline.omittedReason === "unreadable"
+          ? "unreadable" as const
+          : "captured" as const
+        : candidate.baseline?.omittedReason === "unreadable"
+          ? "unreadable" as const
+          : "missing" as const,
     baselineSnapshot: candidate.baseline,
   }));
 

@@ -52,6 +52,8 @@ test("session state round-trips review evidence and associations only for the sa
         isBinary: false,
         content: "base\n",
       }]]),
+      omissions: [],
+      omissionsTruncated: false,
     });
     const evidence = createEvidenceState();
     evidence.candidates.set(join(root, "outside.txt"), {
@@ -137,6 +139,50 @@ test("session state round-trips review evidence and associations only for the sa
     corrupted.state.reviewsPaused = !corrupted.state.reviewsPaused;
     await writeFile(store.path, JSON.stringify(corrupted), "utf8");
     await assert.rejects(store.restore(root), /failed its integrity check/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session state preserves snapshot omission records through save and restore", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-omissions-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    setReviewWindowBaseline(state, {
+      cwd: root,
+      capturedAt: "2026-08-17T00:00:00.000Z",
+      files: new Map([["protected.txt", {
+        relativePath: "protected.txt",
+        absolutePath: join(root, "protected.txt"),
+        exists: true,
+        size: 9,
+        mtimeMs: 2,
+        sha256: null,
+        isBinary: false,
+        omittedReason: "unreadable",
+      }]]),
+      omissions: [
+        { path: "protected.txt", kind: "file", reason: "unreadable", errorCode: "EACCES" },
+        { path: "gone.txt", kind: "file", reason: "missing", errorCode: "ENOENT" },
+        { path: "blocks", kind: "directory", reason: "unreadable", errorCode: "EACCES" },
+      ],
+      omissionsTruncated: true,
+    });
+    const store = new SessionStateStore({ sessionId: "conversation-ledger", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: [], bundles: [] });
+
+    const restored = await store.restore(root);
+    assert.ok(restored);
+    const baseline = restored.state.reviewWindow?.baseline;
+    assert.deepEqual(baseline?.omissions, [
+      { path: "protected.txt", kind: "file", reason: "unreadable", errorCode: "EACCES" },
+      { path: "gone.txt", kind: "file", reason: "missing", errorCode: "ENOENT" },
+      { path: "blocks", kind: "directory", reason: "unreadable", errorCode: "EACCES" },
+    ]);
+    assert.equal(baseline?.omissionsTruncated, true);
+    assert.equal(baseline?.files.get("protected.txt")?.omittedReason, "unreadable");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

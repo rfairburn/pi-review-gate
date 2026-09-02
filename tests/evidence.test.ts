@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -264,4 +264,31 @@ test("accepted reviewer questions and edited answers become structured evidence"
   }]);
   assert.match(bundle.markdown, /Accepted reviewer questions and answers/);
   assert.match(bundle.markdown, /```diff\n-old\n\+new\n```/);
+});
+
+test("evidence candidate baselines distinguish unreadable existing paths and surface in markdown", async (t) => {
+  if (process.platform === "win32" || process.getuid?.() === 0) {
+    t.skip("permission-based tests require a non-root POSIX user");
+  }
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-evidence-unreadable-"));
+  try {
+    await writeFile(join(dir, "candidate.txt"), "candidate content\n", "utf8");
+    await chmod(join(dir, "candidate.txt"), 0o000);
+    const state = createEvidenceState();
+    await recordToolCallEvidence({
+      state,
+      cwd: dir,
+      toolName: "write",
+      toolInput: { path: "candidate.txt" },
+      snapshotOptions,
+    });
+    const bundle = buildEvidenceBundle(state, []);
+    const candidate = bundle.candidates.find((entry) => entry.path === "candidate.txt");
+    assert.equal(candidate?.baseline, "unreadable");
+    assert.equal(candidate?.baselineSnapshot?.omittedReason, "unreadable");
+    assert.match(bundle.markdown, /candidate\.txt \(unreadable;/);
+  } finally {
+    await chmod(join(dir, "candidate.txt"), 0o644).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
 });

@@ -97,6 +97,8 @@ function buildSelectiveCheckpoint(
       cwd: preWaveBaseline.cwd,
       capturedAt: afterSnapshot.capturedAt,
       files: mergedFiles,
+      omissions: afterSnapshot.omissions,
+      omissionsTruncated: afterSnapshot.omissionsTruncated,
     },
     parentOwnedOverlapPaths,
   };

@@ -2680,7 +2680,7 @@ function selectiveCheckpoint(
     if (!absolute.has(baselineFile.absolutePath) || after.files.has(key)) continue;
     if (!parentChanged(taskBaseline.files.get(key), before.files.get(key))) files.delete(key);
   }
-  return { cwd: accumulatedBaseline.cwd, capturedAt: after.capturedAt, files };
+  return { cwd: accumulatedBaseline.cwd, capturedAt: after.capturedAt, files, omissions: after.omissions, omissionsTruncated: after.omissionsTruncated };
 }
 
 function parentChanged(a: FileSnapshot | undefined, b: FileSnapshot | undefined): boolean {

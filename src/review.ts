@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { resolveReviewers, reviewerDisplayLabel, reviewerDisplayLabels, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
-import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type WorkspaceSnapshot } from "./capture";
+import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type SnapshotOmission, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
 import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
 import type { ChangeIdentity, ReviewResult } from "./schema";
@@ -263,6 +263,8 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
     sideEffectChanges,
     patch: patchResult.patch,
     sideEffectPatch: sideEffectPatchResult.patch,
+    snapshotOmissions: after.omissions,
+    snapshotOmissionsTruncated: after.omissionsTruncated,
     evidence: input.evidence
       ? buildEvidenceBundle(
         input.evidence,
@@ -297,6 +299,8 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
       changeIdentity: input.changeIdentity,
+      snapshotOmissions: after.omissions,
+      snapshotOmissionsTruncated: after.omissionsTruncated,
       ...(input.exactChange !== undefined ? {
         exactChangedPaths: input.exactChange.changedPaths,
         exactPatchTruncated: input.exactChange.truncated,
@@ -381,7 +385,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   }
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
   const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
-  const { changes, workspaceChanges, evidenceChanges, sideEffectChanges } = await collectCurrentChanges({
+  const { changes, workspaceChanges, evidenceChanges, sideEffectChanges, snapshotOmissions, snapshotOmissionsTruncated } = await collectCurrentChanges({
     cwd: input.cwd,
     before: input.before,
     config: input.config,
@@ -414,6 +418,8 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
     sideEffectChanges,
     patch: patchResult.patch,
     sideEffectPatch: sideEffectPatchResult.patch,
+    snapshotOmissions,
+    snapshotOmissionsTruncated,
     evidence: input.evidence
       ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
       : undefined,
@@ -429,6 +435,8 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
       sideEffectPatchTruncated: sideEffectPatchResult.truncated,
       omittedSideEffectDiffs: sideEffectPatchResult.omitted,
       changeIdentity: input.changeIdentity,
+      snapshotOmissions,
+      snapshotOmissionsTruncated,
     },
   });
   registerBundleWithWindow(input.window, bundle.dir);
@@ -933,9 +941,16 @@ async function collectCurrentChanges(input: {
   before?: WorkspaceSnapshot;
   config: ReviewGateConfig;
   evidence?: EvidenceState;
-}): Promise<{ changes: ChangedFile[]; workspaceChanges: ChangedFile[]; evidenceChanges: ChangedFile[]; sideEffectChanges: ChangedFile[] }> {
+}): Promise<{
+  changes: ChangedFile[];
+  workspaceChanges: ChangedFile[];
+  evidenceChanges: ChangedFile[];
+  sideEffectChanges: ChangedFile[];
+  snapshotOmissions: SnapshotOmission[];
+  snapshotOmissionsTruncated: boolean;
+}> {
   if (!input.before) {
-    return { changes: [], workspaceChanges: [], evidenceChanges: [], sideEffectChanges: [] };
+    return { changes: [], workspaceChanges: [], evidenceChanges: [], sideEffectChanges: [], snapshotOmissions: [], snapshotOmissionsTruncated: false };
   }
   const after = await createWorkspaceSnapshot(input.cwd, {
     maxFileBytes: input.config.maxFileBytes,
@@ -948,7 +963,11 @@ async function collectCurrentChanges(input: {
       maxSnapshotBytes: input.config.maxSnapshotBytes,
     })
     : [];
-  return splitReviewChanges(workspaceChanges, evidenceChanges);
+  return {
+    ...splitReviewChanges(workspaceChanges, evidenceChanges),
+    snapshotOmissions: after.omissions,
+    snapshotOmissionsTruncated: after.omissionsTruncated,
+  };
 }
 
 function splitReviewChanges(

@@ -257,6 +257,8 @@ test("beginAgentRun preserves the review-window baseline and evidence across con
     cwd: "/tmp/project",
     capturedAt: "2026-07-01T00:00:00.000Z",
     files: new Map(),
+    omissions: [],
+    omissionsTruncated: false,
   });
   state.reviewWindow!.evidence.events.push({
     sequence: 1,

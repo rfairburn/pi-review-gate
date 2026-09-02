@@ -402,22 +402,28 @@ Recommendation:
       commands and clear `pendingContinuation`.
 - [ ] Test status: none — interrupt tests assert task state and steering failure only.
 
-### 9. MEDIUM — Workspace snapshot fails the whole turn on concurrent FS changes (review pipeline)
+### 9. MEDIUM — RESOLVED (2026-09-02): Snapshots failed on concurrent filesystem changes
 
-Refs: `src/capture.ts` `inspectFile` (`:343-389`, rejects on stream error — a file deleted
-between `lstat` and `createReadStream`); `discoverFilesystemFiles` walk (`:288-310`, no
-per-entry error tolerance; unreadable dir throws from `readdir` in the non-git fallback);
-bubbles through `before_agent_start` at `src/index.ts:377-380`.
+**Root cause.** File and directory inspection treated per-entry races and permission failures as
+fatal to the entire snapshot. A file removed between enumeration, `lstat`, and streaming—or an
+unreadable directory during the non-Git walk—could therefore reject the agent turn.
 
-Impact: a background `ShellStart` job (or any concurrent process) deleting/rotating a file
-mid-snapshot rejects `createWorkspaceSnapshot`, which can fail the agent turn and the review
-gate for reasons unrelated to the change under review.
+**Fix.** Capture is now best-effort per entry while preserving abort semantics. A typed, bounded
+omission ledger distinguishes verified `missing` entries from possibly present `unreadable`
+files/directories, retains unreadable presence records, suppresses false child deletions beneath
+unreadable directories, and survives ledger overflow with a conservative root sentinel. Git
+warning paths are rebased to the capture cwd and audited with a filesystem fallback. File reads
+use a no-follow handle, verify canonical workspace containment and stable identity/size before and
+after hashing, and close handles on every path. Omissions persist with session snapshots and flow
+through review/question bundles into reviewer prompts; prompt rendering caps count, path length,
+and error-code length and visibly reports both display and ledger truncation.
 
-Recommendation:
-- [ ] Per-file/per-dir try/catch recording an `omittedReason` (`"missing"`/`"unreadable"`)
-      instead of throwing; keep the snapshot best-effort with a visible omission list.
-- [ ] Test status: none for concurrent deletion or unreadable dirs; `tests/capture.test.ts`
-      covers stable-tree capture only.
+**Tests.** Deterministic fault seams and filesystem controls cover deletion between `lstat` and
+open, unreadable files/directories, non-Git and Git-warning discovery, cwd rebasing, omission
+bounds/root sentinel behavior, file-to-symlink swaps, in-place growth/shrink races, aborts, handle
+cleanup, stable-tree compatibility, session round trips, evidence classification, prompt bounds,
+and review/wave propagation. Focused capture, evidence, prompt, session/state, and wave-semantic
+suites plus static checks pass without touching `dist/`.
 
 ### 10. MEDIUM — Transient delivery failures are not retried or surfaced in-session (review pipeline)
 

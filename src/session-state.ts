@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import type { ReviewGateConfig } from "./config";
 import type { EvidenceCandidate, EvidenceState } from "./evidence";
 import type { ReattachmentBundle } from "./execution/operation-record";
-import type { FileSnapshot, WorkspaceSnapshot } from "./capture";
+import type { FileSnapshot, SnapshotOmission, WorkspaceSnapshot } from "./capture";
 import type { ReviewGateState, ReviewWindow } from "./state";
 import type { ReviewerSession } from "./adapters/types";
 
@@ -90,6 +90,8 @@ interface PersistedWorkspaceSnapshot {
   cwd: string;
   capturedAt: string;
   files: Array<[string, FileSnapshot]>;
+  omissions: SnapshotOmission[];
+  omissionsTruncated: boolean;
 }
 
 interface PersistedEvidenceState {
@@ -348,6 +350,8 @@ function serializeSnapshot(snapshot: WorkspaceSnapshot): PersistedWorkspaceSnaps
     cwd: snapshot.cwd,
     capturedAt: snapshot.capturedAt,
     files: [...snapshot.files.entries()].map(([key, value]) => [key, { ...value }]),
+    omissions: snapshot.omissions.map((omission) => ({ ...omission })),
+    omissionsTruncated: snapshot.omissionsTruncated,
   };
 }
 
@@ -356,6 +360,9 @@ function deserializeSnapshot(snapshot: PersistedWorkspaceSnapshot): WorkspaceSna
     cwd: snapshot.cwd,
     capturedAt: snapshot.capturedAt,
     files: new Map(snapshot.files.map(([key, value]) => [key, { ...value }])),
+    // Legacy persisted state predates the omission ledger; default to empty.
+    omissions: (snapshot.omissions ?? []).map((omission) => ({ ...omission })),
+    omissionsTruncated: snapshot.omissionsTruncated ?? false,
   };
 }
 

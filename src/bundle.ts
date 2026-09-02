@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { ChangedFile } from "./capture";
+import type { ChangedFile, SnapshotOmission } from "./capture";
 import type { ChangeIdentity } from "./schema";
 import { summarizeReviewChanges } from "./change-context";
 import type { EvidenceBundle } from "./evidence";
@@ -34,6 +34,8 @@ interface ReviewBundleContext {
   guidanceEscalation?: ImplementationGuidanceEscalation;
   changeIdentity?: ChangeIdentity;
   metadata?: Record<string, unknown>;
+  snapshotOmissions?: SnapshotOmission[];
+  snapshotOmissionsTruncated?: boolean;
 }
 
 export interface ReviewBundleInput extends ReviewBundleContext {}
@@ -78,6 +80,8 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
     evidenceMarkdown: input.evidence?.markdown,
     guidanceEscalation: input.guidanceEscalation,
     changeIdentity: input.changeIdentity,
+    snapshotOmissions: input.snapshotOmissions,
+    snapshotOmissionsTruncated: input.snapshotOmissionsTruncated,
   };
   const prompt = question
     ? buildReviewerQuestionPrompt({ ...promptContext, question: input.question })

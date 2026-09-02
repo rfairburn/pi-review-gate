@@ -165,3 +165,63 @@ test("agentic reviewer bundle prompt permits only read-only filesystem commands 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("reviewer prompt surfaces bounded snapshot capture notes only when omissions exist", () => {
+  const base = {
+    request: "review the change",
+    submittedChanges: [],
+    patch: "",
+    cwd: "/tmp/project",
+  };
+
+  const clean = buildReviewerPrompt(base);
+  assert.doesNotMatch(clean, /snapshot_capture_notes/);
+
+  const prompt = buildReviewerPrompt({
+    ...base,
+    snapshotOmissions: [
+      { path: "secret.txt", kind: "file", reason: "unreadable", errorCode: "EACCES" },
+      { path: "gone.txt", kind: "file", reason: "missing", errorCode: "ENOENT" },
+      { path: "blocks", kind: "directory", reason: "unreadable" },
+      { path: "x".repeat(1_000), kind: "file", reason: "unreadable", errorCode: "E".repeat(100) },
+    ],
+  });
+  assert.match(prompt, /<snapshot_capture_notes>/);
+  assert.match(prompt, /secret\.txt \(file unreadable: EACCES\)/);
+  assert.match(prompt, /gone\.txt \(file missing: ENOENT\)/);
+  assert.match(prompt, /blocks \(directory unreadable\)/);
+  assert.ok(prompt.includes(`${"x".repeat(511)}… (file unreadable: ${"E".repeat(39)}…)`));
+  assert.ok(!prompt.includes("x".repeat(512)));
+  assert.ok(!prompt.includes("E".repeat(40)));
+  assert.match(prompt, /Entries marked unreadable may still exist; entries marked missing vanished during capture/);
+  assert.doesNotMatch(prompt, /beyond the capture bound/);
+
+  const truncated = buildReviewerPrompt({
+    ...base,
+    snapshotOmissions: [{ path: "a.txt", kind: "file", reason: "unreadable" }],
+    snapshotOmissionsTruncated: true,
+  });
+  assert.match(truncated, /additional omissions were recorded beyond the capture bound/);
+
+  // Both notices appear independently when the rendered bound and the capture
+  // bound are exceeded at the same time.
+  const overflowAndTruncated = buildReviewerPrompt({
+    ...base,
+    snapshotOmissions: Array.from({ length: 101 }, (_, index) => ({
+      path: `f${index}.txt`,
+      kind: "file" as const,
+      reason: "missing" as const,
+    })),
+    snapshotOmissionsTruncated: true,
+  });
+  assert.match(overflowAndTruncated, /\.\.\. and 1 more/);
+  assert.match(overflowAndTruncated, /additional omissions were recorded beyond the capture bound/);
+
+  const question = buildReviewerQuestionPrompt({
+    ...base,
+    question: "what changed?",
+    snapshotOmissions: [{ path: "b.txt", kind: "file", reason: "missing" }],
+  });
+  assert.match(question, /<snapshot_capture_notes>/);
+  assert.match(question, /b\.txt \(file missing\)/);
+});

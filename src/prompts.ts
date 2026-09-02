@@ -1,4 +1,4 @@
-import type { ChangedFile } from "./capture";
+import type { ChangedFile, SnapshotOmission } from "./capture";
 import type { ChangeIdentity } from "./schema";
 import { summarizeSideEffectChanges, summarizeSubmittedChanges } from "./change-context";
 
@@ -86,6 +86,9 @@ export interface ReviewerPromptContext {
   evidenceMarkdown?: string;
   guidanceEscalation?: ImplementationGuidanceEscalation;
   changeIdentity?: ChangeIdentity;
+  /** Best-effort ledger of entries omitted from the workspace snapshot. */
+  snapshotOmissions?: SnapshotOmission[];
+  snapshotOmissionsTruncated?: boolean;
 }
 
 export interface ReviewerQuestionPromptContext extends ReviewerPromptContext {
@@ -117,6 +120,10 @@ function renderReviewerPrompt(input: ReviewerPromptInput): string {
     : "Review the supplied user request context, submitted workspace patch, captured side-effect evidence, session evidence, and the current workspace for concrete code logic, correctness, regression, security, API, test, and acceptance-criteria problems. The user request context may include additional guidance given after the initial request; treat that later guidance as part of the same task, not as a replacement for the initial request. Do not ask for more context unless the supplied context and read-only inspection are impossible to review without it. Do not include chain of thought. Return only valid JSON matching the schema.";
   const questionBlock = question
     ? `Reviewer question:\n<question>\n${input.question}\n</question>\n\n`
+    : "";
+  const captureNotes = renderSnapshotCaptureNotes(input.snapshotOmissions ?? [], input.snapshotOmissionsTruncated === true);
+  const captureNotesBlock = captureNotes
+    ? `Workspace snapshot capture notes:\n<snapshot_capture_notes>\n${captureNotes}\n</snapshot_capture_notes>\n\n`
     : "";
   const emptyPatch = question
     ? "(no submitted workspace patch supplied)"
@@ -162,7 +169,7 @@ Captured side-effect patch:
 ${input.sideEffectPatch || "(no captured side-effect changes detected)"}
 </captured_side_effect_patch_diff>
 
-Session evidence:
+${captureNotesBlock}Session evidence:
 <session_evidence>
 ${input.evidenceMarkdown || "(no session evidence captured)"}
 </session_evidence>
@@ -179,4 +186,32 @@ This review verdict applies specifically to candidate commit ${input.changeIdent
 
 Use "file": "session" and "line": null for findings about missing commands, process evidence, or other issues that do not belong to a specific file.
 ${questionVerdictPolicy}`;
+}
+
+/** Bounded inline rendering of snapshot omissions for reviewer prompts. */
+function renderSnapshotCaptureNotes(omissions: SnapshotOmission[], truncated: boolean): string {
+  if (omissions.length === 0 && !truncated) return "";
+  const MAX_RENDERED_OMISSIONS = 100;
+  const MAX_RENDERED_PATH_CHARS = 512;
+  const MAX_RENDERED_ERROR_CODE_CHARS = 40;
+  const visibleField = (value: string, cap: number) => value.length <= cap
+    ? value
+    : `${value.slice(0, cap - 1)}…`;
+  const lines = omissions.slice(0, MAX_RENDERED_OMISSIONS).map((omission) => {
+    const path = visibleField(omission.path, MAX_RENDERED_PATH_CHARS);
+    const errorCode = omission.errorCode
+      ? `: ${visibleField(omission.errorCode, MAX_RENDERED_ERROR_CODE_CHARS)}`
+      : "";
+    return `- ${path} (${omission.kind} ${omission.reason}${errorCode})`;
+  });
+  if (omissions.length > MAX_RENDERED_OMISSIONS) {
+    lines.push(`- ... and ${omissions.length - MAX_RENDERED_OMISSIONS} more`);
+  }
+  // Independent of the rendered-count overflow: the ledger itself may also
+  // have hit its capture bound, and reviewers must be told when it did.
+  if (truncated) {
+    lines.push("- ... additional omissions were recorded beyond the capture bound");
+  }
+  lines.push("Entries marked unreadable may still exist; entries marked missing vanished during capture.");
+  return lines.join("\n");
 }

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { atomicWrite } from "./durable-write";
 import type { ExecutorSession } from "./types";
 import type { ExecutorSelection } from "../config";
 
@@ -371,11 +372,9 @@ export async function writeOperationRecord(record: OperationRecord): Promise<voi
   const path = operationRecordPath(record.artifactDir);
   const body = `${JSON.stringify(record, null, 2)}\n`;
   const previous = operationWriteTails.get(path) ?? Promise.resolve();
-  const operation = previous.catch(() => undefined).then(async () => {
-    const temporary = `${path}.tmp.${randomUUID()}`;
-    await writeFile(temporary, body, "utf8");
-    await rename(temporary, path);
-  });
+  // Caller-owned tail serialization is preserved; the shared helper adds
+  // fsync-before-rename durability to each individual write.
+  const operation = previous.catch(() => undefined).then(() => atomicWrite(path, body));
   operationWriteTails.set(path, operation);
   try {
     await operation;

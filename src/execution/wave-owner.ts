@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { atomicWrite, atomicWriteExclusive } from "./durable-write";
 
 export interface WaveOwnerLease {
   version: 1;
@@ -38,13 +39,11 @@ export async function acquireWaveOwner(waveRoot: string, waveId: string): Promis
   const path = waveOwnerPath(waveRoot);
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
-      const file = await open(path, "wx", 0o600);
-      try {
-        await file.writeFile(`${JSON.stringify(lease, null, 2)}\n`, "utf8");
-        await file.sync();
-      } finally {
-        await file.close();
-      }
+      // Durable exclusive publication: EEXIST preserves the atomic claim
+      // semantics; readers never see a partially written lease, and a failure
+      // before publication leaves no final record behind so a later claim
+      // attempt is not blocked by a corrupt one.
+      await atomicWriteExclusive(path, `${JSON.stringify(lease, null, 2)}\n`);
       return lease;
     } catch (error) {
       const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
@@ -98,10 +97,7 @@ export async function inspectWaveOwner(waveRoot: string): Promise<WaveOwnershipS
 }
 
 async function writeWaveOwner(waveRoot: string, lease: WaveOwnerLease): Promise<void> {
-  const path = waveOwnerPath(waveRoot);
-  const temporary = `${path}.tmp.${randomUUID()}`;
-  await writeFile(temporary, `${JSON.stringify(lease, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, path);
+  await atomicWrite(waveOwnerPath(waveRoot), `${JSON.stringify(lease, null, 2)}\n`);
 }
 
 function isWaveOwnerLease(value: unknown): value is WaveOwnerLease {

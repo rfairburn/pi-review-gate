@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { DEFAULT_SUBTASK_NOTIFICATION_MODE, type ReviewGateConfig } from "../config";
@@ -8,6 +8,7 @@ import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } fr
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts, unresolvedConflictMarkers } from "./conflict-materialization";
+import { atomicWrite } from "./durable-write";
 import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
 import { continueOperation, inspectOperation } from "./operation-actions";
 import type { ReattachmentBundle } from "./operation-record";
@@ -2636,30 +2637,6 @@ async function removeOwnedExecutionRoot(root: string): Promise<void> {
     throw new Error(`Refusing to remove unrecognized execution root: ${resolved}`);
   }
   await rm(resolved, { recursive: true, force: true });
-}
-
-async function atomicWrite(path: string, body: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.tmp.${randomUUID()}`;
-  const file = await open(temporary, "wx", 0o600);
-  try {
-    await file.writeFile(body, "utf8");
-    await file.sync();
-  } finally {
-    await file.close();
-  }
-  await rename(temporary, path);
-  try {
-    const directory = await open(dirname(path), "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  } catch {
-    // Some filesystems do not permit directory fsync; the atomic rename still
-    // protects readers from partial manifests.
-  }
 }
 
 function selectiveCheckpoint(

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { atomicWrite } from "./durable-write";
 import { DEFAULT_EXECUTION_RETRY_POLICY, resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import type { WaveCaptureHooks, WaveCaptureResult } from "./wave-repository";
 import { captureWaveBase, discoverWaveSource, WaveCaptureError } from "./wave-repository";
@@ -395,26 +396,18 @@ async function retryInfrastructure<T>(
 
 // ── manifest helpers ─────────────────────────────────────────────────────────
 
-/** Write the wave manifest atomically (temp file + rename). */
+/** Write the wave manifest atomically and durably (shared atomic write helper). */
 async function writeWaveManifest(waveRoot: string, manifest: WaveManifest): Promise<void> {
   const manifestPath = join(waveRoot, "wave-manifest.json");
-  const tmpPath = `${manifestPath}.tmp.${randomUUID()}`;
-  try {
-    const previous = await fs.readFile(manifestPath, "utf8")
-      .then((text) => JSON.parse(text) as WaveManifest)
-      .catch(() => undefined);
-    if (previous?.version === 1) {
-      for (const task of manifest.tasks) {
-        task.task ??= previous.tasks.find((candidate) => candidate.taskId === task.taskId)?.task;
-      }
+  const previous = await fs.readFile(manifestPath, "utf8")
+    .then((text) => JSON.parse(text) as WaveManifest)
+    .catch(() => undefined);
+  if (previous?.version === 1) {
+    for (const task of manifest.tasks) {
+      task.task ??= previous.tasks.find((candidate) => candidate.taskId === task.taskId)?.task;
     }
-    await fs.writeFile(tmpPath, JSON.stringify(manifest, null, 2), "utf8");
-    await fs.rename(tmpPath, manifestPath);
-  } catch (err) {
-    // Clean up temp file on failure.
-    await fs.unlink(tmpPath).catch(() => {});
-    throw err;
   }
+  await atomicWrite(manifestPath, JSON.stringify(manifest, null, 2));
 }
 
 function buildManifest(

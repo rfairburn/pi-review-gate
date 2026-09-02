@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -77,6 +77,16 @@ test("landed operation can rehydrate its checkpoint, continue, land, and dedupli
     assert.ok(progress.some((update) => update.phase === "accepted"));
     assert.ok(progress.some((update) => update.phase === "integrating"));
     assert.ok(progress.some((update) => update.phase === "landing"));
+
+    // The continuation manifest must be published durably: restrictive mode,
+    // no temp litter.
+    const manifestPath = join(wave.waveRoot, "wave-manifest.json");
+    assert.equal((await stat(manifestPath)).mode & 0o777, 0o600);
+    assert.equal(
+      (await readdir(wave.waveRoot)).some((name) => name.startsWith("wave-manifest.json.tmp.")),
+      false,
+      "no continuation-manifest temp litter may survive",
+    );
 
     const duplicate = await continueOperation({
       bundle: continued.inspection.bundle,

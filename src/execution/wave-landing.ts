@@ -3,6 +3,7 @@ import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { promises as fs, readlink as fsReadlink, Stats } from "node:fs";
 import { join, sep, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
+import { atomicWrite } from "./durable-write";
 import { WaveCaptureResult } from "./wave-repository";
 import { integrationRefName } from "./wave-worktrees";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
@@ -846,35 +847,11 @@ async function unlinkIfAbsent(path: string): Promise<void> {
 }
 
 /**
- * Atomically update a JSON file by writing to a temp file and renaming.
- * Cleans up temp files on error and fsyncs the final file where practical.
+ * Atomically update a JSON file through the shared durable write helper
+ * (temp file + fsync + rename + best-effort directory fsync).
  */
 async function atomicWriteJson(path: string, data: unknown): Promise<void> {
-  const tmp = `${path}.tmp.${randomUUID()}`;
-  let created = false;
-  try {
-    const fd = await fs.open(tmp, "wx");
-    created = true;
-    await fd.writeFile(JSON.stringify(data, null, 2));
-    await fd.datasync();
-    await fd.close();
-    await fs.rename(tmp, path);
-    // fsync the directory containing the file to ensure durability.
-    const dir = path.substring(0, path.lastIndexOf("/"));
-    try {
-      const dirFd = await fs.open(dir, "r");
-      await dirFd.datasync();
-      await dirFd.close();
-    } catch (_fsyncErr) {
-      // fsync is best-effort; ignore failures.
-    }
-  } catch (_writeErr) {
-    // Clean up temp file only if this invocation created it.
-    if (created) {
-      await unlinkIfAbsent(tmp).catch(() => {});
-    }
-    throw _writeErr;
-  }
+  await atomicWrite(path, JSON.stringify(data, null, 2));
 }
 
 /**

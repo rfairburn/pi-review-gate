@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -285,6 +285,14 @@ test("wave-worker runs one executor turn and normalizes to candidate", async () 
     const taskArtifact = JSON.parse(await readFile(join(artifactDir, "task.json"), "utf8"));
     assert.equal(taskArtifact.taskId, "task-1");
     assert.equal(taskArtifact.task.title, "Test wave worker task");
+    // Initial task.json creation must be durable: restrictive mode, no temp litter.
+    const taskPath = join(artifactDir, "task.json");
+    assert.equal((await stat(taskPath)).mode & 0o777, 0o600);
+    assert.equal(
+      (await readdir(artifactDir)).some((name) => name.startsWith("task.json.tmp.")),
+      false,
+      "no task.json temp litter may survive",
+    );
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {

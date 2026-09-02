@@ -429,27 +429,26 @@ risk. Compatibility trade-off: BrowserExtract now refuses pages that require cro
 subresources or cross-hostname redirects; the error names the blocked URL and directs the model to
 extract that final URL directly.
 
-### 7. MEDIUM-LOW — Inconsistent fsync discipline across durable record writers
+### 7. MEDIUM-LOW — RESOLVED (2026-09-02): Durable record writers had inconsistent fsync discipline
 
-Refs: fully durable: `src/execution/background-controller.ts:2496-2520` (`atomicWrite`: file
-fsync + best-effort dir fsync) and `src/execution/wave-landing.ts:852-870`
-(`atomicWriteJson`: datasync + dir fsync). Not durable (temp write + rename, no fsync):
-`src/execution/operation-record.ts:368-382` (`writeOperationRecord` — the durable recovery
-record gating `continueOperation` and crash reconciliation),
-`src/execution/wave-controller.ts:399-417` (`writeWaveManifest` — drives
-`pruneCompletedWaveRoots` and legacy-terminal detection), `src/execution/wave-owner.ts:100-105`
-(`writeWaveOwner` heartbeat updates; the initial acquisition at `:44` does sync), and
-`src/execution/wave-worker.ts:191-201` (`persistTaskDefinition`).
+**Root cause.** Recovery-critical operation records, wave manifests, owner-heartbeat updates,
+and persisted task definitions used temp-file renames without syncing file contents or the parent
+directory. A hard crash could therefore leave stale or unreadable recovery state exactly when it
+was needed.
 
-Impact: power loss/hard crash right after rename can leave `operation.json` or
-`wave-manifest.json` zero-length or stale on filesystems that don't guarantee rename
-durability without fsync — degrading `paused_recoverable` recovery into "record unreadable"
-exactly when it matters.
+**Fix.** New `src/execution/durable-write.ts` centralizes restrictive same-directory exclusive
+temp creation, complete write, file fsync, close, atomic rename, best-effort directory fsync, and
+owned-temp cleanup. Operation records retain their per-path serialization; wave and continuation
+manifests, owner heartbeats, and initial/updated task definitions now use the helper. Owner
+acquisition preserves exclusive-claim semantics by publishing a fully synced staged file with an
+atomic hard link. The prior background-controller and wave-landing durable-write duplicates were
+also consolidated without changing their serialized bytes.
 
-Recommendation:
-- [ ] Route the four listed non-durable writers through one shared `atomicWrite` helper
-      (promote the controller's to a util) so fsync policy is single-sourced.
-- [ ] Test status: none — no crash-durability tests exist anywhere in the execution suites.
+**Tests.** Deterministic stage hooks cover pre-rename failures, prior-target preservation,
+post-rename reality, foreign temp collisions, exclusive publication visibility/collisions,
+restrictive modes, and temp cleanup. Writer regressions cover operation sequencing and recovery,
+owner acquisition/heartbeat/release, task metadata preservation, and wave/continuation manifests.
+The focused durable/execution/landing suites pass 166/166 with static checks; `dist/` was untouched.
 
 ### 8. MEDIUM-LOW — Interrupt never fails queued `continue` commands
 

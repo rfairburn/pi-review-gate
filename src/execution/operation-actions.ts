@@ -1,10 +1,10 @@
 import { readFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
+import { atomicWrite } from "./durable-write";
 import type { ExecutorPoolAssignment } from "./executor-pool";
 import { candidateRefName, normalizeCandidate, pinRecoveryCandidate } from "./wave-commits";
 import type { WaveIntegrationResult } from "./wave-integration";
@@ -886,9 +886,7 @@ async function publishContinuationManifest(
   }
   manifest.revision += 1;
   manifest.updatedAt = new Date().toISOString();
-  const temporary = `${path}.tmp.${randomUUID()}`;
-  await fs.writeFile(temporary, JSON.stringify(manifest, null, 2), "utf8");
-  await fs.rename(temporary, path);
+  await atomicWrite(path, JSON.stringify(manifest, null, 2));
 }
 
 async function resolveOperation(bundle: ReattachmentBundle): Promise<{

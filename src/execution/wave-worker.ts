@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { promises as fs } from "node:fs";
+import { atomicWrite } from "./durable-write";
 import { createExecutorAdapter } from "./adapters/factory";
 import { normalizeCandidate, pinRecoveryCandidate, type CandidateCommit } from "./wave-commits";
 import type { WorkerWorktree } from "./wave-worktrees";
@@ -192,13 +192,7 @@ export async function persistTaskDefinition(artifactDir: string, task: WaveWorke
   const path = join(artifactDir, "task.json");
   const metadata = JSON.parse(await fs.readFile(path, "utf8")) as Record<string, unknown>;
   metadata.task = task;
-  const temporaryPath = `${path}.tmp.${randomUUID()}`;
-  try {
-    await fs.writeFile(temporaryPath, JSON.stringify(metadata, null, 2), "utf8");
-    await fs.rename(temporaryPath, path);
-  } finally {
-    await fs.unlink(temporaryPath).catch(() => undefined);
-  }
+  await atomicWrite(path, JSON.stringify(metadata, null, 2));
 }
 
 /** Status of a wave worker turn result. */
@@ -861,7 +855,7 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
   });
 
   // ── Write task metadata ──
-  await writeFile(
+  await atomicWrite(
     join(resolvedArtifactDir, "task.json"),
     JSON.stringify({
       version: 1,
@@ -872,7 +866,6 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       executorSelection: assignment.entry.selection,
       startedAt: new Date().toISOString(),
     }, null, 2),
-    "utf8",
   );
 
   // ── Build prompt with path rewriting and isolation directive ──

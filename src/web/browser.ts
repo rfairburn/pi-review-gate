@@ -1,9 +1,15 @@
+import { existsSync } from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Response, type Route } from "playwright";
 import type { DownloadedText, NetworkOptions } from "./network";
 import { validatedPublicUrl } from "./network";
 
 const PASSIVE_RESOURCE_TYPES = new Set(["image", "media", "font"]);
 const LOCAL_BROWSER_PROTOCOLS = new Set(["about:", "blob:", "data:"]);
+// Keep these in sync with SKIP_CHROMIUM_ENV and INSTALL_COMMAND in
+// scripts/ensure-playwright-chromium.cjs; that script runs pre-build during
+// postinstall and cannot import constants compiled from src.
+export const PLAYWRIGHT_CHROMIUM_SKIP_ENV = "PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM";
+export const PLAYWRIGHT_CHROMIUM_INSTALL_COMMAND = "npx playwright install chromium";
 
 /**
  * Render one public page in an isolated headless Chromium process.
@@ -14,6 +20,7 @@ const LOCAL_BROWSER_PROTOCOLS = new Set(["about:", "blob:", "data:"]);
  */
 export async function renderWithChromium(url: string, options: NetworkOptions): Promise<DownloadedText> {
   const requestedUrl = await validatedPublicUrl(url);
+  assertChromiumAvailable();
   const approvedOrigins = new Set<string>([new URL(requestedUrl).origin]);
   const controller = new AbortController();
   const timeout = setTimeout(
@@ -90,6 +97,21 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
     await context?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
   }
+}
+
+export function assertChromiumAvailable(
+  executablePath: string = chromium.executablePath(),
+  exists: (path: string) => boolean = existsSync,
+): void {
+  if (!exists(executablePath)) throw missingChromiumError(executablePath);
+}
+
+export function missingChromiumError(executablePath: string = chromium.executablePath()): Error {
+  return new Error(
+    `Playwright Chromium is not installed${executablePath ? ` at ${executablePath}` : ""}, so BrowserExtract cannot run. `
+    + `Install it with \`${PLAYWRIGHT_CHROMIUM_INSTALL_COMMAND}\` and retry. `
+    + `If ${PLAYWRIGHT_CHROMIUM_SKIP_ENV} was set during installation, unset ${PLAYWRIGHT_CHROMIUM_SKIP_ENV} before reinstalling or run the install command manually.`,
+  );
 }
 
 export function assertSuccessfulBrowserNavigation(status: number | undefined, url: string): void {

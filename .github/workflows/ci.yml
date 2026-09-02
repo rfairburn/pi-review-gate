@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  PI_REVIEW_GATE_SKIP_BROWSER_INSTALL: "1"
+  PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
 
 jobs:
   verify:

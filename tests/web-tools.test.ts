@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { access, readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
-import { assertSuccessfulBrowserNavigation } from "../src/web/browser";
+import { assertChromiumAvailable, assertSuccessfulBrowserNavigation, missingChromiumError } from "../src/web/browser";
 import { WebPageCache } from "../src/web/cache";
 import { canonicalSearchUrl, normalizeDdgsResults, searchDdgs, type DdgsRunner } from "../src/web/network";
 import { extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
@@ -58,6 +58,14 @@ test("BrowserExtract accepts only successful final main-document responses", () 
     () => assertSuccessfulBrowserNavigation(undefined, "https://example.com/no-response"),
     /no HTTP response/,
   );
+});
+
+test("BrowserExtract explains how to install missing Chromium", () => {
+  assert.throws(
+    () => assertChromiumAvailable("/missing/playwright/chromium", () => false),
+    /Playwright Chromium is not installed.*BrowserExtract cannot run.*npx playwright install chromium.*PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM/,
+  );
+  assert.match(missingChromiumError("/missing/playwright/chromium").message, /unset PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM/);
 });
 
 test("full-page extraction reports tables beyond the current view and supports direct indexed reads", () => {

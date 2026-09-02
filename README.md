@@ -127,8 +127,22 @@ rendered HTML, closes Chromium, and exposes the same `find`, `index`,
 `nextIndex`, table inventory, and `columns` operations as `WebFetch`. It does
 not click, type, authenticate, interactively scroll, capture screenshots, or
 maintain a browser session; it is not an interactive browser or vision tool.
-Installation verifies and, when necessary, downloads Playwright's compatible
-Chromium build.
+By default, package installation verifies and, when necessary, downloads
+Playwright's compatible Chromium build. CI and server installs that do not need
+`BrowserExtract` can skip that browser download with the documented opt-in
+environment variable:
+
+```bash
+PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1 npm install
+```
+
+This only skips Chromium provisioning; `WebSearch` and `WebFetch` remain
+available. If provisioning fails for another reason, package installation still
+completes with a warning so the core package remains usable. Invoking
+`BrowserExtract` without Chromium then reports the setup action directly: run
+`npx playwright install chromium` in the package environment and retry. If the
+skip variable was set, unset it before reinstalling or run that command
+manually when browser extraction is needed.
 
 The page cache is bounded by entry count and total bytes and is force-removed
 on session/application shutdown. Shutdown also removes settled subtask wave

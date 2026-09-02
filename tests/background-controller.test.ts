@@ -8,7 +8,13 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { compareSnapshots, createWorkspaceSnapshot } from "../src/capture";
 import { normalizeConfig } from "../src/config";
-import { BackgroundExecutionController } from "../src/execution/background-controller";
+import {
+  BackgroundExecutionController,
+  type BackgroundExecutionGroup,
+  type BackgroundFaultHooks,
+  type BackgroundInspection,
+  type BackgroundTaskRecord,
+} from "../src/execution/background-controller";
 import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
 
 const execFileAsync = promisify(execFile);
@@ -815,6 +821,415 @@ test("restored conflict gates keep injecting until mark-clean validates resoluti
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("post-landing parent checkpoint failure preserves the landed outcome", async () => {
+  const scenario = await setupFaultScenario({
+    checkpointParent: () => {
+      throw new Error("ENOSPC: parent checkpoint write failed");
+    },
+  });
+  const { root, controller, started, messages } = scenario;
+  try {
+    await waitFor(() => controller.inspect(started.executionId).tasks[0]?.state === "landed");
+    assert.equal(await readFile(join(root, "fault.txt"), "utf8"), "landed before bookkeeping failure\n");
+    await waitForLandedDurableRecord(started, "bookkeeping");
+    const task = controller.inspect(started.executionId).tasks[0]!;
+    assert.equal(task.state, "landed");
+    assert.ok((task.stateHistory ?? []).every((entry) => entry.state !== "failed"));
+    assert.ok(
+      task.activity.some((event) => event.phase === "bookkeeping" && /post-landing parent checkpoint failed.*ENOSPC/s.test(event.message)),
+      "expected a bookkeeping activity entry for the parent checkpoint failure",
+    );
+    assert.ok(messages.some((message) => /landed, but parent checkpoint failed afterward \(landing preserved\)/.test(message)));
+    assert.ok(controller.inspect(started.executionId).activeCount === 0);
+    await controller.shutdown();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("post-landing durable save failure still persists the landed outcome on retry", async () => {
+  let landedSaveCalls = 0;
+  const scenario = await setupFaultScenario({
+    save: (context) => {
+      if (context.taskStates?.includes("landed") && landedSaveCalls++ === 0) {
+        throw new Error("EIO: disk full while writing execution.json");
+      }
+    },
+  });
+  const { root, controller, started } = scenario;
+  try {
+    await waitFor(() => controller.inspect(started.executionId).tasks[0]?.state === "landed");
+    assert.equal(await readFile(join(root, "fault.txt"), "utf8"), "landed before bookkeeping failure\n");
+    await waitForLandedDurableRecord(started, "bookkeeping");
+    const task = controller.inspect(started.executionId).tasks[0]!;
+    assert.equal(task.state, "landed");
+    assert.ok((task.stateHistory ?? []).every((entry) => entry.state !== "failed"));
+    assert.ok(
+      task.activity.some((event) => event.phase === "bookkeeping" && /post-landing durable save failed.*disk full/s.test(event.message)),
+      "expected a bookkeeping activity entry for the durable save failure",
+    );
+    await controller.shutdown();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("post-landing association publish failure preserves the landed outcome", async () => {
+  const scenario = await setupFaultScenario({
+    publishAssociations: (context) => {
+      if (context.taskStates?.includes("landed")) {
+        throw new Error("association publish socket closed");
+      }
+    },
+  });
+  const { root, controller, started } = scenario;
+  try {
+    await waitFor(() => controller.inspect(started.executionId).tasks[0]?.state === "landed");
+    assert.equal(await readFile(join(root, "fault.txt"), "utf8"), "landed before bookkeeping failure\n");
+    await waitForLandedDurableRecord(started, "bookkeeping");
+    const task = controller.inspect(started.executionId).tasks[0]!;
+    assert.equal(task.state, "landed");
+    assert.ok((task.stateHistory ?? []).every((entry) => entry.state !== "failed"));
+    assert.ok(
+      task.activity.some((event) => event.phase === "bookkeeping" && /post-landing association publish failed.*socket closed/s.test(event.message)),
+      "expected a bookkeeping activity entry for the association publish failure",
+    );
+    await controller.shutdown();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("post-landing wake failure preserves the landed outcome", async () => {
+  const scenario = await setupFaultScenario({
+    wake: (context) => {
+      if (context.taskState === "landed") {
+        throw new Error("wake transport unavailable");
+      }
+    },
+  });
+  const { root, controller, started, messages } = scenario;
+  try {
+    await waitFor(() => controller.inspect(started.executionId).tasks[0]?.state === "landed");
+    assert.equal(await readFile(join(root, "fault.txt"), "utf8"), "landed before bookkeeping failure\n");
+    await waitForLandedDurableRecord(started, "bookkeeping");
+    const task = controller.inspect(started.executionId).tasks[0]!;
+    assert.equal(task.state, "landed");
+    assert.ok((task.stateHistory ?? []).every((entry) => entry.state !== "failed"));
+    assert.ok(
+      task.activity.some((event) => event.phase === "bookkeeping" && /post-landing completion wake failed.*wake transport unavailable/s.test(event.message)),
+      "expected a bookkeeping activity entry for the wake failure",
+    );
+    assert.ok(messages.some((message) => /landed, but completion wake failed afterward \(landing preserved\)/.test(message)));
+    await controller.shutdown();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("force-merge save failure after landing preserves the landed outcome", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-force-merge-fault-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "slow-executor.cjs");
+    await writeFile(executor, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');process.stdin.resume();process.stdin.on('end',()=>{",
+      "fs.writeFileSync('draft.txt','recover me\\n');",
+      "setTimeout(()=>console.log(JSON.stringify({type:'assistant',text:'late completion'})),30000);",
+      "});",
+    ].join("\n"), "utf8");
+    await chmod(executor, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "slow",
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" },
+      }],
+      execution: { activeExecutor: { source: "external", id: "slow" }, maxWorkers: 1 },
+      retainBundles: "always",
+    });
+    let landedSaveCalls = 0;
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config,
+      state: createState(),
+      cwd: () => root,
+      faults: {
+        save: (context) => {
+          if (context.taskStates?.includes("landed") && landedSaveCalls++ === 0) {
+            throw new Error("EIO: force-merge save failed");
+          }
+        },
+      },
+    });
+    const started = await controller.start([{
+      title: "recover interrupted edit",
+      instructions: "write draft.txt",
+      acceptanceCriteria: ["draft.txt exists"],
+    }]);
+    const taskId = started.tasks[0]!.taskId;
+    await waitFor(() => controller.inspect(started.executionId, taskId).tasks[0]?.state === "running");
+    await waitForAsync(async () => {
+      const waveRoot = controller.inspect(started.executionId, taskId).tasks[0]?.waveRoot;
+      if (!waveRoot) return false;
+      return readFile(join(waveRoot, "workers", taskId, "draft.txt"), "utf8").then(() => true, () => false);
+    });
+    await controller.interrupt({
+      executionId: started.executionId,
+      taskId,
+      mode: "interrupt_as_failure",
+      instructionId: "interrupt-test",
+      actor: "user",
+    });
+    const landed = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId,
+      mergeAnyhow: false,
+      instructionId: "force-test",
+      actor: "user",
+    });
+    assert.equal(landed.tasks[0]?.state, "landed");
+    assert.equal(await readFile(join(root, "draft.txt"), "utf8"), "recover me\n");
+    assert.ok((landed.tasks[0]?.stateHistory ?? []).every((entry) => entry.state !== "failed"));
+    assert.ok(
+      (landed.tasks[0]?.activity ?? []).some((event) => event.phase === "bookkeeping" && /post-landing durable save failed.*force-merge save failed/s.test(event.message)),
+      "expected a bookkeeping activity entry for the force-merge save failure",
+    );
+    await waitForAsync(async () => {
+      const persisted = JSON.parse(await readFile(join(landed.root, "execution.json"), "utf8")) as { tasks: Array<{ taskId: string; state: string }> };
+      return persisted.tasks.some((entry) => entry.taskId === taskId && entry.state === "landed");
+    });
+    await controller.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("launch rejection never regresses a terminal state even with a pending interruption mode", async () => {
+  const scenario = await setupFaultScenario({});
+  const { controller, started, messages } = scenario;
+  try {
+    await waitFor(() => controller.inspect(started.executionId).tasks[0]?.state === "landed");
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      handleLaunchRejection: (group: BackgroundExecutionGroup, task: BackgroundTaskRecord, error: unknown) => Promise<void>;
+    };
+    const group = internals.groups.get(started.executionId)!;
+    const task = group.tasks[0]!;
+    assert.equal(task.state, "landed");
+    // Simulate interrupt() having set its mode while the launch promise is still
+    // settling, followed by a post-terminal rejection reaching the launch catch.
+    task.interruptionMode = "interrupt_as_failure";
+    await internals.handleLaunchRejection(group, task, new Error("post-terminal bookkeeping rejection"));
+    assert.equal(task.state, "landed", "a pending interruption mode must not regress a landed task");
+    assert.ok((task.stateHistory ?? []).every((entry) => entry.state !== "interrupted" && entry.state !== "failed"));
+    assert.ok(
+      task.activity.some((event) => event.phase === "bookkeeping" && /already reached landed.*outcome is preserved.*post-terminal bookkeeping rejection/s.test(event.message)),
+      "expected a bookkeeping activity entry preserving the landed outcome",
+    );
+    assert.ok(messages.some((message) => /already reached landed.*outcome is preserved/.test(message)));
+    await controller.shutdown();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("force-merge publish and wake failures after landing are recorded durably", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-force-merge-publish-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "slow-executor.cjs");
+    await writeFile(executor, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');process.stdin.resume();process.stdin.on('end',()=>{",
+      "fs.writeFileSync('draft.txt','recover me\\n');",
+      "setTimeout(()=>console.log(JSON.stringify({type:'assistant',text:'late completion'})),30000);",
+      "});",
+    ].join("\n"), "utf8");
+    await chmod(executor, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "slow",
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" },
+      }],
+      execution: { activeExecutor: { source: "external", id: "slow" }, maxWorkers: 1 },
+      retainBundles: "always",
+    });
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config,
+      state: createState(),
+      cwd: () => root,
+      faults: {
+        publishAssociations: (context) => {
+          if (context.taskStates?.includes("landed")) {
+            throw new Error("association publish endpoint down");
+          }
+        },
+        wake: (context) => {
+          if (context.taskState === "landed") {
+            throw new Error("wake transport refused");
+          }
+        },
+      },
+    });
+    const started = await controller.start([{
+      title: "recover interrupted edit",
+      instructions: "write draft.txt",
+      acceptanceCriteria: ["draft.txt exists"],
+    }]);
+    const taskId = started.tasks[0]!.taskId;
+    await waitFor(() => controller.inspect(started.executionId, taskId).tasks[0]?.state === "running");
+    await waitForAsync(async () => {
+      const waveRoot = controller.inspect(started.executionId, taskId).tasks[0]?.waveRoot;
+      if (!waveRoot) return false;
+      return readFile(join(waveRoot, "workers", taskId, "draft.txt"), "utf8").then(() => true, () => false);
+    });
+    await controller.interrupt({
+      executionId: started.executionId,
+      taskId,
+      mode: "interrupt_as_failure",
+      instructionId: "interrupt-test",
+      actor: "user",
+    });
+    const landed = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId,
+      mergeAnyhow: false,
+      instructionId: "force-test",
+      actor: "user",
+    });
+    assert.equal(landed.tasks[0]?.state, "landed");
+    assert.equal(await readFile(join(root, "draft.txt"), "utf8"), "recover me\n");
+    assert.ok((landed.tasks[0]?.stateHistory ?? []).every((entry) => entry.state !== "failed"));
+    const activity = landed.tasks[0]?.activity ?? [];
+    assert.ok(
+      activity.some((event) => event.phase === "bookkeeping" && /post-landing association publish failed.*endpoint down/s.test(event.message)),
+      "expected a bookkeeping activity entry for the association publish failure",
+    );
+    assert.ok(
+      activity.some((event) => event.phase === "bookkeeping" && /post-landing completion wake failed.*wake transport refused/s.test(event.message)),
+      "expected a bookkeeping activity entry for the wake failure",
+    );
+    await waitForAsync(async () => {
+      try {
+        const archive = JSON.parse(await readFile(join(landed.root, "tasks", `${taskId}.json`), "utf8")) as {
+          task: { state: string; activity?: Array<{ phase: string; message: string }> };
+        };
+        return archive.task?.state === "landed"
+          && archive.task.activity?.some((event) => event.phase === "bookkeeping" && /association publish failed.*endpoint down/.test(event.message)) === true
+          && archive.task.activity?.some((event) => event.phase === "bookkeeping" && /completion wake failed.*wake transport refused/.test(event.message)) === true;
+      } catch {
+        return false;
+      }
+    });
+    await controller.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function setupFaultScenario(faults: BackgroundFaultHooks): Promise<{
+  root: string;
+  controller: BackgroundExecutionController;
+  started: BackgroundInspection;
+  messages: string[];
+  cleanup: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-fault-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+  await writeFile(join(root, "base.txt"), "base\n", "utf8");
+  await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+  const executor = join(root, "fault-executor.cjs");
+  await writeFile(executor, [
+    "#!/usr/bin/env node",
+    "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+    "process.stdin.on('end',()=>{",
+    "fs.writeFileSync('fault.txt','landed before bookkeeping failure\\n');",
+    "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
+    "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
+    "});",
+  ].join("\n"), "utf8");
+  await chmod(executor, 0o755);
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "fault-fake",
+      adapter: "run-as-binary",
+      command: executor,
+      execution: { protocol: "pi-review-executor-jsonl-v1" },
+    }],
+    execution: { activeExecutor: { source: "external", id: "fault-fake" }, maxWorkers: 1 },
+    retainBundles: "always",
+  });
+  const messages: string[] = [];
+  const controller = new BackgroundExecutionController({
+    pi: { sendMessage: (message: { content: string }) => messages.push(message.content) },
+    config,
+    state: createState(),
+    cwd: () => root,
+    notify: (message) => {
+      messages.push(message);
+    },
+    faults,
+  });
+  const started = await controller.start([{
+    title: "fault scenario",
+    instructions: "LAND_SENTINEL",
+    acceptanceCriteria: ["fault.txt exists"],
+  }]);
+  return {
+    root,
+    controller,
+    started,
+    messages,
+    cleanup: async () => {
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+async function waitForLandedDurableRecord(
+  started: BackgroundInspection,
+  requiredPhase: string,
+): Promise<void> {
+  await waitForAsync(async () => {
+    try {
+      const archive = JSON.parse(
+        await readFile(join(started.root, "tasks", `${started.tasks[0]?.taskId}.json`), "utf8"),
+      ) as {
+        task: { state: string; activity?: Array<{ phase: string; message: string }> };
+      };
+      if (archive.task?.state !== "landed") return false;
+      return archive.task.activity?.some((event) => event.phase === requiredPhase && /landed outcome is preserved/.test(event.message)) === true;
+    } catch {
+      return false;
+    }
+  });
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;

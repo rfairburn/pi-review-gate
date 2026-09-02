@@ -249,6 +249,27 @@ interface BackgroundControllerInput {
   notify?: (message: string) => void | Promise<void>;
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | Promise<void>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
+  faults?: BackgroundFaultHooks;
+}
+
+/** Context passed to deterministic fault hooks (used by tests to inject failures). */
+export interface BackgroundFaultContext {
+  executionId?: string;
+  taskId?: string;
+  taskState?: BackgroundTaskState;
+  taskStates?: BackgroundTaskState[];
+  kind?: string;
+}
+
+/**
+ * Deterministic fault seams. Each hook runs immediately before the corresponding
+ * step; throwing from a hook simulates that step failing.
+ */
+export interface BackgroundFaultHooks {
+  checkpointParent?: (context: BackgroundFaultContext) => unknown;
+  save?: (context: BackgroundFaultContext) => unknown;
+  publishAssociations?: (context: BackgroundFaultContext) => unknown;
+  wake?: (context: BackgroundFaultContext) => unknown;
 }
 
 export interface BackgroundInspection {
@@ -312,6 +333,15 @@ export class BackgroundExecutionController {
   constructor(private readonly input: BackgroundControllerInput) {
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
     this.expandedView = input.config.ui?.subtasksViewExpanded === true;
+  }
+
+  /**
+   * Install or clear deterministic fault hooks (testing seam). Hooks fire
+   * immediately before the corresponding bookkeeping step; throwing simulates
+   * that step failing.
+   */
+  setFaultHooks(hooks: BackgroundFaultHooks | undefined): void {
+    this.input.faults = hooks;
   }
 
   setScopedModels(models: readonly string[]): void {
@@ -814,7 +844,7 @@ export class BackgroundExecutionController {
           throw new Error(`${task.summary} Re-run SubtasksForceMerge with mergeAnyhow only if ordinary conflict markers should be materialized.`);
         }
         const materialized = await materializeLandingConflicts(capture, plan, `forced subtask ${task.taskId}`);
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths);
+        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
         this.conflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
@@ -843,18 +873,33 @@ export class BackgroundExecutionController {
         : "Force-merge checkpoint contains no changes that remain to be landed; manual workspace inspection is still required to determine whether the requested changes are present.";
       command.status = "acknowledged";
       command.acknowledgedAt = new Date().toISOString();
-      await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
+      // The landing mutated main (finding 2): run the parent checkpoint as
+      // tolerated bookkeeping (preserving the success-path ordering where the
+      // checkpoint completes before the landed state becomes visible), then
+      // transition to landed unconditionally; save/publish/wake stay tolerated
+      // so the landed outcome survives any of them failing.
+      await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
+        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId });
+      });
       transitionTaskState(task, "landed");
-      await this.save(group);
-      await this.publishAssociations();
-      await this.wake(task, "completion", `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`);
+      await this.completeLandedBookkeeping(task, "durable save", async () => {
+        await this.save(group);
+      });
+      await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
+      await this.completeLandedBookkeeping(task, "completion wake", () =>
+        this.wake(task, "completion", `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`));
+      // Always persist the landed state and any bookkeeping diagnostics recorded
+      // after the initial save (e.g., when the first save failed).
+      await this.completeLandedBookkeeping(task, "durable save", async () => {
+        await this.save(group);
+      });
       return this.inspect(group.executionId, task.taskId);
     } catch (error) {
       if (command.status !== "failed") {
         command.status = "failed";
         command.error = messageOf(error);
       }
-      if (task.state !== "conflicted") transitionTaskState(task, "paused_recoverable");
+      if (task.state !== "conflicted" && task.state !== "landed") transitionTaskState(task, "paused_recoverable");
       task.error = messageOf(error);
       await this.save(group);
       throw error;
@@ -1037,23 +1082,7 @@ export class BackgroundExecutionController {
       : task.pendingContinuation
         ? this.runContinuation(group, task, abort, lease)
         : this.runFresh(group, task, abort, lease))
-      .catch(async (error) => {
-        if (task.interruptionMode) {
-          this.failUndeliveredSteering(task, "Task was interrupted before the queued steering instruction was delivered.");
-          transitionTaskState(task, "interrupted");
-          task.error = undefined;
-          task.summary = `Executor acknowledged ${task.interruptionMode} during startup or capture; its writer is quiesced.`;
-          this.addActivity(task, "interrupt", task.summary);
-        } else {
-          this.failUndeliveredSteering(task, "Task failed before the queued steering instruction was delivered.");
-          if (task.state !== "stopped_for_application_exit") transitionTaskState(task, "failed");
-          task.error = messageOf(error);
-          task.summary = `Background controller failure: ${task.error}`;
-        }
-        task.updatedAt = new Date().toISOString();
-        await this.save(group);
-        if (!task.interruptionMode) await this.wake(task, "failure", task.summary);
-      })
+      .catch((error) => this.handleLaunchRejection(group, task, error))
       .finally(() => {
         // executeWave/continuation owns normal lease release. This is idempotent
         // and covers failures before ownership was handed down.
@@ -1065,6 +1094,49 @@ export class BackgroundExecutionController {
       });
     this.runtimes.set(task.taskId, { abort, promise, controlStatus: "pending" });
     this.updateIndicator();
+  }
+
+  private async handleLaunchRejection(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    error: unknown,
+  ): Promise<void> {
+    // Terminal successful/conflicted outcomes must never be regressed by a later
+    // bookkeeping failure (finding 2): the landing already happened. This check
+    // takes precedence over a concurrently pending interruption mode, which
+    // interrupt() leaves set until the launch promise settles.
+    const preserved = task.state === "landed" || task.state === "reported" || task.state === "conflicted";
+    if (preserved) {
+      this.failUndeliveredSteering(task, "Task reached a terminal state before the queued steering instruction was delivered; the terminal outcome is preserved.");
+      task.error = messageOf(error);
+      task.summary = `Task ${task.taskId} already reached ${task.state}; a later bookkeeping step failed and the ${task.state} outcome is preserved: ${task.error}`;
+      this.addActivity(task, "bookkeeping", task.summary);
+    } else if (task.interruptionMode) {
+      this.failUndeliveredSteering(task, "Task was interrupted before the queued steering instruction was delivered.");
+      transitionTaskState(task, "interrupted");
+      task.error = undefined;
+      task.summary = `Executor acknowledged ${task.interruptionMode} during startup or capture; its writer is quiesced.`;
+      this.addActivity(task, "interrupt", task.summary);
+    } else {
+      this.failUndeliveredSteering(task, "Task failed before the queued steering instruction was delivered.");
+      if (task.state !== "stopped_for_application_exit") transitionTaskState(task, "failed");
+      task.error = messageOf(error);
+      task.summary = `Background controller failure: ${task.error}`;
+    }
+    task.updatedAt = new Date().toISOString();
+    try {
+      await this.save(group);
+    } catch (saveError) {
+      this.addActivity(task, "bookkeeping", `Durable save failed after launch failure: ${messageOf(saveError)}`);
+    }
+    if (preserved || !task.interruptionMode) {
+      try {
+        const wakeKind = task.state === "conflicted" ? "failure" : preserved ? "completion" : "failure";
+        await this.wake(task, wakeKind, task.summary);
+      } catch {
+        // Best-effort; the failure is already recorded in durable activity.
+      }
+    }
   }
 
   private async runResearchFresh(
@@ -1344,7 +1416,7 @@ export class BackgroundExecutionController {
       takeDeferredSteering: () => this.takeDeferredSteering(group, task),
       onLandingConflict: async ({ capture, plan }) => {
         const materialized = await materializeLandingConflicts(capture, plan, `subtask ${task.taskId}`);
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths);
+        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
         this.conflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
@@ -1377,21 +1449,32 @@ export class BackgroundExecutionController {
     }
     if (result.landing?.status === "landed") {
       const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
-      await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
+      // The source workspace was mutated successfully (finding 2): run the parent
+      // checkpoint as tolerated bookkeeping (preserving the success-path ordering
+      // where the checkpoint completes before the landed state becomes visible),
+      // then transition to landed unconditionally — a checkpoint/save/publish/wake
+      // failure can neither prevent nor reclassify the landing.
+      await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
+        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId });
+      });
       transitionTaskState(task, "landed");
       const completionSnapshot = transitionEventSnapshot(group, task);
       this.updateIndicator();
-      const persisted = await this.save(group);
-      await this.publishAssociations();
-      synchronizeEventSnapshot(completionSnapshot, persisted);
-      await this.wake(
-        task,
-        undeliveredSteering.length > 0 ? "failure" : "completion",
-        undeliveredSteering.length > 0
-          ? `Task ${task.taskId} landed, but ${undeliveredSteering.length} queued steering instruction(s) were not applied.`
-          : `Task ${task.taskId} landed independently in the main workspace.`,
-        completionSnapshot,
-      );
+      let persisted: PersistedGroupRevision | undefined;
+      await this.completeLandedBookkeeping(task, "durable save", async () => {
+        persisted = await this.save(group);
+      });
+      await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
+      if (persisted) synchronizeEventSnapshot(completionSnapshot, persisted);
+      await this.completeLandedBookkeeping(task, "completion wake", () =>
+        this.wake(
+          task,
+          undeliveredSteering.length > 0 ? "failure" : "completion",
+          undeliveredSteering.length > 0
+            ? `Task ${task.taskId} landed, but ${undeliveredSteering.length} queued steering instruction(s) were not applied.`
+            : `Task ${task.taskId} landed independently in the main workspace.`,
+          completionSnapshot,
+        ));
     } else if (result.landing?.status === "conflicted") {
       transitionTaskState(task, "conflicted");
       task.summary = this.conflictGate
@@ -1408,8 +1491,15 @@ export class BackgroundExecutionController {
       await this.wake(task, "failure", `Task ${task.taskId} failed: ${task.error ?? task.summary ?? "unknown failure"}`);
     }
     task.updatedAt = new Date().toISOString();
-    await this.save(group);
-    await this.publishAssociations();
+    if (task.state === "landed") {
+      await this.completeLandedBookkeeping(task, "durable save", async () => {
+        await this.save(group);
+      });
+      await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
+    } else {
+      await this.save(group);
+      await this.publishAssociations();
+    }
     this.updateIndicator();
   }
 
@@ -1460,7 +1550,7 @@ export class BackgroundExecutionController {
         takeDeferredSteering: () => this.takeDeferredSteering(group, task),
         onLandingConflict: async ({ capture, plan }) => {
           const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
-          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths);
+          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
           this.activateConflictGate(group, task, materialized.paths, materialized.manifestPath, `Continued task ${task.taskId} requires immediate conflict resolution.`);
           this.addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
           await this.save(group);
@@ -1480,21 +1570,31 @@ export class BackgroundExecutionController {
       if (result.landing?.status === "landed") {
         task.summary = "Continued task landed independently in the main workspace.";
         const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths);
+        // The source workspace was mutated successfully (finding 2): run the
+        // parent checkpoint as tolerated bookkeeping (preserving the success-path
+        // ordering where the checkpoint completes before the landed state becomes
+        // visible), then transition to landed unconditionally.
+        await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
+          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId });
+        });
         transitionTaskState(task, "landed");
         const completionSnapshot = transitionEventSnapshot(group, task);
         this.updateIndicator();
-        const persisted = await this.save(group);
-        await this.publishAssociations();
-        synchronizeEventSnapshot(completionSnapshot, persisted);
-        await this.wake(
-          task,
-          undeliveredSteering.length > 0 ? "failure" : "completion",
-          undeliveredSteering.length > 0
+        let persisted: PersistedGroupRevision | undefined;
+        await this.completeLandedBookkeeping(task, "durable save", async () => {
+          persisted = await this.save(group);
+        });
+        await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
+        if (persisted) synchronizeEventSnapshot(completionSnapshot, persisted);
+        await this.completeLandedBookkeeping(task, "completion wake", () =>
+          this.wake(
+            task,
+            undeliveredSteering.length > 0 ? "failure" : "completion",
+            undeliveredSteering.length > 0
               ? `Task ${task.taskId} continuation landed, but ${undeliveredSteering.length} queued steering instruction(s) were not applied.`
               : `Task ${task.taskId} continuation landed.`,
-          completionSnapshot,
-        );
+            completionSnapshot,
+          ));
       } else if (result.landing?.status === "conflicted") {
         transitionTaskState(task, "conflicted");
         task.summary = this.conflictGate
@@ -1512,8 +1612,15 @@ export class BackgroundExecutionController {
       throw error;
     } finally {
       task.updatedAt = new Date().toISOString();
-      await this.save(group);
-      await this.publishAssociations();
+      if (task.state === "landed") {
+        await this.completeLandedBookkeeping(task, "durable save", async () => {
+          await this.save(group);
+        });
+        await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
+      } else {
+        await this.save(group);
+        await this.publishAssociations();
+      }
       this.updateIndicator();
     }
   }
@@ -1610,7 +1717,9 @@ export class BackgroundExecutionController {
     before: WorkspaceSnapshot | undefined,
     sourceRoot: string,
     landedPaths: string[],
+    faultContext: BackgroundFaultContext = {},
   ): Promise<void> {
+    await this.input.faults?.checkpointParent?.(faultContext);
     if (!taskBaseline || !before || reviewWindowId === undefined || this.input.state.reviewWindow?.id !== reviewWindowId || landedPaths.length === 0) return;
     const after = await createWorkspaceSnapshot(sourceRoot, {
       maxFileBytes: this.input.config.maxFileBytes,
@@ -1621,6 +1730,34 @@ export class BackgroundExecutionController {
     const accumulatedBaseline = activeExchangeBaseline(this.input.state);
     if (!accumulatedBaseline) return;
     checkpointReviewWindow(this.input.state, selectiveCheckpoint(accumulatedBaseline, taskBaseline, before, after, landedPaths, sourceRoot));
+  }
+
+  /**
+   * Runs a post-landing bookkeeping step, tolerating its failure: the task has
+   * already mutated main successfully, so the landed outcome must be preserved
+   * and the failure recorded as activity/diagnostic instead (finding 2).
+   */
+  private async completeLandedBookkeeping(
+    task: BackgroundTaskRecord,
+    step: string,
+    run: () => Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await run();
+    } catch (error) {
+      const message = messageOf(error);
+      task.updatedAt = new Date().toISOString();
+      this.addActivity(
+        task,
+        "bookkeeping",
+        `Task ${task.taskId} landed in the main workspace, but post-landing ${step} failed; the landed outcome is preserved. ${message}`,
+      );
+      try {
+        await this.input.notify?.(`review gate: task ${task.taskId} landed, but ${step} failed afterward (landing preserved): ${message}`);
+      } catch {
+        // Notification is best-effort; the landed outcome is already recorded.
+      }
+    }
   }
 
   private async acknowledgeInterrupt(task: BackgroundTaskRecord): Promise<void> {
@@ -1748,6 +1885,7 @@ export class BackgroundExecutionController {
     content: string,
     eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
   ): Promise<void> {
+    await this.input.faults?.wake?.({ taskId: task.taskId, taskState: task.state, kind });
     if (kind === "completion" || kind === "failure") {
       const owner = eventSnapshot?.group
         ?? [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
@@ -1931,6 +2069,10 @@ export class BackgroundExecutionController {
   private async save(group: BackgroundExecutionGroup): Promise<PersistedGroupRevision> {
     group.revision += 1;
     group.updatedAt = new Date().toISOString();
+    await this.input.faults?.save?.({
+      executionId: group.executionId,
+      taskStates: group.tasks.map((candidate) => candidate.state),
+    });
     const archiveWrites: Array<{
       taskId: string;
       updatedAt: string;
@@ -1996,6 +2138,9 @@ export class BackgroundExecutionController {
   }
 
   private async publishAssociations(): Promise<void> {
+    await this.input.faults?.publishAssociations?.({
+      taskStates: [...this.groups.values()].flatMap((group) => group.tasks.map((task) => task.state)),
+    });
     await this.input.onAssociationsChanged?.(this.associations());
   }
 

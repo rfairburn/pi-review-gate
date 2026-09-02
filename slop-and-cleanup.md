@@ -1,7 +1,7 @@
 # Slop and cleanup review inventory
 
 Date: 2026-09-02
-Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0 and 1 are
+Status: Final consolidated inventory replacing the 2026-08-27 draft. Findings 0, 1, and 2 are
 RESOLVED work-history entries (fixes landed 2026-09-02); remaining findings are
 recommendations only with no product code changes.
 
@@ -146,38 +146,57 @@ connection count stays unchanged (zero new connections).
 canonicalizes before checking and cannot be bypassed by any spelling of an
 embedded-IPv4 or special-range address.
 
-### 2. MEDIUM-HIGH — Post-landing bookkeeping failure flips a landed task to `failed`
+### 2. MEDIUM-HIGH — RESOLVED (2026-09-02): Post-landing bookkeeping failure flips a landed task to `failed`
 
-Refs: `src/execution/background-controller.ts:1040-1057` (launch `.catch` runs
-`transitionTaskState(task, "failed")` whenever the body rejects and state is not
-`stopped_for_application_exit`). In `runFresh`, after a successful landing the order is
-`checkpointParent` awaited **first** (`:1380`), then the transition to `landed` (`:1381`),
-then `save`, `publishAssociations`, `wake` (`:1382-1392`). `forceMerge` transitions to
-`landed` at `:847` before `save`/`wake` (`:846-850`) with its own catch moving the task to
-`paused_recoverable` (`:851-859`).
+**Root cause (confirmed).** In `runFresh`/`runContinuation`, `checkpointParent` was awaited
+before the `landed` transition, and the launch `.catch` moved any rejecting body to `failed`;
+`forceMerge` had the same shape (checkpoint → transition → save/publish/wake inside a catch
+that moved non-conflicted tasks to `paused_recoverable`). A post-landing checkpoint/save/
+publish/wake failure therefore either prevented the `landed` transition or regressed it, so
+main was changed while the durable record claimed failure.
 
-Impact: landing mutates the source workspace, and every step after that mutation can reject
-(ENOSPC/EACCES on the parent checkpoint, disk-full group save, `wake`/`notify` throw). Two
-failure windows both lose the successful landing outcome: (a) `checkpointParent` fails
-*before* the `landed` transition, so the task never reaches `landed` and the catch marks it
-`failed`; (b) a post-`landed` save/publish/wake failure lets the catch flip `landed` back to
-`failed`. Either way the durable record and reality disagree: main changed, the model is told
-the task failed, and recovery flows (e.g., force-merge eligibility for non-active states) can
-re-land already-landed content or confuse triage.
+**Fix.**
+- `src/execution/background-controller.ts`: new invariant — once the source workspace
+  mutation succeeded (`landing.status === "landed"`), no later bookkeeping failure may
+  change the outcome. `runFresh`, `runContinuation`, and `forceMerge` now run
+  `checkpointParent` as tolerated bookkeeping *before* the (unchanged) success-path
+  `landed` transition — closing both windows: a checkpoint failure no longer prevents the
+  transition, and a post-transition save/publish/wake failure can never regress it. The
+  new `completeLandedBookkeeping` helper catches each step's failure, records a
+  `bookkeeping` activity entry plus a `notify` diagnostic ("landing preserved"), and
+  retries the durable save when an earlier post-landing save failed, and force-merge always
+  performs a tolerated final durable save so post-save diagnostics persist. The launch
+  rejection handler is state-aware and terminal-state preservation takes precedence over a
+  concurrently pending `interruptionMode` (which `interrupt()` leaves set until the launch
+  promise settles): `landed`/`reported`/`conflicted` are never regressed to `interrupted` or
+  `failed`; preserved successful states wake as `completion` while `conflicted` remains an
+  actionable `failure` wake, recording the bookkeeping failure in activity/summary instead,
+  and the handler's own save/wake are exception-safe.
+  Pre-landing failures keep their existing failure/recovery paths untouched.
+- New deterministic fault seams: `BackgroundFaultHooks` (`checkpointParent`, `save`,
+  `publishAssociations`, `wake`) accepted via controller input or `setFaultHooks`, each
+  invoked immediately before its step with task/state context.
 
-Recommendation:
-- [ ] Preserve the successful landing outcome independently of all subsequent
-      checkpoint/save/publish/wake failures — e.g., transition to `landed` as soon as
-      `result.landing.status === "landed"` is known and treat the parent checkpoint as
-      non-fatal bookkeeping (activity + diagnostic), or at minimum make the launch catch
-      state-aware so it never moves a task out of `landed`/`reported`/`conflicted`.
-- [ ] Add fault-hook tests for each post-mutation step, including `checkpointParent` failing
-      before the current `landed` transition, asserting the task ends `landed` (or an
-      explicit recoverable state) rather than `failed`.
+**Tests.** `tests/background-controller.test.ts` adds seven deterministic fault tests: each
+post-mutation step (parent checkpoint, durable save, association publish, completion wake)
+failing after successful landing asserts main contains the landed change, the task stays
+`landed` with no `failed` history entry, a `bookkeeping` activity entry records the failure,
+and the task archive on disk agrees (`landed` + activity); the durable-save case also proves
+the landed state reaches `execution.json` on the retry. Force-merge variants cover a failing
+post-landing save and failing publish+wake (both recorded in the archived activity with the
+landed state durable). A regression test proves the launch rejection handler keeps a
+`landed` task at `landed` (never `interrupted`/`failed`) even when `interruptionMode` is
+simultaneously pending and a post-terminal rejection arrives.
 
-Test status: none — `tests/background-controller.test.ts` covers landing, interrupt +
-force-merge, restore, and steering, but no test injects post-landing I/O failure (no fault
-hooks exist on those paths).
+**Validation.** `npm run check:static`; `npm run build:test` + targeted
+`node --test --test-concurrency=1 dist-test/tests/background-controller.test.js` (17/17)
+and the rest of the execution suite (`background-process-readiness`, `execution-tool-batch`,
+`executor-pool`, `operation-actions`, `session-state`, `source-mutation-lease`; 42/42);
+no `dist/` output touched.
+
+**Impact.** A successful source landing can no longer be reclassified as failed by any
+checkpoint/save/publish/wake error; bookkeeping failures are visible as activity and
+notifications while the durable and in-memory task states stay consistent with main.
 
 ### 3. HIGH — ShellSend can crash the pi host via unhandled async stdin EPIPE
 

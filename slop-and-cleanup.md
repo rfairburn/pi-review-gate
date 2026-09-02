@@ -555,8 +555,10 @@ Test status: caps/archiving tested; soak test missing.
 - L6. Secrets redaction misses PEM private-key blocks and raw JWTs without a `Bearer` prefix
   (`src/redaction.ts:8-14`); such tool results persist unredacted in review evidence.
   `tests/redaction.test.ts` covers only two basic cases.
-- L7. `new TextDecoder(charsetOf(…))` throws RangeError on an unknown declared charset
-  (`src/web/network.ts:96`, `charsetOf :416`) — fall back to utf-8.
+- L7. **RESOLVED (2026-09-02):** response decoding now routes through
+  `decodeResponseText`, which honors supported declared charsets and falls back to UTF-8 when
+  `TextDecoder` rejects an unknown label. Focused tests cover supported, unknown, malformed,
+  absent, and unquoted charset declarations without changing the existing byte limit.
 - L8. `wake()` failure diagnostics embed a full `inspect()` clone as pretty-printed JSON in
   the notification (`background-controller.ts:1776`) — use a curated diagnostic subset.
 - L9. `saveTails` entries are never pruned (set at `background-controller.ts:1988`, awaited

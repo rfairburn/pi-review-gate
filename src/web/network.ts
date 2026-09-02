@@ -94,7 +94,7 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
         requestedUrl: requested,
         finalUrl: current,
         contentType: response.headers.get("content-type") ?? "application/octet-stream",
-        text: new TextDecoder(charsetOf(response.headers.get("content-type"))).decode(bytes),
+        text: decodeResponseText(response.headers.get("content-type"), bytes),
         data: bytes,
         bytes: bytes.byteLength,
         fetchedAt: new Date().toISOString(),
@@ -392,6 +392,22 @@ function cleanText(value: string): string {
 
 function freshnessCode(value: "day" | "week" | "month" | "year"): "d" | "w" | "m" | "y" {
   return ({ day: "d", week: "w", month: "m", year: "y" } as const)[value];
+}
+
+/**
+ * Decode response bytes with the declared charset. Unknown or unsupported
+ * labels fall back to UTF-8 so a hostile content-type header cannot let a
+ * TextDecoder RangeError escape downloadText.
+ */
+export function decodeResponseText(contentType: string | null, bytes: Uint8Array): string {
+  const charset = charsetOf(contentType);
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(charset);
+  } catch {
+    decoder = new TextDecoder("utf-8");
+  }
+  return decoder.decode(bytes);
 }
 
 function charsetOf(contentType: string | null): string {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
 import { isBlockedAddress, parseIp } from "../src/web/ip";
-import { downloadText, validatedPublicUrl, type NetworkOptions } from "../src/web/network";
+import { decodeResponseText, downloadText, validatedPublicUrl, type NetworkOptions } from "../src/web/network";
 
 // Unit table tests for the canonical, fail-closed SSRF range check.
 
@@ -192,5 +192,36 @@ test("downloadText cannot connect to a loopback server through mapped or compati
     assert.equal(connections, connectionsAfterControl, "blocked forms must not open new connections");
   } finally {
     await new Promise<void>((resolveClose, rejectClose) => server.close((error) => (error ? rejectClose(error) : resolveClose())));
+  }
+});
+
+// L7: response decoding must fall back to UTF-8 when the declared charset is
+// unknown or unsupported instead of letting a TextDecoder RangeError escape.
+const utf8Hello = new TextEncoder().encode("héllo"); // "héllo" as UTF-8 bytes
+const latin1Hello = new Uint8Array([0x68, 0xe9, 0x6c, 0x6c, 0x6f]); // same text in ISO-8859-1
+
+test("decodeResponseText honors a supported declared charset", () => {
+  const text = decodeResponseText("text/html; charset=iso-8859-1", latin1Hello);
+  assert.equal(text, "héllo");
+  // The same bytes decoded as UTF-8 would contain a replacement character, so
+  // the equality above proves the declared label was actually used.
+  assert.notEqual(new TextDecoder("utf-8").decode(latin1Hello), text);
+});
+
+test("decodeResponseText falls back to UTF-8 for unknown or unsupported charsets", () => {
+  for (const contentType of ["text/plain; charset=x-not-a-real-charset", 'text/plain; charset="x-bogus"']) {
+    assert.equal(decodeResponseText(contentType, utf8Hello), "héllo", `expected ${contentType} to fall back to UTF-8`);
+  }
+});
+
+test("decodeResponseText treats malformed content-type headers as UTF-8", () => {
+  for (const contentType of ["text/plain; charset=", "text/plain; charset=;", "", null]) {
+    assert.equal(decodeResponseText(contentType, utf8Hello), "héllo", `expected ${JSON.stringify(contentType)} to decode as UTF-8`);
+  }
+});
+
+test("decodeResponseText decodes absent charset declarations as UTF-8", () => {
+  for (const contentType of ["text/html", "application/json; version=1"]) {
+    assert.equal(decodeResponseText(contentType, utf8Hello), "héllo", `expected ${JSON.stringify(contentType)} to decode as UTF-8`);
   }
 });

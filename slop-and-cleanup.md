@@ -552,27 +552,30 @@ no active delivery despite a stale cancelled same-text record, then verifies the
 record and cleared ledger remain durably cancelled. Command and Kitty-escape tests assert that
 zero-drop cancellation does not invent a drop notice.
 
-### 13. MEDIUM — Maintainability: `BackgroundExecutionController` decomposition (updated)
+### 13. MEDIUM — RESOLVED (2026-09-02): `BackgroundExecutionController` mixed unrelated mechanics
 
-Refs: `src/execution/background-controller.ts` is now **2,592 lines** (previous inventory
-said "more than 2,200"). It still owns group persistence, scheduling, execution,
-continuation, live control, interruption, force-merge, conflict gating, restoration,
-notification delivery, diagnostic formatting, and widget rendering.
+**Root cause.** The controller owned pure task lifecycle/timing/history logic, durable group and
+archive formats, filesystem cleanup, widget rendering, scheduling, recovery transactions, and
+notification delivery in one module. That obscured persistence boundaries and made independent
+behavior difficult to test.
 
-Recommendation (extraction order unchanged; boundaries re-verified):
-- [ ] Extract task/group persistence and integrity handling (`save`/`atomicWrite` cluster,
-      `:1936-2020`, `:2496-2520`).
-- [ ] Extract the conflict-gate/force-merge cluster (`~:760-935`) — cleanest first cut.
-- [ ] Extract the wake/notification cluster (`wake` lanes `:1745-1810`,
-      `formatExecutionEvent :2149+`, `noActionResponseNotice :2210+`,
-      `formatResearchCompletion :2105+`) together with item 14.
-- [ ] Extract widget/view-model construction, then scheduler/runtime ownership, then
-      interaction/recovery commands where transaction boundaries remain explicit.
-- Do not split transaction-heavy landing code solely to reduce line count.
+**Fix.** Cohesive internals now live in three typed modules. `task-state.ts` owns task contracts,
+state predicates/transitions, timing, bounded history normalization, activity, and progress
+mapping. `background-group-store.ts` owns manifest/archive versions, exact serialization and
+integrity checks, legacy-v1 restoration, archive reuse/hydration, durable writes, and guarded temp
+root cleanup while the controller retains L9 caller-owned save ordering. `subtask-widget.ts` owns
+the compact/expanded view model, executor labels, clipping, and component rendering from plain
+snapshots. Existing controller imports remain source-compatible through re-exports. The
+force-merge/conflict path deliberately stays controller-owned because it is one transaction over
+the source lease, parent checkpoint, conflict gate, durable save, associations, and wake; splitting
+it into callbacks would hide rather than clarify ownership. Notification policy is handled
+separately by finding 14.
 
-Test status: behavior is well covered (`tests/background-controller.test.ts`, execution
-suite); extraction is refactor-safe with the current 52/52 `test:execution` baseline as a
-guard.
+**Tests.** New module suites cover task transitions/timing/history/progress, exact group and archive
+bytes/hashes, archive reuse/tamper/state validation, legacy execute/research restore, guarded root
+cleanup, executor labels, compact/expanded widgets, sorting, clipping, conflict display, and public
+re-export compatibility. Controller/tool/session and new module suites pass 89/89 with static
+checks, with on-disk versions and existing lifecycle behavior unchanged.
 
 ### 14. MEDIUM — Centralize the subtask notification contract (updated)
 

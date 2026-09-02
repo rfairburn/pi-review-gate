@@ -1,33 +1,87 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { DEFAULT_SUBTASK_NOTIFICATION_MODE, type ReviewGateConfig } from "../config";
-import { externalAgentCatalog, resolvedWorkerResources, resolvedWorkerRoute } from "../config";
+import { resolvedWorkerResources, resolvedWorkerRoute } from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts, unresolvedConflictMarkers } from "./conflict-materialization";
-import { atomicWrite } from "./durable-write";
+import {
+  GROUP_VERSION,
+  readGroup,
+  removeOwnedExecutionRoot,
+  removeOwnedWaveRoot,
+  serializeGroupSnapshot,
+  writeGroupSnapshot,
+  type BackgroundExecutionGroup,
+} from "./background-group-store";
 import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
 import { continueOperation, inspectOperation } from "./operation-actions";
 import type { ReattachmentBundle } from "./operation-record";
 import { readOperationRecord } from "./operation-record";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
-import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskProgressPhase } from "./types";
-import { executeWave, type WaveProgressUpdate, type WaveResult } from "./wave-controller";
-import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
+import {
+  appendActivity,
+  clipActivity,
+  cloneTask,
+  isActiveTaskState,
+  isInterruptibleTaskState,
+  MAX_ACTIVITY,
+  newTask,
+  stateFromContinuationProgress,
+  stateFromWaveProgress,
+  taskTiming,
+  transitionTaskState,
+  isStoppedForExit,
+  type BackgroundActivityEvent,
+  type BackgroundCommandRecord,
+  type BackgroundTaskDefinition,
+  type BackgroundTaskKind,
+  type BackgroundTaskRecord,
+  type BackgroundTaskState,
+  type BackgroundTaskTimingSummary,
+} from "./task-state";
+import { executorDisplayLabel, renderSubtaskWidget } from "./subtask-widget";
+import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl } from "./types";
+import { executeWave, type WaveProgressUpdate } from "./wave-controller";
+import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult } from "./wave-worker";
 import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
 import { researchWorkspaceChanges } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
 import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
 
-const GROUP_VERSION = 2;
-const LEGACY_GROUP_VERSION = 1;
-const TASK_ARCHIVE_VERSION = 1;
-const MAX_ACTIVITY = 200;
-const MAX_STATE_HISTORY = 64;
+/**
+ * Finding 13: the controller no longer owns pure task-state/timing
+ * bookkeeping (./task-state), durable group/archive format mechanics
+ * (./background-group-store), or widget view-model rendering
+ * (./subtask-widget). The original public surface of this module is preserved
+ * via the re-exports below; notification/event formatting (including the
+ * watch-checkpoint event text) and scaling remain in the controller
+ * (findings 14 and 15).
+ */
+export {
+  BACKGROUND_TASK_STATES,
+  isActiveTaskState,
+  isForceMergeCandidateTaskState,
+  isInterruptibleTaskState,
+  stateFromContinuationProgress,
+  stateFromWaveProgress,
+} from "./task-state";
+export type {
+  BackgroundActivityEvent,
+  BackgroundCommandRecord,
+  BackgroundStateTransition,
+  BackgroundTaskDefinition,
+  BackgroundTaskKind,
+  BackgroundTaskRecord,
+  BackgroundTaskState,
+  BackgroundTaskTimingSummary,
+} from "./task-state";
+export type { BackgroundExecutionGroup } from "./background-group-store";
+
 const RECENT_ACTIVITY_LIMIT = 10;
 
 /**
@@ -51,102 +105,12 @@ const WAKE_FAILURE_JSON_CAP = 7_000;
 const WAKE_FAILURE_NOTIFICATION_CAP = 16_000;
 const TRUNCATION_MARKER = "…[truncated]";
 
-export const BACKGROUND_TASK_STATES = [
-  "queued",
-  "capturing",
-  "running",
-  "reviewing",
-  "accepted",
-  "waiting_to_land",
-  "landing",
-  "landed",
-  "reported",
-  "failed",
-  "interrupted",
-  "conflicted",
-  "paused_recoverable",
-  "stopped_for_application_exit",
-] as const;
-
-export type BackgroundTaskState = typeof BACKGROUND_TASK_STATES[number];
-export type BackgroundTaskKind = "execute" | "research";
-
-const ACTIVE_TASK_STATES: ReadonlySet<BackgroundTaskState> = new Set([
-  "queued",
-  "capturing",
-  "running",
-  "reviewing",
-  "accepted",
-  "waiting_to_land",
-  "landing",
-]);
-
-export function isActiveTaskState(state: BackgroundTaskState): boolean {
-  return ACTIVE_TASK_STATES.has(state);
-}
-
-export function isInterruptibleTaskState(state: BackgroundTaskState): boolean {
-  return isActiveTaskState(state);
-}
-
-export function isForceMergeCandidateTaskState(state: BackgroundTaskState): boolean {
-  return !isActiveTaskState(state);
-}
-
-export type BackgroundTaskDefinition = WaveWorkerTask;
-
-export interface BackgroundCommandRecord {
-  instructionId: string;
-  action: "continue" | "steer" | "interrupt" | "force_merge";
-  actor: "model" | "user" | "system";
-  text?: string;
-  mode?: string;
-  status: "queued" | "delivered" | "acknowledged" | "failed";
-  createdAt: string;
-  deliveredAt?: string;
-  acknowledgedAt?: string;
-  error?: string;
-}
-
 export interface BackgroundForceMergeInput {
   executionId?: string;
   taskId?: string;
   mergeAnyhow: boolean;
   instructionId: string;
   actor: "model" | "user" | "system";
-}
-
-export interface BackgroundActivityEvent {
-  sequence: number;
-  at: string;
-  phase: string;
-  message: string;
-}
-
-export interface BackgroundStateTransition {
-  sequence: number;
-  state: BackgroundTaskState;
-  at: string;
-  generation: number;
-}
-
-export interface BackgroundTaskTimingSummary {
-  queueMs: number;
-  captureMs: number;
-  executionMs: number;
-  reviewMs: number;
-  landingMs: number;
-  totalMs: number;
-}
-
-interface BackgroundTaskTimingAccumulator {
-  queueMs: number;
-  captureMs: number;
-  executionMs: number;
-  reviewMs: number;
-  landingMs: number;
-  stateEnteredAt: string;
-  terminalAt?: string;
 }
 
 export interface BackgroundSchedulingSnapshot {
@@ -162,89 +126,10 @@ export interface BackgroundSchedulingSnapshot {
   globallyDispatchPending: number;
 }
 
-export interface BackgroundTaskRecord {
-  taskId: string;
-  definition: BackgroundTaskDefinition;
-  state: BackgroundTaskState;
-  createdAt: string;
-  updatedAt: string;
-  generation: number;
-  waveRoot?: string;
-  bundle?: ReattachmentBundle;
-  executorEntryId?: string;
-  lastRuntimeConfigDigest?: string;
-  result?: WaveResult;
-  researchResult?: WaveWorkerResult;
-  report?: string;
-  reportPath?: string;
-  summary?: string;
-  error?: string;
-  activity: BackgroundActivityEvent[];
-  nextActivitySequence: number;
-  stateHistory?: BackgroundStateTransition[];
-  nextStateSequence?: number;
-  timingAccumulator?: BackgroundTaskTimingAccumulator;
-  commands: BackgroundCommandRecord[];
-  pendingContinuation?: { instructions: string; instructionId: string };
-  interruptionMode?: "interrupt_as_failure" | "interrupt_with_merge";
-  reviewStatus?: {
-    phase: string;
-    reviewers: string[];
-    activity: string[];
-    updatedAt: string;
-  };
-}
-
-export interface BackgroundExecutionGroup {
-  version: 2;
-  revision: number;
-  integritySha256: string;
-  executionId: string;
-  kind: BackgroundTaskKind;
-  root: string;
-  cwd: string;
-  createdAt: string;
-  updatedAt: string;
-  peakConcurrency?: number;
-  tasks: BackgroundTaskRecord[];
-}
-
-interface ArchivedBackgroundTaskReference {
-  archived: true;
-  taskId: string;
-  title: string;
-  state: "landed" | "reported";
-  createdAt: string;
-  updatedAt: string;
-  summary?: string;
-  error?: string;
-  timing: BackgroundTaskTimingSummary;
-  archivePath: string;
-  archiveIntegritySha256: string;
-}
-
-interface PersistedBackgroundExecutionGroup extends Omit<BackgroundExecutionGroup, "tasks" | "version"> {
-  version: 1 | 2;
-  tasks: Array<BackgroundTaskRecord | ArchivedBackgroundTaskReference>;
-}
-
-interface PersistedBackgroundTaskArchive {
-  version: 1;
-  taskId: string;
-  archivedAt: string;
-  integritySha256: string;
-  task: BackgroundTaskRecord;
-}
-
 interface RecentBackgroundActivity {
   taskId: string;
   title: string;
   event: BackgroundActivityEvent;
-}
-
-interface ReadGroupResult {
-  group: BackgroundExecutionGroup;
-  archives: Map<string, { updatedAt: string; integritySha256: string }>;
 }
 
 export interface BackgroundConflictGate {
@@ -920,6 +805,16 @@ export class BackgroundExecutionController {
     }
   }
 
+  /**
+   * Finding-13 boundary: the conflict-gate/force-merge cluster intentionally
+   * remains in the controller. runForceMerge is a single transaction over
+   * controller-owned state — the source-mutation lease, conflict gate, durable
+   * save-tail ordering (save), association publication, parent checkpoint,
+   * tolerated landed-bookkeeping, and wake delivery. Extracting it behind
+   * callbacks would move transaction ownership into a callback bag without
+   * reducing coupling, so it stays here; the pure state/format mechanics it
+   * touches live in task-state and background-group-store.
+   */
   private async runForceMerge(
     input: BackgroundForceMergeInput,
     group: BackgroundExecutionGroup,
@@ -2411,49 +2306,12 @@ export class BackgroundExecutionController {
     // quiescing the tail map can never miss a save that is already in flight.
     group.revision += 1;
     group.updatedAt = new Date().toISOString();
-    const archiveWrites: Array<{
-      taskId: string;
-      updatedAt: string;
-      integritySha256: string;
-      path: string;
-      body: string;
-    }> = [];
-    const persistedTasks = group.tasks.map((task): BackgroundTaskRecord | ArchivedBackgroundTaskReference => {
-      normalizeTaskHistory(task);
-      if (!isArchivableTaskState(task.state)) return cloneTask(task);
-      const priorArchive = this.archivedTasks.get(task.taskId);
-      let archiveIntegritySha256 = priorArchive?.updatedAt === task.updatedAt
-        ? priorArchive.integritySha256
-        : undefined;
-      if (!archiveIntegritySha256) {
-        const archive = createTaskArchive(task);
-        archiveIntegritySha256 = archive.snapshot.integritySha256;
-        archiveWrites.push({
-          taskId: task.taskId,
-          updatedAt: task.updatedAt,
-          integritySha256: archiveIntegritySha256,
-          path: join(group.root, taskArchivePath(task.taskId)),
-          body: `${JSON.stringify(archive.snapshot, null, 2)}\n`,
-        });
-      }
-      return {
-        archived: true,
-        taskId: task.taskId,
-        title: task.definition.title,
-        state: task.state,
-        createdAt: task.createdAt,
-        updatedAt: task.updatedAt,
-        summary: task.summary ? clipActivity(task.summary, 500) : undefined,
-        error: task.error ? clipActivity(task.error, 500) : undefined,
-        timing: taskTiming(task),
-        archivePath: taskArchivePath(task.taskId),
-        archiveIntegritySha256,
-      };
-    });
-    const snapshot = JSON.parse(JSON.stringify({ ...group, version: GROUP_VERSION, tasks: persistedTasks })) as PersistedBackgroundExecutionGroup;
-    const unsigned = { ...snapshot, integritySha256: undefined };
-    snapshot.integritySha256 = createHash("sha256").update(JSON.stringify(unsigned)).digest("hex");
-    group.integritySha256 = snapshot.integritySha256;
+    // Group/archive serialization (archive selection and reuse, integrity
+    // hashing, exact JSON shapes) is delegated to the group store; this method
+    // keeps the attachment guard, revision bookkeeping, fault seam, and L9
+    // save-tail ordering.
+    const serialized = serializeGroupSnapshot(group, this.archivedTasks);
+    const snapshot = serialized.snapshot;
     // Freeze the hook context with the snapshot it guards; the hook itself
     // still runs inside the serialized chain so it can gate the write.
     const faultContext: BackgroundFaultContext = {
@@ -2466,9 +2324,8 @@ export class BackgroundExecutionController {
       // this save's durable writes; a throwing hook rejects `next` while the
       // registered tail (its caught twin) still settles and prunes itself.
       await this.input.faults?.save?.(faultContext);
-      for (const archive of archiveWrites) await atomicWrite(archive.path, archive.body);
-      await atomicWrite(join(group.root, "execution.json"), `${JSON.stringify(snapshot, null, 2)}\n`);
-      for (const archive of archiveWrites) {
+      await writeGroupSnapshot(group.root, serialized);
+      for (const archive of serialized.archiveWrites) {
         this.archivedTasks.set(archive.taskId, {
           updatedAt: archive.updatedAt,
           integritySha256: archive.integritySha256,
@@ -2504,62 +2361,49 @@ export class BackgroundExecutionController {
   private updateIndicator(): void {
     const ctx = this.uiContext;
     if (!isRecord(ctx) || !isRecord(ctx.ui) || typeof ctx.ui.setWidget !== "function") return;
-    const live = [...this.groups.values()].flatMap((group) => group.tasks).filter((task) => isActiveTaskState(task.state));
+    // The controller only assembles the snapshot (active tasks, runtime
+    // assignment, conflict gate, recent activity); all rendering details live
+    // in the subtask-widget module.
+    const tasks = [...this.groups.values()].flatMap((group) => group.tasks
+      .filter((task) => isActiveTaskState(task.state))
+      .map((task) => ({
+        kind: group.kind,
+        taskId: task.taskId,
+        title: task.definition.title,
+        state: task.state,
+        updatedAt: task.updatedAt,
+        executorEntryId: task.executorEntryId,
+        reviewStatus: task.reviewStatus
+          ? { phase: task.reviewStatus.phase, reviewers: [...task.reviewStatus.reviewers] }
+          : undefined,
+        latestCommand: task.commands.at(-1)
+          ? { action: task.commands.at(-1)!.action, status: task.commands.at(-1)!.status }
+          : undefined,
+        queuedExecutorAssigned: this.runtimes.has(task.taskId),
+      })));
     try {
-      if (this.expandedView) {
-        const all = [...this.groups.values()]
-          .flatMap((group) => group.tasks.map((task) => ({ group, task })))
-          .sort((left, right) => right.task.updatedAt.localeCompare(left.task.updatedAt));
-        const activeTasks = all.filter(({ task }) => isActiveTaskState(task.state));
-        const shown = activeTasks.slice(0, 16);
-        const lines = [
-          `⟳ ${live.length} active background subtask${live.length === 1 ? "" : "s"} — expanded live view (/subtasks-view to collapse)`,
-        ];
-        if (this.conflictGate) lines.push(`CRITICAL conflict: ${this.conflictGate.paths.join(", ")}`);
-        if (shown.length === 0) lines.push("  No active background subtasks.");
-        for (const { group, task } of shown) {
-          const reviewers = task.reviewStatus
-            ? ` · reviewers ${task.reviewStatus.reviewers.join(", ") || "none"} (${task.reviewStatus.phase})`
-            : "";
-          const command = task.commands.at(-1);
-          const latestCommand = command ? ` · ${command.action} ${command.status}` : "";
-          lines.push(`  ${group.kind} · ${task.definition.title} [${task.state}] · ${executorDisplayLabel(task, this.input.config, group.kind)}${reviewers}${latestCommand}`);
-        }
-        if (activeTasks.length > shown.length) lines.push(`  … ${activeTasks.length - shown.length} additional active task${activeTasks.length - shown.length === 1 ? "" : "s"} omitted`);
-        const recent = this.recentActivity;
-        lines.push("  Recent activity (10 newest events across all tasks):");
-        if (recent.length === 0) lines.push("    no activity recorded yet");
-        for (const { title, event } of recent) {
-          lines.push(`    ${title} · ${event.phase} · ${clipActivity(event.message)}`);
-        }
-        ctx.ui.setWidget("review-gate-subtasks", () => liveViewComponent(lines), { placement: "belowEditor" });
-        return;
+      const rendered = renderSubtaskWidget({
+        expanded: this.expandedView,
+        conflictPaths: this.conflictGate ? [...this.conflictGate.paths] : undefined,
+        tasks,
+        recent: this.recentActivity.map((entry) => ({ title: entry.title, event: entry.event })),
+      }, this.input.config);
+      if (rendered.component) {
+        ctx.ui.setWidget("review-gate-subtasks", rendered.component, { placement: "belowEditor" });
+      } else {
+        ctx.ui.setWidget("review-gate-subtasks", rendered.lines, { placement: "belowEditor" });
       }
-      if (live.length === 0 && !this.conflictGate) {
-        ctx.ui.setWidget("review-gate-subtasks", undefined, { placement: "belowEditor" });
-        return;
-      }
-      const detail = this.conflictGate
-        ? `CRITICAL conflict: ${this.conflictGate.paths.join(", ")}`
-        : [
-            ...live.slice(0, 3).map((task) => `${task.definition.title} (${task.state === "queued"
-              ? this.runtimes.has(task.taskId) ? "queued: executor assigned/startup" : "queued: executor capacity wait"
-              : task.state})`),
-            ...(live.length > 3 ? [`+${live.length - 3} more`] : []),
-          ].join(", ");
-      ctx.ui.setWidget("review-gate-subtasks", [`⟳ ${live.length} background subtask${live.length === 1 ? "" : "s"} — ${detail}`], { placement: "belowEditor" });
     } catch {
       // UI surfaces are optional in print/headless harnesses.
     }
   }
 }
 
-function clipActivity(value: string, max = 180): string {
-  const compact = value.replace(/\s+/g, " ").trim();
-  return compact.length <= max ? compact : `${compact.slice(0, Math.max(1, max - 1))}…`;
-}
-
-function formatWatchEvent(inspections: BackgroundInspection[], config: ReviewGateConfig): string {
+/**
+ * Watch-checkpoint event text (controller-owned; finding 14 keeps event
+ * formatting here). Exported for focused regression tests only.
+ */
+export function formatWatchEvent(inspections: BackgroundInspection[], config: ReviewGateConfig): string {
   const lines = [
     "[pi-review-subtask-watch]",
     inspections.length === 1
@@ -2622,30 +2466,6 @@ function formatResearchCompletion(taskId: string, report: string, reportPath: st
   if (declaredSummary) lines.push(declaredSummary);
   else lines.push("No bounded standalone summary was supplied; read the full report when its details are needed for synthesis.");
   return lines.join("\n");
-}
-
-function executorDisplayLabel(task: BackgroundTaskRecord, config: ReviewGateConfig, kind: BackgroundTaskKind = "execute"): string {
-  if (!task.executorEntryId) return "executor pending";
-  const entry = resolvedWorkerRoute(config, kind).find((candidate) => candidate.entryId === task.executorEntryId)
-    ?? resolvedWorkerResources(config).find((candidate) => candidate.entryId === task.executorEntryId);
-  if (!entry) return task.executorEntryId;
-  if (entry.selection.source === "pi") return entry.selection.model;
-  const externalId = entry.selection.id;
-  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === externalId);
-  return agent && "model" in agent && typeof agent.model === "string" && agent.model
-    ? agent.model
-    : externalId;
-}
-
-function liveViewComponent(lines: readonly string[]): { render(width: number): string[]; invalidate(): void } {
-  return {
-    render: (width) => lines.map((line) => clipWidgetLine(line, Math.max(1, width))),
-    invalidate() {},
-  };
-}
-
-function clipWidgetLine(value: string, width: number): string {
-  return value.length <= width ? value : `${value.slice(0, Math.max(1, width - 1))}…`;
 }
 
 /** Curated, bounded failure diagnostic delivered with wake failure notifications (L8). */
@@ -2839,24 +2659,6 @@ function stateTransitionNotice(
   return undefined;
 }
 
-function newTask(definition: BackgroundTaskDefinition): BackgroundTaskRecord {
-  const now = new Date().toISOString();
-  return {
-    taskId: `task-${randomUUID()}`,
-    definition: JSON.parse(JSON.stringify(definition)) as BackgroundTaskDefinition,
-    state: "queued",
-    createdAt: now,
-    updatedAt: now,
-    generation: 0,
-    activity: [],
-    nextActivitySequence: 1,
-    stateHistory: [{ sequence: 1, state: "queued", at: now, generation: 0 }],
-    nextStateSequence: 2,
-    timingAccumulator: emptyTimingAccumulator(now),
-    commands: [],
-  };
-}
-
 function researchTaskDefinition(definition: BackgroundTaskDefinition): BackgroundTaskDefinition {
   return {
     ...definition,
@@ -2893,195 +2695,12 @@ function researchWorktree(capture: WaveCaptureResult, taskId: string): WorkerWor
   };
 }
 
-function transitionTaskState(task: BackgroundTaskRecord, next: BackgroundTaskState, at = new Date().toISOString()): BackgroundTaskState {
-  const previous = task.state;
-  task.updatedAt = at;
-  if (previous === next) return previous;
-  const timing = ensureTimingAccumulator(task);
-  accumulateStateDuration(timing, previous, timing.stateEnteredAt, at);
-  timing.stateEnteredAt = at;
-  timing.terminalAt = isActiveTaskState(next) ? undefined : at;
-  task.stateHistory ??= [{ sequence: 1, state: previous, at: task.createdAt, generation: task.generation }];
-  task.nextStateSequence ??= (task.stateHistory.at(-1)?.sequence ?? 0) + 1;
-  task.state = next;
-  task.stateHistory.push({ sequence: task.nextStateSequence++, state: next, at, generation: task.generation });
-  if (task.stateHistory.length > MAX_STATE_HISTORY) task.stateHistory.splice(0, task.stateHistory.length - MAX_STATE_HISTORY);
-  return previous;
-}
-
-function taskTiming(task: BackgroundTaskRecord, now = Date.now()): BackgroundTaskTimingSummary {
-  const timing = ensureTimingAccumulator(task);
-  const totals = {
-    queueMs: timing.queueMs,
-    captureMs: timing.captureMs,
-    executionMs: timing.executionMs,
-    reviewMs: timing.reviewMs,
-    landingMs: timing.landingMs,
-  };
-  if (isActiveTaskState(task.state)) accumulateStateDuration(totals, task.state, timing.stateEnteredAt, now);
-  const terminalAt = !isActiveTaskState(task.state) ? Date.parse(timing.terminalAt ?? task.updatedAt) : now;
-  const createdAt = Date.parse(task.createdAt);
-  return {
-    ...totals,
-    totalMs: Number.isFinite(createdAt) && Number.isFinite(terminalAt) ? Math.max(0, terminalAt - createdAt) : 0,
-  };
-}
-
-function emptyTimingAccumulator(stateEnteredAt: string): BackgroundTaskTimingAccumulator {
-  return { queueMs: 0, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0, stateEnteredAt };
-}
-
-function ensureTimingAccumulator(task: BackgroundTaskRecord): BackgroundTaskTimingAccumulator {
-  if (task.timingAccumulator) return task.timingAccumulator;
-  const history = task.stateHistory?.length
-    ? task.stateHistory
-    : [{ sequence: 1, state: task.state, at: task.createdAt, generation: task.generation }];
-  const timing = emptyTimingAccumulator(history[0]?.at ?? task.createdAt);
-  for (let index = 0; index < history.length - 1; index += 1) {
-    const transition = history[index]!;
-    accumulateStateDuration(timing, transition.state, transition.at, history[index + 1]!.at);
-  }
-  timing.stateEnteredAt = history.at(-1)?.at ?? task.updatedAt;
-  timing.terminalAt = isActiveTaskState(task.state) ? undefined : timing.stateEnteredAt;
-  task.timingAccumulator = timing;
-  return timing;
-}
-
-function accumulateStateDuration(
-  totals: Pick<BackgroundTaskTimingAccumulator, "queueMs" | "captureMs" | "executionMs" | "reviewMs" | "landingMs">,
-  state: BackgroundTaskState,
-  startAt: string,
-  endAt: string | number,
-): void {
-  if (!isActiveTaskState(state)) return;
-  const start = Date.parse(startAt);
-  const end = typeof endAt === "number" ? endAt : Date.parse(endAt);
-  const elapsed = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : 0;
-  if (state === "queued") totals.queueMs += elapsed;
-  else if (state === "capturing") totals.captureMs += elapsed;
-  else if (state === "running") totals.executionMs += elapsed;
-  else if (state === "reviewing") totals.reviewMs += elapsed;
-  else totals.landingMs += elapsed;
-}
-
-function appendActivity(task: BackgroundTaskRecord, phase: string, message: string): BackgroundActivityEvent | undefined {
-  if (task.activity.at(-1)?.message === message) return undefined;
-  const event = { sequence: task.nextActivitySequence++, at: new Date().toISOString(), phase, message };
-  task.activity.push(event);
-  task.updatedAt = event.at;
-  if (task.activity.length > MAX_ACTIVITY) task.activity.splice(0, task.activity.length - MAX_ACTIVITY);
-  return event;
-}
-
-export function stateFromWaveProgress(update: WaveProgressUpdate): BackgroundTaskState | undefined {
-  if (update.phase === "capturing") return "capturing";
-  if (update.phase === "integrating" || update.phase === "planning") return "waiting_to_land";
-  if (update.phase === "landing") return "landing";
-  if (update.phase === "completed" || update.phase === "aborted" || update.phase === "settling") return undefined;
-  const phase = update.subtask?.phase ?? update.taskStatuses?.[0]?.phase;
-  const workerState = stateFromWorkerProgressPhase(phase);
-  if (workerState) return workerState;
-  if (update.phase === "working" && (phase === "accepted" || phase === "accepted_with_warnings" || phase === "completed_unreviewed" || phase === "no_changes")) return "accepted";
-  return undefined;
-}
-
-export function stateFromContinuationProgress(update: ContinuationProgressUpdate): BackgroundTaskState {
-  if (update.phase === "accepted") return "accepted";
-  if (update.phase === "integrating") return "waiting_to_land";
-  if (update.phase === "landing") return "landing";
-  return stateFromWorkerProgressPhase(update.phase) ?? "running";
-}
-
-function stateFromWorkerProgressPhase(phase: SubtaskProgressPhase | string | undefined): BackgroundTaskState | undefined {
-  if (phase === "reviewing") return "reviewing";
-  if (phase === "starting" || phase === "executing" || phase === "correcting" || phase === "confirming" || phase === "completing") return "running";
-  return undefined;
-}
-
-function isStoppedForExit(task: BackgroundTaskRecord): boolean {
-  return task.state === "stopped_for_application_exit";
-}
-
 async function continuationEntryId(task: BackgroundTaskRecord): Promise<string | undefined> {
   if (task.executorEntryId) return task.executorEntryId;
   if (!task.bundle) return undefined;
   const inspection = await inspectOperation(task.bundle);
   const operation = await readOperationRecord(inspection.record.artifactDir + "/operation.json");
   return operation.assignments.at(-1)?.entryId;
-}
-
-async function readGroup(root: string): Promise<ReadGroupResult> {
-  const resolved = await realpath(resolve(root));
-  if (!basename(resolved).startsWith("pi-review-execution-")) throw new Error("Invalid background execution root.");
-  const parsed = JSON.parse(await readFile(join(resolved, "execution.json"), "utf8")) as PersistedBackgroundExecutionGroup;
-  if ((parsed.version !== GROUP_VERSION && parsed.version !== LEGACY_GROUP_VERSION) || parsed.root !== resolved || !parsed.executionId || !Array.isArray(parsed.tasks)) {
-    throw new Error("Invalid background execution manifest.");
-  }
-  const { integritySha256, ...unsigned } = parsed;
-  const actual = createHash("sha256").update(JSON.stringify({ ...unsigned, integritySha256: undefined })).digest("hex");
-  if (!integritySha256 || integritySha256 !== actual) throw new Error("Background execution manifest failed its integrity check.");
-  const archives = new Map<string, { updatedAt: string; integritySha256: string }>();
-  const tasks: BackgroundTaskRecord[] = [];
-  for (const persistedTask of parsed.tasks) {
-    const task = isArchivedTaskReference(persistedTask)
-      ? await readTaskArchive(resolved, persistedTask)
-      : persistedTask;
-    delete (task as BackgroundTaskRecord & { matchedWakePatterns?: string[] }).matchedWakePatterns;
-    delete (task.definition as BackgroundTaskDefinition & { wakeOn?: unknown }).wakeOn;
-    normalizeTaskHistory(task);
-    tasks.push(task);
-    if (isArchivedTaskReference(persistedTask)) {
-      archives.set(task.taskId, { updatedAt: task.updatedAt, integritySha256: persistedTask.archiveIntegritySha256 });
-    }
-  }
-  const group = {
-    ...parsed,
-    version: GROUP_VERSION,
-    tasks,
-    kind: parsed.kind ?? (tasks.some((task) => task.definition.backgroundKind === "research") ? "research" : "execute"),
-    peakConcurrency: parsed.peakConcurrency ?? 0,
-  } as BackgroundExecutionGroup;
-  return { group, archives };
-}
-
-function isArchivedTaskReference(task: BackgroundTaskRecord | ArchivedBackgroundTaskReference): task is ArchivedBackgroundTaskReference {
-  return "archived" in task && task.archived === true;
-}
-
-async function readTaskArchive(root: string, reference: ArchivedBackgroundTaskReference): Promise<BackgroundTaskRecord> {
-  const expectedPath = taskArchivePath(reference.taskId);
-  if (reference.archivePath !== expectedPath) throw new Error(`Invalid archive path for task ${reference.taskId}.`);
-  const parsed = JSON.parse(await readFile(join(root, expectedPath), "utf8")) as PersistedBackgroundTaskArchive;
-  if (parsed.version !== TASK_ARCHIVE_VERSION || parsed.taskId !== reference.taskId || parsed.task?.taskId !== reference.taskId) {
-    throw new Error(`Invalid background task archive for ${reference.taskId}.`);
-  }
-  const { integritySha256, ...unsigned } = parsed;
-  const actual = createHash("sha256").update(JSON.stringify(unsigned)).digest("hex");
-  if (!integritySha256 || integritySha256 !== actual || integritySha256 !== reference.archiveIntegritySha256) {
-    throw new Error(`Background task archive failed its integrity check: ${reference.taskId}.`);
-  }
-  if (!isArchivableTaskState(parsed.task.state) || parsed.task.state !== reference.state) {
-    throw new Error(`Background task archive state does not match its execution manifest: ${reference.taskId}.`);
-  }
-  return parsed.task;
-}
-
-async function removeOwnedWaveRoot(root: string): Promise<void> {
-  const resolved = resolve(root);
-  const temporaryRoot = await realpath(resolve(tmpdir()));
-  if (!basename(resolved).startsWith("wave-") || dirname(resolved) !== temporaryRoot) {
-    throw new Error(`Refusing to remove unrecognized wave root: ${resolved}`);
-  }
-  await rm(resolved, { recursive: true, force: true });
-}
-
-async function removeOwnedExecutionRoot(root: string): Promise<void> {
-  const resolved = resolve(root);
-  const temporaryRoot = await realpath(resolve(tmpdir()));
-  if (!basename(resolved).startsWith("pi-review-execution-") || dirname(resolved) !== temporaryRoot) {
-    throw new Error(`Refusing to remove unrecognized execution root: ${resolved}`);
-  }
-  await rm(resolved, { recursive: true, force: true });
 }
 
 function selectiveCheckpoint(
@@ -3109,45 +2728,6 @@ function parentChanged(a: FileSnapshot | undefined, b: FileSnapshot | undefined)
   if (!a && !b) return false;
   if (!a || !b) return true;
   return a.content !== b.content || a.sha256 !== b.sha256 || a.isBinary !== b.isBinary;
-}
-
-function isArchivableTaskState(state: BackgroundTaskState): state is "landed" | "reported" {
-  return state === "landed" || state === "reported";
-}
-
-function taskArchivePath(taskId: string): string {
-  return join("tasks", `${taskId}.json`);
-}
-
-function createTaskArchive(task: BackgroundTaskRecord): { snapshot: PersistedBackgroundTaskArchive } {
-  const unsigned = {
-    version: TASK_ARCHIVE_VERSION as 1,
-    taskId: task.taskId,
-    archivedAt: new Date().toISOString(),
-    task: cloneTask(task),
-  };
-  const snapshot: PersistedBackgroundTaskArchive = {
-    ...unsigned,
-    integritySha256: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex"),
-  };
-  return { snapshot };
-}
-
-function normalizeTaskHistory(task: BackgroundTaskRecord): void {
-  task.activity ??= [];
-  task.commands ??= [];
-  if (task.activity.length > MAX_ACTIVITY) task.activity.splice(0, task.activity.length - MAX_ACTIVITY);
-  task.nextActivitySequence = Math.max(task.nextActivitySequence ?? 1, (task.activity.at(-1)?.sequence ?? 0) + 1);
-  if (!Array.isArray(task.stateHistory) || task.stateHistory.length === 0) {
-    task.stateHistory = [{ sequence: 1, state: task.state, at: task.createdAt, generation: task.generation }];
-  }
-  ensureTimingAccumulator(task);
-  if (task.stateHistory.length > MAX_STATE_HISTORY) task.stateHistory.splice(0, task.stateHistory.length - MAX_STATE_HISTORY);
-  task.nextStateSequence = Math.max(task.nextStateSequence ?? 1, (task.stateHistory.at(-1)?.sequence ?? 0) + 1);
-}
-
-function cloneTask(task: BackgroundTaskRecord): BackgroundTaskRecord {
-  return JSON.parse(JSON.stringify(task)) as BackgroundTaskRecord;
 }
 
 function messageOf(error: unknown): string {

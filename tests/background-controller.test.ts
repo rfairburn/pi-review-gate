@@ -13,7 +13,9 @@ import {
   type BackgroundExecutionGroup,
   type BackgroundFaultHooks,
   type BackgroundInspection,
+  type BackgroundStateTransition,
   type BackgroundTaskRecord,
+  formatWatchEvent,
 } from "../src/execution/background-controller";
 import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
 import { sourceMutationCoordinator } from "../src/execution/source-mutation-lease";
@@ -2577,4 +2579,101 @@ test("quiet and noisy subtask notification modes both retain actionable wake fai
       await cleanup();
     }
   }
+});
+
+// ── Watch-checkpoint event formatting (controller-owned; finding 14 boundary) ──
+
+const watchConfig = normalizeConfig({
+  enabled: true,
+  review: { activeReviewers: [] },
+  externalAgents: [{
+    id: "fake",
+    adapter: "run-as-binary",
+    command: process.execPath,
+    execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+  }],
+  execution: {
+    executorPool: [
+      { entryId: "pi-entry", selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1 },
+      { entryId: "external-fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
+    ],
+  },
+});
+
+test("formatWatchEvent renders a bounded checkpoint report for active tasks only", () => {
+  const now = Date.now();
+  const inspection = {
+    executionId: "exec-1",
+    kind: "execute",
+    revision: 7,
+    tasks: [
+      {
+        taskId: "task-1",
+        definition: { title: "Task one" },
+        state: "running",
+        updatedAt: new Date(now - 5000).toISOString(),
+        executorEntryId: "pi-entry",
+        activity: [{ sequence: 3, at: new Date(now - 30_000).toISOString(), phase: "executing", message: "progress ".repeat(40) }],
+        timing: { queueMs: 1000, captureMs: 2000, executionMs: 90_000, reviewMs: 0, landingMs: 0, totalMs: 93_000 },
+        liveControl: { steer: true },
+      },
+      {
+        taskId: "task-2",
+        definition: { title: "Landed task" },
+        state: "landed",
+        updatedAt: new Date(now - 5000).toISOString(),
+        activity: [],
+        timing: { queueMs: 0, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0, totalMs: 0 },
+      },
+    ],
+  };
+  const single = formatWatchEvent([inspection] as unknown as BackgroundInspection[], watchConfig);
+  assert.ok(single.startsWith("[pi-review-subtask-watch]"));
+  assert.ok(single.includes("The requested one-shot checkpoint for execution exec-1 is due while work remains active."));
+  assert.ok(single.includes("Execution exec-1: 1 active task(s), revision 7."));
+  assert.ok(single.includes("- task-1 · Task one · running · gpt-x"));
+  assert.ok(single.includes("elapsed 1m33s;"));
+  assert.ok(single.includes("last recorded activity 30s ago;"));
+  assert.ok(single.includes("controls: inspect yes, steer yes (live yes), interrupt yes"));
+  assert.ok(single.includes("recent: executing · "));
+  assert.ok(!single.includes("landed task") && !single.includes("Landed task"));
+
+  const both = formatWatchEvent([inspection, { ...inspection, executionId: "exec-2" }] as unknown as BackgroundInspection[], watchConfig);
+  assert.ok(both.includes("2 requested one-shot subtask checkpoints became due together"));
+  assert.ok(both.includes("Execution exec-2:"));
+});
+
+test("formatWatchEvent falls back to updated time and the raw executor entry id", () => {
+  const now = Date.now();
+  const inspection = {
+    executionId: "exec-3",
+    kind: "research",
+    revision: 1,
+    tasks: [{
+      taskId: "task-9",
+      definition: { title: "Research one" },
+      state: "queued",
+      updatedAt: new Date(now - 125_000).toISOString(),
+      executorEntryId: "unknown-entry",
+      activity: [],
+      timing: { queueMs: 5000, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0, totalMs: 5000 },
+    }],
+  };
+  const text = formatWatchEvent([inspection] as unknown as BackgroundInspection[], watchConfig);
+  assert.ok(text.includes("Research exec-3: 1 active task(s), revision 1."));
+  assert.ok(text.includes("- task-9 · Research one · queued · unknown-entry"));
+  assert.ok(text.includes("elapsed 5s;"));
+  assert.ok(text.includes("last recorded activity 2m5s ago;"));
+  assert.ok(text.includes("interrupt yes"));
+  assert.ok(text.includes("recent: no recorded activity yet"));
+});
+
+test("BackgroundStateTransition remains exported from background-controller (compile-time probe)", () => {
+  const transition: BackgroundStateTransition = {
+    sequence: 1,
+    state: "queued",
+    at: "2024-01-01T00:00:00.000Z",
+    generation: 0,
+  };
+  assert.equal(transition.state, "queued");
 });

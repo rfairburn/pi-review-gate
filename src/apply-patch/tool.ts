@@ -347,9 +347,19 @@ export async function performApplyPatchOperation(
   };
 }
 
+type ApplyPatchThemeColor =
+  | "accent"
+  | "error"
+  | "muted"
+  | "success"
+  | "toolDiffAdded"
+  | "toolDiffContext"
+  | "toolDiffRemoved"
+  | "toolTitle";
+
 export interface ApplyPatchRendererTheme {
   bold(text: string): string;
-  fg(color: string, text: string): string;
+  fg(color: ApplyPatchThemeColor, text: string): string;
 }
 
 export function renderApplyPatchCall(args: unknown, theme: ApplyPatchRendererTheme): unknown {
@@ -390,14 +400,18 @@ export function renderApplyPatchResult(value: unknown, _options: unknown, theme:
 function renderDiffBlock(diff: string, maxLines: number, label: string, width: number, theme: ApplyPatchRendererTheme): string[] {
   const diffLines = diff.split("\n").filter((line) => line.length > 0);
   if (diffLines.length === 0) return [];
-  const lines = [clip(theme.fg("secondary", theme.bold(label)), width)];
+  const lines = [clip(theme.fg("muted", theme.bold(label)), width)];
   const shown = diffLines.slice(0, maxLines);
   for (const line of shown) {
-    const prefix = line.startsWith("+") ? "diffAdded" : line.startsWith("-") ? "diffRemoved" : "secondary";
-    lines.push(clip(theme.fg(prefix, line), width));
+    const color = line.startsWith("+")
+      ? "toolDiffAdded"
+      : line.startsWith("-")
+        ? "toolDiffRemoved"
+        : "toolDiffContext";
+    lines.push(clip(theme.fg(color, line), width));
   }
   if (diffLines.length > shown.length) {
-    lines.push(clip(theme.fg("secondary", `… ${diffLines.length - shown.length} more diff line(s)`), width));
+    lines.push(clip(theme.fg("muted", `… ${diffLines.length - shown.length} more diff line(s)`), width));
   }
   return lines;
 }

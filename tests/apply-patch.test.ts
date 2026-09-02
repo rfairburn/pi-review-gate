@@ -696,10 +696,16 @@ test("symlink escapes and symlinked targets are rejected without following them"
 // Sequential declaration, rendering, evidence, and abort behavior
 // ---------------------------------------------------------------------------
 
-test("ApplyPatch renders compact call and result summaries with diff detail", () => {
+test("ApplyPatch renders compact call and result summaries with supported theme colors and diff detail", () => {
+  const supportedColors = new Set([
+    "accent", "error", "muted", "success", "toolDiffAdded", "toolDiffContext", "toolDiffRemoved", "toolTitle",
+  ]);
   const theme = {
     bold: (text: string) => `B(${text})`,
-    fg: (color: string, text: string) => `F(${color})[${text}]`,
+    fg: (color: string, text: string) => {
+      assert.ok(supportedColors.has(color), `unsupported theme color: ${color}`);
+      return `F(${color})[${text}]`;
+    },
   };
   const call = renderApplyPatchCall(
     { operation: { type: "update_file", path: "src/app.ts", moveTo: "src/main.ts", diff: "-a" } },
@@ -719,9 +725,9 @@ test("ApplyPatch renders compact call and result summaries with diff detail", ()
   const lines = rendered.render(160);
   assert.match(lines[0], /updated src\/app\.ts/);
   assert.match(lines.join("\n"), /Requested diff:/);
-  assert.match(lines.join("\n"), /diffRemoved\)\[-one\]/);
-  assert.match(lines.join("\n"), /diffAdded\)\[\+uno\]/);
-  assert.match(lines.join("\n"), / two/);
+  assert.match(lines.join("\n"), /toolDiffRemoved\)\[-one\]/);
+  assert.match(lines.join("\n"), /toolDiffAdded\)\[\+uno\]/);
+  assert.match(lines.join("\n"), /toolDiffContext\)\[ two\]/);
 
   // Moves render the bounded final diff with rename from/to headers.
   const moveRendered = renderApplyPatchResult({
@@ -755,7 +761,7 @@ test("ApplyPatch renders compact call and result summaries with diff detail", ()
   }, {}, theme) as { render(width: number): string[] };
   const deleteLines = deleteRendered.render(200).join("\n");
   assert.match(deleteLines, /Final diff:/);
-  assert.match(deleteLines, /diffRemoved\)\[-bye\]/);
+  assert.match(deleteLines, /toolDiffRemoved\)\[-bye\]/);
   assert.doesNotMatch(deleteLines, /Requested diff:/);
 
   // Long diffs are bounded with a truncation note.

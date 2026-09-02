@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -220,6 +220,110 @@ test("settled tasks move to bounded archives and restore through stable task han
     await controller?.shutdown().catch(() => undefined);
     for (const owned of ownedRoots) await rm(owned, { recursive: true, force: true }).catch(() => undefined);
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restore rejects cross-cwd groups before their archive metadata reaches controller state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-cwd-restore-"));
+  const fixtureRoots: string[] = [];
+  try {
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+    const collidingTaskId = "task-collide-cwd-restore";
+    const collidingUpdatedAt = "2024-01-01T00:00:00.000Z";
+    const collidingCreatedAt = "2023-12-31T23:59:00.000Z";
+
+    const validRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
+    const mismatchedRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
+    const malformedRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
+    const foreignWorkspace = await realpath(await mkdtemp(join(tmpdir(), "pi-review-cwd-foreign-")));
+    fixtureRoots.push(validRoot, mismatchedRoot, malformedRoot, foreignWorkspace);
+
+    // Both groups persist an archived task with the SAME task id and updatedAt
+    // but different archive bodies (and therefore different integrity hashes).
+    const validTask = collidingTaskRecord(collidingTaskId, collidingCreatedAt, collidingUpdatedAt, "valid archive body");
+    const mismatchedTask = collidingTaskRecord(collidingTaskId, collidingCreatedAt, collidingUpdatedAt, "mismatched archive body");
+    await writePersistedExecutionGroup(validRoot, root, "exec-cwd-valid", validTask);
+    await writePersistedExecutionGroup(mismatchedRoot, foreignWorkspace, "exec-cwd-mismatched", mismatchedTask);
+    await writeFile(join(malformedRoot, "execution.json"), "{not json", "utf8");
+
+    const validArchivePath = join(validRoot, "tasks", `${collidingTaskId}.json`);
+    const validArchiveBefore = await readFile(validArchivePath, "utf8");
+    const validManifestPath = join(validRoot, "execution.json");
+    const validManifestBefore = await readFile(validManifestPath, "utf8");
+
+    const notifications: string[] = [];
+    const restored = new BackgroundExecutionController({
+      pi: {},
+      config,
+      state: createState(),
+      cwd: () => root,
+      notify: (message) => {
+        notifications.push(message);
+      },
+    });
+    try {
+      await restored.restore({
+        waveRoots: [],
+        bundles: [],
+        groupRoots: [validRoot, mismatchedRoot, malformedRoot],
+      });
+
+      // Fail-closed behavior: the cross-cwd and malformed groups are rejected...
+      assert.ok(notifications.some((message) => message.includes(mismatchedRoot) && /was not restored/.test(message)));
+      assert.ok(notifications.some((message) => message.includes(malformedRoot) && /was not restored/.test(message)));
+      assert.throws(() => restored.inspect("exec-cwd-mismatched"), /Unknown execution group/);
+      // ...while the valid same-cwd group still restores.
+      assert.deepEqual(restored.associations().groupRoots, [validRoot]);
+      const validInspection = restored.inspect("exec-cwd-valid");
+      assert.equal(validInspection.tasks.length, 1);
+      assert.equal(validInspection.tasks[0]?.taskId, collidingTaskId);
+      assert.equal(validInspection.tasks[0]?.state, "landed");
+      assert.equal(validInspection.tasks[0]?.summary, "valid archive body");
+
+      // The rejected group must not leave archive metadata behind: colliding
+      // task id + matching updatedAt must not let the foreign archive hash win.
+      // Touching the valid group forces a re-save; a contaminated controller
+      // would persist the foreign archiveIntegritySha256 without rewriting the
+      // archive file, corrupting the persisted manifest.
+      await restored.add("exec-cwd-valid", [{
+        title: "contamination trigger",
+        instructions: "force a save of the restored group",
+        acceptanceCriteria: ["done"],
+      }]);
+      const manifestAfter = JSON.parse(await readFile(validManifestPath, "utf8")) as {
+        tasks: Array<{ archived?: boolean; taskId: string; archiveIntegritySha256?: string }>;
+      };
+      const reference = manifestAfter.tasks.find((task) => task.taskId === collidingTaskId)!;
+      assert.ok(reference.archived, "archived task stays archived after re-save");
+      const archiveOnDisk = JSON.parse(await readFile(validArchivePath, "utf8")) as { integritySha256: string };
+      assert.equal(
+        reference.archiveIntegritySha256,
+        archiveOnDisk.integritySha256,
+        "persisted archive reference must keep the valid group's own archive hash",
+      );
+      assert.equal(await readFile(validArchivePath, "utf8"), validArchiveBefore);
+      assert.notEqual(await readFile(validManifestPath, "utf8"), validManifestBefore);
+
+      // The rewritten manifest still restores cleanly for the valid group.
+      await restored.shutdown();
+      await restored.detach();
+      const reread = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+      try {
+        await reread.restore({ waveRoots: [], bundles: [], groupRoots: [validRoot] });
+        assert.deepEqual(notifications.filter((message) => message.includes(validRoot) && /was not restored/.test(message)), []);
+        const rereadInspection = reread.inspect("exec-cwd-valid");
+        assert.equal(rereadInspection.tasks[0]?.state, "landed");
+      } finally {
+        await reread.shutdown().catch(() => undefined);
+        await reread.detach().catch(() => undefined);
+      }
+    } finally {
+      await restored.shutdown().catch(() => undefined);
+      await restored.detach().catch(() => undefined);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    for (const owned of fixtureRoots) await rm(owned, { recursive: true, force: true }).catch(() => undefined);
   }
 });
 
@@ -1842,6 +1946,66 @@ async function waitForAsync(predicate: () => Promise<boolean>, timeoutMs = 15_00
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
   }
   throw new Error("timed out waiting for asynchronous background task state");
+}
+
+function collidingTaskRecord(taskId: string, createdAt: string, updatedAt: string, summary: string): BackgroundTaskRecord {
+  return {
+    taskId,
+    definition: { title: "colliding archived task", instructions: "shared work", acceptanceCriteria: ["done"] },
+    state: "landed",
+    createdAt,
+    updatedAt,
+    generation: 0,
+    summary,
+    activity: [],
+    nextActivitySequence: 1,
+    stateHistory: [{ sequence: 1, state: "queued", at: createdAt, generation: 0 }],
+    nextStateSequence: 2,
+    commands: [],
+  };
+}
+
+async function writePersistedExecutionGroup(
+  groupRoot: string,
+  groupCwd: string,
+  executionId: string,
+  task: BackgroundTaskRecord,
+): Promise<void> {
+  const archiveUnsigned = {
+    version: 1 as const,
+    taskId: task.taskId,
+    archivedAt: task.updatedAt,
+    task,
+  };
+  const archiveIntegritySha256 = createHash("sha256").update(JSON.stringify(archiveUnsigned)).digest("hex");
+  const reference = {
+    archived: true,
+    taskId: task.taskId,
+    title: task.definition.title,
+    state: task.state as "landed",
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    summary: task.summary,
+    timing: { queueMs: 1, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0, totalMs: 0 },
+    archivePath: join("tasks", `${task.taskId}.json`),
+    archiveIntegritySha256,
+  };
+  const unsigned = {
+    version: 2 as const,
+    revision: 0,
+    executionId,
+    kind: "execute" as const,
+    root: groupRoot,
+    cwd: groupCwd,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    peakConcurrency: 1,
+    tasks: [reference],
+  };
+  const snapshot = { ...unsigned, integritySha256: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex") };
+  await mkdir(join(groupRoot, "tasks"), { recursive: true });
+  await writeFile(join(groupRoot, "tasks", `${task.taskId}.json`), `${JSON.stringify({ ...archiveUnsigned, integritySha256: archiveIntegritySha256 }, null, 2)}\n`, "utf8");
+  await writeFile(join(groupRoot, "execution.json"), `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
 }
 
 function renderWidget(content: unknown, width = 240): string[] {

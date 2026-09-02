@@ -418,10 +418,10 @@ export class BackgroundExecutionController {
       try {
         const restored = await readGroup(root);
         const group = restored.group;
-        for (const [taskId, archive] of restored.archives) this.archivedTasks.set(taskId, archive);
         if (resolve(group.cwd) !== resolve(this.input.cwd())) {
           throw new Error(`execution cwd ${group.cwd} does not match ${resolve(this.input.cwd())}`);
         }
+        for (const [taskId, archive] of restored.archives) this.archivedTasks.set(taskId, archive);
         for (const task of group.tasks) {
           if (task.state === "stopped_for_application_exit" && task.bundle) {
             const instructionId = `application-resume-${randomUUID()}`;

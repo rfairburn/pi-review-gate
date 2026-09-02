@@ -639,9 +639,12 @@ Test status: caps/archiving tested; soak test missing.
   landing path. Aborted coordinator waiters now prune their settled lease tails even though no
   release callback was returned. Focused conflict-gate, held-lease interrupt/shutdown, no-mutation,
   command-status, and tail-cleanup tests pass (27/27 with the controller and coordinator suites).
-- L2. `restore()` merges `restored.archives` into `this.archivedTasks` **before** the
-  cwd-mismatch validation throws (`background-controller.ts:370-374`) — cross-contaminates
-  archive hashes across workspaces. Validate cwd before merging.
+- L2. **RESOLVED (2026-09-02):** `restore()` now validates each persisted group's cwd
+  before merging any of its archive metadata into controller-global state. A cross-cwd or
+  malformed group remains rejected without contaminating archive hashes used by a valid group.
+  A collision regression restores valid, mismatched, and malformed groups together, forces the
+  valid group through another save, verifies its archive bytes/hash and second restore, and
+  confirms rejected groups never become inspectable. The focused controller suite passes 25/25.
 - L3. **RESOLVED (2026-09-02):** the launcher still sanitizes and re-resolves inherited
   `PI_REVIEW_GATE_CONFIG`, but now preserves the documented `PI_REVIEW_GATE_DISABLED` kill
   switch, forwards it to Pi, and prints a clear non-activation notice for the same truthy values

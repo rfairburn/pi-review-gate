@@ -670,6 +670,19 @@ export async function activate(pi: unknown): Promise<void> {
         await reviewAbort.notifyCancellation();
       }
       state.reviewInProgress = false;
+      // Restored sessions may hold queued-input ledger entries without durable
+      // delivery records; reconcile them before counting so every entry that is
+      // cleared below is also counted. Deliveries already in flight
+      // (dispatching/uncertain) are never counted as definitely dropped.
+      if (backfillLegacyQueuedInputDeliveries(state)) {
+        await persistSessionState();
+      }
+      // Count the queued user inputs that are deliberately dropped with this
+      // cancellation so the notice below never invents or leaks content. The
+      // count is computed before the deliveries below are cancelled and the
+      // queued-input ledger is cleared.
+      const droppedInputCount = state.pendingModelDeliveries.filter((delivery) =>
+        delivery.kind === "queued_user_input" && delivery.status === "queued").length;
       for (const delivery of state.pendingModelDeliveries) {
         if (delivery.kind === "queued_user_input" && delivery.status === "queued") {
           delivery.status = "cancelled";
@@ -677,6 +690,19 @@ export async function activate(pi: unknown): Promise<void> {
         }
       }
       state.queuedUserInputsDuringReview.splice(0);
+      // Make the cancellation durable immediately: cancelled deliveries must
+      // never be re-dispatched by a later restore, and the cleared ledger must
+      // not be resurrected.
+      await persistSessionState();
+      if (droppedInputCount > 0) {
+        // Explicit count-only notice: dropped input is never resent
+        // automatically and its content is never echoed.
+        await sendNoticeWhileSessionActive(
+          noticeTarget,
+          `review gate: ${droppedInputCount} queued user input(s) were dropped when the review was cancelled and will not be sent automatically; resend them if still needed`,
+          () => sessionActive,
+        );
+      }
       return;
     }
 
@@ -1019,24 +1045,7 @@ async function releaseQueuedUserInputs(
   persist: () => void | Promise<void>,
 ): Promise<void> {
   state.reviewInProgress = false;
-  let queuedLegacyDelivery = false;
-  const queuedOccurrences = new Map<string, number>();
-  for (const message of state.queuedUserInputsDuringReview) {
-    const occurrence = (queuedOccurrences.get(message) ?? 0) + 1;
-    queuedOccurrences.set(message, occurrence);
-    const existing = state.pendingModelDeliveries.filter((delivery) =>
-      delivery.kind === "queued_user_input" && delivery.message === message && delivery.status !== "delivered").length;
-    if (existing >= occurrence) continue;
-    const sequence = state.pendingModelDeliveries.filter((delivery) => delivery.kind === "queued_user_input").length + 1;
-    queueModelDelivery(state, {
-      deliveryId: `queued-user-input:${state.reviewWindow?.id ?? "window"}:${sequence}`,
-      kind: "queued_user_input",
-      channel: "follow_up",
-      message,
-    });
-    queuedLegacyDelivery = true;
-  }
-  if (queuedLegacyDelivery) await persist();
+  if (backfillLegacyQueuedInputDeliveries(state)) await persist();
   for (const delivery of state.pendingModelDeliveries.filter((candidate) =>
     candidate.kind === "queued_user_input" && candidate.status !== "delivered" && candidate.status !== "cancelled")) {
     if (!isSessionActive()) return;
@@ -1055,6 +1064,33 @@ async function releaseQueuedUserInputs(
       return;
     }
   }
+}
+
+// Reconcile legacy queued-input ledger entries into durable queued_user_input
+// deliveries (occurrence-aware, matching releaseQueuedUserInputs dispatch
+// semantics). Returns true when any delivery record was backfilled.
+function backfillLegacyQueuedInputDeliveries(state: ReviewGateState): boolean {
+  let backfilled = false;
+  const queuedOccurrences = new Map<string, number>();
+  for (const message of state.queuedUserInputsDuringReview) {
+    const occurrence = (queuedOccurrences.get(message) ?? 0) + 1;
+    queuedOccurrences.set(message, occurrence);
+    const existing = state.pendingModelDeliveries.filter((delivery) =>
+      delivery.kind === "queued_user_input"
+      && delivery.message === message
+      && delivery.status !== "delivered"
+      && delivery.status !== "cancelled").length;
+    if (existing >= occurrence) continue;
+    const sequence = state.pendingModelDeliveries.filter((delivery) => delivery.kind === "queued_user_input").length + 1;
+    queueModelDelivery(state, {
+      deliveryId: `queued-user-input:${state.reviewWindow?.id ?? "window"}:${sequence}`,
+      kind: "queued_user_input",
+      channel: "follow_up",
+      message,
+    });
+    backfilled = true;
+  }
+  return backfilled;
 }
 
 type ReviewAbortReason = "parent" | "escape" | "manual" | "session_shutdown";

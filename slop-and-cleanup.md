@@ -460,19 +460,24 @@ Recommendation:
       receipts in one invocation and `:1843+` verifies an initial receipt; no test covers
       concurrent receipt writes or atomic-write failure.
 
-### 12. LOW-MEDIUM — Aborting a review silently discards queued user input (review pipeline)
+### 12. LOW-MEDIUM — RESOLVED (2026-09-02): Cancellation silently discarded queued user input
 
-Refs: `src/index.ts:642-652` (escape-abort marks queued `queued_user_input` deliveries
-`cancelled` and clears `queuedUserInputsDuringReview`); `notifyCancellation`
-(`:1060-1067`) sends only the generic "review gate: review cancelled" notice.
+**Root cause.** Escape and `/review-cancel` correctly cancelled durable queued-input deliveries
+and cleared the legacy input ledger, but their only user-facing message reported reviewer
+quiescence. Users therefore had no indication that mid-review guidance was deliberately dropped.
 
-Impact: user types guidance mid-review, presses Escape, and the guidance is dropped without
-explanation.
+**Fix.** The cancellation path now reconciles legacy ledger-only occurrences into active durable
+deliveries, treating stale delivered/cancelled records as non-matches, counts only deliveries
+still definitely `queued` (never `dispatching`/`uncertain`), marks them cancelled, clears the
+ledger, persists that state immediately, and emits one count-only notice telling the user the
+inputs will not be sent automatically and should be resent if needed. Input content is never
+echoed. Zero-drop cancellation remains quiet apart from the existing cancellation notices.
 
-Recommendation:
-- [ ] Include the dropped-input count (and a pointer to retype) in the cancellation notice.
-- [ ] Test status: `tests/commands.test.ts:222` covers abort mechanics but not the
-      dropped-input notice.
+**Tests.** Automatic Escape and `/review-cancel` tests assert a single count-only notice, no
+follow-up delivery, and no content leak. A restore regression covers a legacy queued ledger with
+no active delivery despite a stale cancelled same-text record, then verifies the reconciled
+record and cleared ledger remain durably cancelled. Command and Kitty-escape tests assert that
+zero-drop cancellation does not invent a drop notice.
 
 ### 13. MEDIUM — Maintainability: `BackgroundExecutionController` decomposition (updated)
 

@@ -1046,6 +1046,17 @@ test("escape terminal input aborts an active reviewer process", async () => {
     assert.doesNotMatch(notices.join("\n"), /reviewer failed/);
     assert.equal(followUps.length, 0);
     assert.equal(terminalHandlers.length, 0);
+    // The mid-review guidance was deliberately dropped with the cancellation:
+    // one bounded count-only notice, no input content, no follow-up delivery.
+    assert.equal(
+      notices.filter((notice) => notice.includes("were dropped when the review was cancelled")).length,
+      1,
+    );
+    assert.match(
+      notices.join("\n"),
+      /review gate: 1 queued user input\(s\) were dropped when the review was cancelled and will not be sent automatically; resend them if still needed/,
+    );
+    assert.doesNotMatch(notices.join("\n"), /do not continue with this/);
 
     await trigger(hooks, "input", { cwd: dir, text: "redirect after cancelling review", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
@@ -1182,6 +1193,10 @@ test("kitty CSI-u escape aborts an active reviewer process; release and modified
     });
     assert.match(notices.join("\n"), /review gate: review cancelled; reviewer processes stopped/);
     assert.equal(terminalHandlers.length, 0);
+    // No input was queued during the review, so no dropped-input notice may
+    // claim a drop.
+    assert.doesNotMatch(notices.join("\n"), /were dropped when the review was cancelled/);
+    assert.doesNotMatch(notices.join("\n"), /will not be sent automatically/);
 
     // The aborted invocation leaves the user-canceled tombstone artifact.
     await trigger(hooks, "input", { cwd: dir, text: "redirect after cancelling review", source: "user" });
@@ -1258,6 +1273,13 @@ test("/review-cancel stops an active automatic review and reports when no review
     const reviewerPid = Number(await readFile(pidPath, "utf8"));
     assert.doesNotThrow(() => process.kill(reviewerPid, 0));
 
+    // Type guidance mid-review; /review-cancel drops it deliberately, so the
+    // session must report the count without delivering or echoing the content.
+    assert.deepEqual(
+      await triggerResults(hooks, "input", { cwd: dir, text: "keep this guidance", source: "user" }),
+      [{ action: "handled" }],
+    );
+
     await commands.get("review-cancel")?.("", pi);
     await reviewPromise;
 
@@ -1269,6 +1291,15 @@ test("/review-cancel stops an active automatic review and reports when no review
       notices.filter((notice) => notice === "review gate: review cancelled; reviewer processes stopped").length,
       1,
     );
+    assert.equal(
+      notices.filter((notice) => notice.includes("were dropped when the review was cancelled")).length,
+      1,
+    );
+    assert.match(
+      notices.join("\n"),
+      /review gate: 1 queued user input\(s\) were dropped when the review was cancelled and will not be sent automatically; resend them if still needed/,
+    );
+    assert.doesNotMatch(notices.join("\n"), /keep this guidance/);
     await waitForCondition(() => {
       try {
         process.kill(reviewerPid, 0);
@@ -1280,6 +1311,137 @@ test("/review-cancel stops an active automatic review and reports when no review
 
     await commands.get("review-cancel")?.("", pi);
     assert.match(notices.join("\n"), /no active review to cancel/);
+  } finally {
+    reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy queued inputs without active delivery records are counted when a review is cancelled", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-legacy-queued-drop-"));
+
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const markerPath = join(dir, "reviewer-marker.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      decider: {
+        id: "slow",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
+        ],
+        timeoutMs: 300000,
+      },
+    }), "utf8");
+
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const sessionFile = join(dir, "legacy-conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const mkRuntime = (sessionId: string) => {
+      const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+      const notices: string[] = [];
+      const followUps: Array<{ message: string; options: unknown }> = [];
+      const terminalHandlers: Array<(input: unknown) => unknown> = [];
+      const pi = {
+        on(name: string, handler: (...args: unknown[]) => unknown) {
+          hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+        },
+        registerCommand() {},
+        notify(message: string) { notices.push(message); },
+        ui: {
+          notify(message: string) { notices.push(message); },
+          onTerminalInput(handler: (input: unknown) => unknown) {
+            terminalHandlers.push(handler);
+            return () => {
+              const index = terminalHandlers.indexOf(handler);
+              if (index >= 0) terminalHandlers.splice(index, 1);
+            };
+          },
+        },
+        sendUserMessage(message: string, options: unknown) { followUps.push({ message, options }); },
+      };
+      const ctx = {
+        cwd: dir,
+        ui: pi.ui,
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getSessionFile: () => sessionFile,
+          getCwd: () => dir,
+        },
+      };
+      return { hooks, notices, followUps, terminalHandlers, pi, ctx };
+    };
+
+    // First session: establish a review window with a baseline, then shut down.
+    const first = mkRuntime("legacy-conversation");
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: dir, text: "initial request", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+
+    // Rewrite the persisted state into a legacy/inconsistent shape: a queued-input
+    // ledger entry without an active durable delivery. A stale cancelled record
+    // for the same text must not hide the currently queued occurrence.
+    const store = new SessionStateStore({ sessionId: "legacy-conversation", sessionFile, cwd: dir });
+    const persistedState = await store.restore(dir);
+    assert.ok(persistedState);
+    persistedState.state.queuedUserInputsDuringReview = ["legacy mid-review direction"];
+    persistedState.state.pendingModelDeliveries = [];
+    const staleCancelledDelivery = queueModelDelivery(persistedState.state, {
+      deliveryId: "queued-user-input:old-window:1",
+      kind: "queued_user_input",
+      channel: "follow_up",
+      message: "legacy mid-review direction",
+    });
+    staleCancelledDelivery.status = "cancelled";
+    await store.save(persistedState.state, persistedState.execution);
+
+    // Resumed session: the legacy entry survives the restore (the recovery
+    // notice reports it), the automatic review runs, and Escape cancels it.
+    // The drop notice must count the legacy entry even though it has no
+    // delivery record, without ever echoing its content.
+    const resumed = mkRuntime("legacy-conversation");
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+    assert.match(resumed.notices.join("\n"), /remain queued from an interrupted review/);
+
+    await trigger(resumed.hooks, "agent_end", { cwd: dir, ui: resumed.pi.ui }, resumed.ctx);
+    const reviewPromise = trigger(resumed.hooks, "agent_settled", { cwd: dir, ui: resumed.pi.ui }, resumed.ctx);
+    await waitForFile(markerPath);
+
+    assert.equal(resumed.terminalHandlers.length, 1);
+    assert.deepEqual(resumed.terminalHandlers[0]?.("\x1b"), { action: "handled", consume: true });
+    await reviewPromise;
+
+    assert.match(resumed.notices.join("\n"), /review gate: review cancelled/);
+    assert.equal(
+      resumed.notices.filter((notice) => notice.includes("were dropped when the review was cancelled")).length,
+      1,
+    );
+    assert.match(
+      resumed.notices.join("\n"),
+      /review gate: 1 queued user input\(s\) were dropped when the review was cancelled and will not be sent automatically; resend them if still needed/,
+    );
+    assert.doesNotMatch(resumed.notices.join("\n"), /legacy mid-review direction/);
+    assert.equal(resumed.followUps.length, 0);
+
+    // The cancellation is durable: the ledger is cleared and the reconciled
+    // delivery is cancelled, so a later restore cannot resurrect either.
+    const persisted = JSON.parse(await readFile(`${sessionFile}.pi-review-gate-state.json`, "utf8")) as {
+      state: { queuedUserInputsDuringReview: string[]; pendingModelDeliveries: Array<{ kind: string; status: string; message: string }> };
+    };
+    assert.deepEqual(persisted.state.queuedUserInputsDuringReview, []);
+    assert.equal(persisted.state.pendingModelDeliveries.length, 2);
+    assert.ok(persisted.state.pendingModelDeliveries.every((delivery) => delivery.kind === "queued_user_input"));
+    assert.ok(persisted.state.pendingModelDeliveries.every((delivery) => delivery.status === "cancelled"));
   } finally {
     reapAll();
     await rm(dir, { recursive: true, force: true });

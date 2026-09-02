@@ -287,6 +287,10 @@ test("Escape immediately aborts an active /review-now", async () => {
     assert.match(notices.join("\n"), /review gate: review cancelled/);
     assert.equal(terminalHandlers.length, 0);
     assert.equal(followUps.length, 0);
+    // No input was queued during the /review-now run, so no dropped-input
+    // notice may claim a drop on this cancellation path.
+    assert.doesNotMatch(notices.join("\n"), /were dropped when the review was cancelled/);
+    assert.doesNotMatch(notices.join("\n"), /will not be sent automatically/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -360,6 +364,10 @@ test("/review-cancel stops an active /review-now, reports quiescence, and works 
       notices.filter((notice) => notice === "review gate: review cancelled; reviewer processes stopped").length,
       1,
     );
+    // No input was queued during the /review-now run, so no dropped-input
+    // notice may claim a drop on this cancellation path.
+    assert.doesNotMatch(notices.join("\n"), /were dropped when the review was cancelled/);
+    assert.doesNotMatch(notices.join("\n"), /will not be sent automatically/);
     await waitForCondition(() => {
       try {
         process.kill(reviewerPid, 0);

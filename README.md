@@ -167,26 +167,44 @@ rendered HTML, closes Chromium, and exposes the same `find`, `index`,
 `nextIndex`, table inventory, and `columns` operations as `WebFetch`. It does
 not click, type, authenticate, interactively scroll, capture screenshots, or
 maintain a browser session; it is not an interactive browser or vision tool.
-BrowserExtract also pins DNS inside the browser, in two layers. The initially
-validated hostname is mapped to one validated public address with Chromium
-host-resolver rules (IPv4 preferred), with browser proxying disabled so
-proxy-side DNS cannot bypass that mapping, and the resolver is then made
-default-deny (`MAP * ~NOTFOUND` after the admitted-host mapping), so sockets
-Chromium may create without a routeable request — speculative preconnect or
-alternative-service endpoints — cannot reach any other hostname either.
-Chromium therefore never performs a second, unpinnable DNS lookup, and requests
-to that hostname are allowed for every scheme and port (so common http→https
-upgrade redirects keep working). Every
-HTTP(S) response's actual remote address is then verified through Playwright's
-`Response.serverAddr()`: a response from a blocked address, a non-pinned
-address, or a response with no verifiable server address aborts the whole
-render immediately. Requests to any other hostname — which the MAP rule does
-not pin — fail the whole render closed with a message naming the blocked URL
-and suggesting direct extraction of that final URL with `WebFetch` instead.
-Local browser protocols (`about:`, `blob:`, `data:`) remain narrowly allowed,
-WebSockets are always closed, and images/media/fonts are blocked (and reported
-when cross-hostname), so a same-hostname page renders normally while any
-cross-hostname request fails with actionable compatibility text.
+BrowserExtract routes every Chromium request through a per-render loopback
+egress broker (an HTTP/HTTPS CONNECT proxy owned by the render and bound only
+to 127.0.0.1 on an ephemeral port). Chromium is launched so the broker is its
+only network path: the proxy is forced (`--proxy-server` plus
+`--proxy-bypass-list=<-loopback>`, which removes Chromium's implicit loopback
+bypass so even loopback/private-literal requests reach the broker and are
+refused there), QUIC and alternative direct transports are disabled,
+WebRTC is forced to `disable_non_proxied_udp` so peer connections cannot open
+direct UDP to IP literals, the broker accepts only this render's Chromium
+(per-render Basic proxy credentials challenged via 407), and the
+host resolver is default-deny (`MAP * ~NOTFOUND`) with only the exact broker
+endpoint excluded, so speculative preconnect or direct-IP attempts can never
+resolve or connect outside the broker. For every destination — including
+cross-hostname resources and redirects — the broker canonicalizes the request
+or CONNECT authority, rejects credentials and non-HTTP(S) schemes, resolves
+the hostname exactly once, requires every resolved address to be public, and
+dials only that validated address set, with no fallback to system DNS.
+Original hostname semantics are preserved: the browser keeps its `Host` header
+for plain HTTP, and HTTPS traffic stays end-to-end through the CONNECT tunnel,
+so TLS SNI and certificate verification remain between Chromium and the origin
+(the broker never decrypts it). WebSockets are always closed, service workers
+are blocked, and every outbound connection is recorded in a broker-owned
+connection ledger that is audited before the render result is returned; the
+browser and all broker sockets quiesce before anything is exposed. Local
+browser protocols (`about:`, `blob:`, `data:`) remain narrowly allowed.
+Images, media, and fonts are intentionally omitted: they are aborted by the
+route policy before any connection is made, cross-host or not, and this never
+fails the render. The result discloses bounded omission diagnostics (capped
+samples plus a dropped count) alongside explicit per-render budgets (distinct
+hostnames, concurrent broker client connections and their pre-authentication
+idle deadline, destination connections, per-connection and aggregate bytes,
+authority/header lengths, idle and total time); a budget that destroys an
+in-flight transfer is nonfatal only when the main document completed, and
+main-document failures,
+non-2xx navigations, oversized rendered HTML, and any ledger audit failure
+fail the render closed. Pages requiring ordinary cross-host scripts, styles,
+API calls, or redirects now render normally through independently validated
+public destinations.
 By default, package installation verifies and, when necessary, downloads
 Playwright's compatible Chromium build. CI and server installs that do not need
 `BrowserExtract` can skip that browser download with the documented opt-in

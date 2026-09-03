@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { Agent, request, type Dispatcher } from "undici";
 import { isBlockedAddress } from "./ip";
+import type { BrokerDial } from "./egress-broker";
 
 export interface NetworkOptions {
   timeoutMs: number;
@@ -27,6 +28,22 @@ export interface NetworkOptions {
    * addresses returned by the immediately preceding validation.
    */
   createDispatcher?: (validated: ValidatedUrl) => Dispatcher;
+  /**
+   * Seam for deterministic tests: dials the BrowserExtract egress broker's
+   * outbound sockets. Production callers never set this; the default dials
+   * exactly one validated public address (IPv4 preferred).
+   */
+  brokerDial?: BrokerDial;
+}
+
+/** Bounded omission diagnostics disclosed by a BrowserExtract render. */
+export interface BrowserOmissions {
+  /** Total omissions: retained samples plus any dropped beyond the cap. */
+  count: number;
+  /** True when more omissions occurred than the bounded entry list holds. */
+  truncated: boolean;
+  /** Bounded sample of omission diagnostics (each entry is length-bounded). */
+  entries: readonly string[];
 }
 
 export interface DownloadedText {
@@ -38,6 +55,8 @@ export interface DownloadedText {
   data?: Uint8Array;
   bytes: number;
   fetchedAt: string;
+  /** Present only for BrowserExtract: bounded omissions of subresources. */
+  browserOmissions?: BrowserOmissions;
 }
 
 export interface SearchResult {

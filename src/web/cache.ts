@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WebFetchConfig } from "../config";
+import type { BrowserOmissions } from "./network";
 import { downloadText } from "./network";
 import { extractWebPage, findInWebPage, renderWebPage, type ExtractedWebPage, type RenderedWebPage, type WebPageFindResult } from "./page";
 import { extractPdfDocument, isPdfResponse } from "./pdf";
@@ -17,6 +18,7 @@ interface CacheEntry {
   diskBytes: number;
   lastAccessedAt: number;
   page: ExtractedWebPage;
+  browserOmissions?: BrowserOmissions;
   rawPath: string;
   indexPath: string;
 }
@@ -40,6 +42,8 @@ export interface WebFetchResult extends RenderedWebPage {
   pageCount?: number;
   pdfMetadata?: ExtractedWebPage["pdfMetadata"];
   scannedOrImageOnlySuspected?: boolean;
+  /** Present only for BrowserExtract acquisitions: bounded subresource omissions. */
+  browserOmissions?: BrowserOmissions;
   find?: WebPageFindResult;
 }
 
@@ -109,6 +113,7 @@ export class WebPageCache {
       ...(entry.page.scannedOrImageOnlySuspected !== undefined
         ? { scannedOrImageOnlySuspected: entry.page.scannedOrImageOnlySuspected }
         : {}),
+      ...(entry.browserOmissions ? { browserOmissions: entry.browserOmissions } : {}),
       ...(found ? { find: found } : {}),
     };
   }
@@ -155,6 +160,7 @@ export class WebPageCache {
       finalUrl: downloaded.finalUrl,
       fetchedAt: downloaded.fetchedAt,
       contentType: downloaded.contentType,
+      ...(downloaded.browserOmissions ? { browserOmissions: downloaded.browserOmissions } : {}),
       page,
     })}\n`;
     await Promise.all([
@@ -172,6 +178,7 @@ export class WebPageCache {
       diskBytes: (rawData?.byteLength ?? Buffer.byteLength(downloaded.text, "utf8")) + Buffer.byteLength(serialized, "utf8"),
       lastAccessedAt: Date.now(),
       page,
+      ...(downloaded.browserOmissions ? { browserOmissions: downloaded.browserOmissions } : {}),
       rawPath,
       indexPath,
     };

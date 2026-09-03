@@ -230,6 +230,13 @@ function formatPage(value: WebFetchResult, toolName: "WebFetch" | "BrowserExtrac
   } else {
     lines.push("dynamic_content_suspected: false — no static heuristic detected; this does not prove the page is complete");
   }
+  if (toolName === "BrowserExtract" && value.browserOmissions) {
+    lines.push(
+      `browser_omissions: ${value.browserOmissions.count} subresource(s) omitted during the render`
+      + `${value.browserOmissions.truncated ? " (diagnostics truncated; more omissions occurred)" : ""}.`,
+    );
+    for (const entry of value.browserOmissions.entries.slice(0, 8)) lines.push(`- ${entry}`);
+  }
   if (value.tables.length > 0) {
     lines.push("", `Tables discovered across the full page (${value.tables.length}):`);
     for (const table of value.tables.slice(0, 40)) {

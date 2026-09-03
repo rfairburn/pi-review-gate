@@ -457,6 +457,15 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
       text: rendered,
       bytes: Buffer.byteLength(rendered),
       fetchedAt: "2026-08-23T00:00:01.000Z",
+      browserOmissions: {
+        count: 3,
+        truncated: true,
+        entries: [
+          "passive resource omitted before any connection: image https://cdn.other.test/a.png",
+          "connect destination refused: Hostname did not resolve: unresolved.test (https://unresolved.test:8080/).",
+          "byte budget exceeded for slow.test:443 (8388608 bytes); connection destroyed.",
+        ],
+      },
     };
   });
   const manager = new WebToolManager({
@@ -517,6 +526,9 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   });
   assert.match(browserFirst.content[0].text as string, /Find "Rendered largest cities"/);
   assert.match(browserFirst.content[0].text as string, /BrowserExtract/);
+  // Bounded omission warnings must be visible in the model-facing tool text.
+  assert.match(browserFirst.content[0].text as string, /browser_omissions: 3 subresource\(s\) omitted during the render \(diagnostics truncated; more omissions occurred\)\./);
+  assert.match(browserFirst.content[0].text as string, /- passive resource omitted before any connection: image https:\/\/cdn\.other\.test\/a\.png/);
   const browserIndex = browserFirst.details.response.find.matches[0].index as number;
   const browserSecond = await tools.get("BrowserExtract").execute("browser-two", {
     url: "https://example.com/cities",

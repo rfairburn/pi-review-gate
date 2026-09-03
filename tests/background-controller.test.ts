@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -10,6 +10,8 @@ import { compareSnapshots, createWorkspaceSnapshot } from "../src/capture";
 import { normalizeConfig } from "../src/config";
 import {
   BackgroundExecutionController,
+  MAX_UNSETTLED_TASKS_PER_EXECUTION,
+  isArchivableTaskState,
   type BackgroundExecutionGroup,
   type BackgroundFaultHooks,
   type BackgroundInspection,
@@ -17,6 +19,9 @@ import {
   type BackgroundTaskRecord,
   formatWatchEvent,
 } from "../src/execution/background-controller";
+import { INLINE_SETTLED_TASK_LIMIT } from "../src/execution/background-group-store";
+import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
+import { transitionTaskState } from "../src/execution/task-state";
 import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
 import { sourceMutationCoordinator } from "../src/execution/source-mutation-lease";
 
@@ -190,7 +195,7 @@ test("settled tasks move to bounded archives and restore through stable task han
       version: number;
       tasks: Array<Record<string, unknown>>;
     };
-    assert.equal(manifest.version, 2);
+    assert.equal(manifest.version, 3);
     const reference = manifest.tasks.find((task) => task.taskId === archivedTaskId)!;
     assert.equal(reference.archived, true);
     assert.equal(reference.state, "landed");
@@ -249,7 +254,6 @@ test("restore rejects cross-cwd groups before their archive metadata reaches con
     await writeFile(join(malformedRoot, "execution.json"), "{not json", "utf8");
 
     const validArchivePath = join(validRoot, "tasks", `${collidingTaskId}.json`);
-    const validArchiveBefore = await readFile(validArchivePath, "utf8");
     const validManifestPath = join(validRoot, "execution.json");
     const validManifestBefore = await readFile(validManifestPath, "utf8");
 
@@ -303,7 +307,17 @@ test("restore rejects cross-cwd groups before their archive metadata reaches con
         archiveOnDisk.integritySha256,
         "persisted archive reference must keep the valid group's own archive hash",
       );
-      assert.equal(await readFile(validArchivePath, "utf8"), validArchiveBefore);
+      // The legacy archive was migrated to an execution-bound version-2
+      // document built from the valid group's own record — never from the
+      // rejected foreign group's colliding body.
+      const migratedArchive = JSON.parse(await readFile(validArchivePath, "utf8")) as {
+        version: number;
+        executionId: string;
+        task: { summary: string };
+      };
+      assert.equal(migratedArchive.version, 2);
+      assert.equal(migratedArchive.executionId, "exec-cwd-valid");
+      assert.equal(migratedArchive.task.summary, "valid archive body");
       assert.notEqual(await readFile(validManifestPath, "utf8"), validManifestBefore);
 
       // The rewritten manifest still restores cleanly for the valid group.
@@ -2173,6 +2187,1265 @@ async function setupFaultScenario(faults: BackgroundFaultHooks): Promise<{
   };
 }
 
+// ── Finding 15: bounded execution persistence and top-off scaling ──────────
+
+/** Controller harness for bounded-scaling tests: an executor route exists but
+ *  maxWorkers is 0, so nothing is ever dispatched and settlement is injected
+ *  deterministically. */
+function boundedScalingConfig() {
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "unstarted",
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
+    }],
+    execution: {
+      activeExecutor: { source: "external", id: "unstarted" },
+      maxWorkers: 1,
+    },
+    retainBundles: "always",
+  });
+  // Nothing may ever dispatch in these tests: settlement is injected directly.
+  config.execution!.maxWorkers = 0;
+  return config;
+}
+
+function controllerInternals(controller: BackgroundExecutionController): {
+  groups: Map<string, BackgroundExecutionGroup>;
+  activeTasks: Map<string, unknown>;
+  archivedTasks: Map<string, unknown>;
+  save: (group: BackgroundExecutionGroup) => Promise<unknown>;
+  wake: (task: BackgroundTaskRecord, kind: "completion" | "failure" | "state", content: string) => Promise<void>;
+} {
+  return controller as unknown as {
+    groups: Map<string, BackgroundExecutionGroup>;
+    activeTasks: Map<string, unknown>;
+    archivedTasks: Map<string, unknown>;
+    save: (group: BackgroundExecutionGroup) => Promise<unknown>;
+    wake: (task: BackgroundTaskRecord, kind: "completion" | "failure" | "state", content: string) => Promise<void>;
+  };
+}
+
+/** Settles the oldest unsettled task directly and saves the group. */
+async function settleOldestUnsettled(
+  controller: BackgroundExecutionController,
+  executionId: string,
+  label: string,
+): Promise<BackgroundTaskRecord> {
+  const internals = controllerInternals(controller);
+  const group = internals.groups.get(executionId)!;
+  const target = group.tasks.find((task) => !isArchivableTaskState(task.state));
+  assert.ok(target, "an unsettled task is available to settle");
+  transitionTaskState(target, "landed");
+  target.summary = `settled outcome ${label}`;
+  await internals.save(group);
+  return target;
+}
+
+test("unsettled task admission is capped per execution while sequential settled top-offs continue", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-cap-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    controller = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    const cap = MAX_UNSETTLED_TASKS_PER_EXECUTION;
+    const definitions = Array.from({ length: cap }, (_unused, index) => ({
+      title: `task ${index}`,
+      instructions: "bounded work",
+      acceptanceCriteria: ["done"],
+    }));
+    const started = await controller.start(definitions);
+    assert.equal(started.historicalCount, cap);
+    assert.equal(started.tasks.length, cap);
+
+    // Fail closed at the cap with a clear, actionable error and no partial state.
+    await assert.rejects(
+      () => controller!.add(started.executionId, [{ title: "over cap", instructions: "work", acceptanceCriteria: ["done"] }]),
+      (error: Error) => /at most \d+ unsettled tasks are admitted per execution/.test(error.message)
+        && error.message.includes(started.executionId),
+    );
+    assert.equal(controller.inspect(started.executionId).tasks.length, cap);
+    await assert.rejects(
+      () => controller!.start([{ title: "over cap start", instructions: "work", acceptanceCriteria: ["done"] }, ...definitions]),
+      /At most \d+ unsettled tasks are admitted per execution/,
+    );
+    assert.throws(() => controller!.inspect("exec-never-created"), /Unknown execution group/);
+
+    // Sequential top-offs after settlement remain supported without limit.
+    const group = controllerInternals(controller).groups.get(started.executionId)!;
+    const oldest = group.tasks[0]!;
+    transitionTaskState(oldest, "landed");
+    oldest.summary = "settled to free admission capacity";
+    await controllerInternals(controller).save(group);
+    const toppedOff = await controller.add(started.executionId, [{
+      title: "after settle",
+      instructions: "work",
+      acceptanceCriteria: ["done"],
+    }]);
+    // The settled record stays inline within the bounded window; the admission
+    // cap counts only the unsettled (128) tasks, all of which remain queued
+    // for dispatch in this harness (maxWorkers 0).
+    assert.equal(toppedOff.tasks.length, cap + 1);
+    assert.equal(toppedOff.historicalCount, cap + 1);
+    assert.equal(toppedOff.archivedCount, 0);
+    assert.equal(controller.inspect(started.executionId).scheduling.globallyDispatchPending, cap);
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy v2 manifests with many settled stubs restore lazily and rewrite to the bounded v3 format", async () => {
+  const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-v2-many-")));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-review-background-v2-workspace-"));
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const records = Array.from({ length: 40 }, (_unused, index) => collidingTaskRecord(
+      `task-legacy-${index}`,
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      new Date(Date.parse("2024-01-02T00:00:00.000Z") + index * 1_000).toISOString(),
+      `legacy summary ${index}`,
+    ));
+    await writePersistedExecutionGroupTasks(fixtureRoot, workspaceRoot, "exec-legacy-v2", records);
+    const archiveBytesBefore = await readFile(join(fixtureRoot, "tasks", `${records[0]!.taskId}.json`), "utf8");
+
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    await restored.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+
+    // Only the bounded recent settled window hydrates; older settled tasks stay
+    // archive-only behind truthful aggregates.
+    const inspection = restored.inspect("exec-legacy-v2");
+    assert.equal(inspection.tasks.length, INLINE_SETTLED_TASK_LIMIT);
+    assert.equal(inspection.historicalCount, 40);
+    assert.equal(inspection.archivedCount, 40 - INLINE_SETTLED_TASK_LIMIT);
+    assert.equal(inspection.activeCount, 0);
+
+    // Exact historical task handles load their integrity-checked archives.
+    const historical = await restored.inspectTask("exec-legacy-v2", records[0]!.taskId);
+    assert.equal(historical.tasks[0]!.taskId, records[0]!.taskId);
+    assert.equal(historical.tasks[0]!.state, "landed");
+    assert.equal(historical.tasks[0]!.summary, "legacy summary 0");
+
+    // Restore rewrote the manifest to the bounded v3 format with exact totals.
+    const manifest = JSON.parse(await readFile(join(fixtureRoot, "execution.json"), "utf8")) as {
+      version: number;
+      totalTaskCount: number;
+      settledArchivedCount: number;
+      tasks: Array<Record<string, unknown>>;
+    };
+    assert.equal(manifest.version, 3);
+    assert.equal(manifest.totalTaskCount, 40);
+    assert.equal(manifest.settledArchivedCount, 40 - INLINE_SETTLED_TASK_LIMIT);
+    assert.equal(manifest.tasks.length, INLINE_SETTLED_TASK_LIMIT);
+    // Evicted archive documents were preserved byte-for-byte (never deleted to
+    // achieve boundedness).
+    assert.equal(await readFile(join(fixtureRoot, "tasks", `${records[0]!.taskId}.json`), "utf8"), archiveBytesBefore);
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("archived history inspection and recovery fail closed on tampered or missing archives", async () => {
+  const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-v2-tamper-")));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-review-background-v2-tamper-"));
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const records = Array.from({ length: 40 }, (_unused, index) => collidingTaskRecord(
+      `task-legacy-${index}`,
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      `legacy summary ${index}`,
+    ));
+    await writePersistedExecutionGroupTasks(fixtureRoot, workspaceRoot, "exec-legacy-tamper", records);
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    await restored.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+
+    // Tamper one evicted archive (its content is no longer manifest-covered).
+    const tamperedPath = join(fixtureRoot, "tasks", `${records[0]!.taskId}.json`);
+    const tampered = JSON.parse(await readFile(tamperedPath, "utf8")) as { task: { summary: string } };
+    tampered.task.summary = "tampered outcome";
+    await writeFile(tamperedPath, `${JSON.stringify(tampered, null, 2)}\n`, "utf8");
+    await assert.rejects(
+      () => restored!.inspectTask("exec-legacy-tamper", records[0]!.taskId),
+      /failed its integrity check/,
+    );
+    await assert.rejects(
+      () => restored!.continueTask({
+        executionId: "exec-legacy-tamper",
+        taskId: records[0]!.taskId,
+        instructions: "resume",
+        instructionId: "tamper-probe",
+        actor: "user",
+      }),
+      /failed its integrity check/,
+      "recovery must stay fail-closed on a tampered archive",
+    );
+
+    // A missing archive keeps the unknown-task failure instead of a wrong match.
+    await rm(join(fixtureRoot, "tasks", `${records[1]!.taskId}.json`));
+    await assert.rejects(
+      () => restored!.inspectTask("exec-legacy-tamper", records[1]!.taskId),
+      new RegExp(`Unknown task ${records[1]!.taskId}`),
+    );
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("routine saves write only the manifest and changed archives, reusing settled archives", async () => {
+  const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-v2-writes-")));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-review-background-v2-writes-"));
+  let restored: BackgroundExecutionController | undefined;
+  const writes: string[] = [];
+  try {
+    const records = Array.from({ length: 40 }, (_unused, index) => collidingTaskRecord(
+      `task-legacy-${index}`,
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      `legacy summary ${index}`,
+    ));
+    await writePersistedExecutionGroupTasks(fixtureRoot, workspaceRoot, "exec-legacy-writes", records);
+    const evictedArchiveBytesBefore = await readFile(join(fixtureRoot, "tasks", `${records[0]!.taskId}.json`), "utf8");
+    setDurableWriteFaultInjectionForTesting((stage, path) => {
+      if (stage === "before_rename") writes.push(path);
+    });
+    try {
+      restored = new BackgroundExecutionController({
+        pi: {},
+        config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+        state: createState(),
+        cwd: () => workspaceRoot,
+      });
+      await restored.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+      // Restore's rewrite persists the bounded manifest, migrates the 32
+      // inline window archives to execution-bound version-2 documents (one
+      // bounded write per legacy task), writes the authenticated membership
+      // index for the 8 evicted legacy stubs, and never rewrites the evicted
+      // archives themselves.
+      const written = writes.map((path) => path.slice(fixtureRoot.length + 1)).sort();
+      assert.deepEqual(written, [
+        "execution.json",
+        "tasks/index.json",
+        ...Array.from({ length: INLINE_SETTLED_TASK_LIMIT }, (_unused, index) => `tasks/task-legacy-${index + 8}.json`),
+      ].sort());
+      // The evicted stubs' own archives were reused verbatim, never rewritten.
+      assert.equal(await readFile(join(fixtureRoot, "tasks", `${records[0]!.taskId}.json`), "utf8"), evictedArchiveBytesBefore);
+
+      // A top-off writes only the manifest; the settled archives are untouched.
+      writes.length = 0;
+      const added = await restored.add("exec-legacy-writes", [{
+        title: "fresh top-off",
+        instructions: "work",
+        acceptanceCriteria: ["done"],
+      }]);
+      assert.deepEqual(writes, [join(fixtureRoot, "execution.json")]);
+
+      // Settling the new task produces exactly one archive write plus the manifest;
+      // the oldest window archive (task-legacy-8) is evicted without a rewrite
+      // because its migrated archive already exists on disk.
+      writes.length = 0;
+      const internals = controllerInternals(restored);
+      const group = internals.groups.get("exec-legacy-writes")!;
+      const task = group.tasks.find((candidate) => candidate.taskId === added.tasks.at(-1)!.taskId)!;
+      transitionTaskState(task, "landed");
+      task.summary = "newly settled";
+      task.updatedAt = new Date(Date.parse("2024-02-01T00:00:00.000Z")).toISOString();
+      await internals.save(group);
+      assert.deepEqual(writes.sort(), [
+        join(fixtureRoot, "execution.json"),
+        join(fixtureRoot, "tasks", `${task.taskId}.json`),
+      ]);
+      // The migrated archives are execution-bound version-2 documents.
+      const migrated = JSON.parse(await readFile(join(fixtureRoot, "tasks", "task-legacy-8.json"), "utf8")) as { version: number; executionId: string };
+      assert.equal(migrated.version, 2);
+      assert.equal(migrated.executionId, "exec-legacy-writes");
+    } finally {
+      setDurableWriteFaultInjectionForTesting(undefined);
+    }
+    const manifest = JSON.parse(await readFile(join(fixtureRoot, "execution.json"), "utf8")) as { totalTaskCount: number; settledArchivedCount: number };
+    assert.equal(manifest.totalTaskCount, 41);
+    assert.equal(manifest.settledArchivedCount, 40 - INLINE_SETTLED_TASK_LIMIT + 1);
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("compaction keeps recovery wave roots and evicted landed tasks stay continuable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-continue-"));
+  let controller: BackgroundExecutionController | undefined;
+  const ownedRoots = new Set<string>();
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    controller = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    ownedRoots.add(root);
+    const started = await controller.start([{ title: "seed task", instructions: "seed", acceptanceCriteria: ["done"] }]);
+    ownedRoots.add(started.root);
+    const executionId = started.executionId;
+    const seedTaskId = started.tasks[0]!.taskId;
+    const waveRootDir = await realpath(await mkdtemp(join(tmpdir(), "wave-continue-root-")));
+    ownedRoots.add(waveRootDir);
+    const internals = controllerInternals(controller);
+    const group = internals.groups.get(executionId)!;
+    const seed = group.tasks[0]!;
+    seed.bundle = {
+      version: 1,
+      operationId: "op-continue-evicted",
+      waveId: "wave-continue-evicted",
+      taskId: seed.taskId,
+      waveRoot: waveRootDir,
+      expectedRevision: 1,
+    };
+    seed.waveRoot = waveRootDir;
+    transitionTaskState(seed, "landed");
+    seed.summary = "settled seed with a durable continuation bundle";
+    await internals.save(group);
+    // Push the seed out of the bounded inline window with 32 newer settlements.
+    for (let index = 0; index < 32; index += 1) {
+      await controller.add(executionId, [{
+        title: `later task ${index + 1}`,
+        instructions: "work",
+        acceptanceCriteria: ["done"],
+      }]);
+      await settleOldestUnsettled(controller, executionId, `later ${index + 1}`);
+    }
+
+    const manifest = JSON.parse(await readFile(join(started.root, "execution.json"), "utf8")) as {
+      settledArchivedCount: number;
+      tasks: Array<Record<string, unknown>>;
+    };
+    assert.equal(manifest.settledArchivedCount, 1);
+    assert.ok(!manifest.tasks.some((task) => task.taskId === seedTaskId), "the seed task was evicted from the inline window");
+    // Compaction must keep the recovery wave root the archived continuation
+    // bundle points into.
+    await access(waveRootDir);
+    const archive = JSON.parse(
+      await readFile(join(started.root, "tasks", `${seedTaskId}.json`), "utf8"),
+    ) as { task: { bundle?: { operationId: string }; waveRoot?: string } };
+    assert.equal(archive.task.bundle?.operationId, "op-continue-evicted");
+    assert.equal(archive.task.waveRoot, waveRootDir);
+
+    // Exact-handle continuation lazily re-admits the settled task and stays
+    // continuable from its retained checkpoint workspace.
+    const continued = await controller.continueTask({
+      executionId,
+      taskId: seedTaskId,
+      instructions: "resume the evicted task",
+      instructionId: "continue-evicted-1",
+      actor: "user",
+    });
+    const continuedTask = continued.tasks.find((task) => task.taskId === seedTaskId)!;
+    assert.equal(continuedTask.state, "queued");
+    assert.equal(continued.tasks.find((task) => task.taskId === seedTaskId)!.bundle?.operationId, "op-continue-evicted");
+    await access(waveRootDir);
+    const inspection = controller.inspect(executionId);
+    assert.equal(inspection.historicalCount, 33);
+    assert.equal(inspection.archivedCount, 0, "re-admission retires the archive-only representation");
+    assert.equal(inspection.scheduling.globallyDispatchPending, 1);
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    for (const owned of ownedRoots) await rm(owned, { recursive: true, force: true }).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("archived-task reactivation and recovery adoption enforce the unsettled admission cap", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-cap-continue-"));
+  let controller: BackgroundExecutionController | undefined;
+  const ownedRoots = new Set<string>();
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    controller = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    const cap = MAX_UNSETTLED_TASKS_PER_EXECUTION;
+    const started = await controller.start(Array.from({ length: cap }, (_unused, index) => ({
+      title: `task ${index}`,
+      instructions: "bounded work",
+      acceptanceCriteria: ["done"],
+    })));
+    ownedRoots.add(started.root);
+    const evictedTaskId = started.tasks[0]!.taskId;
+    // Give the task a durable continuation bundle so it stays continuable
+    // after eviction, exactly like a real landing.
+    const waveRootDir = await realpath(await mkdtemp(join(tmpdir(), "wave-cap-continue-")));
+    ownedRoots.add(waveRootDir);
+    const internals = controllerInternals(controller);
+    const firstGroup = internals.groups.get(started.executionId)!;
+    const firstTask = firstGroup.tasks[0]!;
+    firstTask.bundle = {
+      version: 1,
+      operationId: "op-cap-continue",
+      waveId: "wave-cap-continue",
+      taskId: firstTask.taskId,
+      waveRoot: waveRootDir,
+      expectedRevision: 1,
+    };
+    firstTask.waveRoot = waveRootDir;
+    // 40 settlements: 8 evicted archives, 32 inline settled, 88 unsettled.
+    for (let index = 0; index < 40; index += 1) {
+      await settleOldestUnsettled(controller!, started.executionId, `settle ${index + 1}`);
+    }
+    // Fill the unsettled population to exactly the cap.
+    await controller.add(started.executionId, Array.from({ length: 40 }, (_unused, index) => ({
+      title: `top-off ${index + 1}`,
+      instructions: "work",
+      acceptanceCriteria: ["done"],
+    })));
+    assert.equal(controller.inspect(started.executionId).archivedCount, 8);
+
+    // Reactivating an archived task is admission-capped like SubtasksAdd.
+    await assert.rejects(
+      () => controller!.continueTask({
+        executionId: started.executionId,
+        taskId: evictedTaskId,
+        instructions: "resume",
+        instructionId: "cap-probe",
+        actor: "user",
+      }),
+      (error: Error) => /at most \d+ unsettled tasks are admitted per execution/.test(error.message)
+        && error.message.includes(started.executionId),
+    );
+    // Settling one task frees exactly one slot: the same continuation succeeds.
+    await settleOldestUnsettled(controller, started.executionId, "free one slot");
+    const continued = await controller.continueTask({
+      executionId: started.executionId,
+      taskId: evictedTaskId,
+      instructions: "resume",
+      instructionId: "cap-probe-2",
+      actor: "user",
+    });
+    assert.equal(continued.tasks[0]!.state, "queued");
+    assert.equal(controller.inspect(started.executionId).archivedCount, 8);
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    for (const owned of ownedRoots) await rm(owned, { recursive: true, force: true }).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("archive reuse and membership stay scoped per execution across same-cwd colliding handles", async () => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-review-background-collide-"));
+  const rootA = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-collide-a-")));
+  const rootB = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-collide-b-")));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    // Two same-cwd executions persist the SAME taskId and updatedAt with
+    // different archive bodies.
+    const sharedTaskId = "task-collide-same-cwd";
+    const createdAt = "2023-12-31T23:59:00.000Z";
+    const updatedAt = "2024-01-01T00:00:00.000Z";
+    await writePersistedExecutionGroupTasks(rootA, workspaceRoot, "exec-collide-a", [
+      collidingTaskRecord(sharedTaskId, createdAt, updatedAt, "group A outcome"),
+    ]);
+    await writePersistedExecutionGroupTasks(rootB, workspaceRoot, "exec-collide-b", [
+      collidingTaskRecord(sharedTaskId, createdAt, updatedAt, "group B outcome"),
+    ]);
+    controller = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [rootA, rootB] });
+    // Force a save of each group; archive reuse must stay execution-scoped.
+    await controller.add("exec-collide-a", [{ title: "a top-off", instructions: "work", acceptanceCriteria: ["done"] }]);
+    await controller.add("exec-collide-b", [{ title: "b top-off", instructions: "work", acceptanceCriteria: ["done"] }]);
+    for (const [executionId, groupRoot, expectedSummary] of [
+      ["exec-collide-a", rootA, "group A outcome"],
+      ["exec-collide-b", rootB, "group B outcome"],
+    ] as const) {
+      const manifest = JSON.parse(await readFile(join(groupRoot, "execution.json"), "utf8")) as {
+        tasks: Array<{ taskId: string; archiveIntegritySha256?: string }>;
+      };
+      const reference = manifest.tasks.find((task) => task.taskId === sharedTaskId)!;
+      const archiveOnDisk = JSON.parse(await readFile(join(groupRoot, "tasks", `${sharedTaskId}.json`), "utf8")) as {
+        integritySha256: string;
+        executionId: string;
+      };
+      assert.equal(reference.archiveIntegritySha256, archiveOnDisk.integritySha256, `${executionId} references its own archive hash`);
+      assert.equal(archiveOnDisk.executionId, executionId);
+      const historical = await controller.inspectTask(executionId, sharedTaskId);
+      assert.equal(historical.tasks[0]!.summary, expectedSummary);
+    }
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    await rm(rootA, { recursive: true, force: true });
+    await rm(rootB, { recursive: true, force: true });
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("execution-bound archives reject foreign handles planted into another execution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-foreign-"));
+  let controllerA: BackgroundExecutionController | undefined;
+  let controllerB: BackgroundExecutionController | undefined;
+  const ownedRoots = new Set<string>();
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    controllerA = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    controllerB = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    const startedA = await controllerA.start([{ title: "a seed", instructions: "seed", acceptanceCriteria: ["done"] }]);
+    const startedB = await controllerB.start([{ title: "b seed", instructions: "seed", acceptanceCriteria: ["done"] }]);
+    ownedRoots.add(startedA.root);
+    ownedRoots.add(startedB.root);
+    const evictedTaskId = startedA.tasks[0]!.taskId;
+    for (let index = 0; index < 32; index += 1) {
+      await controllerA.add(startedA.executionId, [{ title: `later ${index + 1}`, instructions: "work", acceptanceCriteria: ["done"] }]);
+      await settleOldestUnsettled(controllerA, startedA.executionId, `later ${index + 1}`);
+    }
+    // Copy execution A's evicted archive under execution B's root with the
+    // same handle: it must never authenticate there.
+    await mkdir(join(startedB.root, "tasks"), { recursive: true });
+    await writeFile(
+      join(startedB.root, "tasks", `${evictedTaskId}.json`),
+      await readFile(join(startedA.root, "tasks", `${evictedTaskId}.json`), "utf8"),
+      "utf8",
+    );
+    await assert.rejects(
+      () => controllerB!.inspectTask(startedB.executionId, evictedTaskId),
+      new RegExp(`does not belong to execution ${startedB.executionId}`),
+    );
+    // The owning execution still resolves its own archive.
+    const historical = await controllerA!.inspectTask(startedA.executionId, evictedTaskId);
+    assert.equal(historical.tasks[0]!.taskId, evictedTaskId);
+    assert.equal(historical.tasks[0]!.state, "landed");
+  } finally {
+    await controllerA?.shutdown().catch(() => undefined);
+    await controllerA?.detach().catch(() => undefined);
+    await controllerB?.shutdown().catch(() => undefined);
+    await controllerB?.detach().catch(() => undefined);
+    for (const owned of ownedRoots) await rm(owned, { recursive: true, force: true }).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the membership index keeps legacy evicted handles recoverable across restarts and fails closed when tampered", async () => {
+  const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-v2-index-")));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-review-background-v2-index-"));
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const records = Array.from({ length: 40 }, (_unused, index) => collidingTaskRecord(
+      `task-legacy-${index}`,
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      `legacy summary ${index}`,
+    ));
+    await writePersistedExecutionGroupTasks(fixtureRoot, workspaceRoot, "exec-legacy-index", records);
+    const first = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    await first.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+    await first.detach();
+
+    // Second restore: the v3 manifest no longer references the evicted legacy
+    // stubs, but the durable membership index authenticates their handles.
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    // Review pass 3: the restored handles exactly match the durable index, so
+    // the restart must NOT rewrite the potentially lifetime-sized index — only
+    // the bounded manifest save should occur.
+    const secondRestoreWrites: string[] = [];
+    setDurableWriteFaultInjectionForTesting((stage, path) => {
+      if (stage === "before_rename") secondRestoreWrites.push(path);
+    });
+    try {
+      await restored.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+      assert.deepEqual(
+        secondRestoreWrites.map((path) => path.slice(fixtureRoot.length + 1)).sort(),
+        ["execution.json"],
+      );
+    } finally {
+      setDurableWriteFaultInjectionForTesting(undefined);
+    }
+    const historical = await restored.inspectTask("exec-legacy-index", records[0]!.taskId);
+    assert.equal(historical.tasks[0]!.taskId, records[0]!.taskId);
+    assert.equal(historical.tasks[0]!.state, "landed");
+    assert.equal(historical.tasks[0]!.summary, "legacy summary 0");
+    await restored.detach();
+
+    // A tampered membership index fails closed at restore.
+    const indexPath = join(fixtureRoot, "tasks", "index.json");
+    const tampered = JSON.parse(await readFile(indexPath, "utf8")) as {
+      entries: Record<string, { archiveIntegritySha256: string }>;
+      integritySha256: string;
+    };
+    tampered.entries[records[0]!.taskId]!.archiveIntegritySha256 = "f".repeat(64);
+    await writeFile(indexPath, `${JSON.stringify(tampered, null, 2)}\n`, "utf8");
+    const notifications: string[] = [];
+    const hardened = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+      notify: (message: string) => {
+        notifications.push(message);
+      },
+    });
+    try {
+      await hardened.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+      assert.ok(notifications.some((message) => message.includes(fixtureRoot) && /was not restored/.test(message)));
+      assert.throws(() => hardened.inspect("exec-legacy-index"), /Unknown execution group/);
+    } finally {
+      await hardened.shutdown().catch(() => undefined);
+      await hardened.detach().catch(() => undefined);
+    }
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("re-admitted legacy tasks rebind to a fresh archive and keep their stable handle across re-eviction and restart", async () => {
+  const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-v2-readmit-")));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-review-background-v2-readmit-"));
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const records = Array.from({ length: 40 }, (_unused, index) => collidingTaskRecord(
+      `task-legacy-${index}`,
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      `legacy summary ${index}`,
+    ));
+    records[0]!.bundle = {
+      version: 1,
+      operationId: "op-readmit",
+      waveId: "wave-readmit",
+      taskId: records[0]!.taskId,
+      waveRoot: join(tmpdir(), "wave-readmit-unused"),
+      expectedRevision: 1,
+    };
+    await writePersistedExecutionGroupTasks(fixtureRoot, workspaceRoot, "exec-legacy-readmit", records);
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    await restored.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+
+    // Re-admit the legacy evicted task and settle it again: its archive must
+    // be rewritten as an execution-bound version-2 document.
+    const continued = await restored.continueTask({
+      executionId: "exec-legacy-readmit",
+      taskId: records[0]!.taskId,
+      instructions: "resume the legacy task",
+      instructionId: "readmit-1",
+      actor: "user",
+    });
+    assert.equal(continued.tasks[0]!.state, "queued");
+    const internals = controllerInternals(restored);
+    const group = internals.groups.get("exec-legacy-readmit")!;
+    const readmitted = group.tasks.find((task) => task.taskId === records[0]!.taskId)!;
+    transitionTaskState(readmitted, "landed");
+    readmitted.summary = "re-settled after continuation";
+    readmitted.updatedAt = new Date(Date.parse("2024-03-01T00:00:00.000Z")).toISOString();
+    await internals.save(group);
+
+    // Push it out of the inline window again with 33 newer settlements.
+    for (let index = 0; index < 33; index += 1) {
+      await restored.add("exec-legacy-readmit", [{ title: `post ${index + 1}`, instructions: "work", acceptanceCriteria: ["done"] }]);
+      await settleOldestUnsettled(restored, "exec-legacy-readmit", `post ${index + 1}`);
+    }
+
+    // The stable handle resolves the REWRITTEN archive, not the stale legacy
+    // membership hash.
+    const historical = await restored.inspectTask("exec-legacy-readmit", records[0]!.taskId);
+    assert.equal(historical.tasks[0]!.taskId, records[0]!.taskId);
+    assert.equal(historical.tasks[0]!.state, "landed");
+    assert.equal(historical.tasks[0]!.summary, "re-settled after continuation");
+    // The membership index no longer vouches for the superseded archive.
+    const index = JSON.parse(await readFile(join(fixtureRoot, "tasks", "index.json"), "utf8")) as {
+      entries: Record<string, unknown>;
+    };
+    assert.ok(!(records[0]!.taskId in index.entries));
+    assert.ok(records[1]!.taskId in index.entries);
+
+    // Restart: the handle still resolves through its bound archive.
+    await restored.detach();
+    const second = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    try {
+      await second.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+      const again = await second.inspectTask("exec-legacy-readmit", records[0]!.taskId);
+      assert.equal(again.tasks[0]!.summary, "re-settled after continuation");
+    } finally {
+      await second.shutdown().catch(() => undefined);
+      await second.detach().catch(() => undefined);
+    }
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("continuing an inline settled task is capped like archive reactivation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-cap-inline-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    controller = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    const cap = MAX_UNSETTLED_TASKS_PER_EXECUTION;
+    const started = await controller.start(Array.from({ length: cap }, (_unused, index) => ({
+      title: `task ${index}`,
+      instructions: "bounded work",
+      acceptanceCriteria: ["done"],
+    })));
+    const internals = controllerInternals(controller);
+    const group = internals.groups.get(started.executionId)!;
+    // The NEWEST settled task stays inline (within the bounded window) — it is
+    // the inline settled continuation case.
+    const inlineSettled = group.tasks[32]!;
+    inlineSettled.bundle = {
+      version: 1,
+      operationId: "op-inline-cap",
+      waveId: "wave-inline-cap",
+      taskId: inlineSettled.taskId,
+      waveRoot: join(tmpdir(), "wave-inline-cap-unused"),
+      expectedRevision: 1,
+    };
+    for (let index = 0; index < 33; index += 1) {
+      await settleOldestUnsettled(controller, started.executionId, `settle ${index + 1}`);
+    }
+    // 32 inline settled, 1 archived, 95 unsettled: fill the cap exactly.
+    await controller.add(started.executionId, Array.from({ length: 33 }, (_unused, index) => ({
+      title: `top-off ${index + 1}`,
+      instructions: "work",
+      acceptanceCriteria: ["done"],
+    })));
+    assert.equal(controller.inspect(started.executionId).archivedCount, 1);
+
+    // The settled INLINE task also re-enters the unsettled population when
+    // continued: the shared admission cap refuses it at the cap.
+    await assert.rejects(
+      () => controller!.continueTask({
+        executionId: started.executionId,
+        taskId: inlineSettled.taskId,
+        instructions: "resume",
+        instructionId: "inline-cap-probe",
+        actor: "user",
+      }),
+      (error: Error) => /at most \d+ unsettled tasks are admitted per execution/.test(error.message)
+        && error.message.includes(started.executionId),
+    );
+    // Rejected continuation leaves inline state and aggregates untouched.
+    const inspection = controller.inspect(started.executionId);
+    assert.equal(inspection.archivedCount, 1);
+    const stillInline = inspection.tasks.find((task) => task.taskId === inlineSettled.taskId);
+    assert.equal(stillInline?.state, "landed");
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a bundle-less archived continuation leaves counts and inline state unchanged", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-bundleless-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    controller = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    const started = await controller.start([{ title: "bundleless seed", instructions: "seed", acceptanceCriteria: ["done"] }]);
+    const archivedTaskId = started.tasks[0]!.taskId;
+    for (let index = 0; index < 33; index += 1) {
+      await controller.add(started.executionId, [{ title: `filler ${index + 1}`, instructions: "work", acceptanceCriteria: ["done"] }]);
+      await settleOldestUnsettled(controller, started.executionId, `settle ${index + 1}`);
+    }
+    const before = controller.inspect(started.executionId);
+    assert.equal(before.archivedCount, 1);
+    assert.equal(before.historicalCount, 34);
+
+    // No bundle (the settled record never produced one): the continuation
+    // fails without re-admitting the record or touching any aggregate.
+    await assert.rejects(
+      () => controller!.continueTask({
+        executionId: started.executionId,
+        taskId: archivedTaskId,
+        instructions: "resume",
+        instructionId: "bundleless-probe",
+        actor: "user",
+      }),
+      /has no durable continuation bundle/,
+    );
+    const internals = controllerInternals(controller);
+    assert.equal(internals.groups.get(started.executionId)!.tasks.some((task) => task.taskId === archivedTaskId), false);
+    const after = controller.inspect(started.executionId);
+    assert.equal(after.archivedCount, 1);
+    assert.equal(after.historicalCount, 34);
+    // A later unrelated save keeps the record archive-only in the manifest.
+    await controller.add(started.executionId, [{ title: "unrelated", instructions: "work", acceptanceCriteria: ["done"] }]);
+    const manifest = JSON.parse(await readFile(join(started.root, "execution.json"), "utf8")) as {
+      tasks: Array<Record<string, unknown>>;
+    };
+    assert.ok(!manifest.tasks.some((task) => task.taskId === archivedTaskId && task.archived !== true));
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a save tail never evicts a task that a continuation reactivated", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-race-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    controller = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    const started = await controller.start(Array.from({ length: 33 }, (_unused, index) => ({
+      title: `race task ${index}`,
+      instructions: "work",
+      acceptanceCriteria: ["done"],
+    })));
+    const internals = controllerInternals(controller);
+    const group = internals.groups.get(started.executionId)!;
+    const reactivated = group.tasks[0]!;
+    reactivated.bundle = {
+      version: 1,
+      operationId: "op-race",
+      waveId: "wave-race",
+      taskId: reactivated.taskId,
+      waveRoot: join(tmpdir(), "wave-race-unused"),
+      expectedRevision: 1,
+    };
+    // Settle tasks[0..31] with awaited saves (oldest updatedAt first), leaving
+    // tasks[32] unsettled.
+    for (let index = 0; index < 32; index += 1) {
+      await settleOldestUnsettled(controller, started.executionId, `settle ${index + 1}`);
+    }
+
+    // Gate the evicting save inside its durable tail.
+    let gateEntered = 0;
+    let releaseSave!: () => void;
+    const gate = new Promise<void>((resolveGate) => { releaseSave = resolveGate; });
+    controller.setFaultHooks({
+      save: () => {
+        gateEntered += 1;
+        return gateEntered === 1 ? gate : undefined;
+      },
+    });
+    try {
+      const racer = group.tasks[32]!;
+      transitionTaskState(racer, "landed");
+      racer.summary = "settled behind the gate";
+      const gatedSave = internals.save(group);
+      await waitFor(() => gateEntered === 1);
+      // Reactivate the task the gated save serialized for eviction.
+      const continuedPromise = controller.continueTask({
+        executionId: started.executionId,
+        taskId: reactivated.taskId,
+        instructions: "reactivate while the older save is pending",
+        instructionId: "race-continue",
+        actor: "user",
+      });
+      releaseSave();
+      await gatedSave;
+      await continuedPromise;
+
+      // The manifest keeps the reactivated task inline and queued; no stale
+      // eviction survives, and the aggregates stay truthful.
+      const manifest = JSON.parse(await readFile(join(started.root, "execution.json"), "utf8")) as {
+        settledArchivedCount: number;
+        tasks: Array<Record<string, unknown>>;
+      };
+      const handle = manifest.tasks.find((task) => task.taskId === reactivated.taskId)!;
+      assert.equal(handle.archived, undefined);
+      assert.equal(handle.state, "queued");
+      assert.equal(manifest.settledArchivedCount, 0);
+      const inspection = controller.inspect(started.executionId);
+      assert.equal(inspection.archivedCount, 0);
+      assert.equal(inspection.tasks.find((task) => task.taskId === reactivated.taskId)?.state, "queued");
+    } finally {
+      controller.setFaultHooks(undefined);
+      releaseSave();
+    }
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shutdown wave-root retirement validates archives and never deletes on tampered content", async () => {
+  const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-v2-wavescan-")));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-review-background-v2-wavescan-"));
+  const legitWaveRoot = await realpath(await mkdtemp(join(tmpdir(), "wave-cleanup-legit-")));
+  const decoyWaveRoot = await realpath(await mkdtemp(join(tmpdir(), "wave-cleanup-decoy-")));
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const records = Array.from({ length: 40 }, (_unused, index) => collidingTaskRecord(
+      `task-legacy-${index}`,
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      new Date(Date.parse("2024-01-01T00:00:00.000Z") + index * 1_000).toISOString(),
+      `legacy summary ${index}`,
+    ));
+    records[1]!.waveRoot = legitWaveRoot;
+    await writePersistedExecutionGroupTasks(fixtureRoot, workspaceRoot, "exec-legacy-wavescan", records);
+    // Tamper one evicted archive so it claims the decoy wave root while its
+    // integrity hash no longer matches: shutdown must skip it entirely.
+    const tamperedPath = join(fixtureRoot, "tasks", `${records[0]!.taskId}.json`);
+    const tampered = JSON.parse(await readFile(tamperedPath, "utf8")) as { task: { waveRoot?: string } };
+    tampered.task.waveRoot = decoyWaveRoot;
+    await writeFile(tamperedPath, `${JSON.stringify(tampered, null, 2)}\n`, "utf8");
+
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    await restored.restore({ waveRoots: [], bundles: [], groupRoots: [fixtureRoot] });
+    await restored.shutdown();
+
+    // The validated archive's wave root was retired at whole-group cleanup...
+    await assert.rejects(() => access(legitWaveRoot));
+    // ...the tampered archive's claimed wave root was never touched...
+    await access(decoyWaveRoot);
+    // ...and the group root itself was still removed.
+    await assert.rejects(() => access(fixtureRoot));
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+    await rm(fixtureRoot, { recursive: true, force: true });
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(legitWaveRoot, { recursive: true, force: true }).catch(() => undefined);
+    await rm(decoyWaveRoot, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+test("widget and dispatch traverse the controller-wide active index, not settled history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-active-index-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    controller = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    const startedA = await controller.start([
+      { title: "a1", instructions: "work", acceptanceCriteria: ["done"] },
+      { title: "a2", instructions: "work", acceptanceCriteria: ["done"] },
+      { title: "a3", instructions: "work", acceptanceCriteria: ["done"] },
+    ]);
+    const startedB = await controller.start([
+      { title: "b1", instructions: "work", acceptanceCriteria: ["done"] },
+      { title: "b2", instructions: "work", acceptanceCriteria: ["done"] },
+    ]);
+    const internals = controllerInternals(controller);
+    const activeCount = () => internals.activeTasks.size;
+    assert.equal(activeCount(), 5, "both groups' live tasks are indexed");
+    assert.equal(controller.inspect(startedA.executionId).scheduling.globallyDispatchPending, 5);
+    // Readiness checks read the same index.
+    assert.equal(controller.reviewReadiness().length, 5);
+    assert.ok(controller.reviewReadiness().every((task) => task.state === "queued"));
+
+    // Settle two of A's tasks: the index drops them without touching B's.
+    await settleOldestUnsettled(controller, startedA.executionId, "a1");
+    await settleOldestUnsettled(controller, startedA.executionId, "a2");
+    assert.equal(activeCount(), 3);
+    assert.equal(controller.inspect(startedA.executionId).scheduling.globallyDispatchPending, 3);
+    assert.equal(controller.inspect(startedA.executionId).scheduling.dispatchPending, 1);
+    assert.equal(controller.inspect(startedB.executionId).scheduling.dispatchPending, 2);
+    const readiness = controller.reviewReadiness();
+    assert.equal(readiness.length, 3);
+    assert.equal(readiness.filter((task) => task.executionId === startedA.executionId).length, 1);
+    assert.equal(readiness.filter((task) => task.executionId === startedB.executionId).length, 2);
+    assert.ok(readiness.every((task) => task.taskId !== startedA.tasks[0]!.taskId));
+
+    // Widget rendering reads the same index: three active across both groups.
+    const widgetContents: unknown[] = [];
+    const widgetCtx = { ui: { setWidget: (_name: string, content: unknown) => { widgetContents.push(content); } } };
+    await controller.toggleExpandedView(widgetCtx);
+    const expandedComponent = widgetContents.at(-1) as () => { render(width: number): string[]; invalidate(): void };
+    const rendered = expandedComponent().render(240);
+    assert.ok(rendered[0]!.includes("3 active background subtasks"));
+
+    // Settle everything, including across groups: the index empties and the
+    // compact widget clears.
+    await settleOldestUnsettled(controller, startedA.executionId, "a3");
+    await settleOldestUnsettled(controller, startedB.executionId, "b1");
+    await settleOldestUnsettled(controller, startedB.executionId, "b2");
+    assert.equal(activeCount(), 0, "the active index reaches zero after settlement");
+    assert.equal(controller.inspect(startedA.executionId).scheduling.globallyDispatchPending, 0);
+    assert.deepEqual(controller.reviewReadiness(), []);
+    widgetContents.length = 0;
+    controller.setUiContext(widgetCtx);
+    // The expanded view (toggled above) always renders; with an empty active
+    // index it must report zero active tasks rather than settled history.
+    const clearedComponent = widgetContents.at(-1) as () => { render(width: number): string[]; invalidate(): void };
+    const cleared = clearedComponent().render(240);
+    assert.ok(cleared[0]!.includes("0 active background subtasks"));
+    assert.ok(cleared.some((line: string) => line.includes("No active background subtasks.")));
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("archive-reuse metadata for a save comes only from that group's bounded inline tasks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-prior-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    controller = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    const startedA = await controller.start([
+      { title: "a1", instructions: "work", acceptanceCriteria: ["done"] },
+      { title: "a2", instructions: "work", acceptanceCriteria: ["done"] },
+    ]);
+    const startedB = await controller.start([
+      { title: "b1", instructions: "work", acceptanceCriteria: ["done"] },
+    ]);
+    await settleOldestUnsettled(controller, startedA.executionId, "a1");
+    await settleOldestUnsettled(controller, startedA.executionId, "a2");
+    await settleOldestUnsettled(controller, startedB.executionId, "b1");
+
+    // Plant archive metadata the old controller-wide scan would have picked
+    // up: one phantom entry attributed to A for a task A never held, and one
+    // foreign entry for B.
+    const internals = controllerInternals(controller);
+    const cache = internals.archivedTasks as Map<string, { updatedAt: string; integritySha256: string; executionId?: string }>;
+    const bogus = { updatedAt: "2024-01-01T00:00:00.000Z", integritySha256: "f".repeat(64) };
+    cache.set(`${startedA.executionId}:task-phantom`, { ...bogus, executionId: startedA.executionId });
+    cache.set(`${startedB.executionId}:task-foreign`, { ...bogus, executionId: startedB.executionId });
+
+    const groupA = internals.groups.get(startedA.executionId)!;
+    const groupB = internals.groups.get(startedB.executionId)!;
+    const priorArchivesOf = (controller as unknown as {
+      priorArchivesFor(g: BackgroundExecutionGroup): Map<string, unknown>;
+    }).priorArchivesFor.bind(controller);
+    const priorA = priorArchivesOf(groupA);
+    assert.deepEqual(
+      [...priorA.keys()].sort(),
+      [startedA.tasks[0]!.taskId, startedA.tasks[1]!.taskId].sort(),
+      "A's reuse metadata contains exactly A's bounded inline tasks — no phantom, no foreign entries",
+    );
+    const priorB = priorArchivesOf(groupB);
+    assert.deepEqual([...priorB.keys()], [startedB.tasks[0]!.taskId]);
+
+    // And a real save of A still reuses A's own archives end to end.
+    const writes: string[] = [];
+    setDurableWriteFaultInjectionForTesting((stage, path) => {
+      if (stage === "before_rename") writes.push(path);
+    });
+    try {
+      await controller.add(startedA.executionId, [{ title: "a3", instructions: "work", acceptanceCriteria: ["done"] }]);
+      assert.deepEqual(writes, [join(startedA.root, "execution.json")]);
+      const manifest = JSON.parse(await readFile(join(startedA.root, "execution.json"), "utf8")) as {
+        tasks: Array<{ taskId: string; archiveIntegritySha256?: string }>;
+      };
+      for (const taskId of [startedA.tasks[0]!.taskId, startedA.tasks[1]!.taskId]) {
+        const reference = manifest.tasks.find((task) => task.taskId === taskId)!;
+        const archiveOnDisk = JSON.parse(await readFile(join(startedA.root, "tasks", `${taskId}.json`), "utf8")) as { integritySha256: string };
+        assert.equal(reference.archiveIntegritySha256, archiveOnDisk.integritySha256);
+      }
+    } finally {
+      setDurableWriteFaultInjectionForTesting(undefined);
+    }
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sequential top-offs keep manifest bytes, inline state, and widget work bounded (finding 15 soak)", async () => {
+  const SOAK_TOP_OFFS = 220;
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-soak-"));
+  let controller: BackgroundExecutionController | undefined;
+  let restored: BackgroundExecutionController | undefined;
+  const ownedRoots = new Set<string>();
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+      notify: () => undefined,
+    });
+    const started = await controller.start([{ title: "seed task", instructions: "seed", acceptanceCriteria: ["done"] }]);
+    ownedRoots.add(started.root);
+    const executionId = started.executionId;
+    const manifestPath = join(started.root, "execution.json");
+    const firstSettledTaskId = started.tasks[0]!.taskId;
+    let sizeAfterWindow = 0;
+    for (let index = 0; index < SOAK_TOP_OFFS; index += 1) {
+      await settleOldestUnsettled(controller, executionId, `top-off ${index + 1}`);
+      if (index === 40) sizeAfterWindow = (await stat(manifestPath)).size;
+      if (index < SOAK_TOP_OFFS - 1) {
+        await controller.add(executionId, [{
+          title: `top-off ${index + 1}`,
+          instructions: `top-off work ${index + 1}`,
+          acceptanceCriteria: ["done"],
+        }]);
+      }
+      // Bounded in-memory inline state despite lifetime completions, and the
+      // active-task index tracks exactly the live population.
+      const live = controllerInternals(controller).groups.get(executionId)!;
+      assert.ok(
+        live.tasks.length <= INLINE_SETTLED_TASK_LIMIT + 1,
+        `inline task window must stay bounded after ${index + 1} top-offs (got ${live.tasks.length})`,
+      );
+      assert.equal(
+        controllerInternals(controller).activeTasks.size,
+        index < SOAK_TOP_OFFS - 1 ? 1 : 0,
+        `active-task index must track exactly the live population (top-off ${index + 1})`,
+      );
+    }
+
+    // Bounded durable manifest independent of lifetime completions.
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      version: number;
+      totalTaskCount: number;
+      settledArchivedCount: number;
+      tasks: Array<Record<string, unknown>>;
+    };
+    assert.equal(manifest.version, 3);
+    assert.equal(manifest.totalTaskCount, SOAK_TOP_OFFS);
+    assert.equal(manifest.settledArchivedCount, SOAK_TOP_OFFS - INLINE_SETTLED_TASK_LIMIT);
+    assert.equal(manifest.tasks.length, INLINE_SETTLED_TASK_LIMIT);
+    assert.ok(manifest.tasks.every((task) => task.archived === true));
+    const finalSize = (await stat(manifestPath)).size;
+    assert.ok(
+      finalSize <= sizeAfterWindow + 4096,
+      `manifest bytes must stay bounded across sequential top-offs (${sizeAfterWindow} -> ${finalSize})`,
+    );
+
+    // Every historical archive remains independently addressable on disk.
+    const archiveFiles = await readdir(join(started.root, "tasks"));
+    assert.equal(archiveFiles.length, SOAK_TOP_OFFS);
+    const evictedArchive = JSON.parse(
+      await readFile(join(started.root, "tasks", `${firstSettledTaskId}.json`), "utf8"),
+    ) as { task: { taskId: string; state: string; summary: string } };
+    assert.equal(evictedArchive.task.taskId, firstSettledTaskId);
+    assert.equal(evictedArchive.task.state, "landed");
+
+    // Truthful aggregate counts in inspection and completion notifications.
+    const inspection = controller!.inspect(executionId);
+    assert.equal(inspection.historicalCount, SOAK_TOP_OFFS);
+    assert.equal(inspection.archivedCount, SOAK_TOP_OFFS - INLINE_SETTLED_TASK_LIMIT);
+    assert.equal(inspection.activeCount, 0);
+    assert.equal(inspection.tasks.length, INLINE_SETTLED_TASK_LIMIT);
+    assert.equal(inspection.scheduling.globallyDispatchPending, 0);
+    const notificationCollector: string[] = [];
+    (controller as unknown as { input: { notify?: (message: string) => void } }).input.notify = (message) => notificationCollector.push(message);
+    const internals = controllerInternals(controller!);
+    const completionTask = inspection.tasks[0]!;
+    await internals.wake(completionTask, "completion", `Task ${completionTask.taskId} landed.`);
+    assert.ok(
+      notificationCollector.some((message) => message.includes(`Execution ${executionId} COMPLETE: ${SOAK_TOP_OFFS}/${SOAK_TOP_OFFS} tasks landed.`)),
+      "completion aggregates must be truthful from persisted counts",
+    );
+    assert.ok(
+      notificationCollector.some((message) => message.includes(`${SOAK_TOP_OFFS - INLINE_SETTLED_TASK_LIMIT} earlier task(s) landed and are archived`)),
+      "completion notifications must disclose archive-only omissions",
+    );
+
+    // Widget updates stay bounded: the indicator traverses only the bounded
+    // inline window, and an expanded live-view render succeeds from it.
+    const widgetContents: unknown[] = [];
+    const widgetCtx = { ui: { setWidget: (_name: string, content: unknown) => { widgetContents.push(content); } } };
+    await controller!.toggleExpandedView(widgetCtx);
+    assert.equal(widgetContents.length, 1);
+    const expandedComponent = widgetContents[0] as () => { render(width: number): string[]; invalidate(): void };
+    const rendered = expandedComponent().render(240);
+    assert.ok(rendered[0]!.includes("0 active background subtasks"));
+    assert.ok(rendered.some((line: string) => line.includes("No active background subtasks.")));
+
+    // Restart: restore must not eagerly hydrate historical archives, and exact
+    // historical lookup must lazily load and integrity-check the archive.
+    const associations = controller!.associations();
+    for (const groupRoot of associations.groupRoots ?? []) ownedRoots.add(groupRoot);
+    await controller!.detach();
+    controller = undefined;
+    restored = new BackgroundExecutionController({ pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => root });
+    await restored.restore(associations);
+    const restoredGroup = controllerInternals(restored).groups.get(executionId)!;
+    assert.ok(restoredGroup.tasks.length <= INLINE_SETTLED_TASK_LIMIT, "restore must not eagerly hydrate historical archives");
+    assert.equal(restoredGroup.totalTaskCount, SOAK_TOP_OFFS);
+    assert.equal(restoredGroup.settledArchivedCount, SOAK_TOP_OFFS - INLINE_SETTLED_TASK_LIMIT);
+    const historical = await restored.inspectTask(executionId, firstSettledTaskId);
+    assert.equal(historical.tasks[0]!.taskId, firstSettledTaskId);
+    assert.equal(historical.tasks[0]!.state, "landed");
+    assert.ok(historical.tasks[0]!.summary!.includes("settled outcome"));
+    assert.equal(historical.historicalCount, SOAK_TOP_OFFS);
+    assert.equal(historical.archivedCount, SOAK_TOP_OFFS - INLINE_SETTLED_TASK_LIMIT);
+    // Stable aggregate counts survive the restart.
+    const restoredInspection = restored.inspect(executionId);
+    assert.equal(restoredInspection.historicalCount, SOAK_TOP_OFFS);
+    assert.equal(restoredInspection.archivedCount, SOAK_TOP_OFFS - INLINE_SETTLED_TASK_LIMIT);
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+    await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
+    for (const owned of ownedRoots) await rm(owned, { recursive: true, force: true }).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function waitForLandedDurableRecord(
   started: BackgroundInspection,
   requiredPhase: string,
@@ -2227,31 +3500,37 @@ function collidingTaskRecord(taskId: string, createdAt: string, updatedAt: strin
   };
 }
 
-async function writePersistedExecutionGroup(
+async function writePersistedExecutionGroupTasks(
   groupRoot: string,
   groupCwd: string,
   executionId: string,
-  task: BackgroundTaskRecord,
+  tasks: BackgroundTaskRecord[],
 ): Promise<void> {
-  const archiveUnsigned = {
-    version: 1 as const,
-    taskId: task.taskId,
-    archivedAt: task.updatedAt,
-    task,
-  };
-  const archiveIntegritySha256 = createHash("sha256").update(JSON.stringify(archiveUnsigned)).digest("hex");
-  const reference = {
-    archived: true,
-    taskId: task.taskId,
-    title: task.definition.title,
-    state: task.state as "landed",
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-    summary: task.summary,
-    timing: { queueMs: 1, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0, totalMs: 0 },
-    archivePath: join("tasks", `${task.taskId}.json`),
-    archiveIntegritySha256,
-  };
+  const payloads = tasks.map((task) => {
+    const archiveUnsigned = {
+      version: 1 as const,
+      taskId: task.taskId,
+      archivedAt: task.updatedAt,
+      task,
+    };
+    const archiveIntegritySha256 = createHash("sha256").update(JSON.stringify(archiveUnsigned)).digest("hex");
+    return {
+      archiveUnsigned,
+      archiveIntegritySha256,
+      reference: {
+        archived: true,
+        taskId: task.taskId,
+        title: task.definition.title,
+        state: task.state as "landed",
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+        summary: task.summary,
+        timing: { queueMs: 1, captureMs: 0, executionMs: 0, reviewMs: 0, landingMs: 0, totalMs: 0 },
+        archivePath: join("tasks", `${task.taskId}.json`),
+        archiveIntegritySha256,
+      },
+    };
+  });
   const unsigned = {
     version: 2 as const,
     revision: 0,
@@ -2259,15 +3538,30 @@ async function writePersistedExecutionGroup(
     kind: "execute" as const,
     root: groupRoot,
     cwd: groupCwd,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
+    createdAt: tasks[0]!.createdAt,
+    updatedAt: tasks.at(-1)!.updatedAt,
     peakConcurrency: 1,
-    tasks: [reference],
+    tasks: payloads.map((payload) => payload.reference),
   };
   const snapshot = { ...unsigned, integritySha256: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex") };
   await mkdir(join(groupRoot, "tasks"), { recursive: true });
-  await writeFile(join(groupRoot, "tasks", `${task.taskId}.json`), `${JSON.stringify({ ...archiveUnsigned, integritySha256: archiveIntegritySha256 }, null, 2)}\n`, "utf8");
+  for (const payload of payloads) {
+    await writeFile(
+      join(groupRoot, "tasks", `${payload.reference.taskId}.json`),
+      `${JSON.stringify({ ...payload.archiveUnsigned, integritySha256: payload.archiveIntegritySha256 }, null, 2)}\n`,
+      "utf8",
+    );
+  }
   await writeFile(join(groupRoot, "execution.json"), `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+}
+
+async function writePersistedExecutionGroup(
+  groupRoot: string,
+  groupCwd: string,
+  executionId: string,
+  task: BackgroundTaskRecord,
+): Promise<void> {
+  await writePersistedExecutionGroupTasks(groupRoot, groupCwd, executionId, [task]);
 }
 
 function renderWidget(content: unknown, width = 240): string[] {

@@ -238,7 +238,13 @@ export function formatExecutionEvent(
 ): string {
   const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
   const successVerb = group.kind === "research" ? "reported" : "landed";
-  const successful = group.tasks.filter((candidate) => candidate.state === successState);
+  // Finding 15: totals come from the persisted aggregate counts so they stay
+  // truthful after settled tasks are evicted from the bounded inline window;
+  // the inline incomplete list is exhaustive because every unsettled task
+  // stays inline (bounded by the per-execution admission cap).
+  const archivedSettled = group.settledArchivedCount ?? 0;
+  const successful = group.tasks.filter((candidate) => candidate.state === successState).length + archivedSettled;
+  const total = group.totalTaskCount ?? group.tasks.length;
   const incomplete = group.tasks.filter((candidate) => candidate.state !== successState);
   const active = group.tasks.filter((candidate) => isActiveTaskState(candidate.state));
   const title = task.definition.title;
@@ -247,6 +253,9 @@ export function formatExecutionEvent(
     "",
     `Task: ${task.taskId} · ${title} · ${task.state}`,
   ];
+  if (archivedSettled > 0) {
+    lines.push(`${archivedSettled} earlier task(s) ${successVerb} and are archived; use SubtasksInspect with their taskId for exact history.`);
+  }
   if (kind !== "completion") lines.push(`Execution revision: ${group.revision}`);
   const landedPaths = [
     ...(task.result?.landing?.appliedPaths ?? []),
@@ -261,22 +270,22 @@ export function formatExecutionEvent(
   }
   if (incomplete.length === 0) {
     if (kind === "completion") {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} COMPLETE: ${successful.length}/${group.tasks.length} tasks ${successVerb}.`);
+      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} COMPLETE: ${successful}/${total} tasks ${successVerb}.`);
       lines.push(group.kind === "research"
         ? "All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group."
         : "All requested task outputs have landed; aggregate verification is now appropriate.");
     } else if (kind === "failure") {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} has ${successful.length}/${group.tasks.length} tasks ${successVerb}, but this interaction reported a failure.`);
+      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} has ${successful}/${total} tasks ${successVerb}, but this interaction reported a failure.`);
       lines.push(`Inspect the failed command and verify the ${group.kind === "research" ? "reports" : "landed output"} before treating the group as successful.`);
     } else {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} currently has ${successful.length}/${group.tasks.length} tasks ${successVerb}.`);
+      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} currently has ${successful}/${total} tasks ${successVerb}.`);
       lines.push("This is an informational state update; rely on the separate completion or failure event for the execution outcome.");
     }
     if (kind === "state") lines.push(noActionResponseNotice(task));
     return lines.join("\n");
   }
   const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
-  lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} ${disposition}: ${successful.length}/${group.tasks.length} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
+  lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} ${disposition}: ${successful}/${total} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
   if (kind === "completion") {
     lines.push(`This is a partial task completion, not completion of the whole group. Do not claim outputs from tasks that have not ${successVerb}.`);
   } else if (kind === "failure") {
@@ -484,8 +493,8 @@ export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): W
     taskState: live.state,
     message: boundDiagnosticText(content, WAKE_FAILURE_MAX_SUMMARY) ?? "",
     groupSummary: {
-      taskCount: group.tasks.length,
-      settled: group.tasks.filter((candidate) => candidate.state === successState).length,
+      taskCount: group.totalTaskCount ?? group.tasks.length,
+      settled: (group.settledArchivedCount ?? 0) + group.tasks.filter((candidate) => candidate.state === successState).length,
       active: group.tasks.filter((candidate) => isActiveTaskState(candidate.state)).length,
     },
     recovery: {

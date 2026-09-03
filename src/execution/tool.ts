@@ -218,9 +218,9 @@ export class ExecutionToolManager {
     });
     register("subtask-inspect", "Pick and inspect a background subtask; explicit IDs remain optional.", async (args, ctx) => {
       const [executionId, taskId] = words(args);
-      if (executionId) return this.controller.inspect(executionId, taskId);
+      if (executionId) return this.controller.inspectTask(executionId, taskId);
       const selected = await selectTask(this.controller, ctx, "Inspect background subtask");
-      return selected ? this.controller.inspect(selected.executionId, selected.taskId) : undefined;
+      return selected ? this.controller.inspectTask(selected.executionId, selected.taskId) : undefined;
     });
     register("subtask-add", "Pick an execution and add JSON task definitions; explicit arguments remain optional.", async (args, ctx) => {
       let [executionId, json] = splitFirst(args);
@@ -376,7 +376,9 @@ export class ExecutionToolManager {
           return backgroundResult("add", inspection, false, this.input.config);
         }
         case "inspect": {
-          const inspection = this.controller.inspect(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines);
+          // Finding 15: exact task handles also recover settled tasks whose
+          // records were archived (lazily loaded and integrity-checked).
+          const inspection = await this.controller.inspectTask(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines);
           return backgroundResult("inspect", inspection, false);
         }
         case "watch": {
@@ -729,6 +731,9 @@ function formatInspectionForModel(summary: string, inspection: BackgroundInspect
     );
   }
   lines.push("Task handles (retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect):");
+  if (inspection.archivedCount > 0) {
+    lines.push(`  (${inspection.archivedCount} earlier settled task(s) are archived and not listed; SubtasksInspect with their taskId loads the integrity-checked archive.)`);
+  }
   for (const task of inspection.tasks) {
     const control = task.liveControl
       ? `live control: steer ${task.liveControl.steer ? "yes" : "no"}, interrupt ${task.liveControl.interrupt ? "yes" : "no"}`
@@ -787,7 +792,8 @@ function renderResult(value: unknown, _options: unknown, theme: ThemeLike): unkn
   return textComponent((width) => {
     const lines = [clip(theme.fg(isRecord(value) && value.isError ? "error" : "success", summary), width)];
     if (details && Array.isArray(details.tasks)) {
-      for (const task of details.tasks.slice(0, 8)) {
+      const renderedTasks = details.tasks.slice(0, 8);
+      for (const task of renderedTasks) {
         if (!isRecord(task)) continue;
         const title = isRecord(task.definition) && typeof task.definition.title === "string" ? task.definition.title : task.taskId;
         const state = task.state === "queued"
@@ -796,6 +802,16 @@ function renderResult(value: unknown, _options: unknown, theme: ThemeLike): unkn
             : "queued (executor capacity wait)"
           : task.state ?? "unknown";
         lines.push(clip(`  ${String(task.taskId ?? "task")}  ${state}  ${title ?? "task"}`, width));
+      }
+      // Finding 15 (review pass 2): compact rendering is explicitly bounded,
+      // so it must disclose what it omits — both unrendered inline tasks and
+      // archive-only settled history.
+      if (details.tasks.length > renderedTasks.length) {
+        lines.push(clip(`  … ${details.tasks.length - renderedTasks.length} additional inline task(s) omitted from this compact rendering.`, width));
+      }
+      const archivedCount = typeof details.archivedCount === "number" ? details.archivedCount : 0;
+      if (archivedCount > 0) {
+        lines.push(clip(`  … ${archivedCount} earlier settled task(s) are archived; inspect by taskId for exact history.`, width));
       }
     }
     return lines;
@@ -921,7 +937,8 @@ function formatUserCommandResult(value: unknown): string {
   const lines: string[] = [];
   for (const inspection of inspections) {
     if (!isRecord(inspection) || typeof inspection.executionId !== "string" || !Array.isArray(inspection.tasks)) continue;
-    lines.push(`${typeof inspection.kind === "string" ? inspection.kind : "background"} group ${inspection.executionId} (${inspection.activeCount ?? 0} active)`);
+    const archivedCount = typeof inspection.archivedCount === "number" ? inspection.archivedCount : 0;
+    lines.push(`${typeof inspection.kind === "string" ? inspection.kind : "background"} group ${inspection.executionId} (${inspection.activeCount ?? 0} active${archivedCount > 0 ? `, ${archivedCount} archived task(s) not listed; inspect by taskId for exact history` : ""})`);
     for (const task of inspection.tasks) {
       if (!isRecord(task)) continue;
       const title = isRecord(task.definition) && typeof task.definition.title === "string" ? task.definition.title : "task";

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ReviewGateConfig } from "../config";
@@ -10,12 +10,16 @@ import { configDigest, type ExecutionAssociationsSnapshot } from "../session-sta
 import { materializeLandingConflicts, unresolvedConflictMarkers } from "./conflict-materialization";
 import {
   GROUP_VERSION,
+  INLINE_SETTLED_TASK_LIMIT,
+  MAX_UNSETTLED_TASKS_PER_EXECUTION,
   readGroup,
+  readOwnedTaskArchive,
   removeOwnedExecutionRoot,
   removeOwnedWaveRoot,
   serializeGroupSnapshot,
   writeGroupSnapshot,
   type BackgroundExecutionGroup,
+  type PriorArchiveRecord,
 } from "./background-group-store";
 import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
 import { continueOperation, inspectOperation } from "./operation-actions";
@@ -26,6 +30,7 @@ import {
   appendActivity,
   cloneTask,
   isActiveTaskState,
+  isArchivableTaskState,
   MAX_ACTIVITY,
   newTask,
   stateFromContinuationProgress,
@@ -75,18 +80,27 @@ import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
  * (./subtask-widget). Finding 14 moves notification policy, event
  * formatting, and the L8 bounded failure diagnostic to ./subtask-notifications;
  * the original public surface of this module is preserved via the re-exports
- * below. Scaling remains in the controller (finding 15).
+ * below. Finding 15 bounds execution persistence and top-off scaling here:
+ * unsettled tasks are capped per execution, settled tasks beyond a small
+ * recent inline window are evicted to their independently addressed archives
+ * after each durable save (aggregate counts keep completion notifications
+ * truthful), restore hydrates only the bounded window, and exact historical
+ * (executionId, taskId) inspection/recovery lazily loads and integrity-checks
+ * the compacted archive. Routine save/widget work therefore stays
+ * proportional to bounded live/recent state instead of lifetime tasks.
  */
 export { formatWatchEvent } from "./subtask-notifications";
 export type { WakeFailureDiagnostic } from "./subtask-notifications";
 export {
   BACKGROUND_TASK_STATES,
   isActiveTaskState,
+  isArchivableTaskState,
   isForceMergeCandidateTaskState,
   isInterruptibleTaskState,
   stateFromContinuationProgress,
   stateFromWaveProgress,
 } from "./task-state";
+export { INLINE_SETTLED_TASK_LIMIT, MAX_UNSETTLED_TASKS_PER_EXECUTION };
 export type {
   BackgroundActivityEvent,
   BackgroundCommandRecord,
@@ -202,7 +216,13 @@ export interface BackgroundInspection {
   updatedAt: string;
   peakConcurrency: number;
   activeCount: number;
+  /** Lifetime tasks ever admitted to this execution (truthful total). */
   historicalCount: number;
+  /**
+   * Finding 15: settled tasks persisted only in their per-task archives and
+   * therefore omitted from `tasks` here; recover them by exact taskId.
+   */
+  archivedCount: number;
   scheduling: BackgroundSchedulingSnapshot;
   conflictGate?: BackgroundConflictGate;
   tasks: Array<BackgroundTaskRecord & {
@@ -235,7 +255,18 @@ export class BackgroundExecutionController {
   private readonly pendingForceMerges = new Map<string, PendingForceMerge>();
   private readonly saveTails = new Map<string, Promise<void>>();
   private readonly steeringTails = new Map<string, Promise<void>>();
-  private readonly archivedTasks = new Map<string, { updatedAt: string; integritySha256: string }>();
+  private readonly archivedTasks = new Map<string, { updatedAt: string; integritySha256: string; executionId?: string; legacy?: boolean }>();
+  /**
+   * Finding 15: authenticated membership handles for legacy settled stubs that
+   * are archive-only (evicted from a legacy manifest or covered by the durable
+   * membership index). Entries are scoped per execution so a copied or
+   * colliding archive can never authenticate an old handle in another group.
+   */
+  private readonly legacyArchiveHandles = new Map<string, {
+    entries: Map<string, { integritySha256: string; updatedAt: string }>;
+    /** True once the membership index covering these handles is durably written. */
+    persisted: boolean;
+  }>();
   private recentActivity: RecentBackgroundActivity[] = [];
   private pool: ExecutorPoolScheduler;
   private active = 0;
@@ -334,7 +365,55 @@ export class BackgroundExecutionController {
         if (resolve(group.cwd) !== resolve(this.input.cwd())) {
           throw new Error(`execution cwd ${group.cwd} does not match ${resolve(this.input.cwd())}`);
         }
-        for (const [taskId, archive] of restored.archives) this.archivedTasks.set(taskId, archive);
+        // Finding 15: seed archive-reuse metadata only for tasks that restored
+        // inline (the bounded recent settled window); evicted settled tasks
+        // stay archive-only and are recovered lazily per exact task handle, so
+        // restore never eagerly hydrates every historical archive. Legacy
+        // (version-1) archives are flagged for one-time migration on their
+        // next archive write and authenticated via their manifest-covered
+        // hashes until then.
+        const inlineTaskIds = new Set(group.tasks.map((task) => task.taskId));
+        for (const [taskId, archive] of restored.archives) {
+          if (inlineTaskIds.has(taskId)) {
+            this.archivedTasks.set(this.archiveHandleKey(group.executionId, taskId), {
+              updatedAt: archive.updatedAt,
+              integritySha256: archive.integritySha256,
+              executionId: group.executionId,
+              legacy: archive.legacy === true,
+            });
+          }
+        }
+        // Legacy evicted stubs (and any durable membership index from a prior
+        // compaction) authenticate exact historical handles for this group.
+        const legacyHandles = new Map<string, { integritySha256: string; updatedAt: string }>();
+        for (const [taskId, entry] of restored.legacyArchives) {
+          legacyHandles.set(taskId, { integritySha256: entry.archiveIntegritySha256, updatedAt: entry.updatedAt });
+        }
+        if (restored.archiveIndex) {
+          for (const [taskId, entry] of Object.entries(restored.archiveIndex.entries)) {
+            if (!legacyHandles.has(taskId)) legacyHandles.set(taskId, { integritySha256: entry.archiveIntegritySha256, updatedAt: entry.updatedAt });
+          }
+        }
+        if (legacyHandles.size > 0) {
+          // Review pass 3: the handles are durably persisted (no rewrite on
+          // the next save) exactly when they match the durable membership
+          // index restored above — comparing ids, hashes, and timestamps, not
+          // just counts, so any divergence still forces a rewrite.
+          const durableEntries = restored.archiveIndex?.entries;
+          const alreadyPersisted = durableEntries !== undefined
+            && legacyHandles.size === Object.keys(durableEntries).length
+            && [...legacyHandles].every(([taskId, entry]) => {
+              const durable = durableEntries[taskId];
+              return durable?.archiveIntegritySha256 === entry.integritySha256
+                && durable.updatedAt === entry.updatedAt;
+            });
+          this.legacyArchiveHandles.set(group.executionId, {
+            entries: legacyHandles,
+            // Handles sourced from the durable index are already persisted;
+            // manifest-evicted legacy stubs still need their index write.
+            persisted: alreadyPersisted,
+          });
+        }
         for (const task of group.tasks) {
           if (task.state === "stopped_for_application_exit" && task.bundle) {
             const instructionId = `application-resume-${randomUUID()}`;
@@ -406,6 +485,13 @@ export class BackgroundExecutionController {
     if (resolvedWorkerRoute(this.input.config, kind).length === 0) {
       throw new Error(`No ${kind} worker route is configured. Add at least one eligible resource in /review-settings.`);
     }
+    // Finding 15: fail closed at the unsettled admission cap before any
+    // filesystem resources are created.
+    if (tasks.length > MAX_UNSETTLED_TASKS_PER_EXECUTION) {
+      throw new Error(
+        `At most ${MAX_UNSETTLED_TASKS_PER_EXECUTION} unsettled tasks are admitted per execution; ${tasks.length} were requested. Split the work across sequential top-offs after tasks settle.`,
+      );
+    }
     const root = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
     // Group creation awaited the filesystem: a detach/shutdown may have begun
     // (and completed its quiescence) meanwhile. Never attach a group — and
@@ -429,6 +515,10 @@ export class BackgroundExecutionController {
       updatedAt: now,
       peakConcurrency: 0,
       tasks: tasks.map((definition) => newTask(definition)),
+      // Finding 15: truthful lifetime aggregates start here and grow with
+      // admissions, independent of the bounded inline task window.
+      totalTaskCount: tasks.length,
+      settledArchivedCount: 0,
     };
     this.groups.set(executionId, group);
     await this.save(group);
@@ -437,10 +527,98 @@ export class BackgroundExecutionController {
     return this.inspect(executionId);
   }
 
+  /** Composite archive-handle key: archive metadata is scoped per execution. */
+  private archiveHandleKey(executionId: string, taskId: string): string {
+    return `${executionId}:${taskId}`;
+  }
+
+  /** Execution-scoped view of the archive-reuse metadata for one group. */
+  private priorArchivesFor(group: BackgroundExecutionGroup): Map<string, PriorArchiveRecord> {
+    // Review pass 4: inspect only the target group's bounded inline tasks via
+    // composite-key lookups — routine save work never scales with the archive
+    // metadata of unrelated attached executions.
+    const priorArchives = new Map<string, PriorArchiveRecord>();
+    for (const task of group.tasks) {
+      const entry = this.archivedTasks.get(this.archiveHandleKey(group.executionId, task.taskId));
+      if (entry?.executionId === group.executionId) {
+        priorArchives.set(task.taskId, entry);
+      }
+    }
+    return priorArchives;
+  }
+
+  /**
+   * Finding 15: fail closed at the unsettled admission cap. Shared by
+   * SubtasksAdd, archived-task reactivation, and recovery adoption into an
+   * existing execution, so no path can push an execution past the cap.
+   * Sequential top-offs after prior tasks settle remain supported without
+   * limit.
+   */
+  private assertUnsettledAdmissionCapacity(group: BackgroundExecutionGroup, requested: number): void {
+    const unsettled = group.tasks.filter((task) => !isArchivableTaskState(task.state)).length;
+    if (unsettled + requested > MAX_UNSETTLED_TASKS_PER_EXECUTION) {
+      throw new Error(
+        `Execution ${group.executionId} already holds ${unsettled} unsettled task(s); at most ${MAX_UNSETTLED_TASKS_PER_EXECUTION} unsettled tasks are admitted per execution. `
+        + "Wait for tasks to land or report (sequential settled top-offs remain supported), or start a new execution for the additional work.",
+      );
+    }
+  }
+
+  /** Authentication handles for lazily loading one of this group's archives. */
+  private archivedTaskAuth(group: BackgroundExecutionGroup, taskId: string): {
+    executionId: string;
+    archiveIntegritySha256?: string;
+    legacyArchiveIntegritySha256?: string;
+  } {
+    const bound = this.archivedTasks.get(this.archiveHandleKey(group.executionId, taskId));
+    const legacy = this.legacyArchiveHandles.get(group.executionId)?.entries.get(taskId);
+    // Finding 15 (review pass 2): the two hashes authenticate DIFFERENT
+    // archive generations. A bound handle matches the current execution-bound
+    // version-2 archive; a legacy handle matches only the superseded
+    // version-1 document. Applying a legacy hash to a rewritten archive would
+    // break a stable handle after re-admission and re-settlement.
+    return {
+      executionId: group.executionId,
+      archiveIntegritySha256: bound?.integritySha256,
+      legacyArchiveIntegritySha256: legacy?.integritySha256,
+    };
+  }
+
+  /**
+   * True when the task handle resolves to a settled record owned by one of
+   * this controller's executions: inline settled, execution-bound archive, or
+   * authenticated legacy membership. Used to refuse stale-bundle adoption of
+   * this controller's own completed work without blocking legitimate
+   * legacy-bundle continuation of genuinely lost operations.
+   */
+  private async settledArchiveOwner(taskId: string): Promise<string | undefined> {
+    for (const group of this.groups.values()) {
+      const inline = group.tasks.find((candidate) => candidate.taskId === taskId);
+      if (inline && isArchivableTaskState(inline.state)) return group.executionId;
+      try {
+        if (await this.loadArchivedTask(group, taskId)) return group.executionId;
+      } catch {
+        // Not provably ours (tampered/foreign archive): adoption proceeds and
+        // the archive integrity problem surfaces on exact inspection instead.
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Lazily load and integrity-check a settled task archive for an exact
+   * handle, authenticated against this execution's membership metadata.
+   */
+  private loadArchivedTask(group: BackgroundExecutionGroup, taskId: string): Promise<BackgroundTaskRecord | undefined> {
+    return readOwnedTaskArchive(group.root, taskId, this.archivedTaskAuth(group, taskId));
+  }
+
   async add(executionId: string | undefined, tasks: BackgroundTaskDefinition[]): Promise<BackgroundInspection> {
     const group = this.resolveGroup(executionId);
     if (resolve(group.cwd) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
+    this.assertUnsettledAdmissionCapacity(group, tasks.length);
     group.tasks.push(...tasks.map((definition) => newTask(definition)));
+    group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - tasks.length) + tasks.length;
     group.updatedAt = new Date().toISOString();
     await this.save(group);
     void this.pump();
@@ -451,6 +629,35 @@ export class BackgroundExecutionController {
     const group = this.resolveGroup(executionId);
     const selected = taskId ? group.tasks.filter((task) => task.taskId === taskId) : group.tasks;
     if (taskId && selected.length === 0) throw new Error(`Unknown task ${taskId}.`);
+    return this.buildInspection(group, selected, offset, lines);
+  }
+
+  /**
+   * Finding 15: exact task inspection that also recovers settled tasks whose
+   * records were evicted from the bounded inline window. The compacted task
+   * archive is loaded lazily and integrity-checked; a missing archive keeps
+   * the original unknown-task failure while a malformed or tampered archive
+   * fails closed with its integrity diagnostic. Bounded list inspections stay
+   * synchronous via inspect(); every list discloses archivedCount omissions.
+   */
+  async inspectTask(executionId?: string, taskId?: string, offset?: number, lines?: number): Promise<BackgroundInspection> {
+    try {
+      return this.inspect(executionId, taskId, offset, lines);
+    } catch (error) {
+      if (!taskId) throw error;
+      const group = this.resolveGroup(executionId);
+      const archived = await this.loadArchivedTask(group, taskId);
+      if (!archived) throw error;
+      return this.buildInspection(group, [archived], offset, lines);
+    }
+  }
+
+  private buildInspection(
+    group: BackgroundExecutionGroup,
+    selected: BackgroundTaskRecord[],
+    offset?: number,
+    lines?: number,
+  ): BackgroundInspection {
     const from = Math.max(0, offset ?? 0);
     const count = Math.max(1, Math.min(lines ?? MAX_ACTIVITY, 500));
     return {
@@ -463,7 +670,10 @@ export class BackgroundExecutionController {
       updatedAt: group.updatedAt,
       peakConcurrency: group.peakConcurrency ?? 0,
       activeCount: group.tasks.filter((task) => isActiveTaskState(task.state)).length,
-      historicalCount: group.tasks.length,
+      // Finding 15: truthful lifetime/aggregate counts instead of the bounded
+      // inline window, plus explicit disclosure of archive-only omissions.
+      historicalCount: group.totalTaskCount ?? group.tasks.length,
+      archivedCount: group.settledArchivedCount ?? 0,
       scheduling: this.schedulingSnapshot(group),
       conflictGate: this.conflictGate && this.conflictGate.executionId === group.executionId
         ? { ...this.conflictGate, paths: [...this.conflictGate.paths] }
@@ -514,15 +724,19 @@ export class BackgroundExecutionController {
   }
 
   reviewReadiness(): BackgroundReviewReadinessTask[] {
-    return [...this.groups.values()].flatMap((group) => group.tasks
-      .filter((task) => isActiveTaskState(task.state))
-      .map((task) => ({
+    // Review pass 4: readiness checks run repeatedly during orchestration —
+    // read the controller-wide active-task index instead of traversing every
+    // settled window in every attached group. The active-state filter stays
+    // defensive so an unsynchronized transition can never surface.
+    return [...this.activeTasks.values()]
+      .filter(({ task }) => isActiveTaskState(task.state))
+      .map(({ group, task }) => ({
         executionId: group.executionId,
         kind: group.kind,
         taskId: task.taskId,
         title: task.definition.title,
         state: task.state,
-      })));
+      }));
   }
 
   async continueTask(input: {
@@ -535,11 +749,29 @@ export class BackgroundExecutionController {
   }): Promise<BackgroundInspection> {
     const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle);
     const { group, task } = target;
+    const archiveOnly = target.archiveOnly === true;
     if (isActiveTaskState(task.state)) throw new Error(`Task ${task.taskId} is already active.`);
     const bundle = input.bundle ?? task.bundle;
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
-    if (duplicate) return this.inspect(group.executionId, task.taskId);
+    if (duplicate) {
+      return archiveOnly
+        ? this.buildInspection(group, [task])
+        : this.inspect(group.executionId, task.taskId);
+    }
+    // Finding 15 (review pass 2): settled-task reactivation re-enters the
+    // unsettled population — the shared admission cap applies to inline
+    // settled and archive-only reactivation alike. Re-admission mutates
+    // controller state only after bundle and duplicate validation, so a
+    // bundle-less or duplicate continuation leaves counts and state exactly
+    // as they were.
+    if (isArchivableTaskState(task.state)) this.assertUnsettledAdmissionCapacity(group, 1);
+    if (archiveOnly) {
+      group.tasks.push(task);
+      // The archive-only representation is being retired: re-admitting a
+      // settled task moves it back inline, so the aggregate must follow.
+      group.settledArchivedCount = Math.max(0, (group.settledArchivedCount ?? 0) - 1);
+    }
     task.bundle = { ...bundle };
     task.pendingContinuation = { instructions: input.instructions, instructionId: input.instructionId };
     task.commands.push({
@@ -560,11 +792,26 @@ export class BackgroundExecutionController {
     executionId?: string,
     taskId?: string,
     bundle?: ReattachmentBundle,
-  ): Promise<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord }> {
+  ): Promise<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord; archiveOnly?: boolean }> {
     try {
       return this.resolveTask(executionId, taskId, bundle);
     } catch (error) {
-      if (!bundle || taskId) throw error;
+      if (taskId) {
+        // Finding 15: exact historical recovery for a stable task handle whose
+        // settled record was evicted from the inline window. The compacted
+        // archive is loaded lazily, integrity-checked and execution-bound.
+        // The record is NOT re-admitted here: continueTask owns re-admission
+        // after bundle and duplicate validation, so a bundle-less, failing, or
+        // duplicate continuation never mutates bounded inline state or
+        // aggregates.
+        const group = this.resolveGroup(executionId);
+        const archived = await this.loadArchivedTask(group, taskId);
+        if (!archived) throw error;
+        const existing = group.tasks.find((candidate) => candidate.taskId === taskId);
+        if (existing) return { group, task: existing };
+        return { group, task: archived, archiveOnly: true };
+      }
+      if (!bundle) throw error;
       const adoptionEpoch = this.detachEpoch;
       if (this.shuttingDown || this.detaching > 0) {
         throw new Error("Application shutdown or controller detach is in progress.");
@@ -576,11 +823,22 @@ export class BackgroundExecutionController {
       if (resolve(inspection.manifest.sourceRoot) !== resolve(this.input.cwd())) {
         throw new Error(`Recovery bundle belongs to ${inspection.manifest.sourceRoot}, not ${resolve(this.input.cwd())}.`);
       }
+      if (inspection.record.state === "landed" && await this.settledArchiveOwner(inspection.bundle.taskId)) {
+        // Finding 15 (narrowed in review pass 2): settled work owned by one of
+        // this controller's executions must never resurrect as recoverable
+        // work when stale association bundles outlive a compaction. Deliberate
+        // legacy-bundle continuation of a landed operation whose owning
+        // execution is genuinely gone remains supported by the operation layer.
+        throw new Error(`Recovery bundle ${bundle.operationId} already landed; re-adoption would duplicate completed work.`);
+      }
       const definition = inspection.manifest.task?.task;
       if (!definition) throw new Error("Recovery bundle has no durable task definition and cannot be adopted automatically.");
       let group: BackgroundExecutionGroup;
       if (executionId) {
         group = this.resolveGroup(executionId);
+        // Adoption into an existing execution adds to its unsettled
+        // population: the shared admission cap applies here too.
+        this.assertUnsettledAdmissionCapacity(group, 1);
       } else {
         const root = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
         if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== adoptionEpoch) {
@@ -600,6 +858,8 @@ export class BackgroundExecutionController {
           updatedAt: now,
           peakConcurrency: 0,
           tasks: [],
+          totalTaskCount: 0,
+          settledArchivedCount: 0,
         };
         this.groups.set(group.executionId, group);
       }
@@ -610,6 +870,10 @@ export class BackgroundExecutionController {
       task.summary = `Adopted durable operation ${inspection.bundle.operationId} for triage-style continuation.`;
       this.addActivity(task, "recovery", task.summary);
       group.tasks.push(task);
+      // Adoption into an existing execution adds to its unsettled population,
+      // so the shared admission cap applies here; only adoption into a fresh
+      // execution bypasses the check (it starts from an empty population).
+      group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - 1) + 1;
       await this.save(group);
       await this.publishAssociations();
       return { group, task };
@@ -1075,9 +1339,38 @@ export class BackgroundExecutionController {
         task.updatedAt = new Date().toISOString();
       }
       if (settled.length === group.tasks.length) {
+        // Whole-group retirement: recover the wave roots recorded in the
+        // (evicted) task archives once, shutdown-only, before the root is
+        // removed so sequential top-offs do not leave their workspace
+        // artifacts behind. Every archive is loaded through the integrity and
+        // execution-ownership checks before its waveRoot is trusted — a
+        // malformed or tampered archive is skipped, never acted on
+        // destructively. Recovery archives themselves are deleted with the
+        // group exactly as before; this scan never deletes them early.
+        const archiveDir = join(group.root, "tasks");
+        for (const entry of await readdir(archiveDir).catch(() => [] as string[])) {
+          if (!entry.endsWith(".json") || entry === "index.json") continue;
+          try {
+            const archived = await this.loadArchivedTask(group, entry.slice(0, -".json".length));
+            if (archived?.waveRoot) await removeOwnedWaveRoot(archived.waveRoot).catch(() => undefined);
+          } catch {
+            // Never act destructively on malformed, tampered, or foreign
+            // archive contents. The execution root cleanup below remains
+            // independently owned.
+          }
+        }
         await removeOwnedExecutionRoot(group.root);
         this.groups.delete(executionId);
-        for (const task of settled) this.archivedTasks.delete(task.taskId);
+        this.dropActiveTasks(executionId);
+        // Finding 15: retire every archive handle owned by the removed group,
+        // including handles for tasks whose records were already evicted to
+        // their compacted archives, and its membership-index bookkeeping.
+        this.legacyArchiveHandles.delete(executionId);
+        for (const [taskId, entry] of this.archivedTasks) {
+          if (entry.executionId === executionId || settled.some((task) => task.taskId === taskId)) {
+            this.archivedTasks.delete(taskId);
+          }
+        }
       } else if (settled.length > 0) {
         await this.save(group);
       }
@@ -1098,9 +1391,11 @@ export class BackgroundExecutionController {
     try {
       await this.quiesceSaveTails(() => {
         this.groups.clear();
+        this.activeTasks.clear();
         this.runtimes.clear();
         this.pendingForceMerges.clear();
         this.archivedTasks.clear();
+        this.legacyArchiveHandles.clear();
         this.recentActivity = [];
         this.active = 0;
         this.shuttingDown = false;
@@ -2136,14 +2431,45 @@ export class BackgroundExecutionController {
     }
   }
 
-  private queuedTasks(): Array<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord }> {
-    const queued: Array<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord }> = [];
-    for (const group of this.groups.values()) {
-      for (const task of group.tasks) {
-        if (task.state === "queued" && !this.runtimes.has(task.taskId)) queued.push({ group, task });
+  /**
+   * Finding 15 (review pass 3): controller-wide active-task index. Widget
+   * updates and queued dispatch read this index instead of traversing every
+   * inline task of every attached group, so neither scales with the number of
+   * attached executions or their settled history. Synchronized in the
+   * synchronous prefix of save() (every state mutation is followed by a
+   * save), plus explicit clears on detach and group retirement; consumers
+   * still filter by state, so a not-yet-synchronized transition can never
+   * surface incorrectly.
+   */
+  private readonly activeTasks = new Map<string, {
+    group: BackgroundExecutionGroup;
+    task: BackgroundTaskRecord;
+  }>();
+
+  private activeTaskKey(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): string {
+    return `${group.executionId}:${task.taskId}`;
+  }
+
+  private syncActiveTasks(group: BackgroundExecutionGroup): void {
+    for (const [key, entry] of this.activeTasks) {
+      if (entry.group === group) this.activeTasks.delete(key);
+    }
+    for (const task of group.tasks) {
+      if (isActiveTaskState(task.state)) {
+        this.activeTasks.set(this.activeTaskKey(group, task), { group, task });
       }
     }
-    return queued;
+  }
+
+  private dropActiveTasks(executionId: string): void {
+    for (const [key, entry] of this.activeTasks) {
+      if (entry.group.executionId === executionId) this.activeTasks.delete(key);
+    }
+  }
+
+  private queuedTasks(): Array<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord }> {
+    return [...this.activeTasks.values()].filter(({ task }) =>
+      task.state === "queued" && !this.runtimes.has(task.taskId));
   }
 
   private schedulingSnapshot(group: BackgroundExecutionGroup, releasingTask?: BackgroundTaskRecord): BackgroundSchedulingSnapshot {
@@ -2225,9 +2551,21 @@ export class BackgroundExecutionController {
     // Group/archive serialization (archive selection and reuse, integrity
     // hashing, exact JSON shapes) is delegated to the group store; this method
     // keeps the attachment guard, revision bookkeeping, fault seam, and L9
-    // save-tail ordering.
-    const serialized = serializeGroupSnapshot(group, this.archivedTasks);
-    const snapshot = serialized.snapshot;
+    // save-tail ordering. Archive-reuse metadata is scoped per execution and
+    // pending legacy membership handles are persisted via the authenticated
+    // archive index before the manifest drops their references. State
+    // mutations always precede save(), so the active-task index is
+    // synchronized in this synchronous section: widget and scheduler reads
+    // never traverse settled history.
+    this.syncActiveTasks(group);
+    const priorArchives = this.priorArchivesFor(group);
+    const legacyHandles = this.legacyArchiveHandles.get(group.executionId);
+    const pendingLegacyHandles = legacyHandles && !legacyHandles.persisted ? legacyHandles.entries : undefined;
+    const serialized = serializeGroupSnapshot(group, priorArchives, pendingLegacyHandles);
+    // Size of the pending legacy set serialized into this save's index body
+    // (the map is live and may be retired further by earlier chained tails).
+    const legacySizeAtSerialize = pendingLegacyHandles ? pendingLegacyHandles.size : -1;
+    let returnedSnapshot = serialized.snapshot;
     // Freeze the hook context with the snapshot it guards; the hook itself
     // still runs inside the serialized chain so it can gate the write.
     const faultContext: BackgroundFaultContext = {
@@ -2240,13 +2578,80 @@ export class BackgroundExecutionController {
       // this save's durable writes; a throwing hook rejects `next` while the
       // registered tail (its caught twin) still settles and prunes itself.
       await this.input.faults?.save?.(faultContext);
-      await writeGroupSnapshot(group.root, serialized);
-      for (const archive of serialized.archiveWrites) {
-        this.archivedTasks.set(archive.taskId, {
+      // Review pass 2: a continuation may reactivate an evicted candidate
+      // after this save was serialized but before its durable tail ran. Never
+      // persist a manifest that evicts a task that is no longer settled: the
+      // recomputation is bounded (inline state) and keeps the persisted
+      // aggregates truthful.
+      let effective = serialized;
+      if (serialized.evictedTaskIds.some((taskId) => {
+        const candidate = group.tasks.find((item) => item.taskId === taskId);
+        return candidate !== undefined && !isArchivableTaskState(candidate.state);
+      })) {
+        effective = serializeGroupSnapshot(group, priorArchives, pendingLegacyHandles);
+      }
+      await writeGroupSnapshot(group.root, effective);
+      for (const archive of effective.archiveWrites) {
+        this.archivedTasks.set(this.archiveHandleKey(group.executionId, archive.taskId), {
           updatedAt: archive.updatedAt,
           integritySha256: archive.integritySha256,
+          executionId: group.executionId,
         });
       }
+      if (effective.archiveIndexWrite) {
+        // The membership index now durably covers these legacy handles — as
+        // long as the durable set still matches what this save serialized.
+        // Review pass 4: a concurrent chained tail may retire entries this
+        // tail's pre-captured index body still lists; a size drift (entries
+        // only ever shrink) marks the index stale so the next save rewrites
+        // it instead of leaving persisted=true over an inexact index.
+        if (legacyHandles) {
+          legacyHandles.persisted = legacyHandles.entries.size === legacySizeAtSerialize;
+        }
+      }
+      // Review pass 3: retire the legacy handle of every task the manifest now
+      // durably holds inline — AFTER the durable write, so a crash between the
+      // index and manifest renames leaves the old index still vouching for the
+      // (still archive-only) task. The retirement only marks the index stale;
+      // the next save rewrites it without the retired entries, and stale
+      // entries are harmless in the meantime because legacy hashes never
+      // authenticate version-2 archives.
+      if (legacyHandles) {
+        for (const task of group.tasks) {
+          if (legacyHandles.entries.delete(task.taskId)) legacyHandles.persisted = false;
+        }
+      }
+      // Finding 15 compaction runs only after the durable write succeeded:
+      // settled tasks evicted from the bounded inline window keep their
+      // independently addressed, execution-bound archive files, their
+      // archive-reuse handles are retired, and the live settledArchivedCount
+      // advances by the number of records actually spliced out (a delta, so a
+      // concurrent re-admission decrement between serialization and this tail
+      // can never be clobbered). Recovery wave roots are deliberately kept:
+      // the archived record retains its continuation bundle pointing into that
+      // root, so exact-handle continuation must be able to rehydrate its
+      // checkpoint; wave-root retirement stays with the explicit
+      // cleanupSettledArtifacts lifecycle. A failed write leaves the inline
+      // record untouched, so the next save recomputes the same eviction.
+      if (effective.evictedTaskIds.length > 0) {
+        let evictedNow = 0;
+        for (const taskId of effective.evictedTaskIds) {
+          const index = group.tasks.findIndex((candidate) => candidate.taskId === taskId);
+          if (index < 0) continue;
+          // A continuation may have reactivated this task after serialization:
+          // never splice a task that is no longer settled.
+          if (!isArchivableTaskState(group.tasks[index]!.state)) continue;
+          evictedNow += 1;
+          group.tasks.splice(index, 1);
+          this.archivedTasks.delete(this.archiveHandleKey(group.executionId, taskId));
+          // Retention note: the evicted record's wave root (and any research
+          // report under it) intentionally outlives compaction so the archived
+          // continuation bundle stays rehydratable; wave-root retirement stays
+          // with the explicit cleanup lifecycle, never with compaction.
+        }
+        group.settledArchivedCount = (group.settledArchivedCount ?? 0) + evictedNow;
+      }
+      returnedSnapshot = effective.snapshot;
     });
     const tail = next.catch(() => undefined);
     this.saveTails.set(group.executionId, tail);
@@ -2260,10 +2665,12 @@ export class BackgroundExecutionController {
     });
     await next;
     return {
-      revision: snapshot.revision,
-      updatedAt: snapshot.updatedAt,
-      peakConcurrency: snapshot.peakConcurrency ?? 0,
-      integritySha256: snapshot.integritySha256,
+      // Review pass 3: reflects the snapshot actually durably written when the
+      // tail had to re-serialize (a serialized eviction target was reactivated).
+      revision: returnedSnapshot.revision,
+      updatedAt: returnedSnapshot.updatedAt,
+      peakConcurrency: returnedSnapshot.peakConcurrency ?? 0,
+      integritySha256: returnedSnapshot.integritySha256,
     };
   }
 
@@ -2279,10 +2686,13 @@ export class BackgroundExecutionController {
     if (!isRecord(ctx) || !isRecord(ctx.ui) || typeof ctx.ui.setWidget !== "function") return;
     // The controller only assembles the snapshot (active tasks, runtime
     // assignment, conflict gate, recent activity); all rendering details live
-    // in the subtask-widget module.
-    const tasks = [...this.groups.values()].flatMap((group) => group.tasks
-      .filter((task) => isActiveTaskState(task.state))
-      .map((task) => ({
+    // in the subtask-widget module. Finding 15 (review pass 3): widget work
+    // reads the controller-wide active-task index — bounded by the live
+    // population across all attached groups — and never traverses settled
+    // history or detached groups.
+    const tasks = [...this.activeTasks.values()]
+      .filter(({ task }) => isActiveTaskState(task.state))
+      .map(({ group, task }) => ({
         kind: group.kind,
         taskId: task.taskId,
         title: task.definition.title,
@@ -2296,7 +2706,7 @@ export class BackgroundExecutionController {
           ? { action: task.commands.at(-1)!.action, status: task.commands.at(-1)!.status }
           : undefined,
         queuedExecutorAssigned: this.runtimes.has(task.taskId),
-      })));
+      }));
     try {
       const rendered = renderSubtaskWidget({
         expanded: this.expandedView,

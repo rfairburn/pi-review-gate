@@ -648,41 +648,27 @@ partial/full execution and research completion, watch formatting/delivery, and L
 The focused notification/controller suites pass 59/59 with static checks and unchanged live
 `dist/` output.
 
-### 15. MEDIUM-LOW — Persistence/top-off scaling debt (corrected)
+### 15. MEDIUM-LOW — RESOLVED (2026-09-02): Bound persistence and top-off scaling
 
-Current verified state (replaces the stale draft claims): history caps are
-`MAX_ACTIVITY = 200` / `MAX_STATE_HISTORY = 64` (`background-controller.ts:28-29`, enforced in
-`appendActivity`/`transitionTaskState` plus `normalizeTaskHistory` on read); recent UI
-activity is maintained **incrementally** (`addActivity` at `:1911-1918`,
-`RECENT_ACTIVITY_LIMIT = 10`, rebuilt only on restore via `rebuildRecentActivity`); terminal
-tasks are archived to bounded per-task files with in-manifest stubs (`save()` at `:1943-1972`,
-tested by "settled tasks move to bounded archives" in
-`tests/background-controller.test.ts:128`). Per-task history is bounded, but **total task
-count is not**:
+**Root cause.** Every settled task left a manifest stub that was reprocessed, cloned, hashed, and
+rewritten forever; restore eagerly hydrated all archives; widget/scheduling paths traversed
+lifetime task history; and repeated additions had no per-execution unsettled-task ceiling.
 
-Remaining verified debt:
-- [ ] `add()` appends tasks without bound (`background-controller.ts:467-472`) and every
-      terminal task leaves a manifest stub that every save re-processes and rewrites
-      (`:1943-1980`) — manifest size grows linearly with total top-offs.
-- [ ] Restore loads every archived task's full archive back into memory (`readGroup`
-      `:2435-2436`, `readTaskArchive` `:2460`) — restore cost and peak memory grow with the
-      number of settled tasks.
-- [ ] `updateIndicator` traverses all tasks and, in expanded mode, sorts **all** tasks by
-      `updatedAt` before filtering to active ones (`:2002-2010`) — widget work grows with
-      total task count on every state change.
-- [ ] Per-save cost: `save()` still deep-clones the whole group via
-      `JSON.parse(JSON.stringify(…))` (`:1973`), then stringifies again for the integrity hash
-      (`:1975`) and a third time pretty-printed for the write (`:1980`) — ~3 full
-      serializations per save even when only one task changed.
-- [ ] Unchanged historical payloads (including every terminal stub) are rewritten on every
-      save (no content-diffing of the manifest).
-- [ ] Compact or evict terminal stubs past a bound (keep recent N inline, point older tasks
-      at their archive files only) and index active tasks so indicator work does not scale
-      with total task count.
-- [ ] Soak test: hundreds of sequential top-offs asserting bounded manifest size and widget
-      work — the acceptance test for the compaction above, not merely a missing-test note.
+**Fix.** Version-3 group manifests retain at most 32 recent settled references and persist exact
+lifetime/archived aggregate counts, while execution-bound version-2 task archives preserve stable
+historical handles. Older records load lazily by exact `(executionId, taskId)` with integrity and
+ownership checks; v1/v2 manifests and legacy archives migrate compatibly through an authenticated
+membership index. Routine serialization is proportional to bounded inline state, unchanged
+archives are reused, and archive writes precede the atomic manifest. An execution admits at most
+128 unsettled tasks but supports unlimited sequential settled top-offs. A controller-wide active
+index now feeds scheduling, readiness, and widget rendering without scanning settled history;
+model and compact UI output explicitly disclose archive-only or omitted records.
 
-Test status: caps/archiving tested; soak test missing.
+**Tests.** Admission, legacy migration, lazy lookup, tamper/missing/foreign archive failures,
+archive reuse/write counts, continuation/re-admission races, cleanup safety, truthful notification
+aggregates, active-index behavior, and a 220-top-off soak test cover the new format. The focused
+store/notification/controller/tool suites pass 109/109 with static checks, `git diff --check`, and
+unchanged live `dist/` output.
 
 ## Lower-priority cleanup / general recommendations
 

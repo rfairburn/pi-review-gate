@@ -407,6 +407,27 @@ test("operation-specific execution tools render operation, task count, and durab
   assert.match(rendered, /task-b conflicted Needs merge/);
 });
 
+test("compact task rendering discloses bounded inline omissions and archive-only history", () => {
+  const { tools } = harness();
+  const theme = { bold: (value: string) => value, fg: (_color: string, value: string) => value };
+  const rendered = executionTool(tools, "SubtasksInspect").renderResult({
+    content: [{ type: "text", text: "inspect: execution exec-1" }],
+    details: {
+      archivedCount: 12,
+      tasks: Array.from({ length: 11 }, (_unused, index) => ({
+        taskId: `task-${index}`,
+        state: "running",
+        definition: { title: `Task ${index}` },
+      })),
+    },
+  }, {}, theme).render(200).join("\n");
+  assert.match(rendered, /task-0 running Task 0/);
+  assert.match(rendered, /task-7 running Task 7/);
+  assert.doesNotMatch(rendered, /task-8 running/);
+  assert.match(rendered, /… 3 additional inline task\(s\) omitted from this compact rendering\./);
+  assert.match(rendered, /… 12 earlier settled task\(s\) are archived; inspect by taskId for exact history\./);
+});
+
 test("/subtasks-view toggles a live multiline widget without entering model context", async () => {
   const { commandHandlers, manager, config } = harness();
   const widgetCalls: Array<{ key: string; content: unknown; placement?: string }> = [];

@@ -628,24 +628,25 @@ broker; and (6) host/request/byte/time budgets and diagnostics are bounded. Reta
 `example.com` positive control. Update README's current single-host compatibility warning after
 these tests pass.
 
-### 14. MEDIUM — Centralize the subtask notification contract (updated)
+### 14. MEDIUM — RESOLVED (2026-09-02): Centralize the subtask notification contract
 
-Refs: policy is represented independently in `wake()` lanes (`background-controller.ts:1745-1790`,
-including quiet-mode suppression at `:1758-1762`), `formatExecutionEvent` (`:2149+`),
-`noActionResponseNotice` (`:2210+`), `formatResearchCompletion` (`:2105+`), tool
-descriptions/result prose, the orchestrator prompt text, README, and tests.
+**Root cause.** Wake eligibility, delivery lanes, lifecycle formatting, no-action wording, tool
+result prose, prompt guidance, watch checkpoints, and the L8 failure diagnostic were maintained as
+independent controller/tool copies that could drift. Passive UI state and model-turn policy were
+not represented by one typed contract.
 
-Recommendation (unchanged checklist):
-- [ ] Define one typed policy for quiet/noisy state wakes, terminal completion, failure,
-      conflict, and recovery-required events.
-- [ ] Derive model-facing lifecycle summaries from that policy where practical.
-- [ ] Keep passive UI telemetry distinct from events that trigger model turns.
-- [ ] Test that quiet mode keeps ordinary `RUNNING`/`REVIEWING` passive while completion,
-      failure, conflict, and recovery remain actionable.
-- [ ] Test no-action acknowledgement wording separately from transition selection.
+**Fix.** `src/execution/subtask-notifications.ts` is now the pure, typed source of truth for
+quiet/noisy wake eligibility, actionable versus passive events, immediate/follow-up delivery
+shapes, state-transition and no-action wording, execution/research/watch formatting, derived tool
+and prompt guidance, and the bounded curated failure-recovery diagnostic. The controller retains
+only delivery sequencing, persistence snapshots, watch cancellation, and I/O; widget telemetry
+remains a separate passive path. Existing controller exports remain source-compatible.
 
-Test status: current behavior is tested (quiet-mode assertions exist in the background
-controller tests), but the independent copies can drift — that is the debt.
+**Tests.** Dedicated policy tests cover quiet/noisy eligibility, lanes and trigger-turn behavior,
+derived lifecycle prose, passive transition suppression, no-action acknowledgement separation,
+partial/full execution and research completion, watch formatting/delivery, and L8 content/bounds.
+The focused notification/controller suites pass 59/59 with static checks and unchanged live
+`dist/` output.
 
 ### 15. MEDIUM-LOW — Persistence/top-off scaling debt (corrected)
 

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { DEFAULT_SUBTASK_NOTIFICATION_MODE, type ReviewGateConfig } from "../config";
+import type { ReviewGateConfig } from "../config";
 import { resolvedWorkerResources, resolvedWorkerRoute } from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
@@ -24,10 +24,8 @@ import { readOperationRecord } from "./operation-record";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 import {
   appendActivity,
-  clipActivity,
   cloneTask,
   isActiveTaskState,
-  isInterruptibleTaskState,
   MAX_ACTIVITY,
   newTask,
   stateFromContinuationProgress,
@@ -43,7 +41,24 @@ import {
   type BackgroundTaskState,
   type BackgroundTaskTimingSummary,
 } from "./task-state";
-import { executorDisplayLabel, renderSubtaskWidget } from "./subtask-widget";
+import { renderSubtaskWidget } from "./subtask-widget";
+import {
+  buildWakeFailureDiagnostic,
+  capNotificationText,
+  formatExecutionEvent,
+  formatResearchCompletion,
+  formatWakeFailureDiagnostic,
+  formatWakeFailurePreamble,
+  formatWatchEvent,
+  isActionableWakeKind,
+  isQuietSuppressedWake,
+  notificationLane,
+  deliveryForLane,
+  stateTransitionNotice,
+  subtaskNotificationMode,
+  watchCheckpointDelivery,
+  WAKE_FAILURE_NOTIFICATION_CAP,
+} from "./subtask-notifications";
 import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl } from "./types";
 import { executeWave, type WaveProgressUpdate } from "./wave-controller";
 import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult } from "./wave-worker";
@@ -57,11 +72,13 @@ import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
  * Finding 13: the controller no longer owns pure task-state/timing
  * bookkeeping (./task-state), durable group/archive format mechanics
  * (./background-group-store), or widget view-model rendering
- * (./subtask-widget). The original public surface of this module is preserved
- * via the re-exports below; notification/event formatting (including the
- * watch-checkpoint event text) and scaling remain in the controller
- * (findings 14 and 15).
+ * (./subtask-widget). Finding 14 moves notification policy, event
+ * formatting, and the L8 bounded failure diagnostic to ./subtask-notifications;
+ * the original public surface of this module is preserved via the re-exports
+ * below. Scaling remains in the controller (finding 15).
  */
+export { formatWatchEvent } from "./subtask-notifications";
+export type { WakeFailureDiagnostic } from "./subtask-notifications";
 export {
   BACKGROUND_TASK_STATES,
   isActiveTaskState,
@@ -83,27 +100,6 @@ export type {
 export type { BackgroundExecutionGroup } from "./background-group-store";
 
 const RECENT_ACTIVITY_LIMIT = 10;
-
-/**
- * L8: wake failure notifications carry a curated, explicitly bounded diagnostic
- * subset — never a full inspect() clone. Every attacker/model-controlled field
- * is capped with a visible truncation marker, and the serialized diagnostic and
- * the final notification have hard character caps.
- */
-const WAKE_FAILURE_MAX_TITLE = 200;
-const WAKE_FAILURE_MAX_SUMMARY = 600;
-const WAKE_FAILURE_MAX_ERROR = 800;
-const WAKE_FAILURE_MAX_ACTIVITY_EVENTS = 8;
-const WAKE_FAILURE_MAX_ACTIVITY_MESSAGE = 300;
-const WAKE_FAILURE_MAX_PHASE = 100;
-const WAKE_FAILURE_MAX_EXECUTOR_ENTRY = 120;
-const WAKE_FAILURE_MAX_CONFLICT_PATHS = 10;
-const WAKE_FAILURE_MAX_CONFLICT_PATH = 200;
-const WAKE_FAILURE_MAX_CONFLICT_REASON = 300;
-const WAKE_FAILURE_MAX_ACTION = 600;
-const WAKE_FAILURE_JSON_CAP = 7_000;
-const WAKE_FAILURE_NOTIFICATION_CAP = 16_000;
-const TRUNCATION_MARKER = "…[truncated]";
 
 export interface BackgroundForceMergeInput {
   executionId?: string;
@@ -2027,20 +2023,17 @@ export class BackgroundExecutionController {
     eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
   ): Promise<void> {
     await this.input.faults?.wake?.({ taskId: task.taskId, taskState: task.state, kind });
-    if (kind === "completion" || kind === "failure") {
+    // Finding 14: wake eligibility, lanes, and delivery shapes are policy owned
+    // by ./subtask-notifications; this method only sequences the fault seam,
+    // watch cancellation, persistence-aware snapshots, and delivery.
+    if (isActionableWakeKind(kind)) {
       const owner = eventSnapshot?.group
         ?? [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
       if (owner) this.cancelWatch(owner.executionId);
     }
-    if (kind === "state"
-      && (this.input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE) === "quiet") {
-      return;
-    }
-    const lane = kind === "state"
-      ? "now"
-      : kind === "completion"
-        ? "soon"
-        : "now";
+    const mode = subtaskNotificationMode(this.input.config);
+    if (isQuietSuppressedWake(kind, mode)) return;
+    const lane = notificationLane(kind);
     const owner = [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
     const eventOwner = eventSnapshot?.group ?? owner;
     const eventTask = eventSnapshot?.task ?? task;
@@ -2052,7 +2045,16 @@ export class BackgroundExecutionController {
     // dedicated preamble built only from the curated diagnostic, so every
     // model-controlled character passes through field-level bounding first.
     const diagnostic = kind === "failure" && owner
-      ? this.wakeFailureDiagnostic(owner, eventTask, content)
+      ? buildWakeFailureDiagnostic({
+        group: owner,
+        task: eventTask,
+        content,
+        conflictGate: this.conflictGate
+          && this.conflictGate.executionId === owner.executionId
+          && this.conflictGate.taskId === eventTask.taskId
+          ? this.conflictGate
+          : undefined,
+      })
       : undefined;
     const deliveredContent = diagnostic
       ? capNotificationText(
@@ -2062,15 +2064,11 @@ export class BackgroundExecutionController {
       : eventOwner
         ? formatExecutionEvent(eventOwner, eventTask, kind, content, scheduling)
         : content;
+    const delivery = deliveryForLane(lane);
     if (!isRecord(this.input.pi) || typeof this.input.pi.sendMessage !== "function") {
       await this.input.notify?.(deliveredContent);
       return;
     }
-    const delivery = lane === "now"
-      ? { deliverAs: "steer", triggerTurn: true }
-      : lane === "soon"
-        ? { deliverAs: "followUp", triggerTurn: true }
-        : { deliverAs: "nextTurn" };
     try {
       this.input.pi.sendMessage({
         customType: "pi-review-subtask-event",
@@ -2081,88 +2079,6 @@ export class BackgroundExecutionController {
     } catch (error) {
       await this.input.notify?.(`review gate: task notification could not be delivered: ${messageOf(error)}`);
     }
-  }
-
-  /**
-   * Curated recovery subset for wake failure notifications (L8). Contains only
-   * stable handles, current state, bounded summary/error/activity, and recovery
-   * actions. Task instructions, acceptance criteria, command text, model
-   * output, and full group/task arrays are never included.
-   */
-  private wakeFailureDiagnostic(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    content: string,
-  ): WakeFailureDiagnostic {
-    const live = group.tasks.find((candidate) => candidate.taskId === task.taskId) ?? task;
-    const conflictGate = this.conflictGate
-      && this.conflictGate.executionId === group.executionId
-      && this.conflictGate.taskId === task.taskId
-      ? this.conflictGate
-      : undefined;
-    const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
-    const conflictManifestPath = conflictGate
-      ? boundDiagnosticText(conflictGate.manifestPath, WAKE_FAILURE_MAX_CONFLICT_PATH) ?? ""
-      : undefined;
-    const suggestedActions = [
-      `SubtasksInspect (executionId ${group.executionId}, taskId ${task.taskId}) for the current bounded snapshot`,
-    ];
-    if (conflictGate) {
-      suggestedActions.push(`Resolve the conflict markers in recovery.conflictGate.paths (manifest: ${conflictManifestPath}), verify the workspace, then call SubtasksMarkClean (executionId ${group.executionId}, taskId ${task.taskId}); automatic landings stay blocked until then`);
-    }
-    if (live.bundle) {
-      suggestedActions.push(`SubtasksContinue (executionId ${group.executionId}, taskId ${task.taskId}) to resume from the durable checkpoint`);
-      if (group.kind === "execute" && !isActiveTaskState(live.state)) {
-        suggestedActions.push(`SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) to land the checkpoint mechanically; manual workspace inspection is still required afterward`);
-      }
-    } else {
-      suggestedActions.push("No durable continuation bundle is available; inspect the execution record and restart the task with SubtasksAdd if its outcome is still needed");
-    }
-    suggestedActions.push(`SubtasksInterrupt (executionId ${group.executionId}, taskId ${task.taskId}, interrupt_as_failure) to quiesce any live writer`);
-    // Recovery handles are serialized first so any final JSON truncation hits
-    // the verbose summary/error/activity tail, never the recovery block. Every
-    // field is individually bounded so the structured object passed via
-    // sendMessage details is bounded by construction, not only the rendered text.
-    return fitWakeFailureDiagnostic({
-      executionId: group.executionId,
-      kind: group.kind,
-      revision: group.revision,
-      taskId: task.taskId,
-      taskState: live.state,
-      message: boundDiagnosticText(content, WAKE_FAILURE_MAX_SUMMARY) ?? "",
-      groupSummary: {
-        taskCount: group.tasks.length,
-        settled: group.tasks.filter((candidate) => candidate.state === successState).length,
-        active: group.tasks.filter((candidate) => isActiveTaskState(candidate.state)).length,
-      },
-      recovery: {
-        hasDurableBundle: Boolean(live.bundle),
-        bundleWaveRoot: live.bundle ? boundDiagnosticText(live.bundle.waveRoot, WAKE_FAILURE_MAX_CONFLICT_PATH) : undefined,
-        executorEntryId: live.executorEntryId
-          ? boundDiagnosticText(live.executorEntryId, WAKE_FAILURE_MAX_EXECUTOR_ENTRY)
-          : undefined,
-        conflictGate: conflictGate
-          ? {
-            paths: conflictGate.paths
-              .slice(0, WAKE_FAILURE_MAX_CONFLICT_PATHS)
-              .map((path) => boundDiagnosticText(path, WAKE_FAILURE_MAX_CONFLICT_PATH) ?? ""),
-            manifestPath: conflictManifestPath ?? "",
-            reason: boundDiagnosticText(conflictGate.reason, WAKE_FAILURE_MAX_CONFLICT_REASON) ?? "",
-          }
-          : undefined,
-        suggestedActions: suggestedActions.map((action) => boundDiagnosticText(action, WAKE_FAILURE_MAX_ACTION) ?? ""),
-      },
-      title: boundDiagnosticText(task.definition.title, WAKE_FAILURE_MAX_TITLE) ?? "",
-      summary: boundDiagnosticText(live.summary, WAKE_FAILURE_MAX_SUMMARY),
-      error: boundDiagnosticText(live.error, WAKE_FAILURE_MAX_ERROR),
-      activity: live.activity
-        .slice(-WAKE_FAILURE_MAX_ACTIVITY_EVENTS)
-        .map((event) => ({
-          sequence: event.sequence,
-          phase: boundDiagnosticText(event.phase, WAKE_FAILURE_MAX_PHASE) ?? "",
-          message: boundDiagnosticText(event.message, WAKE_FAILURE_MAX_ACTIVITY_MESSAGE) ?? "",
-        })),
-    });
   }
 
   private cancelWatch(executionId: string): boolean {
@@ -2214,7 +2130,7 @@ export class BackgroundExecutionController {
         content,
         display: true,
         details: { executions: inspections },
-      }, { deliverAs: "followUp", triggerTurn: true });
+      }, watchCheckpointDelivery());
     } catch (error) {
       await this.input.notify?.(`review gate: subtask watch notification could not be delivered: ${messageOf(error)}`);
     }
@@ -2399,229 +2315,6 @@ export class BackgroundExecutionController {
   }
 }
 
-/**
- * Watch-checkpoint event text (controller-owned; finding 14 keeps event
- * formatting here). Exported for focused regression tests only.
- */
-export function formatWatchEvent(inspections: BackgroundInspection[], config: ReviewGateConfig): string {
-  const lines = [
-    "[pi-review-subtask-watch]",
-    inspections.length === 1
-      ? `The requested one-shot checkpoint for execution ${inspections[0]!.executionId} is due while work remains active.`
-      : `${inspections.length} requested one-shot subtask checkpoints became due together while work remains active.`,
-    "This is a deliberate checkpoint, not a completion or failure event. Act only if the snapshot warrants it; call SubtasksWatch again to request another checkpoint.",
-  ];
-  const now = Date.now();
-  for (const inspection of inspections) {
-    const active = inspection.tasks.filter((task) => isActiveTaskState(task.state));
-    lines.push("", `${inspection.kind === "research" ? "Research" : "Execution"} ${inspection.executionId}: ${active.length} active task(s), revision ${inspection.revision}.`);
-    for (const task of active) {
-      const lastActivity = task.activity.at(-1);
-      const lastAt = lastActivity?.at ?? task.updatedAt;
-      const live = task.liveControl;
-      lines.push(`- ${task.taskId} · ${task.definition.title} · ${task.state} · ${executorDisplayLabel(task, config, inspection.kind)}`);
-      lines.push(`  elapsed ${formatElapsed(task.timing.totalMs)}; last recorded activity ${formatElapsedSince(lastAt, now)}; controls: inspect yes, steer yes (live ${live?.steer === true ? "yes" : "no"}), interrupt ${isInterruptibleTaskState(task.state) ? "yes" : "no"}`);
-      lines.push(lastActivity
-        ? `  recent: ${lastActivity.phase} · ${clipActivity(lastActivity.message, 240)}`
-        : "  recent: no recorded activity yet");
-    }
-  }
-  return lines.join("\n");
-}
-
-function formatElapsed(milliseconds: number): string {
-  const seconds = Math.max(0, Math.round(milliseconds / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  if (minutes < 60) return remainingSeconds === 0 ? `${minutes}m` : `${minutes}m${remainingSeconds}s`;
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  return remainingMinutes === 0 ? `${hours}h` : `${hours}h${remainingMinutes}m`;
-}
-
-function formatElapsedSince(at: string, now: number): string {
-  const parsed = Date.parse(at);
-  return Number.isFinite(parsed) ? `${formatElapsed(Math.max(0, now - parsed))} ago` : "unknown";
-}
-
-const SHORT_RESEARCH_REPORT_MAX_CHARS = 900;
-const RESEARCH_SUMMARY_MAX_CHARS = 240;
-
-function formatResearchCompletion(taskId: string, report: string, reportPath: string): string {
-  const trimmed = report.trim();
-  const lines = [
-    `Research task ${taskId} completed without workspace changes.`,
-    `Full report: ${reportPath}`,
-  ];
-  if (trimmed.length <= SHORT_RESEARCH_REPORT_MAX_CHARS) {
-    lines.push("Complete report:", trimmed);
-    return lines.join("\n");
-  }
-  const declaredSummary = trimmed
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => /^Summary:\s+\S/i.test(line) && line.length <= RESEARCH_SUMMARY_MAX_CHARS + "Summary: ".length);
-  lines.push("The report is too long to inline completely; no partial report excerpt is included.");
-  if (declaredSummary) lines.push(declaredSummary);
-  else lines.push("No bounded standalone summary was supplied; read the full report when its details are needed for synthesis.");
-  return lines.join("\n");
-}
-
-/** Curated, bounded failure diagnostic delivered with wake failure notifications (L8). */
-export interface WakeFailureDiagnostic {
-  executionId: string;
-  kind: BackgroundTaskKind;
-  revision: number;
-  taskId: string;
-  taskState: BackgroundTaskState;
-  /** Bounded wake content (notice text); never the raw unbounded string. */
-  message: string;
-  groupSummary: { taskCount: number; settled: number; active: number };
-  recovery: {
-    hasDurableBundle: boolean;
-    bundleWaveRoot?: string;
-    executorEntryId?: string;
-    conflictGate?: { paths: string[]; manifestPath: string; reason: string };
-    suggestedActions: string[];
-  };
-  title: string;
-  summary?: string;
-  error?: string;
-  activity: Array<{ sequence: number; phase: string; message: string }>;
-}
-
-/** JSON-encoded length of a string's content, excluding the surrounding quotes. */
-function jsonEncodedTextLength(value: string): number {
-  // Control characters, quotes, and backslashes expand during JSON.stringify;
-  // field budgets apply to the encoded form so the serialized diagnostic cap
-  // cannot be bypassed with escape-heavy adversarial content.
-  return JSON.stringify(value).length - 2;
-}
-
-function boundDiagnosticText(value: string | undefined, max: number): string | undefined {
-  if (value === undefined) return undefined;
-  const flat = value.replace(/\s+/g, " ").trim();
-  if (jsonEncodedTextLength(flat) <= max) return flat;
-  // Binary-search the longest raw prefix whose JSON encoding (plus the visible
-  // truncation marker) still fits the encoded budget.
-  let low = 0;
-  let high = flat.length;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    if (jsonEncodedTextLength(`${flat.slice(0, mid)}${TRUNCATION_MARKER}`) <= max) {
-      low = mid;
-    } else {
-      high = mid - 1;
-    }
-  }
-  return `${flat.slice(0, low)}${TRUNCATION_MARKER}`;
-}
-
-/**
- * Shed trailing activity entries until the serialized diagnostic fits the JSON
- * cap, so the delivered diagnostic (and the structured object sent via
- * sendMessage details) stays parseable JSON instead of a character-sliced tail.
- */
-function fitWakeFailureDiagnostic(diagnostic: WakeFailureDiagnostic): WakeFailureDiagnostic {
-  let payload = diagnostic;
-  let text = JSON.stringify(payload, null, 2);
-  while (text.length > WAKE_FAILURE_JSON_CAP && payload.activity.length > 0) {
-    payload = { ...payload, activity: payload.activity.slice(0, -1) };
-    text = JSON.stringify(payload, null, 2);
-  }
-  return payload;
-}
-
-function formatWakeFailureDiagnostic(diagnostic: WakeFailureDiagnostic): string {
-  const text = JSON.stringify(diagnostic, null, 2);
-  if (text.length <= WAKE_FAILURE_JSON_CAP) return text;
-  return `${text.slice(0, Math.max(1, WAKE_FAILURE_JSON_CAP - TRUNCATION_MARKER.length))}${TRUNCATION_MARKER}`;
-}
-
-/** Dedicated bounded preamble for failure notifications; built only from the curated diagnostic. */
-function formatWakeFailurePreamble(diagnostic: WakeFailureDiagnostic): string {
-  const successVerb = diagnostic.kind === "research" ? "reported" : "landed";
-  const lines = [
-    `Task ${diagnostic.taskId} requires recovery attention at state ${diagnostic.taskState.toUpperCase()} in ${diagnostic.kind} execution ${diagnostic.executionId} (revision ${diagnostic.revision}).`,
-    `Execution progress: ${diagnostic.groupSummary.settled}/${diagnostic.groupSummary.taskCount} task(s) ${successVerb}, ${diagnostic.groupSummary.active} active.`,
-  ];
-  if (diagnostic.message) lines.push(`Notice: ${diagnostic.message}`);
-  if (diagnostic.summary) lines.push(`Summary: ${diagnostic.summary}`);
-  if (diagnostic.error) lines.push(`Error: ${diagnostic.error}`);
-  return lines.join("\n");
-}
-
-function capNotificationText(content: string, max: number): string {
-  if (content.length <= max) return content;
-  return `${content.slice(0, Math.max(1, max - TRUNCATION_MARKER.length))}${TRUNCATION_MARKER}`;
-}
-
-function formatExecutionEvent(
-  group: BackgroundExecutionGroup,
-  task: BackgroundTaskRecord,
-  kind: "completion" | "failure" | "state",
-  content: string,
-  scheduling?: BackgroundSchedulingSnapshot,
-): string {
-  const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
-  const successVerb = group.kind === "research" ? "reported" : "landed";
-  const successful = group.tasks.filter((candidate) => candidate.state === successState);
-  const incomplete = group.tasks.filter((candidate) => candidate.state !== successState);
-  const active = group.tasks.filter((candidate) => isActiveTaskState(candidate.state));
-  const title = task.definition.title;
-  const lines = [
-    content,
-    "",
-    `Task: ${task.taskId} · ${title} · ${task.state}`,
-  ];
-  if (kind !== "completion") lines.push(`Execution revision: ${group.revision}`);
-  const landedPaths = [
-    ...(task.result?.landing?.appliedPaths ?? []),
-    ...(task.result?.landing?.alreadyAppliedPaths ?? []),
-  ];
-  if (landedPaths.length > 0) lines.push(`Landed paths: ${[...new Set(landedPaths)].join(", ")}`);
-  if (kind === "completion") {
-    if (scheduling) {
-      const topOff = Math.max(0, scheduling.estimatedImmediatelyAvailableSlots - scheduling.globallyDispatchPending);
-      lines.push(`Top-off opportunity: up to ${topOff} additional task(s) may be submitted with SubtasksAdd if planned work remains.`);
-    }
-  }
-  if (incomplete.length === 0) {
-    if (kind === "completion") {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} COMPLETE: ${successful.length}/${group.tasks.length} tasks ${successVerb}.`);
-      lines.push(group.kind === "research"
-        ? "All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group."
-        : "All requested task outputs have landed; aggregate verification is now appropriate.");
-    } else if (kind === "failure") {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} has ${successful.length}/${group.tasks.length} tasks ${successVerb}, but this interaction reported a failure.`);
-      lines.push(`Inspect the failed command and verify the ${group.kind === "research" ? "reports" : "landed output"} before treating the group as successful.`);
-    } else {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} currently has ${successful.length}/${group.tasks.length} tasks ${successVerb}.`);
-      lines.push("This is an informational state update; rely on the separate completion or failure event for the execution outcome.");
-    }
-    if (kind === "state") lines.push(noActionResponseNotice(task));
-    return lines.join("\n");
-  }
-  const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
-  lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} ${disposition}: ${successful.length}/${group.tasks.length} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
-  if (kind === "completion") {
-    lines.push(`This is a partial task completion, not completion of the whole group. Do not claim outputs from tasks that have not ${successVerb}.`);
-  } else if (kind === "failure") {
-    lines.push("The whole execution is not successfully complete. Use the task handles and states below to recover deliberately.");
-  }
-  lines.push(`Tasks not yet ${successVerb}:`);
-  for (const candidate of incomplete) {
-    lines.push(`- ${candidate.taskId} · ${candidate.definition.title} · ${candidate.state}`);
-  }
-  if (kind === "state") lines.push(noActionResponseNotice(task));
-  return lines.join("\n");
-}
-
-function noActionResponseNotice(task: BackgroundTaskRecord): string {
-  return `NO TOOL ACTION IS NECESSARY unless you want to steer this task or the reported state requires recovery. This notification triggered a harness turn, so do not return an empty response. If no action is needed, reply briefly with: No action for ${task.taskId} at ${task.state.toUpperCase()}. Do not call inspect merely to acknowledge this event.`;
-}
-
 function transitionEventSnapshot(
   group: BackgroundExecutionGroup,
   task: BackgroundTaskRecord,
@@ -2641,22 +2334,6 @@ function synchronizeEventSnapshot(
   snapshot.group.updatedAt = persisted.updatedAt;
   snapshot.group.peakConcurrency = persisted.peakConcurrency;
   snapshot.group.integritySha256 = persisted.integritySha256;
-}
-
-function stateTransitionNotice(
-  task: BackgroundTaskRecord,
-  previous: BackgroundTaskState,
-  next: BackgroundTaskState,
-): string | undefined {
-  if (previous === next) return undefined;
-  const transition = `Task ${task.taskId} changed state: ${previous.toUpperCase()} -> ${next.toUpperCase()}.`;
-  if (next === "running") {
-    return `${transition} The task is ACTIVE. Steering is available now; if live control is still starting or a long-running command is in progress, the instruction remains durably queued for the next executor handoff.`;
-  }
-  if (next === "reviewing") {
-    return `${transition} The task is REVIEWING. A new steer takes priority: it interrupts the in-flight review and resumes the executor with the changed request before review restarts.`;
-  }
-  return undefined;
 }
 
 function researchTaskDefinition(definition: BackgroundTaskDefinition): BackgroundTaskDefinition {

@@ -1,4 +1,4 @@
-import { DEFAULT_SUBTASK_NOTIFICATION_MODE, externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
+import { externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
 import type { ExecutionAssociationsSnapshot } from "../session-state";
@@ -13,6 +13,13 @@ import {
   type BackgroundTaskDefinition,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
+import {
+  completionNotificationGuidanceLine,
+  lifecycleWakeGuidanceLine,
+  notificationModeContractProse,
+  subtaskNotificationMode,
+  terminalWakeGuidanceLine,
+} from "./subtask-notifications";
 import { randomUUID } from "node:crypto";
 import { parseDuration } from "../background-shell/jobs";
 
@@ -44,14 +51,14 @@ const SHARED_PROMPT_GUIDELINES = [
   "Use SubtasksSteer for queued, starting, or live tasks: queued steering is durably incorporated before startup and live steering uses the executor transport.",
   "Steering wins over review: a steer received while reviewing interrupts that review, resumes the executor with the changed request, and reviews the replacement result.",
   "If an active adapter cannot steer its current long-running command, keep the steer queued for the next executor handoff; do not treat that transport limitation as rejection.",
-  "The start/add result reports queued tasks. Quiet mode (the default) triggers orchestrator turns for each LANDED, FAILED, CONFLICTED, or other recovery-required task; Noisy mode additionally triggers RUNNING (steerable) and REVIEWING (steering can supersede review). CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING remain visible in SubtasksInspect and /subtasks-view but do not trigger turns. DO NOT POLL for task-state changes and do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate. Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.",
+  lifecycleWakeGuidanceLine(),
   "A taskId may be omitted only when the supplied executionId contains exactly one task; otherwise use the returned taskId.",
-  "Every task landing triggers a notification and lists every sibling that has not landed, even in quiet mode, so freed capacity can be topped off immediately. Do not verify aggregate outputs until the execution-complete notification.",
+  completionNotificationGuidanceLine(),
   "Start/add distinguish tasks already assigned for executor startup from tasks still waiting for capacity. Completion events report durable phase timing, execution revision, peak concurrency on final completion, and estimated post-settlement capacity for SubtasksAdd.",
   "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call SubtasksMarkClean.",
   "Use SubtasksForceMerge only for a stopped task with a verified checkpoint; mergeAnyhow may intentionally materialize conflicts in main. Every force-merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
   "A request to cancel or stop without landing means interrupt_as_failure. Use interrupt_with_merge only when the user explicitly wants a mechanical checkpoint landing; it never guarantees the requested changes are present or correct, so inspect the main workspace manually afterward in every case.",
-  "Each task completion, failure, and critical conflict triggers a model notification. Ordinary running/reviewing transitions do so only in noisy mode. Use SubtasksInspect whenever you need current status or diagnostics; avoid tight repetitive polling.",
+  terminalWakeGuidanceLine(),
 ];
 
 function toolDescription(action: Action): string {
@@ -694,11 +701,9 @@ function backgroundResult(
   const startupDelay = action === "start" || action === "add"
     ? " Queued tasks may wait for executor startup or available pool capacity."
     : "";
-  const notificationMode = config?.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
+  const notificationMode = subtaskNotificationMode(config ?? {} as ReviewGateConfig);
   const successVerb = inspection.kind === "research" ? "reports" : "lands";
-  const notificationContract = notificationMode === "quiet"
-    ? `Quiet notification mode is active: ordinary RUNNING and REVIEWING transitions remain passive UI telemetry. Every task still triggers a turn when it ${successVerb}, fails, conflicts, or requires recovery, and completion events identify siblings that remain active.`
-    : `Noisy notification mode is active: RUNNING and REVIEWING transitions trigger turns in addition to every successful, failed, conflicted, or recovery-required task.`;
+  const notificationContract = notificationModeContractProse(notificationMode, successVerb);
   const scheduling = inspection.scheduling;
   const schedulingSummary = action === "start" || action === "add"
     ? ` Scheduler at acceptance: ${scheduling.dispatchAssigned} task(s) assigned and starting, ${scheduling.dispatchPending} still pending dispatch; ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} global workers and ${scheduling.activePoolLeases}/${scheduling.configuredPoolCapacity} executor-pool slots are occupied; ${scheduling.estimatedImmediatelyAvailableSlots} slot(s) appear immediately available. Assignment is not proof that executor startup has completed.`

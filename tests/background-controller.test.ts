@@ -2677,3 +2677,59 @@ test("BackgroundStateTransition remains exported from background-controller (com
   };
   assert.equal(transition.state, "queued");
 });
+
+test("watch checkpoint delivery options come from the shared notification policy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-watch-delivery-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "executor.cjs");
+    await writeFile(executor, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+      "process.stdin.on('end',()=>setTimeout(()=>{",
+      "if(prompt.includes('WATCH_SENTINEL'))fs.writeFileSync('watched.txt','watched landed\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
+      "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
+      "},400));",
+    ].join("\n"), "utf8");
+    await chmod(executor, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "fake",
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+      }],
+      execution: { activeExecutor: { source: "external", id: "fake" }, maxWorkers: 2 },
+    });
+    const contents: string[] = [];
+    const deliveries: Array<{ deliverAs: string; triggerTurn: boolean } | undefined> = [];
+    const controller = new BackgroundExecutionController({
+      pi: { sendMessage: (message: { content: string }, options?: { deliverAs: "steer" | "followUp"; triggerTurn: boolean }) => {
+        contents.push(message.content);
+        deliveries.push(options);
+      } },
+      config,
+      state: createState(),
+      cwd: () => root,
+    });
+    const started = await controller.start([
+      { title: "watched", instructions: "WATCH_SENTINEL", acceptanceCriteria: ["watched.txt exists"] },
+    ]);
+    controller.watch(started.executionId, 25);
+    await waitFor(() => contents.some((content) => content.startsWith("[pi-review-subtask-watch]")));
+    const watchIndex = contents.findIndex((content) => content.startsWith("[pi-review-subtask-watch]"));
+    assert.deepEqual(deliveries[watchIndex], { deliverAs: "followUp", triggerTurn: true },
+      "watch checkpoints follow up with a turn and never steer, matching watchCheckpointDelivery()");
+    await controller.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

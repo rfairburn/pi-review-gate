@@ -372,15 +372,14 @@ function toolMetadata(value: unknown): ToolMetadata[] {
 function matchTool(tool: ToolMetadata, query: string, terms: readonly string[]): SearchMatch | undefined {
   const name = tool.name.toLocaleLowerCase("en-US");
   const description = tool.description.toLocaleLowerCase("en-US");
-  const combined = `${name} ${description}`;
-  if (!terms.every((term) => combined.includes(term))) return undefined;
+  if (!terms.some((term) => name.includes(term) || description.includes(term))) return undefined;
   const rank = name === query
     ? 0
-    : name.startsWith(query)
+    : terms.some((term) => name === term)
       ? 1
-      : name.includes(query)
+      : terms.some((term) => name.startsWith(term))
         ? 2
-        : terms.every((term) => name.includes(term))
+        : terms.some((term) => name.includes(term))
           ? 3
           : 4;
   return { ...tool, rank };

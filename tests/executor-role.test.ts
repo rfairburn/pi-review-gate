@@ -183,8 +183,8 @@ test("executor role defers to the durable initial subset and activates authorize
     for (const hook of hooks.get("before_agent_start") ?? []) await hook({ cwd: dir }, ctx);
     assert.deepEqual(active, ["read", "edit", "search_tools", "WebSearch"], "activation remains additive on the next model turn");
 
-    const unauthorized = await search.execute("load-private", { query: "background process output" });
-    assert.deepEqual((unauthorized.details as { activated: string[] }).activated, []);
+    const unmatched = await search.execute("load-unmatched", { query: "nonexistent-capability-token" });
+    assert.deepEqual((unmatched.details as { activated: string[] }).activated, []);
     assert.equal(active.includes("ShellLog"), false);
   } finally {
     await rm(dir, { recursive: true, force: true });

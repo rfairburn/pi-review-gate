@@ -219,6 +219,23 @@ test("search deterministically and additively activates authorized matches only"
   assert.match(String((result.content as Array<{ text: string }>)[0]?.text), /did not perform the operation/);
 });
 
+test("search matches any query term so multiple exact or descriptive tool names activate together", async () => {
+  for (const query of ["WebSearch WebFetch", "web search fetch browser weather"]) {
+    const fixture = hostFixture();
+    fixture.pi.registerTool(tool("WebFetch", "Fetch and extract a public web page."));
+    const manager = new DeferredToolManager(fixture.pi);
+    manager.register();
+    manager.sessionStart(fixture.sessionIdentity);
+
+    const result = await fixture.search()("multi-web", { query });
+    const details = result.details as { matched: string[]; activated: string[] };
+    assert.deepEqual(details.matched, ["WebFetch", "WebSearch"]);
+    assert.deepEqual(details.activated, ["WebFetch", "WebSearch"]);
+    assert.ok(fixture.active().includes("WebFetch"));
+    assert.ok(fixture.active().includes("WebSearch"));
+  }
+});
+
 test("invalid and unmatched searches do not change the active set", async () => {
   const fixture = hostFixture();
   const manager = new DeferredToolManager(fixture.pi);
@@ -230,7 +247,7 @@ test("invalid and unmatched searches do not change the active set", async () => 
   assert.equal(invalid.isError, true);
   assert.deepEqual(fixture.active(), before);
 
-  const unmatched = await fixture.search()("unmatched", { query: "tool that does not exist" });
+  const unmatched = await fixture.search()("unmatched", { query: "nonexistent-capability-token" });
   assert.equal(unmatched.isError, false);
   assert.deepEqual((unmatched.details as { activated: string[] }).activated, []);
   assert.deepEqual(fixture.active(), before);

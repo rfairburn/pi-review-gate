@@ -359,6 +359,32 @@ test("downloadText destroys its pinned dispatcher even when the request fails", 
   }
 });
 
+test("downloadText safely abandons an unterminated HTTP error body before dispatcher teardown", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(503, { "content-type": "text/plain" });
+    response.write("partial error body");
+  });
+  const port = await listen(server);
+  const recorded: ValidatedUrl[] = [];
+  const { factory, agents } = { ...localDialFactory(recorded) };
+  try {
+    await assert.rejects(
+      downloadText(`http://streaming-error.test:${port}/`, testOptions({
+        resolveHostname: () => Promise.resolve([publicResolverAnswer]),
+        createDispatcher: factory,
+      })),
+      /HTTP 503/,
+    );
+    // Let stream error delivery run; an unhandled ClientDestroyedError would
+    // fail this test through node:test's uncaught-exception handling.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(agents[0]?.destroyCalls, 1);
+  } finally {
+    await close(server);
+    await Promise.allSettled(agents.map((agent) => agent.destroy()));
+  }
+});
+
 // ---------------------------------------------------------------------------
 // No-loopback connection controls.
 // ---------------------------------------------------------------------------

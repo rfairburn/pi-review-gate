@@ -120,15 +120,25 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
       } catch (error) {
         throw new Error(`Network request failed for ${current.href}: ${errorDiagnostic(error)}`, { cause: error });
       }
+      // Dispatcher teardown can surface ClientDestroyedError on any response
+      // body that the caller abandons. Attach the sink before inspecting
+      // status or headers so those expected teardown errors cannot escape as
+      // uncaught stream errors.
+      response.body.on("error", ignoreStreamError);
       if (response.statusCode >= 300 && response.statusCode < 400) {
         const location = headerValue(response.headers, "location");
-        if (!location) throw new Error(`HTTP ${response.statusCode} redirect omitted Location.`);
-        if (redirects === 5) throw new Error("Redirect limit exceeded.");
+        if (!location) {
+          response.body.destroy();
+          throw new Error(`HTTP ${response.statusCode} redirect omitted Location.`);
+        }
+        if (redirects === 5) {
+          response.body.destroy();
+          throw new Error("Redirect limit exceeded.");
+        }
         // Abandon the redirect response body together with its connection so an
         // unterminated stream cannot hold the dispatcher open; discarding an
         // unread body surfaces as UND_ERR_ABORTED on the stream, which is
         // intentionally swallowed.
-        response.body.on("error", () => undefined);
         response.body.destroy();
         current = await validatePublicUrl(new URL(location, current.href).href, resolve);
         if (response.statusCode === 303 || ((response.statusCode === 301 || response.statusCode === 302) && method === "POST")) {
@@ -138,10 +148,12 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
         continue;
       }
       if (response.statusCode < 200 || response.statusCode >= 300) {
+        response.body.destroy();
         throw new Error(`HTTP ${response.statusCode}`.trim());
       }
       const declared = Number(headerValue(response.headers, "content-length") || "0");
       if (Number.isFinite(declared) && declared > options.maxBytes) {
+        response.body.destroy();
         throw new Error(`Response declares ${declared} bytes; limit is ${options.maxBytes}.`);
       }
       const bytes = await readBoundedBody(response.body, options.maxBytes, controller.signal);
@@ -348,7 +360,7 @@ async function readBoundedBody(body: Readable, maxBytes: number, signal: AbortSi
   let size = 0;
   // Errors on a body we intentionally abandon (timeout, size cap) must not
   // become unhandled rejections.
-  body.on("error", () => undefined);
+  body.on("error", ignoreStreamError);
   try {
     for await (const chunk of body) {
       if (signal.aborted) throw signal.reason;
@@ -368,6 +380,10 @@ async function readBoundedBody(body: Readable, maxBytes: number, signal: AbortSi
     offset += chunk.byteLength;
   }
   return output;
+}
+
+function ignoreStreamError(): void {
+  // Expected for intentionally abandoned bodies when their dispatcher closes.
 }
 
 function headerValue(headers: IncomingHttpHeaders, name: string): string {

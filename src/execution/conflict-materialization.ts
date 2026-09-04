@@ -10,6 +10,7 @@ import { validatePathSafe } from "./wave-landing";
 
 const execFileAsync = promisify(execFile);
 const MAX_CONFLICT_BYTES = 32 * 1024 * 1024;
+const MAX_MERGED_BYTES = MAX_CONFLICT_BYTES * 4;
 
 export interface MaterializedConflictResult {
   paths: string[];
@@ -150,6 +151,7 @@ async function prepareConflictPath(
     writeFile(resultPath, result),
   ]);
   let merged: Buffer;
+  let hasConflicts = false;
   try {
     const output = await execFileAsync("git", [
       "merge-file", "-p", "--diff3",
@@ -157,14 +159,29 @@ async function prepareConflictPath(
       "-L", "subtask base",
       "-L", label,
       currentPath, basePath, resultPath,
-    ], { encoding: "buffer", maxBuffer: MAX_CONFLICT_BYTES * 4 });
+    ], { encoding: "buffer", maxBuffer: MAX_MERGED_BYTES });
     merged = output.stdout;
   } catch (error) {
-    const candidate = error as Error & { code?: number | string; stdout?: Buffer };
-    if (candidate.code !== 1 || !Buffer.isBuffer(candidate.stdout)) throw error;
+    const candidate = error as Error & { code?: number | string; stdout?: Buffer; killed?: boolean; signal?: string | null };
+    // git-merge-file documents 0 for clean merges, 1..127 for conflict
+    // counts (capped at 127), and negative values for errors. Do not treat
+    // process failures or truncated maxBuffer output as conflict data.
+    if (typeof candidate?.code !== "number" || !Number.isInteger(candidate.code)
+      || candidate.code < 1 || candidate.code > 127 || candidate.killed || candidate.signal != null
+      || !Buffer.isBuffer(candidate.stdout)) throw error;
     merged = candidate.stdout;
+    hasConflicts = true;
   }
-  if (!merged.toString("utf8").includes("<<<<<<< current workspace")) {
+  if (!Buffer.isBuffer(merged) || merged.length > MAX_MERGED_BYTES || merged.includes(0)) {
+    throw new Error(`Invalid git merge-file output for ${entry.path}.`);
+  }
+  const mergedText = merged.toString("utf8");
+  if (hasConflicts && (!/^<<<<<<< current workspace$/m.test(mergedText)
+    || !/^\|\|\|\|\|\|\| subtask base$/m.test(mergedText) || !/^=======$/m.test(mergedText)
+    || !(mergedText.includes(`\n>>>>>>> ${label}\n`) || mergedText.includes(`\n>>>>>>> ${label}\r\n`)))) {
+    throw new Error(`Missing conflict markers in git merge-file output for ${entry.path}.`);
+  }
+  if (!mergedText.includes("<<<<<<< current workspace")) {
     merged = Buffer.from([
       "<<<<<<< current workspace\n",
       current.toString("utf8"),

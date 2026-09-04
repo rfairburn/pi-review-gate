@@ -142,6 +142,7 @@ defaults to `true`. The default retry policy is
 {
   "web": {
     "enabled": true,
+    "browserInteractionApproval": "ask",
     "search": { "provider": "ddgs", "timeoutMs": 20000, "maxResults": 10 },
     "fetch": {
       "timeoutMs": 30000,
@@ -154,6 +155,15 @@ defaults to `true`. The default retry policy is
   }
 }
 ```
+
+`web.browserInteractionApproval` accepts exactly `"ask"` (default),
+`"automatically-accept"`, or `"automatically-deny"`. Omission uses Ask; invalid values
+(including `null`, booleans, and display labels such as `"Ask"`) reject configuration
+loading rather than silently granting approval. This policy applies only to the
+confirmation-required branch of authorized native `BrowserClick`, `BrowserFill`,
+`BrowserType`, `BrowserSelect`, and `BrowserPress`; it does not turn off hard-denied
+actions, role authorization, SSRF controls, ref/target/value-digest revalidation, or
+value-secrecy protections. See [approval behavior](web-tools.md#browser-interaction-approval).
 
 These are the defaults; every value can be overridden under `web`. The Python bridge for
 `WebSearch` is deliberately not configurable. Tool behavior and the trusted environment
@@ -192,9 +202,15 @@ boundaries are owned by [Web tools](web-tools.md) and
   the conservative active subset plus `search_tools`. Newly launched Pi subtasks use the
   saved value, while already-running subtask sessions keep their launch behavior.
 - **Subtasks view** stores the expanded/collapsed live-panel preference globally.
-- The maximum acquisition size is also available under **Web**; saves apply to
-  subsequent `WebFetch` and `BrowserExtract` acquisitions without restarting the
-  application.
+- **Web** includes maximum acquisition size and **Browser interaction approval**:
+  **Ask**, **Automatically Accept**, or **Automatically Deny**. Ask prompts when
+  approval is required and rejects without UI; Accept supplies automatic approval
+  without prompting; Deny rejects the approval-required branch. Already-permitted
+  observations and structurally proven local actions remain permitted in every mode.
+  Saves apply immediately to subsequent local approval decisions and acquisitions
+  without restarting. Newly launched Pi workers load the saved policy; running workers
+  keep the configuration loaded at launch. Research roles still cannot click or use
+  form-action tools.
 
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the root
 discards all staged changes; **Save changes** atomically persists every section while

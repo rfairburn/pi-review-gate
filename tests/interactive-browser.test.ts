@@ -5,8 +5,9 @@ import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
-import { normalizeConfig } from "../src/config";
-import type { BrowserTargetStructure } from "../src/web/browser-interaction-policy";
+import { normalizeConfig, type BrowserInteractionApproval } from "../src/config";
+import { WebToolManager } from "../src/web/tools";
+import { BrowserConfirmationPermits, type BrowserTargetStructure } from "../src/web/browser-interaction-policy";
 import {
   InteractiveBrowserManager,
   interactiveChromiumArgs,
@@ -40,6 +41,7 @@ class FakePage extends EventEmitter {
   selectCalls: Array<Array<{ value?: string; label?: string }>> = [];
   pressCalls: string[] = [];
   onClick?: () => void | Promise<void>;
+  onStructureRead?: () => void;
   targetStructure: BrowserTargetStructure = {
     tagName: "a", role: "link", href: "https://example.com/next", target: null,
     download: false, inputType: null, formAssociated: false, formAction: null,
@@ -121,6 +123,7 @@ class FakePage extends EventEmitter {
         if (Array.isArray(args[0])) return args[0].map(() => "value");
         if (args[0] === "append") return true;
         if (args.length > 0) return undefined;
+        page.onStructureRead?.();
         return { ...page.targetStructure };
       },
       hover: async () => { this.hoverCalls += 1; },
@@ -216,7 +219,7 @@ class FakeBrowser extends EventEmitter {
   }
 }
 
-function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boolean; limits?: Record<string, number> } = {}) {
+function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boolean; limits?: Record<string, number>; confirmationPermits?: BrowserConfirmationPermits } = {}) {
   const browser = new FakeBrowser();
   if (options.hangingContextClose) browser.context.close = async () => new Promise<void>(() => undefined);
   const config = normalizeConfig({}).web!.fetch;
@@ -226,6 +229,7 @@ function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boo
     launch: async () => browser as unknown as Browser,
     randomHandle: (kind: string) => `${kind}_${++serial}_${"x".repeat(32)}`,
     limits: { ...(options.limits ?? {}), ...(options.cleanupMs === undefined ? {} : { cleanupMs: options.cleanupMs }) },
+    confirmationPermits: options.confirmationPermits,
   });
   return { manager, browser };
 }
@@ -481,8 +485,10 @@ test("BrowserScroll accepts only bounded page/ref operations and current scoped 
   assert.equal(fixture.manager.activeSessionCount(), 0, "invalid semantic capabilities fail the session closed");
 });
 
-test("BrowserHover and structurally proven link clicks use only fresh refs and invalidate them", async () => {
+for (const mode of ["ask", "automatically-accept", "automatically-deny"] as const) {
+test(`BrowserHover and structurally proven link clicks stay permitted in ${mode}`, async () => {
   const fixture = managerFixture();
+  fixture.manager.updateConfig(normalizeConfig({}).web!.fetch, mode);
   const opened = await fixture.manager.open("https://example.com/interaction");
   let snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
   let ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
@@ -523,8 +529,12 @@ test("BrowserHover and structurally proven link clicks use only fresh refs and i
   await fixture.manager.shutdown();
 });
 
-test("bounded form controls replace, append, multi-select, enforce key grammar, and keep values secret", async () => {
+}
+
+for (const mode of ["ask", "automatically-accept", "automatically-deny"] as const) {
+test(`bounded local form controls stay permitted and keep values secret in ${mode}`, async () => {
   const fixture = managerFixture();
+  fixture.manager.updateConfig(normalizeConfig({}).web!.fetch, mode);
   const opened = await fixture.manager.open("https://example.com/form");
   const freshRef = async () => {
     const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
@@ -573,6 +583,8 @@ test("bounded form controls replace, append, multi-select, enforce key grammar, 
     /not_started/,
   );
 
+  // The remaining legacy assertions exercise Ask-specific confirmation behavior.
+  fixture.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask");
   const enterRef = await freshRef();
   await assert.rejects(
     fixture.manager.press(opened.session, opened.tab, enterRef, "Enter"),
@@ -601,7 +613,7 @@ test("bounded form controls replace, append, multi-select, enforce key grammar, 
       fixture.browser.context.page.targetStructure.domPath += "> changed";
       return true;
     }),
-    /not_started.*confirmed target or consequence changed/,
+    /not_started.*approved target or consequence changed/,
   );
 
   fixture.browser.context.page.targetStructure = {
@@ -631,6 +643,8 @@ test("bounded form controls replace, append, multi-select, enforce key grammar, 
   await fixture.manager.shutdown();
 });
 
+}
+
 test("consequential BrowserClick rejects no-UI and denial and revalidates an approved permit", async () => {
   const fixture = managerFixture();
   const opened = await fixture.manager.open("https://example.com/risky");
@@ -658,10 +672,156 @@ test("consequential BrowserClick rejects no-UI and denial and revalidates an app
   await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref, async () => {
     fixture.browser.context.page.targetStructure.domPath += "> span:nth-of-type(1)";
     return true;
-  }), /not_started.*confirmed target or consequence changed/);
+  }), /not_started.*approved target or consequence changed/);
   assert.equal(fixture.browser.context.page.clickCalls, 0, "changed targets are never dispatched");
   await fixture.manager.shutdown();
 });
+
+const approvalFamilies = ["click", "fill", "type", "select", "press"] as const;
+const approvalModes: BrowserInteractionApproval[] = ["ask", "automatically-accept", "automatically-deny"];
+
+for (const family of approvalFamilies) {
+  test(`Browser ${family} approval modes use current settings, preserve no-UI rules and report the approval source`, async () => {
+    const permits = new BrowserConfirmationPermits();
+    const originalConsume = permits.consume.bind(permits);
+    let consumed = 0;
+    permits.consume = (permit, binding) => {
+      assert.equal(binding.operation, family);
+      assert.equal(typeof binding.targetFingerprint, "string");
+      assert.equal(JSON.stringify(binding).includes("private-approval-value"), false);
+      assert.equal(binding.valueDigest !== null, ["fill", "type", "select"].includes(family));
+      assert.deepEqual(binding.valueLengths, ["fill", "type", "select"].includes(family) ? ["private-approval-value".length] : []);
+      assert.equal(binding.key, family === "press" ? "Enter" : null);
+      const accepted = originalConsume(permit, binding);
+      assert.equal(originalConsume(permit, binding), false, "approval permit cannot be replayed");
+      consumed += Number(accepted);
+      return accepted;
+    };
+    const { manager, browser } = managerFixture({ confirmationPermits: permits });
+    const tools = new Map<string, any>();
+    const config = normalizeConfig({});
+    const web = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, undefined, undefined, manager);
+    web.register();
+    const opened = await manager.open("https://example.com/approval");
+    const page = browser.context.page;
+    page.targetStructure = {
+      ...page.targetStructure, href: null,
+      tagName: family === "click" ? "button" : family === "select" ? "select" : "input",
+      role: family === "click" ? "button" : family === "select" ? "combobox" : "textbox",
+      inputType: family === "click" ? "button" : family === "select" ? null : "text",
+      readOnly: false, autocomplete: null, explicitChangeHandler: true,
+    };
+    const tool = tools.get(`Browser${family[0].toUpperCase()}${family.slice(1)}`);
+    const secret = "private-approval-value";
+    const params = {
+      session: opened.session, tab: opened.tab,
+      ...(family === "fill" ? { value: secret } : family === "type" ? { text: secret }
+        : family === "select" ? { values: [secret] } : family === "press" ? { key: "Enter" } : {}),
+    };
+    let prompts = 0;
+    const ui = { confirm: async (_title: string, message: string) => {
+      prompts += 1;
+      assert.equal(message.includes(secret), false);
+      return true;
+    } };
+    const dispatchCount = () => page.clickCalls + page.fillCalls.length + page.typeCalls.length + page.selectCalls.length + page.pressCalls.length;
+    try {
+      for (const context of [undefined, { hasUI: true, ui: { confirm: async () => false } }, { hasUI: true, ui: { confirm: async () => { throw new Error("UI unavailable"); } } }]) {
+        const ref = (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1];
+        const result = await tool.execute("ask-rejection", { ...params, ref }, undefined, undefined, context);
+        assert.equal(result.isError, true);
+        assert.equal(dispatchCount(), 0, "Ask denies absent UI, denial, and unavailable UI before dispatch");
+      }
+      // The same registered closures and live session must see each saved policy,
+      // including reverting an earlier automatic authorization to Ask.
+      for (const mode of [...approvalModes, "ask"] as BrowserInteractionApproval[]) {
+        config.web!.browserInteractionApproval = mode;
+        web.sync(config);
+        for (const hasUI of [false, true]) {
+          const snapshot = await manager.snapshot(opened.session, opened.tab, 1_000);
+          const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)![1];
+          const before = dispatchCount();
+          const beforePrompts = prompts;
+          const result = await tool.execute("approval", { ...params, ref }, undefined, undefined, { hasUI, ui });
+          const expectedSuccess = mode === "automatically-accept" || (mode === "ask" && hasUI);
+          // This is the extension's returned error marker, not native Pi's outer
+          // isError classification. Dispatch counts independently prove rejection.
+          assert.equal(result.isError, !expectedSuccess, `${mode}, UI=${hasUI}: ${result.content[0].text}`);
+          assert.equal(dispatchCount(), before + Number(expectedSuccess));
+          assert.equal(consumed, dispatchCount(), "human and automatic dispatch both require a consumed bound permit");
+          assert.equal(prompts, beforePrompts + Number(mode === "ask" && hasUI));
+          assert.equal(JSON.stringify(result).includes(secret), false);
+          if (expectedSuccess) {
+            assert.equal(result.details.response.approval, mode === "ask" ? "human" : "automatic");
+            assert.equal(result.details.response.confirmed, mode === "ask");
+            assert.match(result.content[0].text, mode === "ask" ? /approval: human.*interactive confirmation used: true/ : /approval: automatic.*interactive confirmation used: false/);
+            const stale = await tool.execute("stale", { ...params, ref }, undefined, undefined, { hasUI, ui });
+            assert.equal(stale.isError, true);
+            assert.equal(dispatchCount(), before + 1, "successful dispatch invalidates the one-use ref");
+          } else {
+            assert.match(result.content[0].text, mode === "ask" ? /requires an interactive Pi confirmation/ : /automatically denied/);
+          }
+        }
+      }
+    } finally {
+      await web.cleanup();
+    }
+  });
+
+  for (const mode of approvalModes) {
+    test(`Browser ${family} ${mode} rejects changed targets and hard-denied capabilities without dispatch`, async () => {
+      const { manager, browser } = managerFixture();
+      manager.updateConfig(normalizeConfig({}).web!.fetch, mode);
+      const opened = await manager.open("https://example.com/revalidation");
+      const page = browser.context.page;
+      page.targetStructure = {
+        ...page.targetStructure, href: null,
+        tagName: family === "click" ? "button" : family === "select" ? "select" : "input",
+        role: family === "click" ? "button" : family === "select" ? "combobox" : "textbox",
+        inputType: family === "click" ? "button" : family === "select" ? null : "text",
+        readOnly: false, autocomplete: null, explicitChangeHandler: true,
+      };
+      let prompts = 0;
+      const confirmation = async () => { prompts += 1; return true; };
+      const action = (ref: string) => {
+        const args = [opened.session, opened.tab, ref] as const;
+        switch (family) {
+          case "click": return manager.click(...args, confirmation);
+          case "fill": return manager.fill(...args, "private", confirmation);
+          case "type": return manager.type(...args, "private", 0, confirmation);
+          case "select": return manager.select(...args, ["private"], confirmation);
+          case "press": return manager.press(...args, "Enter", confirmation);
+        }
+      };
+      const freshRef = async () => (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1];
+      try {
+        const ref = await freshRef();
+        let reads = 0;
+        page.onStructureRead = () => {
+          if (++reads === 2) page.targetStructure.domPath += "> changed";
+        };
+        await assert.rejects(action(ref), mode === "automatically-deny" ? /automatically denied/ : /approved target or consequence changed/);
+        assert.equal(reads, mode === "automatically-deny" ? 1 : 2, "automatic approval re-resolves the target just like human approval");
+        assert.equal(prompts, mode === "ask" ? 1 : 0);
+        page.onStructureRead = undefined;
+        if (family !== "click") {
+          for (const inputType of ["password", "file"]) {
+            page.targetStructure = { ...page.targetStructure, tagName: "input", role: "textbox", inputType };
+            await assert.rejects(action(await freshRef()), /not_started/);
+          }
+        }
+        const stale = await freshRef();
+        await freshRef();
+        await assert.rejects(action(stale), /not_started/);
+        await assert.rejects(action("forged-ref"), /not_started/);
+        assert.equal(prompts, mode === "ask" ? 1 : 0, "denied capabilities/targets never request approval");
+        assert.equal(page.clickCalls + page.fillCalls.length + page.typeCalls.length + page.selectCalls.length + page.pressCalls.length, 0);
+      } finally {
+        await manager.shutdown();
+      }
+    });
+  }
+}
 
 test("approved risky clicks pre-arm and account for popup, dialog, and canceled download without switching", async () => {
   const fixture = managerFixture();

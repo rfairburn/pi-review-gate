@@ -594,6 +594,33 @@ test("retry policy is staged and saved atomically", async () => {
   assert.equal(config.execution?.retryPolicy?.maxRetries, 5);
 });
 
+test("Web approval choices stage, cancel, persist, and immediately notify the local sync hook", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-approval-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({ enabled: true, review: { activeReviewers: [] } }));
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  const savedPolicies: string[] = [];
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: (next) => { savedPolicies.push(next.web!.browserInteractionApproval); } });
+  let currentLabel = "Ask";
+  for (const [label, policy] of [["Automatically Accept", "automatically-accept"], ["Automatically Deny", "automatically-deny"], ["Ask", "ask"]]) {
+    const choices = [
+      rootSettingsRow("Web", "50 MiB max download"),
+      webSettingsRow("Browser interaction approval", currentLabel),
+      label, "Back",
+    ];
+    const before = await readFile(configPath, "utf8");
+    await registered.handler("", contextWithSelections([...choices, "Cancel"]));
+    assert.equal(await readFile(configPath, "utf8"), before);
+    await registered.handler("", contextWithSelections([...choices, "Save changes"]));
+    assert.equal(config.web!.browserInteractionApproval, policy);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).web.browserInteractionApproval, policy);
+    assert.equal(savedPolicies.at(-1), policy);
+    currentLabel = label;
+  }
+  assert.deepEqual(savedPolicies, ["automatically-accept", "automatically-deny", "ask"]);
+});
+
 test("/review-settings aligns every settings value column from the full label set", async () => {
   const config = normalizeConfig({
     enabled: true,
@@ -663,7 +690,7 @@ const RETRY_SETTING_LABELS = [
   "Delay jitter",
 ] as const;
 
-const WEB_SETTING_LABELS = ["Maximum download"] as const;
+const WEB_SETTING_LABELS = ["Maximum download", "Browser interaction approval"] as const;
 
 function rootSettingsRow(label: typeof ROOT_SETTING_LABELS[number], value: string): string {
   return alignedTestRow(label, value, ROOT_SETTING_LABELS);

@@ -12,6 +12,7 @@ import {
   type ExecutorToolCatalog,
 } from "../src/execution/tool-catalog";
 import { createState } from "../src/state";
+import { InteractiveBrowserManager } from "../src/web/interactive-browser";
 
 const executionToolNames = [
   "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
@@ -84,6 +85,58 @@ async function writeConfig(dir: string): Promise<string> {
   await writeFile(configPath, JSON.stringify({ enabled: true }), "utf8");
   return configPath;
 }
+
+test("worker browser approval is launch-scoped and never widens research authorization", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-worker-browser-policy-"));
+  const originalUpdate = InteractiveBrowserManager.prototype.updateConfig;
+  const updates: string[] = [];
+  InteractiveBrowserManager.prototype.updateConfig = function (config, policy) {
+    updates.push(policy ?? "ask");
+    originalUpdate.call(this, config, policy);
+  };
+  try {
+    const configPath = join(dir, "config.json");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    process.env.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    for (const mode of ["ask", "automatically-accept", "automatically-deny"]) {
+      await writeFile(configPath, JSON.stringify({ enabled: true, web: { browserInteractionApproval: mode } }));
+      const definitions = new Map<string, any>();
+      const hooks = new Map<string, Array<(...args: any[]) => any>>();
+      let active = ["read"];
+      // Research catalog narrowing itself is covered by execution-tool tests;
+      // this fixture checks the child's consumption cannot widen that boundary.
+      const allowed = ["read", ...webToolNames.filter((name) => !["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress"].includes(name))];
+      process.env[EXECUTOR_TOOL_CATALOG_ENV] = JSON.stringify({ allowedToolCatalog: allowed, initialActiveTools: ["read"] });
+      await activate({
+        registerTool(tool: any) { definitions.set(tool.name, tool); active.push(tool.name); },
+        on(name: string, hook: (...args: any[]) => any) { hooks.set(name, [...(hooks.get(name) ?? []), hook]); },
+        getAllTools: () => [{ name: "read", description: "Read" }, ...definitions.values()],
+        getActiveTools: () => [...active],
+        setActiveTools(names: string[]) { active = [...names]; },
+        notify() {},
+      });
+      assert.equal(updates.at(-1), mode, "worker activation loads the saved approval mode through WebToolManager");
+      const updateCount = updates.length;
+      await writeFile(configPath, JSON.stringify({ enabled: true, web: { browserInteractionApproval: "ask" } }));
+      const ctx = { cwd: dir, ui: {}, sessionManager: {} };
+      for (const hook of hooks.get("session_start") ?? []) await hook({ cwd: dir }, ctx);
+      for (const hook of hooks.get("before_agent_start") ?? []) await hook({ cwd: dir }, ctx);
+      assert.equal(updates.length, updateCount, "already-running worker does not reload changed policy");
+      for (const name of ["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress"]) {
+        const result = await definitions.get("search_tools").execute("restricted", { query: name });
+        assert.deepEqual(result.details.activated, []);
+        assert.equal(active.includes(name), false, `${mode} cannot grant research ${name}`);
+      }
+      const observation = await definitions.get("search_tools").execute("observe", { query: "BrowserHover" });
+      assert.deepEqual(observation.details.activated, ["BrowserHover"]);
+    }
+    assert.deepEqual(updates, ["ask", "automatically-accept", "automatically-deny"]);
+  } finally {
+    InteractiveBrowserManager.prototype.updateConfig = originalUpdate;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("executor role registers web tools and background shell without orchestration or review machinery", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-executor-role-"));

@@ -5,6 +5,7 @@ import {
   externalAgentCatalog,
   normalizeConfig,
   type ActiveReviewerSelection,
+  type BrowserInteractionApproval,
   type ExecutorPoolEntry,
   type WorkerRouteEntry,
   type ExecutionRetryPolicy,
@@ -31,6 +32,7 @@ export interface ReviewSettingsSelection {
   deferredPiTools?: boolean;
   subtasksViewExpanded: boolean;
   webMaxDownloadBytes?: number;
+  browserInteractionApproval?: BrowserInteractionApproval;
 }
 
 const configUpdateTails = new Map<string, Promise<void>>();
@@ -79,11 +81,16 @@ export async function persistReviewSettings(
     const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
     ui.subtasksViewExpanded = selection.subtasksViewExpanded;
     parsed.ui = ui;
-    if (selection.webMaxDownloadBytes !== undefined) {
+    if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined) {
       const web = isRecord(parsed.web) ? { ...parsed.web } : {};
-      const fetch = isRecord(web.fetch) ? { ...web.fetch } : {};
-      fetch.maxDownloadBytes = selection.webMaxDownloadBytes;
-      web.fetch = fetch;
+      if (selection.webMaxDownloadBytes !== undefined) {
+        const fetch = isRecord(web.fetch) ? { ...web.fetch } : {};
+        fetch.maxDownloadBytes = selection.webMaxDownloadBytes;
+        web.fetch = fetch;
+      }
+      if (selection.browserInteractionApproval !== undefined) {
+        web.browserInteractionApproval = selection.browserInteractionApproval;
+      }
       parsed.web = web;
     }
     parsed.externalAgents = catalog;

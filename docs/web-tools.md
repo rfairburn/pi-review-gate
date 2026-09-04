@@ -180,13 +180,16 @@ The session surface is bounded and semantic:
   dispatching page click handlers; known consequential destinations such as logout,
   destructive, authorization, publish, send, purchase, or account paths are not silent. Forms, downloads, authentication/terms/permissions, destructive/publish/send/
   purchase/account actions, unknown buttons or menu items, and every unknown or mixed
-  result are consequential. A top-level interactive Pi session must approve one exact,
-  short-lived click through Pi's confirmation UI. The permit is bound to the session,
+  result are consequential and require approval under
+  [Browser interaction approval](#browser-interaction-approval). With the default
+  **Ask**, a top-level interactive Pi session must approve one exact, short-lived click
+  through Pi's confirmation UI. The permit is bound to the session,
   tab, document generation, origin and destination, operation, target fingerprint, and
   consequence; it is single-use, expires absolutely, and is consumed only after the
-  target is re-resolved and all fields still match. Denial, cancellation, timeout,
-  absent UI, changed structure/origin, or stale refs prevents dispatch. Non-UI executor
-  sessions reject consequential clicks rather than approving them.
+  target is re-resolved and all fields still match, including with automatic approval.
+  Denial, cancellation, timeout, changed structure/origin, or stale refs prevents
+  dispatch. Absent UI also rejects in **Ask**; authorized non-UI executor sessions may
+  use **Automatically Accept** but never claim human confirmation.
 - `BrowserFill` replaces a supported text control's bounded value (including
   clearing it), while `BrowserType` appends at most 1,000 characters with an optional
   0–5 ms per-character delay. `BrowserSelect` accepts a nonempty set of at most 32
@@ -201,8 +204,9 @@ The session surface is bounded and semantic:
   assuming those handlers do not exist. Results explicitly distinguish whether a remote
   network effect was observed. Sensitive or autocomplete controls, authentication/terms destinations,
   submit or activation keys (including Enter and Space), explicit change/autosave/
-  submit handlers, and unknown or mixed targets require the same real top-level UI
-  confirmation as consequential clicks and fail closed without UI. Confirmation is
+  submit handlers, and unknown or mixed targets require the same configured approval
+  as consequential clicks (**Ask** requires real top-level UI and rejects without it).
+  Approval is
   bound to the action, key, and a nonpersisted digest and lengths of the exact values,
   in addition to session/tab/generation/origin/target/consequence, followed by immediate
   re-resolution and reclassification. Values and selections are excluded from
@@ -305,6 +309,37 @@ role's deterministic names-only system-prompt inventory while schemas
 remain deferred. The generic deferred matcher, ranking, limits, and guidance are shared
 unchanged with all other tools.
 External Claude and Codex adapters retain their existing native web-tool policies.
+
+### Browser interaction approval
+
+`/review-settings` → **Web** → **Browser interaction approval** controls only the
+existing confirmation-required branch for authorized `BrowserClick`, `BrowserFill`,
+`BrowserType`, `BrowserSelect`, and `BrowserPress`:
+
+- **Ask** (default) uses Pi's interactive confirmation prompt. Denial, cancellation,
+  unavailable UI, or no-UI/background execution rejects that branch.
+- **Automatically Accept** supplies policy approval without invoking UI, including in
+  authorized native workers. It still issues the same short-lived, single-use permit
+  and consumes it only after immediate ref/target/consequence and value-digest/key
+  revalidation. It does not pretend a human confirmed the action.
+- **Automatically Deny** rejects that branch without prompting or dispatching the
+  requested interaction. It is not a browser-wide read-only switch.
+
+Already-permitted observations, controlled ordinary navigation/native disclosure, and
+structurally proven local edits remain permitted in all three modes. No mode grants
+research-role click/form authority or removes password/file/clipboard and other hard
+restrictions, SSRF/broker controls, revalidation, or value-secrecy protections. Approval
+is not a guarantee that page code is safe or that an action has no remote effects.
+
+Successful interaction details include `approval: "not_required"`, `"human"`, or
+`"automatic"`. The compatibility field `confirmed` is true only for interactive human
+confirmation; automatic approval returns `confirmed: false`. Text reports both fields.
+Save applies to subsequent local approval decisions in existing sessions; it does not
+revisit in-flight approval requests or actions already dispatched. Native workers load
+settings once at extension startup:
+new launches use the saved policy, while running worker sessions keep their launch
+values. The setting does not change external adapters' native browser policies.
+Invalid config values reject loading; see [Configuration](configuration.md#web-fields).
 
 ## Page cache
 

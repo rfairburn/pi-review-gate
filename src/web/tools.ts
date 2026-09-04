@@ -92,6 +92,7 @@ export class WebToolManager {
     this.cache = cache ?? new WebPageCache(this.webConfig.fetch);
     this.browserCache = browserCache ?? new WebPageCache(this.webConfig.fetch, renderWithChromium);
     this.interactiveBrowser = interactiveBrowser ?? new InteractiveBrowserManager(this.webConfig.fetch);
+    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval);
     registerProcessExitCleanup(this.cache);
     registerProcessExitCleanup(this.browserCache);
   }
@@ -435,7 +436,7 @@ export class WebToolManager {
     this.pi.registerTool({
       name: "BrowserClick",
       label: "BrowserClick",
-      description: "Click one current opaque BrowserSnapshot ref under the structural consequence policy. Proven HTTP(S) navigation and native local disclosure may proceed; all consequential or unknown actions require immediate interactive Pi confirmation and are rejected without UI.",
+      description: "Click one current opaque BrowserSnapshot ref under the structural consequence policy. Proven HTTP(S) navigation and native local disclosure may proceed; consequential or unknown actions follow the user's Browser interaction approval setting (Ask by default; no UI rejects in Ask). Automatic approval retains all target and safety checks.",
       promptGuidelines: browserInteractionGuidelines(),
       executionMode: "sequential",
       parameters: browserInteractionHandleSchema(),
@@ -677,7 +678,7 @@ export class WebToolManager {
     this.webConfig = config.web ?? DEFAULT_CONFIG.web!;
     this.cache.updateConfig(this.webConfig.fetch);
     this.browserCache.updateConfig(this.webConfig.fetch);
-    this.interactiveBrowser.updateConfig(this.webConfig.fetch);
+    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval);
   }
 
   /** Settlement barrier for browser ownership only; caches are independent. */
@@ -798,7 +799,7 @@ function browserInteractionGuidelines(): string[] {
   return [
     ...browserObservationGuidelines(),
     "Never claim a click is safe. The extension classifies the freshly resolved target from structural facts; accessible names and model assertions cannot authorize it.",
-    "Unknown, mixed, form, download, authentication, terms, permission, destructive, publish, send, purchase, and account consequences require a one-use interactive confirmation. Background execution rejects them.",
+    "Unknown, mixed, form, download, authentication, terms, permission, destructive, publish, send, purchase, and account consequences require one-use approval under the user's Browser interaction approval setting: Ask (UI required), Automatically Accept, or Automatically Deny. Role restrictions and all safety checks still apply.",
     "Cancellation and failure report effect uncertainty and never claim rollback. Popups remain owned without auto-switching; downloads are canceled and dialogs default-dismissed.",
   ];
 }
@@ -815,7 +816,7 @@ function browserFormGuidelines(): string[] {
   return [
     ...browserInteractionGuidelines(),
     "Fill replaces while Type appends. Select uses only exact uniquely resolved native option labels/values. Press accepts only one allowlisted key or short editing chord.",
-    "Ordinary structurally proven unsent local editing may proceed without confirmation. Sensitive/autocomplete/auth/terms/submit, explicit change/autosave, activation keys, and unknown or mixed targets require immediate top-level UI confirmation and are rejected in background execution.",
+    "Ordinary structurally proven unsent local editing remains permitted in every approval mode. Sensitive/autocomplete/auth/terms/submit, explicit change/autosave, activation keys, and unknown or mixed targets follow the user's Browser interaction approval setting; Ask requires UI, Automatically Accept uses one-use revalidated approval, and Automatically Deny rejects before dispatch. Hard-denied targets remain denied.",
     "Values and selections are secret-by-construction and never appear in results, prompts, diagnostics, durable evidence, or logs. Password/file controls, clipboard, upload, filesystem paths, selectors, coordinates, scripts, CDP, forced actions, and raw events are unsupported.",
   ];
 }
@@ -916,7 +917,7 @@ function formatBrowserInteraction(value: BrowserInteractionResult): string {
   return [
     `Browser ${value.operation} ${value.effect}.`,
     `Session: ${value.session} · Tab: ${value.tab} · New document generation: ${value.generation}`,
-    `Consequence class: ${value.consequence} · interactive confirmation used: ${value.confirmed}.`,
+    `Consequence class: ${value.consequence} · approval: ${value.approval} · interactive confirmation used: ${value.confirmed}.`,
     `Observed effects: navigation ${value.effects.navigation}; network ${value.effects.network ?? "not_observed"}; popup tabs ${value.effects.observedPopupTabs}; overflow popups closed ${value.effects.observedOverflowPopupsClosed}; dialogs dismissed ${value.effects.observedDialogsDismissed}; download ${value.effects.download}; accounting ${value.effects.accounting}.`,
     ...(value.consequence === "local_editing" && value.effects.network !== "observed"
       ? ["The completed edit is local ephemeral state; no remote effect was observed."]

@@ -17,6 +17,7 @@ import {
   workerResourceSupportsResearch,
   resolveReviewers,
   type ActiveReviewerSelection,
+  type BrowserInteractionApproval,
   type ExecutorPoolEntry,
   type ExecutorSelection,
   type ExternalAgentConfig,
@@ -84,6 +85,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let deferredPiTools = input.config.execution?.deferredPiTools ?? DEFAULT_DEFERRED_PI_TOOLS;
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
   let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
+  let browserInteractionApproval = input.config.web!.browserInteractionApproval ?? "ask";
 
   while (true) {
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
@@ -199,7 +201,9 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       continue;
     }
     if (choice === webRow) {
-      webMaxDownloadBytes = await selectWebSettings(input.ui, webMaxDownloadBytes);
+      ({ maxDownloadBytes: webMaxDownloadBytes, browserInteractionApproval } = await selectWebSettings(
+        input.ui, webMaxDownloadBytes, browserInteractionApproval,
+      ));
       continue;
     }
     const error = await validateSelection(workerResources, activeReviewers, agents, input.config, input.scoped, executeRoute, researchRoute);
@@ -223,6 +227,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       deferredPiTools,
       subtasksViewExpanded,
       webMaxDownloadBytes,
+      browserInteractionApproval,
     });
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config);
@@ -231,14 +236,33 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   }
 }
 
-async function selectWebSettings(ui: UiContext, initialMaxDownloadBytes: number): Promise<number> {
+const BROWSER_APPROVAL_CHOICES: Record<BrowserInteractionApproval, string> = {
+  ask: "Ask",
+  "automatically-accept": "Automatically Accept",
+  "automatically-deny": "Automatically Deny",
+};
+
+async function selectWebSettings(
+  ui: UiContext,
+  initialMaxDownloadBytes: number,
+  initialApproval: BrowserInteractionApproval,
+): Promise<{ maxDownloadBytes: number; browserInteractionApproval: BrowserInteractionApproval }> {
   let maxDownloadBytes = initialMaxDownloadBytes;
+  let browserInteractionApproval = initialApproval;
   while (true) {
-    const [downloadRow] = alignedSettingsRows([
+    const [downloadRow, approvalRow] = alignedSettingsRows([
       ["Maximum download", formatByteSize(maxDownloadBytes)],
+      ["Browser interaction approval", BROWSER_APPROVAL_CHOICES[browserInteractionApproval]],
     ]);
-    const choice = await ui.select("Web settings", [downloadRow, "Back"]);
-    if (!choice || choice === "Back") return maxDownloadBytes;
+    const choice = await ui.select("Web settings", [downloadRow, approvalRow, "Back"]);
+    if (!choice || choice === "Back") return { maxDownloadBytes, browserInteractionApproval };
+    if (choice === approvalRow) {
+      await notify(ui, "Only confirmation-required actions: Ask prompts (no UI rejects); Automatically Accept approves without UI; Automatically Deny rejects. Already-permitted observations/local actions stay permitted; hard safety and role restrictions remain. Saved changes apply locally now and to newly launched workers.", "info");
+      const selected = await ui.select("Browser interaction approval", Object.values(BROWSER_APPROVAL_CHOICES));
+      const entry = Object.entries(BROWSER_APPROVAL_CHOICES).find(([, label]) => label === selected);
+      if (entry) browserInteractionApproval = entry[0] as BrowserInteractionApproval;
+      continue;
+    }
     if (!ui.input) {
       await notify(ui, "This UI does not support numeric input.", "error");
       continue;

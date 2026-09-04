@@ -58,7 +58,10 @@ receipts of exactly what the model was told.
   allowlisted key press. Only edits with proven absence of relevant page-controlled
   events may remain ephemeral; hidden direct or delegated listeners fail closed.
   Sensitive, submit/activation, handler-bearing, unknown, or consequential actions need
-  a single-use top-level Pi confirmation and are rejected in background execution.
+  single-use revalidated approval: **Ask** (default) requires top-level Pi confirmation
+  and rejects without UI; **Automatically Accept** and **Automatically Deny** under
+  `/review-settings` → **Web** control only that approval-required branch. Neither
+  automatic mode removes hard safety or role restrictions.
   Entered/selected values are excluded from review-gate-owned results, evidence,
   diagnostics, and logs. Pi/provider-native conversation and session retention is
   outside that guarantee, so do not enter secrets. Research roles cannot use form

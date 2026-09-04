@@ -12,7 +12,7 @@ import {
   type Request,
   type Response,
 } from "playwright";
-import type { WebFetchConfig } from "../config";
+import type { BrowserInteractionApproval, WebFetchConfig } from "../config";
 import { redactSensitiveText } from "../redaction";
 import {
   CLEANUP_DEADLINE_MS,
@@ -348,7 +348,9 @@ export interface BrowserInteractionResult {
   generation: string;
   operation: "hover" | "click" | BrowserFormOperation;
   consequence: BrowserConsequence | "observational";
+  /** True only for interactive human confirmation, never automatic approval. */
   confirmed: boolean;
+  approval: "not_required" | "human" | "automatic";
   effect: BrowserInteractionEffectState;
   effects: BrowserInteractionEffects;
   url: string;
@@ -546,6 +548,7 @@ export class InteractiveBrowserManager {
   private readonly randomHandle: NonNullable<InteractiveBrowserDependencies["randomHandle"]>;
   private readonly consequencePolicy: BrowserConsequencePolicy;
   private readonly confirmationPermits: BrowserConfirmationPermits;
+  private interactionApproval: BrowserInteractionApproval = "ask";
   readonly limits: Readonly<InteractiveBrowserLimits>;
 
   constructor(
@@ -579,8 +582,28 @@ export class InteractiveBrowserManager {
     });
   }
 
-  updateConfig(config: WebFetchConfig): void {
+  updateConfig(config: WebFetchConfig, interactionApproval: BrowserInteractionApproval = "ask"): void {
     this.config = config;
+    this.interactionApproval = interactionApproval;
+  }
+
+  /** Select policy at the approval-required branch, after target restrictions.
+   * Automatic approval still issues and consumes the ordinary one-use bound permit.
+   */
+  private interactionAuthorization(name: string, confirmation?: BrowserInteractionConfirmation): {
+    confirm: BrowserInteractionConfirmation;
+    source: "human" | "automatic";
+  } {
+    if (this.interactionApproval === "automatically-deny") {
+      throw new Error(`${name} not_started: browser interaction approval policy automatically denied this approval-required action.`);
+    }
+    if (this.interactionApproval === "automatically-accept") {
+      return { confirm: async () => true, source: "automatic" };
+    }
+    if (!confirmation) {
+      throw new Error(`${name} not_started: this structurally consequential or unknown action requires an interactive Pi confirmation; background or no-UI execution is rejected.`);
+    }
+    return { confirm: confirmation, source: "human" };
   }
 
   async open(url: string, signal?: AbortSignal): Promise<BrowserOpenResult> {
@@ -1242,13 +1265,11 @@ export class InteractiveBrowserManager {
           assertSuitableFormTarget(structure, action.operation);
           let selectedKinds: Array<"value" | "label"> | undefined;
           const decision = this.consequencePolicy.classifyForm(structure, { operation: action.operation, key: action.key });
-          let confirmed = false;
+          let approval: BrowserInteractionResult["approval"] = "not_required";
           const originalFingerprint = this.consequencePolicy.fingerprint(structure);
 
           if (decision.consequential) {
-            if (!confirmation) {
-              throw new Error(`${name} not_started: this structurally consequential or unknown action requires an interactive Pi confirmation; background or no-UI execution is rejected.`);
-            }
+            const authorization = this.interactionAuthorization(name, confirmation);
             const binding = this.formConfirmationBinding(
               session, tab, ref, capturedOrigin, structure, decision.consequence,
               decision.destination, action.operation, valueDigest, valueLengths, action.key ?? null,
@@ -1257,12 +1278,12 @@ export class InteractiveBrowserManager {
             let approved = false;
             try {
               approved = await operation.run(
-                confirmation(formConfirmationPrompt(action.operation, decision.consequence, capturedOrigin, decision.destination)),
-                "interactive confirmation",
+                authorization.confirm(formConfirmationPrompt(action.operation, decision.consequence, capturedOrigin, decision.destination)),
+                "interaction approval",
               );
             } catch {
               this.confirmationPermits.revoke(permit);
-              throw new Error(`${name} not_started: interactive confirmation was unavailable or cancelled.`);
+              throw new Error(`${name} not_started: interaction approval was unavailable or cancelled.`);
             }
             if (!approved) {
               this.confirmationPermits.revoke(permit);
@@ -1271,14 +1292,14 @@ export class InteractiveBrowserManager {
             try {
               throwIfAborted(operation.signal);
               if (session.teardown || session.fatalError || tab.page.isClosed()) {
-                throw new Error(`${name} not_started: the browser session changed or closed after confirmation.`);
+                throw new Error(`${name} not_started: the browser session changed or closed after approval.`);
               }
               if (tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin) {
                 this.invalidateInteractionRefs(tab, capturedGeneration);
-                throw new Error(`${name} not_started: the document or origin changed after confirmation; take a fresh BrowserSnapshot.`);
+                throw new Error(`${name} not_started: the document or origin changed after approval; take a fresh BrowserSnapshot.`);
               }
               locator = this.currentRefLocator(tab, ref);
-              const revalidatedStructure = await operation.run(readTargetStructure(locator), "post-confirmation target revalidation");
+              const revalidatedStructure = await operation.run(readTargetStructure(locator), "post-approval target revalidation");
               assertSuitableFormTarget(revalidatedStructure, action.operation);
               const revalidatedDecision = this.consequencePolicy.classifyForm(revalidatedStructure, { operation: action.operation, key: action.key });
               const rebound = this.formConfirmationBinding(
@@ -1287,9 +1308,9 @@ export class InteractiveBrowserManager {
               );
               if (!this.confirmationPermits.consume(permit, rebound)) {
                 this.invalidateInteractionRefs(tab, capturedGeneration);
-                throw new Error(`${name} not_started: the confirmed target or consequence changed; take a fresh BrowserSnapshot.`);
+                throw new Error(`${name} not_started: the approved target or consequence changed; take a fresh BrowserSnapshot.`);
               }
-              confirmed = true;
+              approval = authorization.source;
             } catch (error) {
               // Revocation is harmless after consume and guarantees every
               // approval path is single-use even when re-resolution itself fails.
@@ -1346,7 +1367,7 @@ export class InteractiveBrowserManager {
           if (session.fatalError) throw session.fatalError;
           const navigated = tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin;
           this.invalidateInteractionRefs(tab, capturedGeneration);
-          return interactionResult(session, tab, action.operation, decision.consequence, confirmed, capture, accounting, navigated);
+          return interactionResult(session, tab, action.operation, decision.consequence, approval, capture, accounting, navigated);
         } catch (error) {
           if (!started) throw error;
           this.invalidateInteractionRefs(tab, capturedGeneration);
@@ -1393,52 +1414,53 @@ export class InteractiveBrowserManager {
         await operation.run(locator.waitFor({ state: "visible", timeout: operation.remainingMs() }), "semantic target validation");
         const structure = await operation.run(readTargetStructure(locator), "structural consequence inspection");
         const decision = this.consequencePolicy.classify(structure);
-        let confirmed = false;
+        let approval: BrowserInteractionResult["approval"] = "not_required";
 
         if (operationName === "click" && decision.consequential) {
-          if (!confirmation) {
-            throw new Error("BrowserClick not_started: this structurally consequential or unknown action requires an interactive Pi confirmation; background or no-UI execution is rejected.");
-          }
+          const authorization = this.interactionAuthorization(name, confirmation);
           const binding = this.confirmationBinding(session, tab, ref, capturedOrigin, structure, decision.consequence, decision.destination);
           const permit = this.confirmationPermits.issue(binding);
           let approved = false;
           try {
-            approved = await operation.run(confirmation(confirmationPrompt(decision.consequence, capturedOrigin, decision.destination)), "interactive confirmation");
+            approved = await operation.run(authorization.confirm(confirmationPrompt(decision.consequence, capturedOrigin, decision.destination)), "interaction approval");
           } catch {
             this.confirmationPermits.revoke(permit);
-            throw new Error("BrowserClick not_started: interactive confirmation was unavailable or cancelled.");
+            throw new Error("BrowserClick not_started: interaction approval was unavailable or cancelled.");
           }
           if (!approved) {
             this.confirmationPermits.revoke(permit);
             throw new Error("BrowserClick not_started: interactive confirmation was denied.");
           }
 
-          throwIfAborted(operation.signal);
-          if (session.teardown || session.fatalError || tab.page.isClosed()) {
+          try {
+            throwIfAborted(operation.signal);
+            if (session.teardown || session.fatalError || tab.page.isClosed()) {
+              throw new Error("BrowserClick not_started: the browser session changed or closed after approval.");
+            }
+            if (tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin) {
+              this.invalidateInteractionRefs(tab, capturedGeneration);
+              throw new Error("BrowserClick not_started: the document or origin changed after approval; take a fresh BrowserSnapshot.");
+            }
+            const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref)), "post-approval target revalidation");
+            const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure);
+            const rebound = this.confirmationBinding(
+              session,
+              tab,
+              ref,
+              capturedOrigin,
+              revalidatedStructure,
+              revalidatedDecision.consequence,
+              revalidatedDecision.destination,
+            );
+            if (!this.confirmationPermits.consume(permit, rebound)) {
+              this.invalidateInteractionRefs(tab, capturedGeneration);
+              throw new Error("BrowserClick not_started: the approved target or consequence changed; take a fresh BrowserSnapshot.");
+            }
+            approval = authorization.source;
+          } finally {
+            // Also revoke on failed re-resolution or cancellation, as for form actions.
             this.confirmationPermits.revoke(permit);
-            throw new Error("BrowserClick not_started: the browser session changed or closed after confirmation.");
           }
-          if (tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin) {
-            this.invalidateInteractionRefs(tab, capturedGeneration);
-            this.confirmationPermits.revoke(permit);
-            throw new Error("BrowserClick not_started: the document or origin changed after confirmation; take a fresh BrowserSnapshot.");
-          }
-          const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref)), "post-confirmation target revalidation");
-          const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure);
-          const rebound = this.confirmationBinding(
-            session,
-            tab,
-            ref,
-            capturedOrigin,
-            revalidatedStructure,
-            revalidatedDecision.consequence,
-            revalidatedDecision.destination,
-          );
-          if (!this.confirmationPermits.consume(permit, rebound)) {
-            this.invalidateInteractionRefs(tab, capturedGeneration);
-            throw new Error("BrowserClick not_started: the confirmed target or consequence changed; take a fresh BrowserSnapshot.");
-          }
-          confirmed = true;
         } else if (operationName === "click") {
           // Silent paths receive the same immediate structural revalidation as
           // confirmed paths. Any loss of proof converts to a no-action failure,
@@ -1485,7 +1507,7 @@ export class InteractiveBrowserManager {
             (details as HTMLDetailsElement).open = !(details as HTMLDetailsElement).open;
           }, "summary"), "controlled local disclosure");
         } else {
-          await operation.run(locator.click({ timeout: operation.remainingMs() }), "confirmed semantic click dispatch");
+          await operation.run(locator.click({ timeout: operation.remainingMs() }), "approved semantic click dispatch");
         }
         const accounting = await accountInteractionEffects(capture, operation);
         if (session.fatalError) throw session.fatalError;
@@ -1498,7 +1520,8 @@ export class InteractiveBrowserManager {
           generation: tab.generation,
           operation: operationName,
           consequence: operationName === "hover" ? "observational" : decision.consequence,
-          confirmed,
+          confirmed: approval === "human",
+          approval,
           effect: "completed",
           effects: {
             navigation: navigated ? "observed" : "not_observed",
@@ -3051,7 +3074,7 @@ function interactionResult(
   tab: BrowserTab,
   operation: BrowserFormOperation,
   consequence: BrowserConsequence,
-  confirmed: boolean,
+  approval: BrowserInteractionResult["approval"],
   capture: InteractionCapture,
   accounting: "bounded_stable" | "bounded_uncertain",
   navigated: boolean,
@@ -3062,7 +3085,8 @@ function interactionResult(
     generation: tab.generation,
     operation,
     consequence,
-    confirmed,
+    confirmed: approval === "human",
+    approval,
     effect: "completed",
     effects: {
       navigation: navigated ? "observed" : "not_observed",

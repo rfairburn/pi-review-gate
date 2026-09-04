@@ -58,6 +58,17 @@ test("loadConfig supports PI_REVIEW_GATE_DISABLED", () => {
   assert.equal(loaded.disabledReason, "PI_REVIEW_GATE_DISABLED is set");
 });
 
+test("browser interaction approval defaults to Ask and rejects every invalid configured value", () => {
+  assert.equal(normalizeConfig({}).web!.browserInteractionApproval, "ask");
+  assert.equal(normalizeConfig({ web: {} }).web!.browserInteractionApproval, "ask");
+  for (const policy of ["ask", "automatically-accept", "automatically-deny"]) {
+    assert.equal(normalizeConfig({ web: { browserInteractionApproval: policy } }).web!.browserInteractionApproval, policy);
+  }
+  for (const policy of [null, false, true, 0, [], {}, "", "Ask", "accept", "allow", "automatically_accept"]) {
+    assert.throws(() => normalizeConfig({ web: { browserInteractionApproval: policy } }), /web.browserInteractionApproval must be/);
+  }
+});
+
 test("native web tooling has bounded defaults and validates overrides", () => {
   const defaults = normalizeConfig({}).web!;
   assert.equal(defaults.enabled, true);

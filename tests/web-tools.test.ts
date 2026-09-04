@@ -681,7 +681,7 @@ test("BrowserClick uses only Pi's interactive execution-context confirmation API
       assert.equal(approved, true);
       return {
         session: "session", tab: "tab", generation: "new-generation", operation: "click",
-        consequence: "unknown_or_mixed", confirmed: true, effect: "completed",
+        consequence: "unknown_or_mixed", confirmed: true, approval: "human", effect: "completed",
         effects: { navigation: "not_observed", observedPopupTabs: 0, observedOverflowPopupsClosed: 0, observedDialogsDismissed: 0, download: "not_observed", accounting: "bounded_stable" },
         url: "https://example.com",
       };
@@ -720,6 +720,7 @@ test("BrowserClick uses only Pi's interactive execution-context confirmation API
   );
   assert.equal(approved.isError, false);
   assert.deepEqual(prompts, [["Fixed title", "Fixed bounded message"]]);
+  assert.match(approved.content[0].text, /approval: human.*interactive confirmation used: true/);
 
   const background = await click.execute(
     "background",

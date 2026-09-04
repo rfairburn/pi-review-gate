@@ -22,8 +22,11 @@ export interface WebFetchConfig {
   userAgent: string;
 }
 
+export type BrowserInteractionApproval = "ask" | "automatically-accept" | "automatically-deny";
+
 export interface WebConfig {
   enabled: boolean;
+  browserInteractionApproval: BrowserInteractionApproval;
   search: WebSearchConfig;
   fetch: WebFetchConfig;
 }
@@ -251,6 +254,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   retainBundles: "on-failure",
   web: {
     enabled: true,
+    browserInteractionApproval: "ask",
     search: { provider: "ddgs", timeoutMs: 20_000, maxResults: 10 },
     fetch: {
       timeoutMs: 30_000,
@@ -349,6 +353,11 @@ function normalizeWeb(value: unknown): WebConfig {
   if (value === undefined) return structuredClone(defaults);
   if (!isRecord(value)) throw new Error("web must be an object");
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error("web.enabled must be a boolean");
+  const browserInteractionApproval = value.browserInteractionApproval === undefined
+    ? defaults.browserInteractionApproval : value.browserInteractionApproval;
+  if (!["ask", "automatically-accept", "automatically-deny"].includes(browserInteractionApproval as string)) {
+    throw new Error("web.browserInteractionApproval must be ask, automatically-accept, or automatically-deny");
+  }
   const search = value.search === undefined ? {} : value.search;
   const fetch = value.fetch === undefined ? {} : value.fetch;
   if (!isRecord(search)) throw new Error("web.search must be an object");
@@ -360,6 +369,7 @@ function normalizeWeb(value: unknown): WebConfig {
   if (typeof userAgent !== "string" || userAgent.trim().length === 0) throw new Error("web.fetch.userAgent must be a non-empty string");
   return {
     enabled: value.enabled ?? defaults.enabled,
+    browserInteractionApproval: browserInteractionApproval as BrowserInteractionApproval,
     search: {
       provider,
       timeoutMs: positiveIntegerOrDefault(search.timeoutMs, defaults.search.timeoutMs, "web.search.timeoutMs"),

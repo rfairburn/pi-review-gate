@@ -1,9 +1,8 @@
 # Development
 
 This page owns the build, test, static-check, and packaging workflows plus launcher
-internals. It does not add repo-management guidance; CI lives in the repository's
-`.github/workflows/ci.yml` (present only in the checkout, not shipped in the npm
-package).
+internals. CI lives in the repository's `.github/workflows/ci.yml` (present only in
+the checkout, not shipped in the npm package).
 
 ## Repository layout
 

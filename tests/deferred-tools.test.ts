@@ -250,6 +250,74 @@ test("search matches any query term so multiple exact or descriptive tool names 
   }
 });
 
+test("queries with more than twelve unique terms remain valid and use every term", async () => {
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  const noise = Array.from({ length: 13 }, (_unused, index) => `noise${index + 1}`);
+  const result = await fixture.search()("many-terms", { query: [...noise, "overwrite"].join(" ") });
+
+  assert.equal(result.isError, false);
+  assert.deepEqual((result.details as { matched: string[] }).matched, ["write"]);
+  assert.deepEqual((result.details as { activated: string[] }).activated, ["write"]);
+  assert.ok(fixture.active().includes("write"));
+});
+
+test("large Unicode term sets cannot cross exact, split-name, and description tiers", async () => {
+  const fixture = hostFixture();
+  const unicodeTerms = Array.from({ length: 105 }, (_unused, index) => String.fromCodePoint(0x4e00 + index));
+  fixture.pi.registerTool(tool("NeedleRunner", "Run the focused operation."));
+  fixture.pi.registerTool(tool("DescriptionHeavy", unicodeTerms.join(" ")));
+  fixture.pi.registerTool(tool("ExactFocus", "Load the exact candidate."));
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  const nameQuery = [...unicodeTerms, "needle"].join(" ");
+  assert.ok(nameQuery.length <= 256);
+  const nameResult = await fixture.search()("large-name-tier", { query: nameQuery });
+  assert.deepEqual((nameResult.details as { matched: string[] }).matched, ["NeedleRunner"]);
+  assert.deepEqual((nameResult.details as { activated: string[] }).activated, ["NeedleRunner"]);
+  assert.equal(fixture.active().includes("DescriptionHeavy"), false);
+
+  const exactQuery = [...unicodeTerms, "needle", "ExactFocus"].join(" ");
+  assert.ok(exactQuery.length <= 256);
+  const exactResult = await fixture.search()("large-exact-tier", { query: exactQuery });
+  assert.deepEqual((exactResult.details as { matched: string[] }).matched, ["ExactFocus"]);
+  assert.deepEqual((exactResult.details as { activated: string[] }).activated, ["ExactFocus"]);
+  assert.equal(fixture.active().includes("DescriptionHeavy"), false);
+});
+
+test("every authorized tool in a strongest tier is activated and reported alphabetically", async () => {
+  const fixture = hostFixture();
+  const strongest = Array.from({ length: 10 }, (_unused, index) => `BatchTool${String(index).padStart(2, "0")}`);
+  for (const name of [...strongest].reverse()) fixture.pi.registerTool(tool(name, "Run one grouped operation."));
+  fixture.pi.registerTool(tool("DescriptionOnly", "Process a batch through a weaker description match."));
+  fixture.pi.registerTool(tool("BatchPrivate", "Unauthorized matching tool."));
+
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity, {
+    allowedToolCatalog: ["read", ...[...strongest].reverse(), "DescriptionOnly"],
+    initialActiveTools: ["read"],
+  });
+
+  const result = await fixture.search()("wide-tier", { query: "batch" });
+  const details = result.details as { matched: string[]; activated: string[]; omitted: number };
+  assert.equal(result.isError, false);
+  assert.deepEqual(details.matched, strongest);
+  assert.deepEqual(details.activated, strongest);
+  assert.equal(details.omitted, 0);
+  assert.deepEqual(fixture.active(), ["read", "search_tools", ...strongest]);
+  const text = String((result.content as Array<{ text: string }>)[0]?.text);
+  assert.equal(text.includes("BatchPrivate"), false, "unauthorized names are not disclosed");
+  assert.equal(text.includes("DescriptionOnly"), false, "weaker matches are not reported or activated");
+  assert.match(text, new RegExp(`Matched authorized tools: ${strongest.join(", ")}\\.`));
+  assert.match(text, /next turn/);
+});
+
 test("exact tool names suppress weaker generic-word matches", async () => {
   for (const [query, expected] of [
     ["WebSearch web search tool", "WebSearch"],

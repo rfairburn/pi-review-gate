@@ -7,8 +7,6 @@ import {
 import { renderAuthorizedToolInventory } from "./tool-inventory";
 
 const MAX_QUERY_CHARS = 256;
-const MAX_QUERY_TERMS = 12;
-const MAX_MATCHES = 8;
 
 interface ToolMetadata {
   name: string;
@@ -29,7 +27,8 @@ interface AuthorizationBoundary {
 }
 
 interface SearchMatch extends ToolMetadata {
-  rank: number;
+  tier: 0 | 1 | 2;
+  matchCount: number;
 }
 
 // Pi recreates ExtensionAPI wrappers when extension modules reload, while the
@@ -187,22 +186,27 @@ export class DeferredToolManager {
       return textResult(`Invalid search_tools request: query must contain 1-${MAX_QUERY_CHARS} characters.`, true);
     }
     const terms = searchTerms(query);
-    if (terms.length === 0 || terms.length > MAX_QUERY_TERMS) {
-      return textResult(`Invalid search_tools request: query must contain at most ${MAX_QUERY_TERMS} searchable terms.`, true);
+    if (terms.length === 0) {
+      return textResult("Invalid search_tools request: query must contain searchable terms.", true);
     }
 
     const matches = this.boundary.catalog
       .map((tool) => matchTool(tool, query, terms))
       .filter((match): match is SearchMatch => match !== undefined)
-      .sort((left, right) => left.rank - right.rank || compareNames(left.name, right.name));
+      .sort((left, right) =>
+        left.tier - right.tier
+        || right.matchCount - left.matchCount
+        || compareNames(left.name, right.name)
+      );
     // Activate only the strongest match tier. Exact tool names outrank all
     // descriptive terms; otherwise tools matching the most name terms outrank
     // description-only matches. This keeps match-any discovery useful without
     // activating every tool that shares one generic word.
-    const preferred = matches.length === 0
+    const selected = matches.length === 0
       ? []
-      : matches.filter((match) => match.rank === matches[0]!.rank);
-    const selected = preferred.slice(0, MAX_MATCHES);
+      : matches.filter((match) =>
+        match.tier === matches[0]!.tier && match.matchCount === matches[0]!.matchCount
+      );
     if (selected.length === 0) {
       return textResult("No authorized tools matched. No tools were activated.", false, {
         activated: [],
@@ -223,17 +227,16 @@ export class DeferredToolManager {
     this.pi.setActiveTools([...this.desiredActiveNames]);
 
     const matchedNames = selected.map((match) => match.name);
-    const omitted = preferred.length - selected.length;
     const status = activated.length > 0
       ? `Activated: ${activated.join(", ")}. Call the required tool on the next turn; search_tools did not perform the operation.`
       : "All matched authorized tools were already active. search_tools did not perform the operation.";
     return textResult([
-      `Matched authorized tools: ${matchedNames.join(", ")}.${omitted > 0 ? ` ${omitted} additional match(es) omitted by the ${MAX_MATCHES}-result limit.` : ""}`,
+      `Matched authorized tools: ${matchedNames.join(", ")}.`,
       status,
     ].join("\n"), false, {
       activated,
       matched: matchedNames,
-      omitted,
+      omitted: 0,
     });
   }
 }
@@ -380,16 +383,16 @@ function matchTool(tool: ToolMetadata, query: string, terms: readonly string[]):
   const name = tool.name.toLocaleLowerCase("en-US");
   const description = tool.description.toLocaleLowerCase("en-US");
   const nameTerms = splitToolName(tool.name);
-  if (name === query || terms.includes(name)) return { ...tool, rank: 0 };
+  if (name === query || terms.includes(name)) return { ...tool, tier: 0, matchCount: 1 };
 
   const nameMatches = terms.filter((term) =>
     nameTerms.some((nameTerm) => nameTerm.includes(term))
   ).length;
-  if (nameMatches > 0) return { ...tool, rank: 100 - nameMatches };
+  if (nameMatches > 0) return { ...tool, tier: 1, matchCount: nameMatches };
 
   const descriptionMatches = terms.filter((term) => description.includes(term)).length;
   if (descriptionMatches === 0) return undefined;
-  return { ...tool, rank: 200 - descriptionMatches };
+  return { ...tool, tier: 2, matchCount: descriptionMatches };
 }
 
 function splitToolName(name: string): string[] {

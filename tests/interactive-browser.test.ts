@@ -28,7 +28,11 @@ function pngWithDimensions(width: number, height: number, bytes = ONE_PIXEL_PNG.
 class FakePage extends EventEmitter {
   private currentUrl = "about:blank";
   private closed = false;
+  private visited: string[] = [];
+  private visitedIndex = -1;
   readonly frame = {};
+  evaluateCalls = 0;
+  readonly visibleTextMatches = new Map<string, number>();
 
   mainFrame() { return this.frame; }
   url() { return this.currentUrl; }
@@ -37,24 +41,69 @@ class FakePage extends EventEmitter {
   viewportSize() { return { width: 1280, height: 720 }; }
   async ariaSnapshot() { return '- heading "Fixture" [level=1]\n- link "Next" [ref=e7]\n'; }
   async screenshot(_options?: Record<string, any>) { return ONE_PIXEL_PNG; }
+  async evaluate() { this.evaluateCalls += 1; }
+  async bringToFront() {}
+  getByText(text: string) {
+    return {
+      filter: ({ visible }: { visible: boolean }) => {
+        assert.equal(visible, true);
+        return {
+          first: () => ({
+            waitFor: async ({ state }: { state: string }) => {
+              const visibleCount = this.visibleTextMatches.has(text)
+                ? this.visibleTextMatches.get(text)!
+                : text === "Missing" ? 0 : 1;
+              if (state === "attached" && visibleCount === 0) throw new Error("no visible text match");
+              if (state === "hidden" && visibleCount > 0) throw new Error("visible text match remains");
+            },
+          }),
+        };
+      },
+    };
+  }
+  async waitForURL(predicate: (url: URL) => boolean) {
+    if (!predicate(new URL(this.currentUrl))) throw new Error("fixture URL condition not satisfied");
+  }
+  async waitForNavigation() {}
+  async waitForTimeout(durationMs: number) { await new Promise<void>((resolve) => setTimeout(resolve, durationMs)); }
   locator(selector: string) {
     assert.equal(selector, "aria-ref=e7", "only the Playwright ref retained from the semantic snapshot is used");
     return {
       scrollIntoViewIfNeeded: async () => undefined,
+      waitFor: async () => undefined,
+      evaluate: async () => undefined,
       boundingBox: async () => ({ x: 1, y: 2, width: 50, height: 20 }),
       screenshot: async () => { throw new Error("element screenshot must use a prevalidated page clip"); },
     };
   }
-  async goto(url: string) {
+  private commit(url: string, addHistory: boolean) {
     const request = {
       isNavigationRequest: () => true,
       frame: () => this.frame,
+      redirectedFrom: () => null,
     };
     this.emit("request", request);
     this.currentUrl = url;
+    if (addHistory) {
+      this.visited.splice(this.visitedIndex + 1);
+      this.visited.push(url);
+      this.visitedIndex = this.visited.length - 1;
+    }
     this.emit("framenavigated", this.frame);
     return { status: () => 200 };
   }
+  async goto(url: string) { return this.commit(url, true); }
+  async goBack() {
+    if (this.visitedIndex <= 0) return null;
+    this.visitedIndex -= 1;
+    return this.commit(this.visited[this.visitedIndex]!, false);
+  }
+  async goForward() {
+    if (this.visitedIndex >= this.visited.length - 1) return null;
+    this.visitedIndex += 1;
+    return this.commit(this.visited[this.visitedIndex]!, false);
+  }
+  async reload() { return this.commit(this.currentUrl, false); }
   async waitForLoadState() {}
   async close() {
     if (this.closed) return;
@@ -65,6 +114,10 @@ class FakePage extends EventEmitter {
 
 class FakeContext extends EventEmitter {
   readonly page = new FakePage();
+  readonly pages = [this.page];
+  private created = 0;
+  configureNextPage?: (page: FakePage) => void;
+  nextPageDelayMs = 0;
   closed = false;
   setDefaultTimeout() {}
   setDefaultNavigationTimeout() {}
@@ -72,12 +125,20 @@ class FakeContext extends EventEmitter {
   async routeWebSocket() {}
   async route() {}
   async newPage() {
-    this.emit("page", this.page);
-    return this.page as unknown as Page;
+    const delayMs = this.created > 0 ? this.nextPageDelayMs : 0;
+    this.nextPageDelayMs = 0;
+    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    const page = this.created++ === 0 ? this.page : new FakePage();
+    if (!this.pages.includes(page)) this.pages.push(page);
+    const configure = this.configureNextPage;
+    this.configureNextPage = undefined;
+    configure?.(page);
+    this.emit("page", page);
+    return page as unknown as Page;
   }
   async close() {
     this.closed = true;
-    await this.page.close();
+    await Promise.all(this.pages.map((page) => page.close()));
   }
 }
 
@@ -255,6 +316,317 @@ test("open, navigate, semantic snapshot, handle rejection, and idempotent close 
   assert.equal(manager.activeSessionCount(), 0);
 });
 
+test("BrowserScroll accepts only bounded page/ref operations and current scoped refs", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/scroll");
+  const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+
+  const page = await fixture.manager.scroll(opened.session, opened.tab, "page", "down", 2, undefined);
+  assert.equal(page.generation, snapshot.generation);
+  assert.equal(fixture.browser.context.page.evaluateCalls, 1);
+  const container = await fixture.manager.scroll(opened.session, opened.tab, "ref_container", "up", 1, ref);
+  assert.equal(container.ref, ref);
+  const positioned = await fixture.manager.scroll(opened.session, opened.tab, "ref", undefined, 1, ref);
+  assert.equal(positioned.target, "ref");
+
+  await assert.rejects(
+    fixture.manager.scroll(opened.session, opened.tab, "page", "down", 4, undefined),
+    /integer from 1-3/,
+  );
+  await assert.rejects(
+    fixture.manager.scroll(opened.session, "tab_forged", "ref", undefined, 1, ref),
+    /Invalid or stale browser session\/tab handle/,
+  );
+  await assert.rejects(
+    fixture.manager.scroll(opened.session, opened.tab, "ref", undefined, 1, `${ref}_forged`),
+    /fresh BrowserSnapshot/,
+  );
+  assert.equal(fixture.manager.activeSessionCount(), 0, "invalid semantic capabilities fail the session closed");
+});
+
+test("BrowserWait exposes only bounded observational conditions and cancellation tears down", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/wait");
+  const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+
+  for (const request of [
+    { condition: "ref", ref, state: "visible" },
+    { condition: "text", text: "Fixture", present: true },
+    { condition: "text", text: "Missing", present: false },
+    { condition: "url", url: "https://example.com/wait", match: "exact" },
+    { condition: "url", url: "https://example.com/", match: "prefix" },
+    { condition: "url", url: "^https://example\\.com/wait$", match: "pattern" },
+    { condition: "navigation", state: "commit" },
+    { condition: "load", state: "load" },
+    { condition: "network_quiet" },
+    { condition: "duration", durationMs: 1 },
+  ] as const) {
+    const result = await fixture.manager.wait(opened.session, opened.tab, request, 1_000);
+    assert.equal(result.satisfied, true);
+    assert.equal(result.condition, request.condition);
+  }
+  fixture.browser.context.page.visibleTextMatches.set("Repeated", 1); // one hidden match and a later visible match
+  assert.equal((await fixture.manager.wait(
+    opened.session,
+    opened.tab,
+    { condition: "text", text: "Repeated", present: true },
+    100,
+  )).satisfied, true);
+  await assert.rejects(
+    fixture.manager.wait(opened.session, opened.tab, { condition: "text", text: "Repeated", present: false }, 100),
+    /visible text match remains/,
+  );
+  fixture.browser.context.page.visibleTextMatches.set("Repeated", 0); // all repeated matches are now hidden
+  assert.equal((await fixture.manager.wait(
+    opened.session,
+    opened.tab,
+    { condition: "text", text: "Repeated", present: false },
+    100,
+  )).satisfied, true);
+
+  await assert.rejects(
+    fixture.manager.wait(opened.session, opened.tab, { condition: "url", url: "(?=unsafe)", match: "pattern" }, 100),
+    /invalid or unsupported by safe RE2/,
+  );
+  await assert.rejects(
+    fixture.manager.wait(opened.session, opened.tab, { condition: "text", text: "x".repeat(513), present: true }, 100),
+    /1-512 characters/,
+  );
+
+  const controller = new AbortController();
+  const waiting = fixture.manager.wait(opened.session, opened.tab, { condition: "duration", durationMs: 500 }, 1_000, controller.signal);
+  controller.abort(new Error("cancel wait fixture"));
+  await assert.rejects(waiting, /cancel wait fixture/);
+  assert.equal(fixture.manager.activeSessionCount(), 0);
+});
+
+test("BrowserHistory bounds entries and invalidates only the traversed tab generation", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/one");
+  await fixture.manager.navigate(opened.session, opened.tab, "https://example.com/two");
+  const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+
+  const listed = await fixture.manager.history(opened.session, opened.tab, "list", 1);
+  assert.equal(listed.entries.length, 1);
+  assert.equal(listed.truncated, true);
+  const backed = await fixture.manager.history(opened.session, opened.tab, "back", 32);
+  assert.equal(backed.url, "https://example.com/one");
+  assert.notEqual(backed.generation, snapshot.generation);
+  const reloaded = await fixture.manager.history(opened.session, opened.tab, "reload", 32);
+  assert.equal(reloaded.entries.length, 2, "reload replaces rather than appends the current history entry");
+  await assert.rejects(
+    fixture.manager.screenshot(opened.session, opened.tab, "element", ref),
+    /fresh BrowserSnapshot/,
+  );
+  assert.equal(fixture.manager.activeSessionCount(), 0);
+});
+
+test("BrowserTabs owns popups, enforces its cap, switches deterministically, and closes the last tab/session", async () => {
+  const browser = new FakeBrowser();
+  let serial = 0;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => browser as unknown as Browser,
+    randomHandle: (kind: string) => `${kind}_${++serial}_${"t".repeat(32)}`,
+    limits: { maxTabsPerSession: 2 },
+  });
+  const opened = await manager.open("https://example.com/primary");
+  const popup = await browser.context.newPage();
+  const listed = await manager.tabs(opened.session, "list");
+  assert.equal(listed.tabs.length, 2);
+  const popupHandle = listed.tabs.find((tab) => tab.tab !== opened.tab)?.tab;
+  assert.ok(popupHandle);
+
+  const refused = await browser.context.newPage() as unknown as FakePage;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(refused.isClosed(), true, "a popup over the cap is immediately contained");
+  await assert.rejects(manager.tabs(opened.session, "open", undefined, "https://example.com/third"), /tab limit/);
+
+  const switched = await manager.tabs(opened.session, "switch", popupHandle);
+  assert.equal(switched.activeTab, popupHandle);
+  const closedPopup = await manager.tabs(opened.session, "close", popupHandle);
+  assert.equal(closedPopup.activeTab, opened.tab);
+  assert.equal(closedPopup.sessionClosed, false);
+  assert.equal((popup as unknown as FakePage).isClosed(), true);
+  const closedLast = await manager.tabs(opened.session, "close", opened.tab);
+  assert.equal(closedLast.sessionClosed, true);
+  assert.equal(closedLast.activeTab, null);
+  assert.equal(manager.activeSessionCount(), 0);
+  assert.equal((await manager.close(opened.session)).alreadyClosed, true);
+});
+
+test("BrowserTabs contains rejected and hung excess-popup closes before retiring the session", async () => {
+  for (const mode of ["reject", "hang"] as const) {
+    const browser = new FakeBrowser();
+    const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+      resolveHostname: async () => ["93.184.216.34"],
+      launch: async () => browser as unknown as Browser,
+      limits: { maxTabsPerSession: 1, cleanupMs: 30 },
+    });
+    const opened = await manager.open("https://example.com/primary");
+    let refusedPage: FakePage | undefined;
+    browser.context.configureNextPage = (page) => {
+      refusedPage = page;
+      const closeNormally = page.close.bind(page);
+      let closeAttempts = 0;
+      page.close = async () => {
+        closeAttempts += 1;
+        if (closeAttempts === 1 && mode === "reject") throw new Error("fixture refused-popup close rejected");
+        if (closeAttempts === 1 && mode === "hang") return new Promise<void>(() => undefined);
+        await closeNormally();
+      };
+    };
+
+    await browser.context.newPage();
+    await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    assert.equal(manager.activeSessionCount(), 0, `${mode} containment failure must retire the session`);
+    assert.equal(refusedPage?.isClosed(), true);
+    assert.ok(browser.context.pages.every((page) => page.isClosed()));
+    assert.equal(browser.isConnected(), false);
+    assert.equal((await manager.close(opened.session)).alreadyClosed, true);
+  }
+});
+
+test("BrowserTabs contains a page that resolves after its creation deadline", async () => {
+  const browser = new FakeBrowser();
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => browser as unknown as Browser,
+    limits: { navigationMs: 20, cleanupMs: 100 },
+  });
+  const opened = await manager.open("https://example.com/primary");
+  browser.context.nextPageDelayMs = 60;
+
+  await assert.rejects(
+    manager.tabs(opened.session, "open", undefined, "https://example.com/late"),
+    /could not confirm whether a new page was created.*teardown started/i,
+  );
+  assert.equal(manager.activeSessionCount(), 0);
+  assert.equal(browser.context.pages.length, 2, "the fixture produced a page after the operation deadline");
+  assert.ok(browser.context.pages.every((page) => page.isClosed()), "every late page is contained before rejection returns");
+  assert.equal(browser.isConnected(), false);
+  assert.equal((await manager.close(opened.session)).alreadyClosed, true);
+});
+
+test("BrowserTabs failed open restores the prior active tab and confirms rollback closure", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/primary");
+  let failedPage: FakePage | undefined;
+  fixture.browser.context.configureNextPage = (page) => {
+    failedPage = page;
+    page.goto = async () => { throw new Error("fixture tab navigation failed"); };
+  };
+
+  await assert.rejects(
+    fixture.manager.tabs(opened.session, "open", undefined, "https://example.com/failure"),
+    /fixture tab navigation failed/,
+  );
+  assert.equal(failedPage?.isClosed(), true);
+  const listed = await fixture.manager.tabs(opened.session, "list");
+  assert.equal(listed.activeTab, opened.tab);
+  assert.deepEqual(listed.tabs.map((tab) => tab.tab), [opened.tab]);
+  await fixture.manager.close(opened.session);
+});
+
+test("BrowserTabs failed-open rollback close rejection tears down instead of orphaning the page", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/primary");
+  let failedPage: FakePage | undefined;
+  fixture.browser.context.configureNextPage = (page) => {
+    failedPage = page;
+    page.goto = async () => { throw new Error("fixture tab navigation failed"); };
+    const closeNormally = page.close.bind(page);
+    let closeAttempts = 0;
+    page.close = async () => {
+      closeAttempts += 1;
+      if (closeAttempts === 1) throw new Error("fixture rollback close rejected");
+      await closeNormally();
+    };
+  };
+
+  await assert.rejects(
+    fixture.manager.tabs(opened.session, "open", undefined, "https://example.com/failure"),
+    /rollback could not confirm closure.*teardown started/i,
+  );
+  assert.equal(failedPage?.isClosed(), true);
+  assert.equal(fixture.manager.activeSessionCount(), 0);
+  assert.equal(fixture.browser.isConnected(), false);
+  assert.equal((await fixture.manager.close(opened.session)).alreadyClosed, true);
+});
+
+test("BrowserTabs close rejection and delayed close fail into confirmed session teardown", async () => {
+  for (const mode of ["reject", "delay"] as const) {
+    const browser = new FakeBrowser();
+    let serial = 0;
+    const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+      resolveHostname: async () => ["93.184.216.34"],
+      launch: async () => browser as unknown as Browser,
+      randomHandle: (kind: string) => `${kind}_${++serial}_${"u".repeat(32)}`,
+      limits: { actionMs: 20, cleanupMs: 100 },
+    });
+    const opened = await manager.open("https://example.com/primary");
+    const added = await manager.tabs(opened.session, "open", undefined, "https://example.com/secondary");
+    const tabHandle = added.openedTab;
+    assert.ok(tabHandle);
+    const page = browser.context.pages[1]!;
+    const closeNormally = page.close.bind(page);
+    let attempts = 0;
+    page.close = async () => {
+      attempts += 1;
+      if (attempts === 1 && mode === "reject") throw new Error("fixture tab close rejected");
+      if (attempts === 1 && mode === "delay") {
+        await new Promise<void>((resolve) => setTimeout(resolve, 60));
+      }
+      await closeNormally();
+    };
+
+    await assert.rejects(
+      manager.tabs(opened.session, "close", tabHandle),
+      /could not confirm closure.*teardown started|20ms total deadline/i,
+    );
+    assert.equal(manager.activeSessionCount(), 0, `${mode} close must not leave a usable session`);
+    assert.equal(browser.isConnected(), false);
+    assert.equal((await manager.close(opened.session)).alreadyClosed, true);
+    if (mode === "delay") await new Promise<void>((resolve) => setTimeout(resolve, 70));
+    assert.equal(page.isClosed(), true);
+  }
+});
+
+test("BrowserHistory validates empty traversal harmlessly and tears down before a timed-out late commit", async () => {
+  const browser = new FakeBrowser();
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => browser as unknown as Browser,
+    limits: { navigationMs: 20, cleanupMs: 100 },
+  });
+  const opened = await manager.open("https://example.com/one");
+  await assert.rejects(manager.history(opened.session, opened.tab, "back", 16), /no bounded session-local entry/);
+  assert.equal(manager.activeSessionCount(), 1, "preflight history errors are harmless");
+  await manager.navigate(opened.session, opened.tab, "https://example.com/two");
+
+  const goBackNormally = browser.context.page.goBack.bind(browser.context.page);
+  browser.context.page.goBack = async () => {
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    return goBackNormally();
+  };
+  await assert.rejects(
+    manager.history(opened.session, opened.tab, "back", 16),
+    /20ms total deadline/,
+  );
+  assert.equal(manager.activeSessionCount(), 0, "an uncertain traversal is contained before rejection returns");
+  assert.equal(browser.context.page.isClosed(), true);
+  assert.equal(browser.isConnected(), false);
+  assert.equal((await manager.close(opened.session)).alreadyClosed, true);
+  await new Promise<void>((resolve) => setTimeout(resolve, 70));
+  assert.equal(manager.activeSessionCount(), 0, "a late fake commit cannot resurrect the torn-down session");
+});
+
 test("screenshot refs reject forged, stale, cross-session, and cross-tab use uniformly", async () => {
   const first = managerFixture();
   const firstOpened = await first.manager.open("https://example.com/first");
@@ -311,6 +683,8 @@ test("element screenshot fixes the validated clip before a resize race", async (
     assert.equal(selector, "aria-ref=e7");
     return {
       scrollIntoViewIfNeeded: async () => undefined,
+      waitFor: async () => undefined,
+      evaluate: async () => undefined,
       boundingBox: async () => {
         queueMicrotask(() => { elementWidth = 10_000; });
         return { x: 10.4, y: 20.2, width: elementWidth, height: 19.2 };

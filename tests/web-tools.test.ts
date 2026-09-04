@@ -476,13 +476,18 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   manager.register();
   assert.deepEqual([...tools.keys()], [
     "WebSearch", "WebFetch", "BrowserExtract",
-    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot", "BrowserClose",
+    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
+    "BrowserScroll", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ]);
   assert.deepEqual(Object.keys(tools.get("BrowserOpen").parameters.properties), ["url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserNavigate").parameters.properties), ["session", "tab", "url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserSnapshot").parameters.properties), ["session", "tab", "maxChars"]);
   assert.deepEqual(Object.keys(tools.get("BrowserScreenshot").parameters.properties), ["session", "tab", "mode", "ref"]);
   assert.deepEqual(tools.get("BrowserScreenshot").parameters.required, ["session", "tab", "mode"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserScroll").parameters.properties), ["session", "tab", "target", "direction", "amount", "ref"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserWait").parameters.properties), ["session", "tab", "condition", "ref", "state", "text", "present", "url", "match", "durationMs", "timeoutMs"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserHistory").parameters.properties), ["session", "tab", "operation", "maxEntries"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserTabs").parameters.properties), ["session", "operation", "tab", "url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserClose").parameters.properties), ["session"]);
   assert.match(tools.get("BrowserSnapshot").description, /no DOM script, selector, coordinate, or CDP/i);
   assert.match(tools.get("BrowserScreenshot").description, /Pi image content.*not a file path or textual encoding/i);

@@ -33,6 +33,11 @@ export interface InteractiveBrowserLimits {
   maxNavigations: number;
   maxActions: number;
   maxMainDocumentRequests: number;
+  maxHistoryEntries: number;
+  maxScrollPages: number;
+  maxWaitTextChars: number;
+  maxWaitPatternChars: number;
+  maxWaitMs: number;
   maxSnapshotChars: number;
   maxSnapshotDepth: number;
   maxScreenshotWidth: number;
@@ -54,10 +59,15 @@ export interface InteractiveBrowserLimits {
 
 export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Object.freeze({
   maxSessions: 4,
-  maxTabsPerSession: 1,
+  maxTabsPerSession: 4,
   maxNavigations: 12,
   maxActions: 64,
   maxMainDocumentRequests: 32,
+  maxHistoryEntries: 32,
+  maxScrollPages: 3,
+  maxWaitTextChars: 512,
+  maxWaitPatternChars: 512,
+  maxWaitMs: 10_000,
   maxSnapshotChars: 24_000,
   maxSnapshotDepth: 16,
   maxScreenshotWidth: 2_000,
@@ -141,6 +151,65 @@ export interface BrowserScreenshotResult {
   metadata: BrowserScreenshotMetadata;
 }
 
+export type BrowserScrollTarget = "page" | "ref_container" | "ref";
+export type BrowserScrollDirection = "up" | "down";
+
+export interface BrowserScrollResult {
+  session: string;
+  tab: string;
+  generation: string;
+  target: BrowserScrollTarget;
+  direction?: BrowserScrollDirection;
+  amount: number;
+  ref?: string;
+  url: string;
+}
+
+export type BrowserWaitRequest =
+  | { condition: "ref"; ref: string; state: "attached" | "detached" | "visible" | "hidden" }
+  | { condition: "text"; text: string; present: boolean }
+  | { condition: "url"; url: string; match: "exact" | "prefix" | "pattern" }
+  | { condition: "navigation"; state: "commit" | "domcontentloaded" | "load" }
+  | { condition: "load"; state: "domcontentloaded" | "load" }
+  | { condition: "network_quiet" }
+  | { condition: "duration"; durationMs: number };
+
+export interface BrowserWaitResult {
+  session: string;
+  tab: string;
+  generation: string;
+  condition: BrowserWaitRequest["condition"];
+  satisfied: true;
+  elapsedMs: number;
+  url: string;
+}
+
+export type BrowserHistoryOperation = "list" | "back" | "forward" | "reload";
+export interface BrowserHistoryResult {
+  session: string;
+  tab: string;
+  generation: string;
+  operation: BrowserHistoryOperation;
+  url: string;
+  title: string;
+  entries: Array<{ index: number; url: string; generation: string; current: boolean }>;
+  truncated: boolean;
+  navigationsRemaining: number;
+}
+
+export type BrowserTabsOperation = "list" | "open" | "switch" | "close";
+export interface BrowserTabsResult {
+  session: string;
+  operation: BrowserTabsOperation;
+  activeTab: string | null;
+  tabs: Array<{ tab: string; generation: string; url: string; active: boolean }>;
+  openedTab?: string;
+  closedTab?: string;
+  sessionClosed: boolean;
+  tabsRemaining: number;
+  maxTabs: number;
+}
+
 export interface BrowserCloseResult {
   session: string;
   closed: true;
@@ -166,23 +235,35 @@ interface OpeningOperation {
   teardownFailure?: Error;
 }
 
+interface BrowserTab {
+  handle: string;
+  generation: string;
+  page: Page;
+  semanticRefs: Map<string, { generation: string; playwrightRef: string }>;
+  history: Array<{ url: string; identityUrl: string; generation: string }>;
+  historyIndex: number;
+  pendingHistoryIndex?: number;
+  lastCommittedUrl: string;
+  documentRequestPending: boolean;
+  closing: boolean;
+}
+
 interface Session {
   handle: string;
-  tab: string;
-  generation: string;
+  activeTab: string;
+  tabs: Map<string, BrowserTab>;
+  pendingPageClosures: Map<Page, Promise<void>>;
+  pendingPageCreations: Set<Promise<void>>;
   browser: Browser;
   context: BrowserContext;
-  page: Page;
   broker: EgressBroker;
   createdAt: number;
   lastUsedAt: number;
   navigations: number;
   actions: number;
   mainDocumentRequests: number;
-  operationRedirects: number;
   operationActive: boolean;
   fatalError?: Error;
-  semanticRefs: Map<string, { generation: string; playwrightRef: string }>;
   teardown?: Promise<BrowserCloseResult>;
   expiryTimer?: NodeJS.Timeout;
   idleTimer?: NodeJS.Timeout;
@@ -219,7 +300,16 @@ export class InteractiveBrowserManager {
     this.launch = dependencies.launch ?? chromium.launch.bind(chromium);
     this.now = dependencies.now ?? Date.now;
     this.randomHandle = dependencies.randomHandle ?? ((kind) => `browser_${kind}_${randomBytes(24).toString("base64url")}`);
-    this.limits = Object.freeze({ ...INTERACTIVE_BROWSER_LIMITS, ...(dependencies.limits ?? {}) });
+    const requestedLimits = { ...INTERACTIVE_BROWSER_LIMITS, ...(dependencies.limits ?? {}) };
+    this.limits = Object.freeze({
+      ...requestedLimits,
+      maxTabsPerSession: clampedTestLimit(requestedLimits.maxTabsPerSession, INTERACTIVE_BROWSER_LIMITS.maxTabsPerSession),
+      maxHistoryEntries: clampedTestLimit(requestedLimits.maxHistoryEntries, INTERACTIVE_BROWSER_LIMITS.maxHistoryEntries),
+      maxScrollPages: clampedTestLimit(requestedLimits.maxScrollPages, INTERACTIVE_BROWSER_LIMITS.maxScrollPages),
+      maxWaitTextChars: clampedTestLimit(requestedLimits.maxWaitTextChars, INTERACTIVE_BROWSER_LIMITS.maxWaitTextChars),
+      maxWaitPatternChars: clampedTestLimit(requestedLimits.maxWaitPatternChars, INTERACTIVE_BROWSER_LIMITS.maxWaitPatternChars),
+      maxWaitMs: clampedTestLimit(requestedLimits.maxWaitMs, INTERACTIVE_BROWSER_LIMITS.maxWaitMs),
+    });
   }
 
   updateConfig(config: WebFetchConfig): void {
@@ -296,38 +386,48 @@ export class InteractiveBrowserManager {
       await operation.run(context.clearPermissions(), "permission denial");
       await operation.run(installRoutePolicy(context, broker), "network route policy installation");
 
-      let creatingPrimary = true;
       const page = await operation.run(context.newPage(), "browser tab creation");
-      creatingPrimary = false;
+      const primaryTab: BrowserTab = {
+        handle: this.uniqueHandle("tab"),
+        generation: this.uniqueHandle("generation"),
+        page,
+        semanticRefs: new Map(),
+        history: [],
+        historyIndex: -1,
+        lastCommittedUrl: page.url(),
+        documentRequestPending: false,
+        closing: false,
+      };
       const session: Session = {
         handle: this.uniqueHandle("session"),
-        tab: this.uniqueHandle("tab"),
-        generation: this.uniqueHandle("generation"),
+        activeTab: primaryTab.handle,
+        tabs: new Map([[primaryTab.handle, primaryTab]]),
+        pendingPageClosures: new Map(),
+        pendingPageCreations: new Set(),
         browser,
         context,
-        page,
         broker,
         createdAt: this.now(),
         lastUsedAt: this.now(),
         navigations: 0,
         actions: 0,
         mainDocumentRequests: 0,
-        operationRedirects: 0,
         operationActive: true,
-        semanticRefs: new Map(),
       };
       pendingFatal = (error) => this.failSession(session, error);
-      context.on("page", (candidate) => {
-        if (creatingPrimary || candidate === session.page) return;
-        broker?.note(`additional tab refused at the ${this.limits.maxTabsPerSession}-tab session limit.`);
-        void candidate.close().catch(() => undefined);
+      this.installPageGuards(session, primaryTab);
+      browser.on("disconnected", () => {
+        if (!session.teardown) this.failSession(session, new Error("Browser process disconnected unexpectedly; teardown started."));
       });
-      this.installPageGuards(session);
+      context.on("page", (candidate) => {
+        if (this.tabForPage(session, candidate)) return;
+        this.adoptPopup(session, candidate);
+      });
       this.sessions.set(session.handle, session);
       resourcesTransferredToSession = true;
       this.armTimers(session);
       try {
-        const navigation = await this.navigateSession(session, requested.href, operation, true);
+        const navigation = await this.navigateSession(session, primaryTab, requested.href, operation, true);
         session.operationActive = false;
         this.touch(session);
         return { ...navigation, limits: this.limits };
@@ -378,11 +478,11 @@ export class InteractiveBrowserManager {
   }
 
   async navigate(sessionHandle: string, tabHandle: string, url: string, signal?: AbortSignal): Promise<BrowserNavigateResult> {
-    const session = this.requireSession(sessionHandle, tabHandle);
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
     return this.operate(session, signal, async () => {
       const operation = new OperationDeadline("BrowserNavigate", this.limits.navigationMs, signal);
       try {
-        return await this.navigateSession(session, url, operation, false);
+        return await this.navigateSession(session, tab, url, operation, false);
       } finally {
         operation.dispose();
       }
@@ -390,13 +490,13 @@ export class InteractiveBrowserManager {
   }
 
   async snapshot(sessionHandle: string, tabHandle: string, maxChars: number, signal?: AbortSignal): Promise<BrowserSnapshotResult> {
-    const session = this.requireSession(sessionHandle, tabHandle);
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
     return this.operate(session, signal, async () => {
       const operation = new OperationDeadline("BrowserSnapshot", this.limits.actionMs, signal);
       try {
-        const capturedGeneration = session.generation;
+        const capturedGeneration = tab.generation;
         const limit = Math.min(Math.max(1_000, maxChars), this.limits.maxSnapshotChars);
-        const raw = await operation.run(session.page.ariaSnapshot({
+        const raw = await operation.run(tab.page.ariaSnapshot({
           mode: "ai",
           depth: this.limits.maxSnapshotDepth,
           boxes: false,
@@ -419,24 +519,24 @@ export class InteractiveBrowserManager {
           return replacement;
         });
         const snapshot = semantic.slice(0, limit);
-        const snapshotUrl = publicPageUrl(session.page.url());
-        const title = bounded(await operation.run(session.page.title(), "browser title read"), 500);
-        if (session.generation !== capturedGeneration) {
+        const snapshotUrl = publicPageUrl(tab.page.url());
+        const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+        if (tab.generation !== capturedGeneration) {
           throw new Error("Browser document changed during semantic snapshot capture; snapshot rejected.");
         }
         // Only refs wholly present in the returned, bounded snapshot remain
         // current. A new snapshot replaces this map rather than accumulating
         // page-controlled references for the session lifetime.
-        session.semanticRefs.clear();
-        for (const [opaqueRef, ref] of capturedRefs) session.semanticRefs.set(opaqueRef, ref);
+        tab.semanticRefs.clear();
+        for (const [opaqueRef, ref] of capturedRefs) tab.semanticRefs.set(opaqueRef, ref);
         return {
           session: session.handle,
-          tab: session.tab,
+          tab: tab.handle,
           generation: capturedGeneration,
           url: snapshotUrl,
           title,
           snapshot,
-          refs: session.semanticRefs.size,
+          refs: tab.semanticRefs.size,
           truncation: {
             truncated: semantic.length > snapshot.length,
             originalChars: semantic.length,
@@ -460,18 +560,18 @@ export class InteractiveBrowserManager {
     if (mode !== "viewport" && mode !== "element") {
       throw new Error("BrowserScreenshot mode must be viewport or element.");
     }
-    const session = this.requireSession(sessionHandle, tabHandle);
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
     return this.operate(session, signal, async () => {
       const operation = new OperationDeadline("BrowserScreenshot", this.limits.actionMs, signal);
       try {
-        const capturedGeneration = session.generation;
+        const capturedGeneration = tab.generation;
         let image: Buffer;
         if (mode === "viewport") {
           if (ref !== undefined) throw new Error("BrowserScreenshot viewport mode does not accept ref.");
-          const viewport = session.page.viewportSize();
+          const viewport = tab.page.viewportSize();
           if (!viewport) throw new Error("BrowserScreenshot could not determine the bounded browser viewport.");
           assertScreenshotDimensions(viewport.width, viewport.height, this.limits, "viewport");
-          image = await operation.run(session.page.screenshot({
+          image = await operation.run(tab.page.screenshot({
             type: "png",
             fullPage: false,
             animations: "disabled",
@@ -481,16 +581,16 @@ export class InteractiveBrowserManager {
           }), "viewport screenshot acquisition");
         } else {
           if (!ref) throw new Error("BrowserScreenshot element mode requires a current ref from BrowserSnapshot.");
-          const semanticRef = session.semanticRefs.get(ref);
+          const semanticRef = tab.semanticRefs.get(ref);
           if (!semanticRef || semanticRef.generation !== capturedGeneration) throw invalidRefError();
-          const locator = session.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
+          const locator = tab.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
           await operation.run(locator.scrollIntoViewIfNeeded({
             timeout: operation.remainingMs(),
             signal: operation.signal,
           }), "element positioning");
           const box = await operation.run(locator.boundingBox({ timeout: operation.remainingMs() }), "element bounds acquisition");
           if (!box) throw new Error("BrowserScreenshot element is not currently visible; take a fresh BrowserSnapshot and retry.");
-          const viewport = session.page.viewportSize();
+          const viewport = tab.page.viewportSize();
           if (!viewport) throw new Error("BrowserScreenshot could not determine the bounded browser viewport.");
           const clip = boundedElementClip(box, viewport, this.limits);
           // Capture an immutable, already-validated clip rather than asking
@@ -500,7 +600,7 @@ export class InteractiveBrowserManager {
           // beyond these fixed dimensions. Leaving animations enabled also
           // avoids Playwright fast-forwarding a finite animation after the
           // preflight and changing the element's size.
-          image = await operation.run(session.page.screenshot({
+          image = await operation.run(tab.page.screenshot({
             type: "png",
             fullPage: false,
             clip,
@@ -513,16 +613,16 @@ export class InteractiveBrowserManager {
 
         throwIfAborted(operation.signal);
         const dimensions = validatePngScreenshot(image, this.limits);
-        const snapshotUrl = publicPageUrl(session.page.url());
-        const title = bounded(await operation.run(session.page.title(), "browser title read"), 500);
-        if (session.generation !== capturedGeneration) {
+        const snapshotUrl = publicPageUrl(tab.page.url());
+        const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+        if (tab.generation !== capturedGeneration) {
           throw new Error("Browser document changed during screenshot capture; screenshot rejected.");
         }
         return {
           image,
           metadata: {
             session: session.handle,
-            tab: session.tab,
+            tab: tab.handle,
             generation: capturedGeneration,
             url: snapshotUrl,
             title,
@@ -545,6 +645,367 @@ export class InteractiveBrowserManager {
         operation.dispose();
       }
     }, true);
+  }
+
+  async scroll(
+    sessionHandle: string,
+    tabHandle: string,
+    target: BrowserScrollTarget,
+    direction: BrowserScrollDirection | undefined,
+    amount: number,
+    ref: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<BrowserScrollResult> {
+    if (target !== "page" && target !== "ref_container" && target !== "ref") {
+      throw new Error("BrowserScroll target must be page, ref_container, or ref.");
+    }
+    if (!Number.isInteger(amount) || amount < 1 || amount > this.limits.maxScrollPages) {
+      throw new Error(`BrowserScroll amount must be an integer from 1-${this.limits.maxScrollPages}.`);
+    }
+    if (target === "ref") {
+      if (!ref || direction !== undefined || amount !== 1) {
+        throw new Error("BrowserScroll ref target requires only a current ref (amount must be 1 and direction omitted).");
+      }
+    } else if (direction !== "up" && direction !== "down") {
+      throw new Error("BrowserScroll page and ref_container targets require direction up or down.");
+    }
+    if (target === "page" && ref !== undefined) throw new Error("BrowserScroll page target does not accept ref.");
+    if (target === "ref_container" && !ref) throw new Error("BrowserScroll ref_container target requires a current ref.");
+
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
+    return this.operate(session, signal, async () => {
+      const operation = new OperationDeadline("BrowserScroll", this.limits.actionMs, signal);
+      try {
+        const generation = tab.generation;
+        if (target === "ref") {
+          const locator = this.currentRefLocator(tab, ref!);
+          await operation.run(locator.scrollIntoViewIfNeeded({ timeout: operation.remainingMs(), signal: operation.signal }), "semantic ref positioning");
+        } else {
+          const viewport = tab.page.viewportSize();
+          if (!viewport) throw new Error("BrowserScroll could not determine the bounded browser viewport.");
+          const delta = Math.max(1, Math.floor(viewport.height * 0.8)) * amount * (direction === "up" ? -1 : 1);
+          if (target === "page") {
+            await operation.run(tab.page.evaluate((dy) => {
+              globalThis.scrollBy({ top: dy, left: 0, behavior: "instant" });
+            }, delta), "bounded page scroll");
+          } else {
+            const locator = this.currentRefLocator(tab, ref!);
+            await operation.run(locator.evaluate((element, dy) => {
+              let candidate: Element | null = element;
+              while (candidate) {
+                const style = globalThis.getComputedStyle(candidate);
+                if (/(auto|scroll)/.test(style.overflowY) && candidate.scrollHeight > candidate.clientHeight) {
+                  candidate.scrollBy({ top: dy, left: 0, behavior: "instant" });
+                  return;
+                }
+                candidate = candidate.parentElement;
+              }
+              throw new Error("Current semantic ref has no scrollable container.");
+            }, delta), "bounded ref-container scroll");
+          }
+        }
+        throwIfAborted(operation.signal);
+        if (tab.generation !== generation) throw new Error("Browser document changed during scroll; result rejected.");
+        return {
+          session: session.handle,
+          tab: tab.handle,
+          generation,
+          target,
+          ...(direction ? { direction } : {}),
+          amount,
+          ...(ref ? { ref } : {}),
+          url: publicPageUrl(tab.page.url()),
+        };
+      } finally {
+        operation.dispose();
+      }
+    }, true);
+  }
+
+  async wait(
+    sessionHandle: string,
+    tabHandle: string,
+    request: BrowserWaitRequest,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<BrowserWaitResult> {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > this.limits.maxWaitMs) {
+      throw new Error(`BrowserWait timeoutMs must be an integer from 1-${this.limits.maxWaitMs}.`);
+    }
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
+    return this.operate(session, signal, async () => {
+      const operation = new OperationDeadline("BrowserWait", timeoutMs, signal);
+      const started = this.now();
+      const generation = tab.generation;
+      try {
+        switch (request.condition) {
+          case "ref": {
+            if (!request.ref || !["attached", "detached", "visible", "hidden"].includes(request.state)) {
+              throw new Error("BrowserWait ref condition requires a current ref and an allowlisted state.");
+            }
+            await operation.run(this.currentRefLocator(tab, request.ref).waitFor({
+              state: request.state,
+              timeout: operation.remainingMs(),
+            }), "semantic ref state wait");
+            break;
+          }
+          case "text": {
+            if (!request.text || request.text.length > this.limits.maxWaitTextChars) {
+              throw new Error(`BrowserWait text must contain 1-${this.limits.maxWaitTextChars} characters.`);
+            }
+            const visibleMatches = tab.page.getByText(request.text, { exact: false }).filter({ visible: true });
+            await operation.run(visibleMatches.first().waitFor({
+              // Presence means at least one visible literal-text match;
+              // absence means no visible match anywhere in the locator set.
+              state: request.present ? "attached" : "hidden",
+              timeout: operation.remainingMs(),
+            }), "bounded text wait");
+            break;
+          }
+          case "url": {
+            if (!request.url || request.url.length > this.limits.maxWaitPatternChars) {
+              throw new Error(`BrowserWait URL value must contain 1-${this.limits.maxWaitPatternChars} characters.`);
+            }
+            const matches = urlWaitMatcher(request.match, request.url);
+            await operation.run(tab.page.waitForURL((url) => matches(url.href), {
+              timeout: operation.remainingMs(),
+              waitUntil: "commit",
+            }), "URL wait");
+            break;
+          }
+          case "navigation":
+            if (request.state !== "commit" && request.state !== "domcontentloaded" && request.state !== "load") {
+              throw new Error("BrowserWait navigation state must be commit, domcontentloaded, or load.");
+            }
+            await operation.run(tab.page.waitForNavigation({
+              waitUntil: request.state,
+              timeout: operation.remainingMs(),
+            }), "navigation completion wait");
+            break;
+          case "load":
+            if (request.state !== "domcontentloaded" && request.state !== "load") {
+              throw new Error("BrowserWait load state must be domcontentloaded or load.");
+            }
+            await operation.run(tab.page.waitForLoadState(request.state, { timeout: operation.remainingMs() }), "load completion wait");
+            break;
+          case "network_quiet":
+            await operation.run(tab.page.waitForLoadState("networkidle", { timeout: operation.remainingMs() }), "bounded network quiet wait");
+            break;
+          case "duration":
+            if (!Number.isInteger(request.durationMs) || request.durationMs < 1 || request.durationMs > Math.min(2_000, timeoutMs)) {
+              throw new Error(`BrowserWait durationMs must be an integer from 1-${Math.min(2_000, timeoutMs)}.`);
+            }
+            await operation.run(tab.page.waitForTimeout(request.durationMs), "short duration wait");
+            break;
+          default:
+            throw new Error("BrowserWait condition is not allowlisted.");
+        }
+        throwIfAborted(operation.signal);
+        if (tab.generation !== generation && request.condition !== "url" && request.condition !== "navigation" && request.condition !== "load" && request.condition !== "network_quiet") {
+          throw new Error("Browser document changed while waiting; condition result rejected.");
+        }
+        return {
+          session: session.handle,
+          tab: tab.handle,
+          generation: tab.generation,
+          condition: request.condition,
+          satisfied: true,
+          elapsedMs: Math.max(0, this.now() - started),
+          url: publicPageUrl(tab.page.url()),
+        };
+      } finally {
+        operation.dispose();
+      }
+    });
+  }
+
+  async history(
+    sessionHandle: string,
+    tabHandle: string,
+    operationName: BrowserHistoryOperation,
+    maxEntries: number,
+    signal?: AbortSignal,
+  ): Promise<BrowserHistoryResult> {
+    if (!["list", "back", "forward", "reload"].includes(operationName)) throw new Error("BrowserHistory operation is not allowlisted.");
+    if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > this.limits.maxHistoryEntries) {
+      throw new Error(`BrowserHistory maxEntries must be an integer from 1-${this.limits.maxHistoryEntries}.`);
+    }
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
+    const traversalTarget = operationName === "back"
+      ? tab.historyIndex - 1
+      : operationName === "forward" ? tab.historyIndex + 1 : undefined;
+    if (traversalTarget !== undefined && (traversalTarget < 0 || traversalTarget >= tab.history.length)) {
+      throw new Error(`BrowserHistory cannot go ${operationName}; no bounded session-local entry exists.`);
+    }
+    return this.operate(session, signal, async () => {
+      const deadlineMs = operationName === "list" ? this.limits.actionMs : this.limits.navigationMs;
+      const operation = new OperationDeadline("BrowserHistory", deadlineMs, signal);
+      try {
+        if (operationName !== "list") {
+          this.consumeNavigation(session);
+          const beforeUrl = tab.page.url();
+          let response: Response | null;
+          if (operationName === "reload") {
+            tab.pendingHistoryIndex = tab.historyIndex;
+            try {
+              response = await operation.run(tab.page.reload({ waitUntil: "domcontentloaded", timeout: operation.remainingMs() }), "history reload");
+            } finally {
+              tab.pendingHistoryIndex = undefined;
+            }
+          } else {
+            const target = traversalTarget!;
+            tab.pendingHistoryIndex = target;
+            try {
+              response = await operation.run(
+                operationName === "back"
+                  ? tab.page.goBack({ waitUntil: "domcontentloaded", timeout: operation.remainingMs() })
+                  : tab.page.goForward({ waitUntil: "domcontentloaded", timeout: operation.remainingMs() }),
+                `history ${operationName}`,
+              );
+            } finally {
+              tab.pendingHistoryIndex = undefined;
+            }
+            if (!response && tab.page.url() === beforeUrl) throw new Error(`BrowserHistory cannot go ${operationName}; browser did not change entries.`);
+            tab.historyIndex = target;
+            tab.history[target] = {
+              url: publicPageUrl(tab.page.url()),
+              identityUrl: bounded(tab.page.url(), 4_096),
+              generation: tab.generation,
+            };
+          }
+          if (operationName === "reload" && !response) throw new Error("BrowserHistory reload returned no HTTP response.");
+          if (session.fatalError) throw session.fatalError;
+        }
+        const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+        return this.historyResult(session, tab, operationName, maxEntries, title);
+      } finally {
+        operation.dispose();
+      }
+    }, operationName !== "list");
+  }
+
+  async tabs(
+    sessionHandle: string,
+    operationName: BrowserTabsOperation,
+    tabHandle?: string,
+    url?: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserTabsResult> {
+    if (!["list", "open", "switch", "close"].includes(operationName)) throw new Error("BrowserTabs operation is not allowlisted.");
+    const session = this.requireOwnedSession(sessionHandle);
+    return this.operate(session, signal, async () => {
+      const operation = new OperationDeadline("BrowserTabs", operationName === "open" ? this.limits.navigationMs : this.limits.actionMs, signal);
+      let openedTab: string | undefined;
+      let closedTab: string | undefined;
+      try {
+        if (operationName === "list") {
+          if (tabHandle !== undefined || url !== undefined) throw new Error("BrowserTabs list does not accept tab or url.");
+        } else if (operationName === "open") {
+          if (tabHandle !== undefined || !url) throw new Error("BrowserTabs open requires url and does not accept tab.");
+          if (session.tabs.size >= this.limits.maxTabsPerSession) throw new Error(`Browser tab limit (${this.limits.maxTabsPerSession}) reached.`);
+          const requested = await operation.run(validatePublicUrl(url, this.resolveHostname), "URL validation");
+          const creation = session.context.newPage();
+          let page: Page;
+          try {
+            page = await operation.run(creation, "browser tab creation");
+          } catch (error) {
+            this.trackLatePageCreation(session, creation, "late BrowserTabs page creation");
+            return this.failUncertainTabClosure(
+              session,
+              "BrowserTabs open could not confirm whether a new page was created",
+              asError(error),
+            );
+          }
+          const tab = this.tabForPage(session, page) ?? this.adoptPage(session, page, false);
+          if (!tab) {
+            await this.containRefusedPage(session, page, "refused BrowserTabs page");
+            throw new Error("Browser tab could not be owned within the session tab limit.");
+          }
+          const previousActiveTab = session.activeTab;
+          openedTab = tab.handle;
+          try {
+            await this.navigateSession(session, tab, requested.href, operation, false);
+            session.activeTab = tab.handle;
+          } catch (error) {
+            tab.closing = true;
+            let rollbackFailure: Error | undefined;
+            try {
+              await boundedCleanup(
+                page.close({ runBeforeUnload: false }),
+                this.limits.cleanupMs,
+                "failed browser tab open rollback",
+              );
+            } catch (closeError) {
+              rollbackFailure = asError(closeError);
+            }
+            if (!page.isClosed()) {
+              return this.failUncertainTabClosure(
+                session,
+                "BrowserTabs open failed and rollback could not confirm closure of the new tab",
+                rollbackFailure ? new AggregateError([error, rollbackFailure]) : asError(error),
+              );
+            }
+            session.tabs.delete(tab.handle);
+            if (session.tabs.has(previousActiveTab)) session.activeTab = previousActiveTab;
+            else if (session.tabs.size > 0) session.activeTab = session.tabs.keys().next().value!;
+            else return this.failUncertainTabClosure(session, "BrowserTabs open rollback left no owned tab", asError(error));
+            throw error;
+          }
+        } else {
+          if (!tabHandle || url !== undefined) throw new Error(`BrowserTabs ${operationName} requires tab and does not accept url.`);
+          const tab = session.tabs.get(tabHandle);
+          if (!tab) throw invalidHandleError();
+          if (operationName === "switch") {
+            await operation.run(tab.page.bringToFront(), "tab switch");
+            session.activeTab = tab.handle;
+          } else {
+            closedTab = tab.handle;
+            tab.closing = true;
+            let closeFailure: Error | undefined;
+            try {
+              await operation.run(tab.page.close({ runBeforeUnload: false }), "tab close");
+            } catch (error) {
+              closeFailure = asError(error);
+            }
+            if (!tab.page.isClosed()) {
+              return this.failUncertainTabClosure(
+                session,
+                "BrowserTabs close could not confirm closure of the selected tab",
+                closeFailure ?? new Error("Playwright returned without closing the selected tab."),
+              );
+            }
+            session.tabs.delete(tab.handle);
+            if (session.tabs.size === 0) {
+              await this.beginTeardown(session);
+              return {
+                session: session.handle,
+                operation: operationName,
+                activeTab: null,
+                tabs: [],
+                closedTab,
+                sessionClosed: true,
+                tabsRemaining: 0,
+                maxTabs: this.limits.maxTabsPerSession,
+              };
+            }
+            if (session.activeTab === tab.handle) session.activeTab = session.tabs.keys().next().value!;
+          }
+        }
+        return {
+          session: session.handle,
+          operation: operationName,
+          activeTab: session.activeTab,
+          tabs: this.tabInventory(session),
+          ...(openedTab ? { openedTab } : {}),
+          ...(closedTab ? { closedTab } : {}),
+          sessionClosed: false,
+          tabsRemaining: session.tabs.size,
+          maxTabs: this.limits.maxTabsPerSession,
+        };
+      } finally {
+        operation.dispose();
+      }
+    });
   }
 
   async close(sessionHandle: string): Promise<BrowserCloseResult> {
@@ -601,40 +1062,32 @@ export class InteractiveBrowserManager {
     return this.sessions.size;
   }
 
-  private async navigateSession(session: Session, rawUrl: string, operation: OperationDeadline, initial: boolean): Promise<BrowserNavigateResult> {
-    if (!initial && session.navigations >= this.limits.maxNavigations) {
-      throw new Error(`Browser navigation limit (${this.limits.maxNavigations}) exhausted.`);
-    }
+  private async navigateSession(session: Session, tab: BrowserTab, rawUrl: string, operation: OperationDeadline, initial: boolean): Promise<BrowserNavigateResult> {
+    if (!initial) this.consumeNavigation(session);
+    else session.navigations += 1;
     const requested = await operation.run(validatePublicUrl(rawUrl, this.resolveHostname), "URL validation");
-    session.navigations += 1;
-    session.operationRedirects = 0;
-    // Invalidate every prior semantic reference before navigation starts,
-    // including failed navigation attempts that may replace the document.
-    session.generation = this.uniqueHandle("generation");
-    session.semanticRefs.clear();
     let response: Response | null;
     try {
       response = await operation.run(
-        session.page.goto(requested.href, { waitUntil: "domcontentloaded", timeout: operation.remainingMs() }),
+        tab.page.goto(requested.href, { waitUntil: "domcontentloaded", timeout: operation.remainingMs() }),
         "main-document navigation",
       );
     } catch (error) {
       throw session.fatalError ?? asError(error);
     }
     if (!response) throw new Error("Browser navigation returned no HTTP response.");
-    const finalUrl = publicPageUrl(session.page.url());
-    // Wait briefly for ordinary rendering, but never require a page to become
-    // network-idle (streaming public pages are still inspectable).
+    const finalUrl = publicPageUrl(tab.page.url());
     await operation.run(
-      session.page.waitForLoadState("networkidle", { timeout: Math.min(2_000, operation.remainingMs()) }).catch(() => undefined),
+      tab.page.waitForLoadState("networkidle", { timeout: Math.min(2_000, operation.remainingMs()) }).catch(() => undefined),
       "browser rendering settle",
     );
     if (session.fatalError) throw session.fatalError;
-    const title = bounded(await operation.run(session.page.title(), "browser title read"), 500);
+    this.recordHistory(tab, finalUrl);
+    const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
     return {
       session: session.handle,
-      tab: session.tab,
-      generation: session.generation,
+      tab: tab.handle,
+      generation: tab.generation,
       url: finalUrl,
       title,
       status: response.status(),
@@ -642,31 +1095,64 @@ export class InteractiveBrowserManager {
     };
   }
 
-  private installPageGuards(session: Session): void {
-    session.page.on("request", (request: Request) => {
-      if (!request.isNavigationRequest() || request.frame() !== session.page.mainFrame()) return;
+  private installPageGuards(session: Session, tab: BrowserTab): void {
+    tab.page.on("request", (request: Request) => {
+      if (!request.isNavigationRequest() || request.frame() !== tab.page.mainFrame()) return;
       session.mainDocumentRequests += 1;
-      session.operationRedirects += 1;
-      if (session.operationRedirects > MAX_MAIN_DOCUMENT_REDIRECTS + 1) {
+      tab.generation = this.uniqueHandle("generation");
+      tab.semanticRefs.clear();
+      tab.documentRequestPending = true;
+      let redirectHops = 0;
+      let redirected = request.redirectedFrom();
+      while (redirected && redirectHops <= MAX_MAIN_DOCUMENT_REDIRECTS) {
+        redirectHops += 1;
+        redirected = redirected.redirectedFrom();
+      }
+      if (redirectHops > MAX_MAIN_DOCUMENT_REDIRECTS) {
         this.failSession(session, new Error(`Browser navigation exceeded ${MAX_MAIN_DOCUMENT_REDIRECTS} redirect hops.`));
       }
       if (session.mainDocumentRequests > this.limits.maxMainDocumentRequests) {
         this.failSession(session, new Error(`Browser main-document request limit (${this.limits.maxMainDocumentRequests}) exhausted.`));
       }
     });
-    session.page.on("framenavigated", (frame) => {
-      if (frame !== session.page.mainFrame()) return;
-      session.generation = this.uniqueHandle("generation");
-      session.semanticRefs.clear();
+    tab.page.on("framenavigated", (frame) => {
+      if (frame !== tab.page.mainFrame()) return;
+      const rawUrl = tab.page.url();
+      if (!tab.documentRequestPending && !sameDocumentUrl(tab.lastCommittedUrl, rawUrl)) {
+        tab.generation = this.uniqueHandle("generation");
+        tab.semanticRefs.clear();
+      } else if (!tab.documentRequestPending && tab.lastCommittedUrl === rawUrl) {
+        // A commit at the identical URL is a reload/replacement, not a hash-only traversal.
+        tab.generation = this.uniqueHandle("generation");
+        tab.semanticRefs.clear();
+      }
+      tab.documentRequestPending = false;
+      tab.lastCommittedUrl = rawUrl;
+      try {
+        const url = publicPageUrl(rawUrl);
+        if (tab.pendingHistoryIndex !== undefined) {
+          tab.historyIndex = tab.pendingHistoryIndex;
+          if (tab.history[tab.historyIndex]) {
+            tab.history[tab.historyIndex] = { url, identityUrl: bounded(rawUrl, 4_096), generation: tab.generation };
+          }
+        } else {
+          this.recordHistory(tab, url);
+        }
+      } catch {
+        // Initial about:blank and blocked protocols are not session history.
+      }
     });
-    session.page.on("dialog", (dialog) => void dialog.dismiss());
-    session.page.on("download", (download) => void download.cancel());
-    session.page.on("crash", () => this.failSession(session, new Error("Browser tab crashed; teardown started.")));
-    session.page.on("close", () => {
-      if (!session.teardown) this.failSession(session, new Error("Browser tab closed unexpectedly; teardown started."));
-    });
-    session.browser.on("disconnected", () => {
-      if (!session.teardown) this.failSession(session, new Error("Browser process disconnected unexpectedly; teardown started."));
+    tab.page.on("dialog", (dialog) => void dialog.dismiss());
+    tab.page.on("download", (download) => void download.cancel());
+    tab.page.on("crash", () => this.failSession(session, new Error("Browser tab crashed; teardown started.")));
+    tab.page.on("close", () => {
+      session.tabs.delete(tab.handle);
+      if (session.teardown || tab.closing) return;
+      if (session.tabs.size === 0) {
+        this.failSession(session, new Error("Last browser tab closed unexpectedly; teardown started."));
+        return;
+      }
+      if (session.activeTab === tab.handle) session.activeTab = session.tabs.keys().next().value!;
     });
   }
 
@@ -685,7 +1171,7 @@ export class InteractiveBrowserManager {
       throwIfAborted(signal);
       const result = await body();
       if (session.fatalError) throw session.fatalError;
-      this.touch(session);
+      if (!session.teardown) this.touch(session);
       return result;
     } catch (error) {
       const failure = asError(error);
@@ -780,12 +1266,160 @@ export class InteractiveBrowserManager {
     this.touch(session);
   }
 
-  private requireSession(sessionHandle: string, tabHandle: string): Session {
+  private async failUncertainTabClosure(session: Session, message: string, cause: Error): Promise<never> {
+    const failure = new Error(`${message}; session teardown started.`, { cause });
+    await this.failAndWait(session, failure);
+    throw failure;
+  }
+
+  private requireOwnedSession(sessionHandle: string): Session {
     const session = this.sessions.get(sessionHandle);
+    if (!session) throw invalidHandleError();
+    return session;
+  }
+
+  private requireTab(sessionHandle: string, tabHandle: string): { session: Session; tab: BrowserTab } {
+    const session = this.sessions.get(sessionHandle);
+    const tab = session?.tabs.get(tabHandle);
     // One deliberately indistinguishable error rejects forged, stale,
     // cross-session, and cross-tab handles without making handles enumerable.
-    if (!session || session.tab !== tabHandle) throw invalidHandleError();
-    return session;
+    if (!session || !tab) throw invalidHandleError();
+    return { session, tab };
+  }
+
+  private currentRefLocator(tab: BrowserTab, ref: string) {
+    const semanticRef = tab.semanticRefs.get(ref);
+    if (!semanticRef || semanticRef.generation !== tab.generation) throw invalidRefError();
+    return tab.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
+  }
+
+  private consumeNavigation(session: Session): void {
+    if (session.navigations >= this.limits.maxNavigations) {
+      throw new Error(`Browser navigation limit (${this.limits.maxNavigations}) exhausted.`);
+    }
+    session.navigations += 1;
+  }
+
+  private recordHistory(tab: BrowserTab, url: string): void {
+    const identityUrl = bounded(tab.page.url(), 4_096);
+    const current = tab.history[tab.historyIndex];
+    if (current?.identityUrl === identityUrl && current.generation === tab.generation) return;
+    tab.history.splice(tab.historyIndex + 1);
+    tab.history.push({ url, identityUrl, generation: tab.generation });
+    if (tab.history.length > this.limits.maxHistoryEntries) tab.history.shift();
+    tab.historyIndex = tab.history.length - 1;
+  }
+
+  private historyResult(
+    session: Session,
+    tab: BrowserTab,
+    operation: BrowserHistoryOperation,
+    maxEntries: number,
+    title: string,
+  ): BrowserHistoryResult {
+    const start = Math.max(0, tab.history.length - maxEntries);
+    return {
+      session: session.handle,
+      tab: tab.handle,
+      generation: tab.generation,
+      operation,
+      url: publicPageUrl(tab.page.url()),
+      title,
+      entries: tab.history.slice(start).map((entry, offset) => ({
+        index: start + offset,
+        url: entry.url,
+        generation: entry.generation,
+        current: start + offset === tab.historyIndex,
+      })),
+      truncated: start > 0,
+      navigationsRemaining: Math.max(0, this.limits.maxNavigations - session.navigations),
+    };
+  }
+
+  private tabForPage(session: Session, page: Page): BrowserTab | undefined {
+    for (const tab of session.tabs.values()) if (tab.page === page) return tab;
+    return undefined;
+  }
+
+  private adoptPage(session: Session, page: Page, popup = true): BrowserTab | undefined {
+    const existing = this.tabForPage(session, page);
+    if (existing) return existing;
+    if (page.isClosed()) {
+      session.broker.note(`${popup ? "popup" : "additional tab"} closed before ownership could be established.`);
+      return undefined;
+    }
+    if (session.teardown || session.tabs.size >= this.limits.maxTabsPerSession) {
+      const label = `${popup ? "popup" : "additional tab"} refused at the ${this.limits.maxTabsPerSession}-tab session limit`;
+      session.broker.note(`${label}.`);
+      void this.containRefusedPage(session, page, label).catch(() => undefined);
+      return undefined;
+    }
+    const tab: BrowserTab = {
+      handle: this.uniqueHandle("tab"),
+      generation: this.uniqueHandle("generation"),
+      page,
+      semanticRefs: new Map(),
+      history: [],
+      historyIndex: -1,
+      lastCommittedUrl: page.url(),
+      documentRequestPending: false,
+      closing: false,
+    };
+    session.tabs.set(tab.handle, tab);
+    this.installPageGuards(session, tab);
+    try {
+      const url = publicPageUrl(page.url());
+      this.recordHistory(tab, url);
+    } catch {
+      // A popup commonly begins at about:blank before its brokered navigation.
+    }
+    return tab;
+  }
+
+  private adoptPopup(session: Session, page: Page): void {
+    this.adoptPage(session, page, true);
+  }
+
+  private containRefusedPage(session: Session, page: Page, label: string): Promise<void> {
+    const existing = session.pendingPageClosures.get(page);
+    if (existing) return existing;
+    const closure = (async () => {
+      let closeFailure: Error | undefined;
+      try {
+        await boundedCleanup(page.close({ runBeforeUnload: false }), this.limits.cleanupMs, label);
+      } catch (error) {
+        closeFailure = asError(error);
+      }
+      if (!page.isClosed()) {
+        const failure = new Error(`${label} could not be closed; session teardown started.`, { cause: closeFailure });
+        this.failSession(session, failure);
+        throw failure;
+      }
+      session.pendingPageClosures.delete(page);
+    })();
+    session.pendingPageClosures.set(page, closure);
+    closure.catch(() => undefined);
+    return closure;
+  }
+
+  private trackLatePageCreation(session: Session, creation: Promise<Page>, label: string): void {
+    let tracked!: Promise<void>;
+    tracked = creation.then(async (latePage) => {
+      if (!this.tabForPage(session, latePage)) await this.containRefusedPage(session, latePage, label);
+    }, () => undefined).finally(() => {
+      session.pendingPageCreations.delete(tracked);
+    });
+    session.pendingPageCreations.add(tracked);
+    tracked.catch(() => undefined);
+  }
+
+  private tabInventory(session: Session): BrowserTabsResult["tabs"] {
+    return [...session.tabs.values()].map((tab) => ({
+      tab: tab.handle,
+      generation: tab.generation,
+      url: safePublicPageUrl(tab.page.url()),
+      active: tab.handle === session.activeTab,
+    }));
   }
 
   private uniqueHandle(kind: "session" | "tab" | "generation" | "ref"): string {
@@ -901,15 +1535,24 @@ export function interactiveRouteDecision(resourceType: string, rawUrl: string): 
 }
 
 async function cleanupSession(session: Session, deadlineMs: number): Promise<EgressSummary> {
-  // Start every shutdown path immediately and bound them concurrently. A hung
-  // page close must not delay the broker kill or prevent context/process close
-  // from being attempted within the same cleanup window.
+  // Start every shutdown path immediately and bound them concurrently. Hung
+  // tab closes must not delay the broker kill or parent-resource close.
+  const pages = [...new Set([
+    ...[...session.tabs.values()].map((tab) => tab.page),
+    ...session.pendingPageClosures.keys(),
+  ])];
+  const pendingContainments = [...session.pendingPageClosures.values()];
+  const pendingCreations = [...session.pendingPageCreations];
+  for (const tab of session.tabs.values()) tab.closing = true;
+  const pageCloses = pages.map((page) => boundedCleanup(
+    page.isClosed() ? Promise.resolve() : page.close({ runBeforeUnload: false }),
+    deadlineMs,
+    "browser tab close",
+  ));
   const operations = await Promise.allSettled([
-    boundedCleanup(
-      session.page.isClosed() ? Promise.resolve() : session.page.close({ runBeforeUnload: false }),
-      deadlineMs,
-      "browser tab close",
-    ),
+    ...pageCloses,
+    ...pendingContainments.map((closure) => boundedCleanup(closure, deadlineMs, "refused browser page containment")),
+    ...pendingCreations.map((creation) => boundedCleanup(creation, deadlineMs, "late browser page creation containment")),
     boundedCleanup(session.context.close(), deadlineMs, "browser context close"),
     boundedCleanup(session.browser.close(), deadlineMs, "browser process close"),
     boundedCleanup(session.broker.close(), deadlineMs, "egress broker close"),
@@ -917,10 +1560,12 @@ async function cleanupSession(session: Session, deadlineMs: number): Promise<Egr
   const operationFailures = operations
     .filter((operation): operation is PromiseRejectedResult => operation.status === "rejected")
     .map((operation) => operation.reason);
-  const brokerOutcome = operations[3];
+  const brokerOutcome = operations[operations.length - 1];
   const summary = brokerOutcome?.status === "fulfilled" ? brokerOutcome.value as EgressSummary : undefined;
   const stateFailures: unknown[] = [];
-  if (!session.page.isClosed()) stateFailures.push(new Error("browser tab remains open"));
+  const allKnownPages = new Set([...pages, ...session.pendingPageClosures.keys()]);
+  if ([...allKnownPages].some((page) => !page.isClosed())) stateFailures.push(new Error("browser tab remains open"));
+  if (session.pendingPageCreations.size > 0) stateFailures.push(new Error("late browser page creation remains unsettled"));
   if (session.browser.isConnected()) stateFailures.push(new Error("browser process remains connected"));
   if (session.browser.contexts().includes(session.context)) stateFailures.push(new Error("browser context remains registered"));
   if (!session.broker.isQuiescent()) stateFailures.push(new Error("egress broker is not quiescent"));
@@ -1040,6 +1685,54 @@ async function within<T>(operation: Promise<T>, timeoutMs: number, label: string
   }
 }
 
+type Re2Matcher = { test(value: string): boolean };
+type Re2Constructor = new (pattern: string, flags?: string) => Re2Matcher;
+let SafeRE2: Re2Constructor | null = null;
+try {
+  SafeRE2 = (require("re2-wasm") as { RE2: Re2Constructor }).RE2;
+} catch {
+  SafeRE2 = null;
+}
+
+function urlWaitMatcher(kind: "exact" | "prefix" | "pattern", value: string): (url: string) => boolean {
+  if (kind === "exact" || kind === "prefix") {
+    let parsed: URL;
+    try { parsed = new URL(value); } catch { throw new Error(`BrowserWait URL ${kind} value must be an absolute HTTP(S) URL.`); }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error(`BrowserWait URL ${kind} value must use HTTP(S).`);
+    const expected = parsed.href;
+    return kind === "exact" ? (url) => url === expected : (url) => url.startsWith(expected);
+  }
+  if (kind !== "pattern") throw new Error("BrowserWait URL match must be exact, prefix, or pattern.");
+  if (!SafeRE2) throw new Error("BrowserWait safe RE2 matching is unavailable in this runtime.");
+  let matcher: Re2Matcher;
+  try {
+    matcher = new SafeRE2(value, "u");
+  } catch {
+    throw new Error("BrowserWait URL pattern is invalid or unsupported by safe RE2.");
+  }
+  return (url) => {
+    try { return matcher.test(url); }
+    catch { throw new Error("BrowserWait URL pattern could not safely inspect the current URL."); }
+  };
+}
+
+function safePublicPageUrl(rawUrl: string): string {
+  try { return publicPageUrl(rawUrl); }
+  catch { return "[navigation pending]"; }
+}
+
+function sameDocumentUrl(left: string, right: string): boolean {
+  try {
+    const first = new URL(left);
+    const second = new URL(right);
+    first.hash = "";
+    second.hash = "";
+    return first.href === second.href && left !== right;
+  } catch {
+    return false;
+  }
+}
+
 function publicPageUrl(rawUrl: string): string {
   let url: URL;
   try { url = new URL(rawUrl); } catch { throw new Error("Browser ended at an invalid URL."); }
@@ -1143,6 +1836,10 @@ function validatePngScreenshot(
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw asError(signal.reason ?? new Error("Browser operation cancelled."));
+}
+
+function clampedTestLimit(value: number, hardMaximum: number): number {
+  return Number.isFinite(value) ? Math.min(hardMaximum, Math.max(1, Math.floor(value))) : hardMaximum;
 }
 
 function bounded(value: string, maxChars: number): string {

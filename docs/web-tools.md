@@ -114,6 +114,32 @@ short-lived interactive session. The initial session surface is deliberately rea
   cannot enlarge the capture. It never returns a file path or textual base64. Full-page screenshots are not
   supported because an arbitrarily tall page cannot meet the allocation guarantee
   without unbounded capture or tiling.
+- `BrowserScroll` permits only three bounded semantic forms: moving the page up/down,
+  moving the nearest scrollable container belonging to a current opaque ref up/down,
+  or bringing a current ref into view. Each movement is at most three viewport
+  fractions. There is no caller-provided selector, pixel coordinate, or script.
+- `BrowserWait` performs one event-driven, deadline-bounded observation. Conditions are
+  limited to a current ref becoming attached/detached/visible/hidden, bounded literal
+  text becoming present/absent, an HTTP(S) URL exact/prefix/safe-RE2 match, DOM/load
+  completion, Playwright-observable network quiet, or a duration of at most two
+  seconds. Text presence requires at least one visible literal match across the page;
+  absence requires that no visible match remains. The total deadline is at most ten
+  seconds and is shared by every phase;
+  this is not a polling or workflow-orchestration tool.
+- `BrowserHistory` lists at most 32 session-local entries or performs back, forward, or
+  reload. Traversal consumes the same cumulative navigation budget. A new document
+  generation invalidates that tab's refs; hash-only same-document traversal retains
+  them.
+- `BrowserTabs` lists, opens, switches, and closes session-owned tabs using opaque
+  handles. A session has at most four tabs. Script-created popups are immediately
+  adopted into that same ownership/broker boundary when capacity exists, or closed at
+  the limit. Refused popups remain tracked until closure is confirmed, and a tab whose
+  creation resolves after its deadline is contained during teardown. Switching does
+  not change a document generation. Closing the active tab chooses the oldest remaining
+  owned tab deterministically; closing the last tab tears down the complete session and
+  reports that fact. Failed opens restore the prior active tab only after rollback
+  closure is confirmed; an uncertain creation, tab close, or history traversal tears
+  down the session before returning an error.
 - `BrowserClose` is idempotent. It reports closure only after the page, context,
   Chromium connection, broker listener, and every tracked broker socket are confirmed
   quiescent. Recent closes retain bounded broker diagnostics; older confirmed closes
@@ -121,9 +147,9 @@ short-lived interactive session. The initial session surface is deliberately rea
   unbounded state.
 
 There is no click, typing, form submission, upload, download, caller-provided selector,
-XPath, coordinate action, arbitrary JavaScript/evaluate, CDP, or permission API. Element
-capture resolves only an extension-issued semantic ref internally. Popups beyond the
-single tab are closed. Service workers, WebSockets,
+XPath, coordinate action, caller-supplied JavaScript/evaluate, CDP, or permission API.
+Element operations resolve only extension-issued semantic refs internally. Popups never
+escape session ownership and are closed when the four-tab bound is full. Service workers, WebSockets,
 external protocols, media, downloads, permissions, direct QUIC/WebRTC, and proxy bypass
 are disabled. This initial observational implementation also disables images and
 custom/downloadable fonts in Chromium itself and blocks image/font requests at routing;
@@ -143,8 +169,9 @@ stale, cross-session, and cross-tab combinations are rejected uniformly. Semanti
 are process-local capabilities scoped to one session, tab, current document generation,
 and latest successful snapshot.
 
-Limits are hard and finite: at most 4 process-local sessions, 1 tab per session, 12
-explicit navigations, 64 operations, 32 main-document requests, 16 destination hosts,
+Limits are hard and finite: at most 4 process-local sessions, 4 tabs per session, 12
+explicit navigations/history traversals, 64 operations, 32 retained history entries per
+tab, 32 main-document requests, 16 destination hosts,
 96 connections, 256 broker requests, 8 MiB per connection, and 32 MiB aggregate bytes.
 Each open/navigation has one 30-second end-to-end deadline and each other action or
 snapshot has one 10-second end-to-end deadline; phases do not receive fresh timers.
@@ -173,8 +200,9 @@ with the exact tool name to load one. `BrowserScreenshot` checks the current Pi 
 input contract before capture; when image input is unavailable (or the host does not
 provide a model capability contract), it returns a clear error and directs the caller
 back to `BrowserSnapshot` rather than creating bytes Pi cannot deliver. Top-level,
-execute, and research Pi roles receive the five observational operations above; no
-interaction operations are part of the role policy.
+execute, and research Pi roles receive all nine observational operations above; no
+interaction operations are part of the role policy. Their names appear in each role's
+deterministic names-only system-prompt inventory while schemas remain deferred.
 External Claude and Codex adapters retain their existing native web-tool policies.
 
 ## Page cache

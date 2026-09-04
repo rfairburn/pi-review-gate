@@ -29,7 +29,8 @@ receipts of exactly what the model was told.
 - **Native web tools** — `WebSearch` (API-key-free DDGS), `WebFetch` (indexed HTML/PDF
   reading), `BrowserExtract` (single-page rendered fallback), and a bounded Pi-native
   observational browser (`BrowserOpen`, `BrowserNavigate`, `BrowserSnapshot`,
-  `BrowserScreenshot`, `BrowserClose`), all with DNS-rebinding-hardened, validated egress
+  `BrowserScreenshot`, `BrowserScroll`, `BrowserWait`, `BrowserHistory`, `BrowserTabs`,
+  `BrowserClose`), all with DNS-rebinding-hardened, validated egress
   ([Web tools](docs/web-tools.md),
   [Security model](docs/security-model.md#web-egress-hardening)).
 - **Durable evidence and recovery** — stable evidence bundles, integrity-checked

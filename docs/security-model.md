@@ -77,7 +77,9 @@ in Chromium's rendering engine, remote fonts are disabled, and image/font reques
 also denied at routing so generated `data:` or `blob:` visual payloads cannot bypass
 broker byte accounting. `BrowserScreenshot` captures only the already-rendered viewport
 or an element addressed by a current opaque semantic ref; it does not admit a new
-network path. Element bounds must fit the viewport and become an immutable screenshot
+network path. Bounded scroll/wait/history controls and every owned tab or admitted
+popup stay inside the same context and authenticated broker; the four-tab cap closes
+excess popups before they can become unowned. Element bounds must fit the viewport and become an immutable screenshot
 clip; the capture leaves finite animations running rather than fast-forwarding them
 after preflight, so a page resize cannot enlarge the requested image. Before native Pi
 image delivery, both pre-capture and decoded final PNG dimensions/pixels are bounded,

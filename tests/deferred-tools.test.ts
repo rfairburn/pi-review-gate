@@ -6,6 +6,7 @@ import { measureToolSchemaBaseline } from "./tool-schema-baseline-helper";
 interface RegisteredTool {
   name: string;
   description?: string;
+  promptSnippet?: string;
   parameters?: unknown;
   execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
 }
@@ -75,6 +76,13 @@ test("first session request is shrunk to the authorized conservative set and loa
   const manager = new DeferredToolManager(fixture.pi);
 
   assert.equal(manager.register(), true);
+  const searchDefinition = fixture.definitions.find((definition) => definition.name === "search_tools")!;
+  assert.match(searchDefinition.description ?? "", /query only exact tool names/);
+  assert.match(searchDefinition.promptSnippet ?? "", /only exact tool names when known, without descriptive words/);
+  assert.match(
+    String((searchDefinition.parameters as { properties?: { query?: { description?: string } } }).properties?.query?.description),
+    /Never mix known names with descriptive words/,
+  );
   assert.ok(fixture.active().includes("WebSearch"), "registration alone does not shrink before session_start");
   assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
 

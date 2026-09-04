@@ -57,8 +57,8 @@ export class DeferredToolManager {
     this.pi.registerTool({
       name: DEFERRED_TOOL_SEARCH_NAME,
       label: DEFERRED_TOOL_SEARCH_NAME,
-      description: "Find authorized tools by name or description and activate matching tools for the next model request. This only loads tools; it never performs the requested operation.",
-      promptSnippet: "Use search_tools when a needed authorized tool is not currently available, then call the newly loaded tool on the next turn.",
+      description: "Activate authorized tools. If names are known, query only exact tool names; otherwise use capability terms. Loading never performs the operation.",
+      promptSnippet: "Authorized names are listed in the system prompt. Search only exact tool names when known, without descriptive words; use capability terms only for unknown names. Call the loaded tool next turn.",
       executionMode: "sequential",
       parameters: {
         type: "object",
@@ -67,7 +67,7 @@ export class DeferredToolManager {
             type: "string",
             minLength: 1,
             maxLength: MAX_QUERY_CHARS,
-            description: "Terms describing the tool needed. Matches captured authorized tool names and descriptions only.",
+            description: "Known: exact tool name(s) only. Unknown: capability terms. Never mix known names with descriptive words.",
           },
         },
         required: ["query"],

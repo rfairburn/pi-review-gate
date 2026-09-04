@@ -7,6 +7,22 @@ import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
 
 const execFileAsync = promisify(execFile);
 
+/** All-zero object name used as the expected-old-value for create-only ref updates. */
+const SHA1_ZERO_SHA = "0000000000000000000000000000000000000000";
+const SHA256_ZERO_SHA = "0".repeat(64);
+
+const zeroShaCache = new Map<string, string>();
+
+/** Resolve the all-zero object name for a repository's object format. */
+async function zeroShaFor(repoPath: string): Promise<string> {
+  const cached = zeroShaCache.get(repoPath);
+  if (cached) return cached;
+  const format = await gitOut(["rev-parse", "--show-object-format"], repoPath).catch(() => "sha1");
+  const zero = format.trim() === "sha256" ? SHA256_ZERO_SHA : SHA1_ZERO_SHA;
+  zeroShaCache.set(repoPath, zero);
+  return zero;
+}
+
 // ── types ────────────────────────────────────────────────────────────────────
 
 /** Result of creating a worker worktree. */
@@ -331,7 +347,10 @@ export async function pinCommit(
   }
 
   // Stable refs are create-once / idempotent-same: refuse replacing an existing
-  // ref with a different SHA. This prevents accidental or malicious ref overwrite.
+  // ref with a different SHA. Creation uses atomic create-only update-ref
+  // semantics (expected old value is the all-zero object name) so concurrent
+  // pinners cannot overwrite each other; a raced loser must find the same SHA
+  // or fail closed. This prevents accidental or malicious ref overwrite.
   const existingSha = await gitOut(
     ["rev-parse", "--verify", refName],
     repoPath,
@@ -349,8 +368,28 @@ export async function pinCommit(
     );
   }
 
-  // Update the ref.
-  await gitCmd(["update-ref", refName, commitSha], repoPath, {}, signal);
+  try {
+    await gitCmd(["update-ref", refName, commitSha, await zeroShaFor(repoPath)], repoPath, {}, signal);
+  } catch (error) {
+    // Another writer may have created the ref concurrently; accept only the
+    // exact same SHA, otherwise fail closed (or rethrow when the ref was
+    // never created, e.g. a lock or permission failure).
+    const racedSha = await gitOut(
+      ["rev-parse", "--verify", refName],
+      repoPath,
+      {},
+      signal,
+    ).catch(() => "");
+    if (racedSha === "") {
+      throw error;
+    }
+    if (racedSha !== commitSha) {
+      throw new Error(
+        `Refusing to replace stable ref "${refName}": currently at ${racedSha}, ` +
+        `requested ${commitSha}. Stable refs are immutable once set.`,
+      );
+    }
+  }
 
   return refName;
 }

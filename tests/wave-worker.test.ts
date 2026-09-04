@@ -1258,8 +1258,14 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
     // The new candidate should have a different SHA (correction changed files).
     assert.notEqual(resumeCandidate.commitSha, firstCandidate.commitSha, "resume candidate should differ from first");
 
-    // The candidate ref should be the same (replacement).
-    assert.equal(resumeCandidate.candidateRef, firstCandidate.candidateRef, "candidate ref should be the same");
+    // With content-addressed snapshot refs, each tree pins its own immutable
+    // ref; the first candidate's ref must remain unchanged and pin the first
+    // commit, and the resumed candidate ref must pin the new commit.
+    assert.notEqual(resumeCandidate.candidateRef, firstCandidate.candidateRef, "different trees pin different snapshot refs");
+    const firstRefSha = await git(["rev-parse", firstCandidate.candidateRef], capture.repositoryPath);
+    assert.equal(firstRefSha, firstCandidate.commitSha, "first snapshot ref must be unchanged");
+    const resumeRefSha = await git(["rev-parse", resumeCandidate.candidateRef], capture.repositoryPath);
+    assert.equal(resumeRefSha, resumeCandidate.commitSha, "resumed candidate ref pins the new commit");
 
     // Verify the candidate has the wave base as its sole parent.
     const parentCount = await git(

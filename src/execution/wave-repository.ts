@@ -485,6 +485,18 @@ export interface SourceIdentity {
 export interface WaveCaptureResult {
   /** The wave identifier. */
   waveId: string;
+  /**
+   * Root (original) wave identity of this capture's continuation chain.
+   * Continuation captures carry the original wave id explicitly so candidate
+   * lineage is never inferred from wave-id text. Defaults to waveId when
+   * absent (original captures and pre-lineage records).
+   */
+  rootWaveId?: string;
+  /**
+   * Continuation generation of this capture: 0 for the original wave, N for
+   * its Nth continuation. Only meaningful together with rootWaveId.
+   */
+  continuationGeneration?: number;
   /** Path to the private bare Git repository. */
   repositoryPath: string;
   /** Wave root directory (parent of the bare repo). */
@@ -693,6 +705,10 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
 
       const capture: WaveCaptureResult = {
         waveId,
+        // Record the explicit continuation lineage: a fresh capture is always
+        // generation 0 of its own root wave.
+        rootWaveId: waveId,
+        continuationGeneration: 0,
         repositoryPath: repoPath,
         waveRoot,
         baseCommit,

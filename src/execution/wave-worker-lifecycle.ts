@@ -30,7 +30,11 @@ import {
 } from "./wave-worker";
 import {
   buildCandidateReviewPatch,
+  pinReviewCycleCandidate,
+  reviewCycleAliasRefName,
+  verifyReviewCycleIdentity,
   type CandidateCommit,
+  type WaveIdentityCapture,
 } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
 import {
@@ -109,6 +113,8 @@ export interface ReviewCycle {
   candidateCommit: string;
   /** Candidate tree SHA. */
   candidateTreeSha: string;
+  /** Immutable per-cycle review alias ref that pins the candidate. */
+  candidateRef: string;
   /** Verdict from the review. */
   verdict: ReviewResult["verdict"];
   /** Review output details. */
@@ -293,9 +299,10 @@ function buildReviewRequest(task: WaveWorkerTask): string {
 async function runCandidateReview(
   frozenConfig: ReviewGateConfig,
   task: WaveWorkerTask,
-  repoPath: string,
-  baseCommit: string,
-  candidateCommit: string,
+  capture: WaveIdentityCapture,
+  taskId: string,
+  aliasRef: string,
+  candidate: { commitSha: string; treeSha: string },
   window: ReviewWindow,
   evidence: EvidenceState,
   worktreeRoot: string,
@@ -305,11 +312,20 @@ async function runCandidateReview(
   signal?: AbortSignal,
   onUpdate?: (message: string) => void,
 ): Promise<ReviewRunOutput> {
+  // Verify the immutable cycle alias still pins the exact candidate identity
+  // before generating the patch the reviewers will see.
+  await verifyReviewCycleIdentity(
+    capture,
+    taskId,
+    aliasRef,
+    candidate,
+  );
+
   // Build the exact patch from Git.
   const patch = await buildCandidateReviewPatch(
-    repoPath,
-    baseCommit,
-    candidateCommit,
+    capture.repositoryPath,
+    capture.baseCommit,
+    candidate.commitSha,
     maxPatchBytes,
   );
 
@@ -326,7 +342,7 @@ async function runCandidateReview(
     before: baseSnapshot,
     config: frozenConfig,
     evidence,
-    changeIdentity: { baseCommit, candidateCommit },
+    changeIdentity: { baseCommit: capture.baseCommit, candidateCommit: candidate.commitSha },
     exactChange,
     window,
     correctionAttemptCount,
@@ -474,6 +490,7 @@ async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResul
         baseCommit: c.baseCommit,
         candidateCommit: c.candidateCommit,
         candidateTreeSha: c.candidateTreeSha,
+        candidateRef: c.candidateRef,
         verdict: c.verdict,
       })),
       reviewReport: result.reviewReport,
@@ -836,6 +853,11 @@ export async function runWaveWorkerLifecycle(
   let currentResult: WaveWorkerResult = initialResult;
   let currentCandidate: CandidateCommit = candidate;
   let correctionCount = 0;
+  // Monotonic review cycle counter: every review attempt (including one
+  // interrupted by steering before its verdict was accepted) consumes one
+  // immutable cycle alias number, so steered re-reviews never collide with a
+  // prior attempt's create-once alias.
+  let nextReviewCycleNumber = 1;
   let lastCandidateTreeSha: string | undefined;
   // Monotonic executor turn counter was initialized after the first turn and
   // includes any deferred-steering handoff completed before review.
@@ -902,7 +924,8 @@ export async function runWaveWorkerLifecycle(
       return result;
     }
 
-    const reviewCycle = reviewCycles.length + 1;
+    const reviewCycle = nextReviewCycleNumber;
+    nextReviewCycleNumber += 1;
     const reviewerLabels = frozen.frozenConfig.reviewers?.map(reviewerProgressLabel) ?? [];
     reportProgress(input, {
       phase: "reviewing",
@@ -939,6 +962,15 @@ export async function runWaveWorkerLifecycle(
       }),
     });
 
+    // Pin the immutable per-cycle review alias before any reviewer runs. The
+    // alias proves the candidate's tree/base/wave/task identity and is
+    // create-once: re-pinning the same commit is idempotent, mutation fails closed.
+    const reviewAliasRef = reviewCycleAliasRefName(capture.waveId, taskId, reviewCycle);
+    await pinReviewCycleCandidate(capture, taskId, reviewCycle, {
+      commitSha: currentCandidate.commitSha,
+      treeSha: currentCandidate.treeSha,
+    });
+
     // Run review on the current candidate (with error handling).
     let reviewOutput: ReviewRunOutput;
     try {
@@ -946,9 +978,10 @@ export async function runWaveWorkerLifecycle(
         () => runCandidateReview(
           frozen.frozenConfig,
           reviewTask,
-          capture.repositoryPath,
-          capture.baseCommit,
-          currentCandidate.commitSha,
+          capture,
+          taskId,
+          reviewAliasRef,
+          { commitSha: currentCandidate.commitSha, treeSha: currentCandidate.treeSha },
           window,
           window.evidence,
           worktree.worktreeRoot,
@@ -1091,12 +1124,36 @@ export async function runWaveWorkerLifecycle(
       return result;
     }
 
+    // Verify the immutable cycle alias still pins the exact reviewed
+    // candidate identity before the verdict is accepted.
+    try {
+      await verifyReviewCycleIdentity(capture, taskId, reviewAliasRef, {
+        commitSha: currentCandidate.commitSha,
+        treeSha: currentCandidate.treeSha,
+      });
+    } catch (error) {
+      const result: WaveWorkerLifecycleResult = {
+        status: "review_error",
+        taskId,
+        title: task.title,
+        summary: "Review cycle identity could not be verified.",
+        adapter: currentResult.adapter,
+        model: currentResult.model,
+        error: error instanceof Error ? error.message : "review cycle identity verification failed",
+        reviewCycles,
+        artifactDir: resolvedArtifactDir,
+      };
+      await writeResult(resolvedArtifactDir, result);
+      return result;
+    }
+
     const verdict = reviewOutput.result?.verdict ?? "error";
     const cycle: ReviewCycle = {
-      cycle: reviewCycles.length + 1,
+      cycle: reviewCycle,
       baseCommit: capture.baseCommit,
       candidateCommit: currentCandidate.commitSha,
       candidateTreeSha: currentCandidate.treeSha,
+      candidateRef: reviewAliasRef,
       verdict,
       reviewOutput,
     };
@@ -1476,6 +1533,44 @@ export async function runWaveWorkerLifecycle(
 
     // If the confirmation tree is unchanged from the passed candidate tree, accept.
     if (confirmCandidate.treeSha === passedTreeSha) {
+      // The pass is tied to the exact immutable cycle candidate/tree: the
+      // cycle alias must still pin the passed commit before acceptance.
+      const passedCycle = reviewCycles[reviewCycles.length - 1];
+      if (!passedCycle || passedCycle.candidateRef !== reviewAliasRef) {
+        const result: WaveWorkerLifecycleResult = {
+          status: "review_error",
+          taskId,
+          title: task.title,
+          summary: "The passing review cycle could not be identified for acceptance.",
+          adapter: confirmResult.adapter,
+          model: confirmResult.model,
+          error: "pass cycle identity missing",
+          reviewCycles,
+          artifactDir: resolvedArtifactDir,
+        };
+        await writeResult(resolvedArtifactDir, result);
+        return result;
+      }
+      try {
+        await verifyReviewCycleIdentity(capture, taskId, passedCycle.candidateRef, {
+          commitSha: passedCommitSha,
+          treeSha: passedTreeSha,
+        });
+      } catch (error) {
+        const result: WaveWorkerLifecycleResult = {
+          status: "review_error",
+          taskId,
+          title: task.title,
+          summary: "The passing review cycle alias no longer pins the passed candidate.",
+          adapter: confirmResult.adapter,
+          model: confirmResult.model,
+          error: error instanceof Error ? error.message : "pass cycle identity verification failed",
+          reviewCycles,
+          artifactDir: resolvedArtifactDir,
+        };
+        await writeResult(resolvedArtifactDir, result);
+        return result;
+      }
       // Restore the clean worker HEAD/index to the exact passed candidate before pinning.
       await gitResetHard(worktree.worktreeRoot, passedCommitSha);
       const workerRef = await pinCommit(capture, passedCommitSha, { type: "worker", taskId }, signal);

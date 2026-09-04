@@ -37,10 +37,367 @@ export interface CandidateCommit {
   differsFromBase: boolean;
 }
 
-/** Optional prior candidate for re-normalization. */
+/** Optional durable prior candidate identity for normalization. */
 export interface PriorCandidate {
   /** SHA of the previous candidate commit. */
   commitSha: string;
+  /** SHA of the previous candidate tree (resolved from the commit when omitted). */
+  treeSha?: string;
+  /** Ref under which the previous candidate is durably pinned (verified read-only). */
+  ref?: string;
+}
+
+/** All-zero object name used as the expected-old-value for create-only ref updates. */
+const SHA1_ZERO_SHA = "0000000000000000000000000000000000000000";
+const SHA256_ZERO_SHA = "0".repeat(64);
+
+const TREE_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+const zeroShaCache = new Map<string, string>();
+
+/** Resolve the all-zero object name for a repository's object format. */
+async function zeroShaFor(repoPath: string): Promise<string> {
+  const cached = zeroShaCache.get(repoPath);
+  if (cached) return cached;
+  const format = await gitOut(["rev-parse", "--show-object-format"], repoPath).catch(() => "sha1");
+  const zero = format.trim() === "sha256" ? SHA256_ZERO_SHA : SHA1_ZERO_SHA;
+  zeroShaCache.set(repoPath, zero);
+  return zero;
+}
+
+/**
+ * Resolve the immutable, content-addressed candidate snapshot ref name for a
+ * worker task and tree. The ref is create-once: it pins exactly one commit
+ * that proves the recorded tree/base/wave/task identity.
+ */
+export function candidateSnapshotRefName(waveId: string, taskId: string, treeSha: string): string {
+  validateSafeId(waveId, "waveId");
+  validateSafeId(taskId, "taskId");
+  if (!TREE_SHA_PATTERN.test(treeSha)) {
+    throw new Error(`Invalid treeSha: "${treeSha}". Must be a full 40-hex object name.`);
+  }
+  return `refs/pi-review-gate/waves/${waveId}/candidate-snapshots/${taskId}/${treeSha}`;
+}
+
+/**
+ * Resolve the immutable per-cycle review alias ref name. Cycle numbers are
+ * 1-based and zero-padded to six digits.
+ */
+export function reviewCycleAliasRefName(waveId: string, taskId: string, cycle: number): string {
+  validateSafeId(waveId, "waveId");
+  validateSafeId(taskId, "taskId");
+  if (!Number.isInteger(cycle) || cycle < 1 || cycle > 999_999) {
+    throw new Error(`Invalid review cycle: ${cycle}. Must be an integer between 1 and 999999.`);
+  }
+  return `refs/pi-review-gate/waves/${waveId}/review-candidates/${taskId}/cycle-${String(cycle).padStart(6, "0")}`;
+}
+
+/**
+ * Resolve the legacy mutable candidate ref name. Legacy refs are strict
+ * read-only compatibility inputs: existing code never writes them.
+ */
+export function candidateRefName(waveId: string, taskId: string): string {
+  validateSafeId(waveId, "waveId");
+  validateSafeId(taskId, "taskId");
+  return `refs/pi-review-gate/waves/${waveId}/candidates/${taskId}`;
+}
+
+/**
+ * Resolve the legacy mutable recovery ref name. Legacy refs are strict
+ * read-only compatibility inputs: existing code never writes them.
+ */
+export function recoveryRefName(waveId: string, taskId: string): string {
+  validateSafeId(waveId, "waveId");
+  validateSafeId(taskId, "taskId");
+  return `refs/pi-review-gate/waves/${waveId}/recovery/${taskId}`;
+}
+
+/**
+ * Explicit continuation lineage for wave identity verification. The root
+ * wave id and the verifying capture's generation are carried by the capture
+ * itself; lineage is never inferred from arbitrary wave-id text, so valid
+ * original wave ids that happen to end in "-gN" keep their own identity.
+ */
+export interface WaveLineage {
+  /** Root (original) wave identity of the continuation chain. */
+  rootWaveId: string;
+  /** Continuation generation of the verifying capture (0 = original wave). */
+  generation: number;
+}
+
+/** The capture fields that identify a wave's immutable ref namespace and lineage. */
+export type WaveIdentityCapture = Pick<
+  WaveCaptureResult,
+  "waveId" | "repositoryPath" | "baseCommit" | "rootWaveId" | "continuationGeneration"
+>;
+
+/**
+ * Resolve the explicit continuation lineage recorded on a capture.
+ *
+ * Original captures (and pre-lineage records) carry no lineage fields and
+ * are generation 0 of their own root wave. Continuation captures must carry
+ * both fields, and their wave id must be exactly "<root>-g<generation>" —
+ * any inconsistency fails closed instead of guessing a lineage.
+ */
+export function waveLineageOf(
+  capture: Pick<WaveCaptureResult, "waveId" | "rootWaveId" | "continuationGeneration">,
+): WaveLineage {
+  const { waveId, rootWaveId, continuationGeneration } = capture;
+  if (rootWaveId === undefined && continuationGeneration === undefined) {
+    return { rootWaveId: waveId, generation: 0 };
+  }
+  if (typeof rootWaveId !== "string" || rootWaveId.length === 0) {
+    throw new Error("Invalid continuation lineage: rootWaveId is missing.");
+  }
+  validateSafeId(rootWaveId, "rootWaveId");
+  if (typeof continuationGeneration !== "number" || !Number.isInteger(continuationGeneration) || continuationGeneration < 0) {
+    throw new Error(
+      `Invalid continuation lineage: generation must be a non-negative integer, got ${String(continuationGeneration)}.`,
+    );
+  }
+  const generation = continuationGeneration;
+  const expectedWaveId = generation === 0 ? rootWaveId : `${rootWaveId}-g${generation}`;
+  if (waveId !== expectedWaveId) {
+    throw new Error(
+      `Invalid continuation lineage: waveId "${waveId}" does not match recorded root wave ` +
+        `"${rootWaveId}" at generation ${generation} (expected "${expectedWaveId}").`,
+    );
+  }
+  return { rootWaveId, generation };
+}
+
+/**
+ * Whether a commit's Wave-Id trailer belongs to the explicit continuation
+ * chain identified by `lineage`. Accepted values are exactly the wave ids
+ * of each generation from the root (generation 0) up to and including the
+ * lineage generation, so later generations can adopt candidates created by
+ * earlier generations of the same chain — and only that chain. Only the
+ * suffix after the recorded root prefix is interpreted; a valid original
+ * wave id ending in "-gN" is never re-parsed as someone else's base.
+ */
+function trailerMatchesLineage(trailerWaveId: string, lineage: WaveLineage): boolean {
+  if (trailerWaveId === lineage.rootWaveId) return true;
+  const prefix = `${lineage.rootWaveId}-g`;
+  if (!trailerWaveId.startsWith(prefix)) return false;
+  const suffix = trailerWaveId.slice(prefix.length);
+  // Reject leading zeros and non-canonical numerals: continuation wave ids
+  // are always rendered as "<root>-g<N>" with N in canonical decimal form.
+  if (!/^\d+$/.test(suffix) || String(Number(suffix)) !== suffix) return false;
+  const generation = Number(suffix);
+  return generation >= 1 && generation <= lineage.generation;
+}
+
+/** A single Git trailer line: an identifier key, a colon, then its value. */
+const TRAILER_LINE_PATTERN = /^([A-Za-z][A-Za-z0-9._-]*):[ \t]*(.*)$/;
+
+/**
+ * Parse the final Git trailer block of a commit message into (key, value)
+ * pairs.
+ *
+ * The trailer block is the run of lines after the message's last blank
+ * line: Git requires trailers to be separated from the title/body by a
+ * blank line, and only that final block is trusted here. Title or body text
+ * that merely looks like a trailer (for example a task titled "Wave-Id:
+ * example") can therefore never be mistaken for identity data. If the final
+ * region contains any non-trailer line the whole block is rejected so
+ * identity verification fails closed.
+ */
+function parseFinalTrailerBlock(message: string): Array<[string, string]> {
+  const lines = message.split("\n");
+  let lastBlank = -1;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (lines[i].trim() === "") {
+      lastBlank = i;
+      break;
+    }
+  }
+  if (lastBlank < 0) return [];
+  const entries: Array<[string, string]> = [];
+  for (const line of lines.slice(lastBlank + 1)) {
+    const match = TRAILER_LINE_PATTERN.exec(line);
+    if (!match) return [];
+    entries.push([match[1], match[2].trim()]);
+  }
+  return entries;
+}
+
+/**
+ * Read one trailer key from a parsed trailer block. Conflicting duplicate
+ * values are treated as missing so identity verification fails closed.
+ */
+function trailerValue(entries: Array<[string, string]>, key: string): string | undefined {
+  const values = entries.filter(([entryKey]) => entryKey === key).map(([, value]) => value);
+  if (values.length === 0) return undefined;
+  if (new Set(values).size > 1) return undefined;
+  return values[0];
+}
+
+/** Identity proof read from a candidate commit object. */
+interface CommitIdentityProof {
+  treeSha: string;
+  parentShas: string[];
+  waveId?: string;
+  taskId?: string;
+}
+
+/** Read the identity proof fields from a commit object. */
+async function readCommitIdentityProof(repoPath: string, commitSha: string): Promise<CommitIdentityProof> {
+  const raw = await gitOut(["show", "-s", "--format=%T%n%P%n%B", commitSha], repoPath);
+  const lines = raw.split("\n");
+  const treeSha = (lines[0] ?? "").trim();
+  const parentLine = (lines[1] ?? "").trim();
+  const message = lines.slice(2).join("\n");
+  const trailers = parseFinalTrailerBlock(message);
+  const waveId = trailerValue(trailers, "Wave-Id");
+  const taskId = trailerValue(trailers, "Task-Id");
+  return {
+    treeSha,
+    parentShas: parentLine === "" ? [] : parentLine.split(/\s+/),
+    waveId,
+    taskId,
+  };
+}
+
+/** Verify a commit proves the recorded tree/base/wave/task identity, or throw. */
+export async function verifyCandidateCommitIdentity(
+  repoPath: string,
+  expectation: {
+    commitSha: string;
+    treeSha?: string;
+    baseCommit: string;
+    lineage: WaveLineage;
+    taskId: string;
+  },
+): Promise<void> {
+  let proof: CommitIdentityProof;
+  try {
+    proof = await readCommitIdentityProof(repoPath, expectation.commitSha);
+  } catch (error) {
+    throw new Error(
+      `Candidate commit ${expectation.commitSha} could not be read to prove its identity: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (expectation.treeSha !== undefined && proof.treeSha !== expectation.treeSha) {
+    throw new Error(
+      `Candidate commit ${expectation.commitSha} does not prove the recorded tree identity: ` +
+        `commit tree is ${proof.treeSha}, expected ${expectation.treeSha}.`,
+    );
+  }
+  if (proof.parentShas.length !== 1 || proof.parentShas[0] !== expectation.baseCommit) {
+    throw new Error(
+      `Candidate commit ${expectation.commitSha} does not prove the base identity: ` +
+        `expected sole parent ${expectation.baseCommit}, got [${proof.parentShas.join(", ") || "none"}].`,
+    );
+  }
+  if (!proof.waveId || !trailerMatchesLineage(proof.waveId, expectation.lineage)) {
+    throw new Error(
+      `Candidate commit ${expectation.commitSha} does not prove the wave identity: ` +
+        `commit Wave-Id is "${proof.waveId ?? "missing"}", expected root wave ` +
+        `"${expectation.lineage.rootWaveId}" at generation 0..${expectation.lineage.generation}.`,
+    );
+  }
+  if (proof.taskId !== expectation.taskId) {
+    throw new Error(
+      `Candidate commit ${expectation.commitSha} does not prove the task identity: ` +
+        `commit Task-Id is "${proof.taskId ?? "missing"}", expected "${expectation.taskId}".`,
+    );
+  }
+}
+
+/**
+ * Verify that a recovery checkpoint's ref is one of the allowed durable forms
+ * for exactly `taskId` within the explicit continuation chain identified by
+ * `lineage`:
+ *
+ *   refs/pi-review-gate/waves/<wave>/candidate-snapshots/<task>/<tree>
+ *   refs/pi-review-gate/waves/<wave>/candidates/<task>      (legacy, read-only)
+ *   refs/pi-review-gate/waves/<wave>/recovery/<task>        (legacy, read-only)
+ *
+ * where `<wave>` is any wave id of the chain (the root, or the canonical
+ * <root>-g1..gN up to and including the lineage generation), `<task>` is
+ * exactly `taskId`, and — for content-addressed snapshot refs — `<tree>` is
+ * a full object name equal to `treeSha` when supplied. Any other ref shape,
+ * task, or wave identity fails closed so a checkpoint from another task or
+ * wave can never be restored into this operation's worktree.
+ */
+export function verifyCheckpointRefPath(
+  ref: string,
+  taskId: string,
+  lineage: WaveLineage,
+  treeSha?: string,
+): void {
+  const parts = ref.split("/");
+  if (parts.length !== 6 && parts.length !== 7) {
+    throw new Error(`Recovery checkpoint ref is not an allowed candidate or recovery form: ${ref}.`);
+  }
+  if (parts[0] !== "refs" || parts[1] !== "pi-review-gate" || parts[2] !== "waves") {
+    throw new Error(`Recovery checkpoint ref is outside the protected namespace: ${ref}.`);
+  }
+  const waveSegment = parts[3];
+  const kind = parts[4];
+  if (parts[5] !== taskId) {
+    throw new Error(
+      `Recovery checkpoint ref ${ref} does not belong to task "${taskId}"; refusing to restore a foreign checkpoint.`,
+    );
+  }
+  if (!trailerMatchesLineage(waveSegment, lineage)) {
+    throw new Error(
+      `Recovery checkpoint ref ${ref} is outside the wave chain rooted at "${lineage.rootWaveId}" ` +
+        `(generation 0..${lineage.generation}); refusing to restore a foreign checkpoint.`,
+    );
+  }
+  if (kind === "candidate-snapshots") {
+    if (parts.length !== 7) {
+      throw new Error(`Recovery checkpoint ref is not an allowed candidate or recovery form: ${ref}.`);
+    }
+    const treeSegment = parts[6];
+    if (!TREE_SHA_PATTERN.test(treeSegment)) {
+      throw new Error(`Recovery checkpoint ref ${ref} is not a content-addressed candidate snapshot form.`);
+    }
+    if (treeSha !== undefined && treeSegment !== treeSha) {
+      throw new Error(
+        `Recovery checkpoint ref ${ref} records tree ${treeSegment}, but the checkpoint records ${treeSha}.`,
+      );
+    }
+  } else if (kind === "candidates" || kind === "recovery") {
+    if (parts.length !== 6) {
+      throw new Error(`Recovery checkpoint ref is not an allowed candidate or recovery form: ${ref}.`);
+    }
+  } else {
+    throw new Error(`Recovery checkpoint ref is not an allowed candidate or recovery form: ${ref}.`);
+  }
+}
+
+/**
+ * Create-once immutable ref update. If the ref already exists, its current
+ * target is returned after passing the adopt check; otherwise the ref is
+ * created with atomic create-only update-ref semantics (expected old value
+ * is the all-zero object name). Concurrent creators race safely: the loser
+ * re-reads the winner's target and must adopt it or fail closed.
+ */
+async function ensureImmutableRef(
+  repoPath: string,
+  ref: string,
+  newSha: string,
+  adopt?: (existingSha: string) => Promise<void> | void,
+): Promise<string> {
+  const existing = await gitOut(["rev-parse", "--verify", ref], repoPath).catch(() => "");
+  if (existing !== "") {
+    if (adopt) await adopt(existing);
+    return existing;
+  }
+  try {
+    await gitCmd(["update-ref", ref, newSha, await zeroShaFor(repoPath)], repoPath);
+    return newSha;
+  } catch (error) {
+    const raced = await gitOut(["rev-parse", "--verify", ref], repoPath).catch(() => "");
+    if (raced === "") {
+      throw error;
+    }
+    if (adopt) await adopt(raced);
+    return raced;
+  }
 }
 
 /**
@@ -101,28 +458,99 @@ async function gitOut(args: string[], cwd: string, envOverrides: Record<string, 
 // ── candidate normalization ──────────────────────────────────────────────────
 
 /**
- * Resolve the candidate ref name for a worker task.
+ * Pin (create-once) or adopt the immutable candidate snapshot ref for a tree.
+ *
+ * The ref target must prove the same tree/base/wave/task identity; an
+ * existing ref that fails the identity proof fails closed. Returns the
+ * adopted or created commit SHA, which may differ from `createCommitSha`
+ * when an equal-identity commit already won the race.
  */
-export function candidateRefName(waveId: string, taskId: string): string {
-  validateSafeId(waveId, "waveId");
-  validateSafeId(taskId, "taskId");
-  return `refs/pi-review-gate/waves/${waveId}/candidates/${taskId}`;
-}
-
-export function recoveryRefName(waveId: string, taskId: string): string {
-  validateSafeId(waveId, "waveId");
-  validateSafeId(taskId, "taskId");
-  return `refs/pi-review-gate/waves/${waveId}/recovery/${taskId}`;
-}
-
-export async function pinRecoveryCandidate(
+async function ensureCandidateSnapshotRef(
   capture: WaveCaptureResult,
   taskId: string,
-  candidate: CandidateCommit,
+  treeSha: string,
+  createCommitSha: string,
+): Promise<{ ref: string; commitSha: string }> {
+  const ref = candidateSnapshotRefName(capture.waveId, taskId, treeSha);
+  const lineage = waveLineageOf(capture);
+  const adoptedSha = await ensureImmutableRef(
+    capture.repositoryPath,
+    ref,
+    createCommitSha,
+    (existingSha) => verifyCandidateCommitIdentity(capture.repositoryPath, {
+      commitSha: existingSha,
+      treeSha,
+      baseCommit: capture.baseCommit,
+      lineage,
+      taskId,
+    }),
+  );
+  return { ref, commitSha: adoptedSha };
+}
+
+/**
+ * Pin the immutable per-cycle review alias for one reviewed candidate.
+ *
+ * The candidate commit must prove the recorded tree/base/wave/task identity
+ * before the alias is created. The alias is create-once: re-pinning the same
+ * cycle with the same commit is idempotent, while any attempt to record a
+ * different commit under an existing cycle alias fails closed and leaves the
+ * alias untouched.
+ */
+export async function pinReviewCycleCandidate(
+  capture: WaveIdentityCapture,
+  taskId: string,
+  cycle: number,
+  candidate: { commitSha: string; treeSha: string },
 ): Promise<string> {
-  const ref = recoveryRefName(capture.waveId, taskId);
-  await gitCmd(["update-ref", ref, candidate.commitSha], capture.repositoryPath);
+  const ref = reviewCycleAliasRefName(capture.waveId, taskId, cycle);
+  await verifyCandidateCommitIdentity(capture.repositoryPath, {
+    commitSha: candidate.commitSha,
+    treeSha: candidate.treeSha,
+    baseCommit: capture.baseCommit,
+    lineage: waveLineageOf(capture),
+    taskId,
+  });
+  await ensureImmutableRef(
+    capture.repositoryPath,
+    ref,
+    candidate.commitSha,
+    (existingSha) => {
+      if (existingSha !== candidate.commitSha) {
+        throw new Error(
+          `Review cycle alias ${ref} is immutable and points to ${existingSha}; ` +
+            `refusing to record candidate ${candidate.commitSha} for cycle ${cycle}.`,
+        );
+      }
+    },
+  );
   return ref;
+}
+
+/**
+ * Re-verify (read-only) that a review cycle alias still pins the exact
+ * reviewed candidate identity before patch generation or verdict acceptance.
+ */
+export async function verifyReviewCycleIdentity(
+  capture: WaveIdentityCapture,
+  taskId: string,
+  aliasRef: string,
+  candidate: { commitSha: string; treeSha: string },
+): Promise<void> {
+  const pinned = await gitOut(["rev-parse", "--verify", aliasRef], capture.repositoryPath).catch(() => "");
+  if (pinned !== candidate.commitSha) {
+    throw new Error(
+      `Review cycle alias ${aliasRef} points to ${pinned || "nothing"}; ` +
+        `expected the reviewed candidate ${candidate.commitSha}.`,
+    );
+  }
+  await verifyCandidateCommitIdentity(capture.repositoryPath, {
+    commitSha: candidate.commitSha,
+    treeSha: candidate.treeSha,
+    baseCommit: capture.baseCommit,
+    lineage: waveLineageOf(capture),
+    taskId,
+  });
 }
 
 /**
@@ -135,11 +563,18 @@ export async function pinRecoveryCandidate(
  * 3. Writes the resulting tree and creates a single commit whose sole parent
  *    is the immutable wave base (flattening any executor-created history).
  * 4. Moves the worker's HEAD/index to the candidate commit.
- * 5. Pins the candidate under a private candidates/<task-id> ref.
+ * 5. Pins the candidate under a create-once, content-addressed
+ *    candidate-snapshots/<task-id>/<tree-sha> ref that proves the recorded
+ *    tree/base/wave/task identity. Equal-tree candidates (including a
+ *    supplied durable prior candidate) adopt the existing proven commit
+ *    instead of creating a parallel one; any existing ref that fails the
+ *    identity proof fails closed.
  * 6. Returns commit/tree/ref metadata and whether the tree differs from base.
  *
- * Re-normalization replaces the candidate ref atomically — it never stacks
- * correction commits.
+ * Re-normalization never stacks correction commits and never mutates legacy
+ * candidates/<task-id> or recovery/<task-id> refs. Legacy prior refs are
+ * verified strictly read-only and migrated lazily onto the immutable
+ * snapshot namespace when a continuation adopts them.
  */
 export async function normalizeCandidate(
   capture: WaveCaptureResult,
@@ -163,6 +598,11 @@ export async function normalizeCandidate(
   if (/\r|\n/.test(title)) {
     throw new Error("Invalid title: must not contain newlines.");
   }
+
+  // Resolve the explicit continuation lineage before any Git mutation so an
+  // inconsistent capture (waveId vs recorded root/generation) fails closed
+  // without touching the worktree.
+  const lineage = waveLineageOf(capture);
 
   // ── Preflight: verify worktree belongs to this private repo ──
   // Resolve canonical paths.
@@ -242,13 +682,37 @@ export async function normalizeCandidate(
 Wave-Id: ${waveId}
 Task-Id: ${taskId}`;
 
-  // ── Create the candidate commit with base as sole parent ──
-  const commitSha = await createCommitWithParent(
-    worktreeRoot,
-    treeSha,
+  // ── Resolve the durable candidate identity ──
+  // A supplied prior candidate is verified strictly read-only (its ref must
+  // still pin its recorded commit). When the new tree matches the prior
+  // tree, the prior commit is adopted after proving the same
+  // tree/base/wave/task identity — this carries the durable checkpoint's
+  // actual ref forward instead of creating a parallel candidate.
+  let commitSha = await adoptPriorCandidate(
+    repoPath,
+    lineage,
+    taskId,
     baseCommit,
-    message,
+    treeSha,
+    priorCandidate,
   );
+
+  // ── Create the candidate commit with base as sole parent ──
+  if (!commitSha) {
+    commitSha = await createCommitWithParent(
+      worktreeRoot,
+      treeSha,
+      baseCommit,
+      message,
+    );
+  }
+
+  // ── Pin the candidate under a create-once, content-addressed ref ──
+  // Equal-tree candidates (including concurrent races) adopt the existing
+  // commit that proves the same identity; anything else fails closed.
+  const pinned = await ensureCandidateSnapshotRef(capture, taskId, treeSha, commitSha);
+  commitSha = pinned.commitSha;
+  const candidateRef = pinned.ref;
 
   // ── Move HEAD to the candidate commit ──
   await gitCmd(["reset", "--hard", commitSha], worktreeRoot);
@@ -264,25 +728,6 @@ Task-Id: ${taskId}`;
     );
   }
 
-  // ── Pin the candidate under a private ref ──
-  const candidateRef = candidateRefName(waveId, taskId);
-
-  // Atomic compare-and-swap: if a prior candidate was supplied, use Git's
-  // expected-old-value form so the replacement is a single operation.
-  if (priorCandidate) {
-    await gitCmd(
-      ["update-ref", candidateRef, commitSha, priorCandidate.commitSha],
-      repoPath,
-    ).catch(() => {
-      throw new Error(
-        `Candidate ref ${candidateRef} was expected at ${priorCandidate.commitSha} ` +
-        `but has changed. Refusing to overwrite.`,
-      );
-    });
-  } else {
-    await gitCmd(["update-ref", candidateRef, commitSha], repoPath);
-  }
-
   // ── Check if tree differs from base ──
   const baseTreeSha = await gitOut(
     ["rev-parse", `${baseCommit}^{tree}`],
@@ -296,6 +741,43 @@ Task-Id: ${taskId}`;
     candidateRef,
     differsFromBase,
   };
+}
+
+/**
+ * Verify a supplied prior candidate strictly (read-only) and return its
+ * commit SHA when the new tree matches the prior tree, or undefined when the
+ * tree differs and a fresh candidate must be created. Legacy mutable prior
+ * refs are accepted only while they still pin the recorded commit.
+ */
+async function adoptPriorCandidate(
+  repoPath: string,
+  lineage: WaveLineage,
+  taskId: string,
+  baseCommit: string,
+  treeSha: string,
+  priorCandidate: PriorCandidate | undefined,
+): Promise<string | undefined> {
+  if (!priorCandidate) return undefined;
+  if (priorCandidate.ref) {
+    const pinned = await gitOut(["rev-parse", "--verify", priorCandidate.ref], repoPath).catch(() => "");
+    if (pinned !== priorCandidate.commitSha) {
+      throw new Error(
+        `Prior candidate ref ${priorCandidate.ref} points to ${pinned || "nothing"}, ` +
+          `expected ${priorCandidate.commitSha}. Refusing to continue from an unverified prior candidate.`,
+      );
+    }
+  }
+  const priorTree = priorCandidate.treeSha
+    ?? await gitOut(["rev-parse", `${priorCandidate.commitSha}^{tree}`], repoPath);
+  if (priorTree !== treeSha) return undefined;
+  await verifyCandidateCommitIdentity(repoPath, {
+    commitSha: priorCandidate.commitSha,
+    treeSha,
+    baseCommit,
+    lineage,
+    taskId,
+  });
+  return priorCandidate.commitSha;
 }
 
 /**

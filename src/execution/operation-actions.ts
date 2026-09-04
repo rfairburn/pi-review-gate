@@ -6,10 +6,18 @@ import { promisify } from "node:util";
 import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import { atomicWrite } from "./durable-write";
 import type { ExecutorPoolAssignment } from "./executor-pool";
-import { candidateRefName, normalizeCandidate, pinRecoveryCandidate } from "./wave-commits";
+import {
+  normalizeCandidate,
+  reviewCycleAliasRefName,
+  verifyCandidateCommitIdentity,
+  verifyCheckpointRefPath,
+  verifyReviewCycleIdentity,
+  waveLineageOf,
+  type WaveLineage,
+} from "./wave-commits";
 import type { WaveIntegrationResult } from "./wave-integration";
 import { executeWaveLanding, inspectLandingRecoveryManifests, planWaveLanding, recoverLandingManifest, type LandingExecutionResult, type LandingPlan, type LandingRecoveryManifestInspection } from "./wave-landing";
-import { readWaveCaptureRecord } from "./wave-repository";
+import { readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
 import { runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "./wave-worker-lifecycle";
 import { createTaskInstructionEvidenceRecorder, resumeWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
 import { createWorkerWorktree, pinCommit, removeWorktree, type WorkerWorktree } from "./wave-worktrees";
@@ -375,17 +383,21 @@ export async function continueOperation(input: {
   };
   const recoveryWorktree = await ensureRecoveryWorktree(capture, record, input.signal);
   record.generation += 1;
-  const continuationCapture = { ...capture, waveId: `${capture.waveId}-g${record.generation}` };
-  await promisify(execFile)("git", [
-    "update-ref",
-    candidateRefName(continuationCapture.waveId, record.taskId),
-    record.checkpoint.commitSha,
-  ], {
-    cwd: capture.repositoryPath,
-    env: { ...process.env, ...GIT_ENV },
-    timeout: 30_000,
-    signal: input.signal,
-  });
+  // Continuation candidates keep their own immutable snapshot namespace per
+  // generation; the durable checkpoint's actual ref is carried verbatim as
+  // the prior candidate identity instead of priming a mutable ref in the
+  // -gN namespace. Legacy checkpoint refs stay read-only and are migrated
+  // lazily onto the immutable namespace when normalization adopts them.
+  // The explicit root wave identity and generation travel with the
+  // continuation capture so candidate lineage is never inferred from
+  // wave-id text (an original wave id may itself end in "-gN").
+  const rootLineage = waveLineageOf(capture);
+  const continuationCapture: WaveCaptureResult = {
+    ...capture,
+    waveId: `${rootLineage.rootWaveId}-g${record.generation}`,
+    rootWaveId: rootLineage.rootWaveId,
+    continuationGeneration: record.generation,
+  };
 
   const instructionRecord: OperationInstruction = {
     instructionId: input.instructionId,
@@ -409,7 +421,10 @@ export async function continueOperation(input: {
     candidate: {
       commitSha: record.checkpoint.commitSha,
       treeSha: record.checkpoint.treeSha,
-      candidateRef: candidateRefName(record.waveId, record.taskId),
+      // Carry the durable checkpoint's actual ref so continuation verifies
+      // and adopts exactly that identity instead of mixing the original-wave
+      // and -gN candidate namespaces.
+      candidateRef: record.checkpoint.ref,
       differsFromBase: record.checkpoint.differsFromBase,
     },
     operationRecord: operationRecordPath(record.artifactDir),
@@ -531,6 +546,9 @@ export async function continueOperation(input: {
         message: "preparing the accepted continuation for independent landing",
         artifactDir: record.artifactDir,
       });
+      // Landing is tied to the exact immutable review-cycle candidate/tree:
+      // re-verify the final review cycle alias still pins the accepted commit.
+      await verifyAcceptedReviewCycleIdentity(continuationCapture, record, lifecycle);
       const integratedRef = await pinCommit(
         continuationCapture,
         lifecycle.acceptedCommitSha!,
@@ -617,6 +635,34 @@ export async function continueOperation(input: {
   }
 }
 
+async function verifyAcceptedReviewCycleIdentity(
+  capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>,
+  record: OperationRecord,
+  lifecycle: WaveWorkerLifecycleResult,
+): Promise<void> {
+  const finalCycle = lifecycle.reviewCycles[lifecycle.reviewCycles.length - 1];
+  if (!finalCycle || !lifecycle.acceptedCommitSha) return;
+  if (finalCycle.candidateCommit !== lifecycle.acceptedCommitSha) {
+    throw new Error(
+      `Accepted continuation commit ${lifecycle.acceptedCommitSha} does not match the final review cycle candidate ` +
+        `${finalCycle.candidateCommit}; refusing to integrate an unverified identity.`,
+    );
+  }
+  const expectedAliasRef = reviewCycleAliasRefName(capture.waveId, record.taskId, finalCycle.cycle);
+  if (finalCycle.candidateRef !== expectedAliasRef) {
+    throw new Error(
+      `Final review cycle alias ${finalCycle.candidateRef} does not match the expected immutable alias ` +
+        `${expectedAliasRef}; refusing to integrate an unverified identity.`,
+    );
+  }
+  await verifyReviewCycleIdentity(
+    capture,
+    record.taskId,
+    finalCycle.candidateRef,
+    { commitSha: finalCycle.candidateCommit, treeSha: finalCycle.candidateTreeSha },
+  );
+}
+
 async function ensureRecoveryWorktree(
   capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>,
   record: OperationRecord,
@@ -640,7 +686,18 @@ async function ensureRecoveryWorktree(
   return worktree;
 }
 
-async function verifyRecoveryCheckpoint(
+/**
+ * Verify the operation's durable recovery checkpoint before any worktree
+ * restoration or executor invocation.
+ *
+ * Beyond object/tree/parent/path checks, the checkpoint must prove its
+ * wave and task identity: its ref must be an allowed immutable snapshot (or
+ * legacy candidates/recovery compatibility) form for exactly this task and
+ * this wave's continuation chain, and its commit must carry Wave-Id and
+ * Task-Id trailers that match that same chain and task. A checkpoint from
+ * another task or wave sharing the base is rejected fail-closed.
+ */
+export async function verifyRecoveryCheckpoint(
   waveRoot: string,
   record: OperationRecord,
   knownCapture?: Awaited<ReturnType<typeof readWaveCaptureRecord>>,
@@ -648,14 +705,29 @@ async function verifyRecoveryCheckpoint(
   const checkpoint = record.checkpoint;
   if (!checkpoint?.verified) throw new Error("Recovery checkpoint is missing or is not marked verified.");
   const capture = knownCapture ?? await readWaveCaptureRecord(waveRoot);
+  // The checkpoint may have been created by any generation of this wave's
+  // continuation chain up to the record's current generation: original-wave
+  // checkpoints pin the root namespace, and continuation k pins <root>-g<k>
+  // (abandoned-writer reconciliation re-pins to the current generation
+  // namespace, <root>-g<k> for k > 0).
+  const captureLineage = waveLineageOf(capture);
+  if (!Number.isInteger(record.generation) || record.generation < 0) {
+    throw new Error(
+      `Operation record generation is not a non-negative integer: ${String(record.generation)}.`,
+    );
+  }
+  const checkpointLineage: WaveLineage = {
+    rootWaveId: captureLineage.rootWaveId,
+    generation: Math.max(captureLineage.generation, record.generation),
+  };
+  // The checkpoint ref must be an allowed durable form for this exact task
+  // and continuation lineage before any Git state is consulted.
+  verifyCheckpointRefPath(checkpoint.ref, record.taskId, checkpointLineage, checkpoint.treeSha);
   const objectType = await gitRead(["cat-file", "-t", checkpoint.commitSha], capture.repositoryPath);
   if (objectType !== "commit") throw new Error(`Recovery object ${checkpoint.commitSha} is not a commit.`);
   const treeSha = await gitRead(["rev-parse", `${checkpoint.commitSha}^{tree}`], capture.repositoryPath);
   if (treeSha !== checkpoint.treeSha) {
     throw new Error(`Recovery checkpoint tree mismatch: recorded ${checkpoint.treeSha}, actual ${treeSha}.`);
-  }
-  if (!checkpoint.ref.startsWith("refs/pi-review-gate/waves/")) {
-    throw new Error(`Recovery checkpoint ref is outside the protected namespace: ${checkpoint.ref}.`);
   }
   const pinnedCommit = await gitRead(["rev-parse", "--verify", checkpoint.ref], capture.repositoryPath);
   if (pinnedCommit !== checkpoint.commitSha) {
@@ -665,6 +737,16 @@ async function verifyRecoveryCheckpoint(
   if (parents.length !== 1 || parents[0] !== capture.baseCommit) {
     throw new Error(`Recovery checkpoint parent mismatch: expected sole parent ${capture.baseCommit}.`);
   }
+  // The checkpoint commit must prove the same tree/base/wave/task identity
+  // as candidate snapshots: its Wave-Id trailer belongs to this wave's
+  // continuation chain and its Task-Id trailer is exactly this task.
+  await verifyCandidateCommitIdentity(capture.repositoryPath, {
+    commitSha: checkpoint.commitSha,
+    treeSha: checkpoint.treeSha,
+    baseCommit: capture.baseCommit,
+    lineage: checkpointLineage,
+    taskId: record.taskId,
+  });
   const changedPaths = (await gitReadRaw(["diff", "--name-only", "-z", capture.baseCommit, checkpoint.commitSha], capture.repositoryPath))
     .split("\0")
     .filter(Boolean)
@@ -691,8 +773,20 @@ async function gitReadRaw(args: string[], cwd: string): Promise<string> {
   return stdout;
 }
 
-async function reconcileAbandonedOperation(record: OperationRecord, waveRoot: string): Promise<OperationRecord> {
+/**
+ * Reconcile an operation whose prior writer ended without releasing it.
+ * Exported for targeted recovery-identity tests.
+ */
+export async function reconcileAbandonedOperation(record: OperationRecord, waveRoot: string): Promise<OperationRecord> {
   const capture = await readWaveCaptureRecord(waveRoot);
+  // Never allow reconciliation to launder an invalid durable checkpoint into
+  // a newly normalized candidate. A retained worktree may contain changes
+  // after the checkpoint, but any checkpoint it claims must first prove its
+  // recorded ref/tree/base/wave/task identity. Legacy interrupted operations
+  // without a checkpoint still reconcile from the worktree alone.
+  if (record.checkpoint) {
+    await verifyRecoveryCheckpoint(waveRoot, record, capture);
+  }
   const worktree = await fs.lstat(record.worktreeRoot).catch(() => undefined);
   if (!worktree?.isDirectory() || worktree.isSymbolicLink()) {
     if (!record.checkpoint?.verified) {
@@ -711,12 +805,34 @@ async function reconcileAbandonedOperation(record: OperationRecord, waveRoot: st
     await writeOperationRecord(record);
     return record;
   }
+  // Reconcile against the full continuation chain the durable checkpoint can
+  // belong to, not just the root namespace: an abandoned continuation's
+  // checkpoint is pinned under <root>-g<k> and its commit proves that
+  // generation's wave identity. Verifying adoption with only the original
+  // capture would reject an unchanged gen-k worktree as a foreign candidate.
+  const rootLineage = waveLineageOf(capture);
+  if (!Number.isInteger(record.generation) || record.generation < 0) {
+    throw new Error(
+      `Operation record generation is not a non-negative integer: ${String(record.generation)}.`,
+    );
+  }
+  const reconcileGeneration = Math.max(rootLineage.generation, record.generation);
+  const reconcileCapture: WaveCaptureResult = {
+    ...capture,
+    waveId: reconcileGeneration === 0 ? rootLineage.rootWaveId : `${rootLineage.rootWaveId}-g${reconcileGeneration}`,
+    rootWaveId: rootLineage.rootWaveId,
+    continuationGeneration: reconcileGeneration,
+  };
   const candidate = await normalizeCandidate(
-    capture,
+    reconcileCapture,
     record.worktreeRoot,
     record.taskId,
     record.title,
-    record.checkpoint ? { commitSha: record.checkpoint.commitSha } : undefined,
+    record.checkpoint ? {
+      commitSha: record.checkpoint.commitSha,
+      treeSha: record.checkpoint.treeSha,
+      ref: record.checkpoint.ref,
+    } : undefined,
   );
   const changed = await promisify(execFile)("git", [
     "diff", "--name-only", "-z", capture.baseCommit, candidate.commitSha,
@@ -729,7 +845,9 @@ async function reconcileAbandonedOperation(record: OperationRecord, waveRoot: st
     checkpointId: `${record.operationId}:restart:${record.revision + 1}`,
     commitSha: candidate.commitSha,
     treeSha: candidate.treeSha,
-    ref: await pinRecoveryCandidate(capture, record.taskId, candidate),
+    // New checkpoints pin the immutable, content-addressed candidate snapshot
+    // ref. Mutable legacy recovery refs are never written again.
+    ref: candidate.candidateRef,
     differsFromBase: candidate.differsFromBase,
     createdAt: new Date().toISOString(),
     verified: true,

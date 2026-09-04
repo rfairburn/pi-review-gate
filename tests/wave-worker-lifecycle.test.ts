@@ -1339,3 +1339,61 @@ test("lifecycle: invalid maxCorrectionCycles fails safely", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("lifecycle: review cycles pin immutable per-cycle aliases and acceptance matches the final cycle", async () => {
+  const root = await mkTmp("pi-wwl-alias-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-alias-lifecycle");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-alias-lifecycle");
+    const { command } = await createFakeExecutor(root);
+
+    const config = buildPassingReviewerConfig(command);
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-alias-lifecycle",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "accepted");
+    assert.ok(result.reviewCycles.length >= 1, "at least one review cycle ran");
+
+    // Every recorded cycle pins an immutable per-cycle alias that still pins
+    // the exact reviewed candidate commit and tree.
+    for (const cycle of result.reviewCycles) {
+      const expectedRef = `refs/pi-review-gate/waves/${capture.waveId}/review-candidates/task-alias-lifecycle/cycle-${String(cycle.cycle).padStart(6, "0")}`;
+      assert.equal(cycle.candidateRef, expectedRef, "cycle records its immutable alias ref");
+      const pinned = await gitInRepo(["rev-parse", "--verify", cycle.candidateRef], capture.repositoryPath);
+      assert.equal(pinned, cycle.candidateCommit, "alias pins the reviewed candidate");
+      const tree = await gitInRepo(["rev-parse", `${cycle.candidateCommit}^{tree}`], capture.repositoryPath);
+      assert.equal(tree, cycle.candidateTreeSha, "alias candidate matches the recorded tree");
+    }
+
+    // Acceptance is tied to the final review cycle candidate.
+    const finalCycle = result.reviewCycles[result.reviewCycles.length - 1];
+    assert.equal(result.acceptedCommitSha, finalCycle.candidateCommit, "accepted commit equals the final cycle candidate");
+
+    // result.json records the alias identity compatibly.
+    const persisted = JSON.parse(await readFile(join(artifactDir, "result.json"), "utf8"));
+    for (const cycle of persisted.reviewCycles) {
+      assert.equal(typeof cycle.candidateRef, "string");
+      assert.ok(cycle.candidateRef.startsWith("refs/pi-review-gate/waves/"));
+    }
+
+    // The accepted worker ref is create-once and pins the exact passed commit.
+    assert.equal(result.acceptedRef, workerRefName(capture.waveId, "task-alias-lifecycle"));
+    assert.equal(
+      await gitInRepo(["rev-parse", result.acceptedRef!], capture.repositoryPath),
+      result.acceptedCommitSha,
+    );
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

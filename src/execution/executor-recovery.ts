@@ -1,5 +1,5 @@
 import type { ExecutionRetryPolicy } from "../config";
-import { normalizeCandidate, pinRecoveryCandidate, type CandidateCommit } from "./wave-commits";
+import { normalizeCandidate, type PriorCandidate } from "./wave-commits";
 import type { WaveCaptureResult } from "./wave-repository";
 import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorRequest, type ExecutorTurn } from "./types";
 import type { WorkerWorktree } from "./wave-worktrees";
@@ -46,8 +46,19 @@ export async function runExecutorWithRecovery(input: {
   let genericRetries = 0;
   let compactionRecoveries = 0;
   let totalAttempts = 0;
-  let priorCheckpointCandidate: CandidateCommit | undefined;
+  let priorCheckpointCandidate: PriorCandidate | undefined;
   let checkpoint: RecoveryCheckpoint | undefined = input.operation.checkpoint;
+  // Honor the durable operation checkpoint as the initial prior checkpoint:
+  // its ref is verified strictly read-only and its commit is adopted whenever
+  // the workspace still matches its tree, so recovery never mingles a new
+  // candidate identity with the durable one.
+  if (checkpoint?.verified) {
+    priorCheckpointCandidate = {
+      commitSha: checkpoint.commitSha,
+      treeSha: checkpoint.treeSha,
+      ref: checkpoint.ref,
+    };
+  }
   let recovery: ExecutorRequest["recovery"];
   const incidents: ExecutionIncident[] = [];
   const repeated = new Map<string, number>();
@@ -105,7 +116,7 @@ export async function runExecutorWithRecovery(input: {
       attemptRecord.outcome = "cancelled";
       try {
         const created = await createVerifiedCheckpoint(input, attemptRecord, priorCheckpointCandidate);
-        priorCheckpointCandidate = created.candidate;
+        priorCheckpointCandidate = created.candidateIdentity;
         checkpoint = created.checkpoint;
         input.operation.checkpoint = checkpoint;
         input.operation.state = "cancelled";
@@ -187,7 +198,7 @@ export async function runExecutorWithRecovery(input: {
 
     try {
       const created = await createVerifiedCheckpoint(input, attemptRecord, priorCheckpointCandidate);
-      priorCheckpointCandidate = created.candidate;
+      priorCheckpointCandidate = created.candidateIdentity;
       checkpoint = created.checkpoint;
       input.operation.checkpoint = checkpoint;
     } catch (error) {
@@ -257,22 +268,29 @@ export async function runExecutorWithRecovery(input: {
 async function createVerifiedCheckpoint(
   input: Parameters<typeof runExecutorWithRecovery>[0],
   attemptRecord: ExecutionAttemptRecord,
-  priorCheckpointCandidate?: CandidateCommit,
-): Promise<{ candidate: CandidateCommit; checkpoint: RecoveryCheckpoint }> {
+  priorCheckpointCandidate?: PriorCandidate,
+): Promise<{ candidateIdentity: PriorCandidate; checkpoint: RecoveryCheckpoint }> {
   const candidate = await normalizeCandidate(
     input.capture,
     input.worktree.worktreeRoot,
     input.taskId,
     input.title,
-    priorCheckpointCandidate ? { commitSha: priorCheckpointCandidate.commitSha } : undefined,
+    priorCheckpointCandidate,
   );
+  const candidateIdentity: PriorCandidate = {
+    commitSha: candidate.commitSha,
+    treeSha: candidate.treeSha,
+    ref: candidate.candidateRef,
+  };
   return {
-    candidate,
+    candidateIdentity,
     checkpoint: {
       checkpointId: `${input.operation.operationId}:${attemptRecord.attempt}`,
       commitSha: candidate.commitSha,
       treeSha: candidate.treeSha,
-      ref: await pinRecoveryCandidate(input.capture, input.taskId, candidate),
+      // New checkpoints pin the immutable, content-addressed candidate
+      // snapshot ref. Mutable legacy recovery refs are never written again.
+      ref: candidate.candidateRef,
       differsFromBase: candidate.differsFromBase,
       createdAt: new Date().toISOString(),
       verified: true,

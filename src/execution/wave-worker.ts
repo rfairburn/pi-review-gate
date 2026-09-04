@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:p
 import { promises as fs } from "node:fs";
 import { atomicWrite } from "./durable-write";
 import { createExecutorAdapter } from "./adapters/factory";
-import { normalizeCandidate, pinRecoveryCandidate, type CandidateCommit } from "./wave-commits";
+import { normalizeCandidate, type CandidateCommit } from "./wave-commits";
 import type { WorkerWorktree } from "./wave-worktrees";
 import type { WaveCaptureResult } from "./wave-repository";
 import {
@@ -660,11 +660,21 @@ async function runWithPoolFailover(input: {
       finishAssignment(assignmentRecord, "failed");
       let checkpoint = input.operation.checkpoint;
       try {
+        // Honor the durable operation checkpoint (if any) as the prior
+        // candidate identity; its ref is verified strictly read-only.
+        const priorCheckpoint = input.operation.checkpoint
+          ? {
+            commitSha: input.operation.checkpoint.commitSha,
+            treeSha: input.operation.checkpoint.treeSha,
+            ref: input.operation.checkpoint.ref,
+          }
+          : undefined;
         const candidate = await normalizeCandidate(
           input.worker.capture,
           input.worker.worktree.worktreeRoot,
           input.worker.taskId,
           input.worker.task.title,
+          priorCheckpoint,
         );
         checkpoint = await checkpointCandidate(input.worker.capture, input.worker.taskId, candidate);
         input.operation.checkpoint = checkpoint;
@@ -1211,7 +1221,11 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       worktree.worktreeRoot,
       taskId,
       task.title,
-      { commitSha: priorResult.candidate.commitSha },
+      {
+        commitSha: priorResult.candidate.commitSha,
+        treeSha: priorResult.candidate.treeSha,
+        ref: priorResult.candidate.candidateRef,
+      },
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Candidate normalization failed.";
@@ -1320,7 +1334,9 @@ async function checkpointCandidate(
     checkpointId: `${capture.waveId}/${taskId}:${candidate.commitSha.slice(0, 12)}`,
     commitSha: candidate.commitSha,
     treeSha: candidate.treeSha,
-    ref: await pinRecoveryCandidate(capture, taskId, candidate),
+    // New checkpoints pin the immutable, content-addressed candidate snapshot
+    // ref. Mutable legacy recovery refs are never written again.
+    ref: candidate.candidateRef,
     differsFromBase: candidate.differsFromBase,
     createdAt: new Date().toISOString(),
     verified: true,

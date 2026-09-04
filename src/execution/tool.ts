@@ -508,10 +508,10 @@ export class ExecutionToolManager {
 
 const RESEARCH_ALLOWED_TOOLS = new Set([
   "read", "grep", "glob", "find", "ls", "WebFetch", "WebSearch", "BrowserExtract",
-  // Initial interactive-browser support is observational only. Mutation and
-  // interaction tools do not enter the research role policy.
+  // Research may use observational hover, but consequential click authority
+  // never enters the read-only role policy.
   "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
-  "BrowserScroll", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
+  "BrowserScroll", "BrowserHover", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
 ]);
 
 function researchToolIntersection(parent: string[]): string[] {

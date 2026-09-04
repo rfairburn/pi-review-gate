@@ -477,7 +477,7 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.deepEqual([...tools.keys()], [
     "WebSearch", "WebFetch", "BrowserExtract",
     "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
-    "BrowserScroll", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
+    "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ]);
   assert.deepEqual(Object.keys(tools.get("BrowserOpen").parameters.properties), ["url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserNavigate").parameters.properties), ["session", "tab", "url"]);
@@ -485,6 +485,13 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.deepEqual(Object.keys(tools.get("BrowserScreenshot").parameters.properties), ["session", "tab", "mode", "ref"]);
   assert.deepEqual(tools.get("BrowserScreenshot").parameters.required, ["session", "tab", "mode"]);
   assert.deepEqual(Object.keys(tools.get("BrowserScroll").parameters.properties), ["session", "tab", "target", "direction", "amount", "ref"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserHover").parameters.properties), ["session", "tab", "ref"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserClick").parameters.properties), ["session", "tab", "ref"]);
+  assert.deepEqual(tools.get("BrowserHover").parameters.required, ["session", "tab", "ref"]);
+  assert.deepEqual(tools.get("BrowserClick").parameters.required, ["session", "tab", "ref"]);
+  assert.equal(tools.get("BrowserClick").parameters.properties.session.maxLength, 256);
+  assert.equal(tools.get("BrowserClick").parameters.properties.tab.maxLength, 256);
+  assert.equal(tools.get("BrowserClick").parameters.properties.ref.maxLength, 512);
   assert.deepEqual(Object.keys(tools.get("BrowserWait").parameters.properties), ["session", "tab", "condition", "ref", "state", "text", "present", "url", "match", "durationMs", "timeoutMs"]);
   assert.deepEqual(Object.keys(tools.get("BrowserHistory").parameters.properties), ["session", "tab", "operation", "maxEntries"]);
   assert.deepEqual(Object.keys(tools.get("BrowserTabs").parameters.properties), ["session", "operation", "tab", "url"]);
@@ -641,6 +648,72 @@ test("BrowserScreenshot returns Pi image content and fails with BrowserSnapshot 
   assert.equal(JSON.stringify(supported.details).includes(png.toString("base64")), false);
   assert.doesNotMatch(supported.content[0].text, new RegExp(png.toString("base64")));
   assert.match(supported.content[0].text, /1x1.*encoded bytes/);
+  await manager.cleanup();
+});
+
+test("BrowserClick uses only Pi's interactive execution-context confirmation API", async () => {
+  const config = normalizeConfig({});
+  const confirmationAvailability: boolean[] = [];
+  const interactive = {
+    click: async (_session: string, _tab: string, _ref: string, confirmation: unknown) => {
+      confirmationAvailability.push(typeof confirmation === "function");
+      if (typeof confirmation !== "function") throw new Error("BrowserClick not_started: confirmation unavailable");
+      const approved = await (confirmation as (request: { title: string; message: string }) => Promise<boolean>)({
+        title: "Fixed title",
+        message: "Fixed bounded message",
+      });
+      assert.equal(approved, true);
+      return {
+        session: "session", tab: "tab", generation: "new-generation", operation: "click",
+        consequence: "unknown_or_mixed", confirmed: true, effect: "completed",
+        effects: { navigation: "not_observed", observedPopupTabs: 0, observedOverflowPopupsClosed: 0, observedDialogsDismissed: 0, download: "not_observed", accounting: "bounded_stable" },
+        url: "https://example.com",
+      };
+    },
+    updateConfig() {},
+    async shutdown() {},
+  } as unknown as InteractiveBrowserManager;
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager(
+    { registerTool: (tool) => tools.set(tool.name, tool) },
+    config,
+    undefined,
+    undefined,
+    interactive,
+  );
+  manager.register();
+  const click = tools.get("BrowserClick");
+  const prompts: Array<[string, string]> = [];
+  const oversized = await click.execute(
+    "oversized",
+    { session: "s".repeat(257), tab: "tab", ref: "ref" },
+    undefined,
+    undefined,
+    { hasUI: true, ui: { confirm: async () => true } },
+  );
+  assert.equal(oversized.isError, true);
+  assert.match(oversized.content[0].text, /256-character limit/);
+  assert.deepEqual(confirmationAvailability, [], "oversized arguments are rejected before manager lookup");
+
+  const approved = await click.execute(
+    "approved",
+    { session: "session", tab: "tab", ref: "ref" },
+    undefined,
+    undefined,
+    { hasUI: true, ui: { confirm: async (title: string, message: string) => { prompts.push([title, message]); return true; } } },
+  );
+  assert.equal(approved.isError, false);
+  assert.deepEqual(prompts, [["Fixed title", "Fixed bounded message"]]);
+
+  const background = await click.execute(
+    "background",
+    { session: "session", tab: "tab", ref: "ref" },
+    undefined,
+    undefined,
+    { hasUI: false, ui: { confirm: async () => true } },
+  );
+  assert.equal(background.isError, true);
+  assert.deepEqual(confirmationAvailability, [true, false], "hasUI=false never reaches an ambient confirm function");
   await manager.cleanup();
 });
 

@@ -1,7 +1,7 @@
 # Web tools
 
 This page owns the native web research tools: `WebSearch`, `WebFetch`,
-`BrowserExtract`, and the observational interactive-browser tools, their cache and
+`BrowserExtract`, and the bounded interactive-browser tools, their cache and
 session behavior, and the standalone web CLI. Config fields and
 defaults live in [Configuration](configuration.md#web-fields); hardening details live in
 the [Security model](security-model.md#web-egress-hardening).
@@ -92,12 +92,12 @@ Chromium provisioning follows the install-time rules described in
 `PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1` and the `npx playwright install chromium`
 recovery path.
 
-## Observational interactive browser
+## Interactive browser
 
 Use the least-powerful acquisition method that works: `WebSearch` discovers sources,
 `WebFetch` reads ordinary documents, `BrowserExtract` renders one dynamic page and
 immediately closes it, and only then should a Pi-native orchestrator or worker open a
-short-lived interactive session. The initial session surface is deliberately read-only:
+short-lived interactive session. The session surface is bounded and semantic:
 
 - `BrowserOpen` creates one isolated context and tab, navigates to a public HTTP(S) URL,
   and returns opaque random session, tab, and document-generation handles.
@@ -140,18 +140,39 @@ short-lived interactive session. The initial session surface is deliberately rea
   reports that fact. Failed opens restore the prior active tab only after rollback
   closure is confirmed; an uncertain creation, tab close, or history traversal tears
   down the session before returning an error.
+- `BrowserHover` hovers exactly one current opaque semantic ref. It is observational,
+  accepts no action options, and invalidates that tab's refs after a successful dispatch
+  because hover-driven page changes can make prior evidence stale.
+- `BrowserClick` clicks exactly one current opaque semantic ref. A centralized policy
+  inspects a freshly resolved target's structural properties and fingerprint; accessible
+  names, page claims, and model assertions never establish safety. Structurally proven
+  ordinary HTTP(S) links and native `summary` disclosure controls may proceed without a
+  prompt. Silent links are activated as controlled brokered navigation rather than by
+  dispatching page click handlers; known consequential destinations such as logout,
+  destructive, authorization, publish, send, purchase, or account paths are not silent. Forms, downloads, authentication/terms/permissions, destructive/publish/send/
+  purchase/account actions, unknown buttons or menu items, and every unknown or mixed
+  result are consequential. A top-level interactive Pi session must approve one exact,
+  short-lived click through Pi's confirmation UI. The permit is bound to the session,
+  tab, document generation, origin and destination, operation, target fingerprint, and
+  consequence; it is single-use, expires absolutely, and is consumed only after the
+  target is re-resolved and all fields still match. Denial, cancellation, timeout,
+  absent UI, changed structure/origin, or stale refs prevents dispatch. Non-UI executor
+  sessions reject consequential clicks rather than approving them.
 - `BrowserClose` is idempotent. It reports closure only after the page, context,
   Chromium connection, broker listener, and every tracked broker socket are confirmed
   quiescent. Recent closes retain bounded broker diagnostics; older confirmed closes
   remain recognizable through authenticated session handles without retaining
   unbounded state.
 
-There is no click, typing, form submission, upload, download, caller-provided selector,
-XPath, coordinate action, caller-supplied JavaScript/evaluate, CDP, or permission API.
-Element operations resolve only extension-issued semantic refs internally. Popups never
-escape session ownership and are closed when the four-tab bound is full. Service workers, WebSockets,
-external protocols, media, downloads, permissions, direct QUIC/WebRTC, and proxy bypass
-are disabled. This initial observational implementation also disables images and
+There is no typing, form-data entry, upload, download saving, clipboard, caller-provided
+selector, XPath, coordinate action, caller-supplied JavaScript/evaluate, forced click,
+arbitrary click option, CDP, or permission API. Click and hover resolve only
+extension-issued semantic refs internally. Navigation, popup, dialog, and download
+observers are armed before dispatch. Popup tabs stay in the same ownership/broker bound
+and are never auto-switched; overflow popups are closed. Unexpected downloads are
+canceled, and confirm/prompt/beforeunload dialogs are default-dismissed so they cannot
+hang an action. Service workers, WebSockets, external protocols, media, permissions,
+direct QUIC/WebRTC, and proxy bypass are disabled. This initial observational implementation also disables images and
 custom/downloadable fonts in Chromium itself and blocks image/font requests at routing;
 no visual resource is allowed to bypass broker accounting through a generated `data:`
 or `blob:` URL.
@@ -173,8 +194,9 @@ Limits are hard and finite: at most 4 process-local sessions, 4 tabs per session
 explicit navigations/history traversals, 64 operations, 32 retained history entries per
 tab, 32 main-document requests, 16 destination hosts,
 96 connections, 256 broker requests, 8 MiB per connection, and 32 MiB aggregate bytes.
-Each open/navigation has one 30-second end-to-end deadline and each other action or
-snapshot has one 10-second end-to-end deadline; phases do not receive fresh timers.
+Each open/navigation and confirmation-capable click has one 30-second end-to-end
+deadline; each other action or snapshot has one 10-second end-to-end deadline. All
+phases share that one absolute timer and never receive fresh timers.
 Idle sessions are capped at 60 seconds, total lifetime at 5 minutes, redirect chains at 10 hops, and
 semantic output at 24,000 characters and depth 16. A screenshot is capped at 2,000×2,000,
 4,000,000 decoded pixels, 4 MiB of final encoded PNG data, and a conservative 32 MiB
@@ -185,7 +207,12 @@ content is created. Budgets are cumulative for the whole session, not reset by
 navigation.
 
 Cancellation, session shutdown, browser crashes, expiry, and broker policy/budget
-failures immediately begin deadline-bounded teardown. Shutdown also aborts and awaits
+failures immediately begin deadline-bounded teardown. Interaction failures distinguish
+`not_started`, `started`, `completed`, and `unknown` effect states where available and
+never claim that cancellation rolled back a page or external effect. Successful results
+use a bounded post-dispatch accounting window, drain containment work added during that
+window, and describe absent navigation/downloads as `not_observed` rather than proving
+that a later page effect cannot occur. Shutdown also aborts and awaits
 any `BrowserOpen` still in startup, permanently rejects new opens, and preserves any
 unconfirmed startup teardown as a shutdown error. If any close step times out or
 quiescence cannot be proven, the tool returns an error saying closure is unconfirmed; it
@@ -199,10 +226,11 @@ authorized but inactive initially when deferred tools are enabled. Use `search_t
 with the exact tool name to load one. `BrowserScreenshot` checks the current Pi model's
 input contract before capture; when image input is unavailable (or the host does not
 provide a model capability contract), it returns a clear error and directs the caller
-back to `BrowserSnapshot` rather than creating bytes Pi cannot deliver. Top-level,
-execute, and research Pi roles receive all nine observational operations above; no
-interaction operations are part of the role policy. Their names appear in each role's
-deterministic names-only system-prompt inventory while schemas remain deferred.
+back to `BrowserSnapshot` rather than creating bytes Pi cannot deliver. Top-level and execute Pi roles receive `BrowserHover` and `BrowserClick`; research Pi
+roles receive observational `BrowserHover` but never `BrowserClick`. Authorized names
+appear in each role's deterministic names-only system-prompt inventory while schemas
+remain deferred. The generic deferred matcher, ranking, limits, and guidance are shared
+unchanged with all other tools.
 External Claude and Codex adapters retain their existing native web-tool policies.
 
 ## Page cache

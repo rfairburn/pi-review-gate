@@ -17,7 +17,7 @@ const backgroundShellToolNames = ["ShellStart", "ShellList", "ShellLog", "ShellS
 const webToolNames = [
   "WebSearch", "WebFetch", "BrowserExtract",
   "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
-  "BrowserScroll", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
+  "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
 ];
 
 let previousConfig: string | undefined;

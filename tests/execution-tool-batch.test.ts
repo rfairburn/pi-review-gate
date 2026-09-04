@@ -525,7 +525,7 @@ test("SubtasksStart creates immutable research groups without child-local eviden
     activeTools: [
       "read", "WebSearch", "WebFetch", "BrowserExtract",
       "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
-      "BrowserScroll", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
+      "BrowserScroll", "BrowserHover", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
       "BrowserClick", "EvidenceAdd", "EvidenceGet", "EvidenceList",
     ],
   });
@@ -545,7 +545,7 @@ test("SubtasksStart creates immutable research groups without child-local eviden
   const researchCatalog = [
     "read", "WebSearch", "WebFetch", "BrowserExtract",
     "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
-    "BrowserScroll", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
+    "BrowserScroll", "BrowserHover", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ];
   assert.deepEqual(started.details.tasks[0].definition.executorAllowedTools, researchCatalog);
   assert.deepEqual(started.details.tasks[0].definition.executorToolCatalog, {

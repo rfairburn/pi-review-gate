@@ -4,6 +4,9 @@ import {
   type Browser,
   type BrowserContext,
   type BrowserType,
+  type Dialog,
+  type Download,
+  type Locator,
   type Page,
   type Request,
   type Response,
@@ -25,6 +28,17 @@ import {
 } from "./egress-broker";
 import type { HostResolver } from "./network";
 import { defaultHostResolver, validatePublicUrl } from "./network";
+import {
+  BrowserConfirmationPermits,
+  BrowserConsequencePolicy,
+  type BrowserConfirmationBinding,
+  type BrowserConsequence,
+  type BrowserTargetStructure,
+} from "./browser-interaction-policy";
+
+export const BROWSER_INTERACTION_SESSION_MAX_CHARS = 256;
+export const BROWSER_INTERACTION_TAB_MAX_CHARS = 256;
+export const BROWSER_INTERACTION_REF_MAX_CHARS = 512;
 
 /** Hard limits for the initial, observational browser surface. */
 export interface InteractiveBrowserLimits {
@@ -47,6 +61,7 @@ export interface InteractiveBrowserLimits {
   maxScreenshotAllocationBytes: number;
   navigationMs: number;
   actionMs: number;
+  confirmationMs: number;
   idleMs: number;
   lifetimeMs: number;
   cleanupMs: number;
@@ -77,6 +92,7 @@ export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Ob
   maxScreenshotAllocationBytes: 32 * 1024 * 1024,
   navigationMs: 30_000,
   actionMs: 10_000,
+  confirmationMs: 30_000,
   idleMs: 60_000,
   lifetimeMs: 5 * 60_000,
   cleanupMs: CLEANUP_DEADLINE_MS,
@@ -210,6 +226,36 @@ export interface BrowserTabsResult {
   maxTabs: number;
 }
 
+export type BrowserInteractionEffectState = "not_started" | "started" | "completed" | "unknown";
+
+export interface BrowserInteractionEffects {
+  navigation: "observed" | "not_observed";
+  observedPopupTabs: number;
+  observedOverflowPopupsClosed: number;
+  observedDialogsDismissed: number;
+  download: "not_observed" | "canceled";
+  accounting: "bounded_stable" | "bounded_uncertain";
+}
+
+export interface BrowserInteractionResult {
+  session: string;
+  tab: string;
+  generation: string;
+  operation: "hover" | "click";
+  consequence: BrowserConsequence | "observational";
+  confirmed: boolean;
+  effect: BrowserInteractionEffectState;
+  effects: BrowserInteractionEffects;
+  url: string;
+}
+
+export interface BrowserClickConfirmationRequest {
+  title: string;
+  message: string;
+}
+
+export type BrowserClickConfirmation = (request: BrowserClickConfirmationRequest) => Promise<boolean>;
+
 export interface BrowserCloseResult {
   session: string;
   closed: true;
@@ -225,6 +271,8 @@ interface InteractiveBrowserDependencies {
   launch?: BrowserType["launch"];
   now?: () => number;
   randomHandle?: (kind: "session" | "tab" | "generation" | "ref") => string;
+  consequencePolicy?: BrowserConsequencePolicy;
+  confirmationPermits?: BrowserConfirmationPermits;
   limits?: Partial<InteractiveBrowserLimits>;
 }
 
@@ -248,6 +296,15 @@ interface BrowserTab {
   closing: boolean;
 }
 
+interface InteractionCapture {
+  dialogs: number;
+  downloads: number;
+  popupTabs: Set<string>;
+  overflowPopups: number;
+  events: number;
+  settlements: Promise<void>[];
+}
+
 interface Session {
   handle: string;
   activeTab: string;
@@ -263,6 +320,7 @@ interface Session {
   actions: number;
   mainDocumentRequests: number;
   operationActive: boolean;
+  interactionCapture?: InteractionCapture;
   fatalError?: Error;
   teardown?: Promise<BrowserCloseResult>;
   expiryTimer?: NodeJS.Timeout;
@@ -290,6 +348,8 @@ export class InteractiveBrowserManager {
   private readonly launch: BrowserType["launch"];
   private readonly now: () => number;
   private readonly randomHandle: NonNullable<InteractiveBrowserDependencies["randomHandle"]>;
+  private readonly consequencePolicy: BrowserConsequencePolicy;
+  private readonly confirmationPermits: BrowserConfirmationPermits;
   readonly limits: Readonly<InteractiveBrowserLimits>;
 
   constructor(
@@ -300,6 +360,9 @@ export class InteractiveBrowserManager {
     this.launch = dependencies.launch ?? chromium.launch.bind(chromium);
     this.now = dependencies.now ?? Date.now;
     this.randomHandle = dependencies.randomHandle ?? ((kind) => `browser_${kind}_${randomBytes(24).toString("base64url")}`);
+    this.consequencePolicy = dependencies.consequencePolicy ?? new BrowserConsequencePolicy();
+    this.confirmationPermits = dependencies.confirmationPermits
+      ?? new BrowserConfirmationPermits(this.now, () => randomBytes(24).toString("base64url"), dependencies.limits?.confirmationMs ?? INTERACTIVE_BROWSER_LIMITS.confirmationMs);
     const requestedLimits = { ...INTERACTIVE_BROWSER_LIMITS, ...(dependencies.limits ?? {}) };
     this.limits = Object.freeze({
       ...requestedLimits,
@@ -421,7 +484,17 @@ export class InteractiveBrowserManager {
       });
       context.on("page", (candidate) => {
         if (this.tabForPage(session, candidate)) return;
-        this.adoptPopup(session, candidate);
+        const adopted = this.adoptPopup(session, candidate);
+        const capture = session.interactionCapture;
+        if (!capture) return;
+        capture.events += 1;
+        if (adopted) {
+          capture.popupTabs.add(adopted.handle);
+        } else {
+          capture.overflowPopups += 1;
+          const closure = session.pendingPageClosures.get(candidate);
+          if (closure) capture.settlements.push(closure);
+        }
       });
       this.sessions.set(session.handle, session);
       resourcesTransferredToSession = true;
@@ -720,6 +793,200 @@ export class InteractiveBrowserManager {
         operation.dispose();
       }
     }, true);
+  }
+
+  async hover(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserInteractionResult> {
+    try {
+      return await this.interact(sessionHandle, tabHandle, ref, "hover", undefined, signal);
+    } catch (error) {
+      throw normalizedInteractionFailure("BrowserHover", error);
+    }
+  }
+
+  async click(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    confirmation?: BrowserClickConfirmation,
+    signal?: AbortSignal,
+  ): Promise<BrowserInteractionResult> {
+    try {
+      return await this.interact(sessionHandle, tabHandle, ref, "click", confirmation, signal);
+    } catch (error) {
+      throw normalizedInteractionFailure("BrowserClick", error);
+    }
+  }
+
+  private async interact(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    operationName: "hover" | "click",
+    confirmation: BrowserClickConfirmation | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<BrowserInteractionResult> {
+    assertBoundedInteractionCapability(sessionHandle, BROWSER_INTERACTION_SESSION_MAX_CHARS);
+    assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
+    assertBoundedInteractionCapability(ref, BROWSER_INTERACTION_REF_MAX_CHARS);
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
+    return this.operate(session, signal, async () => {
+      const name = operationName === "click" ? "BrowserClick" : "BrowserHover";
+      const operation = new OperationDeadline(
+        name,
+        operationName === "click" ? this.limits.confirmationMs : this.limits.actionMs,
+        signal,
+      );
+      const capturedGeneration = tab.generation;
+      const capturedOrigin = interactionIdentityUrl(tab.page.url());
+      let started = false;
+      let capture: InteractionCapture | undefined;
+      try {
+        const locator = this.currentRefLocator(tab, ref);
+        await operation.run(locator.waitFor({ state: "visible", timeout: operation.remainingMs() }), "semantic target validation");
+        const structure = await operation.run(readTargetStructure(locator), "structural consequence inspection");
+        const decision = this.consequencePolicy.classify(structure);
+        let confirmed = false;
+
+        if (operationName === "click" && decision.consequential) {
+          if (!confirmation) {
+            throw new Error("BrowserClick not_started: this structurally consequential or unknown action requires an interactive Pi confirmation; background or no-UI execution is rejected.");
+          }
+          const binding = this.confirmationBinding(session, tab, ref, capturedOrigin, structure, decision.consequence, decision.destination);
+          const permit = this.confirmationPermits.issue(binding);
+          let approved = false;
+          try {
+            approved = await operation.run(confirmation(confirmationPrompt(decision.consequence, capturedOrigin, decision.destination)), "interactive confirmation");
+          } catch {
+            this.confirmationPermits.revoke(permit);
+            throw new Error("BrowserClick not_started: interactive confirmation was unavailable or cancelled.");
+          }
+          if (!approved) {
+            this.confirmationPermits.revoke(permit);
+            throw new Error("BrowserClick not_started: interactive confirmation was denied.");
+          }
+
+          throwIfAborted(operation.signal);
+          if (session.teardown || session.fatalError || tab.page.isClosed()) {
+            this.confirmationPermits.revoke(permit);
+            throw new Error("BrowserClick not_started: the browser session changed or closed after confirmation.");
+          }
+          if (tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin) {
+            this.invalidateInteractionRefs(tab, capturedGeneration);
+            this.confirmationPermits.revoke(permit);
+            throw new Error("BrowserClick not_started: the document or origin changed after confirmation; take a fresh BrowserSnapshot.");
+          }
+          const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref)), "post-confirmation target revalidation");
+          const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure);
+          const rebound = this.confirmationBinding(
+            session,
+            tab,
+            ref,
+            capturedOrigin,
+            revalidatedStructure,
+            revalidatedDecision.consequence,
+            revalidatedDecision.destination,
+          );
+          if (!this.confirmationPermits.consume(permit, rebound)) {
+            this.invalidateInteractionRefs(tab, capturedGeneration);
+            throw new Error("BrowserClick not_started: the confirmed target or consequence changed; take a fresh BrowserSnapshot.");
+          }
+          confirmed = true;
+        } else if (operationName === "click") {
+          // Silent paths receive the same immediate structural revalidation as
+          // confirmed paths. Any loss of proof converts to a no-action failure,
+          // never to an implicit confirmation bypass.
+          if (tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin) {
+            this.invalidateInteractionRefs(tab, capturedGeneration);
+            throw new Error("BrowserClick not_started: the document or origin changed before controlled activation; take a fresh BrowserSnapshot.");
+          }
+          const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref)), "safe-target revalidation");
+          const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure);
+          if (
+            revalidatedDecision.consequential
+            || revalidatedDecision.consequence !== decision.consequence
+            || revalidatedDecision.destination !== decision.destination
+            || this.consequencePolicy.fingerprint(revalidatedStructure) !== this.consequencePolicy.fingerprint(structure)
+          ) {
+            this.invalidateInteractionRefs(tab, capturedGeneration);
+            throw new Error("BrowserClick not_started: the silent target or consequence changed; take a fresh BrowserSnapshot.");
+          }
+        }
+
+        capture = {
+          dialogs: 0,
+          downloads: 0,
+          popupTabs: new Set(),
+          overflowPopups: 0,
+          events: 0,
+          settlements: [],
+        };
+        session.interactionCapture = capture;
+        started = true;
+        if (operationName === "hover") {
+          await operation.run(locator.hover({ timeout: operation.remainingMs() }), "semantic hover dispatch");
+        } else if (decision.consequence === "ordinary_navigation" && decision.destination) {
+          // Do not dispatch page-controlled click listeners for a silent link.
+          // Activate the freshly revalidated HTTP(S) destination through the
+          // existing brokered navigation path instead.
+          await this.navigateSession(session, tab, decision.destination, operation, false);
+        } else if (decision.consequence === "local_disclosure") {
+          // Toggle only the structurally proven native details state. Supplying
+          // a second, fixed argument distinguishes this internal operation from
+          // target-structure reads and exposes no caller-provided script.
+          await operation.run(locator.evaluate((element, expectedTag) => {
+            if (expectedTag !== "summary" || element.tagName.toLocaleLowerCase("en-US") !== expectedTag) {
+              throw new Error("Disclosure target changed.");
+            }
+            const details = element.parentElement;
+            if (!details || details.tagName.toLocaleLowerCase("en-US") !== "details") {
+              throw new Error("Disclosure container changed.");
+            }
+            (details as HTMLDetailsElement).open = !(details as HTMLDetailsElement).open;
+          }, "summary"), "controlled local disclosure");
+        } else {
+          await operation.run(locator.click({ timeout: operation.remainingMs() }), "confirmed semantic click dispatch");
+        }
+        const accounting = await accountInteractionEffects(capture, operation);
+        if (session.fatalError) throw session.fatalError;
+
+        const navigated = tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin;
+        this.invalidateInteractionRefs(tab, capturedGeneration);
+        return {
+          session: session.handle,
+          tab: tab.handle,
+          generation: tab.generation,
+          operation: operationName,
+          consequence: operationName === "hover" ? "observational" : decision.consequence,
+          confirmed,
+          effect: "completed",
+          effects: {
+            navigation: navigated ? "observed" : "not_observed",
+            observedPopupTabs: capture.popupTabs.size,
+            observedOverflowPopupsClosed: capture.overflowPopups,
+            observedDialogsDismissed: capture.dialogs,
+            download: capture.downloads > 0 ? "canceled" : "not_observed",
+            accounting,
+          },
+          url: redactedInteractionUrl(tab.page.url()),
+        };
+      } catch (error) {
+        if (!started) throw error;
+        this.invalidateInteractionRefs(tab, capturedGeneration);
+        const failure = new Error(`${name} failed after dispatch; effect status is unknown and no rollback is claimed.`);
+        let containment = "confirmed";
+        try { await this.failAndWait(session, failure); }
+        catch { containment = "unconfirmed"; }
+        throw new Error(`${failure.message} Session teardown is ${containment}.`);
+      } finally {
+        if (session.interactionCapture === capture) session.interactionCapture = undefined;
+        operation.dispose();
+      }
+    });
   }
 
   async wait(
@@ -1033,6 +1300,7 @@ export class InteractiveBrowserManager {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.confirmationPermits.clear();
     const openings = [...this.openings];
     for (const opening of openings) {
       opening.controller.abort(new Error("BrowserOpen cancelled by interactive browser shutdown."));
@@ -1098,6 +1366,7 @@ export class InteractiveBrowserManager {
   private installPageGuards(session: Session, tab: BrowserTab): void {
     tab.page.on("request", (request: Request) => {
       if (!request.isNavigationRequest() || request.frame() !== tab.page.mainFrame()) return;
+      if (session.interactionCapture) session.interactionCapture.events += 1;
       session.mainDocumentRequests += 1;
       tab.generation = this.uniqueHandle("generation");
       tab.semanticRefs.clear();
@@ -1117,6 +1386,7 @@ export class InteractiveBrowserManager {
     });
     tab.page.on("framenavigated", (frame) => {
       if (frame !== tab.page.mainFrame()) return;
+      if (session.interactionCapture) session.interactionCapture.events += 1;
       const rawUrl = tab.page.url();
       if (!tab.documentRequestPending && !sameDocumentUrl(tab.lastCommittedUrl, rawUrl)) {
         tab.generation = this.uniqueHandle("generation");
@@ -1142,8 +1412,8 @@ export class InteractiveBrowserManager {
         // Initial about:blank and blocked protocols are not session history.
       }
     });
-    tab.page.on("dialog", (dialog) => void dialog.dismiss());
-    tab.page.on("download", (download) => void download.cancel());
+    tab.page.on("dialog", (dialog) => this.dismissDialog(session, dialog));
+    tab.page.on("download", (download) => this.cancelDownload(session, download));
     tab.page.on("crash", () => this.failSession(session, new Error("Browser tab crashed; teardown started.")));
     tab.page.on("close", () => {
       session.tabs.delete(tab.handle);
@@ -1293,6 +1563,63 @@ export class InteractiveBrowserManager {
     return tab.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
   }
 
+  private confirmationBinding(
+    session: Session,
+    tab: BrowserTab,
+    ref: string,
+    origin: string,
+    structure: BrowserTargetStructure,
+    consequence: BrowserConsequence,
+    destination: string | null,
+  ): BrowserConfirmationBinding {
+    return {
+      session: session.handle,
+      tab: tab.handle,
+      generation: tab.generation,
+      operation: "click",
+      ref,
+      origin,
+      destination,
+      targetFingerprint: this.consequencePolicy.fingerprint(structure),
+      consequence,
+    };
+  }
+
+  private invalidateInteractionRefs(tab: BrowserTab, capturedGeneration: string): void {
+    tab.semanticRefs.clear();
+    if (tab.generation === capturedGeneration) tab.generation = this.uniqueHandle("generation");
+  }
+
+  private dismissDialog(session: Session, dialog: Dialog): void {
+    const capture = session.interactionCapture;
+    if (capture) {
+      capture.dialogs += 1;
+      capture.events += 1;
+    }
+    const settlement = dialog.dismiss().then(() => undefined, () => {
+      const failure = new Error("Browser dialog could not be default-dismissed; teardown started.");
+      this.failSession(session, failure);
+      throw failure;
+    });
+    settlement.catch(() => undefined);
+    if (capture) capture.settlements.push(settlement);
+  }
+
+  private cancelDownload(session: Session, download: Download): void {
+    const capture = session.interactionCapture;
+    if (capture) {
+      capture.downloads += 1;
+      capture.events += 1;
+    }
+    const settlement = download.cancel().then(() => undefined, () => {
+      const failure = new Error("Unexpected browser download could not be canceled; teardown started.");
+      this.failSession(session, failure);
+      throw failure;
+    });
+    settlement.catch(() => undefined);
+    if (capture) capture.settlements.push(settlement);
+  }
+
   private consumeNavigation(session: Session): void {
     if (session.navigations >= this.limits.maxNavigations) {
       throw new Error(`Browser navigation limit (${this.limits.maxNavigations}) exhausted.`);
@@ -1376,8 +1703,8 @@ export class InteractiveBrowserManager {
     return tab;
   }
 
-  private adoptPopup(session: Session, page: Page): void {
-    this.adoptPage(session, page, true);
+  private adoptPopup(session: Session, page: Page): BrowserTab | undefined {
+    return this.adoptPage(session, page, true);
   }
 
   private containRefusedPage(session: Session, page: Page, label: string): Promise<void> {
@@ -1604,6 +1931,53 @@ async function boundedCleanup<T>(operation: Promise<T>, deadlineMs: number, labe
   return within(operation, deadlineMs, label);
 }
 
+const INTERACTION_ACCOUNTING_MIN_MS = 200;
+const INTERACTION_ACCOUNTING_MAX_MS = 250;
+const INTERACTION_ACCOUNTING_QUIET_MS = 50;
+
+/** Drain effects added while earlier containment promises are settling. */
+async function accountInteractionEffects(
+  capture: InteractionCapture,
+  operation: OperationDeadline,
+): Promise<"bounded_stable" | "bounded_uncertain"> {
+  const startedAt = Date.now();
+  const accountingDeadline = startedAt + Math.min(
+    INTERACTION_ACCOUNTING_MAX_MS,
+    Math.max(1, operation.remainingMs() - 1),
+  );
+  let cursor = 0;
+  let observedEvents = capture.events;
+  let stableSince = startedAt;
+
+  while (true) {
+    while (cursor < capture.settlements.length) {
+      const batch = capture.settlements.slice(cursor);
+      cursor = capture.settlements.length;
+      const remaining = accountingDeadline - Date.now();
+      if (remaining <= 0) throw new Error("Interaction side-effect containment exceeded its bounded accounting window.");
+      await operation.run(within(
+        Promise.all(batch).then(() => undefined),
+        remaining,
+        "interaction side-effect containment",
+        operation.signal,
+      ), "interaction side-effect containment");
+    }
+
+    const now = Date.now();
+    if (capture.events !== observedEvents) {
+      observedEvents = capture.events;
+      stableSince = now;
+    }
+    const minimumObserved = now - startedAt >= INTERACTION_ACCOUNTING_MIN_MS;
+    const stable = now - stableSince >= INTERACTION_ACCOUNTING_QUIET_MS;
+    if (minimumObserved && stable && cursor === capture.settlements.length) return "bounded_stable";
+    if (now >= accountingDeadline) return "bounded_uncertain";
+
+    const delayMs = Math.max(1, Math.min(25, accountingDeadline - now));
+    await operation.run(new Promise<void>((resolve) => setTimeout(resolve, delayMs)), "interaction effect observation");
+  }
+}
+
 class OperationDeadline {
   readonly signal: AbortSignal;
   private readonly controller = new AbortController();
@@ -1714,6 +2088,131 @@ function urlWaitMatcher(kind: "exact" | "prefix" | "pattern", value: string): (u
     try { return matcher.test(url); }
     catch { throw new Error("BrowserWait URL pattern could not safely inspect the current URL."); }
   };
+}
+
+async function readTargetStructure(locator: Locator): Promise<BrowserTargetStructure> {
+  const structure = await locator.evaluate((element) => {
+    const html = element as HTMLElement;
+    const tagName = html.tagName.toLocaleLowerCase("en-US").slice(0, 129);
+    const control = html as HTMLInputElement & HTMLButtonElement;
+    const form = "form" in control ? control.form : null;
+    const cap = (value: string | null, max = 4_097) => value === null ? null : value.slice(0, max);
+    const path: string[] = [];
+    let current: Element | null = element;
+    while (current && path.length < 12) {
+      let position = 1;
+      let sibling = current.previousElementSibling;
+      while (sibling) {
+        if (sibling.tagName === current.tagName) position += 1;
+        sibling = sibling.previousElementSibling;
+      }
+      path.push(`${current.tagName.toLocaleLowerCase("en-US")}:nth-of-type(${position})`);
+      current = current.parentElement;
+    }
+    const href = "href" in html && typeof (html as HTMLAnchorElement).href === "string"
+      ? (html as HTMLAnchorElement).href
+      : null;
+    const formAction = form
+      ? (("formAction" in control && control.formAction) || form.action || null)
+      : null;
+    const inputType = (tagName === "input" || tagName === "button")
+      ? cap(control.getAttribute("type")?.toLocaleLowerCase("en-US") ?? (tagName === "button" ? "submit" : "text"), 32)
+      : null;
+    return {
+      tagName,
+      role: cap(html.getAttribute("role")?.trim().toLocaleLowerCase("en-US") ?? null, 64),
+      href: cap(href),
+      target: cap(html.getAttribute("target")?.trim().toLocaleLowerCase("en-US") ?? null, 64),
+      download: html.hasAttribute("download"),
+      inputType,
+      formAssociated: form !== null,
+      formAction: cap(formAction),
+      formMethod: cap(form?.method?.toLocaleLowerCase("en-US") ?? null, 16),
+      ariaHasPopup: cap(html.getAttribute("aria-haspopup")?.trim().toLocaleLowerCase("en-US") ?? null, 32),
+      contentEditable: html.isContentEditable,
+      disabled: Boolean(("disabled" in control && control.disabled) || html.getAttribute("aria-disabled") === "true"),
+      inlineEventHandler: [...html.attributes].some((attribute) => /^on/i.test(attribute.name)),
+      summaryForDetails: tagName === "summary" && html.parentElement?.tagName.toLocaleLowerCase("en-US") === "details",
+      domPath: path.reverse().join("> ").slice(0, 513),
+    };
+  });
+  if (!isBrowserTargetStructure(structure) || !boundedTargetStructure(structure)) {
+    throw new Error("Browser interaction target structure could not be safely inspected within policy bounds.");
+  }
+  return structure;
+}
+
+function isBrowserTargetStructure(value: unknown): value is BrowserTargetStructure {
+  if (typeof value !== "object" || value === null) return false;
+  const target = value as Record<string, unknown>;
+  return typeof target.tagName === "string"
+    && (typeof target.role === "string" || target.role === null)
+    && (typeof target.href === "string" || target.href === null)
+    && (typeof target.target === "string" || target.target === null)
+    && typeof target.download === "boolean"
+    && (typeof target.inputType === "string" || target.inputType === null)
+    && typeof target.formAssociated === "boolean"
+    && (typeof target.formAction === "string" || target.formAction === null)
+    && (typeof target.formMethod === "string" || target.formMethod === null)
+    && (typeof target.ariaHasPopup === "string" || target.ariaHasPopup === null)
+    && typeof target.contentEditable === "boolean"
+    && typeof target.disabled === "boolean"
+    && typeof target.inlineEventHandler === "boolean"
+    && typeof target.summaryForDetails === "boolean"
+    && typeof target.domPath === "string";
+}
+
+function boundedTargetStructure(target: BrowserTargetStructure): boolean {
+  return target.tagName.length <= 128
+    && (target.role === null || target.role.length <= 64)
+    && (target.href === null || target.href.length <= 4_096)
+    && (target.target === null || target.target.length <= 64)
+    && (target.inputType === null || target.inputType.length <= 32)
+    && (target.formAction === null || target.formAction.length <= 4_096)
+    && (target.formMethod === null || target.formMethod.length <= 16)
+    && (target.ariaHasPopup === null || target.ariaHasPopup.length <= 32)
+    && target.domPath.length <= 512;
+}
+
+function confirmationPrompt(
+  consequence: BrowserConsequence,
+  origin: string,
+  destination: string | null,
+): BrowserClickConfirmationRequest {
+  return {
+    title: "Confirm consequential browser click",
+    message: [
+      `The target is classified as ${consequence.replaceAll("_", " ")}.`,
+      `Current site: ${redactedInteractionUrl(origin)}.`,
+      ...(destination ? [`Destination site: ${redactedInteractionUrl(destination)}.`] : []),
+      "Approve this one exact click? The page can have external effects; cancellation does not imply rollback.",
+    ].join(" "),
+  };
+}
+
+function assertBoundedInteractionCapability(value: string, maxChars: number): void {
+  if (typeof value !== "string" || value.length < 1 || value.length > maxChars) {
+    throw new Error("Browser interaction capability is absent or exceeds its bounded length.");
+  }
+}
+
+function interactionIdentityUrl(rawUrl: string): string {
+  if (rawUrl.length > 4_096) throw new Error("Browser interaction URL exceeds the bounded policy limit.");
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Browser interaction URL is not HTTP(S).");
+  }
+  return rawUrl;
+}
+
+function redactedInteractionUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "[redacted URL]";
+    return bounded(parsed.origin, 300);
+  } catch {
+    return "[redacted URL]";
+  }
 }
 
 function safePublicPageUrl(rawUrl: string): string {
@@ -1844,6 +2343,15 @@ function clampedTestLimit(value: number, hardMaximum: number): number {
 
 function bounded(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+function normalizedInteractionFailure(name: "BrowserHover" | "BrowserClick", error: unknown): Error {
+  const message = error instanceof Error ? error.message : "";
+  if (/\b(?:not_started|effect status is (?:started|completed|unknown))\b/.test(message)) return asError(error);
+  if (/Invalid or stale browser (?:session\/tab handle|semantic ref)/.test(message)) {
+    return new Error(`${name} not_started: invalid or stale owned semantic capability; take a fresh BrowserSnapshot.`);
+  }
+  return new Error(`${name} failed before dispatch; effect status is not_started.`);
 }
 
 function asError(error: unknown): Error {

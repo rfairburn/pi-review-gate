@@ -17,7 +17,7 @@ each other instead of duplicating detail.
 | [Configuration](configuration.md) | The complete JSON config reference, defaults, legacy compatibility, and the `/review-settings` UI. |
 | [Review workflow](review-workflow.md) | Review windows, evidence bundles, reviewer adapters, corrections, transmission, commands, cancellation. |
 | [Delegated execution](delegated-execution.md) | Subtask tools, worker resources and routes, capture and landing, conflicts, steering, background shell tools. |
-| [Web tools](web-tools.md) | `WebSearch`, `WebFetch`, `BrowserExtract`, observational browser sessions, cache behavior, and the standalone web CLI. |
+| [Web tools](web-tools.md) | `WebSearch`, `WebFetch`, `BrowserExtract`, bounded semantic browser sessions, click confirmation policy, cache behavior, and the standalone web CLI. |
 | [Security model](security-model.md) | Trust boundaries, egress hardening, read-only enforcement, isolation limits, secrets handling. |
 | [Recovery](recovery.md) | Crash recovery for landing manifests, exact-session restart, executor retry and failover. |
 | [Development](development.md) | Build and test commands, test tiers, static checks, package smoke, launcher internals. |

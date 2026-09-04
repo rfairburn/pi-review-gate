@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import type { Browser, BrowserContext, Page } from "playwright";
 import { normalizeConfig } from "../src/config";
+import type { BrowserTargetStructure } from "../src/web/browser-interaction-policy";
 import {
   InteractiveBrowserManager,
   interactiveChromiumArgs,
@@ -32,6 +33,16 @@ class FakePage extends EventEmitter {
   private visitedIndex = -1;
   readonly frame = {};
   evaluateCalls = 0;
+  hoverCalls = 0;
+  clickCalls = 0;
+  onClick?: () => void | Promise<void>;
+  targetStructure: BrowserTargetStructure = {
+    tagName: "a", role: "link", href: "https://example.com/next", target: null,
+    download: false, inputType: null, formAssociated: false, formAction: null,
+    formMethod: null, ariaHasPopup: null, contentEditable: false, disabled: false,
+    inlineEventHandler: false, summaryForDetails: false,
+    domPath: "html:nth-of-type(1)> body:nth-of-type(1)> a:nth-of-type(1)",
+  };
   readonly visibleTextMatches = new Map<string, number>();
 
   mainFrame() { return this.frame; }
@@ -71,7 +82,12 @@ class FakePage extends EventEmitter {
     return {
       scrollIntoViewIfNeeded: async () => undefined,
       waitFor: async () => undefined,
-      evaluate: async () => undefined,
+      evaluate: async (_callback: unknown, ...args: unknown[]) => {
+        if (args.length > 0) return undefined;
+        return { ...this.targetStructure };
+      },
+      hover: async () => { this.hoverCalls += 1; },
+      click: async () => { this.clickCalls += 1; await this.onClick?.(); },
       boundingBox: async () => ({ x: 1, y: 2, width: 50, height: 20 }),
       screenshot: async () => { throw new Error("element screenshot must use a prevalidated page clip"); },
     };
@@ -344,6 +360,164 @@ test("BrowserScroll accepts only bounded page/ref operations and current scoped 
     /fresh BrowserSnapshot/,
   );
   assert.equal(fixture.manager.activeSessionCount(), 0, "invalid semantic capabilities fail the session closed");
+});
+
+test("BrowserHover and structurally proven link clicks use only fresh refs and invalidate them", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/interaction");
+  let snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  let ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+
+  const hovered = await fixture.manager.hover(opened.session, opened.tab, ref);
+  assert.equal(hovered.operation, "hover");
+  assert.equal(hovered.effect, "completed");
+  assert.equal(fixture.browser.context.page.hoverCalls, 1);
+  await assert.rejects(fixture.manager.hover(opened.session, opened.tab, ref), /fresh BrowserSnapshot/);
+
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "summary", role: null, href: null, inputType: null, summaryForDetails: true,
+  };
+  snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+  const disclosed = await fixture.manager.click(opened.session, opened.tab, ref);
+  assert.equal(disclosed.consequence, "local_disclosure");
+  assert.equal(disclosed.confirmed, false);
+
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "a", role: "link", href: "https://example.com/next", summaryForDetails: false,
+  };
+  snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+  fixture.browser.context.page.onClick = () => fixture.browser.context.page.goto("https://example.com/next?private=redacted").then(() => undefined);
+  const clicked = await fixture.manager.click(opened.session, opened.tab, ref);
+  assert.equal(clicked.consequence, "ordinary_navigation");
+  assert.equal(clicked.confirmed, false);
+  assert.equal(clicked.effects.navigation, "observed");
+  assert.equal(clicked.url, "https://example.com", "interaction output redacts path and query");
+  assert.equal(fixture.browser.context.page.clickCalls, 0, "silent activation never dispatches page click handlers");
+  await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref), /fresh BrowserSnapshot/);
+  await fixture.manager.shutdown();
+});
+
+test("consequential BrowserClick rejects no-UI and denial and revalidates an approved permit", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/risky");
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "button", role: "button", href: null, inputType: "button",
+    domPath: "html:nth-of-type(1)> body:nth-of-type(1)> button:nth-of-type(1)",
+  };
+  const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+
+  await assert.rejects(
+    fixture.manager.click("s".repeat(257), opened.tab, ref),
+    /not_started/,
+  );
+  await assert.rejects(
+    fixture.manager.click(opened.session, opened.tab, "r".repeat(513)),
+    /not_started/,
+  );
+  await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref), /not_started.*requires an interactive Pi confirmation/);
+  await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref, async () => false), /not_started.*denied/);
+  assert.equal(fixture.browser.context.page.clickCalls, 0);
+
+  await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref, async () => {
+    fixture.browser.context.page.targetStructure.domPath += "> span:nth-of-type(1)";
+    return true;
+  }), /not_started.*confirmed target or consequence changed/);
+  assert.equal(fixture.browser.context.page.clickCalls, 0, "changed targets are never dispatched");
+  await fixture.manager.shutdown();
+});
+
+test("approved risky clicks pre-arm and account for popup, dialog, and canceled download without switching", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/effects");
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "button", role: "button", href: null, inputType: "button",
+  };
+  const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+  let dismissed = 0;
+  let canceled = 0;
+  fixture.browser.context.page.onClick = async () => {
+    setTimeout(() => fixture.browser.context.page.emit("dialog", {
+      dismiss: async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 45));
+        dismissed += 1;
+      },
+    }), 25);
+    setTimeout(() => fixture.browser.context.page.emit("download", {
+      cancel: async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        canceled += 1;
+      },
+    }), 55);
+    setTimeout(() => { void fixture.browser.context.newPage(); }, 85);
+    setTimeout(() => { void fixture.browser.context.page.goto("https://example.com/delayed-effect"); }, 115);
+  };
+
+  const result = await fixture.manager.click(opened.session, opened.tab, ref, async (request) => {
+    assert.match(request.title, /Confirm consequential browser click/);
+    assert.doesNotMatch(request.message, /\/effects|ref=|browser_session_/);
+    return true;
+  });
+  assert.equal(result.confirmed, true);
+  assert.equal(result.effects.navigation, "observed");
+  assert.equal(result.effects.observedPopupTabs, 1);
+  assert.equal(result.effects.observedDialogsDismissed, 1);
+  assert.equal(result.effects.download, "canceled");
+  assert.equal(result.effects.accounting, "bounded_stable");
+  assert.deepEqual([dismissed, canceled], [1, 1]);
+  const tabs = await fixture.manager.tabs(opened.session, "list");
+  assert.equal(tabs.activeTab, opened.tab, "a popup never auto-switches the active tab");
+  await fixture.manager.shutdown();
+});
+
+test("interaction cancellation reports dispatch uncertainty without claiming rollback", async () => {
+  const before = managerFixture();
+  const beforeOpened = await before.manager.open("https://example.com/cancel-before");
+  const beforeSnapshot = await before.manager.snapshot(beforeOpened.session, beforeOpened.tab, 1_000);
+  const beforeRef = beforeSnapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(beforeRef);
+  const alreadyCanceled = new AbortController();
+  alreadyCanceled.abort(new Error("private cancellation reason"));
+  await assert.rejects(
+    before.manager.hover(beforeOpened.session, beforeOpened.tab, beforeRef, alreadyCanceled.signal),
+    /effect status is not_started/,
+  );
+  assert.equal(before.browser.context.page.hoverCalls, 0);
+
+  const during = managerFixture();
+  const duringOpened = await during.manager.open("https://example.com/cancel-during");
+  during.browser.context.page.targetStructure = {
+    ...during.browser.context.page.targetStructure,
+    tagName: "button", role: "button", href: null, inputType: "button",
+  };
+  const duringSnapshot = await during.manager.snapshot(duringOpened.session, duringOpened.tab, 1_000);
+  const duringRef = duringSnapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(duringRef);
+  let announceDispatch!: () => void;
+  const dispatched = new Promise<void>((resolve) => { announceDispatch = resolve; });
+  during.browser.context.page.onClick = async () => {
+    announceDispatch();
+    await new Promise<void>(() => undefined);
+  };
+  const controller = new AbortController();
+  const clicking = during.manager.click(duringOpened.session, duringOpened.tab, duringRef, async () => true, controller.signal);
+  await dispatched;
+  controller.abort(new Error("private cancellation reason"));
+  await assert.rejects(clicking, /effect status is unknown and no rollback is claimed/);
+  assert.equal(during.manager.activeSessionCount(), 0, "an uncertain dispatched action tears down its session");
+  await Promise.allSettled([before.manager.shutdown(), during.manager.shutdown()]);
 });
 
 test("BrowserWait exposes only bounded observational conditions and cancellation tears down", async () => {
@@ -685,6 +859,8 @@ test("element screenshot fixes the validated clip before a resize race", async (
       scrollIntoViewIfNeeded: async () => undefined,
       waitFor: async () => undefined,
       evaluate: async () => undefined,
+      hover: async () => undefined,
+      click: async () => undefined,
       boundingBox: async () => {
         queueMicrotask(() => { elementWidth = 10_000; });
         return { x: 10.4, y: 20.2, width: elementWidth, height: 19.2 };

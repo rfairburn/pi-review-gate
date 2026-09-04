@@ -32,7 +32,11 @@ class FakePage extends EventEmitter {
   private closed = false;
   private visited: string[] = [];
   private visitedIndex = -1;
-  readonly frame = {};
+  readonly frame = {
+    url: () => this.url(),
+    locator: (_selector: string) => ({ first: () => ({ count: async () => 0 }) }),
+    parentFrame: () => null,
+  };
   evaluateCalls = 0;
   hoverCalls = 0;
   clickCalls = 0;
@@ -91,6 +95,17 @@ class FakePage extends EventEmitter {
     if (selector !== "aria-ref=e7") return { fixtureTag: selector };
     const page = this;
     return {
+      _selector: selector,
+      _frame: { _connection: { toImpl: () => ({ selectors: {
+        callOnSelector: async (ownedSelector: string, options: { strict: boolean; mainWorld: boolean }) => {
+          assert.equal(ownedSelector, "aria-ref=e7");
+          assert.deepEqual(options, { strict: true, mainWorld: false });
+          return { result: page.url() };
+        },
+      } }) } },
+      elementHandle: async () => ({ ownerFrame: async () => page.frame, dispose: async () => undefined }),
+      locator: (_selector: string) => ({ count: async () => 0 }),
+      _expect: async () => ({ received: { value: "Fixture description" } }),
       scrollIntoViewIfNeeded: async () => undefined,
       waitFor: async () => undefined,
       getAttribute: async (name: string) => name === "type"
@@ -104,7 +119,8 @@ class FakePage extends EventEmitter {
         return `- ${role} "Next"${page.targetStructure.disabled ? " [disabled]" : ""} [ref=e7]`;
       },
       isDisabled: async () => page.targetStructure.disabled,
-      isEditable: async () => page.targetStructure.contentEditable || ["input", "textarea", "select"].includes(page.targetStructure.tagName),
+      isEditable: async () => !page.targetStructure.disabled && !page.targetStructure.readOnly
+        && (page.targetStructure.contentEditable || ["input", "textarea", "select"].includes(page.targetStructure.tagName)),
       isChecked: async () => { throw new Error("not checkable"); },
       innerText: async () => {
         if (page.inspectDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, page.inspectDelayMs));
@@ -153,8 +169,18 @@ class FakePage extends EventEmitter {
       this.visited.push(url);
       this.visitedIndex = this.visited.length - 1;
     }
+    const response = { status: () => 200, request: () => request };
+    this.emit("response", response);
     this.emit("framenavigated", this.frame);
-    return { status: () => 200 };
+    return response;
+  }
+  navigationHistory() {
+    return { currentIndex: this.visitedIndex, entries: this.visited.map((url, index) => ({ id: index + 1, url })) };
+  }
+  async navigateToHistoryEntry(id: number) {
+    if (id === this.visitedIndex) await this.goBack();
+    else if (id === this.visitedIndex + 2) await this.goForward();
+    else throw new Error("unexpected fixture history target");
   }
   async goto(url: string) { return this.commit(url, true); }
   async goBack() {
@@ -186,6 +212,16 @@ class FakeContext extends EventEmitter {
   closed = false;
   setDefaultTimeout() {}
   setDefaultNavigationTimeout() {}
+  async newCDPSession(page: FakePage) {
+    return {
+      send: async (method: string, params?: { entryId: number }) => {
+        if (method === "Page.getNavigationHistory") return page.navigationHistory();
+        if (method === "Page.navigateToHistoryEntry") return page.navigateToHistoryEntry(params!.entryId);
+        throw new Error(`Unexpected internal protocol method ${method}`);
+      },
+      detach: async () => undefined,
+    };
+  }
   async clearPermissions() {}
   async routeWebSocket() {}
   async route(_pattern: string, handler: (route: any) => Promise<void>) { this.routeHandler = handler; }
@@ -233,6 +269,45 @@ function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boo
   });
   return { manager, browser };
 }
+
+test("inspect sanitization does not turn readonly or disabled controls editable", async () => {
+  const fixture = managerFixture();
+  try {
+    const opened = await fixture.manager.open("https://example.com/");
+    const page = fixture.browser.context.page;
+    page.ariaSnapshot = async () => '- textbox "Next" [ref=e7]';
+    for (const state of [{ readOnly: true, disabled: false }, { readOnly: false, disabled: true }]) {
+      page.targetStructure = { ...page.targetStructure, tagName: "textarea", role: "textbox", ...state };
+      const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 2_000);
+      const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)![1]!;
+      const inspected = await fixture.manager.inspect(opened.session, opened.tab, ref);
+      assert.equal(inspected.semantic.states.editable, false);
+      assert.equal(inspected.semantic.visibleText.suppressed, true);
+    }
+  } finally { await fixture.manager.shutdown(); }
+});
+
+test("inspect fails closed without the isolated base reader rather than falling back to page evaluation", async () => {
+  const fixture = managerFixture();
+  try {
+    const opened = await fixture.manager.open("https://example.com/");
+    const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 2_000);
+    const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)![1]!;
+    const page = fixture.browser.context.page;
+    const originalLocator = page.locator.bind(page);
+    let pageWorldCalls = 0;
+    page.locator = selector => {
+      const target = originalLocator(selector);
+      if (selector === "aria-ref=e7") {
+        delete target._frame._connection;
+        target.evaluate = target.elementHandle = async () => { pageWorldCalls += 1; throw new Error("page-world fallback"); };
+      }
+      return target;
+    };
+    await assert.rejects(fixture.manager.inspect(opened.session, opened.tab, ref), /isolated document base reader is unavailable/);
+    assert.equal(pageWorldCalls, 0);
+  } finally { await fixture.manager.shutdown(); }
+});
 
 test("interactive browser route and launch policy has no direct-network escape hatch", () => {
   assert.equal(interactiveRouteDecision("image", "https://cdn.example/a.png").allowed, false);

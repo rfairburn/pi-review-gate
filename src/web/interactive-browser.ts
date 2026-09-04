@@ -3,6 +3,7 @@ import {
   chromium,
   type Browser,
   type BrowserContext,
+  type CDPSession,
   type BrowserType,
   type ConsoleMessage,
   type Dialog,
@@ -314,6 +315,7 @@ export interface BrowserHistoryResult {
   title: string;
   entries: Array<{ index: number; url: string; generation: string; current: boolean }>;
   truncated: boolean;
+  omittedEntries: number;
   navigationsRemaining: number;
 }
 
@@ -413,10 +415,10 @@ interface BrowserTab {
   generation: string;
   page: Page;
   semanticRefs: Map<string, { generation: string; playwrightRef: string; semantic: CapturedAriaSemantic }>;
-  history: Array<{ url: string; identityUrl: string; generation: string }>;
+  history: Array<{ id: number; index: number; url: string; generation: string }>;
   historyIndex: number;
-  pendingHistoryIndex?: number;
-  lastCommittedUrl: string;
+  historyOmitted?: number;
+  documentStatus?: number;
   documentRequestPending: boolean;
   closing: boolean;
   diagnosticsActive: boolean;
@@ -636,7 +638,7 @@ export class InteractiveBrowserManager {
     try {
       // This is a no-dial preflight. The broker independently validates and
       // pins the actual browser request before opening its destination socket.
-      const requested = await operation.run(validatePublicUrl(url, this.resolveHostname), "URL validation");
+      const requested = await operation.run(validateNavigationUrl(url, this.resolveHostname), "URL validation");
       assertChromiumAvailable();
       const auth = {
         username: `pi-browser-${randomBytes(8).toString("hex")}`,
@@ -687,7 +689,6 @@ export class InteractiveBrowserManager {
         semanticRefs: new Map(),
         history: [],
         historyIndex: -1,
-        lastCommittedUrl: page.url(),
         documentRequestPending: false,
         closing: false,
         diagnosticsActive: true,
@@ -902,7 +903,7 @@ export class InteractiveBrowserManager {
         const semanticRef = tab.semanticRefs.get(ref);
         if (!semanticRef || semanticRef.generation !== generation) throw invalidRefError();
         const locator = tab.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
-        const raw = await operation.run(readSemanticDetail(locator, tab.page, tab.page.url(), semanticRef.semantic, {
+        const raw = await operation.run(readSemanticDetail(locator, tab.page, semanticRef.semantic, {
           text: this.limits.maxInspectTextChars,
           name: this.limits.maxInspectNameChars,
           description: this.limits.maxInspectDescriptionChars,
@@ -1482,6 +1483,10 @@ export class InteractiveBrowserManager {
           }
         }
 
+        if (operationName === "click" && decision.consequence === "ordinary_navigation") {
+          await operation.run(assertControlledTopNavigation(locator, tab.page), "controlled browsing-context validation");
+          if (tab.generation !== capturedGeneration) throw new Error("BrowserClick not_started: the document changed during frame validation.");
+        }
         capture = newInteractionCapture();
         session.interactionCapture = capture;
         started = true;
@@ -1658,57 +1663,53 @@ export class InteractiveBrowserManager {
       throw new Error(`BrowserHistory maxEntries must be an integer from 1-${this.limits.maxHistoryEntries}.`);
     }
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    const traversalTarget = operationName === "back"
-      ? tab.historyIndex - 1
-      : operationName === "forward" ? tab.historyIndex + 1 : undefined;
-    if (traversalTarget !== undefined && (traversalTarget < 0 || traversalTarget >= tab.history.length)) {
-      throw new Error(`BrowserHistory cannot go ${operationName}; no bounded session-local entry exists.`);
-    }
     return this.operate(session, signal, async (operationSignal) => {
       const deadlineMs = operationName === "list" ? this.limits.actionMs : this.limits.navigationMs;
       const operation = new OperationDeadline("BrowserHistory", deadlineMs, operationSignal);
+      let started = false;
       try {
+        await operation.run(this.refreshHistory(session, tab), "browser history read");
         if (operationName !== "list") {
-          this.consumeNavigation(session);
-          const beforeUrl = tab.page.url();
-          let response: Response | null;
-          if (operationName === "reload") {
-            tab.pendingHistoryIndex = tab.historyIndex;
-            try {
-              response = await operation.run(tab.page.reload({ waitUntil: "domcontentloaded", timeout: operation.remainingMs() }), "history reload");
-            } finally {
-              tab.pendingHistoryIndex = undefined;
-            }
-          } else {
-            const target = traversalTarget!;
-            tab.pendingHistoryIndex = target;
-            try {
-              response = await operation.run(
-                operationName === "back"
-                  ? tab.page.goBack({ waitUntil: "domcontentloaded", timeout: operation.remainingMs() })
-                  : tab.page.goForward({ waitUntil: "domcontentloaded", timeout: operation.remainingMs() }),
-                `history ${operationName}`,
-              );
-            } finally {
-              tab.pendingHistoryIndex = undefined;
-            }
-            if (!response && tab.page.url() === beforeUrl) throw new Error(`BrowserHistory cannot go ${operationName}; browser did not change entries.`);
-            tab.historyIndex = target;
-            tab.history[target] = {
-              url: publicPageUrl(tab.page.url()),
-              identityUrl: bounded(tab.page.url(), 4_096),
-              generation: tab.generation,
-            };
+          const current = tab.history[tab.historyIndex];
+          const target = operationName === "back" ? tab.history[tab.historyIndex - 1]
+            : operationName === "forward" ? tab.history[tab.historyIndex + 1] : current;
+          if (!current || !target || (operationName !== "reload" && Math.abs(target.index - current.index) !== 1)) {
+            throw new Error(`BrowserHistory cannot go ${operationName}; no bounded session-local entry exists.`);
           }
-          if (operationName === "reload" && !response) throw new Error("BrowserHistory reload returned no HTTP response.");
+          this.consumeNavigation(session);
+          started = true;
+          if (operationName === "reload") {
+            await operation.run(tab.page.reload({ waitUntil: "domcontentloaded", timeout: operation.remainingMs() }), "history reload");
+          } else {
+            // Address the observed entry ID, not URL equality or Chromium's
+            // user-activation-based back/forward skip heuristics.
+            await operation.run(this.withHistoryProtocol(session, tab, async protocol => {
+              await protocol.send("Page.navigateToHistoryEntry", { entryId: target.id });
+            }), `history ${operationName}`);
+          }
+          await operation.run(this.waitForHistoryEntry(session, tab, target.id, operation), "history commit");
+          await operation.run(tab.page.waitForLoadState("networkidle", {
+            timeout: Math.min(2_000, operation.remainingMs()),
+          }).catch(() => undefined), "history rendering settle");
+          await operation.run(this.refreshHistory(session, tab), "settled browser history read");
           if (session.fatalError) throw session.fatalError;
         }
+        const generation = tab.generation;
+        const url = tab.page.url();
         const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+        const current = tab.history[tab.historyIndex];
+        if (tab.documentRequestPending || generation !== tab.generation || url !== tab.page.url()
+          || current?.generation !== generation || current.url !== publicPageUrl(url)) {
+          throw new Error("Browser document changed during history read; result rejected.");
+        }
         return this.historyResult(session, tab, operationName, maxEntries, title);
+      } catch (error) {
+        if (started) await this.failAndWait(session, asError(error));
+        throw error;
       } finally {
         operation.dispose();
       }
-    }, operationName !== "list");
+    });
   }
 
   async tabs(
@@ -1730,7 +1731,7 @@ export class InteractiveBrowserManager {
         } else if (operationName === "open") {
           if (tabHandle !== undefined || !url) throw new Error("BrowserTabs open requires url and does not accept tab.");
           if (session.tabs.size >= this.limits.maxTabsPerSession) throw new Error(`Browser tab limit (${this.limits.maxTabsPerSession}) reached.`);
-          const requested = await operation.run(validatePublicUrl(url, this.resolveHostname), "URL validation");
+          const requested = await operation.run(validateNavigationUrl(url, this.resolveHostname), "URL validation");
           const creation = session.context.newPage();
           let page: Page;
           try {
@@ -1935,7 +1936,7 @@ export class InteractiveBrowserManager {
   private async navigateSession(session: Session, tab: BrowserTab, rawUrl: string, operation: OperationDeadline, initial: boolean): Promise<BrowserNavigateResult> {
     if (!initial) this.consumeNavigation(session);
     else session.navigations += 1;
-    const requested = await operation.run(validatePublicUrl(rawUrl, this.resolveHostname), "URL validation");
+    const requested = await operation.run(validateNavigationUrl(rawUrl, this.resolveHostname), "URL validation");
     let response: Response | null;
     try {
       response = await operation.run(
@@ -1945,22 +1946,28 @@ export class InteractiveBrowserManager {
     } catch (error) {
       throw session.fatalError ?? asError(error);
     }
-    if (!response) throw new Error("Browser navigation returned no HTTP response.");
-    const finalUrl = publicPageUrl(tab.page.url());
+    // A successful same-document goto has no response; retain document status.
+    tab.documentStatus ??= response?.status();
     await operation.run(
       tab.page.waitForLoadState("networkidle", { timeout: Math.min(2_000, operation.remainingMs()) }).catch(() => undefined),
       "browser rendering settle",
     );
     if (session.fatalError) throw session.fatalError;
-    this.recordHistory(tab, finalUrl);
+    await operation.run(this.refreshHistory(session, tab), "browser history read");
+    const generation = tab.generation;
+    const finalUrl = publicPageUrl(tab.page.url());
     const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+    if (tab.documentRequestPending || generation !== tab.generation || finalUrl !== publicPageUrl(tab.page.url())) {
+      throw new Error("Browser document changed during navigation metadata read; result rejected.");
+    }
+    if (tab.documentStatus === undefined) throw new Error("Browser navigation has no committed HTTP document status.");
     return {
       session: session.handle,
       tab: tab.handle,
       generation: tab.generation,
       url: finalUrl,
       title,
-      status: response.status(),
+      status: tab.documentStatus,
       navigationsRemaining: Math.max(0, this.limits.maxNavigations - session.navigations),
     };
   }
@@ -1990,37 +1997,33 @@ export class InteractiveBrowserManager {
         this.failSession(session, new Error(`Browser main-document request limit (${this.limits.maxMainDocumentRequests}) exhausted.`));
       }
     });
-    tab.page.on("response", (response: Response) => this.recordNetworkResponse(session, tab, response));
+    tab.page.on("response", (response: Response) => {
+      this.recordNetworkResponse(session, tab, response);
+      const request = response.request();
+      if (request.isNavigationRequest() && request.frame() === tab.page.mainFrame()) {
+        tab.documentStatus = response.status();
+      }
+    });
     tab.page.on("requestfailed", (request: Request) => this.recordNetworkFailure(session, tab, request));
     tab.page.on("console", (message: ConsoleMessage) => this.recordConsoleMessage(session, tab, message));
     tab.page.on("pageerror", (error: Error) => this.recordPageError(session, tab, error));
     tab.page.on("framenavigated", (frame) => {
-      if (frame !== tab.page.mainFrame()) return;
-      if (session.interactionCapture) session.interactionCapture.events += 1;
-      const rawUrl = tab.page.url();
-      if (!tab.documentRequestPending && !sameDocumentUrl(tab.lastCommittedUrl, rawUrl)) {
+      if (frame !== tab.page.mainFrame()) {
+        // Snapshot refs can belong to child documents too.
         tab.generation = this.uniqueHandle("generation");
         tab.semanticRefs.clear();
-      } else if (!tab.documentRequestPending && tab.lastCommittedUrl === rawUrl) {
-        // A commit at the identical URL is a reload/replacement, not a hash-only traversal.
+        return;
+      }
+      if (session.interactionCapture) session.interactionCapture.events += 1;
+      if (!tab.documentRequestPending) {
+        // A generation is a capability epoch, not a guess at history identity.
+        // Conservatively stale refs on SPA commits, including identical URLs.
         tab.generation = this.uniqueHandle("generation");
         tab.semanticRefs.clear();
       }
       tab.documentRequestPending = false;
-      tab.lastCommittedUrl = rawUrl;
-      try {
-        const url = publicPageUrl(rawUrl);
-        if (tab.pendingHistoryIndex !== undefined) {
-          tab.historyIndex = tab.pendingHistoryIndex;
-          if (tab.history[tab.historyIndex]) {
-            tab.history[tab.historyIndex] = { url, identityUrl: bounded(rawUrl, 4_096), generation: tab.generation };
-          }
-        } else {
-          this.recordHistory(tab, url);
-        }
-      } catch {
-        // Initial about:blank and blocked protocols are not session history.
-      }
+      // History identity is read from Chromium, not inferred from this event:
+      // pushState, replaceState and same-URL traversal all emit it.
     });
     tab.page.on("dialog", (dialog) => this.dismissDialog(session, dialog));
     tab.page.on("download", (download) => this.cancelDownload(session, download));
@@ -2406,14 +2409,39 @@ export class InteractiveBrowserManager {
     session.navigations += 1;
   }
 
-  private recordHistory(tab: BrowserTab, url: string): void {
-    const identityUrl = bounded(tab.page.url(), 4_096);
-    const current = tab.history[tab.historyIndex];
-    if (current?.identityUrl === identityUrl && current.generation === tab.generation) return;
-    tab.history.splice(tab.historyIndex + 1);
-    tab.history.push({ url, identityUrl, generation: tab.generation });
-    if (tab.history.length > this.limits.maxHistoryEntries) tab.history.shift();
-    tab.historyIndex = tab.history.length - 1;
+  private async withHistoryProtocol<T>(session: Session, tab: BrowserTab, read: (protocol: CDPSession) => Promise<T>): Promise<T> {
+    // Fixed internal commands only; no caller-supplied CDP or page-world hooks.
+    const protocol = await session.context.newCDPSession(tab.page);
+    try { return await read(protocol); }
+    finally { await protocol.detach(); }
+  }
+
+  private async refreshHistory(session: Session, tab: BrowserTab): Promise<void> {
+    const observed = await this.withHistoryProtocol(session, tab, protocol => protocol.send("Page.getNavigationHistory"));
+    const previous = new Map(tab.history.map(entry => [entry.id, entry]));
+    const publicEntries = observed.entries.flatMap((entry, index) => {
+      try {
+        return [{ id: entry.id, index, url: publicPageUrl(entry.url),
+          generation: index === observed.currentIndex ? tab.generation
+            : previous.get(entry.id)?.generation ?? this.uniqueHandle("generation") }];
+      } catch { return []; }
+    });
+    const current = publicEntries.findIndex(entry => entry.index === observed.currentIndex);
+    // Keep a bounded window containing the current entry and both neighbors
+    // when capacity permits, including after page-initiated traversal.
+    const start = Math.max(0, Math.min(current - Math.floor(this.limits.maxHistoryEntries / 2), publicEntries.length - this.limits.maxHistoryEntries));
+    tab.history = publicEntries.slice(start, start + this.limits.maxHistoryEntries);
+    tab.historyIndex = current < 0 ? -1 : current - start;
+    tab.historyOmitted = publicEntries.length - tab.history.length;
+  }
+
+  private async waitForHistoryEntry(session: Session, tab: BrowserTab, id: number, operation: OperationDeadline): Promise<void> {
+    do {
+      await this.refreshHistory(session, tab);
+      if (tab.history[tab.historyIndex]?.id === id) return;
+      await operation.run(tab.page.waitForTimeout(10), "history entry wait");
+    } while (operation.remainingMs() > 0);
+    throw new Error("BrowserHistory did not commit the requested entry.");
   }
 
   private historyResult(
@@ -2423,7 +2451,9 @@ export class InteractiveBrowserManager {
     maxEntries: number,
     title: string,
   ): BrowserHistoryResult {
-    const start = Math.max(0, tab.history.length - maxEntries);
+    const start = Math.max(0, Math.min(tab.historyIndex - Math.floor(maxEntries / 2), tab.history.length - maxEntries));
+    const entries = tab.history.slice(start, start + maxEntries);
+    const omittedEntries = (tab.historyOmitted ?? 0) + tab.history.length - entries.length;
     return {
       session: session.handle,
       tab: tab.handle,
@@ -2431,13 +2461,14 @@ export class InteractiveBrowserManager {
       operation,
       url: publicPageUrl(tab.page.url()),
       title,
-      entries: tab.history.slice(start).map((entry, offset) => ({
-        index: start + offset,
+      entries: entries.map((entry, offset) => ({
+        index: entry.index,
         url: entry.url,
         generation: entry.generation,
         current: start + offset === tab.historyIndex,
       })),
-      truncated: start > 0,
+      truncated: omittedEntries > 0,
+      omittedEntries,
       navigationsRemaining: Math.max(0, this.limits.maxNavigations - session.navigations),
     };
   }
@@ -2467,7 +2498,6 @@ export class InteractiveBrowserManager {
       semanticRefs: new Map(),
       history: [],
       historyIndex: -1,
-      lastCommittedUrl: page.url(),
       documentRequestPending: false,
       closing: false,
       diagnosticsActive: true,
@@ -2478,12 +2508,6 @@ export class InteractiveBrowserManager {
     };
     session.tabs.set(tab.handle, tab);
     this.installPageGuards(session, tab);
-    try {
-      const url = publicPageUrl(page.url());
-      this.recordHistory(tab, url);
-    } catch {
-      // A popup commonly begins at about:blank before its brokered navigation.
-    }
     return tab;
   }
 
@@ -3270,24 +3294,37 @@ function safePublicPageUrl(rawUrl: string): string {
   catch { return "[navigation pending]"; }
 }
 
-function sameDocumentUrl(left: string, right: string): boolean {
-  try {
-    const first = new URL(left);
-    const second = new URL(right);
-    first.hash = "";
-    second.hash = "";
-    return first.href === second.href && left !== right;
-  } catch {
-    return false;
-  }
-}
-
 function publicPageUrl(rawUrl: string): string {
   let url: URL;
   try { url = new URL(rawUrl); } catch { throw new Error("Browser ended at an invalid URL."); }
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error(`Browser ended at blocked protocol ${url.protocol}.`);
-  url.hash = "";
   return bounded(url.href, 2_048);
+}
+
+async function validateNavigationUrl(rawUrl: string, resolveHostname: HostResolver): Promise<URL> {
+  // Shared fetch/cache validation deliberately canonicalizes away fragments.
+  // Restore only the hash; authority validation and broker egress are unchanged.
+  const validated = await validatePublicUrl(rawUrl, resolveHostname);
+  const navigation = new URL(validated.href);
+  navigation.hash = new URL(rawUrl).hash;
+  return navigation;
+}
+
+async function assertControlledTopNavigation(locator: Locator, page: Page): Promise<void> {
+  const element = await locator.elementHandle();
+  if (!element) throw new Error("BrowserClick not_started: the owned frame target detached.");
+  try {
+    const frame = await element.ownerFrame();
+    if (frame !== page.mainFrame()) {
+      throw new Error("BrowserClick not_started: controlled navigation from a child frame is unsupported.");
+    }
+    const explicitTarget = await locator.getAttribute("target");
+    const base = frame.locator("xpath=/html/descendant::base[@target]").first();
+    const target = explicitTarget ?? (await base.count() ? await base.getAttribute("target") : null);
+    if (target && target.toLowerCase() !== "_self") {
+      throw new Error("BrowserClick not_started: controlled navigation requires the current frame as its effective target.");
+    }
+  } finally { await element.dispose(); }
 }
 
 function invalidHandleError(): Error {
@@ -3562,7 +3599,6 @@ const INSPECT_SELECTED_ROLES = new Set(["columnheader", "gridcell", "option", "r
 async function readSemanticDetail(
   locator: Locator,
   page: Page,
-  baseUrl: string,
   computed: CapturedAriaSemantic,
   limits: { text: number; name: number; description: number },
   timeoutMs: number,
@@ -3572,9 +3608,6 @@ async function readSemanticDetail(
   const attributesPromise = Promise.all([
     locator.getAttribute("type", { timeout }),
     locator.getAttribute("href", { timeout }),
-    locator.getAttribute("aria-description", { timeout }),
-    locator.getAttribute("aria-describedby", { timeout }),
-    locator.getAttribute("title", { timeout }),
     locator.getAttribute("aria-checked", { timeout }),
     locator.getAttribute("aria-expanded", { timeout }),
     locator.getAttribute("aria-selected", { timeout }),
@@ -3592,9 +3625,12 @@ async function readSemanticDetail(
     attributesPromise, tagPromise, disabledPromise, focusedPromise, semanticsCurrentPromise,
   ]);
   throwIfAborted(signal);
-  const [typeAttribute, hrefAttribute, ariaDescription, describedBy, title, ariaChecked, ariaExpanded, ariaSelected] = attributes;
+  const [typeAttribute, hrefAttribute, ariaChecked, ariaExpanded, ariaSelected] = attributes;
   const type = tag === "input" || tag === "button" ? nullableSemanticToken(typeAttribute?.slice(0, 33), 32) : null;
+  const editingHost = locator.locator('xpath=ancestor-or-self::*[@contenteditable][1]');
+  const contentEditable = await editingHost.count() ? (await editingHost.getAttribute("contenteditable", { timeout }))?.toLowerCase() : null;
   const mayBeEditable = tag === "input" || tag === "textarea" || tag === "select"
+    || contentEditable === "" || contentEditable === "true" || contentEditable === "plaintext-only"
     || computed.role === "textbox" || computed.role === "combobox" || computed.role === "searchbox";
   const editable = mayBeEditable ? await locator.isEditable({ timeout }) : false;
   const checkedState = await currentComputedBoolean(locator, page, computed, "checked", INSPECT_CHECKED_ROLES);
@@ -3602,17 +3638,14 @@ async function readSemanticDetail(
     ? await currentDisclosureState(locator, page)
     : await currentComputedBoolean(locator, page, computed, "expanded", INSPECT_EXPANDED_ROLES);
   const selectedState = await currentComputedBoolean(locator, page, computed, "selected", INSPECT_SELECTED_ROLES);
-  const textSuppressed = editable || type === "password";
+  const textSuppressed = editable || tag === "input" || tag === "textarea" || tag === "select";
   const visibleText = textSuppressed ? "" : await locator.innerText({ timeout });
   throwIfAborted(signal);
-  const descriptionCandidate = (await computedDescriptionFromIds(locator, describedBy, timeout, signal)
-    ?? ariaDescription
-    ?? title
-    ?? "").slice(0, limits.description + 1);
-  const description = await verifiedAccessibleDescription(locator, page, computed, descriptionCandidate);
+  const description = await readComputedDescription(locator, limits.description);
   let href: string | null = null;
-  if ((tag === "a" || tag === "area") && hrefAttribute) {
-    try { href = diagnosticPublicOrigin(new URL(hrefAttribute, baseUrl).href); }
+  if ((tag === "a" || tag === "area") && hrefAttribute !== null) {
+    const documentBase = await ownerDocumentBaseUrl(locator);
+    try { href = diagnosticPublicOrigin(new URL(hrefAttribute, documentBase).href); }
     catch { href = null; }
   }
   const normalizedVisibleText = visibleText.slice(0, limits.text + 1).replace(/\s+/gu, " ").trim();
@@ -3669,40 +3702,40 @@ async function currentDisclosureState(locator: Locator, page: Page): Promise<boo
   return open === 1 ? true : closed === 1 ? false : null;
 }
 
-async function computedDescriptionFromIds(
-  scope: Locator,
-  rawIds: string | null,
-  timeout: number,
-  signal: AbortSignal,
-): Promise<string | null> {
-  const ids = (rawIds?.slice(0, 2_048).trim().split(/\s+/u) ?? []).filter(Boolean).slice(0, 8);
-  if (ids.length === 0) return null;
-  const parts: string[] = [];
-  let retained = 0;
-  for (const id of ids) {
-    throwIfAborted(signal);
-    const boundedId = id.slice(0, 256);
-    // Chaining from the aria-ref preserves Playwright's owning-frame routing.
-    // Walking to that frame document's root keeps the XPath document-scoped;
-    // unlike Playwright CSS it does not pierce an open shadow root with an
-    // unrelated same-ID node. The page controls only one escaped literal.
-    const target = scope.locator(
-      `xpath=ancestor-or-self::*[last()]/descendant-or-self::*[@id=${xpathLiteral(boundedId)}]`,
-    ).first();
-    const [ariaLabel, text, title] = await Promise.all([
-      target.getAttribute("aria-label", { timeout }).catch(() => null),
-      target.textContent({ timeout }).catch(() => null),
-      target.getAttribute("title", { timeout }).catch(() => null),
-    ]);
-    const computedTextCandidate = ariaLabel ?? text ?? title;
-    if (!computedTextCandidate) continue;
-    const remaining = Math.max(0, 513 - retained);
-    if (remaining === 0) break;
-    const normalized = computedTextCandidate.slice(0, 514).replace(/\s+/gu, " ").trim();
-    parts.push(normalized.slice(0, remaining));
-    retained += Math.min(remaining, normalized.length) + 1;
+async function ownerDocumentBaseUrl(locator: Locator): Promise<string> {
+  // Use the in-process Playwright implementation's isolated selector evaluator.
+  // Reading markup cannot account for CSP or frozen inherited document bases.
+  // Do not use locator.evaluate / to.have.property, or acquire a main-world
+  // ElementHandle: those can enter the page realm (including handle previews).
+  const internal = locator as unknown as {
+    _selector: string;
+    _frame: { _connection?: { toImpl?(frame: unknown): {
+      selectors?: { callOnSelector?(
+        selector: string,
+        options: { strict: true; mainWorld: false },
+        read: (target: { elements: Element[] }) => string | null,
+        arg: undefined,
+      ): Promise<{ result: unknown } | null> };
+    } } };
+  };
+  // Only our generation-scoped aria-ref locator is accepted, never a caller
+  // selector or a custom selector engine. Built-in aria-ref runs in utility.
+  if (!/^aria-ref=(?:f\d+)?e\d+$/.test(internal._selector)) throw invalidRefError();
+  const implementation = internal._frame?._connection?.toImpl?.(internal._frame);
+  if (!implementation?.selectors?.callOnSelector) {
+    throw new Error("BrowserInspect isolated document base reader is unavailable.");
   }
-  return parts.length > 0 ? parts.join(" ") : null;
+  const observed = await implementation.selectors.callOnSelector(
+    internal._selector,
+    { strict: true, mainWorld: false },
+    ({ elements }) => {
+      const element = elements[0];
+      return element?.isConnected ? element.ownerDocument.baseURI : null;
+    },
+    undefined,
+  );
+  if (typeof observed?.result !== "string") throw invalidRefError();
+  return observed.result;
 }
 
 function parseAriaRoot(snapshot: string): {
@@ -3750,8 +3783,8 @@ function sanitizeSemanticDetail(raw: RawSemanticDetail, limits: Readonly<Interac
   if (!raw || typeof raw !== "object") throw new Error("BrowserInspect could not safely read the semantic target.");
   const tag = semanticToken(raw.tag, 64, "other");
   const type = nullableSemanticToken(raw.type, 32);
-  const editable = raw.editable || tag === "input" || tag === "textarea" || tag === "select";
-  const suppressed = editable || type === "password" || raw.textSuppressed;
+  const editable = raw.editable;
+  const suppressed = editable || tag === "input" || tag === "textarea" || tag === "select" || type === "password" || raw.textSuppressed;
   const name = boundedUntrustedText(raw.accessibleName, limits.maxInspectNameChars);
   const description = boundedUntrustedText(raw.accessibleDescription, limits.maxInspectDescriptionChars);
   const visible = boundedUntrustedText(suppressed ? "" : raw.visibleText, limits.maxInspectTextChars);
@@ -3788,24 +3821,24 @@ async function verifyComputedSemantic(locator: Locator, page: Page, computed: Ca
   }
 }
 
-function xpathLiteral(value: string): string {
-  if (!value.includes("'")) return `'${value}'`;
-  if (!value.includes('"')) return `"${value}"`;
-  return `concat(${value.split("'").map((part) => `'${part}'`).join(", \"'\", ")})`;
-}
-
-async function verifiedAccessibleDescription(
-  locator: Locator,
-  page: Page,
-  semantic: CapturedAriaSemantic,
-  candidate: string,
-): Promise<string> {
-  if (!candidate || !semantic.role || !INSPECT_COMPUTED_ROLE_ALLOWLIST.has(semantic.role)) return "";
-  const role = semantic.role as Parameters<Page["getByRole"]>[0];
-  const matches = await locator.and(page.getByRole(role, {
-    name: semantic.name,
-    description: candidate,
-    exact: true,
-  })).count();
-  return matches === 1 ? candidate : "";
+async function readComputedDescription(locator: Locator, maxChars: number): Promise<string> {
+  // Playwright's fixed accessibility assertion runs in its isolated utility
+  // world and returns the computed value without rewriting aria-ref identity.
+  // Do not substitute to.have.property: that assertion uses the page world.
+  const internal = locator as unknown as {
+    _expect(expression: string, options: {
+      expectedText: Array<{ regexSource: string }>;
+      isNot: boolean;
+      timeout: number;
+    }): Promise<{ received?: unknown }>;
+  };
+  const result = await internal._expect("to.have.accessible.description", {
+    expectedText: [{ regexSource: "(?!)" }],
+    isNot: false,
+    timeout: 1,
+  });
+  const received = result.received as { value?: unknown } | undefined;
+  if (typeof received?.value !== "string") throw new Error("BrowserInspect computed description was unavailable.");
+  // Bound only after computation, never before an exact-equality check.
+  return received.value.slice(0, maxChars + 1);
 }

@@ -104,8 +104,11 @@ The session surface is bounded and semantic:
 
 - `BrowserOpen` creates one isolated context and tab, navigates to a public HTTP(S) URL,
   and returns opaque random session, tab, and document-generation handles.
-- `BrowserNavigate` navigates that tab, including public redirects. Every navigation
-  invalidates all semantic refs from the previous document generation.
+- `BrowserNavigate` navigates that tab, including public redirects. Interactive open,
+  navigate, and tab-open preserve URL fragments; same-document navigation succeeds
+  without a new HTTP response and reports the existing document's status. Navigation
+  metadata is read after bounded rendering settle. Every navigation invalidates all
+  semantic refs from the previous document generation.
 - `BrowserSnapshot` returns a bounded Playwright accessibility/ARIA snapshot. Any refs
   are replaced with opaque generation-scoped refs; truncation and original/returned
   character counts are explicit. A successful snapshot replaces the current ref set.
@@ -125,12 +128,14 @@ The session surface is bounded and semantic:
 - `BrowserInspect` accepts exactly one current opaque ref from the latest successful
   `BrowserSnapshot` for that owned session, tab, and document generation. It returns a
   fixed allowlist: browser-computed role/name semantics captured with the fresh
-  accessibility ref, tag/type and a bounded description candidate accepted only after
-  an exact Playwright computed-description match, current effective checked/disabled/
-  expanded/selected/focus/editability state, redacted HTTP(S) href origin, and bounded
-  visible-text metadata. Description ID resolution remains in the semantic ref's owning
-  top-level or iframe document and does not pierce shadow roots. Editable and password controls never expose values or visible
-  text. Forged, stale, cross-session, and cross-tab refs fail uniformly. The tool has no
+  accessibility ref, tag/type and a browser-computed description bounded after
+  computation, current effective checked/disabled/expanded/selected/focus/editability
+  state, redacted HTTP(S) href origin resolved against the browser-computed owning
+  document base URL (including CSP enforcement and inherited document bases), and
+  bounded visible-text metadata. The fixed base-URL reader uses in-process Playwright's
+  isolated selector evaluator and fails closed if that internal API is unavailable. Description computation uses Playwright's isolated
+  accessibility engine in the ref's owning document. Input, textarea, and select text
+  remains suppressed even when readonly or disabled; suppression does not imply editability. Forged, stale, cross-session, and cross-tab refs fail uniformly. The tool has no
   selector, arbitrary attribute, coordinates, raw HTML/DOM, value, script/evaluate,
   CDP, frame, or shadow-root escape input. Inspection never runs a callback in the
   page's main JavaScript world; timeout or cancellation tears down the owning session
@@ -155,10 +160,15 @@ The session surface is bounded and semantic:
   absence requires that no visible match remains. The total deadline is at most ten
   seconds and is shared by every phase;
   this is not a polling or workflow-orchestration tool.
-- `BrowserHistory` lists at most 32 session-local entries or performs back, forward, or
-  reload. Traversal consumes the same cumulative navigation budget. A new document
-  generation invalidates that tab's refs; hash-only same-document traversal retains
-  them.
+- `BrowserHistory` lists at most 32 browser-owned HTTP(S) history entries or performs
+  back, forward, or reload. Fixed internal Chromium history commands distinguish
+  pushState, replaceState, identical URLs, and page-initiated traversal; no caller CDP
+  input is accepted. The retained window includes the current entry and reports
+  `omittedEntries` and `truncated`, including omissions at the retention limit. Entry
+  indices are browser history indices, not positions within the returned window.
+  Traversal consumes the same navigation budget and targets an observed adjacent entry
+  ID. Generations are opaque observation epochs, not restorable document handles;
+  navigation (including hash/SPA and child-frame commits) invalidates prior refs.
 - `BrowserTabs` lists, opens, switches, and closes session-owned tabs using opaque
   handles. A session has at most four tabs. Script-created popups are immediately
   adopted into that same ownership/broker boundary when capacity exists, or closed at
@@ -176,7 +186,10 @@ The session surface is bounded and semantic:
   inspects a freshly resolved target's structural properties and fingerprint; accessible
   names, page claims, and model assertions never establish safety. Structurally proven
   ordinary HTTP(S) links and native `summary` disclosure controls may proceed without a
-  prompt. Silent links are activated as controlled brokered navigation rather than by
+  prompt. Controlled links must target the current top-level browsing context;
+  child-frame links and non-self base targets are rejected before navigation rather
+  than silently redirected into the top page. Silent links preserve fragments and
+  are activated as controlled brokered navigation rather than by
   dispatching page click handlers; known consequential destinations such as logout,
   destructive, authorization, publish, send, purchase, or account paths are not silent. Forms, downloads, authentication/terms/permissions, destructive/publish/send/
   purchase/account actions, unknown buttons or menu items, and every unknown or mixed

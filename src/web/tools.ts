@@ -680,6 +680,11 @@ export class WebToolManager {
     this.interactiveBrowser.updateConfig(this.webConfig.fetch);
   }
 
+  /** Settlement barrier for browser ownership only; caches are independent. */
+  async quiesce(): Promise<void> {
+    await this.interactiveBrowser.quiesce();
+  }
+
   async cleanup(): Promise<void> {
     await Promise.all([this.cache.cleanup(), this.browserCache.cleanup(), this.interactiveBrowser.shutdown()]);
   }

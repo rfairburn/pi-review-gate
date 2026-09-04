@@ -336,6 +336,79 @@ test("shutdown preserves an unconfirmed in-progress-open teardown failure", asyn
   await assert.rejects(manager.shutdown(), /could not confirm quiescence/i);
 });
 
+test("quiescence drains an established session after another opening records teardown failure", async () => {
+  const establishedBrowser = new FakeBrowser();
+  const failingBrowser = new FakeBrowser();
+  failingBrowser.close = async () => new Promise<void>(() => undefined);
+  let releaseSecondLaunch!: () => void;
+  let announceSecondLaunch!: () => void;
+  const secondLaunched = new Promise<void>((resolve) => { announceSecondLaunch = resolve; });
+  const deferredSecondLaunch = new Promise<Browser>((resolve) => {
+    releaseSecondLaunch = () => resolve(failingBrowser as unknown as Browser);
+  });
+  let launches = 0;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => {
+      launches += 1;
+      if (launches === 1) return establishedBrowser as unknown as Browser;
+      announceSecondLaunch();
+      return deferredSecondLaunch;
+    },
+    limits: { cleanupMs: 10, navigationMs: 1_000 },
+  });
+  await manager.open("https://example.com/established");
+  const secondOpen = manager.open("https://example.com/failing-open");
+  await secondLaunched;
+  const barrier = manager.quiesce();
+  releaseSecondLaunch();
+  await assert.rejects(secondOpen, /teardown could not be confirmed/i);
+  await assert.rejects(barrier, /could not confirm quiescence/i);
+  assert.equal(establishedBrowser.isConnected(), false, "the established browser is drained despite the prior failure");
+  assert.equal(manager.activeSessionCount(), 0);
+});
+
+test("settlement quiescence aborts an in-flight screenshot, proves zero ownership, and permits reuse", async () => {
+  const browsers: FakeBrowser[] = [];
+  let serial = 0;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => {
+      const browser = new FakeBrowser();
+      browsers.push(browser);
+      return browser as unknown as Browser;
+    },
+    randomHandle: (kind: string) => `${kind}_${++serial}_${"x".repeat(32)}`,
+    limits: { cleanupMs: 100 },
+  });
+  const opened = await manager.open("https://example.com/first");
+  let screenshotStarted!: () => void;
+  const started = new Promise<void>((resolve) => { screenshotStarted = resolve; });
+  browsers[0]!.context.page.screenshot = async () => {
+    screenshotStarted();
+    return new Promise<typeof ONE_PIXEL_PNG>(() => undefined);
+  };
+  const screenshot = manager.screenshot(opened.session, opened.tab, "viewport", undefined);
+  await started;
+  const barrier = manager.quiesce();
+  await assert.rejects(screenshot, /agent settlement/);
+  await barrier;
+  assert.equal(manager.activeSessionCount(), 0);
+  assert.equal(browsers[0]!.isConnected(), false);
+
+  const reused = await manager.open("https://example.com/later-turn");
+  assert.equal(manager.activeSessionCount(), 1);
+  await manager.close(reused.session);
+});
+
+test("an unconfirmed settlement teardown permanently fails the browser manager closed", async () => {
+  const { manager } = managerFixture({ hangingContextClose: true, cleanupMs: 10 });
+  await manager.open("https://example.com/unconfirmed");
+  await assert.rejects(manager.quiesce(), /could not confirm quiescence/i);
+  await assert.rejects(manager.quiesce(), /could not confirm quiescence/i);
+  await assert.rejects(manager.open("https://example.com/must-not-reopen"), /could not confirm quiescence/i);
+});
+
 test("open, navigate, semantic snapshot, handle rejection, and idempotent close are coherent", async () => {
   const { manager } = managerFixture();
   const opened = await manager.open("https://example.com/start");
@@ -1679,6 +1752,7 @@ test("close never claims success when browser/context quiescence is unconfirmed"
   const opened = await manager.open("https://example.com/start");
   await assert.rejects(manager.close(opened.session), /closure is unconfirmed/i);
   await assert.rejects(manager.close(opened.session), /closure is unconfirmed/i);
+  await assert.rejects(manager.open("https://example.com/after-unconfirmed-close"), /manager is shut down/i);
 });
 
 test("browser diagnostics are bounded, redacted, cursor-based, ref-scoped, and memory-only", async () => {

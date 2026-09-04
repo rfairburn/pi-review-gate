@@ -7,6 +7,14 @@ import { CodexExecutorAdapter } from "../src/execution/adapters/codex-cli";
 import { PiExecutorAdapter } from "../src/execution/adapters/pi-model";
 import type { ExecutorLiveControl } from "../src/execution/types";
 
+// Minimal stand-in for the trusted child extension in fake RPC fixtures. Real
+// Pi children publish this only from the extension's agent_settled hook after
+// browser quiescence; these protocol fixtures have no extension host.
+const fakePiQuiescenceReceipt = [
+  "const crypto=require('node:crypto');let ackGeneration=0;",
+  "const ack=()=>{ackGeneration++;const sessionId=process.env.PI_REVIEW_GATE_QUIESCENCE_SESSION;const childId=process.env.PI_REVIEW_GATE_QUIESCENCE_CHILD;const secret=process.env.PI_REVIEW_GATE_QUIESCENCE_SECRET;const target=process.env.PI_REVIEW_GATE_QUIESCENCE_PATH;const pid=process.pid;const version=1;const oneShot=crypto.createHmac('sha256',secret).update('pi-review-gate-quiescence-key:v1:'+ackGeneration).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,sessionId,childId,ackGeneration,pid])).digest('base64url');const receipt={version,sessionId,childId,settlement:ackGeneration,pid,mac};fs.mkdirSync(require('node:path').dirname(target),{recursive:true,mode:0o700});const temporary=target+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,target);};",
+];
+
 test("Pi executor refuses to launch without an authoritative native --tools allowlist", async () => {
   const adapter = new PiExecutorAdapter({ model: "provider/model", command: "must-not-launch" });
   await assert.rejects(
@@ -30,14 +38,15 @@ test("Pi executor child loads the review-gate extension in executor role without
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');",
+      ...fakePiQuiescenceReceipt,
       `fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({argv:process.argv.slice(2),env:process.env}));`,
       "let input=''; process.stdin.setEncoding('utf8');",
       "const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
-      "if(c.type==='prompt'){out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});out({type:'agent_end'});}",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}",
       "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'research complete'}});",
-      "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});out({type:'agent_end'});}",
+      "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});ack();out({type:'agent_end'});}",
       "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);
@@ -98,6 +107,175 @@ test("Pi executor child loads the review-gate extension in executor role without
   }
 });
 
+test("Pi executor fails closed when agent_end and process lifetime provide no trusted quiescence receipt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-missing-quiescence-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "unacknowledged-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "let input='';process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});out({type:'agent_end'});}",
+      "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,success:true,data:{text:'untrusted completion claim'}});",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const result = await new PiExecutorAdapter({
+      model: "provider/model",
+      command,
+      timeoutMs: 1_000,
+      quiescenceTimeoutMs: 50,
+    }).run({
+      cwd: root,
+      prompt: "finish without acknowledgement",
+      artifactDir,
+      turn: 1,
+      allowedTools: ["read"],
+    });
+    assert.equal(result.code, 1);
+    assert.equal(result.failure?.category, "protocol");
+    assert.match(result.failure?.message ?? "", /quiescence acknowledgement was not received/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor does not turn child termination into successful completion", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-terminated-quiescence-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "terminated-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiQuiescenceReceipt,
+      "let input='';process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});setImmediate(()=>process.kill(process.pid,'SIGTERM'));}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const result = await new PiExecutorAdapter({
+      model: "provider/model",
+      command,
+      quiescenceTimeoutMs: 100,
+    }).run({
+      cwd: root,
+      prompt: "terminate",
+      artifactDir,
+      turn: 1,
+      allowedTools: ["read"],
+    });
+    assert.equal(result.code, 1);
+    assert.equal(result.failure?.category, "protocol");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor waits from agent_end through delayed child agent_settled acknowledgement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-delayed-settlement-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "delayed-settlement-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiQuiescenceReceipt,
+      "let input='';let settled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});out({type:'agent_end'});setTimeout(()=>{ack();settled=true;},150);}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{isStreaming:!settled,pendingMessageCount:0}});",
+      "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,success:true,data:{text:'settled after cleanup'}});",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const started = Date.now();
+    const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 2_000 }).run({
+      cwd: root,
+      prompt: "wait for true settlement",
+      artifactDir,
+      turn: 1,
+      allowedTools: ["read"],
+    });
+    assert.equal(result.failure, undefined);
+    assert.equal(result.text, "settled after cleanup");
+    assert.ok(Date.now() - started >= 140, "agent_end alone must not release executor completion");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor does not count retry agent_end events as settlement generations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retry-settlement-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "retry-settlement-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiQuiescenceReceipt,
+      "let input='';let settled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});out({type:'agent_end'});setTimeout(()=>{out({type:'agent_end'});setTimeout(()=>{settled=true;ack();},40);},40);}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,success:true,data:{isStreaming:!settled,pendingMessageCount:0}});",
+      "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,success:true,data:{text:'retry settled once'}});",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 2_000 }).run({
+      cwd: root,
+      prompt: "retry before settlement",
+      artifactDir,
+      turn: 1,
+      allowedTools: ["read"],
+    });
+    assert.equal(result.failure, undefined);
+    assert.equal(result.text, "retry settled once");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor follows trusted generations across an autonomous settlement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-autonomous-settlement-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "autonomous-settlement-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiQuiescenceReceipt,
+      "let input='';let pending=true;let autoScheduled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
+      "else if(c.type==='get_state'){out({type:'response',id:c.id,success:true,data:{isStreaming:false,pendingMessageCount:pending?1:0}});if(pending&&!autoScheduled){autoScheduled=true;setTimeout(()=>{pending=false;ack();out({type:'agent_end'});},25);}}",
+      "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,success:true,data:{text:'autonomous final settlement'}});",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 2_000 }).run({
+      cwd: root,
+      prompt: "allow autonomous completion",
+      artifactDir,
+      turn: 1,
+      allowedTools: ["read"],
+    });
+    assert.equal(result.failure, undefined);
+    assert.equal(result.text, "autonomous final settlement");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Pi executor uses acknowledged RPC steering and a durable session", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-little-rpc-"));
   try {
@@ -109,14 +287,15 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
     await writeFile(command, [
       "#!/usr/bin/env node",
       `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2)));`,
+      ...fakePiQuiescenceReceipt,
       `fs.writeFileSync(${JSON.stringify(environmentCapture)},JSON.stringify({toolCatalog:process.env.PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG}));`,
-      "let input=''; process.stdin.setEncoding('utf8');",
+      "let input='';let streaming=false; process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
-      "if(c.type==='prompt'){console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));}",
-      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:true,pendingMessageCount:0}}));",
-      "else if(c.type==='steer'){console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'pi complete'}]}}));console.log(JSON.stringify({type:'turn_end'}));console.log(JSON.stringify({type:'agent_end'}));}",
+      "if(c.type==='prompt'){streaming=true;console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));}",
+      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:streaming,pendingMessageCount:0}}));",
+      "else if(c.type==='steer'){streaming=false;console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'pi complete'}]}}));console.log(JSON.stringify({type:'turn_end'}));ack();console.log(JSON.stringify({type:'agent_end'}));}",
       "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:'pi complete'}}));",
-      "else if(c.type==='abort'){console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));console.log(JSON.stringify({type:'agent_end'}));}",
+      "else if(c.type==='abort'){streaming=false;console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));ack();console.log(JSON.stringify({type:'agent_end'}));}",
       "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);
@@ -182,14 +361,15 @@ test("Pi stays alive for ShellStart work and accepts steering while its agent is
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');const {spawn}=require('node:child_process');let input='';let bg;let prompts=0;process.stdin.setEncoding('utf8');",
+      ...fakePiQuiescenceReceipt,
       `const capture=${JSON.stringify(capture)};`,
       "const out=(v)=>console.log(JSON.stringify(v));",
-      "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});out({type:'agent_end'});};",
+      "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});ack();out({type:'agent_end'});};",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){prompts++;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});if(prompts===1){bg=spawn(process.execPath,['-e','setTimeout(()=>{},5000)'],{detached:true,stdio:'ignore'});bg.unref();out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started \"long test\" as job1 (pid '+bg.pid+').\\nWaking you on: exit.'}]},isError:false});settle('background started');}else{if(bg){try{process.kill(-bg.pid,'SIGTERM')}catch{}}settle(prompts===2?'steering applied':'final inspection complete');}}",
       "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
       "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'final inspection complete'}});",
-      "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});out({type:'agent_end'});}",
+      "else if(c.type==='abort'){out({type:'response',id:c.id,command:c.type,success:true});ack();out({type:'agent_end'});}",
       "}});",
     ].join("\n"), "utf8");
     await chmod(command, 0o755);

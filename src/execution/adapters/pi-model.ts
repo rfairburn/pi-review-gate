@@ -18,6 +18,17 @@ import {
   createPiWorkerToolCatalog,
   type ExecutorToolCatalog,
 } from "../tool-catalog";
+import {
+  PI_QUIESCENCE_CHILD_ENV,
+  PI_QUIESCENCE_PATH_ENV,
+  PI_QUIESCENCE_SECRET_ENV,
+  PI_QUIESCENCE_SESSION_ENV,
+  awaitPiQuiescenceReceipt,
+  createPiQuiescenceBootstrap,
+  piQuiescenceEnvironment,
+  removePiQuiescenceReceipt,
+  type PiQuiescenceBootstrap,
+} from "../pi-quiescence-receipt";
 
 export interface PiExecutorOptions {
   model: string;
@@ -25,6 +36,8 @@ export interface PiExecutorOptions {
   command?: string;
   args?: string[];
   timeoutMs?: number;
+  /** Test/embedding override; production defaults to a bounded five seconds. */
+  quiescenceTimeoutMs?: number;
 }
 
 export class PiExecutorAdapter implements ExecutorAdapter {
@@ -93,17 +106,23 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       "--session-dir", sessionDir,
       ...childArgs(this.options.args ?? [], launchTools),
     ];
+    const timeoutMs = this.options.timeoutMs ?? 1_800_000;
+    const quiescenceBootstrap = createPiQuiescenceBootstrap(request.artifactDir, sessionId);
+    // The identity is random, but remove only this exact parent-owned path so
+    // an impossible stale collision can never satisfy the new child.
+    await removePiQuiescenceReceipt(quiescenceBootstrap);
     const proc = spawn(this.options.command ?? "pi", args, {
       cwd: request.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: executorEnv(toolCatalog),
+      env: executorEnv(toolCatalog, quiescenceBootstrap),
     });
     const identity = proc.pid === undefined ? undefined : {
       pid: proc.pid,
       processGroupId: process.platform === "win32" ? undefined : proc.pid,
     };
+    quiescenceBootstrap.pid = proc.pid;
     if (identity) await request.onProcessStart?.(identity);
     const backgroundReadiness = new BackgroundProcessReadiness();
     const rpc = new PiRpc(proc, backgroundReadiness, (chunk) => {
@@ -115,8 +134,43 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     let interruptedByControl = false;
     let protocolFailure: string | undefined;
     let finalText = "";
-    const timeoutMs = this.options.timeoutMs ?? 1_800_000;
     let timeoutDeadline = Date.now() + timeoutMs;
+    let receiptGeneration = 0;
+    let lastSettlementAcknowledged = false;
+    const settlementAcknowledgements = new Map<number, Promise<void>>();
+    const waitForQuiescentSettlement = async (after: number): Promise<void> => {
+      let acknowledgement = settlementAcknowledgements.get(after);
+      if (!acknowledgement) {
+        acknowledgement = (async () => {
+          let afterAgentEnd = after;
+          for (;;) {
+            // agent_end is only a wake-up hint. The signed receipt below is
+            // emitted by the child's actual agent_settled hook and supplies
+            // the authoritative child generation.
+            await rpc.waitForSettled(afterAgentEnd);
+            const remaining = Math.max(1, timeoutDeadline - Date.now());
+            receiptGeneration = await awaitPiQuiescenceReceipt(
+              quiescenceBootstrap,
+              receiptGeneration,
+              Math.min(this.options.quiescenceTimeoutMs ?? remaining, remaining),
+              request.signal,
+            );
+            const state = rpcState(await rpc.request("get_state", {}));
+            if (!state.isStreaming && state.pendingMessageCount === 0) {
+              lastSettlementAcknowledged = true;
+              return;
+            }
+            // A prior autonomous settlement raced the prompted turn. Its
+            // receipt is valid but cannot acknowledge the newer active/queued
+            // turn; wait for that turn's own actual settlement generation.
+            lastSettlementAcknowledged = false;
+            afterAgentEnd = rpc.settledGeneration;
+          }
+        })();
+        settlementAcknowledgements.set(after, acknowledgement);
+      }
+      await acknowledgement;
+    };
     const timer = setInterval(() => {
       if (backgroundReadiness.snapshot().running.length > 0) {
         timeoutDeadline = Date.now() + timeoutMs;
@@ -148,7 +202,10 @@ export class PiExecutorAdapter implements ExecutorAdapter {
               await rpc.request("steer", { message: instruction }, instructionId);
               return { status: "acknowledged", message: "Pi RPC acknowledged live steering." };
             }
+            const beforeSteer = rpc.settledGeneration;
             await rpc.request("prompt", { message: instruction }, instructionId);
+            lastSettlementAcknowledged = false;
+            await waitForQuiescentSettlement(beforeSteer);
             return {
               status: "acknowledged",
               message: "Pi RPC resumed the idle executor with the steering instruction while background work remained active.",
@@ -167,14 +224,16 @@ export class PiExecutorAdapter implements ExecutorAdapter {
             }
             const beforeInterrupt = rpc.settledGeneration;
             await rpc.request("abort", {});
-            await rpc.waitForSettled(beforeInterrupt);
-            return { status: "acknowledged", message: "Pi RPC acknowledged interruption and the agent settled." };
+            lastSettlementAcknowledged = false;
+            await waitForQuiescentSettlement(beforeInterrupt);
+            return { status: "acknowledged", message: "Pi RPC acknowledged interruption and browser quiescence was confirmed." };
           } catch (error) {
             return { status: "failed", message: messageOf(error) };
           }
         },
       });
-      await rpc.waitForSettled(settledGeneration);
+      lastSettlementAcknowledged = false;
+      await waitForQuiescentSettlement(settledGeneration);
       for (;;) {
         const background = backgroundReadiness.snapshot();
         if (background.unverifiable.length > 0) {
@@ -199,24 +258,45 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         }
         if (state.isStreaming || state.pendingMessageCount > 0) {
           request.onUpdate?.("background process completed; waiting for the executor's automatic completion turn");
-          await rpc.waitForSettled(settledGeneration);
+          lastSettlementAcknowledged = false;
+          await waitForQuiescentSettlement(settledGeneration);
         } else {
           request.onUpdate?.("background process completed; resuming executor for final inspection before review");
           await rpc.request("prompt", { message: backgroundCompletionPrompt });
-          await rpc.waitForSettled(settledGeneration);
+          lastSettlementAcknowledged = false;
+          await waitForQuiescentSettlement(settledGeneration);
         }
       }
       const response = await rpc.request("get_last_assistant_text", {});
       finalText = isRecord(response.data) && typeof response.data.text === "string" ? response.data.text : "";
+      if (!lastSettlementAcknowledged) {
+        throw new Error("Pi executor completion lacks an acknowledgement for its final settlement.");
+      }
     } catch (error) {
       if (!timedOut && !aborted && !interruptedByControl) protocolFailure = messageOf(error);
     } finally {
       clearInterval(timer);
       request.signal?.removeEventListener("abort", onAbort);
       request.onLiveControl?.(undefined);
-      rpc.terminate();
+      if (lastSettlementAcknowledged && !timedOut && !aborted && !interruptedByControl && !protocolFailure) rpc.closeInput();
+      else rpc.terminate();
     }
-    const exit = await rpc.closed();
+    let exit = await Promise.race([
+      rpc.closed(),
+      new Promise<undefined>((resolvePromise) => {
+        const grace = setTimeout(() => resolvePromise(undefined), 2_000);
+        grace.unref?.();
+      }),
+    ]);
+    if (!exit) {
+      protocolFailure ??= "Pi RPC did not exit cleanly after acknowledged completion.";
+      rpc.terminate();
+      exit = await rpc.closed();
+    }
+    if (!aborted && !interruptedByControl && !timedOut && (exit.signal || (exit.code !== null && exit.code !== 0))) {
+      protocolFailure ??= `Pi executor process terminated unexpectedly (${exit.signal ?? exit.code}).`;
+    }
+    await removePiQuiescenceReceipt(quiescenceBootstrap).catch(() => undefined);
     if (identity) await request.onProcessExit?.({ ...identity, code: exit.code, signal: exit.signal });
     const output = rpc.output(protocolFailure ? 1 : 0, timedOut, aborted || interruptedByControl);
     activity.finish();
@@ -237,7 +317,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       session: { adapter: this.kind, id: sessionId },
       usage: extracted.usage,
       ...artifacts,
-      code: output.code,
+      code: protocolFailure ? 1 : output.code,
       timedOut: output.timedOut,
       aborted: output.aborted,
       lifecycle: extracted.lifecycle,
@@ -318,6 +398,10 @@ class PiRpc {
       if (this.proc.exitCode === null && this.proc.signalCode === null) terminateProcessTree(this.proc, "SIGKILL");
     }, 2_000);
     timer.unref?.();
+  }
+
+  closeInput(): void {
+    if (this.proc.stdin?.writable) this.proc.stdin.end();
   }
 
   closed(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
@@ -578,7 +662,7 @@ function childArgs(args: readonly string[], allowedTools: readonly string[]): st
   ];
 }
 
-function executorEnv(toolCatalog: ExecutorToolCatalog): NodeJS.ProcessEnv {
+function executorEnv(toolCatalog: ExecutorToolCatalog, quiescence?: PiQuiescenceBootstrap): NodeJS.ProcessEnv {
   const next = { ...process.env };
   // The child must load the review-gate extension in its executor role so the
   // already-designed registration of web tools and background shell runs.
@@ -588,7 +672,12 @@ function executorEnv(toolCatalog: ExecutorToolCatalog): NodeJS.ProcessEnv {
   // the explicitly passed --extension loads in the child.
   delete next.PI_REVIEW_GATE_DISABLED;
   delete next.PI_EXTRA_EXTENSIONS;
+  delete next[PI_QUIESCENCE_SECRET_ENV];
+  delete next[PI_QUIESCENCE_PATH_ENV];
+  delete next[PI_QUIESCENCE_SESSION_ENV];
+  delete next[PI_QUIESCENCE_CHILD_ENV];
   next.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
   next[EXECUTOR_TOOL_CATALOG_ENV] = JSON.stringify(toolCatalog);
+  if (quiescence) Object.assign(next, piQuiescenceEnvironment(quiescence));
   return next;
 }

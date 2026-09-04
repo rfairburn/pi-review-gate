@@ -32,6 +32,7 @@ export interface RegisterCommandsInput {
   sessionSignal?: AbortSignal;
   cancellation?: ReviewCancellationCoordinator;
   prepareReviewerQuestion?: (commandName: string, ctx: unknown) => Promise<void>;
+  requireBrowserQuiescence?: (ctx: unknown) => Promise<void>;
   onStateChanged?: () => void | Promise<void>;
   releaseQueuedUserInputs?: () => Promise<void>;
 }
@@ -44,10 +45,18 @@ export function registerCommands(input: RegisterCommandsInput): void {
   const registerCommand: RegisterCommand = (name, options) => rawRegisterCommand(name, {
     ...options,
     handler: async (args, ctx) => {
+      let handlerFailed = false;
       try {
         return await options.handler(args, ctx);
+      } catch (error) {
+        handlerFailed = true;
+        throw error;
       } finally {
-        await input.onStateChanged?.();
+        if (handlerFailed) {
+          try { await input.onStateChanged?.(); } catch { /* preserve the command failure */ }
+        } else {
+          await input.onStateChanged?.();
+        }
       }
     },
   });
@@ -159,6 +168,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, "review gate: automatic review is disabled by settings");
         return;
       }
+      // Manual review is a completion/review boundary too. Never let it
+      // bypass a failed or still-running browser teardown from settlement.
+      await input.requireBrowserQuiescence?.(ctx);
       const statusTracker = createStatusTracker(ctx, "review-gate", "reviewing changes");
       let settleCommandReview!: () => void;
       const commandReviewSettled = new Promise<void>((resolvePromise) => { settleCommandReview = resolvePromise; });

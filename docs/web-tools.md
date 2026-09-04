@@ -205,13 +205,22 @@ The session surface is bounded and semantic:
   confirmation as consequential clicks and fail closed without UI. Confirmation is
   bound to the action, key, and a nonpersisted digest and lengths of the exact values,
   in addition to session/tab/generation/origin/target/consequence, followed by immediate
-  re-resolution and reclassification. Values and selections never appear in result
-  text/details, confirmation prompts, diagnostics, durable evidence, or review-gate logs.
+  re-resolution and reclassification. Values and selections are excluded from
+  review-gate-owned result text/details, confirmation prompts, diagnostics, durable
+  evidence, and logs. Pi/provider-native conversation and session-history retention is
+  outside this guarantee; do not enter secrets or other credentials.
 - `BrowserClose` is idempotent. It reports closure only after the page, context,
   Chromium connection, broker listener, and every tracked broker socket are confirmed
   quiescent. Recent closes retain bounded broker diagnostics; older confirmed closes
   remain recognizable through authenticated session handles without retaining
   unbounded state.
+
+At every final agent-settlement boundary, the extension aborts and drains in-progress
+browser opens/actions, closes every owned tab, context, Chromium process, and broker,
+and independently confirms zero ownership before review or completion can proceed.
+Successful settlement quiescence permits a later turn to open a new session. Any
+unconfirmed teardown fails closed for the rest of that extension runtime. Browser state
+is process-local and is never represented as surviving a restart.
 
 There is no password/file entry, upload, download saving, clipboard, filesystem-path
 input, caller-provided selector, XPath, coordinate action, caller-supplied JavaScript/

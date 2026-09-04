@@ -1333,6 +1333,47 @@ test("agent end skips reviewer when primary turn signal is already aborted", asy
   }
 });
 
+test("browser quiescence failure rejects agent_settled before completion or review branching", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-browser-settlement-failure-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify(indexTestConfig), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const notices: string[] = [];
+    let quiescenceCalls = 0;
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify(message: string) { notices.push(message); },
+    };
+    await activate(pi, {
+      webTools: {
+        register() {},
+        sync() {},
+        async cleanup() {},
+        async quiesce() {
+          quiescenceCalls += 1;
+          throw new Error("fixture teardown owner unknown");
+        },
+      },
+    });
+
+    // No review window exists: this is the bare task-completion path, and it
+    // must still reject rather than treating hook completion as success.
+    await assert.rejects(
+      trigger(hooks, "agent_settled", { cwd: dir }),
+      /review\/completion blocked because interactive browser quiescence could not be confirmed/,
+    );
+    assert.equal(quiescenceCalls, 1);
+    assert.match(notices.join("\n"), /fixture teardown owner unknown/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("/new shutdown silently aborts review work before its context becomes stale", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-new-session-abort-"));
 

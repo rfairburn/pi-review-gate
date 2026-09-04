@@ -59,8 +59,10 @@ receipts of exactly what the model was told.
   events may remain ephemeral; hidden direct or delegated listeners fail closed.
   Sensitive, submit/activation, handler-bearing, unknown, or consequential actions need
   a single-use top-level Pi confirmation and are rejected in background execution.
-  Entered/selected values are never returned or durably recorded. Research roles cannot
-  use form actions. There is no password/file entry, upload/download saving, arbitrary
+  Entered/selected values are excluded from review-gate-owned results, evidence,
+  diagnostics, and logs. Pi/provider-native conversation and session retention is
+  outside that guarantee, so do not enter secrets. Research roles cannot use form
+  actions. There is no password/file entry, upload/download saving, arbitrary
   selector/script/event, forced option, coordinate, filesystem path, clipboard,
   permission, or CDP escape hatch
   ([Web tools](docs/web-tools.md#interactive-browser)).

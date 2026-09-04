@@ -52,6 +52,11 @@ import {
   createExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./execution/tool-catalog";
+import {
+  capturePiQuiescenceBootstrap,
+  publishPiQuiescenceReceipt,
+  type PiQuiescenceBootstrap,
+} from "./execution/pi-quiescence-receipt";
 
 declare const module: {
   exports: unknown;
@@ -65,7 +70,24 @@ const orchestratorBackgroundCompletionPrompt = [
   "Do not claim success from process exit alone; verify the requested outcome before completing this turn.",
 ].join(" ");
 
-export async function activate(pi: unknown): Promise<void> {
+interface ActivationDependencies {
+  /** Narrow injection seam used by lifecycle tests; production constructs it. */
+  webTools?: Pick<WebToolManager, "register" | "quiesce" | "cleanup" | "sync">;
+}
+
+export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
+  const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
+  let executorQuiescenceBootstrap: PiQuiescenceBootstrap | undefined;
+  let executorQuiescenceBootstrapError: Error | undefined;
+  if (executorRole) {
+    try {
+      // Capture and erase the signing bootstrap before the first await, tool
+      // registration, model request, or model-spawned subprocess.
+      executorQuiescenceBootstrap = capturePiQuiescenceBootstrap();
+    } catch (error) {
+      executorQuiescenceBootstrapError = error instanceof Error ? error : new Error("Pi executor quiescence bootstrap failed.");
+    }
+  }
   let loaded;
   try {
     loaded = loadConfig();
@@ -80,7 +102,7 @@ export async function activate(pi: unknown): Promise<void> {
     return;
   }
 
-  const webTools = canRegisterWebTools(pi) ? new WebToolManager(pi, loaded.config) : undefined;
+  const webTools = dependencies.webTools ?? (canRegisterWebTools(pi) ? new WebToolManager(pi, loaded.config) : undefined);
   webTools?.register();
 
   // Register ApplyPatch in both the top-level orchestrator and Pi-native
@@ -91,7 +113,7 @@ export async function activate(pi: unknown): Promise<void> {
     registerApplyPatchTool(pi);
   }
 
-  if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor") {
+  if (executorRole) {
     if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
     const deferredTools = new DeferredToolManager(pi);
     if (!deferredTools.register()) return;
@@ -115,6 +137,17 @@ export async function activate(pi: unknown): Promise<void> {
     registerHook(pi, "tool_result", () => {
       deferredTools.reapply();
     });
+    let settlementGeneration = 0;
+    registerHook(pi, "agent_settled", async () => {
+      settlementGeneration += 1;
+      // This acknowledgement is extension-owned. It is emitted only after
+      // browser ownership is independently reduced to zero; agent_end and a
+      // child process exit are deliberately insufficient.
+      await webTools?.quiesce();
+      if (executorQuiescenceBootstrapError) throw executorQuiescenceBootstrapError;
+      if (!executorQuiescenceBootstrap) throw new Error("Pi executor quiescence acknowledgement bootstrap is missing.");
+      await publishPiQuiescenceReceipt(executorQuiescenceBootstrap, settlementGeneration);
+    });
     return;
   }
 
@@ -136,6 +169,7 @@ export async function activate(pi: unknown): Promise<void> {
   let activeReviewSettled: Promise<void> | undefined;
   let activeStatusTracker: ReturnType<typeof createStatusTracker> | undefined;
   let agentRunActive = false;
+  let agentSettlementInputHold = false;
   // Records accumulated from each low-level run's agent_end until Pi confirms
   // via agent_settled that no automatic retry, compaction retry, or queued
   // continuation remains. Finalization must not happen at agent_end: Pi can
@@ -154,7 +188,7 @@ export async function activate(pi: unknown): Promise<void> {
   let unsubscribeBackgroundLifecycle: (() => void) | undefined;
   const pendingEvidenceCaptures = new Set<Promise<void>>();
   const orchestratorBackgroundReadiness = new BackgroundProcessReadiness();
-  const reviewerQuestionPauseWaiters = new Set<() => void>();
+  const reviewerQuestionPauseWaiters = new Set<(error?: Error) => void>();
   const sessionAbortController = new AbortController();
   const executionTools = new ExecutionToolManager({
     pi,
@@ -209,9 +243,9 @@ export async function activate(pi: unknown): Promise<void> {
     }
   };
 
-  const releaseReviewerQuestionPauseWaiters = () => {
+  const releaseReviewerQuestionPauseWaiters = (error?: Error) => {
     for (const resolve of reviewerQuestionPauseWaiters) {
-      resolve();
+      resolve(error);
     }
     reviewerQuestionPauseWaiters.clear();
   };
@@ -412,7 +446,7 @@ export async function activate(pi: unknown): Promise<void> {
       return;
     }
     const text = extractInputText(args);
-    if (state.reviewInProgress && text.trim()) {
+    if ((state.reviewInProgress || agentSettlementInputHold) && text.trim()) {
       const queued = text.trim();
       state.queuedUserInputsDuringReview.push(queued);
       const deliverySequence = state.pendingModelDeliveries.filter((delivery) => delivery.kind === "queued_user_input").length + 1;
@@ -524,35 +558,18 @@ export async function activate(pi: unknown): Promise<void> {
       pendingSettlementAborted = true;
     }
 
+    // The consultation can be identified here, but cannot be reviewed or
+    // released until agent_settled has run the browser ownership barrier.
     const pauseForReviewerQuestion = reviewerQuestionPausePending;
     reviewerQuestionPausePending = false;
-    if (!pauseForReviewerQuestion) {
-      return;
-    }
-    // The turn ended exactly at the /ask-reviewer steering boundary and the
-    // command is waiting on this event, so collect the paused exchange now
-    // instead of at settlement. Marking the cycle keeps agent_settled from
-    // also running an automatic review over the same boundary.
-    pendingSettlementPausedForQuestion = true;
-    try {
-      if (window?.baseline && !signal?.aborted) {
-        await collectPausedReviewExchange({
-          cwd: currentCwd,
-          config: window.reviewConfig ?? config,
-          evidence: window.evidence,
-          actingUsage: pendingSettlementUsage,
-          window,
-        });
-      }
-    } finally {
-      releaseReviewerQuestionPauseWaiters();
-    }
+    if (pauseForReviewerQuestion) pendingSettlementPausedForQuestion = true;
     } finally {
       await persistSessionState();
     }
   });
 
   registerHook(pi, "agent_settled", async (...args) => {
+    let settlementQuiescenceFailure: Error | undefined;
     try {
     // agent_settled is the only point where Pi guarantees that no automatic
     // retry, compaction retry, or queued continuation remains for this turn,
@@ -568,8 +585,45 @@ export async function activate(pi: unknown): Promise<void> {
     agentRunActive = false;
     currentCwd = extractCwd(args, currentCwd);
     const noticeTarget = extractContext(args) ?? pi;
+    const prospectiveWindow = state.reviewWindow;
+    agentSettlementInputHold = Boolean(
+      prospectiveWindow?.baseline
+      && !runAborted
+      && !pausedForReviewerQuestion
+      && !state.reviewsPaused
+      && !prospectiveWindow.reviewConfigurationError
+      && (prospectiveWindow.reviewConfig?.enabled ?? config.enabled),
+    );
+    try {
+      await webTools?.quiesce();
+    } catch (error) {
+      const failure = new Error(
+        `review gate: review/completion blocked because interactive browser quiescence could not be confirmed (${boundDeliveryDiagnostic(error)})`,
+      );
+      settlementQuiescenceFailure = failure;
+      await sendNoticeUnlessItThrows(noticeTarget, failure.message);
+      if (pausedForReviewerQuestion) releaseReviewerQuestionPauseWaiters(failure);
+      throw failure;
+    }
     if (pausedForReviewerQuestion) {
-      // The /ask-reviewer consultation already reviewed this boundary.
+      // The /ask-reviewer command remains paused until this exact final
+      // boundary is quiescent; only then may its review inspect the workspace.
+      const window = state.reviewWindow;
+      try {
+        if (window?.baseline && !runAborted) {
+          await collectPausedReviewExchange({
+            cwd: currentCwd,
+            config: window.reviewConfig ?? config,
+            evidence: window.evidence,
+            actingUsage,
+            window,
+          });
+        }
+        releaseReviewerQuestionPauseWaiters();
+      } catch (error) {
+        releaseReviewerQuestionPauseWaiters(error instanceof Error ? error : new Error("Reviewer consultation settlement failed."));
+        throw error;
+      }
       return;
     }
     const window = state.reviewWindow;
@@ -888,7 +942,12 @@ export async function activate(pi: unknown): Promise<void> {
     await sendNoticeWhileSessionActive(noticeTarget, failed, () => sessionActive);
     await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
     } finally {
-      await persistSessionState();
+      agentSettlementInputHold = false;
+      // A persistence failure must not replace the bounded browser failure
+      // which blocks Pi's settlement. Persistence remains best-effort only in
+      // this already-failed path; normal paths retain their prior semantics.
+      if (settlementQuiescenceFailure) await persistSessionState().catch(() => undefined);
+      else await persistSessionState();
     }
   });
 
@@ -903,13 +962,24 @@ export async function activate(pi: unknown): Promise<void> {
     cancellation: reviewCancellation,
     onStateChanged: persistSessionState,
     releaseQueuedUserInputs: () => releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState),
+    requireBrowserQuiescence: async (ctx) => {
+      try {
+        await webTools?.quiesce();
+      } catch (error) {
+        const failure = new Error(
+          `review gate: manual review blocked because interactive browser quiescence could not be confirmed (${boundDeliveryDiagnostic(error)})`,
+        );
+        await sendNoticeUnlessItThrows(ctx, failure.message);
+        throw failure;
+      }
+    },
     prepareReviewerQuestion: async (commandName, ctx) => {
       if (!agentRunActive && commandContextIsIdle(ctx)) {
         return;
       }
 
       reviewerQuestionPausePending = true;
-      const paused = new Promise<void>((resolve) => reviewerQuestionPauseWaiters.add(resolve));
+      const paused = new Promise<void>((resolve, reject) => reviewerQuestionPauseWaiters.add((error) => error ? reject(error) : resolve()));
       const delivered = await sendSteeringPrompt(
         pi,
         [

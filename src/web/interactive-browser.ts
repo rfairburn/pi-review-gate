@@ -390,6 +390,12 @@ interface OpeningOperation {
   teardownFailure?: Error;
 }
 
+interface ActiveBrowserOperation {
+  controller: AbortController;
+  settled: Promise<void>;
+  settle(): void;
+}
+
 interface CapturedAriaSemantic {
   role: string | null;
   name: string;
@@ -527,9 +533,12 @@ export class InteractiveBrowserManager {
   private readonly closedTombstones = new Map<string, BrowserCloseResult>();
   private readonly failedTombstones = new Map<string, Error>();
   private readonly openings = new Set<OpeningOperation>();
+  private readonly activeOperations = new Set<ActiveBrowserOperation>();
   private readonly handleAuthenticationKey = randomBytes(32);
   private opening = 0;
   private shuttingDown = false;
+  private quiescing = false;
+  private quiescence?: Promise<void>;
   private shutdownFailure?: Error;
   private readonly resolveHostname: HostResolver;
   private readonly launch: BrowserType["launch"];
@@ -575,7 +584,7 @@ export class InteractiveBrowserManager {
   }
 
   async open(url: string, signal?: AbortSignal): Promise<BrowserOpenResult> {
-    if (this.shuttingDown) throw new Error("Interactive browser manager is shut down.");
+    this.assertAcceptingOperations();
     if (this.sessions.size + this.opening >= this.limits.maxSessions) {
       throw new Error(`Browser session limit (${this.limits.maxSessions}) reached; close a session before opening another.`);
     }
@@ -756,8 +765,8 @@ export class InteractiveBrowserManager {
 
   async navigate(sessionHandle: string, tabHandle: string, url: string, signal?: AbortSignal): Promise<BrowserNavigateResult> {
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    return this.operate(session, signal, async () => {
-      const operation = new OperationDeadline("BrowserNavigate", this.limits.navigationMs, signal);
+    return this.operate(session, signal, async (operationSignal) => {
+      const operation = new OperationDeadline("BrowserNavigate", this.limits.navigationMs, operationSignal);
       try {
         return await this.navigateSession(session, tab, url, operation, false);
       } finally {
@@ -768,8 +777,8 @@ export class InteractiveBrowserManager {
 
   async snapshot(sessionHandle: string, tabHandle: string, maxChars: number, signal?: AbortSignal): Promise<BrowserSnapshotResult> {
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    return this.operate(session, signal, async () => {
-      const operation = new OperationDeadline("BrowserSnapshot", this.limits.actionMs, signal);
+    return this.operate(session, signal, async (operationSignal) => {
+      const operation = new OperationDeadline("BrowserSnapshot", this.limits.actionMs, operationSignal);
       try {
         const capturedGeneration = tab.generation;
         const limit = Math.min(Math.max(1_000, maxChars), this.limits.maxSnapshotChars);
@@ -863,8 +872,8 @@ export class InteractiveBrowserManager {
     assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
     assertBoundedInteractionCapability(ref, BROWSER_INTERACTION_REF_MAX_CHARS);
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    return this.operate(session, signal, async () => {
-      const operation = new OperationDeadline("BrowserInspect", this.limits.actionMs, signal);
+    return this.operate(session, signal, async (operationSignal) => {
+      const operation = new OperationDeadline("BrowserInspect", this.limits.actionMs, operationSignal);
       const generation = tab.generation;
       try {
         const semanticRef = tab.semanticRefs.get(ref);
@@ -909,8 +918,8 @@ export class InteractiveBrowserManager {
       throw new Error(`${name} maxEvents must be an integer from 1-${this.limits.maxDiagnosticReadEvents}.`);
     }
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    return this.operate(session, signal, async () => {
-      throwIfAborted(signal);
+    return this.operate(session, signal, async (operationSignal) => {
+      throwIfAborted(operationSignal);
       const ring = tab[kind] as DiagnosticRing<BrowserConsoleEvent> | DiagnosticRing<BrowserNetworkEvent>;
       const read = ring.read(cursor, maxEvents);
       return {
@@ -949,8 +958,8 @@ export class InteractiveBrowserManager {
       throw new Error("BrowserScreenshot mode must be viewport or element.");
     }
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    return this.operate(session, signal, async () => {
-      const operation = new OperationDeadline("BrowserScreenshot", this.limits.actionMs, signal);
+    return this.operate(session, signal, async (operationSignal) => {
+      const operation = new OperationDeadline("BrowserScreenshot", this.limits.actionMs, operationSignal);
       try {
         const capturedGeneration = tab.generation;
         let image: Buffer;
@@ -1061,8 +1070,8 @@ export class InteractiveBrowserManager {
     if (target === "ref_container" && !ref) throw new Error("BrowserScroll ref_container target requires a current ref.");
 
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    return this.operate(session, signal, async () => {
-      const operation = new OperationDeadline("BrowserScroll", this.limits.actionMs, signal);
+    return this.operate(session, signal, async (operationSignal) => {
+      const operation = new OperationDeadline("BrowserScroll", this.limits.actionMs, operationSignal);
       try {
         const generation = tab.generation;
         if (target === "ref") {
@@ -1218,8 +1227,8 @@ export class InteractiveBrowserManager {
       assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
       assertBoundedInteractionCapability(ref, BROWSER_INTERACTION_REF_MAX_CHARS);
       const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-      return await this.operate(session, signal, async () => {
-        const operation = new OperationDeadline(name, this.limits.confirmationMs, signal);
+      return await this.operate(session, signal, async (operationSignal) => {
+        const operation = new OperationDeadline(name, this.limits.confirmationMs, operationSignal);
         const capturedGeneration = tab.generation;
         const capturedOrigin = interactionIdentityUrl(tab.page.url());
         const valueDigest = action.values.length > 0 ? digestExactValues(action.values) : null;
@@ -1368,12 +1377,12 @@ export class InteractiveBrowserManager {
     assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
     assertBoundedInteractionCapability(ref, BROWSER_INTERACTION_REF_MAX_CHARS);
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    return this.operate(session, signal, async () => {
+    return this.operate(session, signal, async (operationSignal) => {
       const name = operationName === "click" ? "BrowserClick" : "BrowserHover";
       const operation = new OperationDeadline(
         name,
         operationName === "click" ? this.limits.confirmationMs : this.limits.actionMs,
-        signal,
+        operationSignal,
       );
       const capturedGeneration = tab.generation;
       const capturedOrigin = interactionIdentityUrl(tab.page.url());
@@ -1528,8 +1537,8 @@ export class InteractiveBrowserManager {
       throw new Error(`BrowserWait timeoutMs must be an integer from 1-${this.limits.maxWaitMs}.`);
     }
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
-    return this.operate(session, signal, async () => {
-      const operation = new OperationDeadline("BrowserWait", timeoutMs, signal);
+    return this.operate(session, signal, async (operationSignal) => {
+      const operation = new OperationDeadline("BrowserWait", timeoutMs, operationSignal);
       const started = this.now();
       const generation = tab.generation;
       try {
@@ -1632,9 +1641,9 @@ export class InteractiveBrowserManager {
     if (traversalTarget !== undefined && (traversalTarget < 0 || traversalTarget >= tab.history.length)) {
       throw new Error(`BrowserHistory cannot go ${operationName}; no bounded session-local entry exists.`);
     }
-    return this.operate(session, signal, async () => {
+    return this.operate(session, signal, async (operationSignal) => {
       const deadlineMs = operationName === "list" ? this.limits.actionMs : this.limits.navigationMs;
-      const operation = new OperationDeadline("BrowserHistory", deadlineMs, signal);
+      const operation = new OperationDeadline("BrowserHistory", deadlineMs, operationSignal);
       try {
         if (operationName !== "list") {
           this.consumeNavigation(session);
@@ -1688,8 +1697,8 @@ export class InteractiveBrowserManager {
   ): Promise<BrowserTabsResult> {
     if (!["list", "open", "switch", "close"].includes(operationName)) throw new Error("BrowserTabs operation is not allowlisted.");
     const session = this.requireOwnedSession(sessionHandle);
-    return this.operate(session, signal, async () => {
-      const operation = new OperationDeadline("BrowserTabs", operationName === "open" ? this.limits.navigationMs : this.limits.actionMs, signal);
+    return this.operate(session, signal, async (operationSignal) => {
+      const operation = new OperationDeadline("BrowserTabs", operationName === "open" ? this.limits.navigationMs : this.limits.actionMs, operationSignal);
       let openedTab: string | undefined;
       let closedTab: string | undefined;
       try {
@@ -1826,32 +1835,74 @@ export class InteractiveBrowserManager {
     throw invalidHandleError();
   }
 
+  /**
+   * Abort and drain every operation which could still acquire browser-owned
+   * resources, then tear down and independently verify every known session.
+   * A successful barrier is reusable by a later agent turn. Any uncertain
+   * cleanup permanently closes this manager, because ownership can no longer
+   * be proved from process-local bookkeeping.
+   */
+  quiesce(): Promise<void> {
+    if (this.quiescence) return this.quiescence;
+    if (
+      this.shutdownFailure
+      && this.openings.size === 0
+      && this.activeOperations.size === 0
+      && this.sessions.size === 0
+    ) return Promise.reject(this.shutdownFailure);
+    this.quiescing = true;
+    const barrier = (async () => {
+      this.confirmationPermits.clear();
+      const openings = [...this.openings];
+      const operations = [...this.activeOperations];
+      const reason = new Error("BrowserOpen cancelled by interactive browser shutdown or agent settlement.");
+      for (const opening of openings) opening.controller.abort(reason);
+      for (const operation of operations) operation.controller.abort(reason);
+
+      await Promise.all([
+        ...openings.map((opening) => opening.settled),
+        ...operations.map((operation) => operation.settled),
+      ]);
+
+      // An opening may have transferred ownership to a Session immediately
+      // before observing cancellation. Snapshot only after all acquisitions
+      // have drained, while quiescing still rejects new operations.
+      const outcomes = await Promise.allSettled([...this.sessions.values()].map((session) =>
+        this.beginTeardown(session, reason)
+      ));
+      const failures = new Set<Error>();
+      if (this.shutdownFailure) failures.add(this.shutdownFailure);
+      for (const failure of this.failedTombstones.values()) failures.add(failure);
+      for (const opening of openings) if (opening.teardownFailure) failures.add(opening.teardownFailure);
+      for (const outcome of outcomes) {
+        if (outcome.status === "rejected") failures.add(asError(outcome.reason));
+      }
+      if (this.opening !== 0 || this.openings.size !== 0) failures.add(new Error("browser opening ownership remains"));
+      if (this.activeOperations.size !== 0) failures.add(new Error("in-flight browser action ownership remains"));
+      if (this.sessions.size !== 0) failures.add(new Error("browser session ownership remains"));
+      if (failures.size > 0) {
+        throw new AggregateError([...failures], "Interactive browser shutdown could not confirm quiescence.");
+      }
+    })().catch((error) => {
+      const failure = asError(error);
+      this.shutdownFailure ??= failure;
+      this.shuttingDown = true;
+      throw failure;
+    }).finally(() => {
+      if (!this.shutdownFailure) this.quiescing = false;
+      if (this.quiescence === barrier) this.quiescence = undefined;
+    });
+    this.quiescence = barrier;
+    return barrier;
+  }
+
   async shutdown(): Promise<void> {
+    // Set the permanent flag after entering quiescence so an already-started
+    // open receives the settlement cancellation diagnostic expected by the
+    // reusable barrier; future calls remain rejected even after success.
+    const completion = this.quiesce();
     this.shuttingDown = true;
-    this.confirmationPermits.clear();
-    const openings = [...this.openings];
-    for (const opening of openings) {
-      opening.controller.abort(new Error("BrowserOpen cancelled by interactive browser shutdown."));
-    }
-    // Each opening settles only after its bounded startup cleanup has finished
-    // or recorded an unconfirmed teardown. It may briefly transfer resources
-    // into sessions before observing cancellation, so sweep sessions after.
-    await Promise.all(openings.map((opening) => opening.settled));
-    const outcomes = await Promise.allSettled([...this.sessions.values()].map((session) =>
-      this.beginTeardown(session, new Error("Browser session shut down with the Pi session."))
-    ));
-    const failures = new Set<Error>();
-    if (this.shutdownFailure) failures.add(this.shutdownFailure);
-    for (const failure of this.failedTombstones.values()) failures.add(failure);
-    for (const opening of openings) if (opening.teardownFailure) failures.add(opening.teardownFailure);
-    for (const outcome of outcomes) {
-      if (outcome.status === "rejected") failures.add(asError(outcome.reason));
-    }
-    if (failures.size > 0) {
-      const aggregate = new AggregateError([...failures], "Interactive browser shutdown could not confirm quiescence.");
-      this.shutdownFailure ??= aggregate;
-      throw aggregate;
-    }
+    await completion;
   }
 
   activeSessionCount(): number {
@@ -2075,7 +2126,13 @@ export class InteractiveBrowserManager {
     tab.networkPolicy = new WeakMap();
   }
 
-  private async operate<T>(session: Session, signal: AbortSignal | undefined, body: () => Promise<T>, fatalOnError = false): Promise<T> {
+  private async operate<T>(
+    session: Session,
+    signal: AbortSignal | undefined,
+    body: (operationSignal: AbortSignal) => Promise<T>,
+    fatalOnError = false,
+  ): Promise<T> {
+    this.assertAcceptingOperations();
     this.assertUsable(session);
     if (session.operationActive) throw new Error("Browser session is busy with another bounded operation.");
     if (session.actions >= this.limits.maxActions) {
@@ -2085,20 +2142,37 @@ export class InteractiveBrowserManager {
     }
     session.actions += 1;
     session.operationActive = true;
+    const controller = new AbortController();
+    let settleOperation!: () => void;
+    const active: ActiveBrowserOperation = {
+      controller,
+      settled: new Promise<void>((resolve) => { settleOperation = resolve; }),
+      settle: () => settleOperation(),
+    };
+    this.activeOperations.add(active);
+    const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     this.touch(session);
     try {
-      throwIfAborted(signal);
-      const result = await body();
+      throwIfAborted(operationSignal);
+      const result = await body(operationSignal);
       if (session.fatalError) throw session.fatalError;
       if (!session.teardown) this.touch(session);
       return result;
     } catch (error) {
       const failure = asError(error);
-      if (fatalOnError || signal?.aborted || session.fatalError) await this.failAndWait(session, session.fatalError ?? failure);
+      if (fatalOnError || operationSignal.aborted || session.fatalError) await this.failAndWait(session, session.fatalError ?? failure);
       throw failure;
     } finally {
       session.operationActive = false;
+      this.activeOperations.delete(active);
+      active.settle();
     }
+  }
+
+  private assertAcceptingOperations(): void {
+    if (this.shutdownFailure) throw this.shutdownFailure;
+    if (this.shuttingDown) throw new Error("Interactive browser manager is shut down.");
+    if (this.quiescing) throw new Error("Interactive browser manager is quiescing at agent settlement.");
   }
 
   private assertUsable(session: Session): void {
@@ -2464,7 +2538,10 @@ export class InteractiveBrowserManager {
 
   private recordOpeningTeardownFailure(opening: OpeningOperation, failure: Error): void {
     opening.teardownFailure ??= failure;
-    this.shutdownFailure ??= failure;
+    this.shutdownFailure ??= new Error(
+      `Interactive browser shutdown could not confirm quiescence: ${failure.message}`,
+      { cause: failure },
+    );
   }
 
   private rememberClosed(handle: string, result: BrowserCloseResult): void {
@@ -2481,6 +2558,10 @@ export class InteractiveBrowserManager {
     // Capacity is reserved before open, so this set never needs unsafe
     // eviction and can retain every unconfirmed teardown fail-closed.
     this.failedTombstones.set(handle, failure);
+    // Ownership is now uncertain. Reject new work immediately, but leave
+    // shutdownFailure unset so quiesce() can still drain every other owner
+    // before publishing the permanent aggregate failure.
+    this.shuttingDown = true;
   }
 
   private brokerBudgets(): EgressBudgets {
@@ -2580,11 +2661,30 @@ async function cleanupSession(session: Session, deadlineMs: number): Promise<Egr
   const operationFailures = operations
     .filter((operation): operation is PromiseRejectedResult => operation.status === "rejected")
     .map((operation) => operation.reason);
+  // Closing the context can synchronously discover/refuse a popup after the
+  // first snapshot. Drain that bounded late-containment tail before checking
+  // ownership so settlement cannot miss a close-event race.
+  const lateContainments = [
+    ...session.pendingPageClosures.values(),
+    ...session.pendingPageCreations,
+  ];
+  const lateOutcomes = await Promise.allSettled(lateContainments.map((containment) =>
+    boundedCleanup(containment, deadlineMs, "late settlement page containment")
+  ));
+  operationFailures.push(...lateOutcomes
+    .filter((operation): operation is PromiseRejectedResult => operation.status === "rejected")
+    .map((operation) => operation.reason));
   const brokerOutcome = operations[operations.length - 1];
   const summary = brokerOutcome?.status === "fulfilled" ? brokerOutcome.value as EgressSummary : undefined;
   const stateFailures: unknown[] = [];
   const allKnownPages = new Set([...pages, ...session.pendingPageClosures.keys()]);
   if ([...allKnownPages].some((page) => !page.isClosed())) stateFailures.push(new Error("browser tab remains open"));
+  const contextPages = safely(() => session.context.pages(), [] as Page[]);
+  if (contextPages.some((page) => !page.isClosed())) stateFailures.push(new Error("browser context still owns an open page"));
+  if (session.tabs.size > 0) stateFailures.push(new Error("browser tab registry is not empty"));
+  // A rejected/hung page.close promise is not residual ownership once the
+  // page, context, and browser postconditions below independently prove it
+  // closed. Late page *creation* can still acquire ownership and must drain.
   if (session.pendingPageCreations.size > 0) stateFailures.push(new Error("late browser page creation remains unsettled"));
   if (session.browser.isConnected()) stateFailures.push(new Error("browser process remains connected"));
   if (session.browser.contexts().includes(session.context)) stateFailures.push(new Error("browser context remains registered"));

@@ -11,7 +11,13 @@ import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorInteractionA
 import type { ThinkingLevel } from "../../config";
 import { BackgroundProcessReadiness } from "../../background-process-readiness";
 import { assertNoPiToolPolicyArgs } from "../../pi-tool-policy";
-import { createExecutorToolCatalog } from "../tool-catalog";
+import {
+  DEFERRED_TOOL_SEARCH_NAME,
+  EXECUTOR_TOOL_CATALOG_ENV,
+  createExecutorToolCatalog,
+  createPiWorkerToolCatalog,
+  type ExecutorToolCatalog,
+} from "../tool-catalog";
 
 export interface PiExecutorOptions {
   model: string;
@@ -32,15 +38,18 @@ export class PiExecutorAdapter implements ExecutorAdapter {
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
     assertNoPiToolPolicyArgs(this.options.args ?? [], "Pi executor arguments");
     const thinkingLevel = this.options.thinkingLevel ?? "high";
-    const toolCatalog = request.executorToolCatalog
+    const durableToolCatalog = request.executorToolCatalog
       ? createExecutorToolCatalog(
           request.executorToolCatalog.allowedToolCatalog,
           request.executorToolCatalog.initialActiveTools,
         )
       : createExecutorToolCatalog(requireAllowedTools(request.allowedTools), request.initialActiveTools);
-    // Deferred activation has no adapter bootstrap channel yet. Preserve the
-    // historical launch contract by authorizing every durable allowed tool.
-    const allowedTools = toolCatalog.allowedToolCatalog;
+    const toolCatalog = createPiWorkerToolCatalog(durableToolCatalog);
+    // The native CLI allowlist remains the hard launch boundary. search_tools
+    // is the sole control tool added outside the durable capability catalog;
+    // the extension receives the validated initial subset through a private
+    // child environment bootstrap.
+    const launchTools = [...new Set([...toolCatalog.allowedToolCatalog, DEFERRED_TOOL_SEARCH_NAME])];
     const sessionId = request.session?.id ?? randomUUID();
     const sessionDir = join(request.artifactDir, "executor-sessions");
     await mkdir(sessionDir, { recursive: true });
@@ -57,9 +66,9 @@ export class PiExecutorAdapter implements ExecutorAdapter {
           sessionId,
           sessionDir,
           cwd: request.cwd,
-          args: childArgs(this.options.args ?? [], allowedTools),
+          args: childArgs(this.options.args ?? [], launchTools),
           timeoutMs: Math.min(this.options.timeoutMs ?? 1_800_000, 300_000),
-          env: executorEnv(),
+          env: executorEnv(toolCatalog),
           signal: request.signal,
           onProcessStart: request.onProcessStart,
           onProcessExit: request.onProcessExit,
@@ -82,14 +91,14 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       "--thinking", thinkingLevel,
       "--session-id", sessionId,
       "--session-dir", sessionDir,
-      ...childArgs(this.options.args ?? [], allowedTools),
+      ...childArgs(this.options.args ?? [], launchTools),
     ];
     const proc = spawn(this.options.command ?? "pi", args, {
       cwd: request.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: executorEnv(),
+      env: executorEnv(toolCatalog),
     });
     const identity = proc.pid === undefined ? undefined : {
       pid: proc.pid,
@@ -569,7 +578,7 @@ function childArgs(args: readonly string[], allowedTools: readonly string[]): st
   ];
 }
 
-function executorEnv(): NodeJS.ProcessEnv {
+function executorEnv(toolCatalog: ExecutorToolCatalog): NodeJS.ProcessEnv {
   const next = { ...process.env };
   // The child must load the review-gate extension in its executor role so the
   // already-designed registration of web tools and background shell runs.
@@ -580,5 +589,6 @@ function executorEnv(): NodeJS.ProcessEnv {
   delete next.PI_REVIEW_GATE_DISABLED;
   delete next.PI_EXTRA_EXTENSIONS;
   next.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
+  next[EXECUTOR_TOOL_CATALOG_ENV] = JSON.stringify(toolCatalog);
   return next;
 }

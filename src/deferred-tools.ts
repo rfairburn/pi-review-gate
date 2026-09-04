@@ -1,5 +1,11 @@
-const SEARCH_TOOLS_NAME = "search_tools";
-const INITIAL_TOOL_ORDER = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart"] as const;
+import {
+  DEFERRED_TOOL_SEARCH_NAME,
+  DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER,
+  createExecutorToolCatalog,
+  type ExecutorToolCatalog,
+} from "./execution/tool-catalog";
+import { renderAuthorizedToolInventory } from "./tool-inventory";
+
 const MAX_QUERY_CHARS = 256;
 const MAX_QUERY_TERMS = 12;
 const MAX_MATCHES = 8;
@@ -41,6 +47,7 @@ export class DeferredToolManager {
   private boundary: AuthorizationBoundary | undefined;
   private desiredActiveNames: string[] = [];
   private activeSetEstablished = false;
+  private sessionDeferred = true;
   private registered = false;
 
   constructor(private readonly pi: unknown) {}
@@ -48,8 +55,8 @@ export class DeferredToolManager {
   register(): boolean {
     if (this.registered || !isDeferredToolHost(this.pi)) return false;
     this.pi.registerTool({
-      name: SEARCH_TOOLS_NAME,
-      label: SEARCH_TOOLS_NAME,
+      name: DEFERRED_TOOL_SEARCH_NAME,
+      label: DEFERRED_TOOL_SEARCH_NAME,
       description: "Find authorized tools by name or description and activate matching tools for the next model request. This only loads tools; it never performs the requested operation.",
       promptSnippet: "Use search_tools when a needed authorized tool is not currently available, then call the newly loaded tool on the next turn.",
       executionMode: "sequential",
@@ -72,23 +79,71 @@ export class DeferredToolManager {
     return true;
   }
 
-  /** Capture authorization before the first shrink, or reuse it on reload. */
-  sessionStart(sessionIdentity: unknown): boolean {
+  /** Capture authorization before the first shrink, or install a durable worker boundary. */
+  sessionStart(
+    sessionIdentity: unknown,
+    configuredCatalog?: ExecutorToolCatalog,
+    requireConfiguredCatalog = false,
+    deferredEnabled = configuredCatalog === undefined
+      || configuredCatalog.initialActiveTools.length < configuredCatalog.allowedToolCatalog.length,
+  ): boolean {
     // Never retain a prior session's authority if this manager is reused and
     // the new hook does not provide a stable WeakMap-compatible identity.
     this.boundary = undefined;
     this.desiredActiveNames = [];
     this.activeSetEstablished = false;
+    this.sessionDeferred = deferredEnabled;
     if (!isDeferredToolHost(this.pi)) return false;
     if (!isObjectIdentity(sessionIdentity)) return this.failClosed(this.pi);
     const registry = authorizationBoundaryRegistry();
     if (!registry) return this.failClosed(this.pi);
     const retained = registry.get(sessionIdentity);
     if (retained !== undefined && !isAuthorizationBoundary(retained)) return this.failClosed(this.pi);
-    const boundary = retained ?? captureAuthorizationBoundary(this.pi);
+    // Executor extension reloads reuse the session-keyed boundary after the
+    // one-shot environment bootstrap has been scrubbed. A fresh executor with
+    // no durable bootstrap must never capture the full launch-active set.
+    if (!retained && requireConfiguredCatalog && configuredCatalog === undefined) {
+      return this.failClosed(this.pi);
+    }
+    if (retained && configuredCatalog !== undefined && !configuredCatalogMatchesBoundary(configuredCatalog, retained)) {
+      return this.failClosed(this.pi);
+    }
+    const configured = retained || configuredCatalog === undefined
+      ? undefined
+      : captureConfiguredAuthorizationBoundary(this.pi, configuredCatalog);
+    if (!retained && configuredCatalog !== undefined && !configured) return this.failClosed(this.pi);
+    const boundary = retained ?? configured ?? captureAuthorizationBoundary(this.pi);
     if (!retained) registry.set(sessionIdentity, boundary);
     this.boundary = boundary;
-    this.desiredActiveNames = [...boundary.initialActiveNames, SEARCH_TOOLS_NAME];
+    this.desiredActiveNames = [
+      ...(this.sessionDeferred ? boundary.initialActiveNames : boundary.authorizedNames),
+      DEFERRED_TOOL_SEARCH_NAME,
+    ];
+    this.pi.setActiveTools([...this.desiredActiveNames]);
+    this.activeSetEstablished = true;
+    return true;
+  }
+
+  startupGuidance(): string | undefined {
+    if (!this.boundary) return undefined;
+    return renderAuthorizedToolInventory(
+      [...this.boundary.authorizedNames, DEFERRED_TOOL_SEARCH_NAME],
+      { deferred: this.sessionDeferred },
+    );
+  }
+
+  /** Apply a local settings change immediately within the captured boundary. */
+  setDeferredEnabled(enabled: boolean): boolean {
+    if (!this.boundary || !isDeferredToolHost(this.pi)) return false;
+    if (this.sessionDeferred === enabled) {
+      this.reapply();
+      return true;
+    }
+    this.sessionDeferred = enabled;
+    this.desiredActiveNames = [
+      ...(enabled ? this.boundary.initialActiveNames : this.boundary.authorizedNames),
+      DEFERRED_TOOL_SEARCH_NAME,
+    ];
     this.pi.setActiveTools([...this.desiredActiveNames]);
     this.activeSetEstablished = true;
     return true;
@@ -113,7 +168,7 @@ export class DeferredToolManager {
       // If the host cannot disclose authorization, no tool name is trusted.
     }
     const activeNames = new Set(normalizedActiveNames(active));
-    this.desiredActiveNames = INITIAL_TOOL_ORDER.filter((name) => activeNames.has(name));
+    this.desiredActiveNames = DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER.filter((name) => activeNames.has(name));
     pi.setActiveTools([...this.desiredActiveNames]);
     this.activeSetEstablished = true;
     return false;
@@ -210,18 +265,77 @@ function isAuthorizationBoundary(value: unknown): value is AuthorizationBoundary
 
 function captureAuthorizationBoundary(pi: DeferredToolHost): AuthorizationBoundary {
   const active = normalizedActiveNames(pi.getActiveTools());
-  const authorizedNames = new Set(active.filter((name) => name !== SEARCH_TOOLS_NAME));
+  const authorizedNames = new Set(active.filter((name) => name !== DEFERRED_TOOL_SEARCH_NAME));
   const metadata = toolMetadata(pi.getAllTools());
   const metadataByName = new Map(metadata.map((tool) => [tool.name, tool]));
   const catalog = [...authorizedNames]
     .map((name) => metadataByName.get(name) ?? { name, description: "" })
     .sort((left, right) => compareNames(left.name, right.name));
-  const initialActiveNames = INITIAL_TOOL_ORDER.filter((name) => authorizedNames.has(name));
+  const initialActiveNames = DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER.filter((name) => authorizedNames.has(name));
+  return createAuthorizationBoundary(catalog, authorizedNames, initialActiveNames);
+}
+
+function captureConfiguredAuthorizationBoundary(
+  pi: DeferredToolHost,
+  configuredCatalog: ExecutorToolCatalog,
+): AuthorizationBoundary | undefined {
+  let normalized: ExecutorToolCatalog;
+  try {
+    normalized = createExecutorToolCatalog(
+      configuredCatalog.allowedToolCatalog,
+      configuredCatalog.initialActiveTools,
+    );
+  } catch {
+    return undefined;
+  }
+  if (
+    normalized.allowedToolCatalog.includes(DEFERRED_TOOL_SEARCH_NAME)
+    || normalized.initialActiveTools.includes(DEFERRED_TOOL_SEARCH_NAME)
+  ) return undefined;
+
+  const launchActive = new Set(normalizedActiveNames(pi.getActiveTools()));
+  if (!launchActive.has(DEFERRED_TOOL_SEARCH_NAME)) return undefined;
+  const metadata = toolMetadata(pi.getAllTools());
+  const metadataByName = new Map(metadata.map((tool) => [tool.name, tool]));
+  if (normalized.allowedToolCatalog.some((name) => !launchActive.has(name) || !metadataByName.has(name))) {
+    return undefined;
+  }
+  const authorizedNames = new Set(normalized.allowedToolCatalog);
+  const catalog = normalized.allowedToolCatalog
+    .map((name) => metadataByName.get(name)!)
+    .sort((left, right) => compareNames(left.name, right.name));
+  return createAuthorizationBoundary(catalog, authorizedNames, normalized.initialActiveTools);
+}
+
+function createAuthorizationBoundary(
+  catalog: readonly ToolMetadata[],
+  authorizedNames: ReadonlySet<string>,
+  initialActiveNames: readonly string[],
+): AuthorizationBoundary {
   return {
     catalog: Object.freeze(catalog.map((tool) => Object.freeze({ ...tool }))),
-    authorizedNames,
+    authorizedNames: new Set(authorizedNames),
     initialActiveNames: Object.freeze([...initialActiveNames]),
   };
+}
+
+function configuredCatalogMatchesBoundary(
+  configuredCatalog: ExecutorToolCatalog,
+  boundary: AuthorizationBoundary,
+): boolean {
+  try {
+    const normalized = createExecutorToolCatalog(
+      configuredCatalog.allowedToolCatalog,
+      configuredCatalog.initialActiveTools,
+    );
+    return !normalized.allowedToolCatalog.includes(DEFERRED_TOOL_SEARCH_NAME)
+      && boundary.authorizedNames.size === normalized.allowedToolCatalog.length
+      && normalized.allowedToolCatalog.every((name) => boundary.authorizedNames.has(name))
+      && boundary.initialActiveNames.length === normalized.initialActiveTools.length
+      && boundary.initialActiveNames.every((name, index) => name === normalized.initialActiveTools[index]);
+  } catch {
+    return false;
+  }
 }
 
 function normalizedActiveNames(value: unknown): string[] {

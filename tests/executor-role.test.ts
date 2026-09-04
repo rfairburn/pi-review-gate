@@ -4,6 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
+import { normalizeConfig } from "../src/config";
+import { ExecutionToolManager } from "../src/execution/tool";
+import {
+  EXECUTOR_TOOL_CATALOG_ENV,
+  createPiWorkerToolCatalog,
+  type ExecutorToolCatalog,
+} from "../src/execution/tool-catalog";
+import { createState } from "../src/state";
 
 const executionToolNames = [
   "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
@@ -15,11 +23,13 @@ const webToolNames = ["WebSearch", "WebFetch", "BrowserExtract"];
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
 let previousRole: string | undefined;
+let previousToolCatalog: string | undefined;
 
 beforeEach(() => {
   previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
   previousRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  previousToolCatalog = process.env[EXECUTOR_TOOL_CATALOG_ENV];
 });
 
 afterEach(() => {
@@ -29,6 +39,8 @@ afterEach(() => {
   else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
   if (previousRole === undefined) delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
   else process.env.PI_REVIEW_GATE_RUNTIME_ROLE = previousRole;
+  if (previousToolCatalog === undefined) delete process.env[EXECUTOR_TOOL_CATALOG_ENV];
+  else process.env[EXECUTOR_TOOL_CATALOG_ENV] = previousToolCatalog;
 });
 
 interface ActivationCapture {
@@ -104,6 +116,121 @@ test("executor role registers web tools and background shell without orchestrati
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("executor role defers to the durable initial subset and activates authorized matches on the next turn", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-executor-deferred-"));
+  try {
+    process.env.PI_REVIEW_GATE_CONFIG = await writeConfig(dir);
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    process.env.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
+    const parentStyleCatalog = await catalogProducedByExecutionToolManager();
+    assert.ok(parentStyleCatalog.allowedToolCatalog.includes("SubtasksStart"));
+    process.env[EXECUTOR_TOOL_CATALOG_ENV] = JSON.stringify(createPiWorkerToolCatalog(parentStyleCatalog));
+
+    type Tool = {
+      name: string;
+      description?: string;
+      execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
+    };
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const definitions = new Map<string, Tool>([
+      ["read", { name: "read", description: "Read files." }],
+      ["edit", { name: "edit", description: "Edit files." }],
+    ]);
+    let active = ["read", "edit"];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerTool(tool: Tool) {
+        definitions.set(tool.name, tool);
+        active.push(tool.name);
+      },
+      getActiveTools: () => [...active],
+      getAllTools: () => [...definitions.values()],
+      setActiveTools(names: string[]) { active = [...names]; },
+      notify() {},
+    };
+
+    await activate(pi);
+    const ctx = { cwd: dir, ui: {}, sessionManager: {} };
+    for (const hook of hooks.get("session_start") ?? []) await hook({ cwd: dir }, ctx);
+    assert.equal(process.env[EXECUTOR_TOOL_CATALOG_ENV], undefined, "bootstrap catalog is removed before worker tools run");
+    assert.deepEqual(active, ["read", "edit", "search_tools"]);
+
+    const before = await Promise.all((hooks.get("before_agent_start") ?? []).map((hook) =>
+      hook({ cwd: dir, systemPrompt: "native Pi prompt" }, ctx)
+    ));
+    const guidance = before.map((value) =>
+      (value as { systemPrompt?: string } | undefined)?.systemPrompt ?? ""
+    ).join("\n");
+    assert.match(guidance, /native Pi prompt/);
+    for (const name of ["read", "edit", "WebSearch", "ShellList", "search_tools"]) {
+      assert.match(guidance, new RegExp(`"${name}"`));
+    }
+    assert.doesNotMatch(guidance, /SubtasksStart|SubtasksInspect/);
+    assert.match(guidance, /exact name/i);
+    assert.match(guidance, /next turn/i);
+    assert.doesNotMatch(guidance, /Read files|Edit files|Search the public web|parameters|properties/);
+
+    const search = definitions.get("search_tools");
+    assert.ok(search?.execute);
+    const loaded = await search.execute("load-web", { query: "public web" });
+    assert.deepEqual((loaded.details as { activated: string[] }).activated, ["WebSearch"]);
+    assert.deepEqual(active, ["read", "edit", "search_tools", "WebSearch"]);
+
+    for (const hook of hooks.get("tool_result") ?? []) await hook({ toolName: "search_tools" }, ctx);
+    for (const hook of hooks.get("before_agent_start") ?? []) await hook({ cwd: dir }, ctx);
+    assert.deepEqual(active, ["read", "edit", "search_tools", "WebSearch"], "activation remains additive on the next model turn");
+
+    const unauthorized = await search.execute("load-private", { query: "background process output" });
+    assert.deepEqual((unauthorized.details as { activated: string[] }).activated, []);
+    assert.equal(active.includes("ShellLog"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function catalogProducedByExecutionToolManager(): Promise<ExecutorToolCatalog> {
+  const tools: Array<{ name: string; execute?: (...args: any[]) => Promise<Record<string, any>> }> = [];
+  const activeNames = ["read", "edit", "WebSearch", "ShellList", ...executionToolNames];
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "fake",
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: {
+        protocol: "pi-review-executor-jsonl-v1",
+        args: ["-e", "process.stdin.resume();setInterval(()=>{},1000)"],
+      },
+    }],
+    execution: { activeExecutor: { source: "external", id: "fake" } },
+  });
+  const manager = new ExecutionToolManager({
+    pi: {
+      registerTool(tool: { name: string; execute?: (...args: any[]) => Promise<Record<string, any>> }) { tools.push(tool); },
+      registerCommand() {},
+      setToolActive() {},
+      getActiveTools: () => activeNames,
+    },
+    config,
+    state: createState(),
+    cwd: () => process.cwd(),
+  });
+  manager.sync();
+  try {
+    const start = tools.find((tool) => tool.name === "SubtasksStart");
+    assert.ok(start?.execute);
+    const result = await start.execute("catalog-bootstrap", {
+      tasks: [{ title: "Catalog", instructions: "Wait", acceptanceCriteria: ["Catalog captured"] }],
+    }, undefined, undefined, {});
+    return result.details.tasks[0].definition.executorToolCatalog as ExecutorToolCatalog;
+  } finally {
+    await manager.shutdown();
+  }
+}
 
 test("PI_REVIEW_GATE_DISABLED still short-circuits activation before executor-role registration", async () => {
   // Documents the kill-switch behavior that previously broke Pi executor

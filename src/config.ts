@@ -176,6 +176,10 @@ export const MAX_WEB_CACHE_BYTES = 256 * 1024 * 1024;
 export const MAX_WEB_CACHE_ENTRIES = 256;
 export type SubtaskNotificationMode = "quiet" | "noisy";
 export const DEFAULT_SUBTASK_NOTIFICATION_MODE: SubtaskNotificationMode = "quiet";
+export const DEFAULT_DEFERRED_PI_TOOLS = true;
+export function deferredPiToolsEnabled(config: Pick<ReviewGateConfig, "execution">): boolean {
+  return config.execution?.deferredPiTools ?? DEFAULT_DEFERRED_PI_TOOLS;
+}
 export const DEFAULT_EXECUTION_RETRY_POLICY: ExecutionRetryPolicy = {
   maxRetries: 2,
   baseDelayMs: 1_000,
@@ -197,6 +201,8 @@ export interface ExecutionConfig {
   maxWorkers?: number;
   retryPolicy?: ExecutionRetryPolicy;
   subtaskNotifications?: SubtaskNotificationMode;
+  /** Defer Pi-native schemas until search_tools activation. Defaults on. */
+  deferredPiTools?: boolean;
 }
 
 export interface ReviewGateUiConfig {
@@ -818,6 +824,9 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
   const maxWorkers = normalizeMaxWorkers(value.maxWorkers);
   const retryPolicy = normalizeExecutionRetryPolicy(value.retryPolicy);
   const subtaskNotifications = normalizeSubtaskNotificationMode(value.subtaskNotifications);
+  if (value.deferredPiTools !== undefined && typeof value.deferredPiTools !== "boolean") {
+    throw new Error("execution.deferredPiTools must be a boolean");
+  }
   return {
     activeExecutor,
     executorPool,
@@ -827,6 +836,7 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
     ...(maxWorkers !== undefined ? { maxWorkers } : {}),
     retryPolicy,
     subtaskNotifications,
+    deferredPiTools: value.deferredPiTools ?? DEFAULT_DEFERRED_PI_TOOLS,
   };
 }
 

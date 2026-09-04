@@ -28,6 +28,7 @@ export interface ReviewSettingsSelection {
   maxWorkers: number;
   retryPolicy: ExecutionRetryPolicy;
   subtaskNotifications: SubtaskNotificationMode;
+  deferredPiTools?: boolean;
   subtasksViewExpanded: boolean;
   webMaxDownloadBytes?: number;
 }
@@ -62,6 +63,8 @@ export async function persistReviewSettings(
     execution.maxWorkers = selection.maxWorkers;
     execution.retryPolicy = { ...selection.retryPolicy };
     execution.subtaskNotifications = selection.subtaskNotifications;
+    execution.deferredPiTools = selection.deferredPiTools
+      ?? (typeof execution.deferredPiTools === "boolean" ? execution.deferredPiTools : true);
     delete execution.parallelEnabled;
     delete execution.externalExecutors;
     parsed.execution = execution;

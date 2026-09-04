@@ -97,6 +97,109 @@ test("first session request is shrunk to the authorized conservative set and loa
   assert.equal(reloaded.authorizedToolNames()?.includes("post_capture"), false);
 });
 
+test("configured worker catalogs use the durable initial subset without narrowing authorization", async () => {
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+
+  assert.equal(manager.sessionStart(fixture.sessionIdentity, {
+    allowedToolCatalog: ["read", "write", "WebSearch"],
+    initialActiveTools: ["read"],
+  }), true);
+  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  assert.deepEqual(manager.authorizedToolNames(), ["read", "write", "WebSearch"]);
+  const inventory = manager.startupGuidance() ?? "";
+  for (const name of ["read", "write", "WebSearch", "search_tools"]) {
+    assert.match(inventory, new RegExp(`"${name}"`));
+  }
+  assert.match(inventory, /exact name/);
+  assert.match(inventory, /next turn/);
+  assert.doesNotMatch(inventory, /Read file contents|Create or overwrite|Search the public web|parameters|properties/);
+
+  const reloaded = new DeferredToolManager(fixture.pi);
+  reloaded.register();
+  assert.equal(
+    reloaded.sessionStart(fixture.sessionIdentity, undefined, true),
+    true,
+    "same-session extension reload reuses the captured one-shot bootstrap",
+  );
+  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+
+  const result = await fixture.search()("search", { query: "public web" });
+  assert.deepEqual((result.details as { activated: string[] }).activated, ["WebSearch"]);
+  assert.deepEqual(fixture.active(), ["read", "search_tools", "WebSearch"]);
+});
+
+test("role-filtered research inventory names every authorized tool without mutation tools or schemas", () => {
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity, {
+    allowedToolCatalog: ["read", "WebSearch"],
+    initialActiveTools: ["read"],
+  });
+
+  const inventory = manager.startupGuidance() ?? "";
+  for (const name of ["read", "WebSearch", "search_tools"]) {
+    assert.match(inventory, new RegExp(`"${name}"`));
+  }
+  assert.doesNotMatch(inventory, /"(?:bash|edit|write|ApplyPatch)"/);
+  assert.doesNotMatch(inventory, /Read file contents|Search the public web|parameters|properties/);
+});
+
+test("configured worker boundaries reject unavailable and unauthorized tools", async () => {
+  const fixture = hostFixture({ disabled: ["WebSearch", "disabled_private"] });
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+
+  assert.equal(manager.sessionStart(fixture.sessionIdentity, {
+    allowedToolCatalog: ["read", "WebSearch"],
+    initialActiveTools: ["read"],
+  }), false, "a durable name absent from the native launch allowlist fails closed");
+  assert.equal(manager.authorizedToolNames(), undefined);
+  assert.equal(fixture.active().includes("search_tools"), false);
+
+  const result = await fixture.search()("unauthorized", { query: "private disabled" });
+  assert.equal(result.isError, true);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "ApplyPatch", "SubtasksStart"]);
+});
+
+test("disabled deferred mode starts full-active and local toggles apply immediately", async () => {
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity, undefined, false, false);
+
+  const authorized = manager.authorizedToolNames()!;
+  assert.deepEqual(fixture.active(), [...authorized, "search_tools"]);
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /inactive|next turn/);
+
+  assert.equal(manager.setDeferredEnabled(true), true);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"]);
+  assert.match(manager.startupGuidance() ?? "", /inactive.*exact name.*next turn/);
+
+  await fixture.search()("load-web", { query: "WebSearch" });
+  assert.ok(fixture.active().includes("WebSearch"));
+  assert.equal(manager.setDeferredEnabled(true), true, "saving the unchanged setting succeeds");
+  assert.ok(fixture.active().includes("WebSearch"), "saving unrelated settings does not unload activated tools");
+
+  assert.equal(manager.setDeferredEnabled(false), true);
+  assert.deepEqual(fixture.active(), [...authorized, "search_tools"]);
+});
+
+test("configured worker with deferred mode disabled starts every durable authorized tool", () => {
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity, {
+    allowedToolCatalog: ["read", "write", "WebSearch"],
+    initialActiveTools: ["read", "write", "WebSearch"],
+  }, true);
+
+  assert.deepEqual(fixture.active(), ["read", "write", "WebSearch", "search_tools"]);
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /inactive|next turn/);
+});
+
 test("search deterministically and additively activates authorized matches only", async () => {
   const fixture = hostFixture();
   const manager = new DeferredToolManager(fixture.pi);
@@ -208,6 +311,31 @@ test("distinct session identities capture isolated authorization catalogs", asyn
   assert.deepEqual((firstWeb.details as { activated: string[] }).activated, ["WebSearch"]);
   const firstPrivate = await firstFixture.search()("first-private", { query: "private disabled service" });
   assert.deepEqual((firstPrivate.details as { activated: string[] }).activated, []);
+});
+
+test("configured worker activation is isolated between task sessions", async () => {
+  const firstFixture = hostFixture();
+  const secondFixture = hostFixture();
+  const first = new DeferredToolManager(firstFixture.pi);
+  const second = new DeferredToolManager(secondFixture.pi);
+  first.register();
+  second.register();
+  first.sessionStart(firstFixture.sessionIdentity, {
+    allowedToolCatalog: ["read", "write"],
+    initialActiveTools: ["read"],
+  });
+  second.sessionStart(secondFixture.sessionIdentity, {
+    allowedToolCatalog: ["read", "WebSearch"],
+    initialActiveTools: ["read"],
+  });
+
+  const firstLoad = await firstFixture.search()("first", { query: "overwrite file" });
+  assert.deepEqual((firstLoad.details as { activated: string[] }).activated, ["write"]);
+  const secondCannotLoadFirst = await secondFixture.search()("second-write", { query: "overwrite file" });
+  assert.deepEqual((secondCannotLoadFirst.details as { activated: string[] }).activated, []);
+  const secondLoad = await secondFixture.search()("second-web", { query: "public web" });
+  assert.deepEqual((secondLoad.details as { activated: string[] }).activated, ["WebSearch"]);
+  assert.equal(firstFixture.active().includes("WebSearch"), false);
 });
 
 test("session startup fails closed without a stable identity", async () => {

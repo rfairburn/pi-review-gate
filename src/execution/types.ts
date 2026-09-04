@@ -34,7 +34,7 @@ export interface ExecutorRequest {
   executorToolCatalog?: ExecutorToolCatalog;
   /** @deprecated Compatibility mirror for adapters that consume only an allowlist. */
   allowedTools?: readonly string[];
-  /** Compatibility mirror for durable future deferred-activation intent. */
+  /** Compatibility mirror for the durable Pi startup-active subset. */
   initialActiveTools?: readonly string[];
   signal?: AbortSignal;
   session?: ExecutorSession;

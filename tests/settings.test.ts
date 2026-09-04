@@ -422,6 +422,35 @@ test("subtask notification mode is staged and saved with quiet as the default", 
   assert.equal(config.execution?.subtaskNotifications, "noisy");
 });
 
+test("deferred Pi tools toggle is staged, persisted, and labeled for local/new-subtask application", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-deferred-tools-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    execution: { activeExecutor: null },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  let appliedImmediately: boolean | undefined;
+  registerReviewSettings({
+    pi: registered.pi,
+    config,
+    configPath,
+    onSaved: (saved) => { appliedImmediately = saved.execution?.deferredPiTools; },
+  });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Deferred Pi tools", "On · local now, new subtasks"),
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.execution.deferredPiTools, false);
+  assert.equal(config.execution?.deferredPiTools, false);
+  assert.equal(appliedImmediately, false);
+});
+
 test("web settings stage and save the maximum download size in MiB", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-web-"));
   const configPath = join(dir, "review-gate.json");
@@ -621,6 +650,7 @@ const ROOT_SETTING_LABELS = [
   "Global concurrency",
   "Retry policy",
   "Subtask notifications",
+  "Deferred Pi tools",
   "Subtasks view",
   "Web",
 ] as const;

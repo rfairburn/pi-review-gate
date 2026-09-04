@@ -2,11 +2,16 @@
  * Durable tool authorization and activation contract for executor tasks.
  *
  * `allowedToolCatalog` is the complete set a child may load. The
- * `initialActiveTools` set durably records the future deferred-activation
- * intent, but adapters do not consume it for activation until a trusted
- * bootstrap channel exists. Keeping the two values in one validated contract
- * prevents a restored or retried task from widening authorization.
+ * `initialActiveTools` is the startup-visible subset used by Pi-native
+ * workers. Keeping the two values in one validated contract prevents a
+ * restored or retried task from widening authorization.
  */
+export const EXECUTOR_TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
+export const DEFERRED_TOOL_SEARCH_NAME = "search_tools";
+export const DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER = [
+  "read", "bash", "edit", "ApplyPatch", "SubtasksStart",
+] as const;
+
 export interface ExecutorToolCatalog {
   allowedToolCatalog: string[];
   initialActiveTools: string[];
@@ -32,6 +37,28 @@ export function normalizeToolNames(names: readonly string[], label = "tool set")
     normalized.push(name);
   }
   return normalized;
+}
+
+/** Conservative startup subset for newly delegated deferred-tool workers. */
+export function defaultExecutorInitialActiveTools(allowedToolCatalog: readonly string[]): string[] {
+  const allowed = new Set(normalizeToolNames(allowedToolCatalog, "allowed tool catalog"));
+  return DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER.filter((name) => allowed.has(name));
+}
+
+/**
+ * Derive the Pi executor-role catalog from the durable parent-authorized
+ * contract. Subtasks* controls belong only to the top-level orchestrator; the
+ * executor extension deliberately does not register recursive delegation.
+ * External adapters continue consuming the unmodified durable catalog.
+ */
+export function createPiWorkerToolCatalog(catalog: ExecutorToolCatalog): ExecutorToolCatalog {
+  const normalized = createExecutorToolCatalog(catalog.allowedToolCatalog, catalog.initialActiveTools);
+  const allowedToolCatalog = normalized.allowedToolCatalog.filter((name) => !name.startsWith("Subtasks"));
+  const allowed = new Set(allowedToolCatalog);
+  return createExecutorToolCatalog(
+    allowedToolCatalog,
+    normalized.initialActiveTools.filter((name) => allowed.has(name)),
+  );
 }
 
 /** Build the canonical contract, defaulting to legacy full-active behavior. */

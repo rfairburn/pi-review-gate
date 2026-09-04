@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   activeExternalExecutor,
   automaticReviewEnabled,
+  deferredPiToolsEnabled,
   loadConfig,
   materializeReviewConfig,
   MAX_WEB_CACHE_BYTES,
@@ -122,6 +123,19 @@ test("normalizeConfig preserves the global subtasks view preference", () => {
   assert.throws(
     () => normalizeConfig({ enabled: true, ui: { subtasksViewExpanded: "yes" } }),
     /ui\.subtasksViewExpanded must be a boolean/,
+  );
+});
+
+test("deferred Pi-native tools default on and require a boolean override", () => {
+  assert.equal(deferredPiToolsEnabled(normalizeConfig({ enabled: true })), true);
+  assert.equal(normalizeConfig({ enabled: true, execution: {} }).execution?.deferredPiTools, true);
+  assert.equal(
+    deferredPiToolsEnabled(normalizeConfig({ enabled: true, execution: { deferredPiTools: false } })),
+    false,
+  );
+  assert.throws(
+    () => normalizeConfig({ enabled: true, execution: { deferredPiTools: "off" } }),
+    /execution\.deferredPiTools must be a boolean/,
   );
 });
 

@@ -28,7 +28,7 @@ function executionTool(tools: Array<Record<string, any>>, name: string): Record<
   return tool;
 }
 
-function harness(options: { slowExecutor?: boolean; expandedView?: boolean; researchCapable?: boolean; resourceCapacity?: number; activeTools?: string[]; omitActiveToolSnapshot?: boolean } = {}) {
+function harness(options: { slowExecutor?: boolean; expandedView?: boolean; researchCapable?: boolean; resourceCapacity?: number; activeTools?: string[]; omitActiveToolSnapshot?: boolean; deferredPiTools?: boolean } = {}) {
   const tools: Array<Record<string, any>> = [];
   const commands: string[] = [];
   const commandHandlers = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
@@ -60,7 +60,10 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean; rese
       },
     }],
     execution: options.resourceCapacity === undefined
-      ? { activeExecutor: { source: "external", id: "fake" } }
+      ? {
+          activeExecutor: { source: "external", id: "fake" },
+          deferredPiTools: options.deferredPiTools,
+        }
       : {
           workerResources: [{
             resourceId: "fake-shared",
@@ -69,6 +72,7 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean; rese
           }],
           routes: { execute: [{ resourceId: "fake-shared" }], research: [] },
           maxWorkers: 4,
+          deferredPiTools: options.deferredPiTools,
         },
     ui: { subtasksViewExpanded: options.expandedView ?? false },
   });
@@ -485,9 +489,9 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.deepEqual(result.details.tasks[0].definition.executorAllowedTools, activeCatalog);
   assert.deepEqual(result.details.tasks[0].definition.executorToolCatalog, {
     allowedToolCatalog: activeCatalog,
-    initialActiveTools: activeCatalog,
+    initialActiveTools: ["read", "bash", "SubtasksStart"],
   });
-  assert.deepEqual(result.details.tasks[0].definition.executorInitialActiveTools, activeCatalog);
+  assert.deepEqual(result.details.tasks[0].definition.executorInitialActiveTools, ["read", "bash", "SubtasksStart"]);
   assert.deepEqual(result.details.tasks[0].timing, {
     queueMs: result.details.tasks[0].timing.queueMs,
     captureMs: 0,
@@ -500,6 +504,17 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.match(diagnostic.content[0].text, /Execution diagnostics: revision \d+; peak concurrency \d+\./);
   assert.match(diagnostic.content[0].text, /Scheduler: \d+\/4 workers active;/);
   assert.match(diagnostic.content[0].text, /timing \(ms\): total \d+; queued \d+; capture \d+; execution \d+; review \d+; landing \d+/);
+  await manager.shutdown();
+});
+
+test("new downstream tasks start full-active when deferred Pi tools are disabled", async () => {
+  const { tools, manager } = harness({ deferredPiTools: false });
+  const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const result = await execute("full-active", {
+    tasks: [{ title: "Full active", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
+  }, undefined, undefined, {});
+  const catalog = result.details.tasks[0].definition.executorToolCatalog;
+  assert.deepEqual(catalog.initialActiveTools, catalog.allowedToolCatalog);
   await manager.shutdown();
 });
 
@@ -526,7 +541,7 @@ test("SubtasksStart creates immutable research groups without child-local eviden
   assert.deepEqual(started.details.tasks[0].definition.executorAllowedTools, researchCatalog);
   assert.deepEqual(started.details.tasks[0].definition.executorToolCatalog, {
     allowedToolCatalog: researchCatalog,
-    initialActiveTools: researchCatalog,
+    initialActiveTools: ["read"],
   });
   assert.equal(started.details.tasks[0].definition.backgroundKind, "research");
   assert.equal(manager.reviewReadiness()[0]?.kind, "research");
@@ -544,7 +559,7 @@ test("SubtasksStart creates immutable research groups without child-local eviden
   assert.deepEqual(added.details.tasks[1].definition.executorAllowedTools, researchCatalog);
   assert.deepEqual(added.details.tasks[1].definition.executorToolCatalog, {
     allowedToolCatalog: researchCatalog,
-    initialActiveTools: researchCatalog,
+    initialActiveTools: ["read"],
   });
   await manager.shutdown();
 });

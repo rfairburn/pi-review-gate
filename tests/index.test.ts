@@ -421,6 +421,7 @@ test("session_start captures execution tools before applying the conservative de
     delete process.env.PI_REVIEW_GATE_DISABLED;
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    let reviewSettingsHandler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
     const registeredTools: Array<{ name: string; description?: string }> = [];
     let activeTools = ["read", "bash", "edit"];
     let runtimeInitialized = false;
@@ -431,7 +432,9 @@ test("session_start captures execution tools before applying the conservative de
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
-      registerCommand() {},
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+        if (name === "review-settings") reviewSettingsHandler = options.handler;
+      },
       registerTool(tool: { name: string; description?: string }) {
         registeredTools.push(tool);
         activeTools.push(tool.name);
@@ -467,11 +470,50 @@ test("session_start captures execution tools before applying the conservative de
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
       ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools", ...executionToolNames,
     ]);
-    assert.deepEqual(activeTools, ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"]);
+    const deferredActive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"];
+    assert.deepEqual(activeTools, deferredActive);
+
+    const toggleDeferredTools = async () => {
+      assert.ok(reviewSettingsHandler);
+      let selectedToggle = false;
+      await reviewSettingsHandler("", {
+        ui: {
+          select: async (title: string, options: string[]) => {
+            if (title !== "Review settings") return undefined;
+            if (!selectedToggle) {
+              selectedToggle = true;
+              return options.find((option) => option.startsWith("Deferred Pi tools"));
+            }
+            return "Save changes";
+          },
+          notify() {},
+        },
+      });
+    };
+    await toggleDeferredTools();
+    const fullAuthorized = [
+      "read", "bash", "edit", ...webToolNames, "ApplyPatch", ...backgroundShellToolNames,
+      ...executionToolNames,
+    ];
+    assert.deepEqual(activeTools, [...fullAuthorized, "search_tools"], "saving Off immediately activates the complete local catalog");
+    await toggleDeferredTools();
+    assert.deepEqual(activeTools, deferredActive, "saving On immediately restores the conservative local catalog");
 
     pi.registerTool({ name: "LateIdleTool", description: "Registered while the model is idle." });
     assert.ok(activeTools.includes("LateIdleTool"));
-    await trigger(hooks, "before_agent_start", { cwd: dir });
+    const beforeStart = await triggerResults(hooks, "before_agent_start", { cwd: dir, systemPrompt: "native orchestrator prompt" });
+    assert.ok(beforeStart.some((value) => typeof (value as { systemPrompt?: unknown }).systemPrompt === "string"));
+    const inventory = JSON.stringify(beforeStart);
+    assert.match(inventory, /native orchestrator prompt/);
+    for (const name of [
+      "read", "bash", "edit", ...webToolNames, "ApplyPatch", ...backgroundShellToolNames,
+      "search_tools", ...executionToolNames,
+    ]) {
+      assert.match(inventory, new RegExp(escapeRegExp(`\\"${name}\\"`)));
+    }
+    assert.match(inventory, /exact name/);
+    assert.match(inventory, /next turn/);
+    assert.doesNotMatch(inventory, /LateIdleTool|Read files|Run shell commands|Edit files|parameters|properties/);
     assert.equal(activeTools.includes("LateIdleTool"), false, "request boundary removes an unauthorized idle registration");
 
     pi.registerTool({ name: "LateToolResultTool", description: "Registered during a tool execution." });

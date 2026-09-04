@@ -60,6 +60,18 @@ test("Pi executor child loads the review-gate extension in executor role without
         },
       });
       assert.equal(result.text, "research complete");
+      const continued = await adapter.run({
+        cwd: root,
+        prompt: "continue research task",
+        artifactDir,
+        turn: 2,
+        session: result.session,
+        executorToolCatalog: {
+          allowedToolCatalog: ["read", "WebSearch", "WebFetch", "BrowserExtract"],
+          initialActiveTools: ["read", "WebFetch"],
+        },
+      });
+      assert.equal(continued.session.id, result.session.id, "a fresh continuation process reuses the durable Pi session");
       const captured = JSON.parse(await readFile(capture, "utf8")) as { argv: string[]; env: Record<string, string | undefined> };
       // The child must not inherit the review-gate kill switch from the parent
       // or have it imposed by the adapter; with it set, activate() returns
@@ -68,7 +80,11 @@ test("Pi executor child loads the review-gate extension in executor role without
       assert.equal(captured.env.PI_REVIEW_GATE_RUNTIME_ROLE, "executor");
       assert.equal(captured.env.PI_EXTRA_EXTENSIONS, undefined);
       const tools = captured.argv[captured.argv.indexOf("--tools") + 1];
-      assert.equal(tools, "read,WebSearch,WebFetch,BrowserExtract");
+      assert.equal(tools, "read,WebSearch,WebFetch,BrowserExtract,search_tools");
+      assert.deepEqual(JSON.parse(captured.env.PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG!), {
+        allowedToolCatalog: ["read", "WebSearch", "WebFetch", "BrowserExtract"],
+        initialActiveTools: ["read", "WebFetch"],
+      });
       const extension = captured.argv[captured.argv.indexOf("--extension") + 1];
       assert.ok(extension.endsWith("index.js"), `expected the review-gate extension to load in the child, got ${extension}`);
     } finally {
@@ -93,7 +109,7 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
     await writeFile(command, [
       "#!/usr/bin/env node",
       `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2)));`,
-      `fs.writeFileSync(${JSON.stringify(environmentCapture)},JSON.stringify({}));`,
+      `fs.writeFileSync(${JSON.stringify(environmentCapture)},JSON.stringify({toolCatalog:process.env.PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG}));`,
       "let input=''; process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));}",
@@ -128,8 +144,12 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
     assert.equal(result.session.adapter, "pi-model");
     const argv: string[] = JSON.parse(await readFile(capture, "utf8"));
     assert.equal(argv[argv.indexOf("--mode") + 1], "rpc");
-    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,SubtasksStart,SubtasksSteer");
-    assert.deepEqual(JSON.parse(await readFile(environmentCapture, "utf8")), {});
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,search_tools");
+    const environment = JSON.parse(await readFile(environmentCapture, "utf8"));
+    assert.deepEqual(JSON.parse(environment.toolCatalog), {
+      allowedToolCatalog: ["read", "bash"],
+      initialActiveTools: ["read", "bash"],
+    });
     assert.equal(argv.includes("--print"), false);
 
     let resolveInterruptControl!: (control: ExecutorLiveControl) => void;

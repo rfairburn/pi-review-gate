@@ -64,6 +64,12 @@ test("PiModelAdapter uses one native --tools allowlist and reports missing final
     assert.deepEqual(argv.includes("--tools"), true);
     assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls");
     assert.deepEqual(argv.includes("--system-prompt"), true);
+    const systemPrompt = argv[argv.indexOf("--system-prompt") + 1];
+    for (const name of ["read", "grep", "find", "ls"]) {
+      assert.match(systemPrompt, new RegExp(`\\b${name}\\b`));
+    }
+    assert.match(systemPrompt, /exactly these tools available/);
+    assert.doesNotMatch(systemPrompt, /parameters|properties|additionalProperties|Read file contents/);
     assert.equal(argv.includes("--output-schema"), false);
     assert.equal(argv[argv.indexOf("--thinking") + 1], "max");
     assert.equal(argv.includes("--no-session"), false);

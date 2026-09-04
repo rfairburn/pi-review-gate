@@ -6,6 +6,8 @@ import test from "node:test";
 import {
   assignExecutorToolCatalog,
   createExecutorToolCatalog,
+  createPiWorkerToolCatalog,
+  defaultExecutorInitialActiveTools,
   normalizeExecutorToolCatalog,
   normalizeToolNames,
 } from "../src/execution/tool-catalog";
@@ -30,6 +32,23 @@ test("tool catalog normalization is stable, deduplicated, and subset validated",
     /must be a subset/,
   );
   assert.throws(() => normalizeToolNames([" "]), /must not be empty/);
+  assert.deepEqual(
+    defaultExecutorInitialActiveTools(["WebSearch", "read", "ApplyPatch", "bash"]),
+    ["read", "bash", "ApplyPatch"],
+  );
+});
+
+test("Pi worker catalogs remove orchestrator-only delegation controls without mutating the durable catalog", () => {
+  const durable = createExecutorToolCatalog(
+    ["read", "bash", "SubtasksStart", "SubtasksInspect", "WebSearch"],
+    ["read", "bash", "SubtasksStart"],
+  );
+  const worker = createPiWorkerToolCatalog(durable);
+  assert.deepEqual(worker, {
+    allowedToolCatalog: ["read", "bash", "WebSearch"],
+    initialActiveTools: ["read", "bash"],
+  });
+  assert.deepEqual(durable.allowedToolCatalog, ["read", "bash", "SubtasksStart", "SubtasksInspect", "WebSearch"]);
 });
 
 test("legacy allowed-only task records restore with every authorized tool active", () => {
@@ -44,7 +63,7 @@ test("legacy allowed-only task records restore with every authorized tool active
   assert.deepEqual(legacy.executorToolCatalog, catalog);
 });
 
-test("task and operation records preserve future initial intent without narrowing authorization", () => {
+test("task and operation records preserve deferred initial intent without narrowing authorization", () => {
   const taskDefinition = definition();
   assignExecutorToolCatalog(taskDefinition, createExecutorToolCatalog(["read", "bash"], ["read"]));
   const task = newTask(taskDefinition);

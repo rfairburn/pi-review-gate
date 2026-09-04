@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import {
+  DEFAULT_DEFERRED_PI_TOOLS,
   DEFAULT_EXECUTION_RETRY_POLICY,
   DEFAULT_MAX_WORKERS,
   DEFAULT_SUBTASK_NOTIFICATION_MODE,
@@ -47,7 +48,7 @@ interface UiContext {
 export function registerReviewSettings(input: RegisterSettingsInput): void {
   if (!isRecord(input.pi) || typeof input.pi.registerCommand !== "function") return;
   input.pi.registerCommand("review-settings", {
-    description: "Configure delegated execution, reviewers, reasoning, review policy, web tools, and bundle retention.",
+    description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, web tools, and retention.",
     handler: async (_args: string, ctx: unknown) => {
       const ui = extractUi(ctx);
       if (!ui) {
@@ -80,6 +81,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let maxWorkers = input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS;
   let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
   let subtaskNotifications = input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
+  let deferredPiTools = input.config.execution?.deferredPiTools ?? DEFAULT_DEFERRED_PI_TOOLS;
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
   let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
 
@@ -88,7 +90,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const [resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, subtasksViewRow, webRow] = alignedSettingsRows([
+    const [resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, deferredToolsRow, subtasksViewRow, webRow] = alignedSettingsRows([
       ["Worker resources", executorPoolSummary(workerResources)],
       ["Execution priority", workerRouteSummary(executeRoute, workerResources, agents, input.scoped)],
       ["Research priority", workerRouteSummary(researchRoute, workerResources, agents, input.scoped)],
@@ -99,6 +101,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ["Global concurrency", String(maxWorkers)],
       ["Retry policy", `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base`],
       ["Subtask notifications", subtaskNotifications === "quiet" ? "Quiet" : "Noisy"],
+      ["Deferred Pi tools", `${deferredPiTools ? "On" : "Off"} · local now, new subtasks`],
       ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
       ["Web", `${formatByteSize(webMaxDownloadBytes)} max download`],
     ]);
@@ -113,6 +116,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       workersRow,
       retryRow,
       notificationsRow,
+      deferredToolsRow,
       subtasksViewRow,
       webRow,
       "Save changes",
@@ -186,6 +190,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       subtaskNotifications = await selectSubtaskNotifications(input.ui, subtaskNotifications);
       continue;
     }
+    if (choice === deferredToolsRow) {
+      deferredPiTools = !deferredPiTools;
+      continue;
+    }
     if (choice === subtasksViewRow) {
       subtasksViewExpanded = !subtasksViewExpanded;
       continue;
@@ -212,6 +220,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       maxWorkers,
       retryPolicy,
       subtaskNotifications,
+      deferredPiTools,
       subtasksViewExpanded,
       webMaxDownloadBytes,
     });

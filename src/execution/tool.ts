@@ -1,4 +1,4 @@
-import { externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
+import { deferredPiToolsEnabled, externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
 import type { ExecutionAssociationsSnapshot } from "../session-state";
@@ -25,6 +25,7 @@ import { parseDuration } from "../background-shell/jobs";
 import {
   assignExecutorToolCatalog,
   createExecutorToolCatalog,
+  defaultExecutorInitialActiveTools,
   resolveExecutorToolCatalog,
 } from "./tool-catalog";
 
@@ -488,7 +489,12 @@ export class ExecutionToolManager {
       // activation request.
       resolveExecutorToolCatalog(task);
       const explicitInitial = task.executorToolCatalog?.initialActiveTools ?? task.executorInitialActiveTools;
-      const catalog = createExecutorToolCatalog(childTools, explicitInitial);
+      const catalog = createExecutorToolCatalog(
+        childTools,
+        explicitInitial ?? (deferredPiToolsEnabled(this.input.config)
+          ? defaultExecutorInitialActiveTools(childTools)
+          : childTools),
+      );
       const definition: BackgroundTaskDefinition = {
         ...task,
         backgroundKind: kind,

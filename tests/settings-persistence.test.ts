@@ -22,6 +22,7 @@ const selection: ReviewSettingsSelection = {
     maxSameIncidentRepeats: 2,
   },
   subtaskNotifications: "quiet",
+  deferredPiTools: true,
   subtasksViewExpanded: false,
 };
 
@@ -34,7 +35,9 @@ test("persistReviewSettings preserves restrictive configuration permissions", as
     await chmod(configPath, 0o600);
     await persistReviewSettings(configPath, selection);
     assert.equal((await stat(configPath)).mode & 0o777, 0o600);
-    assert.equal(JSON.parse(await readFile(configPath, "utf8")).enabled, true);
+    const firstSaved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(firstSaved.enabled, true);
+    assert.equal(firstSaved.execution.deferredPiTools, true);
     assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
     await chmod(configPath, 0o644);
     await persistReviewSettings(configPath, selection);

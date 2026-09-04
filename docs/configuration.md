@@ -125,13 +125,14 @@ save migrates their definitions into `externalAgents`.
 ## Delegated execution fields
 
 The `execution` block (`workerResources`, `routes`, `maxWorkers`,
-`subtaskNotifications`, `retryPolicy`) and the reviewer/execution route matrix are
+`subtaskNotifications`, `deferredPiTools`, `retryPolicy`) and the reviewer/execution route matrix are
 documented with the behavior they control in
 [Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency).
 A complete end-to-end example is `examples/delegated-execution.json`.
 
 Defaults: `execution.maxWorkers` is `4` (allowed range 1–16) and
-`execution.subtaskNotifications` defaults to `quiet`. The default retry policy is
+`execution.subtaskNotifications` defaults to `quiet`. `execution.deferredPiTools`
+defaults to `true`. The default retry policy is
 `maxRetries: 2`, `baseDelayMs: 1000`, `maxDelayMs: 15000`, `jitter: true`,
 `maxSameIncidentRepeats: 2`.
 
@@ -161,7 +162,7 @@ boundaries are owned by [Web tools](web-tools.md) and
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with eleven sections:
+`/review-settings` opens one staged settings transaction with thirteen sections:
 
 - **Worker resources** defines Pi-scoped models and execution-capable entries from
   `externalAgents`, each with one physical maximum concurrency shared by every
@@ -186,6 +187,10 @@ boundaries are owned by [Web tools](web-tools.md) and
   exponential-backoff bounds, jitter, and the repeated-incident guard.
 - **Subtask notifications** defaults to **Quiet**. See
   [Delegated execution](delegated-execution.md#notifications-and-ui).
+- **Deferred Pi tools** defaults to **On**. Saving **Off** immediately exposes every
+  authorized tool in the current top-level Pi session; saving **On** immediately restores
+  the conservative active subset plus `search_tools`. Newly launched Pi subtasks use the
+  saved value, while already-running subtask sessions keep their launch behavior.
 - **Subtasks view** stores the expanded/collapsed live-panel preference globally.
 - The maximum acquisition size is also available under **Web**; saves apply to
   subsequent `WebFetch` and `BrowserExtract` acquisitions without restarting the

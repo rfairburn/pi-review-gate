@@ -1,4 +1,4 @@
-import { loadConfig, materializeReviewConfig } from "./config";
+import { deferredPiToolsEnabled, loadConfig, materializeReviewConfig } from "./config";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
@@ -47,6 +47,11 @@ import {
 import { registerApplyPatchTool } from "./apply-patch/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
 import { DeferredToolManager } from "./deferred-tools";
+import {
+  EXECUTOR_TOOL_CATALOG_ENV,
+  createExecutorToolCatalog,
+  type ExecutorToolCatalog,
+} from "./execution/tool-catalog";
 
 declare const module: {
   exports: unknown;
@@ -88,6 +93,28 @@ export async function activate(pi: unknown): Promise<void> {
 
   if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor") {
     if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
+    const deferredTools = new DeferredToolManager(pi);
+    if (!deferredTools.register()) return;
+    const serializedToolCatalog = process.env[EXECUTOR_TOOL_CATALOG_ENV];
+    const executorToolCatalog = executorBootstrapToolCatalog(serializedToolCatalog);
+    registerHook(pi, "session_start", (...args) => {
+      const context = extractContext(args);
+      const sessionIdentity = typeof context === "object" && context !== null
+        ? (context as { sessionManager?: unknown }).sessionManager
+        : undefined;
+      deferredTools.sessionStart(sessionIdentity, executorToolCatalog, true);
+      // Keep the one-shot bootstrap only until session_start so extension
+      // reloads during initialization can still consume it. Worker tools and
+      // their subprocesses never inherit the hidden catalog.
+      delete process.env[EXECUTOR_TOOL_CATALOG_ENV];
+    });
+    registerHook(pi, "before_agent_start", (...args) => {
+      deferredTools.reapply();
+      return deferredToolPromptInjection(deferredTools.startupGuidance(), extractSystemPrompt(args));
+    });
+    registerHook(pi, "tool_result", () => {
+      deferredTools.reapply();
+    });
     return;
   }
 
@@ -359,7 +386,12 @@ export async function activate(pi: unknown): Promise<void> {
       await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
     }
     executionTools.sync();
-    deferredTools.sessionStart(deferredSessionIdentity);
+    deferredTools.sessionStart(
+      deferredSessionIdentity,
+      undefined,
+      false,
+      deferredPiToolsEnabled(config),
+    );
     if (restoredRevision !== undefined) {
       await recoverPendingModelDeliveries({
         pi,
@@ -404,6 +436,7 @@ export async function activate(pi: unknown): Promise<void> {
     // Pi may auto-activate tools registered after session_start. Reassert the
     // captured boundary immediately before every new agent request.
     deferredTools.reapply();
+    const authorizedToolInventory = deferredTools.startupGuidance();
     agentRunActive = true;
     currentCwd = extractCwd(args, currentCwd);
     pendingSettlementUsage = undefined;
@@ -414,7 +447,7 @@ export async function activate(pi: unknown): Promise<void> {
     executionTools.setUiContext(extractContext(args) ?? pi);
     beginAgentRun(state);
     if (activeExchangeHasBaseline(state)) {
-      return executionPromptInjection(executionTools.criticalPrompt());
+      return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, extractSystemPrompt(args));
     }
     const baseline = await createWorkspaceSnapshot(currentCwd, {
       maxFileBytes: config.maxFileBytes,
@@ -423,7 +456,7 @@ export async function activate(pi: unknown): Promise<void> {
     setReviewWindowBaseline(state, baseline);
     freezeReviewWindowConfig(state, config, currentScopedModels);
     await persistSessionState();
-    return executionPromptInjection(executionTools.criticalPrompt());
+    return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, extractSystemPrompt(args));
   });
 
   registerHook(pi, "tool_call", async (...args) => {
@@ -900,7 +933,7 @@ export async function activate(pi: unknown): Promise<void> {
     configPath: loaded.path,
     onSaved: () => {
       executionTools.sync();
-      deferredTools.reapply();
+      deferredTools.setDeferredEnabled(deferredPiToolsEnabled(config));
       webTools?.sync(config);
     },
     onScopedModels: (models) => {
@@ -941,14 +974,66 @@ function canRegisterApplyPatchTool(value: unknown): boolean {
   return typeof (value as { registerTool?: unknown } | undefined)?.registerTool === "function";
 }
 
-function executionPromptInjection(content: string | undefined): { message: { customType: string; content: string; display: boolean } } | undefined {
+function executorBootstrapToolCatalog(serialized: string | undefined): ExecutorToolCatalog | undefined {
+  if (serialized === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(serialized) as Record<string, unknown>;
+    if (
+      typeof parsed !== "object"
+      || parsed === null
+      || !Array.isArray(parsed.allowedToolCatalog)
+      || !Array.isArray(parsed.initialActiveTools)
+    ) return undefined;
+    return createExecutorToolCatalog(
+      parsed.allowedToolCatalog as string[],
+      parsed.initialActiveTools as string[],
+    );
+  } catch {
+    // A malformed or ambient bootstrap never falls back to the launch-active
+    // catalog. Fresh worker startup will fail closed.
+    return undefined;
+  }
+}
+
+function extractSystemPrompt(args: unknown[]): string | undefined {
+  for (const arg of args) {
+    if (typeof arg === "object" && arg !== null && "systemPrompt" in arg
+      && typeof (arg as { systemPrompt?: unknown }).systemPrompt === "string") {
+      return (arg as { systemPrompt: string }).systemPrompt;
+    }
+  }
+  return undefined;
+}
+
+function withAuthorizedToolInventory(systemPrompt: string | undefined, inventory: string): string {
+  return systemPrompt ? `${systemPrompt}\n\n${inventory}` : inventory;
+}
+
+function deferredToolPromptInjection(
+  content: string | undefined,
+  systemPrompt: string | undefined,
+): { systemPrompt: string } | undefined {
   if (!content) return undefined;
+  return { systemPrompt: withAuthorizedToolInventory(systemPrompt, content) };
+}
+
+function executionPromptInjection(
+  content: string | undefined,
+  authorizedToolInventory?: string,
+  systemPrompt?: string,
+): { message?: { customType: string; content: string; display: boolean }; systemPrompt?: string } | undefined {
+  if (!content && !authorizedToolInventory) return undefined;
   return {
-    message: {
-      customType: "pi-review-subtask-critical",
-      content,
-      display: false,
-    },
+    ...(content ? {
+      message: {
+        customType: "pi-review-subtask-critical",
+        content,
+        display: false,
+      },
+    } : {}),
+    ...(authorizedToolInventory ? {
+      systemPrompt: withAuthorizedToolInventory(systemPrompt, authorizedToolInventory),
+    } : {}),
   };
 }
 

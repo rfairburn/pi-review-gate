@@ -508,7 +508,9 @@ export class ExecutionToolManager {
 
 const RESEARCH_ALLOWED_TOOLS = new Set([
   "read", "grep", "glob", "find", "ls", "WebFetch", "WebSearch", "BrowserExtract",
-  "BrowserNavigate", "BrowserScroll", "BrowserBack", "BrowserHistory",
+  // Initial interactive-browser support is observational only. Mutation and
+  // interaction tools do not enter the research role policy.
+  "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose",
 ]);
 
 function researchToolIntersection(parent: string[]): string[] {

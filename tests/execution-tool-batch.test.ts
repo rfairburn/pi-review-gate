@@ -522,7 +522,11 @@ test("SubtasksStart creates immutable research groups without child-local eviden
   const { tools, manager } = harness({
     slowExecutor: true,
     researchCapable: true,
-    activeTools: ["read", "WebSearch", "WebFetch", "BrowserExtract", "EvidenceAdd", "EvidenceGet", "EvidenceList"],
+    activeTools: [
+      "read", "WebSearch", "WebFetch", "BrowserExtract",
+      "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose",
+      "BrowserClick", "EvidenceAdd", "EvidenceGet", "EvidenceList",
+    ],
   });
   const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   const add = executionTool(tools, "SubtasksAdd").execute as ExecuteTool;
@@ -537,7 +541,10 @@ test("SubtasksStart creates immutable research groups without child-local eviden
 
   assert.equal(started.details.kind, "research");
   assert.match(started.content[0].text, /research group/);
-  const researchCatalog = ["read", "WebSearch", "WebFetch", "BrowserExtract"];
+  const researchCatalog = [
+    "read", "WebSearch", "WebFetch", "BrowserExtract",
+    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose",
+  ];
   assert.deepEqual(started.details.tasks[0].definition.executorAllowedTools, researchCatalog);
   assert.deepEqual(started.details.tasks[0].definition.executorToolCatalog, {
     allowedToolCatalog: researchCatalog,

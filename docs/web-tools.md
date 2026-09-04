@@ -1,7 +1,8 @@
 # Web tools
 
-This page owns the native web research tools: `WebSearch`, `WebFetch`, and
-`BrowserExtract`, their cache behavior, and the standalone web CLI. Config fields and
+This page owns the native web research tools: `WebSearch`, `WebFetch`,
+`BrowserExtract`, and the observational interactive-browser tools, their cache and
+session behavior, and the standalone web CLI. Config fields and
 defaults live in [Configuration](configuration.md#web-fields); hardening details live in
 the [Security model](security-model.md#web-egress-hardening).
 
@@ -90,6 +91,63 @@ Chromium provisioning follows the install-time rules described in
 [Getting started](getting-started.md#installation), including
 `PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1` and the `npx playwright install chromium`
 recovery path.
+
+## Observational interactive browser
+
+Use the least-powerful acquisition method that works: `WebSearch` discovers sources,
+`WebFetch` reads ordinary documents, `BrowserExtract` renders one dynamic page and
+immediately closes it, and only then should a Pi-native orchestrator or worker open a
+short-lived interactive session. The initial session surface is deliberately read-only:
+
+- `BrowserOpen` creates one isolated context and tab, navigates to a public HTTP(S) URL,
+  and returns opaque random session, tab, and document-generation handles.
+- `BrowserNavigate` navigates that tab, including public redirects. Every navigation
+  invalidates all semantic refs from the previous document generation.
+- `BrowserSnapshot` returns a bounded Playwright accessibility/ARIA snapshot. Any refs
+  are replaced with opaque generation-scoped refs; truncation and original/returned
+  character counts are explicit.
+- `BrowserClose` is idempotent. It reports closure only after the page, context,
+  Chromium connection, broker listener, and every tracked broker socket are confirmed
+  quiescent. Recent closes retain bounded broker diagnostics; older confirmed closes
+  remain recognizable through authenticated session handles without retaining
+  unbounded state.
+
+There is no click, typing, form submission, upload, download, selector, XPath,
+coordinate action, arbitrary JavaScript/evaluate, CDP, screenshot, or permission API in
+this first slice. Popups beyond the single tab are closed. Service workers, WebSockets,
+external protocols, media, downloads, permissions, direct QUIC/WebRTC, and proxy bypass
+are disabled. This initial observational implementation also disables images and
+custom/downloadable fonts in Chromium itself and blocks image/font requests at routing;
+no visual resource is allowed to bypass broker accounting through a generated `data:`
+or `blob:` URL.
+
+Everything returned from a page — snapshot text, accessible names, title, and URL — is
+labeled **untrusted evidence**. It must never be treated as an instruction or as a tool
+handle supplied by the extension. Session/tab handles are non-enumerable capabilities;
+forged, stale, cross-session, and cross-tab combinations are rejected uniformly.
+
+Limits are hard and finite: at most 4 process-local sessions, 1 tab per session, 12
+explicit navigations, 64 operations, 32 main-document requests, 16 destination hosts,
+96 connections, 256 broker requests, 8 MiB per connection, and 32 MiB aggregate bytes.
+Each open/navigation has one 30-second end-to-end deadline and each other action or
+snapshot has one 10-second end-to-end deadline; phases do not receive fresh timers.
+Idle sessions are capped at 60 seconds, total lifetime at 5 minutes, redirect chains at 10 hops, and
+semantic output at 24,000 characters and depth 16. Budgets are cumulative for the whole
+session, not reset by navigation.
+
+Cancellation, session shutdown, browser crashes, expiry, and broker policy/budget
+failures immediately begin deadline-bounded teardown. Shutdown also aborts and awaits
+any `BrowserOpen` still in startup, permanently rejects new opens, and preserves any
+unconfirmed startup teardown as a shutdown error. If any close step times out or
+quiescence cannot be proven, the tool returns an error saying closure is unconfirmed; it
+never turns an attempted close into a false closed claim. Call `BrowserClose` as soon as
+the evidence is collected.
+
+The interactive tools are registered only through the Pi extension surface and are
+authorized but inactive initially when deferred tools are enabled. Use `search_tools`
+with the exact tool name to load one. Research workers receive only the four
+observational operations above; no interaction operations are part of the role policy.
+External Claude and Codex adapters retain their existing native web-tool policies.
 
 ## Page cache
 

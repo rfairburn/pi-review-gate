@@ -812,6 +812,16 @@ test("broker close destroys sockets, stops listening, and is idempotent", async 
   await close(target);
 });
 
+test("broker close contains a listener whose startup is still settling", async () => {
+  const broker = new EgressBroker(async () => [publicAnswer]);
+  const starting = broker.start();
+  const closing = broker.close();
+  await assert.rejects(starting, /closed during startup|closing/);
+  await closing;
+  assert.equal(broker.isQuiescent(), true);
+  await assert.rejects(broker.start(), /closing/);
+});
+
 test("ledger audit accepts validated public entries and rejects non-public ones", () => {
   const entry: BrokerLedgerEntry = { hostname: "example.test", port: 443, address: publicAnswer, kind: "connect", bytesSent: 1, bytesReceived: 1, completed: true };
   assert.doesNotThrow(() => auditEgressLedger([entry]));

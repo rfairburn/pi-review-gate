@@ -263,6 +263,31 @@ test("exact tool names suppress weaker generic-word matches", async () => {
   }
 });
 
+test("observational browser tools are authorized, deferred, and discoverable by exact name", async () => {
+  const fixture = hostFixture();
+  for (const definition of [
+    tool("BrowserOpen", "Open an isolated observational browser session."),
+    tool("BrowserNavigate", "Navigate an isolated browser tab."),
+    tool("BrowserSnapshot", "Read a bounded semantic browser snapshot."),
+    tool("BrowserClose", "Close a browser session deterministically."),
+  ]) {
+    fixture.pi.registerTool(definition);
+  }
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  for (const name of ["BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose"]) {
+    assert.ok(manager.authorizedToolNames()?.includes(name));
+    assert.equal(fixture.active().includes(name), false, `${name} must not be initially active`);
+  }
+  const result = await fixture.search()("browser", { query: "BrowserSnapshot" });
+  assert.deepEqual((result.details as { matched: string[] }).matched, ["BrowserSnapshot"]);
+  assert.deepEqual((result.details as { activated: string[] }).activated, ["BrowserSnapshot"]);
+  assert.ok(fixture.active().includes("BrowserSnapshot"));
+  assert.equal(fixture.active().includes("BrowserOpen"), false);
+});
+
 test("invalid and unmatched searches do not change the active set", async () => {
   const fixture = hostFixture();
   const manager = new DeferredToolManager(fixture.pi);

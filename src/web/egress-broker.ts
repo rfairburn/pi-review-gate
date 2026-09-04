@@ -117,6 +117,15 @@ export interface EgressSummary {
 }
 
 /**
+ * Optional lifecycle observer used by a persistent interactive browser
+ * session. BrowserExtract deliberately omits it and keeps its existing
+ * per-render result policy.
+ */
+export interface EgressBrokerObserver {
+  policyFailure(reason: "refusal" | "budget_abort", diagnostic: string): void;
+}
+
+/**
  * Seam for deterministic tests: dials one outbound socket for a validated
  * destination. Production callers never set this; the default dials exactly
  * one validated public address (IPv4 preferred).
@@ -179,6 +188,8 @@ export interface BrokerAuth {
 
 export class EgressBroker {
   private server?: http.Server;
+  private startOperation?: Promise<number>;
+  private startupPending = false;
   private brokerPort = 0;
   private closed = false;
   private startedAtMs = 0;
@@ -205,6 +216,7 @@ export class EgressBroker {
     private readonly dial: BrokerDial = defaultBrokerDial,
     private readonly budgets: EgressBudgets = DEFAULT_EGRESS_BUDGETS,
     auth?: BrokerAuth,
+    private readonly observer?: EgressBrokerObserver,
   ) {
     if (auth) {
       this.expectedAuthorization = `Basic ${Buffer.from(`${auth.username}:${auth.password}`, "utf8").toString("base64")}`;
@@ -222,8 +234,19 @@ export class EgressBroker {
   }
 
   /** Start listening on loopback only and return the ephemeral broker port. */
-  async start(): Promise<number> {
-    if (this.server) throw new Error("Egress broker is already started.");
+  start(): Promise<number> {
+    if (this.startOperation || this.server || this.closed) {
+      return Promise.reject(new Error(this.closed ? "Egress broker is closing." : "Egress broker is already started."));
+    }
+    this.startupPending = true;
+    const operation = this.startListening().finally(() => {
+      this.startupPending = false;
+    });
+    this.startOperation = operation;
+    return operation;
+  }
+
+  private async startListening(): Promise<number> {
     const server = http.createServer();
     server.on("connection", (socket) => this.admitClient(socket));
     server.on("request", (request, response) => {
@@ -248,7 +271,14 @@ export class EgressBroker {
     });
     const address = server.address();
     if (!address || typeof address !== "object" || (address as AddressInfo).address !== "127.0.0.1") {
+      await closeHttpServer(server);
       throw new Error("Egress broker must listen on 127.0.0.1 only.");
+    }
+    // close() may have won while listen() was pending. Never publish a late
+    // listener after closure; shut it down before the start promise settles.
+    if (this.closed) {
+      await closeHttpServer(server);
+      throw new Error("Egress broker closed during startup.");
     }
     this.brokerPort = (address as AddressInfo).port;
     this.server = server;
@@ -294,15 +324,39 @@ export class EgressBroker {
    */
   async close(): Promise<EgressSummary> {
     this.closed = true;
-    for (const socket of [...this.sockets]) socket.destroy();
+    // If close races listen(), startListening observes `closed`, closes the
+    // late listener itself, and only then rejects. Await that containment
+    // before evaluating quiescence.
+    if (this.startOperation && !this.server) {
+      await this.boundedWait(this.startOperation.then(() => undefined, () => undefined), "egress broker startup settlement");
+    }
+    const sockets = [...this.sockets];
+    // A destroyed socket can remain in the set until its asynchronous `close`
+    // event. Attach every waiter before destroy() so that state transition can
+    // neither be missed nor mistaken for quiescence.
+    const socketClosures = sockets.map((socket) => once(socket, "close").then(() => undefined));
+    for (const socket of sockets) socket.destroy();
     const server = this.server;
+    const waits: Promise<unknown>[] = [...socketClosures];
     if (server) {
       this.server = undefined;
+      const listenerClosed = once(server, "close");
       server.close();
       server.closeAllConnections?.();
-      await this.boundedWait(once(server, "close"), "egress broker listener close");
+      waits.push(listenerClosed);
+    }
+    if (waits.length > 0) {
+      await this.boundedWait(Promise.all(waits), "egress broker socket and listener close");
+    }
+    if (!this.isQuiescent()) {
+      throw new Error(`Egress broker shutdown completed without quiescence (${this.sockets.size} socket(s) remain).`);
     }
     return this.summary();
+  }
+
+  /** True only after the listener is gone and every tracked socket closed. */
+  isQuiescent(): boolean {
+    return !this.startupPending && this.server === undefined && this.sockets.size === 0 && this.clientSockets.size === 0;
   }
 
   /** Reject when `operation` does not settle within the cleanup deadline. */
@@ -329,6 +383,13 @@ export class EgressBroker {
       budgetAborts: this.budgetAborts,
       refusals: this.refusals,
     };
+  }
+
+  /** Record and surface a policy refusal to persistent-session owners. */
+  private recordPolicyRefusal(diagnostic: string): void {
+    this.refusals += 1;
+    this.note(diagnostic);
+    this.observer?.policyFailure("refusal", diagnostic);
   }
 
   private track(socket: net.Socket): void {
@@ -363,8 +424,7 @@ export class EgressBroker {
       return;
     }
     if (this.clientSockets.size >= this.budgets.maxClientConnections) {
-      this.refusals += 1;
-      this.note(`egress broker refused client connection: client-connection budget (${this.budgets.maxClientConnections}) exhausted.`);
+      this.recordPolicyRefusal(`egress broker refused client connection: client-connection budget (${this.budgets.maxClientConnections}) exhausted.`);
       socket.destroy();
       return;
     }
@@ -432,8 +492,7 @@ export class EgressBroker {
       return undefined;
     }
     if (Date.now() - this.startedAtMs >= this.budgets.maxTotalMs) {
-      this.refusals += 1;
-      this.note(`${kind} destination refused: total-time budget (${this.budgets.maxTotalMs}ms) exhausted.`);
+      this.recordPolicyRefusal(`${kind} destination refused: total-time budget (${this.budgets.maxTotalMs}ms) exhausted.`);
       return undefined;
     }
     const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -441,18 +500,15 @@ export class EgressBroker {
     // Synchronous reservation: no await may happen between these checks and
     // the increments.
     if (firstSeenHost && this.hosts.size >= this.budgets.maxDistinctHosts) {
-      this.refusals += 1;
-      this.note(`${kind} destination refused: distinct-host budget (${this.budgets.maxDistinctHosts}) exhausted for ${boundedText(hostname)}.`);
+      this.recordPolicyRefusal(`${kind} destination refused: distinct-host budget (${this.budgets.maxDistinctHosts}) exhausted for ${boundedText(hostname)}.`);
       return undefined;
     }
     if (this.connectionCount >= this.budgets.maxConnections) {
-      this.refusals += 1;
-      this.note(`${kind} destination refused: connection budget (${this.budgets.maxConnections}) exhausted for ${boundedText(url.href)}.`);
+      this.recordPolicyRefusal(`${kind} destination refused: connection budget (${this.budgets.maxConnections}) exhausted for ${boundedText(url.href)}.`);
       return undefined;
     }
     if (this.totalBytes >= this.budgets.maxTotalBytes) {
-      this.refusals += 1;
-      this.note(`${kind} destination refused: aggregate byte budget (${this.budgets.maxTotalBytes}) exhausted.`);
+      this.recordPolicyRefusal(`${kind} destination refused: aggregate byte budget (${this.budgets.maxTotalBytes}) exhausted.`);
       return undefined;
     }
     // Keep first-seen hostnames reserved for the whole render, including
@@ -468,8 +524,7 @@ export class EgressBroker {
       // first-seen hostname reservation stay consumed, bounding adversarial
       // refusal loops).
       this.connectionCount -= 1;
-      this.refusals += 1;
-      this.note(`${kind} destination refused: ${error instanceof Error ? error.message : String(error)} (${boundedText(url.href)}).`);
+      this.recordPolicyRefusal(`${kind} destination refused: ${error instanceof Error ? error.message : String(error)} (${boundedText(url.href)}).`);
       return undefined;
     }
   }
@@ -499,14 +554,16 @@ export class EgressBroker {
       this.markClientAuthorized(clientSocket);
       this.requests += 1;
       if (this.requests > this.budgets.maxRequests) {
-        this.refusals += 1;
-        finish(502, "Egress broker request budget exhausted.", undefined, `proxy request refused: request budget (${this.budgets.maxRequests}) exhausted.`);
+        const diagnostic = `proxy request refused: request budget (${this.budgets.maxRequests}) exhausted.`;
+        this.recordPolicyRefusal(diagnostic);
+        finish(502, "Egress broker request budget exhausted.");
         return;
       }
       const target = this.parseProxyRequest(request);
       if (!target) {
-        this.refusals += 1;
-        finish(400, "Egress broker refuses this proxy request.", undefined, `proxy request refused: ${boundedText(String(request.url ?? ""))}`);
+        const diagnostic = `proxy request refused by authority/header/protocol policy: ${boundedText(String(request.url ?? ""))}`;
+        this.recordPolicyRefusal(diagnostic);
+        finish(400, "Egress broker refuses this proxy request.");
         return;
       }
       const validated = await this.admit(target.url, "http");
@@ -644,14 +701,16 @@ export class EgressBroker {
       this.markClientAuthorized(socket);
       this.requests += 1;
       if (this.requests > this.budgets.maxRequests) {
-        this.refusals += 1;
-        refuse(502, `CONNECT refused: request budget (${this.budgets.maxRequests}) exhausted.`);
+        const diagnostic = `CONNECT refused: request budget (${this.budgets.maxRequests}) exhausted.`;
+        this.recordPolicyRefusal(diagnostic);
+        refuse(502);
         return;
       }
       const authority = typeof request.url === "string" ? request.url : "";
       if (authority.length > this.budgets.maxAuthorityChars) {
-        this.refusals += 1;
-        refuse(400, `CONNECT refused: authority exceeds ${this.budgets.maxAuthorityChars} characters.`);
+        const diagnostic = `CONNECT refused: authority exceeds ${this.budgets.maxAuthorityChars} characters.`;
+        this.recordPolicyRefusal(diagnostic);
+        refuse(400);
         return;
       }
       let connectHeaderChars = 0;
@@ -659,19 +718,22 @@ export class EgressBroker {
         connectHeaderChars += request.rawHeaders[index]!.length + request.rawHeaders[index + 1]!.length;
       }
       if (connectHeaderChars > this.budgets.maxHeaderChars) {
-        this.refusals += 1;
-        refuse(400, `CONNECT refused: header block exceeds ${this.budgets.maxHeaderChars} characters.`);
+        const diagnostic = `CONNECT refused: header block exceeds ${this.budgets.maxHeaderChars} characters.`;
+        this.recordPolicyRefusal(diagnostic);
+        refuse(400);
         return;
       }
       const parsed = parseConnectAuthority(authority);
       if (!parsed) {
-        this.refusals += 1;
-        refuse(400, `CONNECT refused: invalid authority ${boundedText(authority)}.`);
+        const diagnostic = `CONNECT refused: invalid authority ${boundedText(authority)}.`;
+        this.recordPolicyRefusal(diagnostic);
+        refuse(400);
         return;
       }
       if (WEBSOCKET_REQUEST_HEADERS.some((name) => request.headers[name] !== undefined)) {
-        this.refusals += 1;
-        refuse(403, `CONNECT refused: WebSocket upgrade to ${parsed.host}:${parsed.port}.`);
+        const diagnostic = `CONNECT refused: WebSocket upgrade to ${parsed.host}:${parsed.port}.`;
+        this.recordPolicyRefusal(diagnostic);
+        refuse(403);
         return;
       }
       // Re-bracket IPv6 literals so the URL is parseable (the parser strips
@@ -681,8 +743,9 @@ export class EgressBroker {
       try {
         url = new URL(`https://${urlHost}:${parsed.port}/`);
       } catch {
-        this.refusals += 1;
-        refuse(400, `CONNECT refused: unparseable authority ${boundedText(authority)}.`);
+        const diagnostic = `CONNECT refused: unparseable authority ${boundedText(authority)}.`;
+        this.recordPolicyRefusal(diagnostic);
+        refuse(400);
         return;
       }
       const validated = await this.admit(url, "connect");
@@ -781,6 +844,10 @@ export class EgressBroker {
       this.abortedEntries.add(entry);
       entry.completed = false;
       this.budgetAborts += 1;
+      this.observer?.policyFailure(
+        "budget_abort",
+        `Egress budget aborted a connection to ${entry.hostname}:${entry.port}.`,
+      );
     }
     for (const socket of peers) socket.destroy();
   }
@@ -844,6 +911,14 @@ async function awaitSocketConnect(socket: net.Socket): Promise<void> {
     socket.once("connect", onConnect);
     socket.once("error", onError);
     socket.once("close", onClose);
+  });
+}
+
+async function closeHttpServer(server: http.Server): Promise<void> {
+  if (!server.listening) return;
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => error ? rejectClose(error) : resolveClose());
+    server.closeAllConnections?.();
   });
 }
 

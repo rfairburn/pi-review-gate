@@ -26,7 +26,8 @@ cannot substitute an arbitrary helper; production always resolves the packaged
 
 ## Web egress hardening
 
-Both download paths (`WebFetch` and `BrowserExtract`) are DNS-rebinding-hardened. Every
+Every native web path (`WebFetch`, `BrowserExtract`, and observational interactive
+browser sessions) is DNS-rebinding-hardened. Every
 URL and every redirect hop is validated immediately before that hop is dialed: the URL
 is canonicalized, credentials are rejected, and the hostname is resolved exactly once
 with every returned address required to be public. The connection then dials only those
@@ -40,8 +41,10 @@ survives.
 ### Egress broker containment
 
 `BrowserExtract` routes every Chromium request through a per-render loopback egress
-broker (an HTTP/HTTPS CONNECT proxy owned by the render and bound only to 127.0.0.1 on
-an ephemeral port). Chromium is launched so the broker is its only network path:
+broker; each observational interactive session uses exactly one authenticated broker
+for its complete lifetime. Each broker is an HTTP/HTTPS CONNECT proxy bound only to
+127.0.0.1 on an ephemeral port. Chromium is launched so the broker is its only network
+path:
 
 - The proxy is forced (`--proxy-server` plus `--proxy-bypass-list=<-loopback>`, which
   removes Chromium's implicit loopback bypass so even loopback/private-literal requests
@@ -65,12 +68,15 @@ decrypts it). WebSockets are always closed, service workers are blocked, and eve
 outbound connection is recorded in a broker-owned connection ledger that is audited
 before the render result is returned; the browser and all broker sockets quiesce before
 anything is exposed. Local browser protocols (`about:`, `blob:`, `data:`) remain
-narrowly allowed.
+narrowly allowed only for non-media, non-visual in-process resources; local image/font
+payloads are blocked so admitted visual resources cannot evade broker byte accounting.
 
-Images, media, and fonts are aborted by the route policy before any connection is made,
-cross-host or not, and this never fails the render. The result discloses bounded
-omission diagnostics (capped samples plus a dropped count) alongside explicit per-render
-budgets (distinct hostnames, concurrent broker client connections and their
+`BrowserExtract` aborts images, media, and fonts before any connection. Interactive
+sessions block media, images, and custom/downloadable fonts as well. Images are disabled
+in Chromium's rendering engine, remote fonts are disabled, and image/font requests are
+also denied at routing so generated `data:` or `blob:` visual payloads cannot bypass
+broker byte accounting. Results disclose bounded omission diagnostics (capped samples plus
+a dropped count) alongside explicit per-render or per-session budgets (distinct hostnames, concurrent broker client connections and their
 pre-authentication idle deadline, destination connections, per-connection and aggregate
 bytes, authority/header lengths, idle and total time). A budget that destroys an
 in-flight transfer is nonfatal only when the main document completed; main-document

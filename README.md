@@ -27,8 +27,9 @@ receipts of exactly what the model was told.
   worktrees with independent landing, conflict gates, bounded retry, and failover
   ([Delegated execution](docs/delegated-execution.md)).
 - **Native web tools** — `WebSearch` (API-key-free DDGS), `WebFetch` (indexed HTML/PDF
-  reading), and `BrowserExtract` (headless-Chromium rendered-page fallback), all with
-  DNS-rebinding-hardened, validated egress
+  reading), `BrowserExtract` (single-page rendered fallback), and a bounded Pi-native
+  observational browser (`BrowserOpen`, `BrowserNavigate`, `BrowserSnapshot`,
+  `BrowserClose`), all with DNS-rebinding-hardened, validated egress
   ([Web tools](docs/web-tools.md),
   [Security model](docs/security-model.md#web-egress-hardening)).
 - **Durable evidence and recovery** — stable evidence bundles, integrity-checked
@@ -49,9 +50,11 @@ receipts of exactly what the model was told.
 - **Not an OS sandbox.** Task isolation is worktree and instruction isolation; a hostile
   custom executor process can still access paths allowed by the host account
   ([Security model](docs/security-model.md#isolation-limits)).
-- **Not an interactive browser.** `BrowserExtract` renders and extracts only; it never
-  clicks, types, authenticates, scrolls, or keeps a browser session
-  ([Web tools](docs/web-tools.md#browserextract-rendered-page-extraction)).
+- **No general browser automation.** The interactive browser is an observational,
+  public-web-only escalation with open, navigate, semantic snapshot, and deterministic
+  close operations. It exposes no click, type, upload, arbitrary selector/script, or
+  CDP escape hatch
+  ([Web tools](docs/web-tools.md#observational-interactive-browser)).
 - **No forced verification theater.** Force merges and `interrupt_with_merge` are
   mechanical landing attempts, not verification; the main workspace must always be
   inspected manually afterward

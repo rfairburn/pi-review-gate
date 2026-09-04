@@ -473,7 +473,15 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
     on: (name, handler) => hooks.set(name, handler),
   }, config, cache, browserCache);
   manager.register();
-  assert.deepEqual([...tools.keys()], ["WebSearch", "WebFetch", "BrowserExtract"]);
+  assert.deepEqual([...tools.keys()], [
+    "WebSearch", "WebFetch", "BrowserExtract",
+    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose",
+  ]);
+  assert.deepEqual(Object.keys(tools.get("BrowserOpen").parameters.properties), ["url"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserNavigate").parameters.properties), ["session", "tab", "url"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserSnapshot").parameters.properties), ["session", "tab", "maxChars"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserClose").parameters.properties), ["session"]);
+  assert.match(tools.get("BrowserSnapshot").description, /no DOM script, selector, coordinate, or CDP/i);
   assert.equal(tools.has("WebRead"), false);
   assert.ok(tools.get("WebSearch").parameters.properties.excludeDomains);
   assert.equal(tools.get("WebSearch").parameters.properties.page, undefined);

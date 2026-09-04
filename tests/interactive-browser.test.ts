@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
-import type { Browser, BrowserContext, Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { normalizeConfig } from "../src/config";
 import type { BrowserTargetStructure } from "../src/web/browser-interaction-policy";
 import {
@@ -48,6 +48,7 @@ class FakePage extends EventEmitter {
     domPath: "html:nth-of-type(1)> body:nth-of-type(1)> a:nth-of-type(1)",
   };
   readonly visibleTextMatches = new Map<string, number>();
+  inspectDelayMs = 0;
 
   mainFrame() { return this.frame; }
   url() { return this.currentUrl; }
@@ -58,6 +59,9 @@ class FakePage extends EventEmitter {
   async screenshot(_options?: Record<string, any>) { return ONE_PIXEL_PNG; }
   async evaluate() { this.evaluateCalls += 1; }
   async bringToFront() {}
+  getByRole(role: string, options: { name?: string } = {}) {
+    return { fixtureRole: role, fixtureName: options.name ?? "" };
+  }
   getByText(text: string) {
     return {
       filter: ({ visible }: { visible: boolean }) => {
@@ -81,19 +85,43 @@ class FakePage extends EventEmitter {
   }
   async waitForNavigation() {}
   async waitForTimeout(durationMs: number) { await new Promise<void>((resolve) => setTimeout(resolve, durationMs)); }
-  locator(selector: string) {
-    assert.equal(selector, "aria-ref=e7", "only the Playwright ref retained from the semantic snapshot is used");
+  locator(selector: string): any {
+    if (selector !== "aria-ref=e7") return { fixtureTag: selector };
+    const page = this;
     return {
       scrollIntoViewIfNeeded: async () => undefined,
       waitFor: async () => undefined,
       getAttribute: async (name: string) => name === "type"
-        ? this.targetStructure.inputType
-        : name === "role" ? this.targetStructure.role : null,
+        ? page.targetStructure.inputType
+        : name === "role" ? page.targetStructure.role
+          : name === "href" ? page.targetStructure.href
+            : name === "aria-description" ? "Fixture description" : null,
+      ariaSnapshot: async () => {
+        if (page.inspectDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, page.inspectDelayMs));
+        const role = page.targetStructure.role ?? (page.targetStructure.tagName === "input" ? "textbox" : "generic");
+        return `- ${role} "Next"${page.targetStructure.disabled ? " [disabled]" : ""} [ref=e7]`;
+      },
+      isDisabled: async () => page.targetStructure.disabled,
+      isEditable: async () => page.targetStructure.contentEditable || ["input", "textarea", "select"].includes(page.targetStructure.tagName),
+      isChecked: async () => { throw new Error("not checkable"); },
+      innerText: async () => {
+        if (page.inspectDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, page.inspectDelayMs));
+        return "Visible fixture text";
+      },
+      and: (other: { fixtureTag?: string; fixtureRole?: string; fixtureName?: string }) => ({
+        count: async () => {
+          if (other.fixtureRole) {
+            const role = page.targetStructure.role ?? (page.targetStructure.tagName === "input" ? "textbox" : "generic");
+            return other.fixtureRole === role && other.fixtureName === "Next" ? 1 : 0;
+          }
+          return other.fixtureTag === page.targetStructure.tagName ? 1 : 0;
+        },
+      }),
       evaluate: async (_callback: unknown, ...args: unknown[]) => {
         if (Array.isArray(args[0])) return args[0].map(() => "value");
         if (args[0] === "append") return true;
         if (args.length > 0) return undefined;
-        return { ...this.targetStructure };
+        return { ...page.targetStructure };
       },
       hover: async () => { this.hoverCalls += 1; },
       click: async () => { this.clickCalls += 1; await this.onClick?.(); },
@@ -150,13 +178,14 @@ class FakeContext extends EventEmitter {
   readonly pages = [this.page];
   private created = 0;
   configureNextPage?: (page: FakePage) => void;
+  routeHandler?: (route: any) => Promise<void>;
   nextPageDelayMs = 0;
   closed = false;
   setDefaultTimeout() {}
   setDefaultNavigationTimeout() {}
   async clearPermissions() {}
   async routeWebSocket() {}
-  async route() {}
+  async route(_pattern: string, handler: (route: any) => Promise<void>) { this.routeHandler = handler; }
   async newPage() {
     const delayMs = this.created > 0 ? this.nextPageDelayMs : 0;
     this.nextPageDelayMs = 0;
@@ -187,7 +216,7 @@ class FakeBrowser extends EventEmitter {
   }
 }
 
-function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boolean } = {}) {
+function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boolean; limits?: Record<string, number> } = {}) {
   const browser = new FakeBrowser();
   if (options.hangingContextClose) browser.context.close = async () => new Promise<void>(() => undefined);
   const config = normalizeConfig({}).web!.fetch;
@@ -196,7 +225,7 @@ function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boo
     resolveHostname: async (hostname: string) => net.isIP(hostname) ? [hostname] : ["93.184.216.34"],
     launch: async () => browser as unknown as Browser,
     randomHandle: (kind: string) => `${kind}_${++serial}_${"x".repeat(32)}`,
-    limits: options.cleanupMs === undefined ? undefined : { cleanupMs: options.cleanupMs },
+    limits: { ...(options.limits ?? {}), ...(options.cleanupMs === undefined ? {} : { cleanupMs: options.cleanupMs }) },
   });
   return { manager, browser };
 }
@@ -1358,6 +1387,125 @@ test("real BrowserType appends despite an existing caret at the start", async ()
   }
 });
 
+test("real BrowserInspect uses computed accessibility semantics without invoking page overrides", async () => {
+  const requests: string[] = [];
+  const origin = createServer((request, response) => {
+    requests.push(request.url ?? "");
+    if (request.url === "/frame") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(`<!doctype html><title>Frame semantics</title>
+        <input aria-label="Framed field" aria-describedby="frame-description">
+        <span id="frame-description">Frame-owned description</span>`);
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(`<!doctype html><title>Inspect semantics</title>
+      <label for="field">Native label</label>
+      <input id="field" aria-describedby="description" value="PRIVATE-VALUE">
+      <div id="shadow-host"></div>
+      <span id="description" aria-label="Computed description">Raw description must not escape</span>
+      <fieldset disabled><button id="button" aria-labelledby="button-name"><span id="button-name">Computed button</span></button></fieldset>
+      <input id="check" type="checkbox" aria-label="Current check">
+      <button id="expand" aria-expanded="false">Disclosure</button>
+      <div role="listbox" aria-label="Choices"><div id="option" role="option" aria-selected="false" tabindex="0">Second</div></div>
+      <a id="link" href="/private/path?token=secret">Link text</a>
+      <span id="frame-description">Main-document collision</span>
+      <iframe src="/frame"></iframe>
+      <p id="mutation">untouched</p>
+      <script>
+        document.querySelector("#shadow-host").attachShadow({ mode: "open" }).innerHTML =
+          '<span id="description" aria-label="Shadow description">Unrelated shadow text</span>';
+        const mark = path => {
+          document.querySelector("#mutation").textContent = "mutated";
+          fetch(path).catch(() => {});
+        };
+        const nativeGetAttribute = Element.prototype.getAttribute;
+        Element.prototype.getAttribute = function(...args) { mark("/probe-get-attribute"); return nativeGetAttribute.apply(this, args); };
+        const nativeStyle = globalThis.getComputedStyle;
+        globalThis.getComputedStyle = function(...args) { mark("/probe-style"); return nativeStyle.apply(this, args); };
+        const hrefDescriptor = Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype, "href");
+        Object.defineProperty(HTMLAnchorElement.prototype, "href", {
+          configurable: true,
+          get() { mark("/probe-href"); return hrefDescriptor.get.call(this); },
+          set(value) { return hrefDescriptor.set.call(this, value); },
+        });
+      </script>`);
+  });
+  await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const port = (origin.address() as AddressInfo).port;
+  let launchedBrowser: Browser | undefined;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    brokerDial: (_validated, requestedPort) => net.connect({ host: "127.0.0.1", port: requestedPort }),
+    launch: async (options) => {
+      launchedBrowser = await chromium.launch(options);
+      return launchedBrowser;
+    },
+  });
+  try {
+    const opened = await manager.open(`http://inspect.test:${port}/`);
+    const snapshot = await manager.snapshot(opened.session, opened.tab, 6_000);
+    const inputRef = snapshot.snapshot.match(/textbox "Native label"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    const buttonRef = snapshot.snapshot.match(/button "Computed button"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    const checkRef = snapshot.snapshot.match(/checkbox "Current check"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    const expandRef = snapshot.snapshot.match(/button "Disclosure"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    const optionRef = snapshot.snapshot.match(/option "Second"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    const linkRef = snapshot.snapshot.match(/link "Link text"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    const frameRef = snapshot.snapshot.match(/textbox "Framed field"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    assert.ok(inputRef && buttonRef && checkRef && expandRef && optionRef && linkRef && frameRef, snapshot.snapshot);
+
+    const input = await manager.inspect(opened.session, opened.tab, inputRef);
+    assert.equal(input.semantic.role, "textbox");
+    assert.equal(input.semantic.tag, "input");
+    assert.equal(input.semantic.accessibleName, "Native label");
+    assert.equal(input.semantic.accessibleDescription, "Computed description");
+    assert.doesNotMatch(JSON.stringify(input), /Raw description|Shadow description|Unrelated shadow/);
+    assert.equal(input.semantic.states.editable, true);
+    assert.deepEqual(input.semantic.visibleText, { text: "", returnedChars: 0, truncated: false, suppressed: true });
+    assert.doesNotMatch(JSON.stringify(input), /PRIVATE-VALUE/);
+
+    const button = await manager.inspect(opened.session, opened.tab, buttonRef);
+    assert.equal(button.semantic.role, "button");
+    assert.equal(button.semantic.tag, "button");
+    assert.equal(button.semantic.accessibleName, "Computed button");
+    assert.equal(button.semantic.states.disabled, true, "disabled fieldset is reflected as effective state");
+
+    const ownedPage = launchedBrowser!.contexts()[0]!.pages()[0]!;
+    await ownedPage.evaluate(() => {
+      (document.querySelector("#check") as HTMLInputElement).checked = true;
+      document.querySelector("#expand")!.setAttribute("aria-expanded", "true");
+      document.querySelector("#option")!.setAttribute("aria-selected", "true");
+    });
+    const checked = await manager.inspect(opened.session, opened.tab, checkRef);
+    const expanded = await manager.inspect(opened.session, opened.tab, expandRef);
+    const selected = await manager.inspect(opened.session, opened.tab, optionRef);
+    assert.equal(checked.semantic.states.checked, true, "inspection reads post-snapshot checked state");
+    assert.equal(expanded.semantic.states.expanded, true, "inspection reads post-snapshot expanded state");
+    assert.equal(selected.semantic.states.selected, true, "inspection reads post-snapshot selected state");
+
+    const link = await manager.inspect(opened.session, opened.tab, linkRef);
+    assert.equal(link.semantic.role, "link");
+    assert.equal(link.semantic.tag, "a");
+    assert.equal(link.semantic.hrefOrigin, `http://inspect.test:${port}`);
+    assert.doesNotMatch(JSON.stringify(link), /private\/path|token=secret/);
+
+    const framed = await manager.inspect(opened.session, opened.tab, frameRef);
+    assert.equal(framed.semantic.tag, "input");
+    assert.equal(framed.semantic.accessibleName, "Framed field");
+    assert.equal(framed.semantic.accessibleDescription, "Frame-owned description");
+    assert.doesNotMatch(JSON.stringify(framed), /Main-document collision/);
+
+    const after = await manager.snapshot(opened.session, opened.tab, 6_000);
+    assert.match(after.snapshot, /untouched/);
+    assert.doesNotMatch(after.snapshot, /mutated/);
+    assert.equal(requests.some((request) => request.startsWith("/probe-")), false);
+    await manager.close(opened.session);
+  } finally {
+    await manager.shutdown();
+    await new Promise<void>((resolve, reject) => origin.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("real Chromium follows a public redirect only through the pinned broker dial", async () => {
   const origin = createServer((request, response) => {
     if (request.url === "/start") {
@@ -1531,4 +1679,139 @@ test("close never claims success when browser/context quiescence is unconfirmed"
   const opened = await manager.open("https://example.com/start");
   await assert.rejects(manager.close(opened.session), /closure is unconfirmed/i);
   await assert.rejects(manager.close(opened.session), /closure is unconfirmed/i);
+});
+
+test("browser diagnostics are bounded, redacted, cursor-based, ref-scoped, and memory-only", async () => {
+  const { manager, browser } = managerFixture({
+    limits: { maxConsoleEvents: 2, maxNetworkEvents: 3, maxDiagnosticReadEvents: 2 },
+  });
+  const opened = await manager.open("https://example.com/start?session_token=never-return-this");
+  const page = browser.context.page;
+
+  const consoleMessage = (text: string, type = "log", url = "https://example.com/private/source.js?token=nope") => ({
+    text: () => text,
+    type: () => type,
+    location: () => ({ url, lineNumber: 7, columnNumber: 9 }),
+  });
+  page.emit("console", consoleMessage("first is dropped"));
+  page.emit("console", consoleMessage("password=hunter2\u001b[31m", "warn"));
+  const pageError = new Error("api_key=super-secret uncaught");
+  pageError.stack = "STACK MUST NEVER APPEAR";
+  page.emit("pageerror", pageError);
+
+  const firstConsole = await manager.console(opened.session, opened.tab, 0, 1);
+  assert.equal(firstConsole.counts.dropped, 1);
+  assert.equal(firstConsole.counts.totalDropped, 1);
+  assert.equal(firstConsole.counts.truncated, 1);
+  assert.equal(firstConsole.events.length, 1);
+  assert.match(firstConsole.events[0]!.text, /\[REDACTED\]/);
+  assert.doesNotMatch(JSON.stringify(firstConsole), /hunter2|private\/source|token=nope|STACK MUST NEVER APPEAR/);
+  assert.equal(firstConsole.events[0]!.source?.origin, "https://example.com");
+  const secondConsole = await manager.console(opened.session, opened.tab, firstConsole.cursor.next, 2);
+  assert.equal(secondConsole.events[0]!.kind, "page_error");
+  assert.match(secondConsole.events[0]!.text, /\[REDACTED\]/);
+  assert.equal(secondConsole.cursor.next, secondConsole.cursor.latest);
+
+  const request = {
+    method: () => "POST",
+    url: () => "https://api.example.com/customer/42?authorization=Bearer-secret",
+    resourceType: () => "fetch",
+    failure: () => ({ errorText: "net::ERR_FAILED authorization=top-secret" }),
+    isNavigationRequest: () => false,
+  };
+  page.emit("request", request);
+  page.emit("response", { request: () => request, status: () => 503 });
+  const failed = {
+    method: () => "GET",
+    url: () => "https://api.example.com/another/private/path?cookie=secret",
+    resourceType: () => "xhr",
+    failure: () => ({ errorText: "token=failure-secret" }),
+    isNavigationRequest: () => false,
+  };
+  page.emit("request", failed);
+  page.emit("requestfailed", failed);
+  const policyRequest = {
+    method: () => "GET",
+    url: () => "https://images.example.com/secret/path?token=never",
+    resourceType: () => "image",
+    frame: () => ({ page: () => page }),
+  };
+  await browser.context.routeHandler?.({
+    request: () => policyRequest,
+    abort: async () => undefined,
+    continue: async () => undefined,
+  });
+  const network = await manager.network(opened.session, opened.tab, 0, 2);
+  assert.ok(network.counts.dropped > 0);
+  assert.ok(network.counts.truncated > 0);
+  const networkRemainder = await manager.network(opened.session, opened.tab, network.cursor.next, 2);
+  const serializedNetwork = JSON.stringify([network, networkRemainder]);
+  assert.doesNotMatch(serializedNetwork, /customer|another|authorization|Bearer-secret|cookie=secret|failure-secret|headers|postData|body/);
+  assert.match(serializedNetwork, /https:\/\/api\.example\.com/);
+  assert.match(serializedNetwork, /policy_blocked/);
+  assert.match(serializedNetwork, /image resource blocked/);
+
+  const snapshot = await manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+  const detail = await manager.inspect(opened.session, opened.tab, ref);
+  assert.deepEqual(Object.keys(detail.semantic), [
+    "role", "tag", "type", "accessibleName", "accessibleDescription", "states", "hrefOrigin", "visibleText",
+  ]);
+  assert.equal(detail.semantic.hrefOrigin, "https://example.com");
+  assert.equal(detail.semantic.visibleText.text, "Visible fixture text");
+  assert.equal((detail.semantic as Record<string, unknown>).value, undefined);
+
+  page.targetStructure = { ...page.targetStructure, tagName: "input", inputType: "password", contentEditable: true };
+  const suppressed = await manager.inspect(opened.session, opened.tab, ref);
+  assert.equal(suppressed.semantic.visibleText.suppressed, true);
+  assert.equal(suppressed.semantic.visibleText.text, "");
+  await manager.navigate(opened.session, opened.tab, "https://example.com/new-document");
+  await assert.rejects(manager.inspect(opened.session, opened.tab, ref), /Invalid or stale browser semantic ref/);
+  await manager.close(opened.session);
+  await assert.rejects(manager.console(opened.session, opened.tab), /Invalid or stale browser session\/tab handle/);
+});
+
+test("browser diagnostics stay tab-local and cancellation tears down the owning session", async () => {
+  const { manager, browser } = managerFixture();
+  const opened = await manager.open("https://example.com/one");
+  const second = await manager.tabs(opened.session, "open", undefined, "https://example.com/two");
+  assert.ok(second.openedTab);
+  const firstPage = browser.context.pages[0]!;
+  const secondPage = browser.context.pages[1]!;
+  const message = (text: string) => ({
+    text: () => text,
+    type: () => "info",
+    location: () => ({ url: "https://example.com/source.js", lineNumber: 1, columnNumber: 1 }),
+  });
+  firstPage.emit("console", message("first-tab-only"));
+  secondPage.emit("console", message("second-tab-only"));
+  const first = await manager.console(opened.session, opened.tab);
+  const other = await manager.console(opened.session, second.openedTab!);
+  assert.match(JSON.stringify(first.events), /first-tab-only/);
+  assert.doesNotMatch(JSON.stringify(first.events), /second-tab-only/);
+  assert.match(JSON.stringify(other.events), /second-tab-only/);
+  assert.doesNotMatch(JSON.stringify(other.events), /first-tab-only/);
+
+  const snapshot = await manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+  await assert.rejects(manager.inspect(opened.session, second.openedTab!, ref), /Invalid or stale browser semantic ref/);
+
+  const controller = new AbortController();
+  controller.abort(new Error("cancel diagnostic read"));
+  await assert.rejects(manager.console(opened.session, opened.tab, 0, 1, controller.signal), /cancel diagnostic read/);
+  assert.equal(manager.activeSessionCount(), 0);
+});
+
+test("a timed-out BrowserInspect is contained before action serialization is released", async () => {
+  const { manager, browser } = managerFixture({ limits: { actionMs: 15, cleanupMs: 100 } });
+  const opened = await manager.open("https://example.com/inspect-timeout");
+  const snapshot = await manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+  browser.context.page.inspectDelayMs = 100;
+  await assert.rejects(manager.inspect(opened.session, opened.tab, ref), /15ms total deadline/);
+  assert.equal(manager.activeSessionCount(), 0, "timeout teardown completes before BrowserInspect rejects");
+  assert.equal(browser.context.page.isClosed(), true);
 });

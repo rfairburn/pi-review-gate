@@ -97,7 +97,10 @@ recovery path.
 Use the least-powerful acquisition method that works: `WebSearch` discovers sources,
 `WebFetch` reads ordinary documents, `BrowserExtract` renders one dynamic page and
 immediately closes it, and only then should a Pi-native orchestrator or worker open a
-short-lived interactive session. The session surface is bounded and semantic:
+short-lived interactive session. Start with `BrowserSnapshot`; escalate to `BrowserInspect`
+only for one referenced element that needs fixed state detail, and use `BrowserConsole` or
+`BrowserNetwork` only to diagnose behavior the rendered semantic view cannot explain.
+The session surface is bounded and semantic:
 
 - `BrowserOpen` creates one isolated context and tab, navigates to a public HTTP(S) URL,
   and returns opaque random session, tab, and document-generation handles.
@@ -106,6 +109,32 @@ short-lived interactive session. The session surface is bounded and semantic:
 - `BrowserSnapshot` returns a bounded Playwright accessibility/ARIA snapshot. Any refs
   are replaced with opaque generation-scoped refs; truncation and original/returned
   character counts are explicit. A successful snapshot replaces the current ref set.
+- `BrowserConsole` reads a cursor page from a capture-time-bounded, per-tab memory ring
+  of console level/text/source metadata and uncaught page errors. Text is structurally
+  filtered, secret-redacted, and capped before retention; sources expose only a public
+  origin and bounded line/column metadata. Console arguments, object serialization,
+  source payloads, and error stacks are excluded. Every result reports the requested,
+  next, latest, and oldest-retained monotonic cursors plus returned, dropped,
+  result-truncated, and capture-truncated counts.
+- `BrowserNetwork` reads an equivalent bounded cursor ring containing only request,
+  response, failure, and available browser-policy metadata: sequence/timing, method,
+  public origin (path, query, fragment, and credentials removed), resource kind, status,
+  and bounded outcome/failure classification. It never returns request or response
+  bodies, headers, cookies, authorization, post data, WebSocket frames, cache contents,
+  or sensitive URL path/query data. Reading it creates no network traffic.
+- `BrowserInspect` accepts exactly one current opaque ref from the latest successful
+  `BrowserSnapshot` for that owned session, tab, and document generation. It returns a
+  fixed allowlist: browser-computed role/name semantics captured with the fresh
+  accessibility ref, tag/type and a bounded description candidate accepted only after
+  an exact Playwright computed-description match, current effective checked/disabled/
+  expanded/selected/focus/editability state, redacted HTTP(S) href origin, and bounded
+  visible-text metadata. Description ID resolution remains in the semantic ref's owning
+  top-level or iframe document and does not pierce shadow roots. Editable and password controls never expose values or visible
+  text. Forged, stale, cross-session, and cross-tab refs fail uniformly. The tool has no
+  selector, arbitrary attribute, coordinates, raw HTML/DOM, value, script/evaluate,
+  CDP, frame, or shadow-root escape input. Inspection never runs a callback in the
+  page's main JavaScript world; timeout or cancellation tears down the owning session
+  before browser action serialization is released.
 - `BrowserScreenshot` is the visual fallback after semantic inspection. It returns a
   PNG as native Pi image tool-result content for either the current 1280×720 viewport
   or one visible element named by a ref from the latest successful `BrowserSnapshot`.
@@ -210,6 +239,15 @@ stale, cross-session, and cross-tab combinations are rejected uniformly. Semanti
 are process-local capabilities scoped to one session, tab, current document generation,
 and latest successful snapshot.
 
+Console and network rings are also process-local and memory-only. They are allocated per
+owned tab, bounded when each event is captured, never written to caches or review-gate
+evidence stores beyond the bounded tool result itself, and cleared on tab close, session
+teardown, or extension shutdown. Diagnostic reads are serialized with existing browser
+actions, consume the existing operation budget, honor cancellation and deadlines, and
+do not navigate, mutate the document generation/page state, create requests, or widen
+broker permissions. Ring overflow and result pagination are never silent: dropped and
+truncated counts accompany every read.
+
 Limits are hard and finite: at most 4 process-local sessions, 4 tabs per session, 12
 explicit navigations/history traversals, 64 operations, 32 retained history entries per
 tab, 32 main-document requests, 16 destination hosts,
@@ -218,7 +256,10 @@ Each open/navigation and confirmation-capable interaction has one 30-second end-
 deadline; each other action or snapshot has one 10-second end-to-end deadline. All
 phases share that one absolute timer and never receive fresh timers.
 Idle sessions are capped at 60 seconds, total lifetime at 5 minutes, redirect chains at 10 hops, and
-semantic output at 24,000 characters and depth 16. A screenshot is capped at 2,000×2,000,
+semantic output at 24,000 characters and depth 16. Console and network rings retain at most
+128 and 256 events per tab respectively; each read returns at most 64. Console/error text
+is captured at 1,000 characters, source origins at 300, inspect names/descriptions/text at
+256/512/512, and every cap has explicit truncation accounting. A screenshot is capped at 2,000×2,000,
 4,000,000 decoded pixels, 4 MiB of final encoded PNG data, and a conservative 32 MiB
 allocation charge covering decoded RGBA, encoded bytes, and the Pi base64 image-content
 string. Both viewport/element bounds and the decoded final PNG are checked; an oversized
@@ -247,9 +288,10 @@ with the exact tool name to load one. `BrowserScreenshot` checks the current Pi 
 input contract before capture; when image input is unavailable (or the host does not
 provide a model capability contract), it returns a clear error and directs the caller
 back to `BrowserSnapshot` rather than creating bytes Pi cannot deliver. Top-level and
-execute Pi roles receive `BrowserHover`, `BrowserClick`, `BrowserFill`, `BrowserType`,
+execute Pi roles receive `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`,
+`BrowserHover`, `BrowserClick`, `BrowserFill`, `BrowserType`,
 `BrowserSelect`, and `BrowserPress`; research Pi roles receive observational
-`BrowserHover` but none of the click/form-action tools. Authorized names appear in each
+`BrowserConsole`, `BrowserNetwork`, `BrowserInspect`, and `BrowserHover` but none of the click/form-action tools. Authorized names appear in each
 role's deterministic names-only system-prompt inventory while schemas
 remain deferred. The generic deferred matcher, ranking, limits, and guidance are shared
 unchanged with all other tools.

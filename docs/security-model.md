@@ -94,6 +94,24 @@ in-flight transfer is nonfatal only when the main document completed; main-docum
 failures, non-2xx navigations, oversized rendered HTML, and any ledger audit failure
 fail the render closed.
 
+Interactive diagnostics do not add an egress path. `BrowserNetwork` observes only
+capture-time-bounded method/origin/resource/status/timing/failure and available route-
+policy outcomes from traffic already governed by the authenticated broker; paths,
+queries, bodies, headers, cookies, authorization, post data, WebSocket frames, and cache
+contents are excluded. `BrowserConsole` retains only bounded redacted text and source
+origin/position metadata, never argument objects, source payloads, or stacks.
+`BrowserInspect` resolves only a current owned semantic ref and returns fixed bounded
+accessibility/state fields using the browser-computed semantics captured with the fresh
+ref and Playwright's isolated locator/accessibility primitives. Description candidates
+are scoped to the ref's owning top-level or iframe document and returned only after an exact computed-description match; current
+control states are read through fixed computed-role filters. It does not execute a
+main-world page callback, cannot receive selectors, attribute names, coordinates,
+scripts, CDP commands, or frame/shadow traversal instructions, and never reads an
+editable/password value. These per-tab rings are memory-only and are cleared at tab or
+session teardown and shutdown. Results are explicitly untrusted and disclose monotonic
+cursors, ring drops, and capture/result truncation; reads create no requests or page
+state/document-generation changes.
+
 ## Read-only enforcement
 
 Built-in Codex, Claude, and Pi model adapters run as read-only agentic reviewers so they

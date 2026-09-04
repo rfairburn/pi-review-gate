@@ -476,13 +476,19 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   manager.register();
   assert.deepEqual([...tools.keys()], [
     "WebSearch", "WebFetch", "BrowserExtract",
-    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
+    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
     "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress",
     "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ]);
   assert.deepEqual(Object.keys(tools.get("BrowserOpen").parameters.properties), ["url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserNavigate").parameters.properties), ["session", "tab", "url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserSnapshot").parameters.properties), ["session", "tab", "maxChars"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserConsole").parameters.properties), ["session", "tab", "cursor", "maxEvents"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserNetwork").parameters.properties), ["session", "tab", "cursor", "maxEvents"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserInspect").parameters.properties), ["session", "tab", "ref"]);
+  assert.deepEqual(tools.get("BrowserConsole").parameters.required, ["session", "tab"]);
+  assert.equal(tools.get("BrowserConsole").parameters.additionalProperties, false);
+  assert.equal(tools.get("BrowserNetwork").parameters.properties.maxEvents.maximum, 64);
   assert.deepEqual(Object.keys(tools.get("BrowserScreenshot").parameters.properties), ["session", "tab", "mode", "ref"]);
   assert.deepEqual(tools.get("BrowserScreenshot").parameters.required, ["session", "tab", "mode"]);
   assert.deepEqual(Object.keys(tools.get("BrowserScroll").parameters.properties), ["session", "tab", "target", "direction", "amount", "ref"]);

@@ -4,6 +4,7 @@ import {
   type Browser,
   type BrowserContext,
   type BrowserType,
+  type ConsoleMessage,
   type Dialog,
   type Download,
   type Locator,
@@ -12,6 +13,7 @@ import {
   type Response,
 } from "playwright";
 import type { WebFetchConfig } from "../config";
+import { redactSensitiveText } from "../redaction";
 import {
   CLEANUP_DEADLINE_MS,
   MAX_MAIN_DOCUMENT_REDIRECTS,
@@ -46,6 +48,8 @@ export const BROWSER_TYPE_MAX_DELAY_MS = 5;
 export const BROWSER_SELECT_MAX_OPTIONS = 32;
 export const BROWSER_SELECT_OPTION_MAX_CHARS = 256;
 export const BROWSER_PRESS_KEY_MAX_CHARS = 32;
+export const BROWSER_DIAGNOSTIC_CURSOR_MAX = Number.MAX_SAFE_INTEGER;
+export const BROWSER_DIAGNOSTIC_READ_MAX_EVENTS = 64;
 
 /** Hard limits for the initial, observational browser surface. */
 export interface InteractiveBrowserLimits {
@@ -66,6 +70,14 @@ export interface InteractiveBrowserLimits {
   maxScreenshotPixels: number;
   maxScreenshotBytes: number;
   maxScreenshotAllocationBytes: number;
+  maxConsoleEvents: number;
+  maxConsoleTextChars: number;
+  maxConsoleSourceChars: number;
+  maxNetworkEvents: number;
+  maxDiagnosticReadEvents: number;
+  maxInspectTextChars: number;
+  maxInspectNameChars: number;
+  maxInspectDescriptionChars: number;
   navigationMs: number;
   actionMs: number;
   confirmationMs: number;
@@ -97,6 +109,14 @@ export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Ob
   maxScreenshotPixels: 4_000_000,
   maxScreenshotBytes: 4 * 1024 * 1024,
   maxScreenshotAllocationBytes: 32 * 1024 * 1024,
+  maxConsoleEvents: 128,
+  maxConsoleTextChars: 1_000,
+  maxConsoleSourceChars: 300,
+  maxNetworkEvents: 256,
+  maxDiagnosticReadEvents: BROWSER_DIAGNOSTIC_READ_MAX_EVENTS,
+  maxInspectTextChars: 512,
+  maxInspectNameChars: 256,
+  maxInspectDescriptionChars: 512,
   navigationMs: 30_000,
   actionMs: 10_000,
   confirmationMs: 30_000,
@@ -172,6 +192,83 @@ export interface BrowserScreenshotMetadata {
 export interface BrowserScreenshotResult {
   image: Buffer;
   metadata: BrowserScreenshotMetadata;
+}
+
+export interface BrowserConsoleEvent {
+  sequence: number;
+  elapsedMs: number;
+  kind: "console" | "page_error";
+  level: "debug" | "info" | "log" | "warning" | "error" | "other";
+  text: string;
+  textTruncated: boolean;
+  source: { origin: string; line: number; column: number } | null;
+  errorName?: string;
+}
+
+export interface BrowserNetworkEvent {
+  sequence: number;
+  elapsedMs: number;
+  phase: "request" | "response" | "failure" | "policy";
+  method: string;
+  origin: string;
+  resourceKind: string;
+  status?: number;
+  durationMs?: number;
+  outcome: "observed" | "succeeded" | "failed" | "policy_blocked";
+  failure?: string;
+}
+
+export interface BrowserDiagnosticResult<T> {
+  session: string;
+  tab: string;
+  generation: string;
+  events: T[];
+  cursor: {
+    requested: number;
+    next: number;
+    latest: number;
+    oldestRetained: number;
+  };
+  counts: {
+    returned: number;
+    dropped: number;
+    totalDropped: number;
+    truncated: number;
+    captureTruncated: number;
+    totalCaptureTruncated: number;
+  };
+  capacity: number;
+  untrusted: true;
+}
+
+export interface BrowserInspectResult {
+  session: string;
+  tab: string;
+  generation: string;
+  ref: string;
+  semantic: {
+    role: string | null;
+    tag: string;
+    type: string | null;
+    accessibleName: string;
+    accessibleDescription: string;
+    states: {
+      checked: boolean | "mixed" | null;
+      disabled: boolean;
+      expanded: boolean | null;
+      selected: boolean | null;
+      focused: boolean;
+      editable: boolean;
+    };
+    hrefOrigin: string | null;
+    visibleText: {
+      text: string;
+      returnedChars: number;
+      truncated: boolean;
+      suppressed: boolean;
+    };
+  };
+  untrusted: true;
 }
 
 export type BrowserScrollTarget = "page" | "ref_container" | "ref";
@@ -293,17 +390,32 @@ interface OpeningOperation {
   teardownFailure?: Error;
 }
 
+interface CapturedAriaSemantic {
+  role: string | null;
+  name: string;
+  checked: boolean | "mixed" | null;
+  disabled: boolean;
+  expanded: boolean | null;
+  selected: boolean | null;
+  focused: boolean;
+}
+
 interface BrowserTab {
   handle: string;
   generation: string;
   page: Page;
-  semanticRefs: Map<string, { generation: string; playwrightRef: string }>;
+  semanticRefs: Map<string, { generation: string; playwrightRef: string; semantic: CapturedAriaSemantic }>;
   history: Array<{ url: string; identityUrl: string; generation: string }>;
   historyIndex: number;
   pendingHistoryIndex?: number;
   lastCommittedUrl: string;
   documentRequestPending: boolean;
   closing: boolean;
+  diagnosticsActive: boolean;
+  consoleDiagnostics: DiagnosticRing<BrowserConsoleEvent>;
+  networkDiagnostics: DiagnosticRing<BrowserNetworkEvent>;
+  networkStartedAt: WeakMap<Request, number>;
+  networkPolicy: WeakMap<Request, string>;
 }
 
 interface InteractionCapture {
@@ -340,6 +452,70 @@ interface Session {
 
 const MAX_TOMBSTONES = 32;
 const SAFE_LOCAL_PROTOCOLS = new Set(["about:", "blob:", "data:"]);
+
+type DiagnosticEvent = { sequence: number; textTruncated?: boolean };
+
+/** A capture-time-bounded, memory-only ring with a never-reused tab-local cursor. */
+class DiagnosticRing<T extends DiagnosticEvent> {
+  private events: T[] = [];
+  private nextSequence = 1;
+  private dropped = 0;
+  private captureTruncated = 0;
+
+  constructor(readonly capacity: number) {}
+
+  push(event: Omit<T, "sequence">): void {
+    const captured = { ...event, sequence: this.nextSequence++ } as T;
+    if (captured.textTruncated) this.captureTruncated += 1;
+    if (this.events.length >= this.capacity) {
+      this.events.shift();
+      this.dropped += 1;
+    }
+    this.events.push(captured);
+  }
+
+  read(after: number, maximum: number): {
+    events: T[];
+    requested: number;
+    next: number;
+    latest: number;
+    oldestRetained: number;
+    dropped: number;
+    totalDropped: number;
+    truncated: number;
+    captureTruncated: number;
+    totalCaptureTruncated: number;
+  } {
+    const latest = this.nextSequence - 1;
+    if (!Number.isSafeInteger(after) || after < 0 || after > latest) {
+      throw new Error(`Browser diagnostic cursor must be an integer from 0 through ${latest}.`);
+    }
+    const oldestRetained = this.events[0]?.sequence ?? this.nextSequence;
+    const dropped = Math.max(0, oldestRetained - 1 - after);
+    const eligible = this.events.filter((event) => event.sequence > after);
+    const events = eligible.slice(0, maximum).map((event) => ({ ...event }));
+    const next = events.at(-1)?.sequence ?? Math.max(after, oldestRetained - 1);
+    return {
+      events,
+      requested: after,
+      next,
+      latest,
+      oldestRetained,
+      dropped,
+      totalDropped: this.dropped,
+      truncated: eligible.length - events.length,
+      captureTruncated: events.filter((event) => event.textTruncated).length,
+      totalCaptureTruncated: this.captureTruncated,
+    };
+  }
+
+  clear(): void {
+    this.events = [];
+    this.nextSequence = 1;
+    this.dropped = 0;
+    this.captureTruncated = 0;
+  }
+}
 
 /**
  * Process-local owner for isolated interactive browser sessions. Nothing is
@@ -383,6 +559,14 @@ export class InteractiveBrowserManager {
       maxWaitTextChars: clampedTestLimit(requestedLimits.maxWaitTextChars, INTERACTIVE_BROWSER_LIMITS.maxWaitTextChars),
       maxWaitPatternChars: clampedTestLimit(requestedLimits.maxWaitPatternChars, INTERACTIVE_BROWSER_LIMITS.maxWaitPatternChars),
       maxWaitMs: clampedTestLimit(requestedLimits.maxWaitMs, INTERACTIVE_BROWSER_LIMITS.maxWaitMs),
+      maxConsoleEvents: clampedTestLimit(requestedLimits.maxConsoleEvents, INTERACTIVE_BROWSER_LIMITS.maxConsoleEvents),
+      maxConsoleTextChars: clampedTestLimit(requestedLimits.maxConsoleTextChars, INTERACTIVE_BROWSER_LIMITS.maxConsoleTextChars),
+      maxConsoleSourceChars: clampedTestLimit(requestedLimits.maxConsoleSourceChars, INTERACTIVE_BROWSER_LIMITS.maxConsoleSourceChars),
+      maxNetworkEvents: clampedTestLimit(requestedLimits.maxNetworkEvents, INTERACTIVE_BROWSER_LIMITS.maxNetworkEvents),
+      maxDiagnosticReadEvents: clampedTestLimit(requestedLimits.maxDiagnosticReadEvents, INTERACTIVE_BROWSER_LIMITS.maxDiagnosticReadEvents),
+      maxInspectTextChars: clampedTestLimit(requestedLimits.maxInspectTextChars, INTERACTIVE_BROWSER_LIMITS.maxInspectTextChars),
+      maxInspectNameChars: clampedTestLimit(requestedLimits.maxInspectNameChars, INTERACTIVE_BROWSER_LIMITS.maxInspectNameChars),
+      maxInspectDescriptionChars: clampedTestLimit(requestedLimits.maxInspectDescriptionChars, INTERACTIVE_BROWSER_LIMITS.maxInspectDescriptionChars),
     });
   }
 
@@ -458,7 +642,10 @@ export class InteractiveBrowserManager {
       context.setDefaultTimeout(this.limits.actionMs);
       context.setDefaultNavigationTimeout(this.limits.navigationMs);
       await operation.run(context.clearPermissions(), "permission denial");
-      await operation.run(installRoutePolicy(context, broker), "network route policy installation");
+      let pendingSession: Session | undefined;
+      await operation.run(installRoutePolicy(context, broker, (request, reason) => {
+        if (pendingSession) this.recordNetworkPolicy(pendingSession, request, reason);
+      }), "network route policy installation");
 
       const page = await operation.run(context.newPage(), "browser tab creation");
       const primaryTab: BrowserTab = {
@@ -471,6 +658,11 @@ export class InteractiveBrowserManager {
         lastCommittedUrl: page.url(),
         documentRequestPending: false,
         closing: false,
+        diagnosticsActive: true,
+        consoleDiagnostics: new DiagnosticRing(this.limits.maxConsoleEvents),
+        networkDiagnostics: new DiagnosticRing(this.limits.maxNetworkEvents),
+        networkStartedAt: new WeakMap(),
+        networkPolicy: new WeakMap(),
       };
       const session: Session = {
         handle: this.uniqueHandle("session"),
@@ -488,6 +680,7 @@ export class InteractiveBrowserManager {
         mainDocumentRequests: 0,
         operationActive: true,
       };
+      pendingSession = session;
       pendingFatal = (error) => this.failSession(session, error);
       this.installPageGuards(session, primaryTab);
       browser.on("disconnected", () => {
@@ -587,7 +780,7 @@ export class InteractiveBrowserManager {
           timeout: operation.remainingMs(),
           signal: operation.signal,
         }), "ARIA snapshot acquisition");
-        const capturedRefs = new Map<string, { generation: string; playwrightRef: string }>();
+        const capturedRefs = new Map<string, { generation: string; playwrightRef: string; semantic: CapturedAriaSemantic }>();
         let transformedDelta = 0;
         const semantic = raw.replace(/\[ref=([^\]\r\n]+)\]/g, (match, playwrightRef: string, rawOffset: number) => {
           const opaqueRef = `${capturedGeneration}_${this.uniqueHandle("ref")}`;
@@ -598,7 +791,13 @@ export class InteractiveBrowserManager {
           // keeps the per-session capability map bounded even if Playwright
           // produces a very large semantic tree.
           if (transformedStart + replacement.length <= limit && /^(?:f\d+)?e\d+$/.test(playwrightRef)) {
-            capturedRefs.set(opaqueRef, { generation: capturedGeneration, playwrightRef });
+            const lineStart = raw.lastIndexOf("\n", rawOffset) + 1;
+            const nextLine = raw.indexOf("\n", rawOffset);
+            const lineEnd = nextLine < 0 ? raw.length : nextLine;
+            // Keep computed semantics, never the raw line or any value text
+            // that may follow its structural metadata.
+            const semantic = parseAriaRoot(raw.slice(lineStart, Math.min(lineEnd, lineStart + 2_048)));
+            capturedRefs.set(opaqueRef, { generation: capturedGeneration, playwrightRef, semantic });
           }
           return replacement;
         });
@@ -632,6 +831,111 @@ export class InteractiveBrowserManager {
         operation.dispose();
       }
     }, true);
+  }
+
+  async console(
+    sessionHandle: string,
+    tabHandle: string,
+    cursor = 0,
+    maxEvents = this.limits.maxDiagnosticReadEvents,
+    signal?: AbortSignal,
+  ): Promise<BrowserDiagnosticResult<BrowserConsoleEvent>> {
+    return this.readDiagnostics("BrowserConsole", sessionHandle, tabHandle, cursor, maxEvents, signal, "consoleDiagnostics");
+  }
+
+  async network(
+    sessionHandle: string,
+    tabHandle: string,
+    cursor = 0,
+    maxEvents = this.limits.maxDiagnosticReadEvents,
+    signal?: AbortSignal,
+  ): Promise<BrowserDiagnosticResult<BrowserNetworkEvent>> {
+    return this.readDiagnostics("BrowserNetwork", sessionHandle, tabHandle, cursor, maxEvents, signal, "networkDiagnostics");
+  }
+
+  async inspect(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserInspectResult> {
+    assertBoundedInteractionCapability(sessionHandle, BROWSER_INTERACTION_SESSION_MAX_CHARS);
+    assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
+    assertBoundedInteractionCapability(ref, BROWSER_INTERACTION_REF_MAX_CHARS);
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
+    return this.operate(session, signal, async () => {
+      const operation = new OperationDeadline("BrowserInspect", this.limits.actionMs, signal);
+      const generation = tab.generation;
+      try {
+        const semanticRef = tab.semanticRefs.get(ref);
+        if (!semanticRef || semanticRef.generation !== generation) throw invalidRefError();
+        const locator = tab.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
+        const raw = await operation.run(readSemanticDetail(locator, tab.page, tab.page.url(), semanticRef.semantic, {
+          text: this.limits.maxInspectTextChars,
+          name: this.limits.maxInspectNameChars,
+          description: this.limits.maxInspectDescriptionChars,
+        }, operation.remainingMs(), operation.signal), "bounded semantic detail read");
+        throwIfAborted(operation.signal);
+        if (tab.generation !== generation) {
+          throw new Error("Browser document changed during semantic detail read; result rejected.");
+        }
+        return {
+          session: session.handle,
+          tab: tab.handle,
+          generation,
+          ref,
+          semantic: sanitizeSemanticDetail(raw, this.limits),
+          untrusted: true,
+        };
+      } catch (error) {
+        if (operation.signal.aborted) await this.failAndWait(session, asError(error));
+        throw error;
+      } finally {
+        operation.dispose();
+      }
+    });
+  }
+
+  private async readDiagnostics<K extends "consoleDiagnostics" | "networkDiagnostics">(
+    name: "BrowserConsole" | "BrowserNetwork",
+    sessionHandle: string,
+    tabHandle: string,
+    cursor: number,
+    maxEvents: number,
+    signal: AbortSignal | undefined,
+    kind: K,
+  ): Promise<BrowserDiagnosticResult<K extends "consoleDiagnostics" ? BrowserConsoleEvent : BrowserNetworkEvent>> {
+    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > this.limits.maxDiagnosticReadEvents) {
+      throw new Error(`${name} maxEvents must be an integer from 1-${this.limits.maxDiagnosticReadEvents}.`);
+    }
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
+    return this.operate(session, signal, async () => {
+      throwIfAborted(signal);
+      const ring = tab[kind] as DiagnosticRing<BrowserConsoleEvent> | DiagnosticRing<BrowserNetworkEvent>;
+      const read = ring.read(cursor, maxEvents);
+      return {
+        session: session.handle,
+        tab: tab.handle,
+        generation: tab.generation,
+        events: read.events,
+        cursor: {
+          requested: read.requested,
+          next: read.next,
+          latest: read.latest,
+          oldestRetained: read.oldestRetained,
+        },
+        counts: {
+          returned: read.events.length,
+          dropped: read.dropped,
+          totalDropped: read.totalDropped,
+          truncated: read.truncated,
+          captureTruncated: read.captureTruncated,
+          totalCaptureTruncated: read.totalCaptureTruncated,
+        },
+        capacity: ring.capacity,
+        untrusted: true,
+      } as BrowserDiagnosticResult<K extends "consoleDiagnostics" ? BrowserConsoleEvent : BrowserNetworkEvent>;
+    });
   }
 
   async screenshot(
@@ -1589,6 +1893,7 @@ export class InteractiveBrowserManager {
 
   private installPageGuards(session: Session, tab: BrowserTab): void {
     tab.page.on("request", (request: Request) => {
+      this.recordNetworkRequest(session, tab, request);
       if (session.interactionCapture) {
         session.interactionCapture.networkRequests += 1;
         session.interactionCapture.events += 1;
@@ -1611,6 +1916,10 @@ export class InteractiveBrowserManager {
         this.failSession(session, new Error(`Browser main-document request limit (${this.limits.maxMainDocumentRequests}) exhausted.`));
       }
     });
+    tab.page.on("response", (response: Response) => this.recordNetworkResponse(session, tab, response));
+    tab.page.on("requestfailed", (request: Request) => this.recordNetworkFailure(session, tab, request));
+    tab.page.on("console", (message: ConsoleMessage) => this.recordConsoleMessage(session, tab, message));
+    tab.page.on("pageerror", (error: Error) => this.recordPageError(session, tab, error));
     tab.page.on("framenavigated", (frame) => {
       if (frame !== tab.page.mainFrame()) return;
       if (session.interactionCapture) session.interactionCapture.events += 1;
@@ -1643,6 +1952,7 @@ export class InteractiveBrowserManager {
     tab.page.on("download", (download) => this.cancelDownload(session, download));
     tab.page.on("crash", () => this.failSession(session, new Error("Browser tab crashed; teardown started.")));
     tab.page.on("close", () => {
+      this.clearTabDiagnostics(tab);
       session.tabs.delete(tab.handle);
       if (session.teardown || tab.closing) return;
       if (session.tabs.size === 0) {
@@ -1651,6 +1961,118 @@ export class InteractiveBrowserManager {
       }
       if (session.activeTab === tab.handle) session.activeTab = session.tabs.keys().next().value!;
     });
+  }
+
+  private recordConsoleMessage(session: Session, tab: BrowserTab, message: ConsoleMessage): void {
+    if (!tab.diagnosticsActive || session.teardown) return;
+    let rawText = "[console message unavailable]";
+    let rawType = "other";
+    let location: { url?: string; lineNumber?: number; columnNumber?: number } = {};
+    try { rawText = message.text(); } catch { /* fixed fallback */ }
+    try { rawType = message.type(); } catch { /* fixed fallback */ }
+    try { location = message.location(); } catch { /* fixed fallback */ }
+    const text = boundedUntrustedText(rawText, this.limits.maxConsoleTextChars);
+    tab.consoleDiagnostics.push({
+      elapsedMs: diagnosticElapsed(this.now(), session.createdAt),
+      kind: "console",
+      level: consoleLevel(rawType),
+      text: text.value,
+      textTruncated: text.truncated,
+      source: location.url ? {
+        origin: diagnosticOrigin(location.url, this.limits.maxConsoleSourceChars),
+        line: boundedNonnegativeInteger(location.lineNumber),
+        column: boundedNonnegativeInteger(location.columnNumber),
+      } : null,
+    });
+  }
+
+  private recordPageError(session: Session, tab: BrowserTab, error: Error): void {
+    if (!tab.diagnosticsActive || session.teardown) return;
+    const text = boundedUntrustedText(error?.message || "Uncaught page error", this.limits.maxConsoleTextChars);
+    const errorName = boundedUntrustedText(error?.name || "Error", 64);
+    tab.consoleDiagnostics.push({
+      elapsedMs: diagnosticElapsed(this.now(), session.createdAt),
+      kind: "page_error",
+      level: "error",
+      text: text.value,
+      textTruncated: text.truncated || errorName.truncated,
+      source: null,
+      errorName: errorName.value,
+    });
+  }
+
+  private recordNetworkRequest(session: Session, tab: BrowserTab, request: Request): void {
+    if (!tab.diagnosticsActive || session.teardown) return;
+    const elapsedMs = diagnosticElapsed(this.now(), session.createdAt);
+    tab.networkStartedAt.set(request, elapsedMs);
+    tab.networkDiagnostics.push({
+      elapsedMs,
+      phase: "request",
+      method: diagnosticMethod(safely(() => request.method(), "OTHER")),
+      origin: diagnosticOrigin(safely(() => request.url(), ""), 300),
+      resourceKind: diagnosticResourceKind(safely(() => request.resourceType(), "other")),
+      outcome: "observed",
+    });
+  }
+
+  private recordNetworkResponse(session: Session, tab: BrowserTab, response: Response): void {
+    if (!tab.diagnosticsActive || session.teardown) return;
+    const request = response.request();
+    const elapsedMs = diagnosticElapsed(this.now(), session.createdAt);
+    const started = tab.networkStartedAt.get(request);
+    tab.networkDiagnostics.push({
+      elapsedMs,
+      phase: "response",
+      method: diagnosticMethod(safely(() => request.method(), "OTHER")),
+      origin: diagnosticOrigin(safely(() => request.url(), ""), 300),
+      resourceKind: diagnosticResourceKind(safely(() => request.resourceType(), "other")),
+      status: boundedHttpStatus(safely(() => response.status(), 0)),
+      ...(started === undefined ? {} : { durationMs: Math.max(0, elapsedMs - started) }),
+      outcome: "succeeded",
+    });
+  }
+
+  private recordNetworkFailure(session: Session, tab: BrowserTab, request: Request): void {
+    if (!tab.diagnosticsActive || session.teardown) return;
+    const elapsedMs = diagnosticElapsed(this.now(), session.createdAt);
+    const started = tab.networkStartedAt.get(request);
+    const policy = tab.networkPolicy.get(request);
+    const rawFailure = safely(() => request.failure()?.errorText, "request failed") ?? "request failed";
+    const failure = policy ?? diagnosticNetworkFailure(rawFailure);
+    tab.networkDiagnostics.push({
+      elapsedMs,
+      phase: "failure",
+      method: diagnosticMethod(safely(() => request.method(), "OTHER")),
+      origin: diagnosticOrigin(safely(() => request.url(), ""), 300),
+      resourceKind: diagnosticResourceKind(safely(() => request.resourceType(), "other")),
+      ...(started === undefined ? {} : { durationMs: Math.max(0, elapsedMs - started) }),
+      outcome: policy ? "policy_blocked" : "failed",
+      failure,
+    });
+  }
+
+  private recordNetworkPolicy(session: Session, request: Request, reason: string): void {
+    const tab = safely(() => this.tabForPage(session, request.frame().page()), undefined);
+    if (!tab || !tab.diagnosticsActive || session.teardown) return;
+    tab.networkPolicy.set(request, reason);
+    const elapsedMs = diagnosticElapsed(this.now(), session.createdAt);
+    tab.networkDiagnostics.push({
+      elapsedMs,
+      phase: "policy",
+      method: diagnosticMethod(safely(() => request.method(), "OTHER")),
+      origin: diagnosticOrigin(safely(() => request.url(), ""), 300),
+      resourceKind: diagnosticResourceKind(safely(() => request.resourceType(), "other")),
+      outcome: "policy_blocked",
+      failure: boundedUntrustedText(reason, 160).value,
+    });
+  }
+
+  private clearTabDiagnostics(tab: BrowserTab): void {
+    tab.diagnosticsActive = false;
+    tab.consoleDiagnostics.clear();
+    tab.networkDiagnostics.clear();
+    tab.networkStartedAt = new WeakMap();
+    tab.networkPolicy = new WeakMap();
   }
 
   private async operate<T>(session: Session, signal: AbortSignal | undefined, body: () => Promise<T>, fatalOnError = false): Promise<T> {
@@ -1707,6 +2129,7 @@ export class InteractiveBrowserManager {
     if (session.teardown) return session.teardown;
     clearTimeout(session.expiryTimer);
     clearTimeout(session.idleTimer);
+    for (const tab of session.tabs.values()) this.clearTabDiagnostics(tab);
     // Publish the in-progress promise before invoking any Playwright close.
     // Browser/page close events may fire synchronously and must observe this
     // marker rather than recursively starting another teardown.
@@ -1950,6 +2373,11 @@ export class InteractiveBrowserManager {
       lastCommittedUrl: page.url(),
       documentRequestPending: false,
       closing: false,
+      diagnosticsActive: true,
+      consoleDiagnostics: new DiagnosticRing(this.limits.maxConsoleEvents),
+      networkDiagnostics: new DiagnosticRing(this.limits.maxNetworkEvents),
+      networkStartedAt: new WeakMap(),
+      networkPolicy: new WeakMap(),
     };
     session.tabs.set(tab.handle, tab);
     this.installPageGuards(session, tab);
@@ -2090,7 +2518,11 @@ export function interactiveChromiumArgs(brokerPort: number): string[] {
   ];
 }
 
-async function installRoutePolicy(context: BrowserContext, broker: EgressBroker): Promise<void> {
+async function installRoutePolicy(
+  context: BrowserContext,
+  broker: EgressBroker,
+  onPolicyBlocked?: (request: Request, reason: string) => void,
+): Promise<void> {
   await context.routeWebSocket("**/*", (socket) => {
     broker.note(`WebSocket blocked before destination connection: ${bounded(socket.url(), 300)}`);
     socket.close();
@@ -2102,7 +2534,9 @@ async function installRoutePolicy(context: BrowserContext, broker: EgressBroker)
       await route.continue().catch(() => undefined);
       return;
     }
-    broker.note(`${decision.reason}: ${bounded(request.url(), 300)}`);
+    const reason = decision.reason ?? "browser request blocked";
+    onPolicyBlocked?.(request, reason);
+    broker.note(`${reason}: ${bounded(request.url(), 300)}`);
     await route.abort("blockedbyclient").catch(() => undefined);
   });
 }
@@ -2837,6 +3271,110 @@ function bounded(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
+function boundedUntrustedText(raw: unknown, maxChars: number): { value: string; truncated: boolean } {
+  const original = typeof raw === "string" ? raw : String(raw ?? "");
+  // Strip terminal/control framing and bidi overrides before generic secret
+  // redaction. The returned string is page-controlled evidence, never markup.
+  const captured = original.slice(0, maxChars);
+  const structural = captured
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, " ")
+    .replace(/[\u202a-\u202e\u2066-\u2069]/gu, "");
+  const redacted = redactSensitiveText(structural);
+  return {
+    value: redacted.slice(0, maxChars),
+    truncated: original.length > maxChars || redacted.length > maxChars,
+  };
+}
+
+function consoleLevel(raw: string): BrowserConsoleEvent["level"] {
+  const normalized = raw.toLocaleLowerCase("en-US");
+  if (normalized === "debug" || normalized === "info" || normalized === "log" || normalized === "error") return normalized;
+  if (normalized === "warning" || normalized === "warn") return "warning";
+  return "other";
+}
+
+function diagnosticElapsed(now: number, createdAt: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(now - createdAt)));
+}
+
+function boundedNonnegativeInteger(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(value)))
+    : 0;
+}
+
+function boundedHttpStatus(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 999 ? value : 0;
+}
+
+function diagnosticMethod(raw: string): string {
+  const upper = raw.toLocaleUpperCase("en-US");
+  return /^[A-Z]{1,16}$/.test(upper) ? upper : "OTHER";
+}
+
+function diagnosticResourceKind(raw: string): string {
+  const normalized = raw.toLocaleLowerCase("en-US");
+  const allowed = new Set([
+    "document", "stylesheet", "script", "xhr", "fetch", "image", "font", "media",
+    "websocket", "eventsource", "manifest", "texttrack", "other",
+  ]);
+  return allowed.has(normalized) ? normalized : "other";
+}
+
+function diagnosticNetworkFailure(raw: string): string {
+  // Browser failure strings occasionally embed the complete request URL.
+  // Retain only Chromium's fixed error token, never free-form failure text.
+  const code = /\b(?:net::)?ERR_[A-Z0-9_]{1,64}\b/u.exec(raw)?.[0];
+  return code ? code.slice(0, 64) : "request_failed";
+}
+
+function diagnosticOrigin(rawUrl: string, maxChars: number): string {
+  const origin = diagnosticPublicOrigin(rawUrl);
+  return bounded(origin ?? "[non-public or redacted origin]", maxChars);
+}
+
+function diagnosticPublicOrigin(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return bounded(parsed.origin, 300);
+  } catch {
+    return null;
+  }
+}
+
+function semanticToken(value: unknown, maxChars: number, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  const token = value.trim().toLocaleLowerCase("en-US");
+  return /^[a-z][a-z0-9_-]*$/.test(token) ? token.slice(0, maxChars) : fallback;
+}
+
+function nullableSemanticToken(value: unknown, maxChars: number): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  const token = semanticToken(value, maxChars, "");
+  return token || null;
+}
+
+function implicitSemanticRole(tag: string, type: string | null): string | null {
+  if (tag === "a" || tag === "area") return "link";
+  if (tag === "button") return "button";
+  if (tag === "textarea") return "textbox";
+  if (tag === "select") return "combobox";
+  if (tag === "img") return "img";
+  if (/^h[1-6]$/.test(tag)) return "heading";
+  if (tag !== "input") return null;
+  if (type === "checkbox") return "checkbox";
+  if (type === "radio") return "radio";
+  if (["button", "submit", "reset", "image"].includes(type ?? "")) return "button";
+  if (type === "range") return "slider";
+  return "textbox";
+}
+
+function safely<T>(operation: () => T, fallback: T): T {
+  try { return operation(); }
+  catch { return fallback; }
+}
+
 function normalizedInteractionFailure(
   name: "BrowserHover" | "BrowserClick" | "BrowserFill" | "BrowserType" | "BrowserSelect" | "BrowserPress",
   error: unknown,
@@ -2851,4 +3389,299 @@ function normalizedInteractionFailure(
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+interface RawSemanticDetail {
+  role: string | null;
+  tag: string;
+  type: string | null;
+  accessibleName: string;
+  accessibleDescription: string;
+  checked: boolean | "mixed" | null;
+  disabled: boolean;
+  expanded: boolean | null;
+  selected: boolean | null;
+  focused: boolean;
+  editable: boolean;
+  href: string | null;
+  visibleText: string;
+  visibleTextTruncated: boolean;
+  textSuppressed: boolean;
+}
+
+const INSPECT_TAG_ALLOWLIST = [
+  "a", "area", "button", "input", "textarea", "select", "option", "img", "summary", "details",
+  "form", "fieldset", "legend", "label", "nav", "main", "header", "footer", "section", "article",
+  "ul", "ol", "li", "table", "tr", "th", "td", "h1", "h2", "h3", "h4", "h5", "h6",
+  "p", "div", "span", "svg",
+] as const;
+
+const INSPECT_COMPUTED_ROLE_ALLOWLIST = new Set([
+  "alert", "alertdialog", "application", "article", "banner", "blockquote", "button", "caption", "cell",
+  "checkbox", "code", "columnheader", "combobox", "complementary", "contentinfo", "definition", "deletion",
+  "dialog", "directory", "document", "emphasis", "feed", "figure", "form", "generic", "grid", "gridcell",
+  "group", "heading", "img", "insertion", "link", "list", "listbox", "listitem", "log", "main", "marquee",
+  "math", "meter", "menu", "menubar", "menuitem", "menuitemcheckbox", "menuitemradio", "navigation", "none",
+  "note", "option", "paragraph", "progressbar", "radio", "radiogroup", "region", "row", "rowgroup",
+  "rowheader", "scrollbar", "search", "searchbox", "separator", "slider", "spinbutton", "status", "strong",
+  "subscript", "superscript", "switch", "tab", "table", "tablist", "tabpanel", "term", "textbox", "time",
+  "timer", "toolbar", "tooltip", "tree", "treegrid", "treeitem",
+]);
+
+const INSPECT_CHECKED_ROLES = new Set(["checkbox", "menuitemcheckbox", "menuitemradio", "option", "radio", "switch", "treeitem"]);
+const INSPECT_EXPANDED_ROLES = new Set([
+  "application", "button", "checkbox", "columnheader", "combobox", "gridcell", "link", "listbox", "menuitem",
+  "menuitemcheckbox", "menuitemradio", "row", "rowheader", "switch", "tab", "treeitem",
+]);
+const INSPECT_SELECTED_ROLES = new Set(["columnheader", "gridcell", "option", "row", "rowheader", "tab", "treeitem"]);
+
+async function readSemanticDetail(
+  locator: Locator,
+  page: Page,
+  baseUrl: string,
+  computed: CapturedAriaSemantic,
+  limits: { text: number; name: number; description: number },
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<RawSemanticDetail> {
+  const timeout = Math.max(1, timeoutMs);
+  const attributesPromise = Promise.all([
+    locator.getAttribute("type", { timeout }),
+    locator.getAttribute("href", { timeout }),
+    locator.getAttribute("aria-description", { timeout }),
+    locator.getAttribute("aria-describedby", { timeout }),
+    locator.getAttribute("title", { timeout }),
+    locator.getAttribute("aria-checked", { timeout }),
+    locator.getAttribute("aria-expanded", { timeout }),
+    locator.getAttribute("aria-selected", { timeout }),
+  ]);
+  const tagPromise = identifySemanticTag(locator, page);
+  const disabledPromise = locator.isDisabled({ timeout });
+  const focusedPromise = locator.and(page.locator(":focus")).count().then((count) => count === 1);
+  // A second ariaSnapshot call rewrites Playwright's aria-ref registry and
+  // would silently stale sibling opaque refs. Revalidate the captured computed
+  // role/name and read current computed states through fixed getByRole filters
+  // instead; these use Playwright's isolated accessibility engine without
+  // changing the ref registry or entering the page's main world.
+  const semanticsCurrentPromise = verifyComputedSemantic(locator, page, computed);
+  const [attributes, tag, disabled, focused] = await Promise.all([
+    attributesPromise, tagPromise, disabledPromise, focusedPromise, semanticsCurrentPromise,
+  ]);
+  throwIfAborted(signal);
+  const [typeAttribute, hrefAttribute, ariaDescription, describedBy, title, ariaChecked, ariaExpanded, ariaSelected] = attributes;
+  const type = tag === "input" || tag === "button" ? nullableSemanticToken(typeAttribute?.slice(0, 33), 32) : null;
+  const mayBeEditable = tag === "input" || tag === "textarea" || tag === "select"
+    || computed.role === "textbox" || computed.role === "combobox" || computed.role === "searchbox";
+  const editable = mayBeEditable ? await locator.isEditable({ timeout }) : false;
+  const checkedState = await currentComputedBoolean(locator, page, computed, "checked", INSPECT_CHECKED_ROLES);
+  const expandedState = tag === "summary"
+    ? await currentDisclosureState(locator, page)
+    : await currentComputedBoolean(locator, page, computed, "expanded", INSPECT_EXPANDED_ROLES);
+  const selectedState = await currentComputedBoolean(locator, page, computed, "selected", INSPECT_SELECTED_ROLES);
+  const textSuppressed = editable || type === "password";
+  const visibleText = textSuppressed ? "" : await locator.innerText({ timeout });
+  throwIfAborted(signal);
+  const descriptionCandidate = (await computedDescriptionFromIds(locator, describedBy, timeout, signal)
+    ?? ariaDescription
+    ?? title
+    ?? "").slice(0, limits.description + 1);
+  const description = await verifiedAccessibleDescription(locator, page, computed, descriptionCandidate);
+  let href: string | null = null;
+  if ((tag === "a" || tag === "area") && hrefAttribute) {
+    try { href = diagnosticPublicOrigin(new URL(hrefAttribute, baseUrl).href); }
+    catch { href = null; }
+  }
+  const normalizedVisibleText = visibleText.slice(0, limits.text + 1).replace(/\s+/gu, " ").trim();
+  return {
+    role: nullableSemanticToken(computed.role, 64),
+    tag,
+    type,
+    accessibleName: computed.name.slice(0, limits.name + 1),
+    accessibleDescription: description,
+    checked: ariaBooleanOrMixed(ariaChecked) ?? checkedState,
+    disabled,
+    expanded: expandedState ?? ariaBoolean(ariaExpanded),
+    selected: selectedState ?? ariaBoolean(ariaSelected),
+    focused,
+    editable,
+    href,
+    visibleText: normalizedVisibleText,
+    visibleTextTruncated: normalizedVisibleText.length > limits.text,
+    textSuppressed,
+  };
+}
+
+async function identifySemanticTag(locator: Locator, page: Page): Promise<string> {
+  const matches = await Promise.all(INSPECT_TAG_ALLOWLIST.map(async (tag) =>
+    (await locator.and(page.locator(tag)).count()) === 1));
+  const index = matches.indexOf(true);
+  return index < 0 ? "other" : INSPECT_TAG_ALLOWLIST[index]!;
+}
+
+async function currentComputedBoolean(
+  locator: Locator,
+  page: Page,
+  semantic: CapturedAriaSemantic,
+  state: "checked" | "expanded" | "selected",
+  supportedRoles: ReadonlySet<string>,
+): Promise<boolean | null> {
+  if (!semantic.role || !supportedRoles.has(semantic.role)) return null;
+  const role = semantic.role as Parameters<Page["getByRole"]>[0];
+  const common = { name: semantic.name, exact: true };
+  const [trueMatches, falseMatches] = await Promise.all([
+    locator.and(page.getByRole(role, { ...common, [state]: true })).count(),
+    locator.and(page.getByRole(role, { ...common, [state]: false })).count(),
+  ]);
+  if (trueMatches === 1) return true;
+  if (falseMatches === 1) return false;
+  return null;
+}
+
+async function currentDisclosureState(locator: Locator, page: Page): Promise<boolean | null> {
+  const [open, closed] = await Promise.all([
+    locator.and(page.locator("details[open] > summary")).count(),
+    locator.and(page.locator("details:not([open]) > summary")).count(),
+  ]);
+  return open === 1 ? true : closed === 1 ? false : null;
+}
+
+async function computedDescriptionFromIds(
+  scope: Locator,
+  rawIds: string | null,
+  timeout: number,
+  signal: AbortSignal,
+): Promise<string | null> {
+  const ids = (rawIds?.slice(0, 2_048).trim().split(/\s+/u) ?? []).filter(Boolean).slice(0, 8);
+  if (ids.length === 0) return null;
+  const parts: string[] = [];
+  let retained = 0;
+  for (const id of ids) {
+    throwIfAborted(signal);
+    const boundedId = id.slice(0, 256);
+    // Chaining from the aria-ref preserves Playwright's owning-frame routing.
+    // Walking to that frame document's root keeps the XPath document-scoped;
+    // unlike Playwright CSS it does not pierce an open shadow root with an
+    // unrelated same-ID node. The page controls only one escaped literal.
+    const target = scope.locator(
+      `xpath=ancestor-or-self::*[last()]/descendant-or-self::*[@id=${xpathLiteral(boundedId)}]`,
+    ).first();
+    const [ariaLabel, text, title] = await Promise.all([
+      target.getAttribute("aria-label", { timeout }).catch(() => null),
+      target.textContent({ timeout }).catch(() => null),
+      target.getAttribute("title", { timeout }).catch(() => null),
+    ]);
+    const computedTextCandidate = ariaLabel ?? text ?? title;
+    if (!computedTextCandidate) continue;
+    const remaining = Math.max(0, 513 - retained);
+    if (remaining === 0) break;
+    const normalized = computedTextCandidate.slice(0, 514).replace(/\s+/gu, " ").trim();
+    parts.push(normalized.slice(0, remaining));
+    retained += Math.min(remaining, normalized.length) + 1;
+  }
+  return parts.length > 0 ? parts.join(" ") : null;
+}
+
+function parseAriaRoot(snapshot: string): {
+  role: string | null;
+  name: string;
+  checked: boolean | "mixed" | null;
+  disabled: boolean;
+  expanded: boolean | null;
+  selected: boolean | null;
+  focused: boolean;
+} {
+  const first = snapshot.split(/\r?\n/u, 1)[0]?.trim() ?? "";
+  const role = /^-\s+([a-z][a-z0-9_-]*)\b/u.exec(first)?.[1] ?? null;
+  const quoted = /^-\s+[a-z][a-z0-9_-]*\s+("(?:\\.|[^"\\])*")/u.exec(first)?.[1];
+  let name = "";
+  if (quoted) {
+    try { name = JSON.parse(quoted) as string; }
+    catch { name = ""; }
+  }
+  const checkedValue = /\[checked=(mixed|true|false)\]/u.exec(first)?.[1];
+  const checked = checkedValue === "mixed" ? "mixed"
+    : checkedValue === "true" ? true
+      : checkedValue === "false" ? false
+        : /\[checked\]/u.test(first) ? true : null;
+  return {
+    role,
+    name,
+    checked,
+    disabled: /\[disabled\]/u.test(first),
+    expanded: /\[expanded\]/u.test(first) ? true : /\[expanded=false\]/u.test(first) ? false : null,
+    selected: /\[selected\]/u.test(first) ? true : /\[selected=false\]/u.test(first) ? false : null,
+    focused: /\[active\]/u.test(first),
+  };
+}
+
+function ariaBoolean(value: string | null): boolean | null {
+  return value === "true" ? true : value === "false" ? false : null;
+}
+
+function ariaBooleanOrMixed(value: string | null): boolean | "mixed" | null {
+  return value === "mixed" ? "mixed" : ariaBoolean(value);
+}
+
+function sanitizeSemanticDetail(raw: RawSemanticDetail, limits: Readonly<InteractiveBrowserLimits>): BrowserInspectResult["semantic"] {
+  if (!raw || typeof raw !== "object") throw new Error("BrowserInspect could not safely read the semantic target.");
+  const tag = semanticToken(raw.tag, 64, "other");
+  const type = nullableSemanticToken(raw.type, 32);
+  const editable = raw.editable || tag === "input" || tag === "textarea" || tag === "select";
+  const suppressed = editable || type === "password" || raw.textSuppressed;
+  const name = boundedUntrustedText(raw.accessibleName, limits.maxInspectNameChars);
+  const description = boundedUntrustedText(raw.accessibleDescription, limits.maxInspectDescriptionChars);
+  const visible = boundedUntrustedText(suppressed ? "" : raw.visibleText, limits.maxInspectTextChars);
+  return {
+    role: raw.role ?? implicitSemanticRole(tag, type),
+    tag,
+    type,
+    accessibleName: name.value,
+    accessibleDescription: description.value,
+    states: {
+      checked: raw.checked,
+      disabled: raw.disabled,
+      expanded: raw.expanded,
+      selected: raw.selected,
+      focused: raw.focused,
+      editable,
+    },
+    hrefOrigin: raw.href ? diagnosticPublicOrigin(raw.href) : null,
+    visibleText: {
+      text: suppressed ? "" : visible.value,
+      returnedChars: suppressed ? 0 : visible.value.length,
+      truncated: suppressed ? false : raw.visibleTextTruncated || visible.truncated,
+      suppressed,
+    },
+  };
+}
+
+async function verifyComputedSemantic(locator: Locator, page: Page, computed: CapturedAriaSemantic): Promise<void> {
+  if (!computed.role || !INSPECT_COMPUTED_ROLE_ALLOWLIST.has(computed.role)) return;
+  const role = computed.role as Parameters<Page["getByRole"]>[0];
+  const matches = await locator.and(page.getByRole(role, { name: computed.name, exact: true })).count();
+  if (matches !== 1) {
+    throw new Error("BrowserInspect semantic target changed since BrowserSnapshot; take a fresh BrowserSnapshot.");
+  }
+}
+
+function xpathLiteral(value: string): string {
+  if (!value.includes("'")) return `'${value}'`;
+  if (!value.includes('"')) return `"${value}"`;
+  return `concat(${value.split("'").map((part) => `'${part}'`).join(", \"'\", ")})`;
+}
+
+async function verifiedAccessibleDescription(
+  locator: Locator,
+  page: Page,
+  semantic: CapturedAriaSemantic,
+  candidate: string,
+): Promise<string> {
+  if (!candidate || !semantic.role || !INSPECT_COMPUTED_ROLE_ALLOWLIST.has(semantic.role)) return "";
+  const role = semantic.role as Parameters<Page["getByRole"]>[0];
+  const matches = await locator.and(page.getByRole(role, {
+    name: semantic.name,
+    description: candidate,
+    exact: true,
+  })).count();
+  return matches === 1 ? candidate : "";
 }

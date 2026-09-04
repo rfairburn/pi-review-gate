@@ -29,6 +29,7 @@ receipts of exactly what the model was told.
 - **Native web tools** — `WebSearch` (API-key-free DDGS), `WebFetch` (indexed HTML/PDF
   reading), `BrowserExtract` (single-page rendered fallback), and a bounded Pi-native
   semantic browser (`BrowserOpen`, `BrowserNavigate`, `BrowserSnapshot`,
+  bounded `BrowserConsole`, `BrowserNetwork`, and `BrowserInspect` diagnostics,
   `BrowserScreenshot`, `BrowserScroll`, `BrowserHover`, policy-bound `BrowserClick`,
   `BrowserFill`, `BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserWait`, `BrowserHistory`, `BrowserTabs`, `BrowserClose`), all with
   DNS-rebinding-hardened, validated egress

@@ -141,7 +141,7 @@ test("configured worker catalogs use the durable initial subset without narrowin
 test("role-filtered research inventory names every authorized tool without mutation tools or schemas", () => {
   const fixture = hostFixture();
   const browserNames = [
-    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
+    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
     "BrowserScroll", "BrowserHover", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ];
   for (const name of browserNames) fixture.pi.registerTool(tool(name, `Private schema description for ${name}.`));
@@ -275,6 +275,9 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
     tool("BrowserOpen", "Open an isolated observational browser session."),
     tool("BrowserNavigate", "Navigate an isolated browser tab."),
     tool("BrowserSnapshot", "Read a bounded semantic browser snapshot."),
+    tool("BrowserConsole", "Read bounded console diagnostics."),
+    tool("BrowserNetwork", "Read bounded network diagnostics."),
+    tool("BrowserInspect", "Inspect one fresh semantic ref."),
     tool("BrowserScreenshot", "Capture bounded visual browser evidence."),
     tool("BrowserScroll", "Perform bounded semantic scrolling."),
     tool("BrowserHover", "Hover a current semantic ref."),
@@ -295,7 +298,7 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
   manager.sessionStart(fixture.sessionIdentity);
 
   const browserNames = [
-    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
+    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
     "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress",
     "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ];
@@ -316,7 +319,7 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
   assert.deepEqual((screenshot.details as { activated: string[] }).activated, ["BrowserScreenshot"]);
   assert.ok(fixture.active().includes("BrowserScreenshot"));
 
-  for (const name of ["BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserWait", "BrowserHistory", "BrowserTabs"]) {
+  for (const name of ["BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserWait", "BrowserHistory", "BrowserTabs"]) {
     const loaded = await fixture.search()(`load-${name}`, { query: name });
     assert.deepEqual((loaded.details as { matched: string[] }).matched, [name]);
     assert.deepEqual((loaded.details as { activated: string[] }).activated, [name]);

@@ -195,7 +195,14 @@ export class DeferredToolManager {
       .map((tool) => matchTool(tool, query, terms))
       .filter((match): match is SearchMatch => match !== undefined)
       .sort((left, right) => left.rank - right.rank || compareNames(left.name, right.name));
-    const selected = matches.slice(0, MAX_MATCHES);
+    // Activate only the strongest match tier. Exact tool names outrank all
+    // descriptive terms; otherwise tools matching the most name terms outrank
+    // description-only matches. This keeps match-any discovery useful without
+    // activating every tool that shares one generic word.
+    const preferred = matches.length === 0
+      ? []
+      : matches.filter((match) => match.rank === matches[0]!.rank);
+    const selected = preferred.slice(0, MAX_MATCHES);
     if (selected.length === 0) {
       return textResult("No authorized tools matched. No tools were activated.", false, {
         activated: [],
@@ -216,7 +223,7 @@ export class DeferredToolManager {
     this.pi.setActiveTools([...this.desiredActiveNames]);
 
     const matchedNames = selected.map((match) => match.name);
-    const omitted = matches.length - selected.length;
+    const omitted = preferred.length - selected.length;
     const status = activated.length > 0
       ? `Activated: ${activated.join(", ")}. Call the required tool on the next turn; search_tools did not perform the operation.`
       : "All matched authorized tools were already active. search_tools did not perform the operation.";
@@ -372,17 +379,24 @@ function toolMetadata(value: unknown): ToolMetadata[] {
 function matchTool(tool: ToolMetadata, query: string, terms: readonly string[]): SearchMatch | undefined {
   const name = tool.name.toLocaleLowerCase("en-US");
   const description = tool.description.toLocaleLowerCase("en-US");
-  if (!terms.some((term) => name.includes(term) || description.includes(term))) return undefined;
-  const rank = name === query
-    ? 0
-    : terms.some((term) => name === term)
-      ? 1
-      : terms.some((term) => name.startsWith(term))
-        ? 2
-        : terms.some((term) => name.includes(term))
-          ? 3
-          : 4;
-  return { ...tool, rank };
+  const nameTerms = splitToolName(tool.name);
+  if (name === query || terms.includes(name)) return { ...tool, rank: 0 };
+
+  const nameMatches = terms.filter((term) =>
+    nameTerms.some((nameTerm) => nameTerm.includes(term))
+  ).length;
+  if (nameMatches > 0) return { ...tool, rank: 100 - nameMatches };
+
+  const descriptionMatches = terms.filter((term) => description.includes(term)).length;
+  if (descriptionMatches === 0) return undefined;
+  return { ...tool, rank: 200 - descriptionMatches };
+}
+
+function splitToolName(name: string): string[] {
+  return name
+    .replace(/([\p{Ll}\p{N}])([\p{Lu}])/gu, "$1 $2")
+    .toLocaleLowerCase("en-US")
+    .match(/[\p{L}\p{N}]+/gu) ?? [];
 }
 
 function compareNames(left: string, right: string): number {

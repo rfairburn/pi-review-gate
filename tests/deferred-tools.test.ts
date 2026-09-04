@@ -236,6 +236,25 @@ test("search matches any query term so multiple exact or descriptive tool names 
   }
 });
 
+test("exact tool names suppress weaker generic-word matches", async () => {
+  for (const [query, expected] of [
+    ["WebSearch web search tool", "WebSearch"],
+    ["WebFetch fetch webpage content", "WebFetch"],
+  ] as const) {
+    const fixture = hostFixture();
+    fixture.pi.registerTool(tool("WebFetch", "Fetch and extract public webpage content."));
+    fixture.pi.registerTool(tool("BrowserExtract", "Use a browser to extract web content."));
+    const manager = new DeferredToolManager(fixture.pi);
+    manager.register();
+    manager.sessionStart(fixture.sessionIdentity);
+
+    const result = await fixture.search()("exact-web", { query });
+    const details = result.details as { matched: string[]; activated: string[] };
+    assert.deepEqual(details.matched, [expected]);
+    assert.deepEqual(details.activated, [expected]);
+  }
+});
+
 test("invalid and unmatched searches do not change the active set", async () => {
   const fixture = hostFixture();
   const manager = new DeferredToolManager(fixture.pi);

@@ -3,6 +3,9 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 export type BrowserConsequence =
   | "ordinary_navigation"
   | "local_disclosure"
+  | "local_editing"
+  | "sensitive_input"
+  | "autosave_or_change"
   | "download"
   | "authentication"
   | "terms_or_consent"
@@ -31,6 +34,14 @@ export interface BrowserTargetStructure {
   disabled: boolean;
   inlineEventHandler: boolean;
   summaryForDetails: boolean;
+  /** Form-control facts are optional for compatibility with pre-form snapshots; absence fails closed. */
+  autocomplete?: string | null;
+  readOnly?: boolean;
+  multiple?: boolean;
+  explicitChangeHandler?: boolean;
+  explicitSubmitHandler?: boolean;
+  /** True only when the caller can prove relevant page listeners are absent. */
+  pageControlledEventsAbsent?: boolean;
   domPath: string;
 }
 
@@ -38,6 +49,13 @@ export interface BrowserConsequenceDecision {
   consequence: BrowserConsequence;
   consequential: boolean;
   destination: string | null;
+}
+
+export type BrowserFormOperation = "fill" | "type" | "select" | "press";
+
+export interface BrowserFormAction {
+  operation: BrowserFormOperation;
+  key?: string;
 }
 
 /**
@@ -94,6 +112,44 @@ export class BrowserConsequencePolicy {
     return { consequence: "unknown_or_mixed", consequential: true, destination };
   }
 
+  classifyForm(target: BrowserTargetStructure, action: BrowserFormAction): BrowserConsequenceDecision {
+    const destination = normalizedHttpUrl(target.formAction);
+    if (target.inputType === "file") return { consequence: "permissions", consequential: true, destination };
+    if (target.inputType === "password") return { consequence: "authentication", consequential: true, destination };
+
+    const formDestination = consequenceFromDestination(target.formAction);
+    if (formDestination) return { consequence: formDestination, consequential: true, destination };
+
+    const autocomplete = target.autocomplete === undefined || target.autocomplete === null
+      ? null
+      : target.autocomplete.trim().toLocaleLowerCase("en-US");
+    if (autocomplete !== null && autocomplete !== "off") {
+      const authentication = /(?:^|\s)(?:current-password|new-password|one-time-code|username|webauthn)(?:\s|$)/.test(autocomplete);
+      return {
+        consequence: authentication ? "authentication" : "sensitive_input",
+        consequential: true,
+        destination,
+      };
+    }
+    if (target.inputType === "email" || target.inputType === "tel") {
+      return { consequence: "sensitive_input", consequential: true, destination };
+    }
+    if (target.explicitChangeHandler || target.explicitSubmitHandler) {
+      return { consequence: "autosave_or_change", consequential: true, destination };
+    }
+    if (action.operation === "press" && isActivationKey(action.key)) {
+      return {
+        consequence: target.formAssociated || isSubmitControl(target) ? "form_submission" : "unknown_or_mixed",
+        consequential: true,
+        destination,
+      };
+    }
+    if (isProvenLocalEditingTarget(target, action.operation)) {
+      return { consequence: "local_editing", consequential: false, destination };
+    }
+    return { consequence: "unknown_or_mixed", consequential: true, destination };
+  }
+
   fingerprint(target: BrowserTargetStructure): string {
     // Fixed field order makes the fingerprint deterministic and excludes names,
     // values, page text, and arbitrary attributes.
@@ -101,7 +157,9 @@ export class BrowserConsequencePolicy {
       target.tagName, target.role, target.href, target.target, target.download,
       target.inputType, target.formAssociated, target.formAction, target.formMethod,
       target.ariaHasPopup, target.contentEditable, target.disabled,
-      target.inlineEventHandler, target.summaryForDetails, target.domPath,
+      target.inlineEventHandler, target.summaryForDetails, target.autocomplete,
+      target.readOnly, target.multiple, target.explicitChangeHandler,
+      target.explicitSubmitHandler, target.pageControlledEventsAbsent, target.domPath,
     ])).digest("base64url");
   }
 }
@@ -110,12 +168,16 @@ export interface BrowserConfirmationBinding {
   session: string;
   tab: string;
   generation: string;
-  operation: "click";
+  operation: "click" | BrowserFormOperation;
   ref: string;
   origin: string;
   destination: string | null;
   targetFingerprint: string;
   consequence: BrowserConsequence;
+  /** Exact values are represented only by a process-local digest and lengths. */
+  valueDigest: string | null;
+  valueLengths: readonly number[];
+  key: string | null;
 }
 
 export interface BrowserConfirmationPermit {
@@ -173,8 +235,48 @@ function bindingDigest(binding: BrowserConfirmationBinding, expiresAt: number): 
   return createHash("sha256").update(JSON.stringify([
     binding.session, binding.tab, binding.generation, binding.operation, binding.ref,
     binding.origin, binding.destination, binding.targetFingerprint, binding.consequence,
-    expiresAt,
+    binding.valueDigest, binding.valueLengths, binding.key, expiresAt,
   ])).digest();
+}
+
+function isActivationKey(key: string | undefined): boolean {
+  if (!key) return false;
+  const base = key.split("+").at(-1);
+  return base === "Enter" || base === "Space";
+}
+
+function isProvenLocalEditingTarget(target: BrowserTargetStructure, operation: BrowserFormOperation): boolean {
+  if (
+    target.readOnly === undefined
+    || target.explicitChangeHandler === undefined
+    || target.explicitSubmitHandler === undefined
+    || !("autocomplete" in target)
+    || target.pageControlledEventsAbsent !== true
+    || target.disabled
+    || target.readOnly
+    || target.inlineEventHandler
+    || target.ariaHasPopup
+    || target.download
+    || target.href
+  ) return false;
+  if (operation === "select") {
+    return target.multiple !== undefined
+      && target.tagName === "select"
+      && (target.role === null || target.role === "listbox" || target.role === "combobox");
+  }
+  const textInput = target.tagName === "input"
+    && (target.role === null || target.role === "textbox" || target.role === "searchbox")
+    && ["text", "search", "url", "number"].includes(target.inputType ?? "");
+  const editable = textInput
+    || (target.tagName === "textarea" && (target.role === null || target.role === "textbox"))
+    || (target.contentEditable && (target.role === null || target.role === "textbox"));
+  if (operation === "fill" || operation === "type") return editable;
+  // Non-activation keys are local only on a proven editable control (including
+  // native select state). Other targets remain unknown and require confirmation.
+  const nativeSelect = target.multiple !== undefined
+    && target.tagName === "select"
+    && (target.role === null || target.role === "listbox" || target.role === "combobox");
+  return operation === "press" && (editable || nativeSelect);
 }
 
 function isSubmitControl(target: BrowserTargetStructure): boolean {

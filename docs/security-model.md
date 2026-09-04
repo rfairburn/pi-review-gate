@@ -26,7 +26,7 @@ cannot substitute an arbitrary helper; production always resolves the packaged
 
 ## Web egress hardening
 
-Every native web path (`WebFetch`, `BrowserExtract`, and observational interactive
+Every native web path (`WebFetch`, `BrowserExtract`, and bounded semantic interactive
 browser sessions) is DNS-rebinding-hardened. Every
 URL and every redirect hop is validated immediately before that hop is dialed: the URL
 is canonicalized, credentials are rejected, and the hostname is resolved exactly once
@@ -41,7 +41,7 @@ survives.
 ### Egress broker containment
 
 `BrowserExtract` routes every Chromium request through a per-render loopback egress
-broker; each observational interactive session uses exactly one authenticated broker
+broker; each bounded interactive session uses exactly one authenticated broker
 for its complete lifetime. Each broker is an HTTP/HTTPS CONNECT proxy bound only to
 127.0.0.1 on an ephemeral port. Chromium is launched so the broker is its only network
 path:
@@ -77,7 +77,7 @@ in Chromium's rendering engine, remote fonts are disabled, and image/font reques
 also denied at routing so generated `data:` or `blob:` visual payloads cannot bypass
 broker byte accounting. `BrowserScreenshot` captures only the already-rendered viewport
 or an element addressed by a current opaque semantic ref; it does not admit a new
-network path. Bounded scroll/wait/history controls and every owned tab or admitted
+network path. Bounded scroll/wait/history/form controls and every owned tab or admitted
 popup stay inside the same context and authenticated broker; the four-tab cap closes
 excess popups before they can become unowned. Element bounds must fit the viewport and become an immutable screenshot
 clip; the capture leaves finite animations running rather than fast-forwarding them

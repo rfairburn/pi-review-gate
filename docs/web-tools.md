@@ -158,16 +158,36 @@ short-lived interactive session. The session surface is bounded and semantic:
   target is re-resolved and all fields still match. Denial, cancellation, timeout,
   absent UI, changed structure/origin, or stale refs prevents dispatch. Non-UI executor
   sessions reject consequential clicks rather than approving them.
+- `BrowserFill` replaces a supported text control's bounded value (including
+  clearing it), while `BrowserType` appends at most 1,000 characters with an optional
+  0–5 ms per-character delay. `BrowserSelect` accepts a nonempty set of at most 32
+  exact, unique native option labels or values and supports bounded multi-selects.
+  `BrowserPress` accepts one named key or short editing chord under a strict grammar;
+  clipboard chords, arbitrary sequences, and raw event objects are rejected. All four
+  require a fresh owned semantic ref and invalidate refs after a successful action.
+  Password and file controls are rejected. A structurally proven unsent local edit may
+  proceed as ephemeral state only when relevant page-controlled events are proven
+  absent; ordinary web pages can hide direct or delegated `addEventListener` handlers,
+  so event-dispatching form actions conservatively require confirmation rather than
+  assuming those handlers do not exist. Results explicitly distinguish whether a remote
+  network effect was observed. Sensitive or autocomplete controls, authentication/terms destinations,
+  submit or activation keys (including Enter and Space), explicit change/autosave/
+  submit handlers, and unknown or mixed targets require the same real top-level UI
+  confirmation as consequential clicks and fail closed without UI. Confirmation is
+  bound to the action, key, and a nonpersisted digest and lengths of the exact values,
+  in addition to session/tab/generation/origin/target/consequence, followed by immediate
+  re-resolution and reclassification. Values and selections never appear in result
+  text/details, confirmation prompts, diagnostics, durable evidence, or review-gate logs.
 - `BrowserClose` is idempotent. It reports closure only after the page, context,
   Chromium connection, broker listener, and every tracked broker socket are confirmed
   quiescent. Recent closes retain bounded broker diagnostics; older confirmed closes
   remain recognizable through authenticated session handles without retaining
   unbounded state.
 
-There is no typing, form-data entry, upload, download saving, clipboard, caller-provided
-selector, XPath, coordinate action, caller-supplied JavaScript/evaluate, forced click,
-arbitrary click option, CDP, or permission API. Click and hover resolve only
-extension-issued semantic refs internally. Navigation, popup, dialog, and download
+There is no password/file entry, upload, download saving, clipboard, filesystem-path
+input, caller-provided selector, XPath, coordinate action, caller-supplied JavaScript/
+evaluate, forced action, arbitrary action option, CDP, or permission API. Interactions
+resolve only extension-issued semantic refs internally. Navigation, popup, dialog, and download
 observers are armed before dispatch. Popup tabs stay in the same ownership/broker bound
 and are never auto-switched; overflow popups are closed. Unexpected downloads are
 canceled, and confirm/prompt/beforeunload dialogs are default-dismissed so they cannot
@@ -194,7 +214,7 @@ Limits are hard and finite: at most 4 process-local sessions, 4 tabs per session
 explicit navigations/history traversals, 64 operations, 32 retained history entries per
 tab, 32 main-document requests, 16 destination hosts,
 96 connections, 256 broker requests, 8 MiB per connection, and 32 MiB aggregate bytes.
-Each open/navigation and confirmation-capable click has one 30-second end-to-end
+Each open/navigation and confirmation-capable interaction has one 30-second end-to-end
 deadline; each other action or snapshot has one 10-second end-to-end deadline. All
 phases share that one absolute timer and never receive fresh timers.
 Idle sessions are capped at 60 seconds, total lifetime at 5 minutes, redirect chains at 10 hops, and
@@ -226,9 +246,11 @@ authorized but inactive initially when deferred tools are enabled. Use `search_t
 with the exact tool name to load one. `BrowserScreenshot` checks the current Pi model's
 input contract before capture; when image input is unavailable (or the host does not
 provide a model capability contract), it returns a clear error and directs the caller
-back to `BrowserSnapshot` rather than creating bytes Pi cannot deliver. Top-level and execute Pi roles receive `BrowserHover` and `BrowserClick`; research Pi
-roles receive observational `BrowserHover` but never `BrowserClick`. Authorized names
-appear in each role's deterministic names-only system-prompt inventory while schemas
+back to `BrowserSnapshot` rather than creating bytes Pi cannot deliver. Top-level and
+execute Pi roles receive `BrowserHover`, `BrowserClick`, `BrowserFill`, `BrowserType`,
+`BrowserSelect`, and `BrowserPress`; research Pi roles receive observational
+`BrowserHover` but none of the click/form-action tools. Authorized names appear in each
+role's deterministic names-only system-prompt inventory while schemas
 remain deferred. The generic deferred matcher, ranking, limits, and guidance are shared
 unchanged with all other tools.
 External Claude and Codex adapters retain their existing native web-tool policies.

@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   chromium,
   type Browser,
@@ -33,12 +33,19 @@ import {
   BrowserConsequencePolicy,
   type BrowserConfirmationBinding,
   type BrowserConsequence,
+  type BrowserFormOperation,
   type BrowserTargetStructure,
 } from "./browser-interaction-policy";
 
 export const BROWSER_INTERACTION_SESSION_MAX_CHARS = 256;
 export const BROWSER_INTERACTION_TAB_MAX_CHARS = 256;
 export const BROWSER_INTERACTION_REF_MAX_CHARS = 512;
+export const BROWSER_FILL_MAX_CHARS = 4_096;
+export const BROWSER_TYPE_MAX_CHARS = 1_000;
+export const BROWSER_TYPE_MAX_DELAY_MS = 5;
+export const BROWSER_SELECT_MAX_OPTIONS = 32;
+export const BROWSER_SELECT_OPTION_MAX_CHARS = 256;
+export const BROWSER_PRESS_KEY_MAX_CHARS = 32;
 
 /** Hard limits for the initial, observational browser surface. */
 export interface InteractiveBrowserLimits {
@@ -234,6 +241,7 @@ export interface BrowserInteractionEffects {
   observedOverflowPopupsClosed: number;
   observedDialogsDismissed: number;
   download: "not_observed" | "canceled";
+  network: "not_observed" | "observed";
   accounting: "bounded_stable" | "bounded_uncertain";
 }
 
@@ -241,7 +249,7 @@ export interface BrowserInteractionResult {
   session: string;
   tab: string;
   generation: string;
-  operation: "hover" | "click";
+  operation: "hover" | "click" | BrowserFormOperation;
   consequence: BrowserConsequence | "observational";
   confirmed: boolean;
   effect: BrowserInteractionEffectState;
@@ -249,12 +257,14 @@ export interface BrowserInteractionResult {
   url: string;
 }
 
-export interface BrowserClickConfirmationRequest {
+export interface BrowserInteractionConfirmationRequest {
   title: string;
   message: string;
 }
 
-export type BrowserClickConfirmation = (request: BrowserClickConfirmationRequest) => Promise<boolean>;
+export type BrowserInteractionConfirmation = (request: BrowserInteractionConfirmationRequest) => Promise<boolean>;
+/** Compatibility alias for the original click API. */
+export type BrowserClickConfirmation = BrowserInteractionConfirmation;
 
 export interface BrowserCloseResult {
   session: string;
@@ -301,6 +311,7 @@ interface InteractionCapture {
   downloads: number;
   popupTabs: Set<string>;
   overflowPopups: number;
+  networkRequests: number;
   events: number;
   settlements: Promise<void>[];
 }
@@ -822,6 +833,225 @@ export class InteractiveBrowserManager {
     }
   }
 
+  async fill(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    value: string,
+    confirmation?: BrowserInteractionConfirmation,
+    signal?: AbortSignal,
+  ): Promise<BrowserInteractionResult> {
+    try {
+      assertExactText(value, BROWSER_FILL_MAX_CHARS, true);
+      return await this.formInteract(sessionHandle, tabHandle, ref, { operation: "fill", values: [value] }, confirmation, signal);
+    } catch (error) {
+      throw normalizedInteractionFailure("BrowserFill", error);
+    }
+  }
+
+  async type(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    text: string,
+    delayMs = 0,
+    confirmation?: BrowserInteractionConfirmation,
+    signal?: AbortSignal,
+  ): Promise<BrowserInteractionResult> {
+    try {
+      assertExactText(text, BROWSER_TYPE_MAX_CHARS, false);
+      if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > BROWSER_TYPE_MAX_DELAY_MS) throw new Error("invalid bounded delay");
+      return await this.formInteract(sessionHandle, tabHandle, ref, { operation: "type", values: [text], delayMs }, confirmation, signal);
+    } catch (error) {
+      throw normalizedInteractionFailure("BrowserType", error);
+    }
+  }
+
+  async select(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    options: readonly string[],
+    confirmation?: BrowserInteractionConfirmation,
+    signal?: AbortSignal,
+  ): Promise<BrowserInteractionResult> {
+    try {
+      assertSelectValues(options);
+      return await this.formInteract(sessionHandle, tabHandle, ref, { operation: "select", values: [...options] }, confirmation, signal);
+    } catch (error) {
+      throw normalizedInteractionFailure("BrowserSelect", error);
+    }
+  }
+
+  async press(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    key: string,
+    confirmation?: BrowserInteractionConfirmation,
+    signal?: AbortSignal,
+  ): Promise<BrowserInteractionResult> {
+    try {
+      const normalizedKey = normalizeBrowserPressKey(key);
+      return await this.formInteract(sessionHandle, tabHandle, ref, { operation: "press", values: [], key: normalizedKey }, confirmation, signal);
+    } catch (error) {
+      throw normalizedInteractionFailure("BrowserPress", error);
+    }
+  }
+
+  private async formInteract(
+    sessionHandle: string,
+    tabHandle: string,
+    ref: string,
+    action: { operation: BrowserFormOperation; values: string[]; delayMs?: number; key?: string },
+    confirmation: BrowserInteractionConfirmation | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<BrowserInteractionResult> {
+    const name = `Browser${action.operation[0]!.toUpperCase()}${action.operation.slice(1)}` as
+      "BrowserFill" | "BrowserType" | "BrowserSelect" | "BrowserPress";
+    try {
+      assertBoundedInteractionCapability(sessionHandle, BROWSER_INTERACTION_SESSION_MAX_CHARS);
+      assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
+      assertBoundedInteractionCapability(ref, BROWSER_INTERACTION_REF_MAX_CHARS);
+      const { session, tab } = this.requireTab(sessionHandle, tabHandle);
+      return await this.operate(session, signal, async () => {
+        const operation = new OperationDeadline(name, this.limits.confirmationMs, signal);
+        const capturedGeneration = tab.generation;
+        const capturedOrigin = interactionIdentityUrl(tab.page.url());
+        const valueDigest = action.values.length > 0 ? digestExactValues(action.values) : null;
+        const valueLengths = action.values.map((value) => value.length);
+        let started = false;
+        let capture: InteractionCapture | undefined;
+        try {
+          let locator = this.currentRefLocator(tab, ref);
+          await operation.run(locator.waitFor({ state: "visible", timeout: operation.remainingMs() }), "semantic target validation");
+          const structure = await operation.run(readTargetStructure(locator), "structural consequence inspection");
+          assertSuitableFormTarget(structure, action.operation);
+          let selectedKinds: Array<"value" | "label"> | undefined;
+          const decision = this.consequencePolicy.classifyForm(structure, { operation: action.operation, key: action.key });
+          let confirmed = false;
+          const originalFingerprint = this.consequencePolicy.fingerprint(structure);
+
+          if (decision.consequential) {
+            if (!confirmation) {
+              throw new Error(`${name} not_started: this structurally consequential or unknown action requires an interactive Pi confirmation; background or no-UI execution is rejected.`);
+            }
+            const binding = this.formConfirmationBinding(
+              session, tab, ref, capturedOrigin, structure, decision.consequence,
+              decision.destination, action.operation, valueDigest, valueLengths, action.key ?? null,
+            );
+            const permit = this.confirmationPermits.issue(binding);
+            let approved = false;
+            try {
+              approved = await operation.run(
+                confirmation(formConfirmationPrompt(action.operation, decision.consequence, capturedOrigin, decision.destination)),
+                "interactive confirmation",
+              );
+            } catch {
+              this.confirmationPermits.revoke(permit);
+              throw new Error(`${name} not_started: interactive confirmation was unavailable or cancelled.`);
+            }
+            if (!approved) {
+              this.confirmationPermits.revoke(permit);
+              throw new Error(`${name} not_started: interactive confirmation was denied.`);
+            }
+            try {
+              throwIfAborted(operation.signal);
+              if (session.teardown || session.fatalError || tab.page.isClosed()) {
+                throw new Error(`${name} not_started: the browser session changed or closed after confirmation.`);
+              }
+              if (tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin) {
+                this.invalidateInteractionRefs(tab, capturedGeneration);
+                throw new Error(`${name} not_started: the document or origin changed after confirmation; take a fresh BrowserSnapshot.`);
+              }
+              locator = this.currentRefLocator(tab, ref);
+              const revalidatedStructure = await operation.run(readTargetStructure(locator), "post-confirmation target revalidation");
+              assertSuitableFormTarget(revalidatedStructure, action.operation);
+              const revalidatedDecision = this.consequencePolicy.classifyForm(revalidatedStructure, { operation: action.operation, key: action.key });
+              const rebound = this.formConfirmationBinding(
+                session, tab, ref, capturedOrigin, revalidatedStructure, revalidatedDecision.consequence,
+                revalidatedDecision.destination, action.operation, valueDigest, valueLengths, action.key ?? null,
+              );
+              if (!this.confirmationPermits.consume(permit, rebound)) {
+                this.invalidateInteractionRefs(tab, capturedGeneration);
+                throw new Error(`${name} not_started: the confirmed target or consequence changed; take a fresh BrowserSnapshot.`);
+              }
+              confirmed = true;
+            } catch (error) {
+              // Revocation is harmless after consume and guarantees every
+              // approval path is single-use even when re-resolution itself fails.
+              this.confirmationPermits.revoke(permit);
+              throw error;
+            }
+          } else {
+            if (tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin) {
+              this.invalidateInteractionRefs(tab, capturedGeneration);
+              throw new Error(`${name} not_started: the document or origin changed before dispatch; take a fresh BrowserSnapshot.`);
+            }
+            locator = this.currentRefLocator(tab, ref);
+            const revalidatedStructure = await operation.run(readTargetStructure(locator), "safe-target revalidation");
+            assertSuitableFormTarget(revalidatedStructure, action.operation);
+            const revalidatedDecision = this.consequencePolicy.classifyForm(revalidatedStructure, { operation: action.operation, key: action.key });
+            if (
+              revalidatedDecision.consequential
+              || revalidatedDecision.consequence !== decision.consequence
+              || revalidatedDecision.destination !== decision.destination
+              || this.consequencePolicy.fingerprint(revalidatedStructure) !== originalFingerprint
+            ) {
+              this.invalidateInteractionRefs(tab, capturedGeneration);
+              throw new Error(`${name} not_started: the local-editing proof changed; take a fresh BrowserSnapshot.`);
+            }
+          }
+
+          capture = newInteractionCapture();
+          session.interactionCapture = capture;
+          started = true;
+          // Exact selections cross into the page realm only after policy
+          // authorization and effect capture. A hostile realm may intercept
+          // evaluation arguments, so any failure from here is post-dispatch
+          // uncertainty and tears down the session.
+          if (action.operation === "select") {
+            selectedKinds = await operation.run(resolveExactSelectOptions(locator, action.values), "authorized exact option resolution");
+          }
+          if (action.operation === "fill") {
+            await operation.run(locator.fill(action.values[0]!, { timeout: operation.remainingMs() }), "bounded fill dispatch");
+          } else if (action.operation === "type") {
+            await operation.run(positionAppendCaret(locator), "bounded append positioning");
+            await operation.run(locator.pressSequentially(action.values[0]!, {
+              delay: action.delayMs ?? 0,
+              timeout: operation.remainingMs(),
+            }), "bounded type dispatch");
+          } else if (action.operation === "select") {
+            await operation.run(locator.selectOption(action.values.map((value, index) =>
+              selectedKinds![index] === "value" ? { value } : { label: value }), {
+              timeout: operation.remainingMs(),
+            }), "bounded select dispatch");
+          } else {
+            await operation.run(locator.press(action.key!, { timeout: operation.remainingMs() }), "bounded key dispatch");
+          }
+          const accounting = await accountInteractionEffects(capture, operation);
+          if (session.fatalError) throw session.fatalError;
+          const navigated = tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin;
+          this.invalidateInteractionRefs(tab, capturedGeneration);
+          return interactionResult(session, tab, action.operation, decision.consequence, confirmed, capture, accounting, navigated);
+        } catch (error) {
+          if (!started) throw error;
+          this.invalidateInteractionRefs(tab, capturedGeneration);
+          const failure = new Error(`${name} failed after dispatch; effect status is unknown and no rollback is claimed.`);
+          let containment = "confirmed";
+          try { await this.failAndWait(session, failure); }
+          catch { containment = "unconfirmed"; }
+          throw new Error(`${failure.message} Session teardown is ${containment}.`);
+        } finally {
+          if (session.interactionCapture === capture) session.interactionCapture = undefined;
+          operation.dispose();
+        }
+      });
+    } catch (error) {
+      throw normalizedInteractionFailure(name, error);
+    }
+  }
+
   private async interact(
     sessionHandle: string,
     tabHandle: string,
@@ -917,14 +1147,7 @@ export class InteractiveBrowserManager {
           }
         }
 
-        capture = {
-          dialogs: 0,
-          downloads: 0,
-          popupTabs: new Set(),
-          overflowPopups: 0,
-          events: 0,
-          settlements: [],
-        };
+        capture = newInteractionCapture();
         session.interactionCapture = capture;
         started = true;
         if (operationName === "hover") {
@@ -970,6 +1193,7 @@ export class InteractiveBrowserManager {
             observedOverflowPopupsClosed: capture.overflowPopups,
             observedDialogsDismissed: capture.dialogs,
             download: capture.downloads > 0 ? "canceled" : "not_observed",
+            network: capture.networkRequests > 0 ? "observed" : "not_observed",
             accounting,
           },
           url: redactedInteractionUrl(tab.page.url()),
@@ -1365,8 +1589,11 @@ export class InteractiveBrowserManager {
 
   private installPageGuards(session: Session, tab: BrowserTab): void {
     tab.page.on("request", (request: Request) => {
+      if (session.interactionCapture) {
+        session.interactionCapture.networkRequests += 1;
+        session.interactionCapture.events += 1;
+      }
       if (!request.isNavigationRequest() || request.frame() !== tab.page.mainFrame()) return;
-      if (session.interactionCapture) session.interactionCapture.events += 1;
       session.mainDocumentRequests += 1;
       tab.generation = this.uniqueHandle("generation");
       tab.semanticRefs.clear();
@@ -1582,6 +1809,38 @@ export class InteractiveBrowserManager {
       destination,
       targetFingerprint: this.consequencePolicy.fingerprint(structure),
       consequence,
+      valueDigest: null,
+      valueLengths: [],
+      key: null,
+    };
+  }
+
+  private formConfirmationBinding(
+    session: Session,
+    tab: BrowserTab,
+    ref: string,
+    origin: string,
+    structure: BrowserTargetStructure,
+    consequence: BrowserConsequence,
+    destination: string | null,
+    operation: BrowserFormOperation,
+    valueDigest: string | null,
+    valueLengths: readonly number[],
+    key: string | null,
+  ): BrowserConfirmationBinding {
+    return {
+      session: session.handle,
+      tab: tab.handle,
+      generation: tab.generation,
+      operation,
+      ref,
+      origin,
+      destination,
+      targetFingerprint: this.consequencePolicy.fingerprint(structure),
+      consequence,
+      valueDigest,
+      valueLengths,
+      key,
     };
   }
 
@@ -2133,11 +2392,37 @@ async function readTargetStructure(locator: Locator): Promise<BrowserTargetStruc
       disabled: Boolean(("disabled" in control && control.disabled) || html.getAttribute("aria-disabled") === "true"),
       inlineEventHandler: [...html.attributes].some((attribute) => /^on/i.test(attribute.name)),
       summaryForDetails: tagName === "summary" && html.parentElement?.tagName.toLocaleLowerCase("en-US") === "details",
+      autocomplete: cap((html.getAttribute("autocomplete") ?? form?.getAttribute("autocomplete"))?.trim().toLocaleLowerCase("en-US") ?? null, 128),
+      readOnly: Boolean("readOnly" in control && control.readOnly),
+      multiple: Boolean("multiple" in html && (html as HTMLSelectElement).multiple),
+      explicitChangeHandler: [html, form].filter(Boolean).some((candidate) => {
+        const eventTarget = candidate as HTMLElement;
+        return Boolean(eventTarget.oninput || eventTarget.onchange || eventTarget.onblur)
+          || [...candidate!.attributes].some((attribute) => /^(?:oninput|onchange|onblur|data-autosave|autosave)$/i.test(attribute.name));
+      }),
+      explicitSubmitHandler: Boolean(form?.onsubmit)
+        || Boolean(form && [...form.attributes].some((attribute) => /^onsubmit$/i.test(attribute.name))),
+      // The main world cannot reliably prove absence of direct or delegated
+      // addEventListener registrations (pages can obtain fresh native methods
+      // from another realm). Event-dispatching form actions therefore fail
+      // closed into confirmation even when no inline/property handler is seen.
+      pageControlledEventsAbsent: false,
       domPath: path.reverse().join("> ").slice(0, 513),
     };
   });
+  // Locator attribute inspection runs through Playwright's selector utility
+  // world rather than page-owned JavaScript prototypes. Do not let a page
+  // disguise a credential/file control by patching Element#getAttribute.
+  const isolatedType = (await locator.getAttribute("type"))?.trim().toLocaleLowerCase("en-US");
+  const isolatedRole = (await locator.getAttribute("role"))?.trim().toLocaleLowerCase("en-US") ?? null;
+  if (isolatedType === "password" || isolatedType === "file") {
+    throw new Error("Password and file controls are not supported by bounded browser form actions.");
+  }
   if (!isBrowserTargetStructure(structure) || !boundedTargetStructure(structure)) {
     throw new Error("Browser interaction target structure could not be safely inspected within policy bounds.");
+  }
+  if (isolatedRole !== structure.role) {
+    throw new Error("Browser interaction target role could not be safely inspected.");
   }
   return structure;
 }
@@ -2159,6 +2444,12 @@ function isBrowserTargetStructure(value: unknown): value is BrowserTargetStructu
     && typeof target.disabled === "boolean"
     && typeof target.inlineEventHandler === "boolean"
     && typeof target.summaryForDetails === "boolean"
+    && (target.autocomplete === undefined || typeof target.autocomplete === "string" || target.autocomplete === null)
+    && (target.readOnly === undefined || typeof target.readOnly === "boolean")
+    && (target.multiple === undefined || typeof target.multiple === "boolean")
+    && (target.explicitChangeHandler === undefined || typeof target.explicitChangeHandler === "boolean")
+    && (target.explicitSubmitHandler === undefined || typeof target.explicitSubmitHandler === "boolean")
+    && (target.pageControlledEventsAbsent === undefined || typeof target.pageControlledEventsAbsent === "boolean")
     && typeof target.domPath === "string";
 }
 
@@ -2171,6 +2462,7 @@ function boundedTargetStructure(target: BrowserTargetStructure): boolean {
     && (target.formAction === null || target.formAction.length <= 4_096)
     && (target.formMethod === null || target.formMethod.length <= 16)
     && (target.ariaHasPopup === null || target.ariaHasPopup.length <= 32)
+    && (target.autocomplete === undefined || target.autocomplete === null || target.autocomplete.length <= 128)
     && target.domPath.length <= 512;
 }
 
@@ -2178,7 +2470,7 @@ function confirmationPrompt(
   consequence: BrowserConsequence,
   origin: string,
   destination: string | null,
-): BrowserClickConfirmationRequest {
+): BrowserInteractionConfirmationRequest {
   return {
     title: "Confirm consequential browser click",
     message: [
@@ -2188,6 +2480,206 @@ function confirmationPrompt(
       "Approve this one exact click? The page can have external effects; cancellation does not imply rollback.",
     ].join(" "),
   };
+}
+
+function formConfirmationPrompt(
+  operation: BrowserFormOperation,
+  consequence: BrowserConsequence,
+  origin: string,
+  destination: string | null,
+): BrowserInteractionConfirmationRequest {
+  return {
+    title: `Confirm consequential browser ${operation}`,
+    message: [
+      `The exact ${operation} action is classified as ${consequence.replaceAll("_", " ")}.`,
+      `Current site: ${redactedInteractionUrl(origin)}.`,
+      ...(destination ? [`Destination site: ${redactedInteractionUrl(destination)}.`] : []),
+      "The entered or selected content is intentionally hidden.",
+      `Approve this one exact ${operation}? The page can have external effects; cancellation does not imply rollback.`,
+    ].join(" "),
+  };
+}
+
+function newInteractionCapture(): InteractionCapture {
+  return {
+    dialogs: 0,
+    downloads: 0,
+    popupTabs: new Set(),
+    overflowPopups: 0,
+    networkRequests: 0,
+    events: 0,
+    settlements: [],
+  };
+}
+
+function interactionResult(
+  session: Session,
+  tab: BrowserTab,
+  operation: BrowserFormOperation,
+  consequence: BrowserConsequence,
+  confirmed: boolean,
+  capture: InteractionCapture,
+  accounting: "bounded_stable" | "bounded_uncertain",
+  navigated: boolean,
+): BrowserInteractionResult {
+  return {
+    session: session.handle,
+    tab: tab.handle,
+    generation: tab.generation,
+    operation,
+    consequence,
+    confirmed,
+    effect: "completed",
+    effects: {
+      navigation: navigated ? "observed" : "not_observed",
+      observedPopupTabs: capture.popupTabs.size,
+      observedOverflowPopupsClosed: capture.overflowPopups,
+      observedDialogsDismissed: capture.dialogs,
+      download: capture.downloads > 0 ? "canceled" : "not_observed",
+      network: capture.networkRequests > 0 ? "observed" : "not_observed",
+      accounting,
+    },
+    url: redactedInteractionUrl(tab.page.url()),
+  };
+}
+
+function assertSuitableFormTarget(target: BrowserTargetStructure, operation: BrowserFormOperation): void {
+  if (target.inputType === "password" || target.inputType === "file") {
+    throw new Error("Password and file controls are not supported by bounded browser form actions.");
+  }
+  if (target.disabled || target.readOnly) throw new Error("The browser form target is not editable.");
+  const role = target.role;
+  const textInput = target.tagName === "input"
+    && ["text", "search", "email", "url", "tel", "number"].includes(target.inputType ?? "")
+    && (role === null || role === "textbox" || role === "searchbox");
+  const textTarget = textInput
+    || (target.tagName === "textarea" && (role === null || role === "textbox"))
+    || (target.contentEditable && (role === null || role === "textbox"));
+  if (operation === "fill" && !textTarget) {
+    throw new Error("The semantic target is not a supported editable text control.");
+  }
+  const sequentialTextInput = textInput
+    && ["text", "search", "url", "tel"].includes(target.inputType ?? "");
+  const sequentialTextTarget = sequentialTextInput
+    || (target.tagName === "textarea" && (role === null || role === "textbox"))
+    || (target.contentEditable && (role === null || role === "textbox"));
+  if (operation === "type" && !sequentialTextTarget) {
+    throw new Error("The semantic target cannot safely establish bounded append positioning.");
+  }
+  const selectTarget = target.tagName === "select"
+    && (role === null || role === "listbox" || role === "combobox");
+  if (operation === "select" && !selectTarget) {
+    throw new Error("The semantic target is not a supported native select control.");
+  }
+  const pressTarget = textTarget
+    || selectTarget
+    || (target.tagName === "button" && (role === null || role === "button"))
+    || (target.tagName === "a" && target.href !== null && (role === null || role === "link" || role === "button"))
+    || (target.summaryForDetails && (role === null || role === "button"));
+  if (operation === "press" && !pressTarget) {
+    throw new Error("The semantic target does not support bounded key interaction.");
+  }
+}
+
+async function positionAppendCaret(locator: Locator): Promise<void> {
+  const positioned = await locator.evaluate((element, expectedOperation) => {
+    if (expectedOperation !== "append") return false;
+    const html = element as HTMLElement;
+    html.focus({ preventScroll: true });
+    if (html instanceof HTMLInputElement || html instanceof HTMLTextAreaElement) {
+      const end = html.value.length;
+      try { html.setSelectionRange(end, end); }
+      catch { return false; }
+      return html.selectionStart === end && html.selectionEnd === end;
+    }
+    if (html.isContentEditable) {
+      const selection = html.ownerDocument.getSelection();
+      if (!selection) return false;
+      const range = html.ownerDocument.createRange();
+      range.selectNodeContents(html);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    }
+    return false;
+  }, "append");
+  if (!positioned) throw new Error("BrowserType could not establish a bounded append position.");
+}
+
+async function resolveExactSelectOptions(locator: Locator, values: readonly string[]): Promise<Array<"value" | "label">> {
+  const kinds = await locator.evaluate((element, exactValues) => {
+    if (element.tagName.toLocaleLowerCase("en-US") !== "select" || !Array.isArray(exactValues)) return null;
+    const select = element as HTMLSelectElement;
+    if (exactValues.length > 1 && !select.multiple) return null;
+    const resolvedIndexes: number[] = [];
+    const resolvedKinds: Array<"value" | "label"> = [];
+    for (const exact of exactValues) {
+      const matches = [...select.options].filter((option) => option.value === exact || option.label === exact);
+      if (matches.length !== 1 || resolvedIndexes.includes(matches[0]!.index)) return null;
+      resolvedIndexes.push(matches[0]!.index);
+      resolvedKinds.push(matches[0]!.value === exact ? "value" : "label");
+    }
+    return resolvedKinds;
+  }, values);
+  if (!Array.isArray(kinds) || kinds.length !== values.length || kinds.some((kind) => kind !== "value" && kind !== "label")) {
+    throw new Error("The requested exact option set was unavailable, ambiguous, or incompatible with this control.");
+  }
+  return kinds;
+}
+
+function digestExactValues(values: readonly string[]): string {
+  const hash = createHash("sha256");
+  for (const value of values) {
+    hash.update(String(Buffer.byteLength(value)), "utf8");
+    hash.update("\0");
+    hash.update(value, "utf8");
+    hash.update("\0");
+  }
+  return hash.digest("base64url");
+}
+
+function assertExactText(value: unknown, maxChars: number, emptyAllowed: boolean): asserts value is string {
+  if (typeof value !== "string" || (!emptyAllowed && value.length === 0) || value.length > maxChars) {
+    throw new Error("Browser form text is absent or exceeds its bounded length.");
+  }
+}
+
+function assertSelectValues(values: unknown): asserts values is readonly string[] {
+  if (!Array.isArray(values) || values.length < 1 || values.length > BROWSER_SELECT_MAX_OPTIONS
+    || values.some((value) => typeof value !== "string" || value.length < 1 || value.length > BROWSER_SELECT_OPTION_MAX_CHARS)) {
+    throw new Error("Browser option set is absent or exceeds its bounded size.");
+  }
+  if (new Set(values).size !== values.length) throw new Error("Browser option set must not contain duplicates.");
+}
+
+export function normalizeBrowserPressKey(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > BROWSER_PRESS_KEY_MAX_CHARS || /\s/.test(value)) {
+    throw new Error("BrowserPress key is not an allowed key or short chord.");
+  }
+  const parts = value.split("+");
+  if (parts.some((part) => !part) || parts.length > 3) throw new Error("BrowserPress key is not an allowed key or short chord.");
+  const base = parts.at(-1)!;
+  const modifiers = parts.slice(0, -1);
+  const modifierSet = new Set(modifiers);
+  const modifierNames = new Set(["Alt", "Control", "Meta", "Shift"]);
+  if (modifierSet.size !== modifiers.length || modifiers.some((part) => !modifierNames.has(part))) {
+    throw new Error("BrowserPress key is not an allowed key or short chord.");
+  }
+  const named = new Set([
+    "Enter", "Space", "Tab", "Escape", "Backspace", "Delete",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown",
+  ]);
+  const editingChord = ["A", "Y", "Z"].includes(base)
+    && modifiers.some((modifier) => modifier === "Control" || modifier === "Meta")
+    && modifiers.every((modifier) => modifier === "Control" || modifier === "Meta" || modifier === "Shift");
+  if (!named.has(base) && !editingChord) throw new Error("BrowserPress key is not an allowed key or short chord.");
+  // Alt/Meta/Control navigation chords are browser-global rather than bounded
+  // target actions. Only Shift may modify named keys; activation stays risky.
+  if (named.has(base) && modifiers.some((modifier) => modifier !== "Shift")) {
+    throw new Error("BrowserPress key is not an allowed key or short chord.");
+  }
+  return value;
 }
 
 function assertBoundedInteractionCapability(value: string, maxChars: number): void {
@@ -2345,7 +2837,10 @@ function bounded(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
-function normalizedInteractionFailure(name: "BrowserHover" | "BrowserClick", error: unknown): Error {
+function normalizedInteractionFailure(
+  name: "BrowserHover" | "BrowserClick" | "BrowserFill" | "BrowserType" | "BrowserSelect" | "BrowserPress",
+  error: unknown,
+): Error {
   const message = error instanceof Error ? error.message : "";
   if (/\b(?:not_started|effect status is (?:started|completed|unknown))\b/.test(message)) return asError(error);
   if (/Invalid or stale browser (?:session\/tab handle|semantic ref)/.test(message)) {

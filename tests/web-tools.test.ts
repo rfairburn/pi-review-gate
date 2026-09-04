@@ -477,7 +477,8 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.deepEqual([...tools.keys()], [
     "WebSearch", "WebFetch", "BrowserExtract",
     "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
-    "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
+    "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress",
+    "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ]);
   assert.deepEqual(Object.keys(tools.get("BrowserOpen").parameters.properties), ["url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserNavigate").parameters.properties), ["session", "tab", "url"]);
@@ -489,6 +490,15 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.deepEqual(Object.keys(tools.get("BrowserClick").parameters.properties), ["session", "tab", "ref"]);
   assert.deepEqual(tools.get("BrowserHover").parameters.required, ["session", "tab", "ref"]);
   assert.deepEqual(tools.get("BrowserClick").parameters.required, ["session", "tab", "ref"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserFill").parameters.properties), ["session", "tab", "ref", "value"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserType").parameters.properties), ["session", "tab", "ref", "text", "delayMs"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserSelect").parameters.properties), ["session", "tab", "ref", "values"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserPress").parameters.properties), ["session", "tab", "ref", "key"]);
+  assert.equal(tools.get("BrowserFill").parameters.additionalProperties, false);
+  assert.equal(tools.get("BrowserType").parameters.properties.text.maxLength, 1_000);
+  assert.equal(tools.get("BrowserType").parameters.properties.delayMs.maximum, 5);
+  assert.equal(tools.get("BrowserSelect").parameters.properties.values.maxItems, 32);
+  assert.equal(tools.get("BrowserPress").parameters.properties.key.maxLength, 32);
   assert.equal(tools.get("BrowserClick").parameters.properties.session.maxLength, 256);
   assert.equal(tools.get("BrowserClick").parameters.properties.tab.maxLength, 256);
   assert.equal(tools.get("BrowserClick").parameters.properties.ref.maxLength, 512);

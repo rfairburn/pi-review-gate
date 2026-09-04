@@ -279,6 +279,10 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
     tool("BrowserScroll", "Perform bounded semantic scrolling."),
     tool("BrowserHover", "Hover a current semantic ref."),
     tool("BrowserClick", "Click a current semantic ref under policy."),
+    tool("BrowserFill", "Replace a bounded editable value under policy."),
+    tool("BrowserType", "Append bounded text under policy."),
+    tool("BrowserSelect", "Select exact options under policy."),
+    tool("BrowserPress", "Press one bounded key under policy."),
     tool("BrowserWait", "Wait for bounded observational conditions."),
     tool("BrowserHistory", "Inspect bounded session history."),
     tool("BrowserTabs", "Manage bounded owned browser tabs."),
@@ -292,7 +296,8 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
 
   const browserNames = [
     "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot",
-    "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
+    "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress",
+    "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ];
   for (const name of browserNames) {
     assert.ok(manager.authorizedToolNames()?.includes(name));
@@ -311,7 +316,7 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
   assert.deepEqual((screenshot.details as { activated: string[] }).activated, ["BrowserScreenshot"]);
   assert.ok(fixture.active().includes("BrowserScreenshot"));
 
-  for (const name of ["BrowserScroll", "BrowserHover", "BrowserClick", "BrowserWait", "BrowserHistory", "BrowserTabs"]) {
+  for (const name of ["BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserWait", "BrowserHistory", "BrowserTabs"]) {
     const loaded = await fixture.search()(`load-${name}`, { query: name });
     assert.deepEqual((loaded.details as { matched: string[] }).matched, [name]);
     assert.deepEqual((loaded.details as { activated: string[] }).activated, [name]);

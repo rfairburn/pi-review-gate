@@ -56,6 +56,32 @@ test("structural consequence policy permits only proven navigation and native di
   assert.equal(policy.classify({ ...baseTarget, inputType: "submit", formAssociated: true, formAction: "https://example.com/delete" }).consequence, "destructive");
 });
 
+test("form consequence policy proves only ordinary local editing and fails risky structure closed", () => {
+  const policy = new BrowserConsequencePolicy();
+  const editable: BrowserTargetStructure = {
+    ...baseTarget,
+    tagName: "input",
+    role: "textbox",
+    inputType: "text",
+    formAssociated: true,
+    autocomplete: null,
+    readOnly: false,
+    multiple: false,
+    explicitChangeHandler: false,
+    explicitSubmitHandler: false,
+    pageControlledEventsAbsent: true,
+  };
+  assert.deepEqual(policy.classifyForm(editable, { operation: "fill" }), {
+    consequence: "local_editing", consequential: false, destination: null,
+  });
+  assert.equal(policy.classifyForm({ ...editable, autocomplete: "email" }, { operation: "type" }).consequence, "sensitive_input");
+  assert.equal(policy.classifyForm({ ...editable, autocomplete: "current-password" }, { operation: "fill" }).consequence, "authentication");
+  assert.equal(policy.classifyForm({ ...editable, explicitChangeHandler: true }, { operation: "fill" }).consequence, "autosave_or_change");
+  assert.equal(policy.classifyForm(editable, { operation: "press", key: "Enter" }).consequence, "form_submission");
+  assert.equal(policy.classifyForm({ ...editable, pageControlledEventsAbsent: false }, { operation: "fill" }).consequence, "unknown_or_mixed");
+  assert.equal(policy.classifyForm({ ...editable, tagName: "div" }, { operation: "fill" }).consequence, "unknown_or_mixed");
+});
+
 test("confirmation permits bind every action field, expire absolutely, and cannot replay", () => {
   let now = 1_000;
   let serial = 0;
@@ -70,11 +96,21 @@ test("confirmation permits bind every action field, expire absolutely, and canno
     destination: null,
     targetFingerprint: "fingerprint",
     consequence: "unknown_or_mixed",
+    valueDigest: null,
+    valueLengths: [],
+    key: null,
   };
 
   const mismatch = permits.issue(binding);
   assert.equal(permits.consume(mismatch, { ...binding, generation: "changed" }), false);
   assert.equal(permits.consume(mismatch, binding), false, "a mismatch consumes the permit");
+
+  const valueMismatch = permits.issue({
+    ...binding, operation: "fill", valueDigest: "first", valueLengths: [5],
+  });
+  assert.equal(permits.consume(valueMismatch, {
+    ...binding, operation: "fill", valueDigest: "second", valueLengths: [6],
+  }), false, "exact action value identity is bound without retaining the value");
 
   const success = permits.issue(binding);
   assert.equal(permits.consume(success, binding), true);

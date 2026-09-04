@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { redactSensitiveText, redactSensitiveValue } from "../src/redaction";
+import { redactBrowserToolInput, redactSensitiveText, redactSensitiveValue } from "../src/redaction";
 
 test("redactSensitiveText removes common credentials while retaining context", () => {
   const text = "Authorization: Bearer abcdefghijklmnop api_key=sk-abcdefghijklmnop";
@@ -127,6 +127,21 @@ test("redactSensitiveText leaves near-miss non-secrets intact", () => {
   ].join("\n");
 
   assert.equal(redactSensitiveText(text), text);
+});
+
+test("browser form values are structurally redacted regardless of content", () => {
+  for (const [tool, field, value] of [
+    ["BrowserFill", "value", "ordinary prose"],
+    ["BrowserType", "text", "password=hunter2"],
+    ["BrowserType", "text", "ghp_abcdefghijklmnopqrstuvwxyz123456"],
+    ["BrowserSelect", "values", ["private selection", "token-value"]],
+  ] as const) {
+    const redacted = redactBrowserToolInput(tool, { session: "safe", [field]: value, failure: "bounded" });
+    const encoded = JSON.stringify(redacted);
+    for (const raw of Array.isArray(value) ? value : [value]) assert.equal(encoded.includes(raw), false);
+    assert.match(encoded, /\[REDACTED\]/);
+    assert.match(encoded, /bounded/);
+  }
 });
 
 test("redactSensitiveValue redacts sensitive keys recursively", () => {

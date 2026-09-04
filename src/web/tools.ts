@@ -1,10 +1,17 @@
 import { DEFAULT_CONFIG, type ReviewGateConfig, type WebConfig } from "../config";
 import { renderWithChromium } from "./browser";
 import {
+  BROWSER_FILL_MAX_CHARS,
   BROWSER_INTERACTION_REF_MAX_CHARS,
   BROWSER_INTERACTION_SESSION_MAX_CHARS,
   BROWSER_INTERACTION_TAB_MAX_CHARS,
+  BROWSER_PRESS_KEY_MAX_CHARS,
+  BROWSER_SELECT_MAX_OPTIONS,
+  BROWSER_SELECT_OPTION_MAX_CHARS,
+  BROWSER_TYPE_MAX_CHARS,
+  BROWSER_TYPE_MAX_DELAY_MS,
   InteractiveBrowserManager,
+  normalizeBrowserPressKey,
   type BrowserHistoryOperation,
   type BrowserHistoryResult,
   type BrowserInteractionResult,
@@ -374,6 +381,117 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
+      name: "BrowserFill",
+      label: "BrowserFill",
+      description: "Replace the value of one supported editable control identified by a fresh opaque BrowserSnapshot ref. The exact bounded value is never echoed or retained in results, prompts, diagnostics, evidence, or logs.",
+      promptGuidelines: browserFormGuidelines(),
+      executionMode: "sequential",
+      parameters: browserInteractionHandleSchema({
+        value: { type: "string", maxLength: BROWSER_FILL_MAX_CHARS, description: "Exact replacement value; may be empty to clear the control and is never returned." },
+      }, ["value"]),
+      execute: async (_id, params, signal, _onUpdate, context) => {
+        try {
+          rejectUnexpectedFields(params, ["session", "tab", "ref", "value"], "BrowserFill");
+          const result = await this.interactiveBrowser.fill(
+            requiredBoundedString(params.session, "session", BROWSER_INTERACTION_SESSION_MAX_CHARS),
+            requiredBoundedString(params.tab, "tab", BROWSER_INTERACTION_TAB_MAX_CHARS),
+            requiredBoundedString(params.ref, "ref", BROWSER_INTERACTION_REF_MAX_CHARS),
+            exactBoundedText(params.value, BROWSER_FILL_MAX_CHARS, true, "value"),
+            interactiveConfirmation(context),
+            signal,
+          );
+          return textResult(formatBrowserInteraction(result), { response: result });
+        } catch (error) {
+          return textResult(`BrowserFill failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+        }
+      },
+    });
+    this.pi.registerTool({
+      name: "BrowserType",
+      label: "BrowserType",
+      description: "Append bounded text to one supported editable control identified by a fresh opaque BrowserSnapshot ref, with only a tightly bounded optional per-character delay. Entered text is never returned or retained.",
+      promptGuidelines: browserFormGuidelines(),
+      executionMode: "sequential",
+      parameters: browserInteractionHandleSchema({
+        text: { type: "string", minLength: 1, maxLength: BROWSER_TYPE_MAX_CHARS, description: "Exact text to append; never returned." },
+        delayMs: { type: "integer", minimum: 0, maximum: BROWSER_TYPE_MAX_DELAY_MS, description: "Optional per-character delay in milliseconds, 0-5; defaults to 0." },
+      }, ["text"]),
+      execute: async (_id, params, signal, _onUpdate, context) => {
+        try {
+          rejectUnexpectedFields(params, ["session", "tab", "ref", "text", "delayMs"], "BrowserType");
+          const result = await this.interactiveBrowser.type(
+            requiredBoundedString(params.session, "session", BROWSER_INTERACTION_SESSION_MAX_CHARS),
+            requiredBoundedString(params.tab, "tab", BROWSER_INTERACTION_TAB_MAX_CHARS),
+            requiredBoundedString(params.ref, "ref", BROWSER_INTERACTION_REF_MAX_CHARS),
+            exactBoundedText(params.text, BROWSER_TYPE_MAX_CHARS, false, "text"),
+            boundedInteger(params.delayMs, 0, BROWSER_TYPE_MAX_DELAY_MS, 0, "delayMs"),
+            interactiveConfirmation(context),
+            signal,
+          );
+          return textResult(formatBrowserInteraction(result), { response: result });
+        } catch (error) {
+          return textResult(`BrowserType failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+        }
+      },
+    });
+    this.pi.registerTool({
+      name: "BrowserSelect",
+      label: "BrowserSelect",
+      description: "Select a bounded nonempty set of exact native option labels or values through one fresh opaque BrowserSnapshot ref. Selected content is never returned or retained.",
+      promptGuidelines: browserFormGuidelines(),
+      executionMode: "sequential",
+      parameters: browserInteractionHandleSchema({
+        values: {
+          type: "array", minItems: 1, maxItems: BROWSER_SELECT_MAX_OPTIONS, uniqueItems: true,
+          items: { type: "string", minLength: 1, maxLength: BROWSER_SELECT_OPTION_MAX_CHARS },
+          description: "Exact option labels or values; each must resolve uniquely and none are returned.",
+        },
+      }, ["values"]),
+      execute: async (_id, params, signal, _onUpdate, context) => {
+        try {
+          rejectUnexpectedFields(params, ["session", "tab", "ref", "values"], "BrowserSelect");
+          const options = exactOptionSet(params.values);
+          const result = await this.interactiveBrowser.select(
+            requiredBoundedString(params.session, "session", BROWSER_INTERACTION_SESSION_MAX_CHARS),
+            requiredBoundedString(params.tab, "tab", BROWSER_INTERACTION_TAB_MAX_CHARS),
+            requiredBoundedString(params.ref, "ref", BROWSER_INTERACTION_REF_MAX_CHARS),
+            options,
+            interactiveConfirmation(context),
+            signal,
+          );
+          return textResult(formatBrowserInteraction(result), { response: result });
+        } catch (error) {
+          return textResult(`BrowserSelect failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+        }
+      },
+    });
+    this.pi.registerTool({
+      name: "BrowserPress",
+      label: "BrowserPress",
+      description: "Press one strictly allowlisted key or short chord on a supported target identified by a fresh opaque BrowserSnapshot ref. Arbitrary event objects and key sequences are not accepted.",
+      promptGuidelines: browserFormGuidelines(),
+      executionMode: "sequential",
+      parameters: browserInteractionHandleSchema({
+        key: { type: "string", minLength: 1, maxLength: BROWSER_PRESS_KEY_MAX_CHARS, description: "One allowlisted named key or short editing chord; no sequences or raw events." },
+      }, ["key"]),
+      execute: async (_id, params, signal, _onUpdate, context) => {
+        try {
+          rejectUnexpectedFields(params, ["session", "tab", "ref", "key"], "BrowserPress");
+          const result = await this.interactiveBrowser.press(
+            requiredBoundedString(params.session, "session", BROWSER_INTERACTION_SESSION_MAX_CHARS),
+            requiredBoundedString(params.tab, "tab", BROWSER_INTERACTION_TAB_MAX_CHARS),
+            requiredBoundedString(params.ref, "ref", BROWSER_INTERACTION_REF_MAX_CHARS),
+            normalizeBrowserPressKey(params.key),
+            interactiveConfirmation(context),
+            signal,
+          );
+          return textResult(formatBrowserInteraction(result), { response: result });
+        } catch (error) {
+          return textResult(`BrowserPress failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+        }
+      },
+    });
+    this.pi.registerTool({
       name: "BrowserWait",
       label: "BrowserWait",
       description: "Wait once, under one finite deadline, for an allowlisted observational condition: current ref state, bounded text presence/absence, HTTP(S) URL exact/prefix/safe-RE2 match, navigation/load completion, network quiet, or a short duration. It is not an orchestration polling primitive.",
@@ -606,12 +724,25 @@ function browserInteractionGuidelines(): string[] {
   ];
 }
 
-function browserInteractionHandleSchema(): Record<string, unknown> {
+function browserFormGuidelines(): string[] {
+  return [
+    ...browserInteractionGuidelines(),
+    "Fill replaces while Type appends. Select uses only exact uniquely resolved native option labels/values. Press accepts only one allowlisted key or short editing chord.",
+    "Ordinary structurally proven unsent local editing may proceed without confirmation. Sensitive/autocomplete/auth/terms/submit, explicit change/autosave, activation keys, and unknown or mixed targets require immediate top-level UI confirmation and are rejected in background execution.",
+    "Values and selections are secret-by-construction and never appear in results, prompts, diagnostics, durable evidence, or logs. Password/file controls, clipboard, upload, filesystem paths, selectors, coordinates, scripts, CDP, forced actions, and raw events are unsupported.",
+  ];
+}
+
+function browserInteractionHandleSchema(
+  extra: Record<string, unknown> = {},
+  extraRequired: readonly string[] = [],
+): Record<string, unknown> {
   return objectSchema({
     session: boundedStringSchema("Opaque BrowserOpen session handle.", BROWSER_INTERACTION_SESSION_MAX_CHARS),
     tab: boundedStringSchema("Opaque BrowserOpen tab handle.", BROWSER_INTERACTION_TAB_MAX_CHARS),
     ref: boundedStringSchema("Current opaque ref from the latest BrowserSnapshot for this session, tab, and document generation.", BROWSER_INTERACTION_REF_MAX_CHARS),
-  }, ["session", "tab", "ref"]);
+    ...extra,
+  }, ["session", "tab", "ref", ...extraRequired]);
 }
 
 function browserHandleSchema(
@@ -690,7 +821,10 @@ function formatBrowserInteraction(value: BrowserInteractionResult): string {
     `Browser ${value.operation} ${value.effect}.`,
     `Session: ${value.session} · Tab: ${value.tab} · New document generation: ${value.generation}`,
     `Consequence class: ${value.consequence} · interactive confirmation used: ${value.confirmed}.`,
-    `Observed effects: navigation ${value.effects.navigation}; popup tabs ${value.effects.observedPopupTabs}; overflow popups closed ${value.effects.observedOverflowPopupsClosed}; dialogs dismissed ${value.effects.observedDialogsDismissed}; download ${value.effects.download}; accounting ${value.effects.accounting}.`,
+    `Observed effects: navigation ${value.effects.navigation}; network ${value.effects.network ?? "not_observed"}; popup tabs ${value.effects.observedPopupTabs}; overflow popups closed ${value.effects.observedOverflowPopupsClosed}; dialogs dismissed ${value.effects.observedDialogsDismissed}; download ${value.effects.download}; accounting ${value.effects.accounting}.`,
+    ...(value.consequence === "local_editing" && value.effects.network !== "observed"
+      ? ["The completed edit is local ephemeral state; no remote effect was observed."]
+      : []),
     `Site (sensitive URL components redacted): ${value.url}`,
     "No rollback is claimed for external effects.",
   ].join("\n");
@@ -862,6 +996,30 @@ function requiredBoundedString(value: unknown, field: string, maxLength: number)
     throw new Error(`${field} exceeds the ${maxLength}-character limit.`);
   }
   return requiredString(value, field);
+}
+
+function exactBoundedText(value: unknown, maxLength: number, emptyAllowed: boolean, field: string): string {
+  if (typeof value !== "string" || (!emptyAllowed && value.length === 0) || value.length > maxLength) {
+    throw new Error(`${field} is absent or exceeds its bounded length.`);
+  }
+  return value;
+}
+
+function exactOptionSet(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > BROWSER_SELECT_MAX_OPTIONS
+    || value.some((option) => typeof option !== "string" || option.length < 1 || option.length > BROWSER_SELECT_OPTION_MAX_CHARS)) {
+    throw new Error("values is absent or exceeds its bounded size.");
+  }
+  const options = value as string[];
+  if (new Set(options).size !== options.length) throw new Error("values must not contain duplicates.");
+  return [...options];
+}
+
+function rejectUnexpectedFields(params: Record<string, unknown>, allowed: readonly string[], tool: string): void {
+  const allowlist = new Set(allowed);
+  if (Object.keys(params).some((field) => !allowlist.has(field))) {
+    throw new Error(`${tool} does not accept extra fields.`);
+  }
 }
 
 function optionalString(value: unknown): string | undefined {

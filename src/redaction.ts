@@ -52,6 +52,23 @@ export function redactSensitiveText(value: string): string {
   return redacted;
 }
 
+export function redactBrowserToolInput(toolName: string, value: unknown): unknown {
+  if (!isRecord(value)) return redactSensitiveValue(value);
+  const normalized = toolName.trim().toLocaleLowerCase("en-US");
+  const secretFields = normalized === "browserfill"
+    ? new Set(["value"])
+    : normalized === "browsertype"
+      ? new Set(["text"])
+      : normalized === "browserselect"
+        ? new Set(["values"])
+        : undefined;
+  if (!secretFields) return redactSensitiveValue(value);
+  return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [
+    childKey,
+    secretFields.has(childKey) ? "[REDACTED]" : redactSensitiveValue(child, childKey),
+  ]));
+}
+
 export function redactSensitiveValue(value: unknown, key?: string): unknown {
   if (key && new RegExp(`^${SENSITIVE_KEY}$`, "i").test(key)) return "[REDACTED]";
   if (typeof value === "string") return redactSensitiveText(value);

@@ -35,6 +35,10 @@ class FakePage extends EventEmitter {
   evaluateCalls = 0;
   hoverCalls = 0;
   clickCalls = 0;
+  fillCalls: string[] = [];
+  typeCalls: Array<{ text: string; delay: number }> = [];
+  selectCalls: Array<Array<{ value?: string; label?: string }>> = [];
+  pressCalls: string[] = [];
   onClick?: () => void | Promise<void>;
   targetStructure: BrowserTargetStructure = {
     tagName: "a", role: "link", href: "https://example.com/next", target: null,
@@ -82,12 +86,25 @@ class FakePage extends EventEmitter {
     return {
       scrollIntoViewIfNeeded: async () => undefined,
       waitFor: async () => undefined,
+      getAttribute: async (name: string) => name === "type"
+        ? this.targetStructure.inputType
+        : name === "role" ? this.targetStructure.role : null,
       evaluate: async (_callback: unknown, ...args: unknown[]) => {
+        if (Array.isArray(args[0])) return args[0].map(() => "value");
+        if (args[0] === "append") return true;
         if (args.length > 0) return undefined;
         return { ...this.targetStructure };
       },
       hover: async () => { this.hoverCalls += 1; },
       click: async () => { this.clickCalls += 1; await this.onClick?.(); },
+      fill: async (value: string) => { this.fillCalls.push(value); },
+      pressSequentially: async (text: string, options: { delay?: number }) => {
+        this.typeCalls.push({ text, delay: options.delay ?? 0 });
+      },
+      selectOption: async (options: Array<{ value?: string; label?: string }>) => {
+        this.selectCalls.push(options);
+      },
+      press: async (key: string) => { this.pressCalls.push(key); },
       boundingBox: async () => ({ x: 1, y: 2, width: 50, height: 20 }),
       screenshot: async () => { throw new Error("element screenshot must use a prevalidated page clip"); },
     };
@@ -401,6 +418,114 @@ test("BrowserHover and structurally proven link clicks use only fresh refs and i
   assert.equal(clicked.url, "https://example.com", "interaction output redacts path and query");
   assert.equal(fixture.browser.context.page.clickCalls, 0, "silent activation never dispatches page click handlers");
   await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref), /fresh BrowserSnapshot/);
+  await fixture.manager.shutdown();
+});
+
+test("bounded form controls replace, append, multi-select, enforce key grammar, and keep values secret", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/form");
+  const freshRef = async () => {
+    const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+    const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+    assert.ok(ref);
+    return ref;
+  };
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "input", role: "textbox", href: null, inputType: "text",
+    formAssociated: true, autocomplete: null, readOnly: false, multiple: false,
+    explicitChangeHandler: false, explicitSubmitHandler: false,
+    pageControlledEventsAbsent: true,
+  };
+
+  const secret = "ordinary text and ghp_abcdefghijklmnopqrstuvwxyz123456";
+  const filled = await fixture.manager.fill(opened.session, opened.tab, await freshRef(), secret);
+  assert.equal(filled.consequence, "local_editing");
+  assert.equal(filled.confirmed, false);
+  assert.equal(filled.effects.network, "not_observed");
+  assert.equal(JSON.stringify(filled).includes(secret), false);
+  assert.deepEqual(fixture.browser.context.page.fillCalls, [secret]);
+
+  const appended = " appended";
+  await fixture.manager.type(opened.session, opened.tab, await freshRef(), appended, 2);
+  assert.deepEqual(fixture.browser.context.page.typeCalls, [{ text: appended, delay: 2 }]);
+
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "select", role: "listbox", inputType: null, multiple: true,
+  };
+  const choices = ["Private A", "Private B"];
+  const selected = await fixture.manager.select(opened.session, opened.tab, await freshRef(), choices);
+  assert.equal(selected.consequence, "local_editing");
+  assert.deepEqual(fixture.browser.context.page.selectCalls, [[{ value: "Private A" }, { value: "Private B" }]]);
+  assert.equal(JSON.stringify(selected).includes("Private"), false);
+
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "textarea", role: "textbox", inputType: null, multiple: false,
+  };
+  await fixture.manager.press(opened.session, opened.tab, await freshRef(), "ArrowDown");
+  assert.deepEqual(fixture.browser.context.page.pressCalls, ["ArrowDown"]);
+  await assert.rejects(
+    fixture.manager.press(opened.session, opened.tab, await freshRef(), "Control+V"),
+    /not_started/,
+  );
+
+  const enterRef = await freshRef();
+  await assert.rejects(
+    fixture.manager.press(opened.session, opened.tab, enterRef, "Enter"),
+    /not_started.*requires an interactive Pi confirmation/,
+  );
+  const confirmed = await fixture.manager.press(opened.session, opened.tab, enterRef, "Enter", async (request) => {
+    assert.match(request.title, /browser press/);
+    assert.doesNotMatch(request.message, /ordinary text|Private A|appended/);
+    return true;
+  });
+  assert.equal(confirmed.confirmed, true);
+  assert.deepEqual(fixture.browser.context.page.pressCalls, ["ArrowDown", "Enter"]);
+
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "input", role: "textbox", inputType: "email", autocomplete: null,
+  };
+  const sensitiveRef = await freshRef();
+  await assert.rejects(
+    fixture.manager.fill(opened.session, opened.tab, sensitiveRef, "private@example.test"),
+    /not_started.*interactive Pi confirmation/,
+  );
+  await assert.rejects(
+    fixture.manager.fill(opened.session, opened.tab, sensitiveRef, "private@example.test", async (request) => {
+      assert.doesNotMatch(request.message, /private@example/);
+      fixture.browser.context.page.targetStructure.domPath += "> changed";
+      return true;
+    }),
+    /not_started.*confirmed target or consequence changed/,
+  );
+
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "button", role: "heading", inputType: "button", href: null,
+  };
+  let unsuitableConfirmations = 0;
+  const pressCount = fixture.browser.context.page.pressCalls.length;
+  await assert.rejects(
+    fixture.manager.press(opened.session, opened.tab, await freshRef(), "Enter", async () => {
+      unsuitableConfirmations += 1;
+      return true;
+    }),
+    /not_started/,
+  );
+  assert.equal(unsuitableConfirmations, 0, "unsuitable roles are rejected before confirmation");
+  assert.equal(fixture.browser.context.page.pressCalls.length, pressCount, "unsuitable roles are never dispatched");
+
+  fixture.browser.context.page.targetStructure = {
+    ...fixture.browser.context.page.targetStructure,
+    tagName: "input", role: "textbox", inputType: "password",
+  };
+  await assert.rejects(
+    fixture.manager.fill(opened.session, opened.tab, await freshRef(), "never-visible", async () => true),
+    /not_started/,
+  );
   await fixture.manager.shutdown();
 });
 
@@ -858,9 +983,14 @@ test("element screenshot fixes the validated clip before a resize race", async (
     return {
       scrollIntoViewIfNeeded: async () => undefined,
       waitFor: async () => undefined,
+      getAttribute: async () => null,
       evaluate: async () => undefined,
       hover: async () => undefined,
       click: async () => undefined,
+      fill: async () => undefined,
+      pressSequentially: async () => undefined,
+      selectOption: async () => undefined,
+      press: async () => undefined,
       boundingBox: async () => {
         queueMicrotask(() => { elementWidth = 10_000; });
         return { x: 10.4, y: 20.2, width: elementWidth, height: 19.2 };
@@ -1118,6 +1248,114 @@ test("semantic output and cumulative action budgets are hard-capped", async () =
   await assert.rejects(manager.snapshot(opened.session, opened.tab, 1_000), /action limit/i);
   assert.equal(manager.activeSessionCount(), 0);
   assert.equal((await manager.close(opened.session)).alreadyClosed, true);
+});
+
+test("real browser form listeners require confirmation before any background dispatch", async () => {
+  let autosaves = 0;
+  const origin = createServer((request, response) => {
+    if (request.url === "/autosave") {
+      autosaves += 1;
+      response.writeHead(204).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(`<!doctype html><title>Listener form</title>
+      <label>Name <input id="name" type="text"></label>
+      <label>Secret <input id="secret" type="password"></label>
+      <label>Choice <select id="choice"><option value="private-choice">A</option></select></label>
+      <button id="bad-role" role="heading">Bad role</button>
+      <script>
+        const save = () => fetch('/autosave', {method: 'POST'});
+        const nativeGetAttribute = Element.prototype.getAttribute;
+        Element.prototype.getAttribute = function(attribute) {
+          if (this.id === 'secret' && attribute === 'type') return 'text';
+          if (this.id === 'bad-role' && attribute === 'role') return 'button';
+          return nativeGetAttribute.call(this, attribute);
+        };
+        const nativeIsArray = Array.isArray;
+        Array.isArray = (value) => {
+          const result = nativeIsArray(value);
+          if (result && value.length === 1 && value[0] === 'private-choice') save();
+          return result;
+        };
+        document.getElementById('name').addEventListener('input', save);
+        document.getElementById('secret').addEventListener('input', save);
+        document.addEventListener('change', save);
+        window.onkeydown = save;
+      </script>`);
+  });
+  await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const port = (origin.address() as AddressInfo).port;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    brokerDial: (_validated, destinationPort) => net.connect({ host: "127.0.0.1", port: destinationPort }),
+  });
+  try {
+    const opened = await manager.open(`http://public.test:${port}/form`);
+    const snapshot = await manager.snapshot(opened.session, opened.tab, 4_000);
+    const inputRef = snapshot.snapshot.match(/textbox "Name" \[ref=([^\]]+)\]/)?.[1];
+    const passwordRef = snapshot.snapshot.match(/textbox "Secret" \[ref=([^\]]+)\]/)?.[1];
+    const selectRef = snapshot.snapshot.match(/combobox "Choice" \[ref=([^\]]+)\]/)?.[1];
+    const badRoleRef = snapshot.snapshot.match(/heading "Bad role"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    assert.ok(inputRef);
+    assert.ok(passwordRef);
+    assert.ok(selectRef);
+    assert.ok(badRoleRef);
+    let badRoleConfirmations = 0;
+    await assert.rejects(manager.press(opened.session, opened.tab, badRoleRef, "Enter", async () => {
+      badRoleConfirmations += 1;
+      return true;
+    }), /not_started/);
+    assert.equal(badRoleConfirmations, 0, "spoofed unsuitable roles are rejected before confirmation");
+    await assert.rejects(manager.fill(opened.session, opened.tab, inputRef, "private"), /not_started.*confirmation/);
+    await assert.rejects(manager.type(opened.session, opened.tab, inputRef, "private"), /not_started.*confirmation/);
+    await assert.rejects(manager.press(opened.session, opened.tab, inputRef, "ArrowDown"), /not_started.*confirmation/);
+    let passwordConfirmations = 0;
+    await assert.rejects(manager.fill(opened.session, opened.tab, passwordRef, "never-send", async () => {
+      passwordConfirmations += 1;
+      return true;
+    }), /not_started/);
+    assert.equal(passwordConfirmations, 0, "isolated password inspection rejects before confirmation");
+    await assert.rejects(manager.select(opened.session, opened.tab, selectRef, ["private-choice"]), /not_started.*confirmation/);
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    assert.equal(autosaves, 0, "direct, delegated, and keyboard listeners never run before UI approval");
+  } finally {
+    await manager.shutdown();
+    await new Promise<void>((resolve, reject) => origin.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("real BrowserType appends despite an existing caret at the start", async () => {
+  const origin = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(`<!doctype html><label>Name <input value="tail"></label><p id="mirror">tail</p>
+      <script>
+        const input = document.querySelector('input');
+        const mirror = document.getElementById('mirror');
+        input.focus();
+        input.setSelectionRange(0, 0);
+        input.addEventListener('input', () => { mirror.textContent = input.value; });
+      </script>`);
+  });
+  await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const port = (origin.address() as AddressInfo).port;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    brokerDial: (_validated, destinationPort) => net.connect({ host: "127.0.0.1", port: destinationPort }),
+  });
+  try {
+    const opened = await manager.open(`http://public.test:${port}/`);
+    const before = await manager.snapshot(opened.session, opened.tab, 2_000);
+    const ref = before.snapshot.match(/textbox "Name"[^\n]*\[ref=([^\]]+)\]/)?.[1];
+    assert.ok(ref);
+    await manager.type(opened.session, opened.tab, ref, "head", 0, async () => true);
+    const after = await manager.snapshot(opened.session, opened.tab, 2_000);
+    assert.match(after.snapshot, /tailhead/);
+    assert.doesNotMatch(after.snapshot, /headtail/);
+  } finally {
+    await manager.shutdown();
+    await new Promise<void>((resolve, reject) => origin.close((error) => error ? reject(error) : resolve()));
+  }
 });
 
 test("real Chromium follows a public redirect only through the pinned broker dial", async () => {

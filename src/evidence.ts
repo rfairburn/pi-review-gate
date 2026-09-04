@@ -7,7 +7,7 @@ import {
   type SnapshotOptions,
 } from "./capture";
 import { normalizeApplyPatchPathMarker } from "./apply-patch/tool";
-import { redactSensitiveText, redactSensitiveValue } from "./redaction";
+import { redactBrowserToolInput, redactSensitiveText, redactSensitiveValue } from "./redaction";
 
 export interface EvidenceState {
   nextSequence: number;
@@ -127,8 +127,8 @@ export async function recordToolCallEvidence(input: {
     exchangeSequence: input.exchangeSequence,
     phase: "tool_call",
     toolName: input.toolName || "unknown",
-    summary: summarizeToolInput(input.toolInput),
-    detail: detailedToolInput(input.toolInput),
+    summary: summarizeToolInput(input.toolName, input.toolInput),
+    detail: detailedToolInput(input.toolName, input.toolInput),
     candidatePaths: unique(candidatePaths),
     riskSignals: extracted.riskSignals,
   });
@@ -431,7 +431,7 @@ function commandText(input: Record<string, unknown>): string {
   return "";
 }
 
-function summarizeToolInput(input?: Record<string, unknown>): string {
+function summarizeToolInput(toolName: string, input?: Record<string, unknown>): string {
   if (!input) {
     return "(no input captured)";
   }
@@ -439,7 +439,7 @@ function summarizeToolInput(input?: Record<string, unknown>): string {
   if (command) {
     return truncate(redactSensitiveText(command).replace(/\s+/g, " ").trim(), 1000);
   }
-  const compact = JSON.stringify(redactLargeValues(redactSensitiveValue(input)));
+  const compact = JSON.stringify(redactLargeValues(redactBrowserToolInput(toolName, input)));
   return truncate(compact, 1000);
 }
 
@@ -463,7 +463,7 @@ function summarizeToolResult(result: unknown, isError: boolean | undefined): str
   return prefix + truncate(JSON.stringify(redactLargeValues(redactSensitiveValue(result))), 1000);
 }
 
-function detailedToolInput(input?: Record<string, unknown>): string | undefined {
+function detailedToolInput(toolName: string, input?: Record<string, unknown>): string | undefined {
   if (!input) {
     return undefined;
   }
@@ -471,7 +471,7 @@ function detailedToolInput(input?: Record<string, unknown>): string | undefined 
   if (command) {
     return truncate(redactSensitiveText(command), 20_000);
   }
-  return truncate(JSON.stringify(redactSensitiveValue(input), null, 2), 20_000);
+  return truncate(JSON.stringify(redactBrowserToolInput(toolName, input), null, 2), 20_000);
 }
 
 function detailedToolResult(result: unknown): string | undefined {

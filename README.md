@@ -30,7 +30,7 @@ receipts of exactly what the model was told.
   reading), `BrowserExtract` (single-page rendered fallback), and a bounded Pi-native
   semantic browser (`BrowserOpen`, `BrowserNavigate`, `BrowserSnapshot`,
   `BrowserScreenshot`, `BrowserScroll`, `BrowserHover`, policy-bound `BrowserClick`,
-  `BrowserWait`, `BrowserHistory`, `BrowserTabs`, `BrowserClose`), all with
+  `BrowserFill`, `BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserWait`, `BrowserHistory`, `BrowserTabs`, `BrowserClose`), all with
   DNS-rebinding-hardened, validated egress
   ([Web tools](docs/web-tools.md),
   [Security model](docs/security-model.md#web-egress-hardening)).
@@ -53,11 +53,15 @@ receipts of exactly what the model was told.
   custom executor process can still access paths allowed by the host account
   ([Security model](docs/security-model.md#isolation-limits)).
 - **No general browser automation.** The public-web-only browser exposes bounded
-  observation plus semantic-ref hover and policy-bound click. Only structurally proven
-  navigation/disclosure can click silently; every unknown or consequential click needs
-  a single-use top-level Pi confirmation and is rejected in background execution.
-  There is no typing, upload/download saving, arbitrary selector/script, forced option,
-  coordinate, clipboard, permission, or CDP escape hatch
+  observation plus fresh-semantic-ref hover, click, fill, type, exact select, and
+  allowlisted key press. Only edits with proven absence of relevant page-controlled
+  events may remain ephemeral; hidden direct or delegated listeners fail closed.
+  Sensitive, submit/activation, handler-bearing, unknown, or consequential actions need
+  a single-use top-level Pi confirmation and are rejected in background execution.
+  Entered/selected values are never returned or durably recorded. Research roles cannot
+  use form actions. There is no password/file entry, upload/download saving, arbitrary
+  selector/script/event, forced option, coordinate, filesystem path, clipboard,
+  permission, or CDP escape hatch
   ([Web tools](docs/web-tools.md#interactive-browser)).
 - **No forced verification theater.** Force merges and `interrupt_with_merge` are
   mechanical landing attempts, not verification; the main workspace must always be

@@ -45,6 +45,22 @@ test("successful discovery tools are transient while their failures remain revie
   assert.equal(shouldRecordToolResultEvidence("bash", false), true);
 });
 
+test("browser form tool-call evidence structurally removes exact values and selections", async () => {
+  const state = createEvidenceState();
+  const cases: Array<[string, Record<string, unknown>, string[]]> = [
+    ["BrowserFill", { session: "s", tab: "t", ref: "r", value: "ordinary private prose" }, ["ordinary private prose"]],
+    ["BrowserType", { session: "s", tab: "t", ref: "r", text: "password=hunter2" }, ["hunter2"]],
+    ["BrowserSelect", { session: "s", tab: "t", ref: "r", values: ["private-a", "private-b"] }, ["private-a", "private-b"]],
+  ];
+  for (const [toolName, toolInput, secrets] of cases) {
+    await recordToolCallEvidence({ state, cwd: process.cwd(), toolName, toolInput, snapshotOptions });
+    const event = state.events.at(-1)!;
+    const rendered = `${event.summary}\n${event.detail}`;
+    for (const secret of secrets) assert.equal(rendered.includes(secret), false);
+    assert.match(rendered, /\[REDACTED\]/);
+  }
+});
+
 test("candidate extraction follows mutation semantics instead of generic path arguments", () => {
   for (const toolName of ["read", "grep", "glob", "find", "ls", "SubtasksInspect"]) {
     assert.deepEqual(extractCandidatePaths(toolName, { path: "server/hosts.go" }).paths, [], toolName);

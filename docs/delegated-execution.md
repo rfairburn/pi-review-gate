@@ -36,6 +36,28 @@ add, steer, interrupt, force-merge, and mark-clean. These commands open interact
 execution/task and action pickers when handles are omitted; their explicit-handle forms
 remain available for scripting.
 
+## Pi worker settlement and browser ownership
+
+Pi workers keep one live browser across their completed turns, including resumed turns
+while background work remains active. The extension publishes a version-2 authenticated
+**model-settlement receipt**, not a browser-quiescence receipt. It binds the child PID,
+child/session identity, and monotonic settlement generation; signatures and one-shot
+consumption prevent stale or forged completion. Legacy zero-browser-resource receipts
+and bootstrap names are not compatible. RPC `agent_end` and process exit alone are
+still insufficient evidence of successful model settlement.
+
+Terminal worker shutdown closes the browser, and the parent adapter awaits process exit
+before returning completion for capture/review. After closing stdin, it allows a separate
+15-second terminal cleanup deadline (covering the browser's 5-second close phase,
+5-second late-containment drain, and exit overhead), independent of the model execution
+deadline. Exceeding that deadline fails completion and escalates process termination.
+Interruption is terminal rather than a claim that a settled turn has no live browser. Executor extension reload or session
+replacement is unsupported: shutdown retires the receipt identity, and the erased
+bootstrap is not reconstructed from environment, session history, or old receipts.
+The replacement runtime blocks tools and cannot acknowledge completion; restart that
+worker with a fresh parent-issued identity. Normal top-level Pi reload remains supported
+and closes its old browser before creating a new runtime.
+
 ## Worker resources, routes, and concurrency
 
 Fresh tasks scan their `execution.routes.execute` or `execution.routes.research`

@@ -8,11 +8,11 @@ import { PiExecutorAdapter } from "../src/execution/adapters/pi-model";
 import type { ExecutorLiveControl } from "../src/execution/types";
 
 // Minimal stand-in for the trusted child extension in fake RPC fixtures. Real
-// Pi children publish this only from the extension's agent_settled hook after
-// browser quiescence; these protocol fixtures have no extension host.
-const fakePiQuiescenceReceipt = [
+// Pi children publish this only from agent_settled, with a LIVE browser.
+// These protocol fixtures have no extension host.
+const fakePiSettlementReceipt = [
   "const crypto=require('node:crypto');let ackGeneration=0;",
-  "const ack=()=>{ackGeneration++;const sessionId=process.env.PI_REVIEW_GATE_QUIESCENCE_SESSION;const childId=process.env.PI_REVIEW_GATE_QUIESCENCE_CHILD;const secret=process.env.PI_REVIEW_GATE_QUIESCENCE_SECRET;const target=process.env.PI_REVIEW_GATE_QUIESCENCE_PATH;const pid=process.pid;const version=1;const oneShot=crypto.createHmac('sha256',secret).update('pi-review-gate-quiescence-key:v1:'+ackGeneration).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,sessionId,childId,ackGeneration,pid])).digest('base64url');const receipt={version,sessionId,childId,settlement:ackGeneration,pid,mac};fs.mkdirSync(require('node:path').dirname(target),{recursive:true,mode:0o700});const temporary=target+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,target);};",
+  "const ack=()=>{ackGeneration++;const sessionId=process.env.PI_REVIEW_GATE_SETTLEMENT_SESSION;const childId=process.env.PI_REVIEW_GATE_SETTLEMENT_CHILD;const secret=process.env.PI_REVIEW_GATE_SETTLEMENT_SECRET;const target=process.env.PI_REVIEW_GATE_SETTLEMENT_PATH;const pid=process.pid;const version=2;const oneShot=crypto.createHmac('sha256',secret).update('pi-review-gate-live-browser-settlement-key:v2:'+ackGeneration).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,sessionId,childId,ackGeneration,pid])).digest('base64url');const receipt={version,sessionId,childId,settlement:ackGeneration,pid,mac};fs.mkdirSync(require('node:path').dirname(target),{recursive:true,mode:0o700});const temporary=target+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,target);};",
 ];
 
 test("Pi executor refuses to launch without an authoritative native --tools allowlist", async () => {
@@ -38,7 +38,7 @@ test("Pi executor child loads the review-gate extension in executor role without
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');",
-      ...fakePiQuiescenceReceipt,
+      ...fakePiSettlementReceipt,
       `fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({argv:process.argv.slice(2),env:process.env}));`,
       "let input=''; process.stdin.setEncoding('utf8');",
       "const out=(v)=>console.log(JSON.stringify(v));",
@@ -107,7 +107,7 @@ test("Pi executor child loads the review-gate extension in executor role without
   }
 });
 
-test("Pi executor fails closed when agent_end and process lifetime provide no trusted quiescence receipt", async () => {
+test("Pi executor fails closed when agent_end and process lifetime provide no trusted settlement receipt", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-missing-quiescence-"));
   try {
     const artifactDir = join(root, "artifacts");
@@ -126,7 +126,7 @@ test("Pi executor fails closed when agent_end and process lifetime provide no tr
       model: "provider/model",
       command,
       timeoutMs: 1_000,
-      quiescenceTimeoutMs: 50,
+      settlementTimeoutMs: 50,
     }).run({
       cwd: root,
       prompt: "finish without acknowledgement",
@@ -136,7 +136,7 @@ test("Pi executor fails closed when agent_end and process lifetime provide no tr
     });
     assert.equal(result.code, 1);
     assert.equal(result.failure?.category, "protocol");
-    assert.match(result.failure?.message ?? "", /quiescence acknowledgement was not received/);
+    assert.match(result.failure?.message ?? "", /settlement acknowledgement was not received/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -153,7 +153,7 @@ test("Pi executor does not turn child termination into successful completion", {
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');",
-      ...fakePiQuiescenceReceipt,
+      ...fakePiSettlementReceipt,
       "let input='';process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});setImmediate(()=>process.kill(process.pid,'SIGTERM'));}",
@@ -163,7 +163,7 @@ test("Pi executor does not turn child termination into successful completion", {
     const result = await new PiExecutorAdapter({
       model: "provider/model",
       command,
-      quiescenceTimeoutMs: 100,
+      settlementTimeoutMs: 100,
     }).run({
       cwd: root,
       prompt: "terminate",
@@ -178,6 +178,80 @@ test("Pi executor does not turn child termination into successful completion", {
   }
 });
 
+test("Pi executor does not mask a terminal cleanup hook error behind a valid live-browser settlement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-terminal-cleanup-"));
+  try {
+    const command = join(root, "rpc.cjs");
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiSettlementReceipt,
+      "let input='';const out=v=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const c=JSON.parse(input.slice(0,n));input=input.slice(n+1);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
+      "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
+      "process.stdin.on('end',()=>out({type:'extension_error',event:'session_shutdown',error:'closure unconfirmed'}));",
+    ].join("\n"));
+    await chmod(command, 0o755);
+    const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 2_000 }).run({
+      cwd: root, prompt: "finish", artifactDir: root, turn: 1, allowedTools: ["read"],
+    });
+    assert.equal(result.code, 1);
+    assert.equal(result.failure?.category, "protocol");
+    assert.match(result.failure?.message ?? "", /terminal session cleanup failed/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+for (const cleanup of ["delayed", "stalled"] as const) {
+  test(`Pi executor terminal cleanup ${cleanup === "delayed" ? "can outlast two seconds and the model deadline without termination" : "has a separate finite deadline before termination"}`, {
+    skip: process.platform === "win32",
+  }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-terminal-cleanup-grace-"));
+    try {
+      const command = join(root, "rpc.cjs");
+      const marker = join(root, "cleanup.json");
+      await writeFile(command, [
+        "#!/usr/bin/env node",
+        "const fs=require('node:fs');",
+        ...fakePiSettlementReceipt,
+        `const marker=${JSON.stringify(marker)};let cleanupStarted;`,
+        "process.on('SIGTERM',()=>{fs.writeFileSync(marker,JSON.stringify({state:'terminated',elapsed:Date.now()-cleanupStarted}));process.exit(1);});",
+        "let input='';const out=v=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const c=JSON.parse(input.slice(0,n));input=input.slice(n+1);",
+        "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
+        "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
+        "process.stdin.on('end',()=>{cleanupStarted=Date.now();",
+        cleanup === "delayed"
+          ? "setTimeout(()=>fs.writeFileSync(marker,JSON.stringify({state:'complete',elapsed:Date.now()-cleanupStarted})),2500);"
+          : "setInterval(()=>{},1000);",
+        "});",
+      ].join("\n"));
+      await chmod(command, 0o755);
+      const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 2_000 }).run({
+        cwd: root, prompt: "finish", artifactDir: root, turn: 1, allowedTools: ["read"],
+      });
+      const outcome = JSON.parse(await readFile(marker, "utf8"));
+      if (cleanup === "delayed") {
+        assert.equal(outcome.state, "complete", "valid terminal cleanup must finish without SIGTERM");
+        assert.ok(outcome.elapsed >= 2_400, "the fixture exercised cleanup beyond the old two-second grace");
+        assert.equal(result.code, 0);
+        assert.equal(result.failure, undefined);
+        assert.equal(result.text, "done");
+      } else {
+        assert.equal(outcome.state, "terminated");
+        assert.ok(outcome.elapsed >= 14_500, "cleanup receives its own grace, not the model deadline");
+        assert.equal(result.code, 1);
+        assert.equal(result.failure?.category, "protocol");
+        assert.match(result.failure?.message ?? "", /terminal shutdown exceeded its 15000ms cleanup deadline/);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("Pi executor waits from agent_end through delayed child agent_settled acknowledgement", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-delayed-settlement-"));
   try {
@@ -187,7 +261,7 @@ test("Pi executor waits from agent_end through delayed child agent_settled ackno
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');",
-      ...fakePiQuiescenceReceipt,
+      ...fakePiSettlementReceipt,
       "let input='';let settled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});out({type:'agent_end'});setTimeout(()=>{ack();settled=true;},150);}",
@@ -221,7 +295,7 @@ test("Pi executor does not count retry agent_end events as settlement generation
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');",
-      ...fakePiQuiescenceReceipt,
+      ...fakePiSettlementReceipt,
       "let input='';let settled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});out({type:'agent_end'});setTimeout(()=>{out({type:'agent_end'});setTimeout(()=>{settled=true;ack();},40);},40);}",
@@ -253,7 +327,7 @@ test("Pi executor follows trusted generations across an autonomous settlement", 
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');",
-      ...fakePiQuiescenceReceipt,
+      ...fakePiSettlementReceipt,
       "let input='';let pending=true;let autoScheduled=false;process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
       "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
@@ -287,7 +361,7 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
     await writeFile(command, [
       "#!/usr/bin/env node",
       `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2)));`,
-      ...fakePiQuiescenceReceipt,
+      ...fakePiSettlementReceipt,
       `fs.writeFileSync(${JSON.stringify(environmentCapture)},JSON.stringify({toolCatalog:process.env.PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG}));`,
       "let input='';let streaming=false; process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
@@ -361,7 +435,7 @@ test("Pi stays alive for ShellStart work and accepts steering while its agent is
     await writeFile(command, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');const {spawn}=require('node:child_process');let input='';let bg;let prompts=0;process.stdin.setEncoding('utf8');",
-      ...fakePiQuiescenceReceipt,
+      ...fakePiSettlementReceipt,
       `const capture=${JSON.stringify(capture)};`,
       "const out=(v)=>console.log(JSON.stringify(v));",
       "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});ack();out({type:'agent_end'});};",

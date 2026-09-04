@@ -31,6 +31,7 @@ import {
   type BrokerAuth,
   type BrokerLedgerEntry,
   type EgressBudgets,
+  type EgressBrokerObserver,
 } from "../src/web/egress-broker";
 import type { HostResolver, NetworkOptions, ValidatedUrl } from "../src/web/network";
 
@@ -112,12 +113,14 @@ interface BrokerHarness {
   stop(): Promise<void>;
 }
 
-async function startBroker(resolver: HostResolver, budgets?: Partial<EgressBudgets>): Promise<BrokerHarness> {
+async function startBroker(resolver: HostResolver, budgets?: Partial<EgressBudgets>, observer?: EgressBrokerObserver): Promise<BrokerHarness> {
   const dials: Array<{ hostname: string; port: number; address: string }> = [];
   const broker = new EgressBroker(
     resolver,
     loopbackDial(dials),
     budgets ? { ...DEFAULT_EGRESS_BUDGETS, ...budgets } : DEFAULT_EGRESS_BUDGETS,
+    undefined,
+    observer,
   );
   const port = await broker.start();
   return {
@@ -752,12 +755,16 @@ test("broker caps authority and header sizes and bounds its diagnostics", async 
   }
 });
 
-test("broker destroys idle connections after the idle budget", async () => {
+test("broker evicts idle tunnels as incomplete without fatal notification and revalidates DNS on reconnect", async () => {
   const silent = net.createServer(() => undefined); // never responds
   const silentPort = await listen(silent);
+  let answer = publicAnswer;
+  let resolutions = 0;
+  const failures: string[] = [];
   const harness = await startBroker(
-    (hostname) => Promise.resolve([hostname === "slow.test" ? publicAnswer : "127.0.0.1"]),
+    async () => { resolutions++; return [answer]; },
     { idleSocketMs: 100 },
+    { policyFailure: (reason) => { failures.push(reason); } },
   );
   try {
     const connect = await proxyConnect(harness.port, `slow.test:${silentPort}`);
@@ -771,7 +778,18 @@ test("broker destroys idle connections after the idle budget", async () => {
       });
     });
     assert.equal(closed, true, "an idle connection must be destroyed at the idle budget");
-    assert.ok(harness.broker.summary().omissions.some((omission) => omission.includes("idle timeout")));
+    const summary = harness.broker.summary();
+    assert.ok(summary.omissions.some((omission) => omission.includes("idle timeout")));
+    assert.equal(summary.ledger[0]?.completed, false, "opaque tunnel completion is never invented");
+    assert.equal(summary.budgetAborts, 1, "conservative render accounting remains unchanged");
+    assert.deepEqual(failures, [], "ordinary idleness must not kill an interactive owner");
+    answer = "127.0.0.1";
+    const rebound = await proxyConnect(harness.port, `slow.test:${silentPort}`);
+    assert.equal(rebound.status, 403);
+    rebound.socket.destroy();
+    assert.equal(resolutions, 2, "future connections revalidate instead of using an expired pin");
+    assert.equal(harness.dials.length, 1);
+    assert.deepEqual(failures, ["refusal"], "real safety failures still notify the interactive owner");
   } finally {
     await harness.stop();
     await close(silent);

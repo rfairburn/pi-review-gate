@@ -82,8 +82,7 @@ export interface InteractiveBrowserLimits {
   navigationMs: number;
   actionMs: number;
   confirmationMs: number;
-  idleMs: number;
-  lifetimeMs: number;
+  idleSocketMs: number;
   cleanupMs: number;
   maxDistinctHosts: number;
   maxConnections: number;
@@ -93,7 +92,7 @@ export interface InteractiveBrowserLimits {
 }
 
 export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Object.freeze({
-  maxSessions: 4,
+  maxSessions: 1,
   maxTabsPerSession: 4,
   maxNavigations: 12,
   maxActions: 64,
@@ -121,8 +120,7 @@ export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Ob
   navigationMs: 30_000,
   actionMs: 10_000,
   confirmationMs: 30_000,
-  idleMs: 60_000,
-  lifetimeMs: 5 * 60_000,
+  idleSocketMs: 20_000,
   cleanupMs: CLEANUP_DEADLINE_MS,
   maxDistinctHosts: 16,
   maxConnections: 96,
@@ -367,6 +365,19 @@ export type BrowserInteractionConfirmation = (request: BrowserInteractionConfirm
 /** Compatibility alias for the original click API. */
 export type BrowserClickConfirmation = BrowserInteractionConfirmation;
 
+export interface BrowserClosureReason {
+  kind: "explicit_close" | "session_shutdown" | "fatal_error";
+  message: string;
+}
+
+/** Only issued for a handle authenticated by this manager, never guesses. */
+export class BrowserSessionClosedError extends Error {
+  constructor(readonly closure: BrowserClosureReason | undefined) {
+    super(`Browser session is closed${closure ? ` (${closure.kind}: ${closure.message})` : ""}. Use BrowserOpen to start a new browser; do not replay uncertain actions automatically.`);
+    this.name = "BrowserSessionClosedError";
+  }
+}
+
 export interface BrowserCloseResult {
   session: string;
   closed: true;
@@ -374,6 +385,7 @@ export interface BrowserCloseResult {
   quiescent: true;
   broker: (Pick<EgressSummary, "budgetAborts" | "refusals"> & { connections: number }) | null;
   diagnosticsRetained: boolean;
+  closure?: BrowserClosureReason;
 }
 
 interface InteractiveBrowserDependencies {
@@ -395,6 +407,7 @@ interface OpeningOperation {
 }
 
 interface ActiveBrowserOperation {
+  session: Session;
   controller: AbortController;
   settled: Promise<void>;
   settle(): void;
@@ -448,7 +461,6 @@ interface Session {
   context: BrowserContext;
   broker: EgressBroker;
   createdAt: number;
-  lastUsedAt: number;
   navigations: number;
   actions: number;
   mainDocumentRequests: number;
@@ -456,8 +468,6 @@ interface Session {
   interactionCapture?: InteractionCapture;
   fatalError?: Error;
   teardown?: Promise<BrowserCloseResult>;
-  expiryTimer?: NodeJS.Timeout;
-  idleTimer?: NodeJS.Timeout;
 }
 
 const MAX_TOMBSTONES = 32;
@@ -567,6 +577,7 @@ export class InteractiveBrowserManager {
     const requestedLimits = { ...INTERACTIVE_BROWSER_LIMITS, ...(dependencies.limits ?? {}) };
     this.limits = Object.freeze({
       ...requestedLimits,
+      maxSessions: 1,
       maxTabsPerSession: clampedTestLimit(requestedLimits.maxTabsPerSession, INTERACTIVE_BROWSER_LIMITS.maxTabsPerSession),
       maxHistoryEntries: clampedTestLimit(requestedLimits.maxHistoryEntries, INTERACTIVE_BROWSER_LIMITS.maxHistoryEntries),
       maxScrollPages: clampedTestLimit(requestedLimits.maxScrollPages, INTERACTIVE_BROWSER_LIMITS.maxScrollPages),
@@ -610,8 +621,12 @@ export class InteractiveBrowserManager {
 
   async open(url: string, signal?: AbortSignal): Promise<BrowserOpenResult> {
     this.assertAcceptingOperations();
-    if (this.sessions.size + this.opening >= this.limits.maxSessions) {
-      throw new Error(`Browser session limit (${this.limits.maxSessions}) reached; close a session before opening another.`);
+    const existing = this.sessions.values().next().value as Session | undefined;
+    if (existing) {
+      throw new Error(`A browser is already open for this Pi session: session=${existing.handle}. Use BrowserTabs with action=list on that session, then BrowserNavigate with an owned tab; or BrowserClose before BrowserOpen. No new browser was opened.`);
+    }
+    if (this.opening > 0) {
+      throw new Error("BrowserOpen is already in progress for this Pi session. Wait for its result and use its session/tab handles; no second browser was opened.");
     }
     // Reserve enough bounded failure-state capacity for every open session to
     // end in an unconfirmed teardown without evicting safety information.
@@ -707,7 +722,6 @@ export class InteractiveBrowserManager {
         context,
         broker,
         createdAt: this.now(),
-        lastUsedAt: this.now(),
         navigations: 0,
         actions: 0,
         mainDocumentRequests: 0,
@@ -735,11 +749,9 @@ export class InteractiveBrowserManager {
       });
       this.sessions.set(session.handle, session);
       resourcesTransferredToSession = true;
-      this.armTimers(session);
       try {
         const navigation = await this.navigateSession(session, primaryTab, requested.href, operation, true);
         session.operationActive = false;
-        this.touch(session);
         return { ...navigation, limits: this.limits };
       } catch (error) {
         session.operationActive = false;
@@ -1842,7 +1854,16 @@ export class InteractiveBrowserManager {
     const closed = this.closedTombstones.get(sessionHandle);
     if (closed) return { ...closed, alreadyClosed: true };
     const session = this.sessions.get(sessionHandle);
-    if (session) return this.beginTeardown(session);
+    if (session) {
+      const operations = [...this.activeOperations].filter((operation) => operation.session === session);
+      // Publish explicit closure before abort observers can classify it as a
+      // fatal action failure. Also retire pending permission/action deadlines.
+      const teardown = this.beginTeardown(session);
+      for (const operation of operations) operation.controller.abort(new Error("Browser operation cancelled by BrowserClose."));
+      const result = await teardown;
+      await Promise.all(operations.map((operation) => operation.settled));
+      return result;
+    }
     // A valid self-authenticating handle was issued by this manager. If it is
     // no longer active and has no retained failure, its teardown was confirmed
     // even if bounded successful diagnostics have since been evicted.
@@ -1862,11 +1883,10 @@ export class InteractiveBrowserManager {
   /**
    * Abort and drain every operation which could still acquire browser-owned
    * resources, then tear down and independently verify every known session.
-   * A successful barrier is reusable by a later agent turn. Any uncertain
-   * cleanup permanently closes this manager, because ownership can no longer
-   * be proved from process-local bookkeeping.
+   * Terminal cleanup only: never called at turn or review boundaries. Any
+   * uncertain cleanup permanently closes this manager.
    */
-  quiesce(): Promise<void> {
+  private drainForShutdown(): Promise<void> {
     if (this.quiescence) return this.quiescence;
     if (
       this.shutdownFailure
@@ -1879,7 +1899,7 @@ export class InteractiveBrowserManager {
       this.confirmationPermits.clear();
       const openings = [...this.openings];
       const operations = [...this.activeOperations];
-      const reason = new Error("BrowserOpen cancelled by interactive browser shutdown or agent settlement.");
+      const reason = new Error("Browser operation cancelled by Pi session shutdown/replacement/reload.");
       for (const opening of openings) opening.controller.abort(reason);
       for (const operation of operations) operation.controller.abort(reason);
 
@@ -1921,10 +1941,7 @@ export class InteractiveBrowserManager {
   }
 
   async shutdown(): Promise<void> {
-    // Set the permanent flag after entering quiescence so an already-started
-    // open receives the settlement cancellation diagnostic expected by the
-    // reusable barrier; future calls remain rejected even after success.
-    const completion = this.quiesce();
+    const completion = this.drainForShutdown();
     this.shuttingDown = true;
     await completion;
   }
@@ -2171,18 +2188,17 @@ export class InteractiveBrowserManager {
     const controller = new AbortController();
     let settleOperation!: () => void;
     const active: ActiveBrowserOperation = {
+      session,
       controller,
       settled: new Promise<void>((resolve) => { settleOperation = resolve; }),
       settle: () => settleOperation(),
     };
     this.activeOperations.add(active);
     const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-    this.touch(session);
     try {
       throwIfAborted(operationSignal);
       const result = await body(operationSignal);
       if (session.fatalError) throw session.fatalError;
-      if (!session.teardown) this.touch(session);
       return result;
     } catch (error) {
       const failure = asError(error);
@@ -2198,17 +2214,12 @@ export class InteractiveBrowserManager {
   private assertAcceptingOperations(): void {
     if (this.shutdownFailure) throw this.shutdownFailure;
     if (this.shuttingDown) throw new Error("Interactive browser manager is shut down.");
-    if (this.quiescing) throw new Error("Interactive browser manager is quiescing at agent settlement.");
+    if (this.quiescing) throw new Error("Interactive browser manager is closing for Pi session shutdown.");
   }
 
   private assertUsable(session: Session): void {
     if (session.fatalError) throw session.fatalError;
     if (session.teardown) throw new Error("Browser session teardown is in progress.");
-    if (this.now() - session.createdAt >= this.limits.lifetimeMs) {
-      const error = new Error(`Browser session lifetime limit (${this.limits.lifetimeMs}ms) expired; teardown started.`);
-      this.failSession(session, error);
-      throw error;
-    }
   }
 
   private failSession(session: Session, error: Error): void {
@@ -2225,10 +2236,13 @@ export class InteractiveBrowserManager {
     }
   }
 
-  private beginTeardown(session: Session, _cause?: Error): Promise<BrowserCloseResult> {
+  private beginTeardown(session: Session, cause?: Error): Promise<BrowserCloseResult> {
     if (session.teardown) return session.teardown;
-    clearTimeout(session.expiryTimer);
-    clearTimeout(session.idleTimer);
+    const closure: BrowserClosureReason = session.fatalError
+      ? { kind: "fatal_error", message: bounded(session.fatalError.message, 500) }
+      : cause
+        ? { kind: "session_shutdown", message: "Pi session shutdown, replacement, or reload." }
+        : { kind: "explicit_close", message: "BrowserClose was called." };
     for (const tab of session.tabs.values()) this.clearTabDiagnostics(tab);
     // Publish the in-progress promise before invoking any Playwright close.
     // Browser/page close events may fire synchronously and must observe this
@@ -2255,6 +2269,7 @@ export class InteractiveBrowserManager {
             refusals: summary.refusals,
           },
           diagnosticsRetained: true,
+          closure,
         };
         this.rememberClosed(session.handle, result);
         resolveTeardown(result);
@@ -2269,23 +2284,6 @@ export class InteractiveBrowserManager {
     return teardown;
   }
 
-  private touch(session: Session): void {
-    session.lastUsedAt = this.now();
-    clearTimeout(session.idleTimer);
-    session.idleTimer = setTimeout(() => {
-      this.failSession(session, new Error(`Browser session idle limit (${this.limits.idleMs}ms) expired; teardown started.`));
-    }, this.limits.idleMs);
-    session.idleTimer.unref?.();
-  }
-
-  private armTimers(session: Session): void {
-    session.expiryTimer = setTimeout(() => {
-      this.failSession(session, new Error(`Browser session lifetime limit (${this.limits.lifetimeMs}ms) expired; teardown started.`));
-    }, this.limits.lifetimeMs);
-    session.expiryTimer.unref?.();
-    this.touch(session);
-  }
-
   private async failUncertainTabClosure(session: Session, message: string, cause: Error): Promise<never> {
     const failure = new Error(`${message}; session teardown started.`, { cause });
     await this.failAndWait(session, failure);
@@ -2294,16 +2292,21 @@ export class InteractiveBrowserManager {
 
   private requireOwnedSession(sessionHandle: string): Session {
     const session = this.sessions.get(sessionHandle);
-    if (!session) throw invalidHandleError();
-    return session;
+    if (session) return session;
+    const failed = this.failedTombstones.get(sessionHandle);
+    if (failed) throw failed;
+    if (this.authenticatesSessionHandle(sessionHandle)) {
+      throw new BrowserSessionClosedError(this.closedTombstones.get(sessionHandle)?.closure);
+    }
+    throw invalidHandleError();
   }
 
   private requireTab(sessionHandle: string, tabHandle: string): { session: Session; tab: BrowserTab } {
-    const session = this.sessions.get(sessionHandle);
-    const tab = session?.tabs.get(tabHandle);
-    // One deliberately indistinguishable error rejects forged, stale,
-    // cross-session, and cross-tab handles without making handles enumerable.
-    if (!session || !tab) throw invalidHandleError();
+    const session = this.requireOwnedSession(sessionHandle);
+    const tab = session.tabs.get(tabHandle);
+    // Forged/cross-session tab handles stay indistinguishable. Authenticated
+    // closed session handles above can safely receive actionable diagnostics.
+    if (!tab) throw invalidHandleError();
     return { session, tab };
   }
 
@@ -2606,7 +2609,7 @@ export class InteractiveBrowserManager {
     // eviction and can retain every unconfirmed teardown fail-closed.
     this.failedTombstones.set(handle, failure);
     // Ownership is now uncertain. Reject new work immediately, but leave
-    // shutdownFailure unset so quiesce() can still drain every other owner
+    // shutdownFailure unset so shutdown can still drain every other owner
     // before publishing the permanent aggregate failure.
     this.shuttingDown = true;
   }
@@ -2618,14 +2621,15 @@ export class InteractiveBrowserManager {
       maxClientConnections: 64,
       preAuthSocketMs: 5_000,
       maxRequests: this.limits.maxRequests,
-      maxTotalMs: this.limits.lifetimeMs,
+      // The Pi session owns browser lifetime; action deadlines remain finite.
+      maxTotalMs: null,
       maxCleanupMs: this.limits.cleanupMs,
       maxConnectionBytes: this.limits.maxConnectionBytes,
       maxTotalBytes: this.limits.maxTotalBytes,
       maxAuthorityChars: 2_048,
       maxHeaderChars: 32_768,
       maxDiagnostics: 32,
-      idleSocketMs: 20_000,
+      idleSocketMs: this.limits.idleSocketMs,
     };
   }
 }

@@ -32,7 +32,6 @@ export interface RegisterCommandsInput {
   sessionSignal?: AbortSignal;
   cancellation?: ReviewCancellationCoordinator;
   prepareReviewerQuestion?: (commandName: string, ctx: unknown) => Promise<void>;
-  requireBrowserQuiescence?: (ctx: unknown) => Promise<void>;
   onStateChanged?: () => void | Promise<void>;
   releaseQueuedUserInputs?: () => Promise<void>;
 }
@@ -168,9 +167,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, "review gate: automatic review is disabled by settings");
         return;
       }
-      // Manual review is a completion/review boundary too. Never let it
-      // bypass a failed or still-running browser teardown from settlement.
-      await input.requireBrowserQuiescence?.(ctx);
+      // Manual review does not suspend or close the Pi session's browser;
+      // page scripts and network effects can continue while reviewers run.
       const statusTracker = createStatusTracker(ctx, "review-gate", "reviewing changes");
       let settleCommandReview!: () => void;
       const commandReviewSettled = new Promise<void>((resolvePromise) => { settleCommandReview = resolvePromise; });

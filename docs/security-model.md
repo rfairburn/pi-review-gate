@@ -66,8 +66,9 @@ HTTP, and HTTPS traffic stays end-to-end through the CONNECT tunnel, so TLS SNI 
 certificate verification remain between Chromium and the origin (the broker never
 decrypts it). WebSockets are always closed, service workers are blocked, and every
 outbound connection is recorded in a broker-owned connection ledger that is audited
-before the render result is returned; the browser and all broker sockets quiesce before
-anything is exposed. Local browser protocols (`about:`, `blob:`, `data:`) remain
+before a `BrowserExtract` render result is returned; that one-shot browser and its
+broker sockets quiesce before extraction is exposed. Interactive browsers instead remain
+live across turns and reviews until explicit close or terminal session teardown. Local browser protocols (`about:`, `blob:`, `data:`) remain
 narrowly allowed only for non-media, non-visual in-process resources; local image/font
 payloads are blocked so admitted visual resources cannot evade broker byte accounting.
 
@@ -89,10 +90,15 @@ excluded from review-gate diagnostics/details and are retained only where Pi's n
 image message itself requires them. Results disclose bounded omission diagnostics (capped samples plus
 a dropped count) alongside explicit per-render or per-session budgets (distinct hostnames, concurrent broker client connections and their
 pre-authentication idle deadline, destination connections, per-connection and aggregate
-bytes, authority/header lengths, idle and total time). A budget that destroys an
-in-flight transfer is nonfatal only when the main document completed; main-document
-failures, non-2xx navigations, oversized rendered HTML, and any ledger audit failure
-fail the render closed.
+bytes, authority/header lengths, socket idle time, and total time for one-shot renders).
+Interactive sessions have finite action deadlines but no elapsed browser-lifetime limit.
+Quiet socket eviction destroys the connection and records opaque tunnel completion as
+unconfirmed without sending a fatal policy/budget notification to the interactive
+owner. Fresh connections still revalidate DNS; actions are never replayed automatically.
+Hard security and byte/request/connection budget failures still contain the browser.
+For `BrowserExtract`, a budget that destroys an in-flight transfer is nonfatal only when
+the main document completed; main-document failures, non-2xx navigations, oversized
+rendered HTML, and any ledger audit failure fail the render closed.
 
 Interactive diagnostics do not add an egress path. `BrowserNetwork` observes only
 capture-time-bounded method/origin/resource/status/timing/failure and available route-

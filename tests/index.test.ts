@@ -1333,7 +1333,7 @@ test("agent end skips reviewer when primary turn signal is already aborted", asy
   }
 });
 
-test("browser quiescence failure rejects agent_settled before completion or review branching", async () => {
+test("completed turns never invoke terminal browser cleanup", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-browser-settlement-failure-"));
   try {
     const configPath = join(dir, "review-gate.json");
@@ -1342,7 +1342,7 @@ test("browser quiescence failure rejects agent_settled before completion or revi
     delete process.env.PI_REVIEW_GATE_DISABLED;
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
     const notices: string[] = [];
-    let quiescenceCalls = 0;
+    let cleanupCalls = 0;
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
@@ -1353,22 +1353,18 @@ test("browser quiescence failure rejects agent_settled before completion or revi
       webTools: {
         register() {},
         sync() {},
-        async cleanup() {},
-        async quiesce() {
-          quiescenceCalls += 1;
-          throw new Error("fixture teardown owner unknown");
+        async cleanup() {
+          cleanupCalls += 1;
+          throw new Error("terminal cleanup must not run at turn settlement");
         },
       },
     });
 
-    // No review window exists: this is the bare task-completion path, and it
-    // must still reject rather than treating hook completion as success.
-    await assert.rejects(
-      trigger(hooks, "agent_settled", { cwd: dir }),
-      /review\/completion blocked because interactive browser quiescence could not be confirmed/,
-    );
-    assert.equal(quiescenceCalls, 1);
-    assert.match(notices.join("\n"), /fixture teardown owner unknown/);
+    // Bare task completion keeps browser ownership across multiple turns.
+    await trigger(hooks, "agent_settled", { cwd: dir });
+    await trigger(hooks, "agent_settled", { cwd: dir });
+    assert.equal(cleanupCalls, 0);
+    assert.doesNotMatch(notices.join("\n"), /quiescence|teardown/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -86,7 +86,7 @@ test("/review-pause and /review-unpause gate explicit reviewer commands", async 
   assert.match(notices.at(-1) ?? "", /next eligible turn will review accumulated changes and evidence/);
 });
 
-test("/review-now cannot bypass a failed browser quiescence barrier", async () => {
+test("/review-now retains persistence failure semantics without a browser teardown barrier", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-manual-browser-barrier-"));
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
@@ -98,7 +98,6 @@ test("/review-now cannot bypass a failed browser quiescence barrier", async () =
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
-    let barrierCalls = 0;
     registerCommands({
       pi: {
         registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
@@ -108,16 +107,11 @@ test("/review-now cannot bypass a failed browser quiescence barrier", async () =
       cwd: () => dir,
       config: reviewConfig(),
       state,
-      requireBrowserQuiescence: async () => {
-        barrierCalls += 1;
-        throw new Error("browser ownership remains unconfirmed");
-      },
       onStateChanged: async () => {
         throw new Error("persistence unavailable");
       },
     });
-    await assert.rejects(async () => { await commands.get("review-now")?.("", {}); }, /browser ownership remains unconfirmed/);
-    assert.equal(barrierCalls, 1);
+    await assert.rejects(async () => { await commands.get("review-now")?.("", {}); }, /persistence unavailable/);
     assert.equal(state.reviewInProgress, false);
   } finally {
     await rm(dir, { recursive: true, force: true });

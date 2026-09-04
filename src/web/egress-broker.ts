@@ -58,7 +58,8 @@ export interface EgressBudgets {
    */
   maxRequests: number;
   /** Wall-clock time from broker start after which new requests are refused. */
-  maxTotalMs: number;
+  /** null only for a live interactive Pi session; renders retain a deadline. */
+  maxTotalMs: number | null;
   /** Fail-closed deadline for broker teardown (socket/listener shutdown). */
   maxCleanupMs: number;
   /** Bytes per single connection (both directions combined). */
@@ -491,7 +492,7 @@ export class EgressBroker {
       this.note(`${kind} destination refused: broker is closing.`);
       return undefined;
     }
-    if (Date.now() - this.startedAtMs >= this.budgets.maxTotalMs) {
+    if (this.budgets.maxTotalMs !== null && Date.now() - this.startedAtMs >= this.budgets.maxTotalMs) {
       this.recordPolicyRefusal(`${kind} destination refused: total-time budget (${this.budgets.maxTotalMs}ms) exhausted.`);
       return undefined;
     }
@@ -823,7 +824,10 @@ export class EgressBroker {
     this.idleAttached.add(socket);
     socket.on("timeout", () => {
       this.note(`idle timeout (${this.budgets.idleSocketMs}ms) destroyed connection to ${entry.hostname}:${entry.port}.`);
-      this.abortConnections(entry, peers);
+      // Evict quiet sockets, not their owning browser. TLS tunnels are opaque:
+      // we cannot attest completion, but idleness is not a security violation.
+      // Subsequent connections still pass admit() and fresh DNS validation.
+      this.abortConnections(entry, peers, "idle");
     });
   }
 
@@ -839,12 +843,14 @@ export class EgressBroker {
     return true;
   }
 
-  private abortConnections(entry: BrokerLedgerEntry, peers: net.Socket[]): void {
+  private abortConnections(entry: BrokerLedgerEntry, peers: net.Socket[], reason: "budget" | "idle" = "budget"): void {
     if (!this.abortedEntries.has(entry)) {
       this.abortedEntries.add(entry);
       entry.completed = false;
       this.budgetAborts += 1;
-      this.observer?.policyFailure(
+      // Preserve conservative render accounting (including incomplete idle
+      // transfers), but notify the fatal observer only for hard budgets.
+      if (reason === "budget") this.observer?.policyFailure(
         "budget_abort",
         `Egress budget aborted a connection to ${entry.hostname}:${entry.port}.`,
       );

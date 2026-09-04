@@ -232,12 +232,19 @@ The session surface is bounded and semantic:
   remain recognizable through authenticated session handles without retaining
   unbounded state.
 
-At every final agent-settlement boundary, the extension aborts and drains in-progress
-browser opens/actions, closes every owned tab, context, Chromium process, and broker,
-and independently confirms zero ownership before review or completion can proceed.
-Successful settlement quiescence permits a later turn to open a new session. Any
-unconfirmed teardown fails closed for the rest of that extension runtime. Browser state
-is process-local and is never represented as surviving a restart.
+Each Pi session owns at most **one live, non-suspended browser**, with multiple owned
+tabs. Its session/tab handles remain usable across completed turns, model thinking,
+ordinary idle, and automatic/manual/ask-reviewer reviews until `BrowserClose`.
+Duplicate or concurrent `BrowserOpen` never creates or replaces an instance: it gives
+instructions for the existing session (`BrowserTabs`/`BrowserNavigate`/`BrowserClose`),
+or asks you to await the already-running open.
+
+Reviews do **not** establish browser quiescence: page scripts, timers, and permitted
+network effects can continue during review. Call `BrowserClose` when that is no longer
+desired. Explicit close and terminal Pi shutdown, reload, replacement, or worker process
+shutdown drain operations and close all browser/broker resources. Unrecoverable safety
+failures may also close the browser. Unconfirmed teardown fails closed for the remainder
+of that runtime. Browser state is process-local and never survives a restart.
 
 There is no password/file entry, upload, download saving, clipboard, filesystem-path
 input, caller-provided selector, XPath, coordinate action, caller-supplied JavaScript/
@@ -261,7 +268,9 @@ image content (and consequently Pi's own conversation/session representation), n
 review-gate details, error diagnostics, caches, or paths. Metadata is bounded to the
 session/tab/generation, bounded URL/title, mode/ref, MIME type, dimensions, encoded byte
 count, and hard limits. Session/tab handles are non-enumerable capabilities; forged,
-stale, cross-session, and cross-tab combinations are rejected uniformly. Semantic refs
+cross-session, and cross-tab combinations are rejected uniformly. Authenticated closed
+session handles receive a bounded closure reason and instructions to open a new browser;
+older evicted closure diagnostics are not invented. Semantic refs
 are process-local capabilities scoped to one session, tab, current document generation,
 and latest successful snapshot.
 
@@ -274,15 +283,19 @@ do not navigate, mutate the document generation/page state, create requests, or 
 broker permissions. Ring overflow and result pagination are never silent: dropped and
 truncated counts accompany every read.
 
-Limits are hard and finite: at most 4 process-local sessions, 4 tabs per session, 12
+Resource and action limits remain hard and finite: one browser per Pi session, 4 tabs, 12
 explicit navigations/history traversals, 64 operations, 32 retained history entries per
 tab, 32 main-document requests, 16 destination hosts,
 96 connections, 256 broker requests, 8 MiB per connection, and 32 MiB aggregate bytes.
 Each open/navigation and confirmation-capable interaction has one 30-second end-to-end
 deadline; each other action or snapshot has one 10-second end-to-end deadline. All
 phases share that one absolute timer and never receive fresh timers.
-Idle sessions are capped at 60 seconds, total lifetime at 5 minutes, redirect chains at 10 hops, and
-semantic output at 24,000 characters and depth 16. Console and network rings retain at most
+There is no browser idle or elapsed-lifetime expiry. Quiet destination sockets are still
+evicted after 20 seconds without closing the browser or cancelling a pending permission
+prompt. Opaque evicted tunnels are conservatively recorded as incomplete transfers;
+future connections undergo fresh DNS validation and pinned dialing. No page action is
+automatically replayed. Redirect chains are capped at 10 hops and semantic output at
+24,000 characters and depth 16. Console and network rings retain at most
 128 and 256 events per tab respectively; each read returns at most 64. Console/error text
 is captured at 1,000 characters, source origins at 300, inspect names/descriptions/text at
 256/512/512, and every cap has explicit truncation accounting. A screenshot is capped at 2,000×2,000,
@@ -293,8 +306,9 @@ or malformed final result is discarded and fails the session closed before image
 content is created. Budgets are cumulative for the whole session, not reset by
 navigation.
 
-Cancellation, session shutdown, browser crashes, expiry, and broker policy/budget
-failures immediately begin deadline-bounded teardown. Interaction failures distinguish
+Action cancellation, terminal session shutdown, browser crashes, and hard broker
+policy/budget failures immediately begin deadline-bounded teardown. Ordinary socket
+idle eviction is not a fatal budget notification. Interaction failures distinguish
 `not_started`, `started`, `completed`, and `unknown` effect states where available and
 never claim that cancellation rolled back a page or external effect. Successful results
 use a bounded post-dispatch accounting window, drain containment work added during that

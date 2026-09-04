@@ -377,7 +377,7 @@ test("shutdown aborts and awaits an in-progress BrowserOpen, then rejects future
     limits: { cleanupMs: 100, navigationMs: 1_000 },
   });
   const opening = manager.open("https://example.com/start");
-  const openingRejected = assert.rejects(opening, /cancelled by interactive browser shutdown/);
+  const openingRejected = assert.rejects(opening, /cancelled by Pi session shutdown/);
   await launched;
   const shuttingDown = manager.shutdown();
   releaseLaunch();
@@ -415,39 +415,42 @@ test("shutdown preserves an unconfirmed in-progress-open teardown failure", asyn
   await assert.rejects(manager.shutdown(), /could not confirm quiescence/i);
 });
 
-test("quiescence drains an established session after another opening records teardown failure", async () => {
-  const establishedBrowser = new FakeBrowser();
-  const failingBrowser = new FakeBrowser();
-  failingBrowser.close = async () => new Promise<void>(() => undefined);
-  let releaseSecondLaunch!: () => void;
-  let announceSecondLaunch!: () => void;
-  const secondLaunched = new Promise<void>((resolve) => { announceSecondLaunch = resolve; });
-  const deferredSecondLaunch = new Promise<Browser>((resolve) => {
-    releaseSecondLaunch = () => resolve(failingBrowser as unknown as Browser);
-  });
-  let launches = 0;
+test("concurrent and duplicate opens reserve exactly one browser; explicit close permits a fresh open", async () => {
+  const browsers: FakeBrowser[] = [];
+  let now = 1;
   const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
     resolveHostname: async () => ["93.184.216.34"],
+    now: () => now,
     launch: async () => {
-      launches += 1;
-      if (launches === 1) return establishedBrowser as unknown as Browser;
-      announceSecondLaunch();
-      return deferredSecondLaunch;
+      const browser = new FakeBrowser();
+      browsers.push(browser);
+      return browser as unknown as Browser;
     },
-    limits: { cleanupMs: 10, navigationMs: 1_000 },
+    limits: { maxSessions: 100 }, // even test overrides cannot loosen ownership
   });
-  await manager.open("https://example.com/established");
-  const secondOpen = manager.open("https://example.com/failing-open");
-  await secondLaunched;
-  const barrier = manager.quiesce();
-  releaseSecondLaunch();
-  await assert.rejects(secondOpen, /teardown could not be confirmed/i);
-  await assert.rejects(barrier, /could not confirm quiescence/i);
-  assert.equal(establishedBrowser.isConnected(), false, "the established browser is drained despite the prior failure");
+  const first = manager.open("https://example.com/first");
+  await assert.rejects(manager.open("https://example.com/second"), /already in progress/);
+  const opened = await first;
+  await assert.rejects(manager.open("https://example.com/second"), (error: Error) => {
+    assert.match(error.message, /already open.*BrowserTabs.*BrowserClose/);
+    assert.ok(error.message.includes(opened.session));
+    return true;
+  });
+  now += 24 * 60 * 60_000; // no elapsed-lifetime check at the next operation
+  await manager.screenshot(opened.session, opened.tab, "viewport", undefined);
+  assert.equal(browsers.length, 1);
+  assert.equal(manager.limits.maxSessions, 1);
+  const closed = await manager.close(opened.session);
+  assert.equal(closed.closure?.kind, "explicit_close");
+  await assert.rejects(manager.snapshot(opened.session, opened.tab, 1_000), /closed.*explicit_close.*BrowserOpen/);
+  const reopened = await manager.open("https://example.com/new");
+  assert.notEqual(reopened.session, opened.session);
+  assert.equal(browsers.length, 2);
+  await manager.shutdown();
   assert.equal(manager.activeSessionCount(), 0);
 });
 
-test("settlement quiescence aborts an in-flight screenshot, proves zero ownership, and permits reuse", async () => {
+test("terminal shutdown aborts an in-flight screenshot and proves zero ownership", async () => {
   const browsers: FakeBrowser[] = [];
   let serial = 0;
   const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
@@ -469,22 +472,40 @@ test("settlement quiescence aborts an in-flight screenshot, proves zero ownershi
   };
   const screenshot = manager.screenshot(opened.session, opened.tab, "viewport", undefined);
   await started;
-  const barrier = manager.quiesce();
-  await assert.rejects(screenshot, /agent settlement/);
+  const barrier = manager.shutdown();
+  await assert.rejects(screenshot, /Pi session shutdown/);
   await barrier;
   assert.equal(manager.activeSessionCount(), 0);
   assert.equal(browsers[0]!.isConnected(), false);
 
-  const reused = await manager.open("https://example.com/later-turn");
-  assert.equal(manager.activeSessionCount(), 1);
-  await manager.close(reused.session);
+  await assert.rejects(manager.open("https://example.com/later-session"), /manager is shut down/);
 });
 
-test("an unconfirmed settlement teardown permanently fails the browser manager closed", async () => {
+test("explicit BrowserClose aborts and drains an in-flight action without losing its closure reason", async () => {
+  const { manager, browser } = managerFixture();
+  const opened = await manager.open("https://example.com/closing");
+  let announce!: () => void;
+  const started = new Promise<void>((resolve) => { announce = resolve; });
+  browser.context.page.screenshot = async () => {
+    announce();
+    return new Promise<typeof ONE_PIXEL_PNG>(() => undefined);
+  };
+  const capture = manager.screenshot(opened.session, opened.tab, "viewport", undefined);
+  const rejected = assert.rejects(capture, /cancelled by BrowserClose/);
+  await started;
+  const closed = await manager.close(opened.session);
+  await rejected;
+  assert.equal(closed.closure?.kind, "explicit_close");
+  assert.equal(browser.isConnected(), false);
+  assert.equal(manager.activeSessionCount(), 0);
+  await manager.shutdown();
+});
+
+test("an unconfirmed terminal teardown permanently fails the browser manager closed", async () => {
   const { manager } = managerFixture({ hangingContextClose: true, cleanupMs: 10 });
   await manager.open("https://example.com/unconfirmed");
-  await assert.rejects(manager.quiesce(), /could not confirm quiescence/i);
-  await assert.rejects(manager.quiesce(), /could not confirm quiescence/i);
+  await assert.rejects(manager.shutdown(), /could not confirm quiescence/i);
+  await assert.rejects(manager.shutdown(), /could not confirm quiescence/i);
   await assert.rejects(manager.open("https://example.com/must-not-reopen"), /could not confirm quiescence/i);
 });
 
@@ -1302,6 +1323,7 @@ test("screenshot refs reject forged, stale, cross-session, and cross-tab use uni
   const sourceSnapshot = await crossManager.snapshot(sourceSession.session, sourceSession.tab, 1_000);
   const sourceRef = sourceSnapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
   assert.ok(sourceRef);
+  await crossManager.close(sourceSession.session);
   const targetSession = await crossManager.open("https://example.com/target-session");
   await crossManager.snapshot(targetSession.session, targetSession.tab, 1_000);
   await assert.rejects(
@@ -1440,7 +1462,7 @@ test("screenshots reject closed and unexpectedly lost sessions without returning
   await closed.manager.close(closedOpened.session);
   await assert.rejects(
     closed.manager.screenshot(closedOpened.session, closedOpened.tab, "viewport", undefined),
-    /Invalid or stale browser session\/tab handle/,
+    /closed.*explicit_close.*BrowserOpen/,
   );
 
   const lost = managerFixture();
@@ -2078,7 +2100,7 @@ test("browser diagnostics are bounded, redacted, cursor-based, ref-scoped, and m
   await manager.navigate(opened.session, opened.tab, "https://example.com/new-document");
   await assert.rejects(manager.inspect(opened.session, opened.tab, ref), /Invalid or stale browser semantic ref/);
   await manager.close(opened.session);
-  await assert.rejects(manager.console(opened.session, opened.tab), /Invalid or stale browser session\/tab handle/);
+  await assert.rejects(manager.console(opened.session, opened.tab), /closed.*explicit_close.*BrowserOpen/);
 });
 
 test("browser diagnostics stay tab-local and cancellation tears down the owning session", async () => {

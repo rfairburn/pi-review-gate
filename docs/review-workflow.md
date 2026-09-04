@@ -28,6 +28,16 @@ after seeing the passing observations, that response becomes a new exchange in t
 window and triggers another review. Later ordinary work starts a fresh window from
 current file contents and does not re-review changes that already passed.
 
+## Live browser during review
+
+Automatic reviews, `/review-now`, and `/ask-reviewer` settle model work without closing,
+pausing, or suspending the Pi session's browser. Page scripts and permitted network
+activity can continue during review; a passing review is not an attestation of zero
+browser resources or absence of later web effects. The same session/tab handles work
+in later turns. Use `BrowserClose` to stop those effects explicitly. Terminal session
+shutdown/replacement/reload still closes browser resources. See
+[Interactive browser](web-tools.md#interactive-browser) for limits and closure behavior.
+
 ## Reviewer execution
 
 Every built-in Codex, Claude, and Pi review pass starts a fresh CLI session. Correction

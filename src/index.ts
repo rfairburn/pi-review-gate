@@ -53,10 +53,11 @@ import {
   type ExecutorToolCatalog,
 } from "./execution/tool-catalog";
 import {
-  capturePiQuiescenceBootstrap,
-  publishPiQuiescenceReceipt,
-  type PiQuiescenceBootstrap,
-} from "./execution/pi-quiescence-receipt";
+  capturePiSettlementBootstrap,
+  publishPiSettlementReceipt,
+  removePiSettlementReceipt,
+  type PiSettlementBootstrap,
+} from "./execution/pi-settlement-receipt";
 
 declare const module: {
   exports: unknown;
@@ -72,20 +73,20 @@ const orchestratorBackgroundCompletionPrompt = [
 
 interface ActivationDependencies {
   /** Narrow injection seam used by lifecycle tests; production constructs it. */
-  webTools?: Pick<WebToolManager, "register" | "quiesce" | "cleanup" | "sync">;
+  webTools?: Pick<WebToolManager, "register" | "cleanup" | "sync">;
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
   const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
-  let executorQuiescenceBootstrap: PiQuiescenceBootstrap | undefined;
-  let executorQuiescenceBootstrapError: Error | undefined;
+  let executorSettlementBootstrap: PiSettlementBootstrap | undefined;
+  let executorSettlementBootstrapError: Error | undefined;
   if (executorRole) {
     try {
       // Capture and erase the signing bootstrap before the first await, tool
       // registration, model request, or model-spawned subprocess.
-      executorQuiescenceBootstrap = capturePiQuiescenceBootstrap();
+      executorSettlementBootstrap = capturePiSettlementBootstrap();
     } catch (error) {
-      executorQuiescenceBootstrapError = error instanceof Error ? error : new Error("Pi executor quiescence bootstrap failed.");
+      executorSettlementBootstrapError = error instanceof Error ? error : new Error("Pi executor settlement bootstrap failed.");
     }
   }
   let loaded;
@@ -138,15 +139,42 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       deferredTools.reapply();
     });
     let settlementGeneration = 0;
+    let terminal = false;
+    let receiptPublication = Promise.resolve();
+    const acknowledgementFailure = () => executorSettlementBootstrapError
+      ?? (!executorSettlementBootstrap || terminal ? new Error(
+        "Pi executor settlement bootstrap is unavailable or retired. Executor reload/replacement is unsupported; restart this worker with a fresh parent-issued identity.",
+      ) : undefined);
+    // Bootstrap secrets are intentionally erased, not persisted across reload.
+    // Pi logs most hook errors and continues: block tools explicitly, and never
+    // publish a replacement receipt or reset a generation under the old identity.
+    registerHook(pi, "tool_call", () => {
+      const failure = acknowledgementFailure();
+      if (failure) return { block: true, reason: failure.message };
+      return undefined;
+    });
+    registerHook(pi, "session_shutdown", async () => {
+      terminal = true;
+      // Retire acknowledgements even if terminal browser cleanup fails. Wait
+      // for any publication already in flight so it cannot recreate the file.
+      await Promise.all([
+        webTools?.cleanup(),
+        receiptPublication.catch(() => undefined).then(async () => {
+          if (executorSettlementBootstrap) await removePiSettlementReceipt(executorSettlementBootstrap);
+        }),
+      ]);
+    });
     registerHook(pi, "agent_settled", async () => {
-      settlementGeneration += 1;
-      // This acknowledgement is extension-owned. It is emitted only after
-      // browser ownership is independently reduced to zero; agent_end and a
-      // child process exit are deliberately insufficient.
-      await webTools?.quiesce();
-      if (executorQuiescenceBootstrapError) throw executorQuiescenceBootstrapError;
-      if (!executorQuiescenceBootstrap) throw new Error("Pi executor quiescence acknowledgement bootstrap is missing.");
-      await publishPiQuiescenceReceipt(executorQuiescenceBootstrap, settlementGeneration);
+      const failure = acknowledgementFailure();
+      if (failure) throw failure;
+      const generation = ++settlementGeneration;
+      // Authenticate model settlement, NOT browser quiescence. The browser
+      // remains live until explicit close or terminal worker/session shutdown.
+      receiptPublication = receiptPublication.then(async () => {
+        if (terminal) throw acknowledgementFailure();
+        await publishPiSettlementReceipt(executorSettlementBootstrap!, generation);
+      });
+      await receiptPublication;
     });
     return;
   }
@@ -569,7 +597,6 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "agent_settled", async (...args) => {
-    let settlementQuiescenceFailure: Error | undefined;
     try {
     // agent_settled is the only point where Pi guarantees that no automatic
     // retry, compaction retry, or queued continuation remains for this turn,
@@ -594,20 +621,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       && !prospectiveWindow.reviewConfigurationError
       && (prospectiveWindow.reviewConfig?.enabled ?? config.enabled),
     );
-    try {
-      await webTools?.quiesce();
-    } catch (error) {
-      const failure = new Error(
-        `review gate: review/completion blocked because interactive browser quiescence could not be confirmed (${boundDeliveryDiagnostic(error)})`,
-      );
-      settlementQuiescenceFailure = failure;
-      await sendNoticeUnlessItThrows(noticeTarget, failure.message);
-      if (pausedForReviewerQuestion) releaseReviewerQuestionPauseWaiters(failure);
-      throw failure;
-    }
+    // Reviews settle model work, not the live browser. Page scripts and
+    // authenticated broker traffic may continue throughout a review.
     if (pausedForReviewerQuestion) {
-      // The /ask-reviewer command remains paused until this exact final
-      // boundary is quiescent; only then may its review inspect the workspace.
+      // /ask-reviewer waits for this exact model settlement boundary, without
+      // closing or suspending the browser. Web effects may continue.
       const window = state.reviewWindow;
       try {
         if (window?.baseline && !runAborted) {
@@ -943,11 +961,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
     } finally {
       agentSettlementInputHold = false;
-      // A persistence failure must not replace the bounded browser failure
-      // which blocks Pi's settlement. Persistence remains best-effort only in
-      // this already-failed path; normal paths retain their prior semantics.
-      if (settlementQuiescenceFailure) await persistSessionState().catch(() => undefined);
-      else await persistSessionState();
+      await persistSessionState();
     }
   });
 
@@ -962,17 +976,6 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     cancellation: reviewCancellation,
     onStateChanged: persistSessionState,
     releaseQueuedUserInputs: () => releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState),
-    requireBrowserQuiescence: async (ctx) => {
-      try {
-        await webTools?.quiesce();
-      } catch (error) {
-        const failure = new Error(
-          `review gate: manual review blocked because interactive browser quiescence could not be confirmed (${boundDeliveryDiagnostic(error)})`,
-        );
-        await sendNoticeUnlessItThrows(ctx, failure.message);
-        throw failure;
-      }
-    },
     prepareReviewerQuestion: async (commandName, ctx) => {
       if (!agentRunActive && commandContextIsIdle(ctx)) {
         return;
@@ -985,7 +988,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         [
           `Reviewer consultation requested by /${commandName}.`,
           "Pause implementation at this steering boundary. Do not call any more tools or modify files after receiving this message.",
-          "End this turn so the reviewer can inspect a stable workspace; its response will be provided next.",
+          "End this turn so the reviewer can inspect the workspace; its response will be provided next. The browser remains live during review and page effects may continue.",
         ].join(" "),
       );
       if (!delivered) {

@@ -46,6 +46,7 @@ import {
 } from "./background-shell";
 import { registerApplyPatchTool } from "./apply-patch/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
+import { DeferredToolManager } from "./deferred-tools";
 
 declare const module: {
   exports: unknown;
@@ -94,6 +95,12 @@ export async function activate(pi: unknown): Promise<void> {
     ? registerBackgroundShell(pi)
     : undefined;
 
+  // Register the compact loader before session_start. Authorization capture
+  // is deliberately delayed until executionTools.sync() has registered and
+  // reconciled every legitimately available top-level execution tool.
+  const deferredTools = new DeferredToolManager(pi);
+  deferredTools.register();
+
   const state = createState();
   let currentCwd = process.cwd();
   let currentScopedModels: string[] = [];
@@ -127,6 +134,7 @@ export async function activate(pi: unknown): Promise<void> {
     config,
     state,
     cwd: () => currentCwd,
+    authorizedTools: () => deferredTools.authorizedToolNames(),
     notify: (message) => sendNotice(pi, message),
     onAssociationsChanged: () => persistSessionState(),
     onExpandedViewChanged: async (expanded) => {
@@ -304,6 +312,9 @@ export async function activate(pi: unknown): Promise<void> {
     executionTools.setUiContext(extractContext(args) ?? pi);
     discardSessionState(state);
     const context = extractContext(args);
+    const deferredSessionIdentity = typeof context === "object" && context !== null
+      ? (context as { sessionManager?: unknown }).sessionManager
+      : undefined;
     const identity = sessionPersistenceIdentity(context, currentCwd);
     const appendEntry = typeof pi === "object" && pi !== null && "appendEntry" in pi && typeof pi.appendEntry === "function"
       ? pi.appendEntry.bind(pi) as (customType: string, data: unknown) => void
@@ -348,6 +359,7 @@ export async function activate(pi: unknown): Promise<void> {
       await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
     }
     executionTools.sync();
+    deferredTools.sessionStart(deferredSessionIdentity);
     if (restoredRevision !== undefined) {
       await recoverPendingModelDeliveries({
         pi,
@@ -389,6 +401,9 @@ export async function activate(pi: unknown): Promise<void> {
   });
 
   registerHook(pi, "before_agent_start", async (...args) => {
+    // Pi may auto-activate tools registered after session_start. Reassert the
+    // captured boundary immediately before every new agent request.
+    deferredTools.reapply();
     agentRunActive = true;
     currentCwd = extractCwd(args, currentCwd);
     pendingSettlementUsage = undefined;
@@ -432,6 +447,10 @@ export async function activate(pi: unknown): Promise<void> {
   });
 
   registerHook(pi, "tool_result", async (...args) => {
+    // The next provider request can follow this hook immediately. Preserve
+    // loader additions while removing registrations that were never in the
+    // captured authorization boundary.
+    deferredTools.reapply();
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
     if (!backgroundShellController) {
@@ -881,6 +900,7 @@ export async function activate(pi: unknown): Promise<void> {
     configPath: loaded.path,
     onSaved: () => {
       executionTools.sync();
+      deferredTools.reapply();
       webTools?.sync(config);
     },
     onScopedModels: (models) => {

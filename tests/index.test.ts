@@ -400,7 +400,7 @@ test("automatic review waits while execution subtasks remain active", async () =
   }
 });
 
-test("delegated execution tool activation waits for session_start", async () => {
+test("session_start captures execution tools before applying the conservative deferred set", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-runtime-start-"));
   try {
     const configPath = join(dir, "review-gate.json");
@@ -421,8 +421,8 @@ test("delegated execution tool activation waits for session_start", async () => 
     delete process.env.PI_REVIEW_GATE_DISABLED;
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
-    const registeredTools: string[] = [];
-    let activeTools = ["read"];
+    const registeredTools: Array<{ name: string; description?: string }> = [];
+    let activeTools = ["read", "bash", "edit"];
     let runtimeInitialized = false;
     const assertRuntime = () => {
       if (!runtimeInitialized) throw new Error("Extension runtime not initialized");
@@ -432,13 +432,22 @@ test("delegated execution tool activation waits for session_start", async () => 
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
       registerCommand() {},
-      registerTool(tool: { name: string }) {
-        registeredTools.push(tool.name);
+      registerTool(tool: { name: string; description?: string }) {
+        registeredTools.push(tool);
         activeTools.push(tool.name);
       },
       getActiveTools() {
         assertRuntime();
         return activeTools;
+      },
+      getAllTools() {
+        assertRuntime();
+        return [
+          { name: "read", description: "Read files." },
+          { name: "bash", description: "Run shell commands." },
+          { name: "edit", description: "Edit files." },
+          ...registeredTools,
+        ];
       },
       setActiveTools(next: string[]) {
         assertRuntime();
@@ -448,13 +457,123 @@ test("delegated execution tool activation waits for session_start", async () => 
     };
 
     await activate(pi);
-    assert.deepEqual(registeredTools, [...webToolNames, "ApplyPatch", ...backgroundShellToolNames]);
+    assert.deepEqual(registeredTools.map((tool) => tool.name), [
+      ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools",
+    ]);
 
     runtimeInitialized = true;
-    await trigger(hooks, "session_start", { cwd: dir });
-    assert.deepEqual(registeredTools, [...webToolNames, "ApplyPatch", ...backgroundShellToolNames, ...executionToolNames]);
-    assert.deepEqual(activeTools, ["read", ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, ...executionToolNames]);
+    const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
+    await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
+    assert.deepEqual(registeredTools.map((tool) => tool.name), [
+      ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools", ...executionToolNames,
+    ]);
+    assert.deepEqual(activeTools, ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"]);
+
+    pi.registerTool({ name: "LateIdleTool", description: "Registered while the model is idle." });
+    assert.ok(activeTools.includes("LateIdleTool"));
+    await trigger(hooks, "before_agent_start", { cwd: dir });
+    assert.equal(activeTools.includes("LateIdleTool"), false, "request boundary removes an unauthorized idle registration");
+
+    pi.registerTool({ name: "LateToolResultTool", description: "Registered during a tool execution." });
+    assert.ok(activeTools.includes("LateToolResultTool"));
+    await trigger(hooks, "tool_result", { cwd: dir, toolName: "read", input: {}, isError: false });
+    assert.equal(activeTools.includes("LateToolResultTool"), false, "tool-result boundary removes widening before the next request");
+
+    const searchTools = registeredTools.find((tool) => tool.name === "search_tools") as {
+      execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
+    } | undefined;
+    assert.ok(searchTools?.execute);
+    const result = await searchTools.execute("load-add", { query: "add tasks to existing execution" });
+    assert.equal(result.isError, false);
+    assert.deepEqual((result.details as { activated: string[] }).activated, ["SubtasksAdd"]);
+    assert.deepEqual(activeTools, ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools", "SubtasksAdd"]);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("deferred authorization survives API recreation and remains isolated per Pi session", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-deferred-sessions-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    type ToolDefinition = {
+      name: string;
+      description?: string;
+      execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
+    };
+    const createBacking = (sessionTool: string) => ({
+      definitions: new Map<string, ToolDefinition>([
+        ["read", { name: "read", description: "Read files." }],
+        ["bash", { name: "bash", description: "Run shell commands." }],
+        ["edit", { name: "edit", description: "Edit files." }],
+        [sessionTool, { name: sessionTool, description: `Authorized only for ${sessionTool}.` }],
+      ]),
+      active: ["read", "bash", "edit", sessionTool],
+    });
+    const createWrapper = (backing: ReturnType<typeof createBacking>) => {
+      const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+      const pi = {
+        on(name: string, handler: (...args: unknown[]) => unknown) {
+          hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+        },
+        registerCommand() {},
+        registerTool(definition: ToolDefinition) {
+          backing.definitions.set(definition.name, definition);
+          if (!backing.active.includes(definition.name)) backing.active.push(definition.name);
+        },
+        getActiveTools: () => [...backing.active],
+        getAllTools: () => [...backing.definitions.values()],
+        setActiveTools(names: string[]) { backing.active = [...names]; },
+        notify() {},
+      };
+      return { hooks, pi };
+    };
+    const executeSearch = async (backing: ReturnType<typeof createBacking>, query: string) => {
+      const search = backing.definitions.get("search_tools");
+      assert.ok(search?.execute);
+      return search.execute("search", { query });
+    };
+
+    const sessionAIdentity = {};
+    const backingA = createBacking("SessionAOnly");
+    const firstA = createWrapper(backingA);
+    await activate(firstA.pi);
+    const contextA = { cwd: dir, ui: {}, sessionManager: sessionAIdentity };
+    await trigger(firstA.hooks, "session_start", { cwd: dir }, contextA);
+
+    firstA.pi.registerTool({ name: "SessionALate", description: "Registered after authorization capture." });
+    const reloadedA = createWrapper(backingA);
+    assert.notEqual(reloadedA.pi, firstA.pi, "reload recreates the ExtensionAPI wrapper");
+    await activate(reloadedA.pi);
+    const reloadedContextA = { cwd: dir, ui: {}, sessionManager: sessionAIdentity };
+    assert.notEqual(reloadedContextA, contextA, "reload recreates the ExtensionContext wrapper");
+    await trigger(reloadedA.hooks, "session_start", { cwd: dir }, reloadedContextA);
+    assert.equal(backingA.active.includes("SessionALate"), false);
+    const originalA = await executeSearch(backingA, "SessionAOnly");
+    assert.deepEqual((originalA.details as { activated: string[] }).activated, ["SessionAOnly"]);
+    const lateA = await executeSearch(backingA, "SessionALate");
+    assert.deepEqual((lateA.details as { activated: string[] }).activated, []);
+
+    const sessionBIdentity = {};
+    const backingB = createBacking("SessionBOnly");
+    const sessionB = createWrapper(backingB);
+    await activate(sessionB.pi);
+    const contextB = { cwd: dir, ui: {}, sessionManager: sessionBIdentity };
+    await trigger(sessionB.hooks, "session_start", { cwd: dir }, contextB);
+    const ownB = await executeSearch(backingB, "SessionBOnly");
+    assert.deepEqual((ownB.details as { activated: string[] }).activated, ["SessionBOnly"]);
+    const foreignA = await executeSearch(backingB, "SessionAOnly");
+    assert.deepEqual((foreignA.details as { activated: string[] }).activated, []);
+    assert.equal(backingB.active.includes("SessionAOnly"), false);
+  } finally {
+    reapAll();
     await rm(dir, { recursive: true, force: true });
   }
 });

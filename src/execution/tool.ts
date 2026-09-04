@@ -108,6 +108,8 @@ interface ExecutionToolManagerInput {
   config: ReviewGateConfig;
   state: ReviewGateState;
   cwd: () => string;
+  /** Full parent authorization when the top-level active schema is deferred. */
+  authorizedTools?: () => string[] | undefined;
   notify?: (message: string) => void | Promise<void>;
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | Promise<void>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
@@ -474,7 +476,7 @@ export class ExecutionToolManager {
   }
 
   private withParentTools(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind): BackgroundTaskDefinition[] {
-    const allowedTools = activeToolSnapshot(this.input.pi);
+    const allowedTools = this.input.authorizedTools?.() ?? activeToolSnapshot(this.input.pi);
     if (!allowedTools) {
       throw new Error(`${kind === "research" ? "Research" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
     }

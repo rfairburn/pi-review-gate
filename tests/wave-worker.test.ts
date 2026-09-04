@@ -1805,3 +1805,116 @@ test("resumeWaveWorker requires a prior candidate checkpoint", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("resumeWaveWorker recovers candidate-less read-only research from its verified unchanged checkpoint", async () => {
+  const root = await mkTmp("pi-ww-research-resume-");
+  try {
+    const { capture } = await setupCapture(root);
+    const taskId = "task-research-resume";
+    const task: WaveWorkerTask = {
+      title: "Research recovery",
+      instructions: "Inspect the repository and report.",
+      acceptanceCriteria: ["Return a report"],
+      backgroundKind: "research",
+    };
+    const worker = await createWorkerWorktree(capture, taskId);
+    const artifactDir = join(capture.waveRoot, "artifacts", taskId);
+    await mkdir(artifactDir, { recursive: true });
+
+    const executor = join(root, "research-resume.cjs");
+    await writeFile(executor, [
+      "if(process.env.PI_REVIEW_EXECUTOR_TURN==='1')process.exit(1);",
+      "console.log(JSON.stringify({type:'session',sessionId:'research-resumed-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'Summary: recovered research report.'}));",
+    ].join("\n"), "utf8");
+    const config: ReviewGateConfig = normalizeConfig({
+      enabled: true,
+      execution: {
+        activeExecutor: { source: "external", id: "research-executor" },
+        retryPolicy: NO_RETRY,
+      },
+      externalAgents: [{
+        id: "research-executor",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1",
+          args: [executor],
+          timeoutMs: 15000,
+        },
+      }],
+    });
+    const priorResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId,
+      task,
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+    assert.equal(priorResult.status, "executor_error");
+    assert.equal(priorResult.candidate, undefined);
+    assert.equal(priorResult.checkpoint?.verified, true);
+    assert.equal(priorResult.checkpoint?.differsFromBase, false);
+    assert.deepEqual(priorResult.checkpoint?.changedPaths, []);
+
+    await assert.rejects(
+      resumeWaveWorker({
+        sourceRoot: capture.discovery.captureRoot,
+        taskId,
+        task,
+        capture,
+        worktree: worker,
+        artifactDir,
+        config,
+        priorResult: {
+          ...priorResult,
+          checkpoint: { ...priorResult.checkpoint!, treeSha: "0".repeat(40) },
+        },
+        feedback: "Continue.",
+        turn: 2,
+      }),
+      /checkpoint does not match the prior durable result/,
+    );
+
+    const mutationPath = join(worker.worktreeRoot, "research-mutation.txt");
+    await writeFile(mutationPath, "not allowed\n", "utf8");
+    await assert.rejects(
+      resumeWaveWorker({
+        sourceRoot: capture.discovery.captureRoot,
+        taskId,
+        task,
+        capture,
+        worktree: worker,
+        artifactDir,
+        config,
+        priorResult,
+        feedback: "Continue.",
+        turn: 2,
+      }),
+      /private workspace changed after the prior turn.*research-mutation\.txt/,
+    );
+    await rm(mutationPath, { force: true });
+
+    const resumed = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId,
+      task,
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      priorResult,
+      feedback: "Finish the report from the retained session and workspace.",
+      turn: 2,
+    });
+    assert.equal(resumed.status, "no_changes");
+    assert.equal(resumed.candidate?.differsFromBase, false);
+    assert.match(resumed.turn?.text ?? "", /recovered research report/);
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

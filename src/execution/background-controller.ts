@@ -1590,8 +1590,8 @@ export class BackgroundExecutionController {
     abort: AbortController,
     lease: ExecutorPoolLease,
   ): Promise<void> {
-    if (!task.waveRoot || !task.researchResult?.candidate) {
-      throw new Error("Research continuation requires its persisted private workspace and prior candidate checkpoint.");
+    if (!task.waveRoot || !task.researchResult) {
+      throw new Error("Research continuation requires its persisted private workspace and prior durable result.");
     }
     const pending = task.pendingContinuation;
     if (!pending) throw new Error("Continuation was interrupted before executor dispatch.");

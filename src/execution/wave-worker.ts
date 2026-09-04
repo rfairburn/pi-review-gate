@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:p
 import { promises as fs } from "node:fs";
 import { atomicWrite } from "./durable-write";
 import { createExecutorAdapter } from "./adapters/factory";
-import { normalizeCandidate, type CandidateCommit } from "./wave-commits";
+import { normalizeCandidate, researchWorkspaceChanges, type CandidateCommit } from "./wave-commits";
 import type { WorkerWorktree } from "./wave-worktrees";
 import type { WaveCaptureResult } from "./wave-repository";
 import {
@@ -305,7 +305,7 @@ export interface WaveWorkerContinuationInput {
   sourceRoot: string;
   /** Lexical aliases for the source root (for example macOS /tmp vs /private/tmp). */
   sourceRootAliases?: string[];
-  /** Prior successful result containing session and candidate. */
+  /** Prior durable result containing session and a candidate or verified recovery checkpoint. */
   priorResult: WaveWorkerResult;
   /** Feedback / correction text to supply to the resumed session. */
   feedback: string;
@@ -1101,8 +1101,8 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
 /**
  * Resume a wave worker turn with feedback from a prior review.
  *
- * Given the same capture/worktree/task/artifact/config plus a prior successful
- * WaveWorkerResult with a candidate checkpoint, prompt text, and turn number >= 2,
+ * Given the same capture/worktree/task/artifact/config plus a prior durable
+ * WaveWorkerResult, prompt text, and turn number >= 2,
  * this function:
  * 1. Revalidates the isolated paths/worktree.
  * 2. Recreates the configured adapter.
@@ -1122,7 +1122,8 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, priorResult, feedback, turn } = input;
 
   // ── Validate prior result ──
-  if (!priorResult.candidate) {
+  const research = task.backgroundKind === "research";
+  if (!priorResult.candidate && !research) {
     throw new Error("Continuation requires a prior result with a candidate.");
   }
   if (turn < 2) {
@@ -1144,6 +1145,56 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
 
   const operation = await readOperationRecord(operationRecordPath(resolvedArtifactDir));
   synchronizeTaskAndOperationToolCatalog(task, operation);
+
+  let continuationCandidate = priorResult.candidate;
+  if (research) {
+    const workspaceChanges = await researchWorkspaceChanges(worktree.worktreeRoot);
+    if (workspaceChanges.length > 0) {
+      throw new Error(
+        `Research continuation refused because its private workspace changed after the prior turn: ${workspaceChanges.slice(0, 20).join(", ")}.`,
+      );
+    }
+    if (!continuationCandidate) {
+      const checkpoint = operation.checkpoint;
+      const resultCheckpoint = priorResult.checkpoint;
+      if (
+        !checkpoint?.verified
+        || !resultCheckpoint?.verified
+        || checkpoint.differsFromBase
+        || resultCheckpoint.differsFromBase
+        || checkpoint.changedPaths.length > 0
+        || resultCheckpoint.changedPaths.length > 0
+      ) {
+        throw new Error("Research continuation without a candidate requires an unchanged verified recovery checkpoint.");
+      }
+      if (
+        checkpoint.checkpointId !== resultCheckpoint.checkpointId
+        || checkpoint.commitSha !== resultCheckpoint.commitSha
+        || checkpoint.treeSha !== resultCheckpoint.treeSha
+        || checkpoint.ref !== resultCheckpoint.ref
+      ) {
+        throw new Error("Research continuation recovery checkpoint does not match the prior durable result.");
+      }
+      continuationCandidate = await normalizeCandidate(
+        capture,
+        worktree.worktreeRoot,
+        taskId,
+        task.title,
+        {
+          commitSha: checkpoint.commitSha,
+          treeSha: checkpoint.treeSha,
+          ref: checkpoint.ref,
+        },
+      );
+      if (continuationCandidate.differsFromBase) {
+        throw new Error("Research continuation recovery checkpoint differs from the captured read-only base.");
+      }
+    }
+  }
+  if (!continuationCandidate) {
+    throw new Error("Continuation requires a prior result with a candidate.");
+  }
+
   operation.state = "running";
   const priorExecutorSelection = operation.executorSelection;
   const assignment = input.executorAssignment ?? (config.execution?.executorPool !== undefined
@@ -1257,9 +1308,9 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       taskId,
       task.title,
       {
-        commitSha: priorResult.candidate.commitSha,
-        treeSha: priorResult.candidate.treeSha,
-        ref: priorResult.candidate.candidateRef,
+        commitSha: continuationCandidate.commitSha,
+        treeSha: continuationCandidate.treeSha,
+        ref: continuationCandidate.candidateRef,
       },
     );
   } catch (error) {

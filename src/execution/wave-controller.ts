@@ -105,6 +105,8 @@ export interface WaveTaskResult {
   unreviewed?: boolean;
   /** Structured reviewer evidence for the orchestrator. */
   reviewReport?: SubtaskReviewReport;
+  reviewCycles?: Array<Pick<import("./wave-worker-lifecycle").ReviewCycle,
+    "cycle" | "baseCommit" | "candidateCommit" | "candidateTreeSha" | "candidateRef" | "verdict">>;
   operationRecord?: string;
   bundle?: ReattachmentBundle;
   incidents?: ExecutionIncident[];
@@ -201,6 +203,8 @@ export interface WaveControllerInput {
   onProgress?: (update: WaveProgressUpdate) => void;
   /** Called after the durable wave manifest exists and before any worker starts. */
   onWaveCreated?: (waveRoot: string) => void | Promise<void>;
+  /** Durable result handoff, awaited before any integration or source mutation. */
+  onWorkersSettled?: (result: WaveResult) => void | Promise<void>;
   /** Artifact parent directory (outside source). */
   artifactDir?: string;
   /** Wave identifier (generated if omitted). */
@@ -1140,6 +1144,8 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         checkpoint: r.checkpoint,
         attempts: r.attempts,
         diagnostics: r.diagnostics,
+        reviewCycles: r.reviewCycles.map(({ cycle, baseCommit, candidateCommit, candidateTreeSha, candidateRef, verdict }) =>
+          ({ cycle, baseCommit, candidateCommit, candidateTreeSha, candidateRef, verdict })),
         worktree: handles.find((handle) => handle.taskId === ti.taskId)?.worktreeRoot,
         artifactDir: handles.find((handle) => handle.taskId === ti.taskId)?.artifactDir,
       };
@@ -1160,6 +1166,11 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       status: "cancelled" as WaveWorkerLifecycleStatus,
       summary: "Task was not started.",
     };
+  });
+
+  await input.onWorkersSettled?.({
+    waveId, waveRoot, sourceRoot: capture.discovery.captureRoot,
+    phase: "working", taskResults: taskResultsArray,
   });
 
   // Check if any worker failed (not accepted, completed_unreviewed, or no_changes).

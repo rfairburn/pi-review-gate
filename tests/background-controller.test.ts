@@ -489,6 +489,7 @@ test("parallel independent landings accumulate in the parent review checkpoint",
 
 test("research tasks report without review or landing and quarantine accidental writes", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-background-research-"));
+  const controllers: BackgroundExecutionController[] = [];
   try {
     await execFileAsync("git", ["init", "-q"], { cwd: root });
     await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
@@ -505,7 +506,7 @@ test("research tasks report without review or landing and quarantine accidental 
       "readline.createInterface({input:process.stdin}).on('line',line=>{const request=JSON.parse(line);",
       "if(request.method==='initialize')return send({jsonrpc:'2.0',id:request.id,result:{userAgent:'test-codex'}});",
       "if(request.method==='initialized')return;",
-      "if(request.method==='thread/start'||request.method==='thread/resume')return send({jsonrpc:'2.0',id:request.id,result:{thread:{id:request.params.threadId||threadId}}});",
+      "if(request.method==='thread/start'||request.method==='thread/resume'){threadId=request.params.threadId||threadId;return send({jsonrpc:'2.0',id:request.id,result:{thread:{id:threadId}}});}",
       "if(request.method==='turn/start'){const prompt=request.params.input?.[0]?.text||'';if(prompt.includes('DIRTY_RESEARCH'))fs.writeFileSync('ignored-research.txt','must not land\\n');",
       "const turnId='turn-'+(++turn),text=prompt.includes('LONG_RESEARCH')?'Summary: The captured baseline was found.\\n\\n## Details\\n'+('LONG_DETAIL '.repeat(120)):'Evidence-backed finding: base.txt contains the captured baseline.';send({jsonrpc:'2.0',id:request.id,result:{turn:{id:turnId}}});",
       "setImmediate(()=>{send({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text}}});send({jsonrpc:'2.0',method:'turn/completed',params:{threadId,turn:{id:turnId,status:'completed',items:[{type:'agentMessage',text}]}}});});return;}",
@@ -543,6 +544,7 @@ test("research tasks report without review or landing and quarantine accidental 
       cwd: () => root,
     });
 
+    controllers.push(controller);
     const started = await controller.start([
       {
         title: "clean research",
@@ -596,6 +598,31 @@ test("research tasks report without review or landing and quarantine accidental 
       actor: "model",
     }), /Research tasks have reports, not mergeable checkpoints/);
 
+    // Research has a retained operation/capture, not an execute-wave manifest.
+    // Its own returned bundle must still support explicit continuation.
+    await waitFor(() => (controller as unknown as { runtimes: Map<string, unknown> }).runtimes.size === 0);
+    await assert.rejects(access(join(clean.waveRoot!, "wave-manifest.json")), /ENOENT/);
+    const continueResearch = (bundle = clean.bundle!) => controller.continueTask({
+      executionId: started.executionId, taskId: clean.taskId, bundle,
+      instructions: "Confirm the evidence in base.txt without modifying any files.",
+      instructionId: "explicit-research-continuation", actor: "user",
+    });
+    await assert.rejects(continueResearch(dirty.bundle!), /ownership/);
+    await assert.rejects(continueResearch({ ...clean.bundle!, waveRoot: dirty.waveRoot! }), /ownership/);
+    await assert.rejects(continueResearch({ ...clean.bundle!, expectedRevision: Number.MAX_SAFE_INTEGER }), /revision/);
+    assert.equal(controller.inspect(started.executionId, clean.taskId).tasks[0]!.commands.length, 0);
+    await continueResearch();
+    await waitFor(() => {
+      const task = controller.inspect(started.executionId, clean.taskId).tasks[0]!;
+      return task.state === "reported" && task.generation > clean.generation;
+    });
+    const continuedResearch = controller.inspect(started.executionId, clean.taskId).tasks[0]!;
+    assert.equal(continuedResearch.commands.find((command) => command.instructionId === "explicit-research-continuation")?.status, "acknowledged");
+    assert.match(continuedResearch.report!, /Evidence-backed finding/);
+    assert.equal(controller.inspect(started.executionId).historicalCount, 3);
+    assert.equal(await readFile(join(root, "base.txt"), "utf8"), "base\n");
+    await assert.rejects(access(join(clean.waveRoot!, "wave-manifest.json")), /ENOENT/);
+
     const associations = controller.associations();
     await controller.shutdown();
     await controller.detach();
@@ -605,6 +632,7 @@ test("research tasks report without review or landing and quarantine accidental 
     assert.equal(restored.inspect(started.executionId).tasks.find((task) => task.taskId === clean.taskId)?.state, "reported");
     await restored.shutdown();
   } finally {
+    for (const controller of controllers) await controller.shutdown();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -1401,7 +1429,6 @@ test("interrupt before executor startup terminalizes an ordinary queued continue
     const queued = await controller.continueTask({
       executionId: started.executionId,
       taskId,
-      bundle,
       instructions: "retry from checkpoint",
       instructionId: "continue-queued",
       actor: "user",

@@ -21,7 +21,7 @@ import { readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository
 import { runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "./wave-worker-lifecycle";
 import { createTaskInstructionEvidenceRecorder, persistTaskDefinition, resumeWaveWorker, synchronizeTaskAndOperationToolCatalog, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
 import { createWorkerWorktree, pinCommit, removeWorktree, type WorkerWorktree } from "./wave-worktrees";
-import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
+import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
 import {
   createReattachmentBundle,
   createIncident,
@@ -34,7 +34,7 @@ import {
   type OperationInstruction,
   type ReattachmentBundle,
 } from "./operation-record";
-import type { WaveManifest, WaveManifestTask } from "./wave-controller";
+import type { WaveManifest, WaveManifestTask, WaveTaskResult } from "./wave-controller";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { acquireWaveOwner, heartbeatWaveOwner, inspectWaveOwner, releaseWaveOwner } from "./wave-owner";
 import type { ContinuationProgressUpdate, ExecutorLiveControl } from "./types";
@@ -283,6 +283,7 @@ export async function continueOperation(input: {
   executorPool?: ExecutorPoolScheduler;
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
   takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
+  onWorkerSettled?: (lifecycle: WaveWorkerLifecycleResult) => void | Promise<void>;
   onLandingConflict?: (input: { capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>; plan: LandingPlan }) => void | Promise<void>;
 }): Promise<{
   inspection: OperationInspection;
@@ -524,6 +525,8 @@ export async function continueOperation(input: {
     persistedInstruction.acknowledgedAt = new Date().toISOString();
   }
 
+  await input.onWorkerSettled?.(lifecycle);
+
   if (!isEligible(lifecycle) || !lifecycle.acceptedCommitSha) {
     record.state = lifecycle.status === "cancelled" ? "cancelled" : "paused_recoverable";
     await writeOperationRecord(record);
@@ -636,6 +639,64 @@ export async function continueOperation(input: {
   } finally {
     await releaseContinuationOwner();
   }
+}
+
+/** Recover accepted evidence only when it still describes the verified checkpoint.
+ * result.json is evidence, not authority for selecting an arbitrary commit.
+ */
+export async function readVerifiedAcceptedResult(inspection: OperationInspection): Promise<WaveTaskResult | undefined> {
+  const { record, bundle } = inspection;
+  const text = await readFile(join(record.artifactDir, "result.json"), "utf8").catch((error) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (text === undefined) return undefined;
+  const result = JSON.parse(text) as WaveWorkerLifecycleResult & { version: number };
+  if (!isEligible(result)) return undefined;
+  if (result.version !== 1 || result.taskId !== record.taskId
+    || result.bundle?.operationId !== record.operationId || result.bundle?.waveId !== record.waveId
+    || result.bundle?.taskId !== record.taskId || result.bundle.version !== 1
+    || await fs.realpath(result.bundle.waveRoot) !== bundle.waveRoot
+    || !Number.isSafeInteger(result.bundle.expectedRevision) || result.bundle.expectedRevision < 0 || result.bundle.expectedRevision > record.revision
+    || inspection.checkpointVerification.status !== "verified"
+    || !result.acceptedCommitSha || result.acceptedCommitSha !== record.checkpoint?.commitSha) {
+    throw new Error("Accepted result identity does not match the verified operation checkpoint.");
+  }
+  const capture = await readWaveCaptureRecord(bundle.waveRoot);
+  const lineage = waveLineageOf(capture);
+  const prefix = "refs/pi-review-gate/waves/";
+  const suffix = `/workers/${record.taskId}`;
+  const waveId = result.acceptedRef?.slice(prefix.length, -suffix.length) ?? "";
+  const generation = waveId === lineage.rootWaveId ? 0
+    : waveId.startsWith(`${lineage.rootWaveId}-g`) ? Number(waveId.slice(lineage.rootWaveId.length + 2)) : NaN;
+  const expectedWaveId = generation === 0 ? lineage.rootWaveId : `${lineage.rootWaveId}-g${generation}`;
+  const expectedRef = `${prefix}${expectedWaveId}${suffix}`;
+  if (!Number.isSafeInteger(generation) || generation < 0 || generation > record.generation
+    || result.acceptedRef !== expectedRef
+    || await gitRead(["rev-parse", "--verify", expectedRef], capture.repositoryPath) !== result.acceptedCommitSha) {
+    throw new Error("Accepted result ref does not match the verified checkpoint identity.");
+  }
+  if (!Array.isArray(result.reviewCycles)
+    || (result.status !== "completed_unreviewed" && !result.reviewCycles.length)) {
+    throw new Error("Accepted result is missing its final review cycle identity.");
+  }
+  const finalCycle = result.reviewCycles.at(-1);
+  if (finalCycle && (finalCycle.verdict !== "pass" || finalCycle.baseCommit !== capture.baseCommit)) {
+    throw new Error("Accepted result final review does not pass against the captured base.");
+  }
+  await verifyAcceptedReviewCycleIdentity({
+    ...capture, waveId, rootWaveId: lineage.rootWaveId, continuationGeneration: generation,
+  }, record, result);
+  return {
+    taskId: record.taskId, title: record.title, status: result.status, summary: result.summary,
+    acceptedRef: result.acceptedRef, acceptedCommitSha: result.acceptedCommitSha,
+    unreviewed: result.unreviewed, reviewReport: result.reviewReport,
+    reviewCycles: result.reviewCycles.map(({ cycle, baseCommit, candidateCommit, candidateTreeSha, candidateRef, verdict }) =>
+      ({ cycle, baseCommit, candidateCommit, candidateTreeSha, candidateRef, verdict })),
+    bundle, checkpoint: record.checkpoint, operationRecord: operationRecordPath(record.artifactDir),
+    artifactDir: record.artifactDir, worktree: record.worktreeRoot,
+    incidents: record.incidents, attempts: record.attempts.length,
+  };
 }
 
 async function verifyAcceptedReviewCycleIdentity(
@@ -1015,9 +1076,15 @@ async function resolveOperation(bundle: ReattachmentBundle): Promise<{
   manifest: WaveManifest;
   record: OperationRecord;
 }> {
-  if (bundle.version !== 1 || !bundle.waveId || !bundle.taskId || !bundle.operationId || !bundle.waveRoot) {
+  if (!bundle || bundle.version !== 1
+    || ![bundle.waveId, bundle.taskId].every((id) => typeof id === "string" && id.length > 0)
+    || typeof bundle.operationId !== "string" || !bundle.operationId
+    || typeof bundle.waveRoot !== "string" || !isAbsolute(bundle.waveRoot)
+    || !Number.isSafeInteger(bundle.expectedRevision) || bundle.expectedRevision < 0) {
     throw new Error("Invalid reattachment bundle.");
   }
+  validateSafeId(bundle.waveId, "waveId");
+  validateSafeId(bundle.taskId, "taskId");
   const waveRoot = await fs.realpath(resolve(bundle.waveRoot));
   if (!basename(waveRoot).startsWith("wave-")) throw new Error("Invalid wave root in reattachment bundle.");
   const manifestPath = join(waveRoot, "wave-manifest.json");

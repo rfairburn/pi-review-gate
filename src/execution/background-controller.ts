@@ -22,9 +22,9 @@ import {
   type PriorArchiveRecord,
 } from "./background-group-store";
 import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
-import { continueOperation, inspectOperation } from "./operation-actions";
+import { continueOperation, inspectOperation, readVerifiedAcceptedResult, verifyRecoveryCheckpoint } from "./operation-actions";
 import type { ReattachmentBundle } from "./operation-record";
-import { readOperationRecord } from "./operation-record";
+import { createReattachmentBundle, operationOwnershipStatus, readOperationRecord } from "./operation-record";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 import {
   appendActivity,
@@ -69,7 +69,7 @@ import { executeWave, type WaveProgressUpdate } from "./wave-controller";
 import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult } from "./wave-worker";
 import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
-import { researchWorkspaceChanges } from "./wave-commits";
+import { researchWorkspaceChanges, waveLineageOf } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
 import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
 
@@ -200,6 +200,7 @@ export interface BackgroundFaultContext {
  * step; throwing from a hook simulates that step failing.
  */
 export interface BackgroundFaultHooks {
+  materializeLandingConflicts?: (context: BackgroundFaultContext) => unknown;
   checkpointParent?: (context: BackgroundFaultContext) => unknown;
   save?: (context: BackgroundFaultContext) => unknown;
   publishAssociations?: (context: BackgroundFaultContext) => unknown;
@@ -253,6 +254,8 @@ export class BackgroundExecutionController {
   private readonly groups = new Map<string, BackgroundExecutionGroup>();
   private readonly runtimes = new Map<string, RuntimeTask>();
   private readonly pendingForceMerges = new Map<string, PendingForceMerge>();
+  /** Reserve command admission before recovery's first await, including bundle adoption. */
+  private readonly continuationAdmissions = new Set<string>();
   private readonly saveTails = new Map<string, Promise<void>>();
   private readonly steeringTails = new Map<string, Promise<void>>();
   private readonly archivedTasks = new Map<string, { updatedAt: string; integritySha256: string; executionId?: string; legacy?: boolean }>();
@@ -415,7 +418,21 @@ export class BackgroundExecutionController {
           });
         }
         for (const task of group.tasks) {
-          if (task.state === "stopped_for_application_exit" && task.bundle) {
+          if (group.kind === "execute" && task.waveRoot && !isArchivableTaskState(task.state)) {
+            try {
+              await this.recoverTaskAssociation(group, task);
+            } catch (error) {
+              this.addActivity(task, "recovery", `Checkpoint backfill refused: ${messageOf(error)}`);
+              if (task.state === "stopped_for_application_exit") {
+                transitionTaskState(task, "paused_recoverable");
+                task.summary = "Restart checkpoint verification failed; inspect before any executor is resumed.";
+              }
+            }
+          }
+          if (task.state === "stopped_for_application_exit" && task.result?.taskResults[0]?.acceptedCommitSha) {
+            transitionTaskState(task, "paused_recoverable");
+            task.summary = "Accepted checkpoint retained after restart; inspect and force-merge without rerunning the executor.";
+          } else if (task.state === "stopped_for_application_exit" && task.bundle) {
             const instructionId = `application-resume-${randomUUID()}`;
             task.pendingContinuation = {
               instructions: "Resume after the owning application restarted. Reinspect the preserved worktree and finish the original task without repeating completed work.",
@@ -641,6 +658,17 @@ export class BackgroundExecutionController {
    * synchronous via inspect(); every list discloses archivedCount omissions.
    */
   async inspectTask(executionId?: string, taskId?: string, offset?: number, lines?: number): Promise<BackgroundInspection> {
+    const group = this.resolveGroup(executionId);
+    for (const task of group.tasks.filter((task) => !taskId || task.taskId === taskId)) {
+      if (group.kind !== "execute" || !task.waveRoot || isArchivableTaskState(task.state)
+        || isActiveTaskState(task.state) || this.runtimes.has(task.taskId) || this.pendingForceMerges.has(task.taskId)) continue;
+      try {
+        await this.recoverTaskAssociation(group, task);
+      } catch (error) {
+        this.addActivity(task, "recovery", `Checkpoint backfill refused: ${messageOf(error)}`);
+      }
+      await this.save(group);
+    }
     try {
       return this.inspect(executionId, taskId, offset, lines);
     } catch (error) {
@@ -747,11 +775,35 @@ export class BackgroundExecutionController {
     instructionId: string;
     actor: "model" | "user";
   }): Promise<BackgroundInspection> {
+    const taskId = input.taskId ?? input.bundle?.taskId ?? this.resolveTask(input.executionId).task.taskId;
+    if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
+    if (this.continuationAdmissions.has(taskId)) throw new Error(`Task ${taskId} has a continuation admission in progress.`);
+    if (this.pendingForceMerges.has(taskId)) throw new Error(`Task ${taskId} has a force-merge in progress.`);
+    const epoch = this.detachEpoch;
+    this.continuationAdmissions.add(taskId);
+    try {
+      return await this.admitContinuation(input, epoch);
+    } finally {
+      this.continuationAdmissions.delete(taskId);
+    }
+  }
+
+  private async admitContinuation(
+    input: Parameters<BackgroundExecutionController["continueTask"]>[0],
+    epoch: number,
+  ): Promise<BackgroundInspection> {
     const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle);
     const { group, task } = target;
     const archiveOnly = target.archiveOnly === true;
-    if (isActiveTaskState(task.state)) throw new Error(`Task ${task.taskId} is already active.`);
-    const bundle = input.bundle ?? task.bundle;
+    this.assertContinuationAdmission(task, epoch);
+    if (group.kind === "execute" && (!task.bundle || input.bundle
+      || (!isArchivableTaskState(task.state) && task.result?.taskResults[0]?.acceptedCommitSha))) {
+      await this.recoverTaskAssociation(group, task, input.bundle);
+    }
+    // No await between this recheck and command/queue mutation. Recovery may
+    // have yielded to shutdown, detach, or another lifecycle state transition.
+    this.assertContinuationAdmission(task, epoch);
+    const bundle = task.bundle;
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) {
@@ -788,11 +840,144 @@ export class BackgroundExecutionController {
     return this.inspect(group.executionId, task.taskId);
   }
 
+  private assertContinuationAdmission(task: BackgroundTaskRecord, epoch: number): void {
+    if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== epoch) {
+      throw new Error("Application shutdown or controller detach began during continuation admission.");
+    }
+    if (isActiveTaskState(task.state) || this.runtimes.has(task.taskId)) throw new Error(`Task ${task.taskId} is already active.`);
+    if (this.pendingForceMerges.has(task.taskId)) throw new Error(`Task ${task.taskId} has a force-merge in progress.`);
+  }
+
+  /** Restore metadata from the task's already-owned wave, never from a guessed
+   * operation id. Inspection verifies the checkpoint and supplies the current
+   * revision; result evidence is separately tied to that exact checkpoint.
+   */
+  private async recoverTaskAssociation(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    explicit?: ReattachmentBundle,
+  ): Promise<void> {
+    if (group.kind === "research") return this.recoverResearchTaskAssociation(group, task, explicit);
+    if (!task.waveRoot) {
+      if (explicit) throw new Error("Recovery task has no durable wave ownership anchor.");
+      return;
+    }
+    const epoch = this.detachEpoch;
+    const ownedRoot = await realpath(task.waveRoot);
+    const bundle = explicit ?? task.bundle ?? createReattachmentBundle(
+      await readOperationRecord(join(ownedRoot, "artifacts", task.taskId, "operation.json")), ownedRoot,
+    );
+    if (bundle.taskId !== task.taskId || await realpath(bundle.waveRoot) !== ownedRoot
+      || (task.bundle && (bundle.operationId !== task.bundle.operationId || bundle.waveId !== task.bundle.waveId))) {
+      throw new Error("Recovery bundle does not match the task's durable wave/operation ownership.");
+    }
+    const inspection = await inspectOperation(bundle);
+    const capture = await readWaveCaptureRecord(ownedRoot);
+    if (await realpath(group.cwd) !== await realpath(this.input.cwd())
+      || await realpath(capture.discovery.requestedCwd) !== await realpath(group.cwd)
+      || await realpath(inspection.manifest.sourceRoot) !== await realpath(capture.discovery.captureRoot)
+      || inspection.bundle.waveId !== capture.waveId
+      || inspection.manifest.baseCommit !== capture.baseCommit
+      || await realpath(inspection.manifest.repositoryPath) !== await realpath(capture.repositoryPath)
+      || !inspection.manifest.task) {
+      throw new Error("Recovery bundle source/task ownership does not match this execution.");
+    }
+    if (explicit && inspection.staleBundle) {
+      throw new Error(`Stale reattachment bundle revision ${explicit.expectedRevision}; current operation revision is ${inspection.bundle.expectedRevision}. Inspect and retry with the returned bundle.`);
+    }
+    if (inspection.live) throw new Error("Recovery operation still has a live writer.");
+    if ((!task.bundle || explicit) && inspection.checkpointVerification.status !== "verified") {
+      throw new Error(`Recovery checkpoint is not verified: ${inspection.checkpointVerification.error ?? inspection.checkpointVerification.status}`);
+    }
+    const accepted = inspection.checkpointVerification.status === "verified"
+      ? await readVerifiedAcceptedResult(inspection) : undefined;
+    if (this.detachEpoch !== epoch || this.detaching > 0) throw new Error("Controller detached during recovery verification.");
+    task.bundle = { ...inspection.bundle };
+    if (accepted && (!task.result || task.result.taskResults[0]?.acceptedCommitSha !== accepted.acceptedCommitSha)) {
+      task.result = {
+        waveId: inspection.bundle.waveId, waveRoot: ownedRoot, sourceRoot: inspection.manifest.sourceRoot,
+        phase: "working", taskResults: [accepted],
+      };
+      task.summary ??= accepted.summary;
+    }
+    task.updatedAt = new Date().toISOString();
+  }
+
+  /** Research owns a capture and an operation, but deliberately no execute-wave
+   * manifest. Validate that retained operation/session rather than adopting it
+   * through inspectOperation's integration/landing protocol.
+   */
+  private async recoverResearchTaskAssociation(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    explicit?: ReattachmentBundle,
+  ): Promise<void> {
+    const prior = task.researchResult;
+    const owned = task.bundle ?? prior?.bundle;
+    const bundle = explicit ?? owned;
+    if (!task.waveRoot || !prior || !owned || !bundle) {
+      throw new Error("Research continuation requires its owned operation and prior durable result.");
+    }
+    const epoch = this.detachEpoch;
+    if (bundle.version !== 1 || bundle.taskId !== task.taskId || prior.taskId !== task.taskId
+      || bundle.operationId !== owned.operationId || bundle.waveId !== owned.waveId
+      || !Number.isSafeInteger(bundle.expectedRevision) || bundle.expectedRevision < 0) {
+      throw new Error("Research bundle does not match the task's durable operation ownership.");
+    }
+    const waveRoot = await realpath(task.waveRoot);
+    if (await realpath(bundle.waveRoot) !== waveRoot || await realpath(owned.waveRoot) !== waveRoot) {
+      throw new Error("Research bundle does not match the task's durable wave ownership.");
+    }
+    const capture = await readWaveCaptureRecord(waveRoot);
+    const artifactDir = await realpath(join(waveRoot, "artifacts", task.taskId));
+    const record = await readOperationRecord(join(artifactDir, "operation.json"));
+    const worktree = researchWorktree(capture, task.taskId);
+    if (record.operationId !== bundle.operationId || record.taskId !== task.taskId
+      || record.waveId !== bundle.waveId || capture.waveId !== bundle.waveId
+      || await realpath(record.artifactDir) !== artifactDir
+      || await realpath(record.worktreeRoot) !== await realpath(worktree.worktreeRoot)
+      || await realpath(record.effectiveCwd) !== await realpath(worktree.effectiveCwd)
+      || await realpath(group.cwd) !== await realpath(this.input.cwd())
+      || await realpath(capture.discovery.requestedCwd) !== await realpath(group.cwd)) {
+      throw new Error("Research bundle source/task ownership does not match this execution.");
+    }
+    if (bundle.expectedRevision > record.revision) throw new Error("Research bundle revision is newer than its owned operation.");
+    if (operationOwnershipStatus(record).processAlive || record.state === "failed_critical") {
+      throw new Error("Research operation still has a live writer or requires critical recovery.");
+    }
+    await verifyRecoveryCheckpoint(waveRoot, record, capture);
+    if (this.detachEpoch !== epoch || this.detaching > 0 || this.shuttingDown) {
+      throw new Error("Controller detached or shut down during research recovery verification.");
+    }
+    // Worker owner-release bookkeeping may advance the returned bundle's
+    // revision. Refresh only after validating its exact owned identity.
+    task.bundle = createReattachmentBundle(record, waveRoot);
+    task.updatedAt = new Date().toISOString();
+  }
+
   private async resolveOrAdoptTask(
     executionId?: string,
     taskId?: string,
     bundle?: ReattachmentBundle,
   ): Promise<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord; archiveOnly?: boolean }> {
+    if (bundle) {
+      // Stable task handles select the existing record, not missing bundle metadata.
+      // Verification happens before association; a failed check must never fall
+      // through to legacy adoption and create a replacement task.
+      const known = [...this.groups.values()].flatMap((group) => group.tasks
+        .filter((task) => task.taskId === (taskId ?? bundle.taskId))
+        .map((task) => ({ group, task })));
+      if (known.length) {
+        const matches = known.filter(({ group }) => !executionId || executionId === group.executionId);
+        if (matches.length !== 1) throw new Error("Recovery bundle task/execution ownership mismatch or ambiguous target.");
+        const target = matches[0]!;
+        if (this.runtimes.has(target.task.taskId) || isActiveTaskState(target.task.state)
+          || this.pendingForceMerges.has(target.task.taskId)) throw new Error("Recovery task still has a live or queued writer.");
+        await this.recoverTaskAssociation(target.group, target.task, bundle);
+        await this.save(target.group);
+        return target;
+      }
+    }
     try {
       return this.resolveTask(executionId, taskId, bundle);
     } catch (error) {
@@ -808,6 +993,7 @@ export class BackgroundExecutionController {
         const archived = await this.loadArchivedTask(group, taskId);
         if (!archived) throw error;
         const existing = group.tasks.find((candidate) => candidate.taskId === taskId);
+        if (bundle) await this.recoverTaskAssociation(group, existing ?? archived, bundle);
         if (existing) return { group, task: existing };
         return { group, task: archived, archiveOnly: true };
       }
@@ -864,6 +1050,7 @@ export class BackgroundExecutionController {
         this.groups.set(group.executionId, group);
       }
       const task = newTask(definition);
+      task.taskId = inspection.bundle.taskId;
       task.bundle = { ...inspection.bundle };
       task.waveRoot = inspection.bundle.waveRoot;
       transitionTaskState(task, "paused_recoverable");
@@ -1041,10 +1228,10 @@ export class BackgroundExecutionController {
     if (this.shuttingDown) throw new Error("Application shutdown is in progress.");
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
     if (group.kind === "research") throw new Error("Research tasks have reports, not mergeable checkpoints; force-merge is unavailable.");
+    if (this.continuationAdmissions.has(task.taskId)) throw new Error(`Task ${task.taskId} has a continuation admission in progress.`);
     if (this.runtimes.has(task.taskId) || isActiveTaskState(task.state)) {
       throw new Error(`Task ${task.taskId} still has a live or queued writer; interrupt and await acknowledgement before force-merge.`);
     }
-    if (!task.bundle) throw new Error(`Task ${task.taskId} has no verified recovery bundle.`);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) return this.inspect(group.executionId, task.taskId);
     if (this.pendingForceMerges.has(task.taskId)) {
@@ -1081,6 +1268,7 @@ export class BackgroundExecutionController {
     task: BackgroundTaskRecord,
     pending: PendingForceMerge,
   ): Promise<BackgroundInspection> {
+    await this.recoverTaskAssociation(group, task);
     const bundle = task.bundle;
     if (!bundle) throw new Error(`Task ${task.taskId} has no verified recovery bundle.`);
     const command: BackgroundCommandRecord = {
@@ -1107,15 +1295,22 @@ export class BackgroundExecutionController {
 
     const inspection = await inspectOperation(bundle);
     const checkpoint = inspection.record.checkpoint;
-    const accepted = task.result?.taskResults[0]?.acceptedCommitSha;
-    const commitSha = accepted ?? checkpoint?.commitSha;
-    if (!commitSha || (!accepted && !checkpoint?.verified)) {
+    const commitSha = checkpoint?.commitSha;
+    if (inspection.live || inspection.record.state === "failed_critical"
+      || inspection.manifest.sourceWorkspace.disposition === "recovery_required"
+      || inspection.checkpointVerification.status !== "verified" || !commitSha) {
       command.status = "failed";
-      command.error = "No accepted commit or verified checkpoint is available.";
+      command.error = "Force-merge requires a stopped verified checkpoint and no unresolved landing recovery; inspect operation ownership and recovery diagnostics.";
       await this.save(group);
       throw new Error(command.error);
     }
-    const capture = await readWaveCaptureRecord(bundle.waveRoot);
+    const originalCapture = await readWaveCaptureRecord(bundle.waveRoot);
+    const lineage = waveLineageOf(originalCapture);
+    const generation = inspection.record.generation;
+    const capture = generation > 0 ? {
+      ...originalCapture, waveId: `${lineage.rootWaveId}-g${generation}`,
+      rootWaveId: lineage.rootWaveId, continuationGeneration: generation,
+    } : originalCapture;
     const reviewWindowId = this.input.state.reviewWindow?.id;
     const parentBaseline = activeExchangeBaseline(this.input.state);
     const preTaskSnapshot = parentBaseline ? await createWorkspaceSnapshot(group.cwd, {
@@ -1144,6 +1339,7 @@ export class BackgroundExecutionController {
           await this.save(group);
           throw new Error(`${task.summary} Re-run SubtasksForceMerge with mergeAnyhow only if ordinary conflict markers should be materialized.`);
         }
+        await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
         const materialized = await materializeLandingConflicts(capture, plan, `forced subtask ${task.taskId}`);
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
         this.conflictGate = {
@@ -1818,6 +2014,13 @@ export class BackgroundExecutionController {
         await this.save(group);
         await this.publishAssociations();
       },
+      onWorkersSettled: async (result) => {
+        task.result = result;
+        task.bundle = result.taskResults[0]?.bundle;
+        task.summary = result.taskResults[0]?.summary;
+        await this.save(group);
+        await this.publishAssociations();
+      },
       onProgress: (update) => this.progress(group, task, update),
       onLiveControl: (_taskId, control) => {
         const runtime = this.runtimes.get(task.taskId);
@@ -1830,6 +2033,7 @@ export class BackgroundExecutionController {
       },
       takeDeferredSteering: () => this.takeDeferredSteering(group, task),
       onLandingConflict: async ({ capture, plan }) => {
+        await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
         const materialized = await materializeLandingConflicts(capture, plan, `subtask ${task.taskId}`);
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
         this.conflictGate = {
@@ -1969,7 +2173,28 @@ export class BackgroundExecutionController {
           });
         },
         takeDeferredSteering: () => this.takeDeferredSteering(group, task),
+        onWorkerSettled: async (lifecycle) => {
+          task.bundle = lifecycle.bundle ?? task.bundle;
+          task.result = {
+            waveId: task.bundle!.waveId, waveRoot: task.waveRoot!, sourceRoot: group.cwd,
+            phase: "working", taskResults: [{
+              taskId: lifecycle.taskId, title: lifecycle.title, status: lifecycle.status,
+              summary: lifecycle.summary, error: lifecycle.error,
+              acceptedRef: lifecycle.acceptedRef, acceptedCommitSha: lifecycle.acceptedCommitSha,
+              unreviewed: lifecycle.unreviewed, reviewReport: lifecycle.reviewReport,
+              reviewCycles: lifecycle.reviewCycles.map(({ cycle, baseCommit, candidateCommit, candidateTreeSha, candidateRef, verdict }) =>
+                ({ cycle, baseCommit, candidateCommit, candidateTreeSha, candidateRef, verdict })),
+              bundle: lifecycle.bundle, checkpoint: lifecycle.checkpoint,
+              operationRecord: lifecycle.operationRecord, diagnostics: lifecycle.diagnostics,
+              incidents: lifecycle.incidents, attempts: lifecycle.attempts,
+            }],
+          };
+          task.summary = lifecycle.summary;
+          await this.save(group);
+          await this.publishAssociations();
+        },
         onLandingConflict: async ({ capture, plan }) => {
+          await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
           const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
           await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
           this.activateConflictGate(group, task, materialized.paths, materialized.manifestPath, `Continued task ${task.taskId} requires immediate conflict resolution.`);

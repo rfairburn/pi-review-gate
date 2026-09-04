@@ -50,7 +50,7 @@ test("Claude executor uses Agent SDK streaming input for acknowledged live steer
   }
 });
 
-test("Claude research executor exposes only parent-authorized read-only tools", async () => {
+test("Claude research executor exposes the full supported parent-authorized catalog", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-research-"));
   try {
     const artifactDir = join(dir, "artifacts");
@@ -72,7 +72,8 @@ test("Claude research executor exposes only parent-authorized read-only tools", 
       artifactDir,
       turn: 1,
       workspaceAccess: "read-only",
-      allowedTools: ["read", "grep", "find", "WebFetch", "BrowserExtract", "bash"],
+      allowedTools: ["read", "grep", "find", "WebFetch", "WebSearch", "BrowserExtract", "bash"],
+      initialActiveTools: ["read", "WebFetch"],
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
@@ -80,14 +81,20 @@ test("Claude research executor exposes only parent-authorized read-only tools", 
     await run;
 
     assert.equal(capturedOptions?.permissionMode, "dontAsk");
-    assert.deepEqual(capturedOptions?.tools, ["Read", "Grep", "Glob", "WebFetch"]);
-    assert.deepEqual(capturedOptions?.allowedTools, ["Read", "Grep", "Glob", "WebFetch"]);
+    assert.deepEqual(capturedOptions?.tools, ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]);
+    assert.deepEqual(capturedOptions?.allowedTools, ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]);
     assert.deepEqual(capturedOptions?.settingSources, []);
     assert.deepEqual(capturedOptions?.plugins, []);
     assert.deepEqual(capturedOptions?.mcpServers, {});
     assert.equal(capturedOptions?.strictMcpConfig, true);
     assert.equal((await capturedOptions?.canUseTool("Read", {}, {})).behavior, "allow");
+    // WebSearch is allowed but intentionally absent from the durable future
+    // initial set, so this proves that set does not activate tools yet.
+    assert.equal((await capturedOptions?.canUseTool("WebSearch", {}, {})).behavior, "allow");
+    // The research-role projection still cannot widen into implementation or
+    // unsupported tools from the parent catalog.
     assert.equal((await capturedOptions?.canUseTool("Bash", {}, {})).behavior, "deny");
+    assert.equal((await capturedOptions?.canUseTool("BrowserExtract", {}, {})).behavior, "deny");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -11,6 +11,7 @@ import type { ReattachmentBundle } from "./operation-record";
 import type { ContinuationProgressUpdate, SubtaskProgressPhase } from "./types";
 import type { WaveProgressUpdate, WaveResult } from "./wave-controller";
 import type { WaveWorkerResult, WaveWorkerTask } from "./wave-worker";
+import { normalizeExecutorToolCatalog } from "./tool-catalog";
 
 /** Bounded per-task activity history retained durably and in memory. */
 export const MAX_ACTIVITY = 200;
@@ -142,9 +143,11 @@ export interface BackgroundTaskRecord {
 
 export function newTask(definition: BackgroundTaskDefinition): BackgroundTaskRecord {
   const now = new Date().toISOString();
+  const normalizedDefinition = JSON.parse(JSON.stringify(definition)) as BackgroundTaskDefinition;
+  normalizeExecutorToolCatalog(normalizedDefinition);
   return {
     taskId: `task-${randomUUID()}`,
-    definition: JSON.parse(JSON.stringify(definition)) as BackgroundTaskDefinition,
+    definition: normalizedDefinition,
     state: "queued",
     createdAt: now,
     updatedAt: now,
@@ -288,6 +291,7 @@ export function isArchivableTaskState(state: BackgroundTaskState): state is "lan
  * the bounded activity/history limits.
  */
 export function normalizeTaskHistory(task: BackgroundTaskRecord): void {
+  normalizeExecutorToolCatalog(task.definition);
   task.activity ??= [];
   task.commands ??= [];
   if (task.activity.length > MAX_ACTIVITY) task.activity.splice(0, task.activity.length - MAX_ACTIVITY);

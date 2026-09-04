@@ -19,7 +19,7 @@ import type { WaveIntegrationResult } from "./wave-integration";
 import { executeWaveLanding, inspectLandingRecoveryManifests, planWaveLanding, recoverLandingManifest, type LandingExecutionResult, type LandingPlan, type LandingRecoveryManifestInspection } from "./wave-landing";
 import { readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
 import { runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "./wave-worker-lifecycle";
-import { createTaskInstructionEvidenceRecorder, resumeWaveWorker, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
+import { createTaskInstructionEvidenceRecorder, persistTaskDefinition, resumeWaveWorker, synchronizeTaskAndOperationToolCatalog, type WaveWorkerResult, type WaveWorkerTask } from "./wave-worker";
 import { createWorkerWorktree, pinCommit, removeWorktree, type WorkerWorktree } from "./wave-worktrees";
 import { GIT_NO_LOCKS_ENV as GIT_ENV } from "./wave-validation";
 import {
@@ -377,6 +377,9 @@ export async function continueOperation(input: {
   const continuationLandingBase = previouslyLanded ? record.checkpoint.commitSha : undefined;
 
   const task = await readTask(record.artifactDir);
+  synchronizeTaskAndOperationToolCatalog(task, record);
+  await persistTaskDefinition(record.artifactDir, task);
+  await writeOperationRecord(record);
   const steeringEvidence = createTaskInstructionEvidenceRecorder(task, record.artifactDir);
   const publishLiveControl = (control: ExecutorLiveControl | undefined): void => {
     input.onLiveControl?.(steeringEvidence.wrap(control));

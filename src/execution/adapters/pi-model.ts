@@ -11,6 +11,7 @@ import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorInteractionA
 import type { ThinkingLevel } from "../../config";
 import { BackgroundProcessReadiness } from "../../background-process-readiness";
 import { assertNoPiToolPolicyArgs } from "../../pi-tool-policy";
+import { createExecutorToolCatalog } from "../tool-catalog";
 
 export interface PiExecutorOptions {
   model: string;
@@ -31,7 +32,15 @@ export class PiExecutorAdapter implements ExecutorAdapter {
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
     assertNoPiToolPolicyArgs(this.options.args ?? [], "Pi executor arguments");
     const thinkingLevel = this.options.thinkingLevel ?? "high";
-    const allowedTools = requireAllowedTools(request.allowedTools);
+    const toolCatalog = request.executorToolCatalog
+      ? createExecutorToolCatalog(
+          request.executorToolCatalog.allowedToolCatalog,
+          request.executorToolCatalog.initialActiveTools,
+        )
+      : createExecutorToolCatalog(requireAllowedTools(request.allowedTools), request.initialActiveTools);
+    // Deferred activation has no adapter bootstrap channel yet. Preserve the
+    // historical launch contract by authorizing every durable allowed tool.
+    const allowedTools = toolCatalog.allowedToolCatalog;
     const sessionId = request.session?.id ?? randomUUID();
     const sessionDir = join(request.artifactDir, "executor-sessions");
     await mkdir(sessionDir, { recursive: true });

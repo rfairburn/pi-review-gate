@@ -30,6 +30,13 @@ import {
   type ReattachmentBundle,
   type RecoveryCheckpoint,
 } from "./operation-record";
+import {
+  assignExecutorToolCatalog,
+  executorToolCatalogsEqual,
+  normalizeExecutorToolCatalog,
+  resolveExecutorToolCatalog,
+  type ExecutorToolCatalog,
+} from "./tool-catalog";
 
 // ── path rewriting for workspace isolation ───────────────────────────────────
 
@@ -91,7 +98,12 @@ export function rewriteTaskPaths(
       ? rewriteSourcePaths(task.relevantContext, sourceRoot, workerRoot)
       : undefined,
     backgroundKind: task.backgroundKind,
+    executorToolCatalog: task.executorToolCatalog ? {
+      allowedToolCatalog: [...task.executorToolCatalog.allowedToolCatalog],
+      initialActiveTools: [...task.executorToolCatalog.initialActiveTools],
+    } : undefined,
     executorAllowedTools: task.executorAllowedTools ? [...task.executorAllowedTools] : undefined,
+    executorInitialActiveTools: task.executorInitialActiveTools ? [...task.executorInitialActiveTools] : undefined,
     authoritativeUpdates: task.authoritativeUpdates?.map((item) => ({
       ...item,
       instruction: rewriteSourcePaths(item.instruction, sourceRoot, workerRoot),
@@ -134,12 +146,12 @@ export interface WaveWorkerTask {
   relevantContext?: string;
   /** Persisted background role for recovery-bundle adoption. */
   backgroundKind?: "execute" | "research";
-  /**
-   * Durable snapshot of the parent agent's active tools. Pi
-   * executor launches reuse this allowlist across retries, compaction, and
-   * continuation so a parent CLI restriction cannot be widened by spawning.
-   */
+  /** Canonical durable authorization and initial-activation contract. */
+  executorToolCatalog?: ExecutorToolCatalog;
+  /** @deprecated Compatibility mirror of executorToolCatalog.allowedToolCatalog. */
   executorAllowedTools?: string[];
+  /** Compatibility mirror of executorToolCatalog.initialActiveTools. */
+  executorInitialActiveTools?: string[];
   /** Acknowledged steering in delivery order. Later entries supersede conflicting earlier task text. */
   authoritativeUpdates?: Array<{
     instructionId: string;
@@ -147,6 +159,23 @@ export interface WaveWorkerTask {
     instruction: string;
     acknowledgedAt: string;
   }>;
+}
+
+/**
+ * Reconcile the independently durable task and operation copies. A mismatch
+ * in a new-format record fails closed; one-sided/legacy records are upgraded
+ * to the available contract and retain full-active compatibility.
+ */
+export function synchronizeTaskAndOperationToolCatalog(task: WaveWorkerTask, operation: OperationRecord): ExecutorToolCatalog | undefined {
+  const taskCatalog = normalizeExecutorToolCatalog(task);
+  const operationCatalog = normalizeExecutorToolCatalog(operation);
+  if (taskCatalog && operationCatalog && !executorToolCatalogsEqual(taskCatalog, operationCatalog)) {
+    throw new Error("Executor tool catalog mismatch between durable task and operation records.");
+  }
+  const catalog = operationCatalog ?? taskCatalog;
+  assignExecutorToolCatalog(task, catalog);
+  assignExecutorToolCatalog(operation, catalog);
+  return catalog;
 }
 
 /** Persist acknowledged steering for executors, reviewers, and restart recovery. */
@@ -728,13 +757,16 @@ async function runWithPoolFailover(input: {
       executorTurn: startingTurn,
     });
 
+    const executorToolCatalog = resolveExecutorToolCatalog(input.worker.task);
     const recovered = await runExecutorWithRecovery({
       adapter,
       request: {
         cwd: input.worker.worktree.effectiveCwd,
         artifactDir: input.resolvedArtifactDir,
         workspaceAccess: input.worker.task.backgroundKind === "research" ? "read-only" : "workspace-write",
-        allowedTools: input.worker.task.executorAllowedTools,
+        executorToolCatalog,
+        allowedTools: executorToolCatalog?.allowedToolCatalog,
+        initialActiveTools: executorToolCatalog?.initialActiveTools,
         signal: input.worker.signal,
         onUpdate: (message) => reportProgress(input.worker, {
           phase: "executing",
@@ -822,6 +854,7 @@ async function runWithPoolFailover(input: {
  */
 export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerResult> {
   const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases } = input;
+  normalizeExecutorToolCatalog(task);
 
   // ── Validate artifact directory (before mkdir) ──
   const resolvedArtifactDir = resolve(artifactDir);
@@ -893,6 +926,7 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     effectiveCwd: worktree.effectiveCwd,
     artifactDir: resolvedArtifactDir,
     retryBudget: config.execution?.retryPolicy?.maxRetries ?? DEFAULT_EXECUTION_RETRY_POLICY.maxRetries,
+    executorToolCatalog: normalizeExecutorToolCatalog(task),
   });
   await writeOperationRecord(operation);
 
@@ -1109,6 +1143,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   await assertWorktreeBelongsToRepo(worktree.worktreeRoot, capture);
 
   const operation = await readOperationRecord(operationRecordPath(resolvedArtifactDir));
+  synchronizeTaskAndOperationToolCatalog(task, operation);
   operation.state = "running";
   const priorExecutorSelection = operation.executorSelection;
   const assignment = input.executorAssignment ?? (config.execution?.executorPool !== undefined

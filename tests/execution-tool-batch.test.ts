@@ -481,7 +481,13 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.match(result.content[0].text, new RegExp(result.details.tasks[0].taskId));
   assert.match(result.content[0].text, /Task handles \(retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect\)/);
   assert.match(result.content[0].text, /executor assigned; startup in progress/);
-  assert.deepEqual(result.details.tasks[0].definition.executorAllowedTools, ["read", "bash", ...executionToolNames]);
+  const activeCatalog = ["read", "bash", ...executionToolNames];
+  assert.deepEqual(result.details.tasks[0].definition.executorAllowedTools, activeCatalog);
+  assert.deepEqual(result.details.tasks[0].definition.executorToolCatalog, {
+    allowedToolCatalog: activeCatalog,
+    initialActiveTools: activeCatalog,
+  });
+  assert.deepEqual(result.details.tasks[0].definition.executorInitialActiveTools, activeCatalog);
   assert.deepEqual(result.details.tasks[0].timing, {
     queueMs: result.details.tasks[0].timing.queueMs,
     captureMs: 0,
@@ -516,7 +522,12 @@ test("SubtasksStart creates immutable research groups without child-local eviden
 
   assert.equal(started.details.kind, "research");
   assert.match(started.content[0].text, /research group/);
-  assert.deepEqual(started.details.tasks[0].definition.executorAllowedTools, ["read", "WebSearch", "WebFetch", "BrowserExtract"]);
+  const researchCatalog = ["read", "WebSearch", "WebFetch", "BrowserExtract"];
+  assert.deepEqual(started.details.tasks[0].definition.executorAllowedTools, researchCatalog);
+  assert.deepEqual(started.details.tasks[0].definition.executorToolCatalog, {
+    allowedToolCatalog: researchCatalog,
+    initialActiveTools: researchCatalog,
+  });
   assert.equal(started.details.tasks[0].definition.backgroundKind, "research");
   assert.equal(manager.reviewReadiness()[0]?.kind, "research");
 
@@ -530,7 +541,11 @@ test("SubtasksStart creates immutable research groups without child-local eviden
   }, undefined, undefined, {});
   assert.equal(added.details.kind, "research");
   assert.equal(added.details.tasks[1].definition.backgroundKind, "research");
-  assert.deepEqual(added.details.tasks[1].definition.executorAllowedTools, ["read", "WebSearch", "WebFetch", "BrowserExtract"]);
+  assert.deepEqual(added.details.tasks[1].definition.executorAllowedTools, researchCatalog);
+  assert.deepEqual(added.details.tasks[1].definition.executorToolCatalog, {
+    allowedToolCatalog: researchCatalog,
+    initialActiveTools: researchCatalog,
+  });
   await manager.shutdown();
 });
 

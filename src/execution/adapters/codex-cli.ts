@@ -9,6 +9,7 @@ import type {
   ExecutorRequest,
   ExecutorTurn,
 } from "../types";
+import { createExecutorToolCatalog } from "../tool-catalog";
 
 interface JsonRpcResponse {
   id: number;
@@ -43,7 +44,17 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
     const startedAt = Date.now();
     const sandbox = request.workspaceAccess === "read-only" ? "read-only" : "workspace-write";
     if (sandbox === "read-only") assertCodexResearchArgsSafe(this.config.args);
-    const researchConfig = sandbox === "read-only" ? codexResearchThreadConfig(request.allowedTools) : undefined;
+    const toolCatalog = request.executorToolCatalog
+      ? createExecutorToolCatalog(
+          request.executorToolCatalog.allowedToolCatalog,
+          request.executorToolCatalog.initialActiveTools,
+        )
+      : request.allowedTools
+        ? createExecutorToolCatalog(request.allowedTools, request.initialActiveTools)
+        : undefined;
+    // Codex has no adapter-specific deferred activation channel. Until it
+    // does, preserve the full role-authorized research catalog.
+    const researchConfig = sandbox === "read-only" ? codexResearchThreadConfig(toolCatalog?.allowedToolCatalog) : undefined;
     const proc = spawn(this.config.command ?? "codex", [
       ...(this.config.args ?? []),
       "app-server",

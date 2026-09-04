@@ -54,7 +54,10 @@ test("Pi executor child loads the review-gate extension in executor role without
         prompt: "research task",
         artifactDir,
         turn: 1,
-        allowedTools: ["read", "WebSearch", "WebFetch", "BrowserExtract"],
+        executorToolCatalog: {
+          allowedToolCatalog: ["read", "WebSearch", "WebFetch", "BrowserExtract"],
+          initialActiveTools: ["read", "WebFetch"],
+        },
       });
       assert.equal(result.text, "research complete");
       const captured = JSON.parse(await readFile(capture, "utf8")) as { argv: string[]; env: Record<string, string | undefined> };
@@ -207,7 +210,7 @@ test("Pi stays alive for ShellStart work and accepts steering while its agent is
   }
 });
 
-test("Codex executor uses app-server turn steering with exact thread and turn ids", async () => {
+test("Codex research executor preserves the full allowed catalog with app-server steering", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-codex-app-server-"));
   try {
     const artifactDir = join(root, "artifacts");
@@ -237,6 +240,7 @@ test("Codex executor uses app-server turn steering with exact thread and turn id
       turn: 1,
       workspaceAccess: "read-only",
       allowedTools: ["read", "WebSearch"],
+      initialActiveTools: ["read"],
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
@@ -251,6 +255,8 @@ test("Codex executor uses app-server turn steering with exact thread and turn id
     assert.equal(steer.params.clientUserMessageId, "durable-steer-id");
     const threadStart = calls.find((call) => call.method === "thread/start");
     assert.equal(threadStart.params.sandbox, "read-only");
+    // WebSearch remains available because it is role-authorized, even though
+    // the durable future initial set does not include it.
     assert.equal(threadStart.params.config.web_search, "live");
     assert.deepEqual(threadStart.params.config.mcp_servers, {});
     assert.equal(threadStart.params.config.apps._default.enabled, false);

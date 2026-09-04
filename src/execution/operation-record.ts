@@ -5,6 +5,11 @@ import { join } from "node:path";
 import { atomicWrite } from "./durable-write";
 import type { ExecutorSession } from "./types";
 import type { ExecutorSelection } from "../config";
+import {
+  assignExecutorToolCatalog,
+  normalizeExecutorToolCatalog,
+  type ExecutorToolCatalog,
+} from "./tool-catalog";
 
 export type TerminalSafetyCode =
   | "recovery_state_corrupt_or_unverifiable"
@@ -132,6 +137,11 @@ export interface OperationRecord {
   executorEntryId?: string;
   executorPriority?: number;
   executorSelection?: ExecutorSelection;
+  /** Canonical durable authorization and initial activation for every attempt. */
+  executorToolCatalog?: ExecutorToolCatalog;
+  /** @deprecated Compatibility mirror for older operation consumers. */
+  executorAllowedTools?: string[];
+  executorInitialActiveTools?: string[];
   session?: ExecutorSession;
   generation: number;
   retryBudget: number;
@@ -331,9 +341,10 @@ export function createOperationRecord(input: {
   effectiveCwd: string;
   artifactDir: string;
   retryBudget: number;
+  executorToolCatalog?: ExecutorToolCatalog;
 }): OperationRecord {
   const now = new Date().toISOString();
-  return {
+  const record: OperationRecord = {
     version: 1,
     revision: 0,
     operationId: `${input.waveId}/${input.taskId}`,
@@ -354,6 +365,8 @@ export function createOperationRecord(input: {
     createdAt: now,
     updatedAt: now,
   };
+  assignExecutorToolCatalog(record, input.executorToolCatalog);
+  return record;
 }
 
 export function createIncident(input: Omit<ExecutionIncident, "incidentId" | "occurredAt">): ExecutionIncident {
@@ -390,6 +403,7 @@ export async function readOperationRecord(path: string): Promise<OperationRecord
   record.assignments ??= [];
   record.instructions ??= [];
   record.nextInstructionSequence ??= record.instructions.length + 1;
+  normalizeExecutorToolCatalog(record);
   return record;
 }
 

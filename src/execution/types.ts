@@ -1,5 +1,6 @@
 import type { TokenUsage } from "../usage";
 import type { PiLifecycleSummary } from "../usage";
+import type { ExecutorToolCatalog } from "./tool-catalog";
 
 export interface ExecutorSession {
   adapter: string;
@@ -29,8 +30,12 @@ export interface ExecutorRequest {
   turn: number;
   /** Filesystem capability assigned by the parent worker role. Defaults to workspace-write. */
   workspaceAccess?: "read-only" | "workspace-write";
-  /** Durable parent tool allowlist. Required by Pi-native child launches. */
+  /** Canonical durable authorization and initial-activation contract. */
+  executorToolCatalog?: ExecutorToolCatalog;
+  /** @deprecated Compatibility mirror for adapters that consume only an allowlist. */
   allowedTools?: readonly string[];
+  /** Compatibility mirror for durable future deferred-activation intent. */
+  initialActiveTools?: readonly string[];
   signal?: AbortSignal;
   session?: ExecutorSession;
   recovery?: {

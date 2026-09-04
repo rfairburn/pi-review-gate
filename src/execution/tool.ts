@@ -22,6 +22,11 @@ import {
 } from "./subtask-notifications";
 import { randomUUID } from "node:crypto";
 import { parseDuration } from "../background-shell/jobs";
+import {
+  assignExecutorToolCatalog,
+  createExecutorToolCatalog,
+  resolveExecutorToolCatalog,
+} from "./tool-catalog";
 
 const ACTIONS = ["start", "add", "inspect", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean"] as const;
 type Action = typeof ACTIONS[number];
@@ -474,12 +479,22 @@ export class ExecutionToolManager {
       throw new Error(`${kind === "research" ? "Research" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
     }
     const childTools = kind === "research" ? researchToolIntersection(allowedTools) : allowedTools;
-    return tasks.map((task) => ({
-      ...task,
-      backgroundKind: kind,
-      acceptanceCriteria: [...task.acceptanceCriteria],
-      executorAllowedTools: [...childTools],
-    }));
+    return tasks.map((task) => {
+      // Validate any supplied contract, but preserve only an explicitly named
+      // initial set. The legacy executorAllowedTools field was historically
+      // overwritten by the authoritative parent snapshot and is not an
+      // activation request.
+      resolveExecutorToolCatalog(task);
+      const explicitInitial = task.executorToolCatalog?.initialActiveTools ?? task.executorInitialActiveTools;
+      const catalog = createExecutorToolCatalog(childTools, explicitInitial);
+      const definition: BackgroundTaskDefinition = {
+        ...task,
+        backgroundKind: kind,
+        acceptanceCriteria: [...task.acceptanceCriteria],
+      };
+      assignExecutorToolCatalog(definition, catalog);
+      return definition;
+    });
   }
 }
 

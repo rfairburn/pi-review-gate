@@ -16,6 +16,7 @@ import { parseClaudeUsage } from "../../usage";
 import { ClaudeStreamJsonParser, ClaudeStreamActivityExtractor } from "../progress";
 import { writeExecutorArtifacts } from "../artifacts";
 import type { ExecutorAdapter, ExecutorInteractionAcknowledgement, ExecutorRequest, ExecutorTurn } from "../types";
+import { createExecutorToolCatalog } from "../tool-catalog";
 
 const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<typeof import("@anthropic-ai/claude-agent-sdk")>;
 
@@ -68,7 +69,17 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
     const readOnly = request.workspaceAccess === "read-only";
-    const researchTools = readOnly ? claudeResearchTools(request.allowedTools) : [];
+    const toolCatalog = request.executorToolCatalog
+      ? createExecutorToolCatalog(
+          request.executorToolCatalog.allowedToolCatalog,
+          request.executorToolCatalog.initialActiveTools,
+        )
+      : request.allowedTools
+        ? createExecutorToolCatalog(request.allowedTools, request.initialActiveTools)
+        : undefined;
+    // Claude has no adapter-specific deferred activation channel. Until it
+    // does, preserve the full role-authorized research catalog.
+    const researchTools = readOnly ? claudeResearchTools(toolCatalog?.allowedToolCatalog) : [];
     if (readOnly) assertClaudeResearchArgsSafe(this.config.args);
     const requestedSessionId = request.session?.id ?? randomUUID();
     const initialUuid = randomUUID();

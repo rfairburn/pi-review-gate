@@ -9,11 +9,52 @@ const projectRoot = path.resolve(__dirname, "..");
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pi-review-package-smoke-"));
 try {
   const cache = path.join(scratch, "npm-cache");
-  const packedName = execFileSync("npm", ["pack", "--silent", "--pack-destination", scratch], {
-    cwd: projectRoot,
-    env: { ...process.env, npm_config_cache: cache },
-    encoding: "utf8",
-  }).trim().split(/\r?\n/).at(-1);
+  // Stage the packaged inputs in scratch so the smoke never depends on (or
+  // touches) the checkout's ignored live dist. CI runs test:fast before
+  // test:package, which produces only dist-test; there is no production dist to
+  // pack, so we compile fresh output into the staging tree below.
+  const stage = path.join(scratch, "package");
+  fs.mkdirSync(stage);
+  for (const entry of [
+    "package.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "LICENSES",
+    "scripts",
+    "skills",
+    "examples",
+    "docs",
+  ]) {
+    fs.cpSync(path.join(projectRoot, entry), path.join(stage, entry), { recursive: true });
+  }
+
+  // Build production output only into the staging tree. The --outDir override
+  // keeps the checkout's dist absent or untouched; source is read from the
+  // project (rootDir in tsconfig.json) and written to stage/dist.
+  execFileSync(
+    process.execPath,
+    [
+      require.resolve("typescript/bin/tsc"),
+      "-p",
+      path.join(projectRoot, "tsconfig.json"),
+      "--outDir",
+      path.join(stage, "dist"),
+    ],
+    { cwd: projectRoot, stdio: "pipe" },
+  );
+
+  // --ignore-scripts disables the prepack lifecycle script so packing cannot
+  // clean or rebuild the live dist; the staged production output is already present.
+  const packedName = execFileSync(
+    "npm",
+    ["pack", "--silent", "--ignore-scripts", "--pack-destination", scratch],
+    {
+      cwd: stage,
+      env: { ...process.env, npm_config_cache: cache },
+      encoding: "utf8",
+    },
+  ).trim().split(/\r?\n/).at(-1);
   assert.ok(packedName, "npm pack did not report a tarball");
   const tarball = path.join(scratch, packedName);
   const consumer = path.join(scratch, "consumer");
@@ -31,14 +72,33 @@ try {
     "scripts/ensure-ddgs.sh",
     "scripts/ddgs-search.py",
     "scripts/orchestrator-system-prompt.md",
+    "scripts/check-docs.cjs",
     "skills/orchestrator/SKILL.md",
     "skills/orchestrator/references/recovery.md",
     "scripts/fake-reviewer.cjs",
     "LICENSES/Apache-2.0.txt",
     "NOTICE",
+    // Public documentation tree (required to ship in the npm package).
+    "docs/README.md",
+    "docs/getting-started.md",
+    "docs/configuration.md",
+    "docs/review-workflow.md",
+    "docs/delegated-execution.md",
+    "docs/web-tools.md",
+    "docs/security-model.md",
+    "docs/recovery.md",
+    "docs/development.md",
+    "docs/troubleshooting.md",
   ]) {
     assert.ok(fs.statSync(path.join(installed, required)).isFile(), `missing packed file: ${required}`);
   }
+  // Validate the installed package layout with the same deterministic docs rules
+  // (links, anchors, reachability, fenced JSON, referenced paths) used in-repo.
+  execFileSync(
+    process.execPath,
+    [path.join(projectRoot, "scripts", "check-docs.cjs"), installed],
+    { stdio: "pipe" },
+  );
   fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate"), fs.constants.X_OK);
   process.stdout.write(`package smoke passed: ${packedName}\n`);
 } finally {

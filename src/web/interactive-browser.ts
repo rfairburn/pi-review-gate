@@ -35,6 +35,11 @@ export interface InteractiveBrowserLimits {
   maxMainDocumentRequests: number;
   maxSnapshotChars: number;
   maxSnapshotDepth: number;
+  maxScreenshotWidth: number;
+  maxScreenshotHeight: number;
+  maxScreenshotPixels: number;
+  maxScreenshotBytes: number;
+  maxScreenshotAllocationBytes: number;
   navigationMs: number;
   actionMs: number;
   idleMs: number;
@@ -55,6 +60,11 @@ export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Ob
   maxMainDocumentRequests: 32,
   maxSnapshotChars: 24_000,
   maxSnapshotDepth: 16,
+  maxScreenshotWidth: 2_000,
+  maxScreenshotHeight: 2_000,
+  maxScreenshotPixels: 4_000_000,
+  maxScreenshotBytes: 4 * 1024 * 1024,
+  maxScreenshotAllocationBytes: 32 * 1024 * 1024,
   navigationMs: 30_000,
   actionMs: 10_000,
   idleMs: 60_000,
@@ -103,6 +113,34 @@ export interface BrowserSnapshotResult {
   };
 }
 
+export type BrowserScreenshotMode = "viewport" | "element";
+
+export interface BrowserScreenshotMetadata {
+  session: string;
+  tab: string;
+  generation: string;
+  url: string;
+  title: string;
+  mode: BrowserScreenshotMode;
+  ref?: string;
+  mimeType: "image/png";
+  width: number;
+  height: number;
+  encodedBytes: number;
+  limits: {
+    maxWidth: number;
+    maxHeight: number;
+    maxPixels: number;
+    maxEncodedBytes: number;
+    maxAllocationBytes: number;
+  };
+}
+
+export interface BrowserScreenshotResult {
+  image: Buffer;
+  metadata: BrowserScreenshotMetadata;
+}
+
 export interface BrowserCloseResult {
   session: string;
   closed: true;
@@ -144,6 +182,7 @@ interface Session {
   operationRedirects: number;
   operationActive: boolean;
   fatalError?: Error;
+  semanticRefs: Map<string, { generation: string; playwrightRef: string }>;
   teardown?: Promise<BrowserCloseResult>;
   expiryTimer?: NodeJS.Timeout;
   idleTimer?: NodeJS.Timeout;
@@ -245,6 +284,8 @@ export class InteractiveBrowserManager {
       contextPromise = browser.newContext({
         acceptDownloads: false,
         javaScriptEnabled: true,
+        viewport: { width: 1_280, height: 720 },
+        deviceScaleFactor: 1,
         serviceWorkers: "block",
         permissions: [],
         userAgent: this.config.userAgent,
@@ -273,6 +314,7 @@ export class InteractiveBrowserManager {
         mainDocumentRequests: 0,
         operationRedirects: 0,
         operationActive: true,
+        semanticRefs: new Map(),
       };
       pendingFatal = (error) => this.failSession(session, error);
       context.on("page", (candidate) => {
@@ -361,10 +403,20 @@ export class InteractiveBrowserManager {
           timeout: operation.remainingMs(),
           signal: operation.signal,
         }), "ARIA snapshot acquisition");
-        let refs = 0;
-        const semantic = raw.replace(/\[ref=[^\]\r\n]+\]/g, () => {
-          refs += 1;
-          return `[ref=${capturedGeneration}_${this.uniqueHandle("ref")}]`;
+        const capturedRefs = new Map<string, { generation: string; playwrightRef: string }>();
+        let transformedDelta = 0;
+        const semantic = raw.replace(/\[ref=([^\]\r\n]+)\]/g, (match, playwrightRef: string, rawOffset: number) => {
+          const opaqueRef = `${capturedGeneration}_${this.uniqueHandle("ref")}`;
+          const replacement = `[ref=${opaqueRef}]`;
+          const transformedStart = rawOffset + transformedDelta;
+          transformedDelta += replacement.length - match.length;
+          // Never retain refs beyond the bounded model-visible output. This
+          // keeps the per-session capability map bounded even if Playwright
+          // produces a very large semantic tree.
+          if (transformedStart + replacement.length <= limit && /^(?:f\d+)?e\d+$/.test(playwrightRef)) {
+            capturedRefs.set(opaqueRef, { generation: capturedGeneration, playwrightRef });
+          }
+          return replacement;
         });
         const snapshot = semantic.slice(0, limit);
         const snapshotUrl = publicPageUrl(session.page.url());
@@ -372,6 +424,11 @@ export class InteractiveBrowserManager {
         if (session.generation !== capturedGeneration) {
           throw new Error("Browser document changed during semantic snapshot capture; snapshot rejected.");
         }
+        // Only refs wholly present in the returned, bounded snapshot remain
+        // current. A new snapshot replaces this map rather than accumulating
+        // page-controlled references for the session lifetime.
+        session.semanticRefs.clear();
+        for (const [opaqueRef, ref] of capturedRefs) session.semanticRefs.set(opaqueRef, ref);
         return {
           session: session.handle,
           tab: session.tab,
@@ -379,12 +436,109 @@ export class InteractiveBrowserManager {
           url: snapshotUrl,
           title,
           snapshot,
-          refs,
+          refs: session.semanticRefs.size,
           truncation: {
             truncated: semantic.length > snapshot.length,
             originalChars: semantic.length,
             returnedChars: snapshot.length,
             maxChars: limit,
+          },
+        };
+      } finally {
+        operation.dispose();
+      }
+    }, true);
+  }
+
+  async screenshot(
+    sessionHandle: string,
+    tabHandle: string,
+    mode: BrowserScreenshotMode,
+    ref: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<BrowserScreenshotResult> {
+    if (mode !== "viewport" && mode !== "element") {
+      throw new Error("BrowserScreenshot mode must be viewport or element.");
+    }
+    const session = this.requireSession(sessionHandle, tabHandle);
+    return this.operate(session, signal, async () => {
+      const operation = new OperationDeadline("BrowserScreenshot", this.limits.actionMs, signal);
+      try {
+        const capturedGeneration = session.generation;
+        let image: Buffer;
+        if (mode === "viewport") {
+          if (ref !== undefined) throw new Error("BrowserScreenshot viewport mode does not accept ref.");
+          const viewport = session.page.viewportSize();
+          if (!viewport) throw new Error("BrowserScreenshot could not determine the bounded browser viewport.");
+          assertScreenshotDimensions(viewport.width, viewport.height, this.limits, "viewport");
+          image = await operation.run(session.page.screenshot({
+            type: "png",
+            fullPage: false,
+            animations: "disabled",
+            caret: "hide",
+            scale: "css",
+            timeout: operation.remainingMs(),
+          }), "viewport screenshot acquisition");
+        } else {
+          if (!ref) throw new Error("BrowserScreenshot element mode requires a current ref from BrowserSnapshot.");
+          const semanticRef = session.semanticRefs.get(ref);
+          if (!semanticRef || semanticRef.generation !== capturedGeneration) throw invalidRefError();
+          const locator = session.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
+          await operation.run(locator.scrollIntoViewIfNeeded({
+            timeout: operation.remainingMs(),
+            signal: operation.signal,
+          }), "element positioning");
+          const box = await operation.run(locator.boundingBox({ timeout: operation.remainingMs() }), "element bounds acquisition");
+          if (!box) throw new Error("BrowserScreenshot element is not currently visible; take a fresh BrowserSnapshot and retry.");
+          const viewport = session.page.viewportSize();
+          if (!viewport) throw new Error("BrowserScreenshot could not determine the bounded browser viewport.");
+          const clip = boundedElementClip(box, viewport, this.limits);
+          // Capture an immutable, already-validated clip rather than asking
+          // Locator.screenshot to resolve the element again. The element may
+          // resize or move after boundingBox (including animation changes),
+          // but it cannot expand the encoded image or browser allocation
+          // beyond these fixed dimensions. Leaving animations enabled also
+          // avoids Playwright fast-forwarding a finite animation after the
+          // preflight and changing the element's size.
+          image = await operation.run(session.page.screenshot({
+            type: "png",
+            fullPage: false,
+            clip,
+            animations: "allow",
+            caret: "hide",
+            scale: "css",
+            timeout: operation.remainingMs(),
+          }), "bounded element clip acquisition");
+        }
+
+        throwIfAborted(operation.signal);
+        const dimensions = validatePngScreenshot(image, this.limits);
+        const snapshotUrl = publicPageUrl(session.page.url());
+        const title = bounded(await operation.run(session.page.title(), "browser title read"), 500);
+        if (session.generation !== capturedGeneration) {
+          throw new Error("Browser document changed during screenshot capture; screenshot rejected.");
+        }
+        return {
+          image,
+          metadata: {
+            session: session.handle,
+            tab: session.tab,
+            generation: capturedGeneration,
+            url: snapshotUrl,
+            title,
+            mode,
+            ...(mode === "element" ? { ref } : {}),
+            mimeType: "image/png",
+            width: dimensions.width,
+            height: dimensions.height,
+            encodedBytes: image.byteLength,
+            limits: {
+              maxWidth: this.limits.maxScreenshotWidth,
+              maxHeight: this.limits.maxScreenshotHeight,
+              maxPixels: this.limits.maxScreenshotPixels,
+              maxEncodedBytes: this.limits.maxScreenshotBytes,
+              maxAllocationBytes: this.limits.maxScreenshotAllocationBytes,
+            },
           },
         };
       } finally {
@@ -457,6 +611,7 @@ export class InteractiveBrowserManager {
     // Invalidate every prior semantic reference before navigation starts,
     // including failed navigation attempts that may replace the document.
     session.generation = this.uniqueHandle("generation");
+    session.semanticRefs.clear();
     let response: Response | null;
     try {
       response = await operation.run(
@@ -500,7 +655,9 @@ export class InteractiveBrowserManager {
       }
     });
     session.page.on("framenavigated", (frame) => {
-      if (frame === session.page.mainFrame()) session.generation = this.uniqueHandle("generation");
+      if (frame !== session.page.mainFrame()) return;
+      session.generation = this.uniqueHandle("generation");
+      session.semanticRefs.clear();
     });
     session.page.on("dialog", (dialog) => void dialog.dismiss());
     session.page.on("download", (download) => void download.cancel());
@@ -893,6 +1050,95 @@ function publicPageUrl(rawUrl: string): string {
 
 function invalidHandleError(): Error {
   return new Error("Invalid or stale browser session/tab handle.");
+}
+
+function invalidRefError(): Error {
+  return new Error("Invalid or stale browser semantic ref; take a fresh BrowserSnapshot for the current session, tab, and document.");
+}
+
+function boundedElementClip(
+  box: { x: number; y: number; width: number; height: number },
+  viewport: { width: number; height: number },
+  limits: Readonly<InteractiveBrowserLimits>,
+): { x: number; y: number; width: number; height: number } {
+  if (![box.x, box.y, box.width, box.height].every(Number.isFinite)) {
+    throw new Error("BrowserScreenshot element has invalid bounds.");
+  }
+  // Use an enclosing integer clip so fractional CSS pixels cannot increase the
+  // decoded output beyond the preflight calculation.
+  const x = Math.floor(box.x);
+  const y = Math.floor(box.y);
+  const right = Math.ceil(box.x + box.width);
+  const bottom = Math.ceil(box.y + box.height);
+  const width = right - x;
+  const height = bottom - y;
+  assertScreenshotDimensions(width, height, limits, "element clip");
+  if (x < 0 || y < 0 || right > viewport.width || bottom > viewport.height) {
+    throw new Error(
+      "BrowserScreenshot element does not fit completely within the bounded viewport after positioning.",
+    );
+  }
+  return { x, y, width, height };
+}
+
+function assertScreenshotDimensions(
+  width: number,
+  height: number,
+  limits: Readonly<InteractiveBrowserLimits>,
+  label: string,
+): void {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new Error(`BrowserScreenshot ${label} has invalid dimensions.`);
+  }
+  const normalizedWidth = Math.ceil(width);
+  const normalizedHeight = Math.ceil(height);
+  const pixels = normalizedWidth * normalizedHeight;
+  const rawAllocation = pixels * 4;
+  if (
+    normalizedWidth > limits.maxScreenshotWidth
+    || normalizedHeight > limits.maxScreenshotHeight
+    || !Number.isSafeInteger(pixels)
+    || pixels > limits.maxScreenshotPixels
+    || rawAllocation > limits.maxScreenshotAllocationBytes
+  ) {
+    throw new Error(
+      `BrowserScreenshot ${label} exceeds the bounded image limits `
+      + `(${normalizedWidth}x${normalizedHeight}, ${pixels} pixels; maximum `
+      + `${limits.maxScreenshotWidth}x${limits.maxScreenshotHeight}, ${limits.maxScreenshotPixels} pixels, `
+      + `${limits.maxScreenshotAllocationBytes} allocation bytes).`,
+    );
+  }
+}
+
+function validatePngScreenshot(
+  image: Buffer,
+  limits: Readonly<InteractiveBrowserLimits>,
+): { width: number; height: number } {
+  // PNG's fixed signature and IHDR put dimensions before any page-controlled
+  // compressed payload. Playwright was explicitly asked for PNG; reject any
+  // malformed or surprising result rather than forwarding opaque bytes.
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (image.byteLength < 24 || !image.subarray(0, 8).equals(signature) || image.subarray(12, 16).toString("ascii") !== "IHDR") {
+    throw new Error("BrowserScreenshot returned an invalid PNG image.");
+  }
+  if (image.byteLength > limits.maxScreenshotBytes) {
+    throw new Error(`BrowserScreenshot final PNG exceeds the ${limits.maxScreenshotBytes}-byte encoded output limit.`);
+  }
+  const width = image.readUInt32BE(16);
+  const height = image.readUInt32BE(20);
+  assertScreenshotDimensions(width, height, limits, "final PNG");
+  const pixels = width * height;
+  const base64Chars = Math.ceil(image.byteLength / 3) * 4;
+  // Conservatively charge two bytes per JavaScript string character in
+  // addition to decoded RGBA and encoded Buffer storage before allocating the
+  // Pi ImageContent string.
+  const allocationBytes = pixels * 4 + image.byteLength + base64Chars * 2;
+  if (allocationBytes > limits.maxScreenshotAllocationBytes) {
+    throw new Error(
+      `BrowserScreenshot final image exceeds the ${limits.maxScreenshotAllocationBytes}-byte allocation limit.`,
+    );
+  }
+  return { width, height };
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

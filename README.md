@@ -29,7 +29,7 @@ receipts of exactly what the model was told.
 - **Native web tools** — `WebSearch` (API-key-free DDGS), `WebFetch` (indexed HTML/PDF
   reading), `BrowserExtract` (single-page rendered fallback), and a bounded Pi-native
   observational browser (`BrowserOpen`, `BrowserNavigate`, `BrowserSnapshot`,
-  `BrowserClose`), all with DNS-rebinding-hardened, validated egress
+  `BrowserScreenshot`, `BrowserClose`), all with DNS-rebinding-hardened, validated egress
   ([Web tools](docs/web-tools.md),
   [Security model](docs/security-model.md#web-egress-hardening)).
 - **Durable evidence and recovery** — stable evidence bundles, integrity-checked
@@ -51,9 +51,10 @@ receipts of exactly what the model was told.
   custom executor process can still access paths allowed by the host account
   ([Security model](docs/security-model.md#isolation-limits)).
 - **No general browser automation.** The interactive browser is an observational,
-  public-web-only escalation with open, navigate, semantic snapshot, and deterministic
-  close operations. It exposes no click, type, upload, arbitrary selector/script, or
-  CDP escape hatch
+  public-web-only escalation with open, navigate, semantic snapshot, bounded viewport
+  or semantic-ref screenshot, and deterministic close operations. Screenshots are
+  delivered only as native Pi image content to vision-capable models. The browser
+  exposes no click, type, upload, arbitrary selector/script, coordinate, or CDP escape hatch
   ([Web tools](docs/web-tools.md#observational-interactive-browser)).
 - **No forced verification theater.** Force merges and `interrupt_with_merge` are
   mechanical landing attempts, not verification; the main workspace must always be

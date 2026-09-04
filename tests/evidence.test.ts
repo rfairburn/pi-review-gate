@@ -36,7 +36,7 @@ test("extractCandidatePaths finds shell redirection and tee targets", () => {
 });
 
 test("successful discovery tools are transient while their failures remain review evidence", () => {
-  for (const toolName of ["read", "grep", "glob", "find", "ls", "Read", "GREP"]) {
+  for (const toolName of ["read", "grep", "glob", "find", "ls", "Read", "GREP", "BrowserScreenshot"]) {
     assert.equal(shouldRecordToolCallEvidence(toolName), false, toolName);
     assert.equal(shouldRecordToolResultEvidence(toolName, false), false, toolName);
     assert.equal(shouldRecordToolResultEvidence(toolName, true), true, toolName);

@@ -20,7 +20,7 @@ const executionToolNames = [
 const backgroundShellToolNames = ["ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"];
 const webToolNames = [
   "WebSearch", "WebFetch", "BrowserExtract",
-  "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose",
+  "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot", "BrowserClose",
 ];
 
 let previousConfig: string | undefined;
@@ -168,7 +168,7 @@ test("executor role defers to the durable initial subset and activates authorize
       (value as { systemPrompt?: string } | undefined)?.systemPrompt ?? ""
     ).join("\n");
     assert.match(guidance, /native Pi prompt/);
-    for (const name of ["read", "edit", "WebSearch", "ShellList", "search_tools"]) {
+    for (const name of ["read", "edit", ...webToolNames, "ShellList", "search_tools"]) {
       assert.match(guidance, new RegExp(`"${name}"`));
     }
     assert.doesNotMatch(guidance, /SubtasksStart|SubtasksInspect/);
@@ -178,7 +178,7 @@ test("executor role defers to the durable initial subset and activates authorize
 
     const search = definitions.get("search_tools");
     assert.ok(search?.execute);
-    const loaded = await search.execute("load-web", { query: "public web" });
+    const loaded = await search.execute("load-web", { query: "WebSearch" });
     assert.deepEqual((loaded.details as { activated: string[] }).activated, ["WebSearch"]);
     assert.deepEqual(active, ["read", "edit", "search_tools", "WebSearch"]);
 
@@ -189,6 +189,10 @@ test("executor role defers to the durable initial subset and activates authorize
     const unmatched = await search.execute("load-unmatched", { query: "nonexistent-capability-token" });
     assert.deepEqual((unmatched.details as { activated: string[] }).activated, []);
     assert.equal(active.includes("ShellLog"), false);
+
+    const screenshot = await search.execute("load-screenshot", { query: "BrowserScreenshot" });
+    assert.deepEqual((screenshot.details as { activated: string[] }).activated, ["BrowserScreenshot"]);
+    assert.ok(active.includes("BrowserScreenshot"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -196,7 +200,7 @@ test("executor role defers to the durable initial subset and activates authorize
 
 async function catalogProducedByExecutionToolManager(): Promise<ExecutorToolCatalog> {
   const tools: Array<{ name: string; execute?: (...args: any[]) => Promise<Record<string, any>> }> = [];
-  const activeNames = ["read", "edit", "WebSearch", "ShellList", ...executionToolNames];
+  const activeNames = ["read", "edit", ...webToolNames, "ShellList", ...executionToolNames];
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },

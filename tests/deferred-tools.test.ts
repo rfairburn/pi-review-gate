@@ -140,19 +140,22 @@ test("configured worker catalogs use the durable initial subset without narrowin
 
 test("role-filtered research inventory names every authorized tool without mutation tools or schemas", () => {
   const fixture = hostFixture();
+  const browserNames = ["BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot", "BrowserClose"];
+  for (const name of browserNames) fixture.pi.registerTool(tool(name, `Private schema description for ${name}.`));
+  fixture.pi.registerTool(tool("BrowserClick", "Excluded interaction tool."));
   const manager = new DeferredToolManager(fixture.pi);
   manager.register();
   manager.sessionStart(fixture.sessionIdentity, {
-    allowedToolCatalog: ["read", "WebSearch"],
+    allowedToolCatalog: ["read", "WebSearch", ...browserNames],
     initialActiveTools: ["read"],
   });
 
   const inventory = manager.startupGuidance() ?? "";
-  for (const name of ["read", "WebSearch", "search_tools"]) {
+  for (const name of ["read", "WebSearch", ...browserNames, "search_tools"]) {
     assert.match(inventory, new RegExp(`"${name}"`));
   }
-  assert.doesNotMatch(inventory, /"(?:bash|edit|write|ApplyPatch)"/);
-  assert.doesNotMatch(inventory, /Read file contents|Search the public web|parameters|properties/);
+  assert.doesNotMatch(inventory, /"(?:bash|edit|write|ApplyPatch|BrowserClick)"/);
+  assert.doesNotMatch(inventory, /Read file contents|Search the public web|Private schema description|Excluded interaction|parameters|properties/);
 });
 
 test("configured worker boundaries reject unavailable and unauthorized tools", async () => {
@@ -269,6 +272,7 @@ test("observational browser tools are authorized, deferred, and discoverable by 
     tool("BrowserOpen", "Open an isolated observational browser session."),
     tool("BrowserNavigate", "Navigate an isolated browser tab."),
     tool("BrowserSnapshot", "Read a bounded semantic browser snapshot."),
+    tool("BrowserScreenshot", "Capture bounded visual browser evidence."),
     tool("BrowserClose", "Close a browser session deterministically."),
   ]) {
     fixture.pi.registerTool(definition);
@@ -277,15 +281,23 @@ test("observational browser tools are authorized, deferred, and discoverable by 
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
 
-  for (const name of ["BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose"]) {
+  const browserNames = ["BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot", "BrowserClose"];
+  for (const name of browserNames) {
     assert.ok(manager.authorizedToolNames()?.includes(name));
     assert.equal(fixture.active().includes(name), false, `${name} must not be initially active`);
+    assert.match(manager.startupGuidance() ?? "", new RegExp(`"${name}"`));
   }
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /isolated observational|bounded semantic|visual browser evidence|parameters|properties/);
   const result = await fixture.search()("browser", { query: "BrowserSnapshot" });
   assert.deepEqual((result.details as { matched: string[] }).matched, ["BrowserSnapshot"]);
   assert.deepEqual((result.details as { activated: string[] }).activated, ["BrowserSnapshot"]);
   assert.ok(fixture.active().includes("BrowserSnapshot"));
   assert.equal(fixture.active().includes("BrowserOpen"), false);
+
+  const screenshot = await fixture.search()("screenshot", { query: "BrowserScreenshot" });
+  assert.deepEqual((screenshot.details as { matched: string[] }).matched, ["BrowserScreenshot"]);
+  assert.deepEqual((screenshot.details as { activated: string[] }).activated, ["BrowserScreenshot"]);
+  assert.ok(fixture.active().includes("BrowserScreenshot"));
 });
 
 test("invalid and unmatched searches do not change the active set", async () => {

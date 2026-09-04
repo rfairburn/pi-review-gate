@@ -75,7 +75,16 @@ payloads are blocked so admitted visual resources cannot evade broker byte accou
 sessions block media, images, and custom/downloadable fonts as well. Images are disabled
 in Chromium's rendering engine, remote fonts are disabled, and image/font requests are
 also denied at routing so generated `data:` or `blob:` visual payloads cannot bypass
-broker byte accounting. Results disclose bounded omission diagnostics (capped samples plus
+broker byte accounting. `BrowserScreenshot` captures only the already-rendered viewport
+or an element addressed by a current opaque semantic ref; it does not admit a new
+network path. Element bounds must fit the viewport and become an immutable screenshot
+clip; the capture leaves finite animations running rather than fast-forwarding them
+after preflight, so a page resize cannot enlarge the requested image. Before native Pi
+image delivery, both pre-capture and decoded final PNG dimensions/pixels are bounded,
+final encoded bytes are capped, and a conservative
+allocation charge includes decoded, encoded, and base64-content storage. Image bytes are
+excluded from review-gate diagnostics/details and are retained only where Pi's native
+image message itself requires them. Results disclose bounded omission diagnostics (capped samples plus
 a dropped count) alongside explicit per-render or per-session budgets (distinct hostnames, concurrent broker client connections and their
 pre-authentication idle deadline, destination connections, per-connection and aggregate
 bytes, authority/header lengths, idle and total time). A budget that destroys an

@@ -8,6 +8,7 @@ import { canonicalSearchUrl, normalizeDdgsResults, searchDdgs, type DdgsRunner }
 import { parseHTML } from "linkedom";
 import { collectBoundedElements, extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
 import { extractPdfDocument, isPdfResponse } from "../src/web/pdf";
+import type { InteractiveBrowserManager } from "../src/web/interactive-browser";
 import { formatSearch, WebToolManager } from "../src/web/tools";
 
 const fixture = `<!doctype html><html><head><title>Population fixture</title></head><body>
@@ -475,13 +476,16 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   manager.register();
   assert.deepEqual([...tools.keys()], [
     "WebSearch", "WebFetch", "BrowserExtract",
-    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose",
+    "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot", "BrowserClose",
   ]);
   assert.deepEqual(Object.keys(tools.get("BrowserOpen").parameters.properties), ["url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserNavigate").parameters.properties), ["session", "tab", "url"]);
   assert.deepEqual(Object.keys(tools.get("BrowserSnapshot").parameters.properties), ["session", "tab", "maxChars"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserScreenshot").parameters.properties), ["session", "tab", "mode", "ref"]);
+  assert.deepEqual(tools.get("BrowserScreenshot").parameters.required, ["session", "tab", "mode"]);
   assert.deepEqual(Object.keys(tools.get("BrowserClose").parameters.properties), ["session"]);
   assert.match(tools.get("BrowserSnapshot").description, /no DOM script, selector, coordinate, or CDP/i);
+  assert.match(tools.get("BrowserScreenshot").description, /Pi image content.*not a file path or textual encoding/i);
   assert.equal(tools.has("WebRead"), false);
   assert.ok(tools.get("WebSearch").parameters.properties.excludeDomains);
   assert.equal(tools.get("WebSearch").parameters.properties.page, undefined);
@@ -555,6 +559,84 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   await hooks.get("session_shutdown")?.();
   await assert.rejects(access(root), /ENOENT/);
   await assert.rejects(access(browserRoot), /ENOENT/);
+});
+
+test("BrowserScreenshot returns Pi image content and fails with BrowserSnapshot guidance without vision", async () => {
+  const config = normalizeConfig({});
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  let captures = 0;
+  const metadata = {
+    session: "browser_session_fixture",
+    tab: "tab_fixture",
+    generation: "generation_fixture",
+    url: "https://example.com/visual",
+    title: "Untrusted visual fixture",
+    mode: "viewport" as const,
+    mimeType: "image/png" as const,
+    width: 1,
+    height: 1,
+    encodedBytes: png.byteLength,
+    limits: {
+      maxWidth: 2_000,
+      maxHeight: 2_000,
+      maxPixels: 4_000_000,
+      maxEncodedBytes: 4 * 1024 * 1024,
+      maxAllocationBytes: 32 * 1024 * 1024,
+    },
+  };
+  const interactive = {
+    screenshot: async () => {
+      captures += 1;
+      return { image: png, metadata };
+    },
+    updateConfig() {},
+    async shutdown() {},
+  } as unknown as InteractiveBrowserManager;
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager(
+    { registerTool: (tool) => tools.set(tool.name, tool) },
+    config,
+    undefined,
+    undefined,
+    interactive,
+  );
+  manager.register();
+  const screenshot = tools.get("BrowserScreenshot");
+
+  const unsupported = await screenshot.execute(
+    "no-vision",
+    { session: "s", tab: "t", mode: "viewport" },
+    undefined,
+    undefined,
+    { model: { input: ["text"] } },
+  );
+  assert.equal(unsupported.isError, true);
+  assert.match(unsupported.content[0].text, /use BrowserSnapshot/i);
+  assert.equal(captures, 0, "unsupported delivery is rejected before browser capture");
+
+  const supported = await screenshot.execute(
+    "vision",
+    { session: "s", tab: "t", mode: "viewport" },
+    undefined,
+    undefined,
+    { model: { input: ["text", "image"] } },
+  );
+  assert.equal(supported.isError, false);
+  assert.equal(captures, 1);
+  assert.deepEqual(supported.content.map((item: { type: string }) => item.type), ["text", "image"]);
+  assert.deepEqual(supported.content[1], {
+    type: "image",
+    data: png.toString("base64"),
+    mimeType: "image/png",
+  });
+  assert.deepEqual(supported.details, { response: metadata });
+  assert.equal(JSON.stringify(supported.details).includes(png.toString("base64")), false);
+  assert.doesNotMatch(supported.content[0].text, new RegExp(png.toString("base64")));
+  assert.match(supported.content[0].text, /1x1.*encoded bytes/);
+  await manager.cleanup();
 });
 
 test("WebFetch gives a direct BrowserExtract escalation when static extraction suspects JavaScript", async () => {

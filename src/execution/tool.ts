@@ -510,7 +510,7 @@ const RESEARCH_ALLOWED_TOOLS = new Set([
   "read", "grep", "glob", "find", "ls", "WebFetch", "WebSearch", "BrowserExtract",
   // Initial interactive-browser support is observational only. Mutation and
   // interaction tools do not enter the research role policy.
-  "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserClose",
+  "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserScreenshot", "BrowserClose",
 ]);
 
 function researchToolIntersection(parent: string[]): string[] {

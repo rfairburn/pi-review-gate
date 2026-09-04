@@ -60,7 +60,9 @@ export interface EvidenceBundle {
   markdown: string;
 }
 
-const TRANSIENT_DISCOVERY_TOOLS = new Set(["read", "grep", "glob", "find", "ls", "websearch", "webfetch"]);
+const TRANSIENT_DISCOVERY_TOOLS = new Set([
+  "read", "grep", "glob", "find", "ls", "websearch", "webfetch", "browserscreenshot",
+]);
 const PATH_MUTATION_TOOLS = new Set(["write", "edit"]);
 const APPLY_PATCH_TOOL = "applypatch";
 const SHELL_TOOLS = new Set(["bash", "shellstart"]);

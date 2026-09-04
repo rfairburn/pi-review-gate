@@ -12,6 +12,19 @@ import {
   interactiveRouteDecision,
 } from "../src/web/interactive-browser";
 
+const ONE_PIXEL_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
+
+function pngWithDimensions(width: number, height: number, bytes = ONE_PIXEL_PNG.byteLength) {
+  const image = Buffer.alloc(Math.max(bytes, 24));
+  ONE_PIXEL_PNG.subarray(0, Math.min(ONE_PIXEL_PNG.byteLength, image.byteLength)).copy(image);
+  image.writeUInt32BE(width, 16);
+  image.writeUInt32BE(height, 20);
+  return image;
+}
+
 class FakePage extends EventEmitter {
   private currentUrl = "about:blank";
   private closed = false;
@@ -21,7 +34,17 @@ class FakePage extends EventEmitter {
   url() { return this.currentUrl; }
   isClosed() { return this.closed; }
   async title() { return "Untrusted fixture title"; }
+  viewportSize() { return { width: 1280, height: 720 }; }
   async ariaSnapshot() { return '- heading "Fixture" [level=1]\n- link "Next" [ref=e7]\n'; }
+  async screenshot(_options?: Record<string, any>) { return ONE_PIXEL_PNG; }
+  locator(selector: string) {
+    assert.equal(selector, "aria-ref=e7", "only the Playwright ref retained from the semantic snapshot is used");
+    return {
+      scrollIntoViewIfNeeded: async () => undefined,
+      boundingBox: async () => ({ x: 1, y: 2, width: 50, height: 20 }),
+      screenshot: async () => { throw new Error("element screenshot must use a prevalidated page clip"); },
+    };
+  }
   async goto(url: string) {
     const request = {
       isNavigationRequest: () => true,
@@ -203,6 +226,20 @@ test("open, navigate, semantic snapshot, handle rejection, and idempotent close 
   assert.match(snapshot.snapshot, new RegExp(`\\[ref=${snapshot.generation}_ref_`));
   assert.doesNotMatch(snapshot.snapshot, /ref=e7/);
   assert.equal(snapshot.truncation.truncated, false);
+  const semanticRef = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(semanticRef);
+
+  const viewport = await manager.screenshot(opened.session, opened.tab, "viewport", undefined);
+  assert.ok(Buffer.isBuffer(viewport.image));
+  assert.equal(viewport.metadata.mode, "viewport");
+  assert.equal(viewport.metadata.mimeType, "image/png");
+  assert.equal(viewport.metadata.encodedBytes, ONE_PIXEL_PNG.byteLength);
+  assert.deepEqual([viewport.metadata.width, viewport.metadata.height], [1, 1]);
+  assert.equal("image" in viewport.metadata, false, "binary image data is not duplicated into metadata");
+
+  const element = await manager.screenshot(opened.session, opened.tab, "element", semanticRef);
+  assert.equal(element.metadata.mode, "element");
+  assert.equal(element.metadata.ref, semanticRef);
 
   const navigated = await manager.navigate(opened.session, opened.tab, "https://example.com/next");
   assert.notEqual(navigated.generation, snapshot.generation, "navigation invalidates prior document refs");
@@ -216,6 +253,189 @@ test("open, navigate, semantic snapshot, handle rejection, and idempotent close 
   assert.equal(secondClose.quiescent, true);
   assert.equal(secondClose.alreadyClosed, true);
   assert.equal(manager.activeSessionCount(), 0);
+});
+
+test("screenshot refs reject forged, stale, cross-session, and cross-tab use uniformly", async () => {
+  const first = managerFixture();
+  const firstOpened = await first.manager.open("https://example.com/first");
+  const firstSnapshot = await first.manager.snapshot(firstOpened.session, firstOpened.tab, 1_000);
+  const firstRef = firstSnapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(firstRef);
+
+  await assert.rejects(
+    first.manager.screenshot(firstOpened.session, "tab_forged", "element", firstRef),
+    /Invalid or stale browser session\/tab handle/,
+  );
+  await assert.rejects(
+    first.manager.screenshot(firstOpened.session, firstOpened.tab, "element", `${firstRef}_forged`),
+    /fresh BrowserSnapshot/,
+  );
+  assert.equal(first.manager.activeSessionCount(), 0, "invalid element refs fail closed and clean up the session");
+
+  const stale = managerFixture();
+  const staleOpened = await stale.manager.open("https://example.com/stale");
+  const staleSnapshot = await stale.manager.snapshot(staleOpened.session, staleOpened.tab, 1_000);
+  const staleRef = staleSnapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(staleRef);
+  await stale.manager.navigate(staleOpened.session, staleOpened.tab, "https://example.com/new-document");
+  await assert.rejects(
+    stale.manager.screenshot(staleOpened.session, staleOpened.tab, "element", staleRef),
+    /fresh BrowserSnapshot/,
+  );
+
+  const crossBrowsers = [new FakeBrowser(), new FakeBrowser()];
+  let crossSerial = 0;
+  const crossManager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => crossBrowsers.shift() as unknown as Browser,
+    randomHandle: (kind: string) => `${kind}_${++crossSerial}_${"c".repeat(32)}`,
+  });
+  const sourceSession = await crossManager.open("https://example.com/source-session");
+  const sourceSnapshot = await crossManager.snapshot(sourceSession.session, sourceSession.tab, 1_000);
+  const sourceRef = sourceSnapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(sourceRef);
+  const targetSession = await crossManager.open("https://example.com/target-session");
+  await crossManager.snapshot(targetSession.session, targetSession.tab, 1_000);
+  await assert.rejects(
+    crossManager.screenshot(targetSession.session, targetSession.tab, "element", sourceRef),
+    /fresh BrowserSnapshot/,
+  );
+  await Promise.all([first.manager.shutdown(), stale.manager.shutdown(), crossManager.shutdown()]);
+});
+
+test("element screenshot fixes the validated clip before a resize race", async () => {
+  const fixture = managerFixture();
+  let elementWidth = 40.2;
+  let screenshotOptions: Record<string, any> | undefined;
+  fixture.browser.context.page.locator = (selector: string) => {
+    assert.equal(selector, "aria-ref=e7");
+    return {
+      scrollIntoViewIfNeeded: async () => undefined,
+      boundingBox: async () => {
+        queueMicrotask(() => { elementWidth = 10_000; });
+        return { x: 10.4, y: 20.2, width: elementWidth, height: 19.2 };
+      },
+      screenshot: async () => { throw new Error("unbounded locator screenshot must not run"); },
+    };
+  };
+  fixture.browser.context.page.screenshot = async (options?: Record<string, any>) => {
+    await Promise.resolve();
+    assert.equal(elementWidth, 10_000, "fixture element changed after bounds acquisition");
+    screenshotOptions = options;
+    return pngWithDimensions(options!.clip.width, options!.clip.height);
+  };
+  const opened = await fixture.manager.open("https://example.com/resize-race");
+  const snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
+  const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
+  assert.ok(ref);
+  const captured = await fixture.manager.screenshot(opened.session, opened.tab, "element", ref);
+  assert.deepEqual(screenshotOptions?.clip, { x: 10, y: 20, width: 41, height: 20 });
+  assert.equal(screenshotOptions?.animations, "allow", "finite animations must not be fast-forwarded after preflight");
+  assert.equal(screenshotOptions?.fullPage, false);
+  assert.deepEqual([captured.metadata.width, captured.metadata.height], [41, 20]);
+  await fixture.manager.close(opened.session);
+});
+
+test("screenshot validates final encoded bytes, decoded dimensions, and allocation before delivery", async () => {
+  const oversizedBytes = managerFixture();
+  oversizedBytes.browser.context.page.screenshot = async () => pngWithDimensions(1, 1, 128);
+  const bytesManager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => oversizedBytes.browser as unknown as Browser,
+    limits: { maxScreenshotBytes: 100, cleanupMs: 100 },
+  });
+  const bytesOpened = await bytesManager.open("https://example.com/bytes");
+  await assert.rejects(
+    bytesManager.screenshot(bytesOpened.session, bytesOpened.tab, "viewport", undefined),
+    /100-byte encoded output limit/,
+  );
+  assert.equal(bytesManager.activeSessionCount(), 0);
+
+  const oversizedDimensions = managerFixture();
+  oversizedDimensions.browser.context.page.screenshot = async () => pngWithDimensions(2_001, 1);
+  const dimensionsManager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => oversizedDimensions.browser as unknown as Browser,
+    limits: { cleanupMs: 100 },
+  });
+  const dimensionsOpened = await dimensionsManager.open("https://example.com/dimensions");
+  await assert.rejects(
+    dimensionsManager.screenshot(dimensionsOpened.session, dimensionsOpened.tab, "viewport", undefined),
+    /final PNG exceeds the bounded image limits/,
+  );
+  assert.equal(dimensionsManager.activeSessionCount(), 0);
+
+  const allocation = managerFixture();
+  allocation.browser.context.page.viewportSize = () => ({ width: 100, height: 100 });
+  allocation.browser.context.page.screenshot = async () => pngWithDimensions(100, 100);
+  const allocationManager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => allocation.browser as unknown as Browser,
+    limits: { maxScreenshotAllocationBytes: 40_100, cleanupMs: 100 },
+  });
+  const allocationOpened = await allocationManager.open("https://example.com/allocation");
+  await assert.rejects(
+    allocationManager.screenshot(allocationOpened.session, allocationOpened.tab, "viewport", undefined),
+    /allocation limit/,
+  );
+  assert.equal(allocationManager.activeSessionCount(), 0);
+});
+
+test("screenshot cancellation fails clearly and confirms session cleanup", async () => {
+  const fixture = managerFixture();
+  let announce!: () => void;
+  const started = new Promise<void>((resolve) => { announce = resolve; });
+  fixture.browser.context.page.screenshot = async () => {
+    announce();
+    return new Promise<typeof ONE_PIXEL_PNG>(() => undefined);
+  };
+  const opened = await fixture.manager.open("https://example.com/cancel-image");
+  const controller = new AbortController();
+  const capture = fixture.manager.screenshot(opened.session, opened.tab, "viewport", undefined, controller.signal);
+  await started;
+  controller.abort(new Error("cancel screenshot test"));
+  await assert.rejects(capture, /cancel screenshot test/);
+  assert.equal(fixture.manager.activeSessionCount(), 0);
+  assert.equal((await fixture.manager.close(opened.session)).alreadyClosed, true);
+});
+
+test("screenshot rejects captured bytes when the document generation changes mid-capture", async () => {
+  const fixture = managerFixture();
+  const opened = await fixture.manager.open("https://example.com/changing-image");
+  let release!: (image: typeof ONE_PIXEL_PNG) => void;
+  let announce!: () => void;
+  const started = new Promise<void>((resolve) => { announce = resolve; });
+  fixture.browser.context.page.screenshot = async () => {
+    announce();
+    return new Promise<typeof ONE_PIXEL_PNG>((resolve) => { release = resolve; });
+  };
+  const capture = fixture.manager.screenshot(opened.session, opened.tab, "viewport", undefined);
+  await started;
+  fixture.browser.context.page.emit("framenavigated", fixture.browser.context.page.frame);
+  release(ONE_PIXEL_PNG);
+  await assert.rejects(capture, /document changed during screenshot capture/i);
+  assert.equal(fixture.manager.activeSessionCount(), 0);
+});
+
+test("screenshots reject closed and unexpectedly lost sessions without returning bytes", async () => {
+  const closed = managerFixture();
+  const closedOpened = await closed.manager.open("https://example.com/closed");
+  await closed.manager.close(closedOpened.session);
+  await assert.rejects(
+    closed.manager.screenshot(closedOpened.session, closedOpened.tab, "viewport", undefined),
+    /Invalid or stale browser session\/tab handle/,
+  );
+
+  const lost = managerFixture();
+  const lostOpened = await lost.manager.open("https://example.com/lost");
+  await lost.browser.context.page.close();
+  await assert.rejects(
+    lost.manager.screenshot(lostOpened.session, lostOpened.tab, "viewport", undefined),
+    /closed unexpectedly|Invalid or stale|teardown/i,
+  );
+  await lost.manager.close(lostOpened.session);
+  assert.equal(lost.manager.activeSessionCount(), 0);
+  await Promise.all([closed.manager.shutdown(), lost.manager.shutdown()]);
 });
 
 test("navigation uses one absolute deadline across validation and page phases", async () => {
@@ -362,6 +582,15 @@ test("real Chromium follows a public redirect only through the pinned broker dia
       response.end();
       return;
     }
+    if (request.url === "/animated") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(`<!doctype html><title>Animated element</title><style>
+        @keyframes grow { from { width: 64px; height: 24px } to { width: 10000px; height: 10000px } }
+        #animated { display: block; width: 64px; height: 24px; overflow: hidden;
+          animation: grow 1s linear forwards; animation-play-state: paused; }
+      </style><a id="animated" href="/next">Animated bounded link</a>`);
+      return;
+    }
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end("<!doctype html><title>Redirect complete</title><main><h1>Brokered evidence</h1><a href='/next'>Next</a></main>");
   });
@@ -384,6 +613,24 @@ test("real Chromium follows a public redirect only through the pinned broker dia
     assert.ok(dials.some((dial) => dial.startsWith(`redirect.test:${originPort}:93.184.216.34`)));
     const snapshot = await manager.snapshot(opened.session, opened.tab, 2_000);
     assert.match(snapshot.snapshot, /Brokered evidence/);
+    const viewportImage = await manager.screenshot(opened.session, opened.tab, "viewport", undefined);
+    assert.deepEqual([viewportImage.metadata.width, viewportImage.metadata.height], [1_280, 720]);
+    assert.ok(viewportImage.metadata.encodedBytes <= viewportImage.metadata.limits.maxEncodedBytes);
+    assert.equal(viewportImage.image.subarray(1, 4).toString("ascii"), "PNG");
+    const linkRef = snapshot.snapshot.match(/link "Next" \[ref=([^\]]+)\]/)?.[1];
+    assert.ok(linkRef, "real AI snapshot exposes a current semantic ref");
+    const elementImage = await manager.screenshot(opened.session, opened.tab, "element", linkRef);
+    assert.equal(elementImage.metadata.mode, "element");
+    assert.ok(elementImage.metadata.width > 0 && elementImage.metadata.height > 0);
+
+    await manager.navigate(opened.session, opened.tab, `http://public.test:${originPort}/animated`);
+    const animatedSnapshot = await manager.snapshot(opened.session, opened.tab, 2_000);
+    const animatedRef = animatedSnapshot.snapshot.match(/link "Animated bounded link" \[ref=([^\]]+)\]/)?.[1];
+    assert.ok(animatedRef);
+    const animatedImage = await manager.screenshot(opened.session, opened.tab, "element", animatedRef);
+    assert.ok(animatedImage.metadata.width <= 65 && animatedImage.metadata.height <= 25,
+      "paused finite animation is not fast-forwarded to its oversized final keyframe after preflight");
+
     await assert.rejects(
       manager.navigate(opened.session, opened.tab, `http://public.test:${originPort}/private-redirect`),
       /egress policy|ERR_FAILED|navigation/i,

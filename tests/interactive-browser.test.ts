@@ -376,7 +376,7 @@ test("BrowserOpen cancellation contains a browser that resolves after cancellati
   await launched;
   controller.abort(new Error("cancel deferred launch"));
   releaseLaunch();
-  await assert.rejects(opening, /cancel deferred launch/);
+  await assert.rejects(opening, /cancelled before navigation dispatch/);
   assert.equal(browser.isConnected(), false, "late browser result is closed before BrowserOpen settles");
   assert.equal(manager.activeSessionCount(), 0);
 });
@@ -596,7 +596,7 @@ test("BrowserScroll accepts only bounded page/ref operations and current scoped 
   );
   await assert.rejects(
     fixture.manager.scroll(opened.session, "tab_forged", "ref", undefined, 1, ref),
-    /Invalid or stale browser session\/tab handle/,
+    /Invalid or stale browser tab handle/,
   );
   await assert.rejects(
     fixture.manager.scroll(opened.session, opened.tab, "ref", undefined, 1, `${ref}_forged`),
@@ -1332,7 +1332,7 @@ test("screenshot refs reject forged, stale, cross-session, and cross-tab use uni
 
   await assert.rejects(
     first.manager.screenshot(firstOpened.session, "tab_forged", "element", firstRef),
-    /Invalid or stale browser session\/tab handle/,
+    /Invalid or stale browser tab handle/,
   );
   await assert.rejects(
     first.manager.screenshot(firstOpened.session, firstOpened.tab, "element", `${firstRef}_forged`),
@@ -2038,7 +2038,7 @@ test("private destinations fail before launch and cancellation tears down an act
   controller.abort(new Error("cancelled by test"));
   await assert.rejects(
     cancellationFixture.manager.navigate(cancellable.session, cancellable.tab, "https://example.com/next", controller.signal),
-    /cancelled by test/,
+    /cancelled before dispatch.*no page effects occurred/s,
   );
   assert.equal(cancellationFixture.manager.activeSessionCount(), 0);
   const closed = await cancellationFixture.manager.close(cancellable.session);
@@ -2173,7 +2173,7 @@ test("browser diagnostics stay tab-local and cancellation tears down the owning 
 
   const controller = new AbortController();
   controller.abort(new Error("cancel diagnostic read"));
-  await assert.rejects(manager.console(opened.session, opened.tab, 0, 1, controller.signal), /cancel diagnostic read/);
+  await assert.rejects(manager.console(opened.session, opened.tab, 0, 1, controller.signal), /cancelled before dispatch/);
   assert.equal(manager.activeSessionCount(), 0);
 });
 

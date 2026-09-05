@@ -12,6 +12,7 @@ import {
   BROWSER_SELECT_OPTION_MAX_CHARS,
   BROWSER_TYPE_MAX_CHARS,
   BROWSER_TYPE_MAX_DELAY_MS,
+  BrowserRecoveryError,
   InteractiveBrowserManager,
   normalizeBrowserPressKey,
   type BrowserHistoryOperation,
@@ -1054,12 +1055,45 @@ function textResult(text: string, details: Record<string, unknown>, isError = fa
  * isError. Throw only fixed, bounded text: raw Playwright/page errors can carry
  * form values, URLs, DOM snippets and arbitrary page exceptions. No cause/data
  * or images are attached. BrowserExtract/WebFetch intentionally stay unchanged.
+ *
+ * Structured manager-owned recovery metadata is classified first, so
+ * cancellation, stale-handle, duplicate-open, and unconfirmed-teardown
+ * guidance never depends on parsing arbitrary exception text. Handle reveals
+ * are bounded authenticated recovery data, never arbitrary passthrough.
  */
 function interactiveBrowserFailure(name: string, error: unknown): Error {
+  if (error instanceof BrowserRecoveryError) {
+    const recovery = error.recovery;
+    if (recovery.kind === "duplicate_open") {
+      return new Error(`${name} failed: a live browser is already open for this Pi session; an earlier result may have been lost after a rewind or Escape. Recover it: BrowserTabs operation=list with session=${recovery.existingSession}, then BrowserNavigate or BrowserClose with its handles. No new browser was opened.`);
+    }
+    if (recovery.kind === "unconfirmed_cleanup") {
+      return new Error(`${name} failed and teardown could not be confirmed; browser resources may remain. The browser manager is fail-closed: recover by restarting the Pi session (terminal restart or reload) before further browser use. Effect status is unknown; no rollback is claimed.`);
+    }
+    if (recovery.kind === "cancelled") {
+      if (recovery.phase === "not_started") {
+        return new Error(`${name} was cancelled before dispatch; no page effects occurred and cleanup was confirmed.${recovery.recovery === "reopen" ? " The session was torn down; use BrowserOpen to start a new browser session." : ` It is safe to retry ${name}.`}`);
+      }
+      if (recovery.phase === "dispatched") {
+        return new Error(`${name} was cancelled after dispatch; page or network effects may have occurred, effect status is unknown, and no rollback is claimed. Cleanup was confirmed; use BrowserOpen to start a new browser session.`);
+      }
+      return new Error(`${name} was cancelled; effect status is unknown and no rollback is claimed. Session teardown was confirmed; use BrowserOpen to start a new browser session.`);
+    }
+    if (recovery.kind === "session_unknown") {
+      return new Error(`${name} failed: invalid or stale browser session handle; it was not issued by this manager or another owner holds it, and no owned browser session was changed. Use BrowserOpen to start a browser for this Pi session; BrowserSnapshot cannot recover an unknown session.`);
+    }
+    if (recovery.kind === "tabs") {
+      const ownedTabs = (recovery.ownedTabs ?? []).join(", ");
+      const message = `${name} failed: invalid or stale browser tab handle. Recover: BrowserTabs operation=list with session=${recovery.session} lists the current owned tabs${ownedTabs ? ` (${ownedTabs})` : ""}; take a fresh BrowserSnapshot on an owned tab.`;
+      return new Error(message.length <= 511 ? message : `${name} failed: invalid or stale browser tab handle. Recover: BrowserTabs operation=list with session=${recovery.session}, then take a fresh BrowserSnapshot on an owned tab.`);
+    }
+  }
   const message = error instanceof Error ? error.message : "";
   let reason = "operation failed; effect status is unknown; no rollback is claimed";
-  if (/closure is unconfirmed|teardown is unconfirmed|teardown could not be confirmed/i.test(message)) {
-    reason = "session closure is unconfirmed; effect status is unknown; no rollback is claimed";
+  if (/closure is unconfirmed|teardown is unconfirmed|teardown could not be confirmed|could not confirm quiescence/i.test(message)) {
+    reason = "session closure is unconfirmed; effect status is unknown; no rollback is claimed; recover by restarting the Pi session (terminal restart or reload)";
+  } else if (/browser session is closed|invalid or stale browser session(\/tab)? handle/i.test(message)) {
+    reason = "browser session is closed, unknown, or owned elsewhere; use BrowserOpen to start a browser for this Pi session; BrowserSnapshot cannot recover it";
   } else if (/effect status is unknown|after dispatch|in.flight/i.test(message)) {
     // Never infer confirmed containment from an arbitrary exception's text.
     reason = "effect status is unknown; no rollback is claimed; check session containment";
@@ -1067,6 +1101,10 @@ function interactiveBrowserFailure(name: string, error: unknown): Error {
     reason = "not_started: target validation or authorization failed; refresh the snapshot or check approval";
   } else if (/character limit|must be|requires|invalid bounded/i.test(message)) {
     reason = "not_started: unsupported or out-of-bounds arguments";
+  } else if (/already in progress/i.test(message)) {
+    reason = "not_started: BrowserOpen is already in progress; wait for its result and reuse its session and tab handles";
+  } else if (/cancel|abort/i.test(message)) {
+    reason = "cancelled; effect status is unknown and no rollback is claimed; if the session was closed, use BrowserOpen to start a new browser";
   } else if (/stale|invalid.*handle|semantic ref/i.test(message)) {
     reason = "invalid or stale capability; take a fresh BrowserSnapshot";
   } else if (/vision|image input|image.*support|support image/i.test(message)) {

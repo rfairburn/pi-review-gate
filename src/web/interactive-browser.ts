@@ -380,6 +380,43 @@ export class BrowserSessionClosedError extends Error {
   }
 }
 
+export type BrowserRecoveryKind =
+  | "duplicate_open"
+  | "session_unknown"
+  | "tabs"
+  | "cancelled"
+  | "unconfirmed_cleanup";
+
+export interface BrowserRecoveryMetadata {
+  kind: BrowserRecoveryKind;
+  /** Dispatch phase at cancellation: no page effect, page effect possible, or unknowable. */
+  phase?: "not_started" | "dispatched" | "unknown";
+  /** Whether the manager proved resource cleanup; never claimed without proof. */
+  cleanup?: "confirmed" | "unconfirmed";
+  /** Authenticated live session revealed by a duplicate open after a lost result. */
+  existingSession?: string;
+  existingTab?: string;
+  /** Authenticated session owning the listed tabs. */
+  session?: string;
+  /** Real owned tab handles, never generated placeholders. */
+  ownedTabs?: readonly string[];
+  /** Whether the caller may retry the same tool or must reopen via BrowserOpen. */
+  recovery?: "retry" | "reopen";
+}
+
+/**
+ * Structured, manager-authored recovery state for cancellation, stale-handle,
+ * duplicate-open, and teardown outcomes. The message is fixed owned guidance;
+ * public sanitization classifies from these fields instead of parsing
+ * arbitrary exception text.
+ */
+export class BrowserRecoveryError extends Error {
+  constructor(message: string, readonly recovery: BrowserRecoveryMetadata) {
+    super(message);
+    this.name = "BrowserRecoveryError";
+  }
+}
+
 export interface BrowserCloseResult {
   session: string;
   closed: true;
@@ -474,6 +511,12 @@ interface Session {
 
 const MAX_TOMBSTONES = 32;
 const SAFE_LOCAL_PROTOCOLS = new Set(["about:", "blob:", "data:"]);
+
+/** Fixed manager-owned cancellation reasons; never caller-controlled text. */
+const BROWSER_CLOSE_CANCEL_REASON = "Browser operation cancelled by BrowserClose.";
+const SESSION_SHUTDOWN_CANCEL_REASON = "Browser operation cancelled by Pi session shutdown/replacement/reload.";
+
+type BrowserCancellationKind = "close" | "shutdown" | "caller";
 
 type DiagnosticEvent = { sequence: number; textTruncated?: boolean };
 
@@ -638,7 +681,7 @@ export class InteractiveBrowserManager {
     this.assertAcceptingOperations();
     const existing = this.sessions.values().next().value as Session | undefined;
     if (existing) {
-      throw new Error(`A browser is already open for this Pi session: session=${existing.handle}. Use BrowserTabs with action=list on that session, then BrowserNavigate with an owned tab; or BrowserClose before BrowserOpen. No new browser was opened.`);
+      throw duplicateOpenError(existing);
     }
     if (this.opening > 0) {
       throw new Error("BrowserOpen is already in progress for this Pi session. Wait for its result and use its session/tab handles; no second browser was opened.");
@@ -665,6 +708,7 @@ export class InteractiveBrowserManager {
     let launchPromise: Promise<Browser> | undefined;
     let contextPromise: Promise<BrowserContext> | undefined;
     let resourcesTransferredToSession = false;
+    let navigationDispatched = false;
     try {
       // This is a no-dial preflight. The broker independently validates and
       // pins the actual browser request before opening its destination socket.
@@ -765,7 +809,9 @@ export class InteractiveBrowserManager {
       this.sessions.set(session.handle, session);
       resourcesTransferredToSession = true;
       try {
-        const navigation = await this.navigateSession(session, primaryTab, requested.href, operation, true);
+        const navigation = await this.navigateSession(session, primaryTab, requested.href, operation, true, () => {
+          navigationDispatched = true;
+        });
         session.operationActive = false;
         return this.protectOutput({ ...navigation, limits: this.limits });
       } catch (error) {
@@ -774,11 +820,15 @@ export class InteractiveBrowserManager {
           await this.failAndWait(session, asError(error));
         } catch (cleanupError) {
           this.recordOpeningTeardownFailure(opening, asError(cleanupError));
-          throw cleanupError;
+          throw unconfirmedOpenCleanupError();
         }
+        const cancellation = cancellationKind(operationSignal);
+        if (cancellation) throw openCancellationError(cancellation, navigationDispatched);
         throw error;
       }
     } catch (error) {
+      if (error instanceof BrowserRecoveryError) throw error;
+      const cancellation = resourcesTransferredToSession ? undefined : cancellationKind(operationSignal);
       if (broker && !resourcesTransferredToSession) {
         // If cancellation won a race, retain and await cleanup of every late
         // startup result. The attached continuations remain active even when
@@ -789,22 +839,25 @@ export class InteractiveBrowserManager {
         const lateBrowserCleanup = launchPromise && !browser
           ? launchPromise.then((lateBrowser) => lateBrowser.close(), () => undefined)
           : undefined;
-        await cleanupPartial(
-          browser,
-          context,
-          broker,
-          this.limits.cleanupMs,
-          lateBrowserCleanup,
-          lateContextCleanup,
-        ).catch((cleanupError) => {
+        try {
+          await cleanupPartial(
+            browser,
+            context,
+            broker,
+            this.limits.cleanupMs,
+            lateBrowserCleanup,
+            lateContextCleanup,
+          );
+        } catch (cleanupError) {
           const failure = new AggregateError(
             [error, cleanupError],
             "BrowserOpen failed and teardown could not be confirmed.",
           );
           this.recordOpeningTeardownFailure(opening, failure);
-          throw failure;
-        });
+          throw unconfirmedOpenCleanupError();
+        }
       }
+      if (cancellation) throw openCancellationError(cancellation, navigationDispatched);
       throw error;
     } finally {
       operation.dispose();
@@ -1800,7 +1853,7 @@ export class InteractiveBrowserManager {
         } else {
           if (!tabHandle || url !== undefined) throw new Error(`BrowserTabs ${operationName} requires tab and does not accept url.`);
           const tab = session.tabs.get(tabHandle);
-          if (!tab) throw invalidHandleError();
+          if (!tab) throw invalidTabHandleError(session);
           if (operationName === "switch") {
             await operation.run(tab.page.bringToFront(), "tab switch");
             session.activeTab = tab.handle;
@@ -1865,7 +1918,7 @@ export class InteractiveBrowserManager {
       // Publish explicit closure before abort observers can classify it as a
       // fatal action failure. Also retire pending permission/action deadlines.
       const teardown = this.beginTeardown(session);
-      for (const operation of operations) operation.controller.abort(new Error("Browser operation cancelled by BrowserClose."));
+      for (const operation of operations) operation.controller.abort(new Error(BROWSER_CLOSE_CANCEL_REASON));
       const result = await teardown;
       await Promise.all(operations.map((operation) => operation.settled));
       return result;
@@ -1883,7 +1936,10 @@ export class InteractiveBrowserManager {
         diagnosticsRetained: false,
       };
     }
-    throw invalidHandleError();
+    throw new BrowserRecoveryError(
+      "Invalid or stale browser session handle for BrowserClose: it was not issued by this manager, or a different owner holds it; nothing was closed. Use BrowserOpen to start a browser for this Pi session, then close the session handle that result returns.",
+      { kind: "session_unknown" },
+    );
   }
 
   /**
@@ -1905,7 +1961,7 @@ export class InteractiveBrowserManager {
       this.confirmationPermits.clear();
       const openings = [...this.openings];
       const operations = [...this.activeOperations];
-      const reason = new Error("Browser operation cancelled by Pi session shutdown/replacement/reload.");
+      const reason = new Error(SESSION_SHUTDOWN_CANCEL_REASON);
       for (const opening of openings) opening.controller.abort(reason);
       for (const operation of operations) operation.controller.abort(reason);
 
@@ -1956,16 +2012,17 @@ export class InteractiveBrowserManager {
     return this.sessions.size;
   }
 
-  private async navigateSession(session: Session, tab: BrowserTab, rawUrl: string, operation: OperationDeadline, initial: boolean): Promise<BrowserNavigateResult> {
+  private async navigateSession(session: Session, tab: BrowserTab, rawUrl: string, operation: OperationDeadline, initial: boolean, onDispatch?: () => void): Promise<BrowserNavigateResult> {
     if (!initial) this.consumeNavigation(session);
     else session.navigations += 1;
     const requested = await operation.run(validateNavigationUrl(rawUrl, this.resolveHostname), "URL validation");
     let response: Response | null;
     try {
-      response = await operation.run(
-        tab.page.goto(requested.href, { waitUntil: "domcontentloaded", timeout: operation.remainingMs() }),
-        "main-document navigation",
-      );
+      // Invoking goto may dispatch the request; after this point cancellation
+      // cannot claim "no page effects".
+      const goto = tab.page.goto(requested.href, { waitUntil: "domcontentloaded", timeout: operation.remainingMs() });
+      onDispatch?.();
+      response = await operation.run(goto, "main-document navigation");
     } catch (error) {
       throw session.fatalError ?? asError(error);
     }
@@ -2201,10 +2258,14 @@ export class InteractiveBrowserManager {
     };
     this.activeOperations.add(active);
     const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let bodyStarted = false;
     const pending = new Set<Promise<unknown>>();
     try {
       throwIfAborted(operationSignal);
-      const result = await operationWork.run(pending, () => body(operationSignal));
+      const result = await operationWork.run(pending, () => {
+        bodyStarted = true;
+        return body(operationSignal);
+      });
       if (pending.size > 0) throw new Error("Browser operation left work in flight.");
       if (session.fatalError) throw session.fatalError;
       return this.protectOutput(result);
@@ -2215,16 +2276,29 @@ export class InteractiveBrowserManager {
         // browser/broker containment and pending command settlement complete.
         const deadline = failure.message.match(/\bBrowser[A-Za-z]+ exceeded its \d{1,8}ms total deadline\./)?.[0];
         const uncertain = new Error(`${deadline ? `${deadline} ` : ""}Browser operation left work in flight; effect status is unknown and no rollback is claimed.`);
+        let teardownConfirmed = false;
         try {
           await this.failAndWait(session, uncertain);
           await boundedCleanup(Promise.allSettled([...pending]), this.limits.cleanupMs, "pending browser operation drain");
+          teardownConfirmed = true;
         } catch {
-          throw new Error(`${uncertain.message} Session teardown is unconfirmed.`);
+          // Teardown or the bounded in-flight drain could not be confirmed.
         }
+        if (!teardownConfirmed) throw new Error(`${uncertain.message} Session teardown is unconfirmed.`);
+        const cancellation = cancellationKind(operationSignal);
+        // In-flight work at abort time proves the command dispatched: report
+        // structured post-dispatch cancellation, never parsed exception text.
+        if (cancellation) throw operationCancellationError(cancellation, "dispatched");
         throw new Error(`${uncertain.message} Session teardown is confirmed.`);
       }
       if ((fatalOnError && !(failure instanceof BrowserValidationError)) || operationSignal.aborted || session.fatalError) {
-        await this.failAndWait(session, session.fatalError ?? failure);
+        try {
+          await this.failAndWait(session, session.fatalError ?? failure);
+        } catch {
+          throw operationTeardownUncertainError();
+        }
+        const cancellation = cancellationKind(operationSignal);
+        if (cancellation) throw operationCancellationError(cancellation, bodyStarted ? "unknown" : "not_started");
       }
       throw failure;
     } finally {
@@ -2321,7 +2395,7 @@ export class InteractiveBrowserManager {
     if (this.authenticatesSessionHandle(sessionHandle)) {
       throw new BrowserSessionClosedError(this.closedTombstones.get(sessionHandle)?.closure);
     }
-    throw invalidHandleError();
+    throw invalidSessionHandleError();
   }
 
   private requireTab(sessionHandle: string, tabHandle: string): { session: Session; tab: BrowserTab } {
@@ -2329,7 +2403,7 @@ export class InteractiveBrowserManager {
     const tab = session.tabs.get(tabHandle);
     // Forged/cross-session tab handles stay indistinguishable. Authenticated
     // closed session handles above can safely receive actionable diagnostics.
-    if (!tab) throw invalidHandleError();
+    if (!tab) throw invalidTabHandleError(session);
     return { session, tab };
   }
 
@@ -3396,8 +3470,81 @@ async function assertControlledTopNavigation(locator: Locator, _page: Page): Pro
 
 class BrowserValidationError extends Error {}
 
-function invalidHandleError(): Error {
-  return new BrowserValidationError("Invalid or stale browser session/tab handle.");
+function invalidSessionHandleError(): BrowserRecoveryError {
+  return new BrowserRecoveryError(
+    "Invalid or stale browser session handle: it was not issued by this manager, or a different owner holds it. Use BrowserOpen to start a browser for this Pi session; BrowserSnapshot cannot recover an unknown session.",
+    { kind: "session_unknown" },
+  );
+}
+
+function invalidTabHandleError(session: Session): BrowserRecoveryError {
+  const ownedTabs = [...session.tabs.keys()];
+  const listing = ownedTabs.length > 0
+    ? `Current owned tabs: ${ownedTabs.join(", ")}.`
+    : "No other tabs are currently owned by this session.";
+  return new BrowserRecoveryError(
+    `Invalid or stale browser tab handle for this session. ${listing} Take a fresh BrowserSnapshot on an owned tab, or switch with BrowserTabs.`,
+    { kind: "tabs", session: session.handle, ownedTabs },
+  );
+}
+
+function duplicateOpenError(existing: Session): BrowserRecoveryError {
+  return new BrowserRecoveryError(
+    `A live browser is already open for this Pi session: session=${existing.handle} with active tab=${existing.activeTab}. An earlier successful BrowserOpen result may have been lost to a rewind or Escape. Use BrowserTabs operation=list on that session to recover its handles, then BrowserNavigate or BrowserClose; this BrowserOpen preserved the live session and opened no new browser.`,
+    { kind: "duplicate_open", existingSession: existing.handle, existingTab: existing.activeTab },
+  );
+}
+
+function openCancellationError(cancellation: BrowserCancellationKind, dispatched: boolean): BrowserRecoveryError {
+  const by = cancellation === "shutdown"
+    ? " by Pi session shutdown/replacement/reload"
+    : cancellation === "close" ? " by BrowserClose" : "";
+  if (!dispatched) {
+    return new BrowserRecoveryError(
+      `BrowserOpen was cancelled${by} before navigation dispatch; no page effects occurred and cleanup was confirmed. It is safe to retry BrowserOpen.`,
+      { kind: "cancelled", phase: "not_started", cleanup: "confirmed", recovery: "retry" },
+    );
+  }
+  return new BrowserRecoveryError(
+    `BrowserOpen was cancelled${by} after navigation dispatch; network effects may have occurred, effect status is unknown, and no rollback is claimed. Cleanup was confirmed; use BrowserOpen to start a new browser session.`,
+    { kind: "cancelled", phase: "dispatched", cleanup: "confirmed", recovery: "reopen" },
+  );
+}
+
+function unconfirmedOpenCleanupError(): BrowserRecoveryError {
+  return new BrowserRecoveryError(
+    "BrowserOpen failed and teardown could not be confirmed; browser resources may remain. This browser manager is fail-closed: recover by restarting the Pi session (terminal restart or reload) before further browser use. Effect status is unknown; no rollback is claimed.",
+    { kind: "unconfirmed_cleanup", phase: "unknown", cleanup: "unconfirmed" },
+  );
+}
+
+function operationCancellationError(cancellation: BrowserCancellationKind, phase: "not_started" | "dispatched" | "unknown"): BrowserRecoveryError {
+  const by = cancellation === "close"
+    ? " by BrowserClose"
+    : cancellation === "shutdown" ? " by Pi session shutdown/replacement/reload" : "";
+  if (phase === "not_started") {
+    return new BrowserRecoveryError(
+      `Browser operation was cancelled${by} before dispatch; effect status is not_started and no page effects occurred. Session teardown was confirmed; use BrowserOpen to start a new browser session.`,
+      { kind: "cancelled", phase: "not_started", cleanup: "confirmed", recovery: "reopen" },
+    );
+  }
+  if (phase === "dispatched") {
+    return new BrowserRecoveryError(
+      `Browser operation was cancelled${by} after dispatch; page or network effects may have occurred, effect status is unknown, and no rollback is claimed. Cleanup was confirmed; use BrowserOpen to start a new browser session.`,
+      { kind: "cancelled", phase: "dispatched", cleanup: "confirmed", recovery: "reopen" },
+    );
+  }
+  return new BrowserRecoveryError(
+    `Browser operation was cancelled${by}; effect status is unknown and no rollback is claimed. Session teardown was confirmed; use BrowserOpen to start a new browser session.`,
+    { kind: "cancelled", phase: "unknown", cleanup: "confirmed", recovery: "reopen" },
+  );
+}
+
+function operationTeardownUncertainError(): BrowserRecoveryError {
+  return new BrowserRecoveryError(
+    "Browser operation failed and teardown could not be confirmed; browser resources may remain. This browser manager is fail-closed: recover by restarting the Pi session (terminal restart or reload) before further browser use. Effect status is unknown; no rollback is claimed.",
+    { kind: "unconfirmed_cleanup", phase: "unknown", cleanup: "unconfirmed" },
+  );
 }
 
 function invalidRefError(): Error {
@@ -3610,11 +3757,27 @@ function normalizedInteractionFailure(
   error: unknown,
 ): Error {
   const message = error instanceof Error ? error.message : "";
-  if (/\b(?:not_started|effect status is (?:started|completed|unknown))\b/.test(message)) return asError(error);
-  if (/Invalid or stale browser (?:session\/tab handle|semantic ref)/.test(message)) {
+  if (/\b(?:not_started|effect status is (?:started|completed|unknown))\b/i.test(message)) return asError(error);
+  if (/Invalid or stale browser session handle|Browser session is closed/.test(message)) {
+    return new Error(`${name} not_started: browser session is closed or unknown; use BrowserOpen to start a browser for this Pi session (BrowserSnapshot cannot recover it).`);
+  }
+  if (/Invalid or stale browser tab handle/.test(message)) {
+    return new Error(`${name} not_started: invalid or stale owned tab capability; list owned tabs with BrowserTabs and take a fresh BrowserSnapshot.`);
+  }
+  if (/Invalid or stale browser semantic ref/.test(message)) {
     return new Error(`${name} not_started: invalid or stale owned semantic capability; take a fresh BrowserSnapshot.`);
   }
   return new Error(`${name} failed before dispatch; effect status is not_started.`);
+}
+
+function cancellationKind(signal: AbortSignal): BrowserCancellationKind | undefined {
+  if (!signal.aborted) return undefined;
+  // Classify only against fixed manager-owned reason strings; arbitrary
+  // caller or page exception text is never parsed for meaning.
+  const reasonMessage = signal.reason instanceof Error ? signal.reason.message : "";
+  if (reasonMessage === BROWSER_CLOSE_CANCEL_REASON) return "close";
+  if (reasonMessage === SESSION_SHUTDOWN_CANCEL_REASON) return "shutdown";
+  return "caller";
 }
 
 function asError(error: unknown): Error {

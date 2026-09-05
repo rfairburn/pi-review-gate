@@ -147,6 +147,19 @@ function assertTagObject(tagResponse, tag, target) {
   }
 }
 
+// Re-read the tag ref and verify it still points at the exact target SHA at an
+// identity-sensitive boundary. The tag ref is the actual source binding of a
+// release; target_commitish is only GitHub's fallback for CREATING a missing
+// tag at publication time, so the ref itself is re-verified before and after
+// publication rather than trusting earlier reads.
+async function assertTagRefMatches({ api, tag, target }) {
+  const ref = await api.getTag(`refs/tags/${tag}`);
+  if (!ref) {
+    throw new ReleaseError(`tag ${tag} is unreadable at a publication boundary; failing closed`);
+  }
+  assertTagObject(ref, tag, target);
+}
+
 // ---------------------------------------------------------------------------
 // Draft resolution
 // ---------------------------------------------------------------------------
@@ -170,6 +183,12 @@ async function findReleaseByTag({ api, tag }) {
 async function resolveOrCreateDraftRelease({ api, eligibility }) {
   const created = await api.createRelease({
     tag_name: eligibility.tag,
+    // Explicit source binding. GitHub's documented default for
+    // target_commitish is the repository's DEFAULT BRANCH; omitting it would
+    // let a publication create the tag at floating `main` if the tag were
+    // missing at publish time. Pinning it to the exact event SHA keeps every
+    // possible tag-creation path on the exact validated source.
+    target_commitish: eligibility.target,
     name: `${eligibility.tag} (${PACKAGE_NAME} ${eligibility.version})`,
     body: releaseBody(eligibility, undefined),
     draft: true,
@@ -177,7 +196,30 @@ async function resolveOrCreateDraftRelease({ api, eligibility }) {
     make_latest: "false",
   });
   if (created.status === 201) {
-    return { release: created.json, mode: "created-draft" };
+    // Validate the ACTUAL stored response identity before anything fallible
+    // (artifact build, asset writes) happens: GitHub has been observed
+    // storing draft releases under a detached tag identity (an
+    // `untagged-<hash>` tag_name). Such a draft is not the release this
+    // builder owns, so it fails closed immediately.
+    const release = created.json;
+    if (!release || release.draft !== true) {
+      throw new ReleaseError("created draft release response is malformed; failing closed");
+    }
+    if (release.tag_name !== eligibility.tag) {
+      throw new ReleaseError(
+        `created draft release reports detached tag_name ${JSON.stringify(release.tag_name)} instead of ${eligibility.tag}; failing closed before any artifact build or asset writes`,
+      );
+    }
+    if (!isOwnedDraft(release, eligibility)) {
+      // Full ownership validation of the ACTUAL stored response: the marker
+      // must pin this exact repository, SHA, tag, and version. A created
+      // draft without it is not owned by this builder, so its body must never
+      // be overwritten by a later identity write; fail closed immediately.
+      throw new ReleaseError(
+        `created draft release does not carry this builder's ownership identity for ${eligibility.tag}; failing closed before any artifact build or asset writes`,
+      );
+    }
+    return { release, mode: "created-draft" };
   }
   if (created.status === 422) {
     // Creation race or an existing release: re-read identity (draft-aware),
@@ -195,6 +237,25 @@ async function resolveOrCreateDraftRelease({ api, eligibility }) {
     return { release: reread, mode: "resume-draft" };
   }
   throw new ReleaseError(`release creation for ${eligibility.tag} failed: status ${created.status} body ${JSON.stringify(created.text.slice(0, 300))}`);
+}
+
+// Fail-closed discovery diagnostic: an owned draft whose API tag_name no
+// longer matches the intended tag (GitHub has been observed storing drafts
+// under a detached `untagged-<hash>` name while the body still carries the
+// exact ownership marker) is invisible to tag-based discovery. Without this
+// check, a retry would create a SECOND draft for the same identity instead of
+// touching the orphan. The orphan itself is never mutated here; recovering or
+// removing it is an explicit operator decision.
+async function findOrphanedOwnedDraft({ api, eligibility }) {
+  const releases = await api.listReleases();
+  const marker = identityMarker(eligibility);
+  return releases.find((release) =>
+    release
+    && release.draft === true
+    && release.tag_name !== eligibility.tag
+    && typeof release.body === "string"
+    && release.body.includes(marker)
+  ) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +457,10 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
   if (existing && existing.draft === false) {
     // Immutable boundary: published releases are verified only, never touched.
     const verification = await verifyPublishedRelease({ api, release: existing, eligibility, tarballFilename });
+    // Read-only identity cross-check: the published release must still be
+    // bound to a tag ref at the exact source SHA. Failing closed here mutates
+    // nothing; it only refuses to certify a compromised identity.
+    await assertTagRefMatches({ api, tag: eligibility.tag, target: eligibility.target });
     return {
       outcome: "already-published",
       tag: eligibility.tag,
@@ -405,6 +470,20 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       tarballSha256: verification.tarballSha256,
       mode: "published",
     };
+  }
+
+  if (!existing) {
+    // No readable release for this tag. Before creating anything, refuse to
+    // duplicate an orphaned owned draft: a draft carrying the exact identity
+    // marker but detached from its tag (e.g. GitHub `untagged-…` tag_name)
+    // must be recovered or removed by an explicit operator action, never
+    // papered over with a duplicate draft.
+    const orphan = await findOrphanedOwnedDraft({ api, eligibility });
+    if (orphan) {
+      throw new ReleaseError(
+        `an owned draft carrying the exact ${eligibility.tag} identity marker exists (release id ${orphan.id}) but its API tag_name is ${JSON.stringify(orphan.tag_name)} (detached draft identity); refusing to create a duplicate draft; operator recovery required; failing closed`,
+      );
+    }
   }
 
   let release;
@@ -447,6 +526,14 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       scratch,
     });
     await api.updateRelease(release.id, {
+      // Re-assert the bound tag and source on EVERY draft mutation: a live
+      // API probe (issue #13) confirmed that a draft PATCH omitting tag_name
+      // detaches the stored tag (the draft is re-stored under a synthetic
+      // `untagged-<hash>` tag_name), while an omitted target_commitish
+      // preserves its existing value — the default branch applies only on
+      // CREATE. Both fields are therefore always sent explicitly here.
+      tag_name: eligibility.tag,
+      target_commitish: eligibility.target,
       draft: true,
       prerelease: true,
       body: releaseBody(eligibility, build.provenance),
@@ -457,7 +544,13 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       throw new ReleaseError("draft release lost its owned identity before publication; failing closed");
     }
     const sync = await syncDraftAssets({ api, release: refreshed, assets: build.assets });
+    // Publication boundary: re-verify the tag ref still points at the exact
+    // target immediately before the publish PATCH, and re-assert the bound
+    // tag/source in the publish payload itself.
+    await assertTagRefMatches({ api, tag: eligibility.tag, target: eligibility.target });
     await api.updateRelease(release.id, {
+      tag_name: eligibility.tag,
+      target_commitish: eligibility.target,
       draft: false,
       prerelease: true,
       make_latest: "false",
@@ -465,6 +558,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
     });
     const published = await api.getRelease(release.id);
     if (!published) throw new ReleaseError("release became unreadable after publication");
+    await assertTagRefMatches({ api, tag: eligibility.tag, target: eligibility.target });
     const verification = await verifyPublishedRelease({
       api,
       release: published,
@@ -489,8 +583,10 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
 }
 
 module.exports = {
+  assertTagRefMatches,
   ensureTag,
   expectedAssetNames,
+  findOrphanedOwnedDraft,
   findReleaseByTag,
   identityMarker,
   isOwnedDraft,

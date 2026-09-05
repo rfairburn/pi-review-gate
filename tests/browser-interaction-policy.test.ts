@@ -25,7 +25,7 @@ const baseTarget: BrowserTargetStructure = {
   domPath: "html:nth-of-type(1)> body:nth-of-type(1)> button:nth-of-type(1)",
 };
 
-test("structural consequence policy permits only proven navigation and native disclosure", () => {
+test("structural consequence policy permits proven navigation but authorizes eventful disclosure", () => {
   const policy = new BrowserConsequencePolicy();
   assert.deepEqual(policy.classify({
     ...baseTarget,
@@ -45,6 +45,8 @@ test("structural consequence policy permits only proven navigation and native di
     inputType: null,
     summaryForDetails: true,
   }).consequence, "local_disclosure");
+  assert.equal(policy.classify({ ...baseTarget, tagName: "summary", role: null, inputType: null, summaryForDetails: true }).consequential, true,
+    "native toggle events are not proof of effect-free disclosure");
 
   assert.equal(policy.classify(baseTarget).consequence, "unknown_or_mixed", "an ordinary-looking button is unknown");
   assert.equal(policy.classify({ ...baseTarget, tagName: "a", role: "link", href: "https://example.com", inputType: null, inlineEventHandler: true }).consequential, true);

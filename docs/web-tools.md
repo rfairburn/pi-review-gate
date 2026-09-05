@@ -185,11 +185,19 @@ The session surface is bounded and semantic:
 - `BrowserClick` clicks exactly one current opaque semantic ref. A centralized policy
   inspects a freshly resolved target's structural properties and fingerprint; accessible
   names, page claims, and model assertions never establish safety. Structurally proven
-  ordinary HTTP(S) links and native `summary` disclosure controls may proceed without a
+  ordinary HTTP(S) links may proceed without a
   prompt. Controlled links must target the current top-level browsing context;
   child-frame links and non-self base targets are rejected before navigation rather
-  than silently redirected into the top page. Silent links preserve fragments and
-  are activated as controlled brokered navigation rather than by
+  than silently redirected into the top page. Silent links preserve fragments and resolve
+  relative URLs against the owning document's isolated native base URL.
+  Native `summary` disclosure is consequential: even setting `details.open` dispatches
+  page-controlled `toggle` handlers. Preflight (including hover) uses Playwright's
+  isolated engine reads, never page-owned getters or main-world evaluation.
+  Submission binding includes the native effective form action and method, including
+  external `form` associations and submitter overrides. These form facts require the
+  supported isolated Playwright selector bridge; missing support fails closed, without
+  falling back to main-world evaluation or element-handle previews.
+  Silent links are activated as controlled brokered navigation rather than by
   dispatching page click handlers; known consequential destinations such as logout,
   destructive, authorization, publish, send, purchase, or account paths are not silent. Forms, downloads, authentication/terms/permissions, destructive/publish/send/
   purchase/account actions, unknown buttons or menu items, and every unknown or mixed
@@ -213,7 +221,7 @@ The session surface is bounded and semantic:
   Password and file controls are rejected. A structurally proven unsent local edit may
   proceed as ephemeral state only when relevant page-controlled events are proven
   absent; ordinary web pages can hide direct or delegated `addEventListener` handlers,
-  so event-dispatching form actions conservatively require confirmation rather than
+  so event-dispatching form actions conservatively require configured approval rather than
   assuming those handlers do not exist. Results explicitly distinguish whether a remote
   network effect was observed. Sensitive or autocomplete controls, authentication/terms destinations,
   submit or activation keys (including Enter and Space), explicit change/autosave/
@@ -222,10 +230,14 @@ The session surface is bounded and semantic:
   Approval is
   bound to the action, key, and a nonpersisted digest and lengths of the exact values,
   in addition to session/tab/generation/origin/target/consequence, followed by immediate
-  re-resolution and reclassification. Values and selections are excluded from
-  review-gate-owned result text/details, confirmation prompts, diagnostics, durable
-  evidence, and logs. Pi/provider-native conversation and session-history retention is
-  outside this guarantee; do not enter secrets or other credentials.
+  re-resolution and reclassification. Input argument redaction and value-free approval
+  prompts remain in place. Before dispatch, literal entered strings and selected native
+  labels/values are registered in bounded, memory-only browser-manager state. Complete
+  literal echoes are redacted from browser result text/details and later diagnostics,
+  including asynchronous echoes, before those results become extension evidence.
+  This is not a page information-flow secrecy guarantee; see the limits below.
+  Pi/provider-native conversation and session-history retention is outside this
+  protection; do not enter secrets or other credentials.
 - `BrowserClose` is idempotent. It reports closure only after the page, context,
   Chromium connection, broker listener, and every tracked broker socket are confirmed
   quiescent. Recent closes retain bounded broker diagnostics; older confirmed closes
@@ -283,13 +295,34 @@ do not navigate, mutate the document generation/page state, create requests, or 
 broker permissions. Ring overflow and result pagination are never silent: dropped and
 truncated counts accompany every read.
 
+Literal-echo protection retains at most 1,024 distinct nonempty strings and 65,536
+UTF-16 code units per browser-manager owner, across tabs and browser close/reopen.
+The registry is never persisted or sent as telemetry. It is not evicted while that
+owner exists: exhaustion rejects further value dispatch rather than forgetting older
+values. Selected-option inspection is capped at 512 options. Ordinary observations
+remain available; matching text is replaced, not the whole page. Very short inputs
+can redact common text; opaque refs, structural role tokens, and typed protocol fields
+are preserved. This protects complete literal matches, not page encodings, escaping,
+transformations, fragments, screenshot pixels, previously returned evidence, or native
+Pi/provider input/conversation retention. It must not be presented as credential-safe
+browsing or as guaranteed erasure. The registry ends when its owning manager is discarded,
+not at a turn/review boundary.
+
 Resource and action limits remain hard and finite: one browser per Pi session, 4 tabs, 12
 explicit navigations/history traversals, 64 operations, 32 retained history entries per
 tab, 32 main-document requests, 16 destination hosts,
 96 connections, 256 broker requests, 8 MiB per connection, and 32 MiB aggregate bytes.
 Each open/navigation and confirmation-capable interaction has one 30-second end-to-end
 deadline; each other action or snapshot has one 10-second end-to-end deadline. All
-phases share that one absolute timer and never receive fresh timers.
+phases share that one absolute timer and never receive fresh timers. A deadline race
+is not cancellation: pending browser commands (including preflight and tab switching)
+are contained through browser/broker teardown and a bounded drain before operation
+serialization is released. Parallel inspection groups retain all issued sibling reads
+until settlement, even when one read rejects; a rejected child cannot hide pending work.
+Cleanup can therefore extend the caller's elapsed time
+beyond the action deadline. Unsettled work reports unknown effects, never rollback.
+Ordinary invalid/stale capability validation and harmless screenshot mode/ref argument
+mistakes do not themselves retire a healthy session.
 There is no browser idle or elapsed-lifetime expiry. Quiet destination sockets are still
 evicted after 20 seconds without closing the browser or cancelling a pending permission
 prompt. Opaque evicted tunnels are conservatively recorded as incomplete transfers;
@@ -322,6 +355,14 @@ fails closed and completes this teardown before returning. Call `BrowserClose` a
 as the evidence is collected; on success it deterministically confirms browser and
 broker cleanup, and it is safe to repeat.
 
+Interactive Browser failures throw bounded, sanitized errors so Pi's native outer
+`toolResult.isError` is true. They contain text only, never screenshots or raw page/
+Playwright exceptions. `BrowserExtract` and `WebFetch` keep their existing result contract.
+The real-runtime regression in `tests/browser-native-error.test.ts` accepts
+`PI_BROWSER_AGENT_RUNTIME` pointing to an installed Pi agent-core `dist/index.js`
+(tested with 0.85.0); its model stream is entirely mocked, with no live model calls.
+Without that runtime path the optional contract test is explicitly skipped.
+
 The interactive tools are registered only through the Pi extension surface and are
 authorized but inactive initially when deferred tools are enabled. Use `search_tools`
 with the exact tool name to load one. `BrowserScreenshot` checks the current Pi model's
@@ -352,7 +393,7 @@ existing confirmation-required branch for authorized `BrowserClick`, `BrowserFil
 - **Automatically Deny** rejects that branch without prompting or dispatching the
   requested interaction. It is not a browser-wide read-only switch.
 
-Already-permitted observations, controlled ordinary navigation/native disclosure, and
+Already-permitted observations, controlled ordinary navigation, and
 structurally proven local edits remain permitted in all three modes. No mode grants
 research-role click/form authority or removes password/file/clipboard and other hard
 restrictions, SSRF/broker controls, revalidation, or value-secrecy protections. Approval

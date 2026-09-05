@@ -106,7 +106,9 @@ export class BrowserConsequencePolicy {
       && !target.contentEditable
       && !target.href
     ) {
-      return { consequence: "local_disclosure", consequential: false, destination: null };
+      // Even a native open-state change queues a page-controlled toggle event.
+      // No reliable absence-of-effects proof exists; use the approval path.
+      return { consequence: "local_disclosure", consequential: true, destination: null };
     }
 
     return { consequence: "unknown_or_mixed", consequential: true, destination };

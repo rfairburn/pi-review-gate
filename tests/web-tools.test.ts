@@ -634,15 +634,13 @@ test("BrowserScreenshot returns Pi image content and fails with BrowserSnapshot 
   manager.register();
   const screenshot = tools.get("BrowserScreenshot");
 
-  const unsupported = await screenshot.execute(
+  await assert.rejects(screenshot.execute(
     "no-vision",
     { session: "s", tab: "t", mode: "viewport" },
     undefined,
     undefined,
     { model: { input: ["text"] } },
-  );
-  assert.equal(unsupported.isError, true);
-  assert.match(unsupported.content[0].text, /use BrowserSnapshot/i);
+  ), /use BrowserSnapshot/i);
   assert.equal(captures, 0, "unsupported delivery is rejected before browser capture");
 
   const supported = await screenshot.execute(
@@ -700,15 +698,13 @@ test("BrowserClick uses only Pi's interactive execution-context confirmation API
   manager.register();
   const click = tools.get("BrowserClick");
   const prompts: Array<[string, string]> = [];
-  const oversized = await click.execute(
+  await assert.rejects(click.execute(
     "oversized",
     { session: "s".repeat(257), tab: "tab", ref: "ref" },
     undefined,
     undefined,
     { hasUI: true, ui: { confirm: async () => true } },
-  );
-  assert.equal(oversized.isError, true);
-  assert.match(oversized.content[0].text, /256-character limit/);
+  ), /not_started.*out-of-bounds/);
   assert.deepEqual(confirmationAvailability, [], "oversized arguments are rejected before manager lookup");
 
   const approved = await click.execute(
@@ -722,14 +718,13 @@ test("BrowserClick uses only Pi's interactive execution-context confirmation API
   assert.deepEqual(prompts, [["Fixed title", "Fixed bounded message"]]);
   assert.match(approved.content[0].text, /approval: human.*interactive confirmation used: true/);
 
-  const background = await click.execute(
+  await assert.rejects(click.execute(
     "background",
     { session: "session", tab: "tab", ref: "ref" },
     undefined,
     undefined,
     { hasUI: false, ui: { confirm: async () => true } },
-  );
-  assert.equal(background.isError, true);
+  ), /not_started/);
   assert.deepEqual(confirmationAvailability, [true, false], "hasUI=false never reaches an ambient confirm function");
   await manager.cleanup();
 });

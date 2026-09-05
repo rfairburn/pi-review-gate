@@ -100,19 +100,35 @@ class FakePage extends EventEmitter {
         callOnSelector: async (ownedSelector: string, options: { strict: boolean; mainWorld: boolean }) => {
           assert.equal(ownedSelector, "aria-ref=e7");
           assert.deepEqual(options, { strict: true, mainWorld: false });
-          return { result: page.url() };
+          return { result: {
+            formAssociated: page.targetStructure.formAssociated, formAction: page.targetStructure.formAction,
+            formMethod: page.targetStructure.formMethod, autocomplete: page.targetStructure.autocomplete ?? null,
+            baseUrl: page.url(), topLevel: true, target: null,
+          } };
         },
       } }) } },
-      elementHandle: async () => ({ ownerFrame: async () => page.frame, dispose: async () => undefined }),
-      locator: (_selector: string) => ({ count: async () => 0 }),
+      elementHandle: async () => { throw new Error("Preflight must not create page-world element previews."); },
       _expect: async () => ({ received: { value: "Fixture description" } }),
       scrollIntoViewIfNeeded: async () => undefined,
       waitFor: async () => undefined,
       getAttribute: async (name: string) => name === "type"
-        ? page.targetStructure.inputType
+        ? (page.onStructureRead?.(), page.targetStructure.inputType)
         : name === "role" ? page.targetStructure.role
           : name === "href" ? page.targetStructure.href
-            : name === "aria-description" ? "Fixture description" : null,
+            : name === "aria-description" ? "Fixture description"
+              : name === "id" ? page.targetStructure.domPath
+                : name === "multiple" ? (page.targetStructure.multiple ? "" : null)
+                  : name === "autocomplete" ? page.targetStructure.autocomplete ?? null
+                    : name === "readonly" ? (page.targetStructure.readOnly ? "" : null) : null,
+      locator: (selector: string) => {
+        if (selector === "xpath=ancestor-or-self::*[@contenteditable][1]") return { count: async () => 0 };
+        assert.equal(selector, "option");
+        const labels = ["Private A", "Private B", "private-approval-value", "private"];
+        return { count: async () => labels.length, nth: (index: number) => ({
+          getAttribute: async (name: string) => name === "value" ? labels[index] : null,
+          textContent: async () => labels[index],
+        }) };
+      },
       ariaSnapshot: async () => {
         if (page.inspectDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, page.inspectDelayMs));
         const role = page.targetStructure.role ?? (page.targetStructure.tagName === "input" ? "textbox" : "generic");
@@ -132,7 +148,12 @@ class FakePage extends EventEmitter {
             const role = page.targetStructure.role ?? (page.targetStructure.tagName === "input" ? "textbox" : "generic");
             return other.fixtureRole === role && other.fixtureName === "Next" ? 1 : 0;
           }
-          return other.fixtureTag === page.targetStructure.tagName ? 1 : 0;
+          const selector = other.fixtureTag;
+          if (selector === "details > summary") return page.targetStructure.summaryForDetails ? 1 : 0;
+          if (selector === "form input, form button, form select, form textarea") return page.targetStructure.formAssociated ? 1 : 0;
+          if (selector?.startsWith("[contenteditable]")) return page.targetStructure.contentEditable ? 1 : 0;
+          if (selector?.startsWith("[onclick]")) return page.targetStructure.inlineEventHandler ? 1 : 0;
+          return selector === page.targetStructure.tagName ? 1 : 0;
         },
       }),
       evaluate: async (_callback: unknown, ...args: unknown[]) => {
@@ -468,12 +489,12 @@ test("terminal shutdown aborts an in-flight screenshot and proves zero ownership
   const started = new Promise<void>((resolve) => { screenshotStarted = resolve; });
   browsers[0]!.context.page.screenshot = async () => {
     screenshotStarted();
-    return new Promise<typeof ONE_PIXEL_PNG>(() => undefined);
+    return new Promise<typeof ONE_PIXEL_PNG>((_resolve, reject) => browsers[0]!.context.page.once("close", () => reject(new Error("closed"))));
   };
   const screenshot = manager.screenshot(opened.session, opened.tab, "viewport", undefined);
   await started;
   const barrier = manager.shutdown();
-  await assert.rejects(screenshot, /Pi session shutdown/);
+  await assert.rejects(screenshot, /effect status is unknown/);
   await barrier;
   assert.equal(manager.activeSessionCount(), 0);
   assert.equal(browsers[0]!.isConnected(), false);
@@ -487,8 +508,11 @@ test("explicit BrowserClose aborts and drains an in-flight action without losing
   let announce!: () => void;
   const started = new Promise<void>((resolve) => { announce = resolve; });
   browser.context.page.screenshot = async () => {
+    const pending = new Promise<typeof ONE_PIXEL_PNG>((_resolve, reject) => {
+      browser.context.page.once("close", () => reject(new Error("Screenshot target closed")));
+    });
     announce();
-    return new Promise<typeof ONE_PIXEL_PNG>(() => undefined);
+    return pending;
   };
   const capture = manager.screenshot(opened.session, opened.tab, "viewport", undefined);
   const rejected = assert.rejects(capture, /cancelled by BrowserClose/);
@@ -578,7 +602,8 @@ test("BrowserScroll accepts only bounded page/ref operations and current scoped 
     fixture.manager.scroll(opened.session, opened.tab, "ref", undefined, 1, `${ref}_forged`),
     /fresh BrowserSnapshot/,
   );
-  assert.equal(fixture.manager.activeSessionCount(), 0, "invalid semantic capabilities fail the session closed");
+  assert.equal(fixture.manager.activeSessionCount(), 1, "ordinary stale-ref validation leaves the session usable");
+  await fixture.manager.shutdown();
 });
 
 for (const mode of ["ask", "automatically-accept", "automatically-deny"] as const) {
@@ -603,9 +628,15 @@ test(`BrowserHover and structurally proven link clicks stay permitted in ${mode}
   snapshot = await fixture.manager.snapshot(opened.session, opened.tab, 1_000);
   ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];
   assert.ok(ref);
-  const disclosed = await fixture.manager.click(opened.session, opened.tab, ref);
-  assert.equal(disclosed.consequence, "local_disclosure");
-  assert.equal(disclosed.confirmed, false);
+  if (mode === "automatically-deny") {
+    await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref, async () => true), /automatically denied/);
+  } else {
+    if (mode === "ask") await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref), /not_started/);
+    const disclosed = await fixture.manager.click(opened.session, opened.tab, ref, async () => true);
+    assert.equal(disclosed.consequence, "local_disclosure");
+    assert.equal(disclosed.confirmed, mode === "ask");
+    assert.equal(disclosed.approval, mode === "ask" ? "human" : "automatic");
+  }
 
   fixture.browser.context.page.targetStructure = {
     ...fixture.browser.context.page.targetStructure,
@@ -620,7 +651,7 @@ test(`BrowserHover and structurally proven link clicks stay permitted in ${mode}
   assert.equal(clicked.confirmed, false);
   assert.equal(clicked.effects.navigation, "observed");
   assert.equal(clicked.url, "https://example.com", "interaction output redacts path and query");
-  assert.equal(fixture.browser.context.page.clickCalls, 0, "silent activation never dispatches page click handlers");
+  assert.equal(fixture.browser.context.page.clickCalls, Number(mode !== "automatically-deny"), "only approved disclosure dispatches page click handlers");
   await assert.rejects(fixture.manager.click(opened.session, opened.tab, ref), /fresh BrowserSnapshot/);
   await fixture.manager.shutdown();
 });
@@ -628,7 +659,7 @@ test(`BrowserHover and structurally proven link clicks stay permitted in ${mode}
 }
 
 for (const mode of ["ask", "automatically-accept", "automatically-deny"] as const) {
-test(`bounded local form controls stay permitted and keep values secret in ${mode}`, async () => {
+test(`eventful local form controls obey approval and keep values secret in ${mode}`, async () => {
   const fixture = managerFixture();
   fixture.manager.updateConfig(normalizeConfig({}).web!.fetch, mode);
   const opened = await fixture.manager.open("https://example.com/form");
@@ -647,15 +678,22 @@ test(`bounded local form controls stay permitted and keep values secret in ${mod
   };
 
   const secret = "ordinary text and ghp_abcdefghijklmnopqrstuvwxyz123456";
-  const filled = await fixture.manager.fill(opened.session, opened.tab, await freshRef(), secret);
-  assert.equal(filled.consequence, "local_editing");
-  assert.equal(filled.confirmed, false);
+  if (mode === "automatically-deny") {
+    await assert.rejects(fixture.manager.fill(opened.session, opened.tab, await freshRef(), secret, async () => true), /automatically denied/);
+    assert.deepEqual(fixture.browser.context.page.fillCalls, []);
+    await fixture.manager.shutdown();
+    return;
+  }
+  const filled = await fixture.manager.fill(opened.session, opened.tab, await freshRef(), secret, async () => true);
+  assert.equal(filled.consequence, "unknown_or_mixed");
+  assert.equal(filled.confirmed, mode === "ask");
+  assert.equal(filled.approval, mode === "ask" ? "human" : "automatic");
   assert.equal(filled.effects.network, "not_observed");
   assert.equal(JSON.stringify(filled).includes(secret), false);
   assert.deepEqual(fixture.browser.context.page.fillCalls, [secret]);
 
   const appended = " appended";
-  await fixture.manager.type(opened.session, opened.tab, await freshRef(), appended, 2);
+  await fixture.manager.type(opened.session, opened.tab, await freshRef(), appended, 2, async () => true);
   assert.deepEqual(fixture.browser.context.page.typeCalls, [{ text: appended, delay: 2 }]);
 
   fixture.browser.context.page.targetStructure = {
@@ -663,8 +701,8 @@ test(`bounded local form controls stay permitted and keep values secret in ${mod
     tagName: "select", role: "listbox", inputType: null, multiple: true,
   };
   const choices = ["Private A", "Private B"];
-  const selected = await fixture.manager.select(opened.session, opened.tab, await freshRef(), choices);
-  assert.equal(selected.consequence, "local_editing");
+  const selected = await fixture.manager.select(opened.session, opened.tab, await freshRef(), choices, async () => true);
+  assert.equal(selected.consequence, "unknown_or_mixed");
   assert.deepEqual(fixture.browser.context.page.selectCalls, [[{ value: "Private A" }, { value: "Private B" }]]);
   assert.equal(JSON.stringify(selected).includes("Private"), false);
 
@@ -672,7 +710,7 @@ test(`bounded local form controls stay permitted and keep values secret in ${mod
     ...fixture.browser.context.page.targetStructure,
     tagName: "textarea", role: "textbox", inputType: null, multiple: false,
   };
-  await fixture.manager.press(opened.session, opened.tab, await freshRef(), "ArrowDown");
+  await fixture.manager.press(opened.session, opened.tab, await freshRef(), "ArrowDown", async () => true);
   assert.deepEqual(fixture.browser.context.page.pressCalls, ["ArrowDown"]);
   await assert.rejects(
     fixture.manager.press(opened.session, opened.tab, await freshRef(), "Control+V"),
@@ -824,8 +862,7 @@ for (const family of approvalFamilies) {
     try {
       for (const context of [undefined, { hasUI: true, ui: { confirm: async () => false } }, { hasUI: true, ui: { confirm: async () => { throw new Error("UI unavailable"); } } }]) {
         const ref = (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1];
-        const result = await tool.execute("ask-rejection", { ...params, ref }, undefined, undefined, context);
-        assert.equal(result.isError, true);
+        await assert.rejects(tool.execute("ask-rejection", { ...params, ref }, undefined, undefined, context), /not_started/);
         assert.equal(dispatchCount(), 0, "Ask denies absent UI, denial, and unavailable UI before dispatch");
       }
       // The same registered closures and live session must see each saved policy,
@@ -838,24 +875,25 @@ for (const family of approvalFamilies) {
           const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)![1];
           const before = dispatchCount();
           const beforePrompts = prompts;
-          const result = await tool.execute("approval", { ...params, ref }, undefined, undefined, { hasUI, ui });
           const expectedSuccess = mode === "automatically-accept" || (mode === "ask" && hasUI);
-          // This is the extension's returned error marker, not native Pi's outer
-          // isError classification. Dispatch counts independently prove rejection.
-          assert.equal(result.isError, !expectedSuccess, `${mode}, UI=${hasUI}: ${result.content[0].text}`);
+          const request = tool.execute("approval", { ...params, ref }, undefined, undefined, { hasUI, ui });
+          let result: any;
+          if (expectedSuccess) {
+            result = await request;
+            assert.equal(result.isError, false);
+          } else {
+            await assert.rejects(request, /not_started/);
+          }
           assert.equal(dispatchCount(), before + Number(expectedSuccess));
           assert.equal(consumed, dispatchCount(), "human and automatic dispatch both require a consumed bound permit");
           assert.equal(prompts, beforePrompts + Number(mode === "ask" && hasUI));
-          assert.equal(JSON.stringify(result).includes(secret), false);
+          if (result) assert.equal(JSON.stringify(result).includes(secret), false);
           if (expectedSuccess) {
             assert.equal(result.details.response.approval, mode === "ask" ? "human" : "automatic");
             assert.equal(result.details.response.confirmed, mode === "ask");
             assert.match(result.content[0].text, mode === "ask" ? /approval: human.*interactive confirmation used: true/ : /approval: automatic.*interactive confirmation used: false/);
-            const stale = await tool.execute("stale", { ...params, ref }, undefined, undefined, { hasUI, ui });
-            assert.equal(stale.isError, true);
+            await assert.rejects(tool.execute("stale", { ...params, ref }, undefined, undefined, { hasUI, ui }), /not_started/);
             assert.equal(dispatchCount(), before + 1, "successful dispatch invalidates the one-use ref");
-          } else {
-            assert.match(result.content[0].text, mode === "ask" ? /requires an interactive Pi confirmation/ : /automatically denied/);
           }
         }
       }
@@ -1057,7 +1095,7 @@ test("BrowserWait exposes only bounded observational conditions and cancellation
   const controller = new AbortController();
   const waiting = fixture.manager.wait(opened.session, opened.tab, { condition: "duration", durationMs: 500 }, 1_000, controller.signal);
   controller.abort(new Error("cancel wait fixture"));
-  await assert.rejects(waiting, /cancel wait fixture/);
+  await assert.rejects(waiting, /effect status is unknown/);
   assert.equal(fixture.manager.activeSessionCount(), 0);
 });
 
@@ -1081,7 +1119,8 @@ test("BrowserHistory bounds entries and invalidates only the traversed tab gener
     fixture.manager.screenshot(opened.session, opened.tab, "element", ref),
     /fresh BrowserSnapshot/,
   );
-  assert.equal(fixture.manager.activeSessionCount(), 0);
+  assert.equal(fixture.manager.activeSessionCount(), 1);
+  await fixture.manager.shutdown();
 });
 
 test("BrowserTabs owns popups, enforces its cap, switches deterministically, and closes the last tab/session", async () => {
@@ -1245,7 +1284,7 @@ test("BrowserTabs close rejection and delayed close fail into confirmed session 
 
     await assert.rejects(
       manager.tabs(opened.session, "close", tabHandle),
-      /could not confirm closure.*teardown started|20ms total deadline/i,
+      /could not confirm closure.*teardown started|20ms total deadline|effect status is unknown/i,
     );
     assert.equal(manager.activeSessionCount(), 0, `${mode} close must not leave a usable session`);
     assert.equal(browser.isConnected(), false);
@@ -1299,7 +1338,7 @@ test("screenshot refs reject forged, stale, cross-session, and cross-tab use uni
     first.manager.screenshot(firstOpened.session, firstOpened.tab, "element", `${firstRef}_forged`),
     /fresh BrowserSnapshot/,
   );
-  assert.equal(first.manager.activeSessionCount(), 0, "invalid element refs fail closed and clean up the session");
+  assert.equal(first.manager.activeSessionCount(), 1, "invalid element refs do not destroy healthy sessions");
 
   const stale = managerFixture();
   const staleOpened = await stale.manager.open("https://example.com/stale");
@@ -1433,7 +1472,7 @@ test("screenshot cancellation fails clearly and confirms session cleanup", async
   const capture = fixture.manager.screenshot(opened.session, opened.tab, "viewport", undefined, controller.signal);
   await started;
   controller.abort(new Error("cancel screenshot test"));
-  await assert.rejects(capture, /cancel screenshot test/);
+  await assert.rejects(capture, /effect status is unknown/);
   assert.equal(fixture.manager.activeSessionCount(), 0);
   assert.equal((await fixture.manager.close(opened.session)).alreadyClosed, true);
 });
@@ -1500,7 +1539,8 @@ test("navigation uses one absolute deadline across validation and page phases", 
     manager.navigate(opened.session, opened.tab, "https://example.com/slow"),
     /80ms total deadline/,
   );
-  assert.ok(Date.now() - started < 105, "phases must not each receive a fresh 80ms allowance");
+  assert.ok(Date.now() - started >= 100, "deadline rejection drains the late command before releasing serialization");
+  assert.ok(Date.now() - started < 300, "command drain remains bounded by cleanup allowance");
   assert.equal(manager.activeSessionCount(), 0);
 });
 
@@ -1545,7 +1585,8 @@ test("snapshot acquisition and metadata reads share one absolute deadline", asyn
     boundedManager.snapshot(boundedOpened.session, boundedOpened.tab, 1_000),
     /80ms total deadline/,
   );
-  assert.ok(Date.now() - started < 105, "snapshot phases must not each receive a fresh allowance");
+  assert.ok(Date.now() - started >= 100, "the timed-out metadata command is drained before rejection");
+  assert.ok(Date.now() - started < 300, "snapshot cleanup and draining remain bounded");
   assert.equal(boundedManager.activeSessionCount(), 0);
 });
 
@@ -1709,7 +1750,8 @@ test("real BrowserType appends despite an existing caret at the start", async ()
     assert.ok(ref);
     await manager.type(opened.session, opened.tab, ref, "head", 0, async () => true);
     const after = await manager.snapshot(opened.session, opened.tab, 2_000);
-    assert.match(after.snapshot, /tailhead/);
+    assert.match(after.snapshot, /tail\[entered value redacted\]/);
+    assert.doesNotMatch(after.snapshot, /head/);
     assert.doesNotMatch(after.snapshot, /headtail/);
   } finally {
     await manager.shutdown();

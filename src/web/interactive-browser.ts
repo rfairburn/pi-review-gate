@@ -15,6 +15,8 @@ import {
 } from "playwright";
 import type { BrowserInteractionApproval, WebFetchConfig } from "../config";
 import { redactSensitiveText } from "../redaction";
+import { BrowserOutputPrivacy } from "./browser-output-privacy";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   CLEANUP_DEADLINE_MS,
   MAX_MAIN_DOCUMENT_REDIRECTS,
@@ -543,6 +545,19 @@ class DiagnosticRing<T extends DiagnosticEvent> {
  * this extension process.
  */
 export class InteractiveBrowserManager {
+  // One manager belongs to one Pi session. Retain across browser close/reopen
+  // because later tabs can redisplay previously entered content.
+  private readonly outputPrivacy = new BrowserOutputPrivacy();
+
+  protectOutput<T>(value: T): T { return this.outputPrivacy.output(value); }
+
+  private privateConfirmation(confirmation?: BrowserInteractionConfirmation): BrowserInteractionConfirmation | undefined {
+    return confirmation ? request => confirmation({
+      title: this.outputPrivacy.text(request.title),
+      message: this.outputPrivacy.text(request.message),
+    }) : undefined;
+  }
+
   private readonly sessions = new Map<string, Session>();
   private readonly closedTombstones = new Map<string, BrowserCloseResult>();
   private readonly failedTombstones = new Map<string, Error>();
@@ -752,7 +767,7 @@ export class InteractiveBrowserManager {
       try {
         const navigation = await this.navigateSession(session, primaryTab, requested.href, operation, true);
         session.operationActive = false;
-        return { ...navigation, limits: this.limits };
+        return this.protectOutput({ ...navigation, limits: this.limits });
       } catch (error) {
         session.operationActive = false;
         try {
@@ -846,9 +861,9 @@ export class InteractiveBrowserManager {
           }
           return replacement;
         });
-        const snapshot = semantic.slice(0, limit);
+        const snapshot = this.outputPrivacy.output({ snapshot: semantic }).snapshot.slice(0, limit);
         const snapshotUrl = publicPageUrl(tab.page.url());
-        const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+        const title = bounded(this.outputPrivacy.text(await operation.run(tab.page.title(), "browser title read")), 500);
         if (tab.generation !== capturedGeneration) {
           throw new Error("Browser document changed during semantic snapshot capture; snapshot rejected.");
         }
@@ -856,7 +871,9 @@ export class InteractiveBrowserManager {
         // current. A new snapshot replaces this map rather than accumulating
         // page-controlled references for the session lifetime.
         tab.semanticRefs.clear();
-        for (const [opaqueRef, ref] of capturedRefs) tab.semanticRefs.set(opaqueRef, ref);
+        for (const [opaqueRef, ref] of capturedRefs) {
+          if (snapshot.includes(`[ref=${opaqueRef}]`)) tab.semanticRefs.set(opaqueRef, ref);
+        }
         return {
           session: session.handle,
           tab: tab.handle,
@@ -1000,7 +1017,7 @@ export class InteractiveBrowserManager {
         const capturedGeneration = tab.generation;
         let image: Buffer;
         if (mode === "viewport") {
-          if (ref !== undefined) throw new Error("BrowserScreenshot viewport mode does not accept ref.");
+          if (ref !== undefined) throw new BrowserValidationError("BrowserScreenshot viewport mode does not accept ref.");
           const viewport = tab.page.viewportSize();
           if (!viewport) throw new Error("BrowserScreenshot could not determine the bounded browser viewport.");
           assertScreenshotDimensions(viewport.width, viewport.height, this.limits, "viewport");
@@ -1013,7 +1030,7 @@ export class InteractiveBrowserManager {
             timeout: operation.remainingMs(),
           }), "viewport screenshot acquisition");
         } else {
-          if (!ref) throw new Error("BrowserScreenshot element mode requires a current ref from BrowserSnapshot.");
+          if (!ref) throw new BrowserValidationError("BrowserScreenshot element mode requires a current ref from BrowserSnapshot.");
           const semanticRef = tab.semanticRefs.get(ref);
           if (!semanticRef || semanticRef.generation !== capturedGeneration) throw invalidRefError();
           const locator = tab.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
@@ -1047,7 +1064,7 @@ export class InteractiveBrowserManager {
         throwIfAborted(operation.signal);
         const dimensions = validatePngScreenshot(image, this.limits);
         const snapshotUrl = publicPageUrl(tab.page.url());
-        const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+        const title = bounded(this.outputPrivacy.text(await operation.run(tab.page.title(), "browser title read")), 500);
         if (tab.generation !== capturedGeneration) {
           throw new Error("Browser document changed during screenshot capture; screenshot rejected.");
         }
@@ -1176,7 +1193,7 @@ export class InteractiveBrowserManager {
     signal?: AbortSignal,
   ): Promise<BrowserInteractionResult> {
     try {
-      return await this.interact(sessionHandle, tabHandle, ref, "click", confirmation, signal);
+      return await this.interact(sessionHandle, tabHandle, ref, "click", this.privateConfirmation(confirmation), signal);
     } catch (error) {
       throw normalizedInteractionFailure("BrowserClick", error);
     }
@@ -1258,6 +1275,7 @@ export class InteractiveBrowserManager {
   ): Promise<BrowserInteractionResult> {
     const name = `Browser${action.operation[0]!.toUpperCase()}${action.operation.slice(1)}` as
       "BrowserFill" | "BrowserType" | "BrowserSelect" | "BrowserPress";
+    confirmation = this.privateConfirmation(confirmation);
     try {
       assertBoundedInteractionCapability(sessionHandle, BROWSER_INTERACTION_SESSION_MAX_CHARS);
       assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
@@ -1272,9 +1290,12 @@ export class InteractiveBrowserManager {
         let started = false;
         let capture: InteractionCapture | undefined;
         try {
+          // Retain even denied attempts: a page may already echo this literal
+          // in an origin/label shown by the approval prompt.
+          this.outputPrivacy.remember(action.values);
           let locator = this.currentRefLocator(tab, ref);
           await operation.run(locator.waitFor({ state: "visible", timeout: operation.remainingMs() }), "semantic target validation");
-          const structure = await operation.run(readTargetStructure(locator), "structural consequence inspection");
+          const structure = await operation.run(readTargetStructure(locator, tab.page), "structural consequence inspection");
           assertSuitableFormTarget(structure, action.operation);
           let selectedKinds: Array<"value" | "label"> | undefined;
           const decision = this.consequencePolicy.classifyForm(structure, { operation: action.operation, key: action.key });
@@ -1312,7 +1333,7 @@ export class InteractiveBrowserManager {
                 throw new Error(`${name} not_started: the document or origin changed after approval; take a fresh BrowserSnapshot.`);
               }
               locator = this.currentRefLocator(tab, ref);
-              const revalidatedStructure = await operation.run(readTargetStructure(locator), "post-approval target revalidation");
+              const revalidatedStructure = await operation.run(readTargetStructure(locator, tab.page), "post-approval target revalidation");
               assertSuitableFormTarget(revalidatedStructure, action.operation);
               const revalidatedDecision = this.consequencePolicy.classifyForm(revalidatedStructure, { operation: action.operation, key: action.key });
               const rebound = this.formConfirmationBinding(
@@ -1336,7 +1357,7 @@ export class InteractiveBrowserManager {
               throw new Error(`${name} not_started: the document or origin changed before dispatch; take a fresh BrowserSnapshot.`);
             }
             locator = this.currentRefLocator(tab, ref);
-            const revalidatedStructure = await operation.run(readTargetStructure(locator), "safe-target revalidation");
+            const revalidatedStructure = await operation.run(readTargetStructure(locator, tab.page), "safe-target revalidation");
             assertSuitableFormTarget(revalidatedStructure, action.operation);
             const revalidatedDecision = this.consequencePolicy.classifyForm(revalidatedStructure, { operation: action.operation, key: action.key });
             if (
@@ -1350,16 +1371,14 @@ export class InteractiveBrowserManager {
             }
           }
 
+          if (action.operation === "select") {
+            const selected = await operation.run(resolveExactSelectOptions(locator, action.values), "isolated exact option resolution");
+            this.outputPrivacy.remember(selected.labels);
+            selectedKinds = selected.kinds;
+          }
           capture = newInteractionCapture();
           session.interactionCapture = capture;
           started = true;
-          // Exact selections cross into the page realm only after policy
-          // authorization and effect capture. A hostile realm may intercept
-          // evaluation arguments, so any failure from here is post-dispatch
-          // uncertainty and tears down the session.
-          if (action.operation === "select") {
-            selectedKinds = await operation.run(resolveExactSelectOptions(locator, action.values), "authorized exact option resolution");
-          }
           if (action.operation === "fill") {
             await operation.run(locator.fill(action.values[0]!, { timeout: operation.remainingMs() }), "bounded fill dispatch");
           } else if (action.operation === "type") {
@@ -1425,7 +1444,7 @@ export class InteractiveBrowserManager {
       try {
         const locator = this.currentRefLocator(tab, ref);
         await operation.run(locator.waitFor({ state: "visible", timeout: operation.remainingMs() }), "semantic target validation");
-        const structure = await operation.run(readTargetStructure(locator), "structural consequence inspection");
+        const structure = await operation.run(readTargetStructure(locator, tab.page), "structural consequence inspection");
         const decision = this.consequencePolicy.classify(structure);
         let approval: BrowserInteractionResult["approval"] = "not_required";
 
@@ -1454,7 +1473,7 @@ export class InteractiveBrowserManager {
               this.invalidateInteractionRefs(tab, capturedGeneration);
               throw new Error("BrowserClick not_started: the document or origin changed after approval; take a fresh BrowserSnapshot.");
             }
-            const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref)), "post-approval target revalidation");
+            const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref), tab.page), "post-approval target revalidation");
             const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure);
             const rebound = this.confirmationBinding(
               session,
@@ -1482,7 +1501,7 @@ export class InteractiveBrowserManager {
             this.invalidateInteractionRefs(tab, capturedGeneration);
             throw new Error("BrowserClick not_started: the document or origin changed before controlled activation; take a fresh BrowserSnapshot.");
           }
-          const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref)), "safe-target revalidation");
+          const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref), tab.page), "safe-target revalidation");
           const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure);
           if (
             revalidatedDecision.consequential
@@ -1509,20 +1528,7 @@ export class InteractiveBrowserManager {
           // Activate the freshly revalidated HTTP(S) destination through the
           // existing brokered navigation path instead.
           await this.navigateSession(session, tab, decision.destination, operation, false);
-        } else if (decision.consequence === "local_disclosure") {
-          // Toggle only the structurally proven native details state. Supplying
-          // a second, fixed argument distinguishes this internal operation from
-          // target-structure reads and exposes no caller-provided script.
-          await operation.run(locator.evaluate((element, expectedTag) => {
-            if (expectedTag !== "summary" || element.tagName.toLocaleLowerCase("en-US") !== expectedTag) {
-              throw new Error("Disclosure target changed.");
-            }
-            const details = element.parentElement;
-            if (!details || details.tagName.toLocaleLowerCase("en-US") !== "details") {
-              throw new Error("Disclosure container changed.");
-            }
-            (details as HTMLDetailsElement).open = !(details as HTMLDetailsElement).open;
-          }, "summary"), "controlled local disclosure");
+
         } else {
           await operation.run(locator.click({ timeout: operation.remainingMs() }), "approved semantic click dispatch");
         }
@@ -1708,7 +1714,7 @@ export class InteractiveBrowserManager {
         }
         const generation = tab.generation;
         const url = tab.page.url();
-        const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+        const title = bounded(this.outputPrivacy.text(await operation.run(tab.page.title(), "browser title read")), 500);
         const current = tab.history[tab.historyIndex];
         if (tab.documentRequestPending || generation !== tab.generation || url !== tab.page.url()
           || current?.generation !== generation || current.url !== publicPageUrl(url)) {
@@ -1973,7 +1979,7 @@ export class InteractiveBrowserManager {
     await operation.run(this.refreshHistory(session, tab), "browser history read");
     const generation = tab.generation;
     const finalUrl = publicPageUrl(tab.page.url());
-    const title = bounded(await operation.run(tab.page.title(), "browser title read"), 500);
+    const title = bounded(this.outputPrivacy.text(await operation.run(tab.page.title(), "browser title read")), 500);
     if (tab.documentRequestPending || generation !== tab.generation || finalUrl !== publicPageUrl(tab.page.url())) {
       throw new Error("Browser document changed during navigation metadata read; result rejected.");
     }
@@ -2065,7 +2071,7 @@ export class InteractiveBrowserManager {
     try { rawText = message.text(); } catch { /* fixed fallback */ }
     try { rawType = message.type(); } catch { /* fixed fallback */ }
     try { location = message.location(); } catch { /* fixed fallback */ }
-    const text = boundedUntrustedText(rawText, this.limits.maxConsoleTextChars);
+    const text = boundedUntrustedText(this.outputPrivacy.text(rawText), this.limits.maxConsoleTextChars);
     tab.consoleDiagnostics.push({
       elapsedMs: diagnosticElapsed(this.now(), session.createdAt),
       kind: "console",
@@ -2082,8 +2088,8 @@ export class InteractiveBrowserManager {
 
   private recordPageError(session: Session, tab: BrowserTab, error: Error): void {
     if (!tab.diagnosticsActive || session.teardown) return;
-    const text = boundedUntrustedText(error?.message || "Uncaught page error", this.limits.maxConsoleTextChars);
-    const errorName = boundedUntrustedText(error?.name || "Error", 64);
+    const text = boundedUntrustedText(this.outputPrivacy.text(error?.message || "Uncaught page error"), this.limits.maxConsoleTextChars);
+    const errorName = boundedUntrustedText(this.outputPrivacy.text(error?.name || "Error"), 64);
     tab.consoleDiagnostics.push({
       elapsedMs: diagnosticElapsed(this.now(), session.createdAt),
       kind: "page_error",
@@ -2195,14 +2201,31 @@ export class InteractiveBrowserManager {
     };
     this.activeOperations.add(active);
     const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const pending = new Set<Promise<unknown>>();
     try {
       throwIfAborted(operationSignal);
-      const result = await body(operationSignal);
+      const result = await operationWork.run(pending, () => body(operationSignal));
+      if (pending.size > 0) throw new Error("Browser operation left work in flight.");
       if (session.fatalError) throw session.fatalError;
-      return result;
+      return this.protectOutput(result);
     } catch (error) {
       const failure = asError(error);
-      if (fatalOnError || operationSignal.aborted || session.fatalError) await this.failAndWait(session, session.fatalError ?? failure);
+      if (pending.size > 0) {
+        // A deadline race is not cancellation. Keep serialization held until
+        // browser/broker containment and pending command settlement complete.
+        const deadline = failure.message.match(/\bBrowser[A-Za-z]+ exceeded its \d{1,8}ms total deadline\./)?.[0];
+        const uncertain = new Error(`${deadline ? `${deadline} ` : ""}Browser operation left work in flight; effect status is unknown and no rollback is claimed.`);
+        try {
+          await this.failAndWait(session, uncertain);
+          await boundedCleanup(Promise.allSettled([...pending]), this.limits.cleanupMs, "pending browser operation drain");
+        } catch {
+          throw new Error(`${uncertain.message} Session teardown is unconfirmed.`);
+        }
+        throw new Error(`${uncertain.message} Session teardown is confirmed.`);
+      }
+      if ((fatalOnError && !(failure instanceof BrowserValidationError)) || operationSignal.aborted || session.fatalError) {
+        await this.failAndWait(session, session.fatalError ?? failure);
+      }
       throw failure;
     } finally {
       session.operationActive = false;
@@ -2800,7 +2823,7 @@ async function accountInteractionEffects(
       const remaining = accountingDeadline - Date.now();
       if (remaining <= 0) throw new Error("Interaction side-effect containment exceeded its bounded accounting window.");
       await operation.run(within(
-        Promise.all(batch).then(() => undefined),
+        settleBrowserReads(batch).then(() => undefined),
         remaining,
         "interaction side-effect containment",
         operation.signal,
@@ -2820,6 +2843,20 @@ async function accountInteractionEffects(
     const delayMs = Math.max(1, Math.min(25, accountingDeadline - now));
     await operation.run(new Promise<void>((resolve) => setTimeout(resolve, delayMs)), "interaction effect observation");
   }
+}
+
+// Async-local tracking keeps concurrent, separately owned sessions isolated.
+const operationWork = new AsyncLocalStorage<Set<Promise<unknown>>>();
+
+/** Do not let a rejected child hide still-running sibling browser commands
+ * from OperationDeadline's composite-promise tracking. The outer deadline can
+ * still contain the browser and drain this group if a sibling never settles.
+ */
+async function settleBrowserReads<const T extends readonly unknown[]>(operations: T): Promise<{ -readonly [P in keyof T]: Awaited<T[P]> }> {
+  const results = await Promise.allSettled(operations);
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+  return results.map((result) => (result as PromiseFulfilledResult<unknown>).value) as { -readonly [P in keyof T]: Awaited<T[P]> };
 }
 
 class OperationDeadline {
@@ -2856,7 +2893,14 @@ class OperationDeadline {
     return remaining;
   }
 
-  run<T>(operation: Promise<T>, _phase: string): Promise<T> {
+  run<T>(operation: Promise<T>, phase: string): Promise<T> {
+    // An expired approval prompt cannot dispatch: its permit is revoked by
+    // the caller. It is not an in-flight browser command to drain.
+    const pending = phase === "interactive confirmation" ? undefined : operationWork.getStore();
+    pending?.add(operation);
+    // Attach before checking the deadline: arguments are evaluated before run,
+    // so a command may already have started even when remainingMs throws.
+    void operation.then(() => pending?.delete(operation), () => pending?.delete(operation));
     this.remainingMs();
     return abortableOperation(operation, this.signal);
   }
@@ -2934,80 +2978,99 @@ function urlWaitMatcher(kind: "exact" | "prefix" | "pattern", value: string): (u
   };
 }
 
-async function readTargetStructure(locator: Locator): Promise<BrowserTargetStructure> {
-  const structure = await locator.evaluate((element) => {
-    const html = element as HTMLElement;
-    const tagName = html.tagName.toLocaleLowerCase("en-US").slice(0, 129);
-    const control = html as HTMLInputElement & HTMLButtonElement;
-    const form = "form" in control ? control.form : null;
-    const cap = (value: string | null, max = 4_097) => value === null ? null : value.slice(0, max);
-    const path: string[] = [];
-    let current: Element | null = element;
-    while (current && path.length < 12) {
-      let position = 1;
-      let sibling = current.previousElementSibling;
-      while (sibling) {
-        if (sibling.tagName === current.tagName) position += 1;
-        sibling = sibling.previousElementSibling;
-      }
-      path.push(`${current.tagName.toLocaleLowerCase("en-US")}:nth-of-type(${position})`);
-      current = current.parentElement;
-    }
-    const href = "href" in html && typeof (html as HTMLAnchorElement).href === "string"
-      ? (html as HTMLAnchorElement).href
-      : null;
-    const formAction = form
-      ? (("formAction" in control && control.formAction) || form.action || null)
-      : null;
-    const inputType = (tagName === "input" || tagName === "button")
-      ? cap(control.getAttribute("type")?.toLocaleLowerCase("en-US") ?? (tagName === "button" ? "submit" : "text"), 32)
-      : null;
+type IsolatedFormFacts = Pick<BrowserTargetStructure, "formAssociated" | "formAction" | "formMethod" | "autocomplete">;
+
+async function readIsolatedFormFacts(locator: Locator): Promise<IsolatedFormFacts> {
+  // Match the owning document through the selector engine, not elementHandle:
+  // handle creation can generate a preview in the hostile main world. This
+  // internal bridge is required; unsupported Playwright runtimes fail closed.
+  const internal = locator as unknown as {
+    _selector?: string;
+    _frame?: { _connection?: { toImpl?: (frame: unknown) => {
+      selectors?: { callOnSelector?: (
+        selector: string,
+        options: { strict: boolean; mainWorld: boolean },
+        callback: (args: { elements: Element[] }) => IsolatedFormFacts,
+        arg: Record<string, never>,
+      ) => Promise<{ result: IsolatedFormFacts } | null> };
+    } } };
+  };
+  const frame = internal._frame;
+  const selectors = frame?._connection?.toImpl?.(frame)?.selectors;
+  if (!selectors?.callOnSelector || !internal._selector || !/^aria-ref=(?:f\d+)?e\d+$/.test(internal._selector)) {
+    throw new BrowserValidationError("Browser interaction owning-form facts require the isolated selector engine.");
+  }
+  const resolved = await selectors.callOnSelector(internal._selector, { strict: true, mainWorld: false }, ({ elements }) => {
+    const element = elements[0];
+    if (!element || elements.length !== 1) throw new Error("Form target unavailable.");
+    const control = element as HTMLInputElement | HTMLButtonElement | HTMLSelectElement | HTMLTextAreaElement;
+    const form = control.form;
+    const autocomplete = Element.prototype.getAttribute.call(control, "autocomplete")
+      ?? (form ? Element.prototype.getAttribute.call(form, "autocomplete") : null);
+    if (!form) return { formAssociated: false, formAction: null, formMethod: null, autocomplete };
+    // Native prototype getters also bypass DOM named-property shadowing, e.g.
+    // an input named "action" or "method" on the owning form.
+    const formAction = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "action")!.get!.call(form) as string;
+    const formMethod = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "method")!.get!.call(form) as string;
+    const submitterPrototype = control instanceof HTMLInputElement ? HTMLInputElement.prototype
+      : control instanceof HTMLButtonElement ? HTMLButtonElement.prototype : null;
     return {
-      tagName,
-      role: cap(html.getAttribute("role")?.trim().toLocaleLowerCase("en-US") ?? null, 64),
-      href: cap(href),
-      target: cap(html.getAttribute("target")?.trim().toLocaleLowerCase("en-US") ?? null, 64),
-      download: html.hasAttribute("download"),
-      inputType,
-      formAssociated: form !== null,
-      formAction: cap(formAction),
-      formMethod: cap(form?.method?.toLocaleLowerCase("en-US") ?? null, 16),
-      ariaHasPopup: cap(html.getAttribute("aria-haspopup")?.trim().toLocaleLowerCase("en-US") ?? null, 32),
-      contentEditable: html.isContentEditable,
-      disabled: Boolean(("disabled" in control && control.disabled) || html.getAttribute("aria-disabled") === "true"),
-      inlineEventHandler: [...html.attributes].some((attribute) => /^on/i.test(attribute.name)),
-      summaryForDetails: tagName === "summary" && html.parentElement?.tagName.toLocaleLowerCase("en-US") === "details",
-      autocomplete: cap((html.getAttribute("autocomplete") ?? form?.getAttribute("autocomplete"))?.trim().toLocaleLowerCase("en-US") ?? null, 128),
-      readOnly: Boolean("readOnly" in control && control.readOnly),
-      multiple: Boolean("multiple" in html && (html as HTMLSelectElement).multiple),
-      explicitChangeHandler: [html, form].filter(Boolean).some((candidate) => {
-        const eventTarget = candidate as HTMLElement;
-        return Boolean(eventTarget.oninput || eventTarget.onchange || eventTarget.onblur)
-          || [...candidate!.attributes].some((attribute) => /^(?:oninput|onchange|onblur|data-autosave|autosave)$/i.test(attribute.name));
-      }),
-      explicitSubmitHandler: Boolean(form?.onsubmit)
-        || Boolean(form && [...form.attributes].some((attribute) => /^onsubmit$/i.test(attribute.name))),
-      // The main world cannot reliably prove absence of direct or delegated
-      // addEventListener registrations (pages can obtain fresh native methods
-      // from another realm). Event-dispatching form actions therefore fail
-      // closed into confirmation even when no inline/property handler is seen.
-      pageControlledEventsAbsent: false,
-      domPath: path.reverse().join("> ").slice(0, 513),
+      formAssociated: true,
+      formAction: submitterPrototype && control.hasAttribute("formaction")
+        ? Object.getOwnPropertyDescriptor(submitterPrototype, "formAction")!.get!.call(control) as string : formAction,
+      formMethod: submitterPrototype && control.hasAttribute("formmethod")
+        ? Object.getOwnPropertyDescriptor(submitterPrototype, "formMethod")!.get!.call(control) as string : formMethod,
+      autocomplete,
     };
-  });
-  // Locator attribute inspection runs through Playwright's selector utility
-  // world rather than page-owned JavaScript prototypes. Do not let a page
-  // disguise a credential/file control by patching Element#getAttribute.
-  const isolatedType = (await locator.getAttribute("type"))?.trim().toLocaleLowerCase("en-US");
-  const isolatedRole = (await locator.getAttribute("role"))?.trim().toLocaleLowerCase("en-US") ?? null;
-  if (isolatedType === "password" || isolatedType === "file") {
+  }, {});
+  if (!resolved?.result || typeof resolved.result.formAssociated !== "boolean") {
+    throw new BrowserValidationError("Browser interaction owning-form facts were unavailable.");
+  }
+  return resolved.result;
+}
+
+async function readTargetStructure(locator: Locator, page: Page): Promise<BrowserTargetStructure> {
+  // Only public Playwright utility-world reads. Even apparently innocuous
+  // locator.evaluate getters execute hostile main-world code before approval.
+  const names = ["type", "role", "href", "target", "download", "form",
+    "aria-haspopup", "autocomplete", "readonly", "multiple", "id", "name"];
+  const attributes = await settleBrowserReads(names.map(name => locator.getAttribute(name)));
+  const attr = (name: string) => attributes[names.indexOf(name)] ?? null;
+  const token = (name: string) => attr(name)?.trim().toLocaleLowerCase("en-US") ?? null;
+  const matches = async (selector: string) => await locator.and(page.locator(selector)).count() === 1;
+  const tagName = await identifySemanticTag(locator, page);
+  const inputType = tagName === "input" || tagName === "button"
+    ? token("type") || (tagName === "button" ? "submit" : "text") : null;
+  if (inputType === "password" || inputType === "file") {
     throw new Error("Password and file controls are not supported by bounded browser form actions.");
   }
+  const form = ["input", "button", "select", "textarea"].includes(tagName)
+    ? await readIsolatedFormFacts(locator)
+    : { formAssociated: false, formAction: null, formMethod: null, autocomplete: token("autocomplete") };
+  // Preserve native relative/fragment semantics without entering the page realm.
+  // The owning document's isolated base read accounts for CSP and inherited bases.
+  const rawHref = attr("href");
+  const href = (tagName === "a" || tagName === "area") && rawHref !== null
+    ? new URL(rawHref, await ownerDocumentBaseUrl(locator)).href : null;
+  const structure: BrowserTargetStructure = {
+    tagName, inputType, role: token("role"), href, target: token("target"),
+    download: attr("download") !== null,
+    formAssociated: form.formAssociated,
+    formAction: form.formAction, formMethod: form.formMethod,
+    ariaHasPopup: token("aria-haspopup"),
+    contentEditable: await matches('[contenteditable]:not([contenteditable="false"]), [contenteditable]:not([contenteditable="false"]) *'),
+    disabled: await locator.isDisabled(),
+    inlineEventHandler: await matches("[onclick], [onmousedown], [onmouseup], [onpointerdown], [onpointerup]"),
+    summaryForDetails: tagName === "summary" && await matches("details > summary"),
+    autocomplete: form.autocomplete?.trim().toLocaleLowerCase("en-US") ?? null, readOnly: attr("readonly") !== null,
+    multiple: attr("multiple") !== null,
+    // Absence of direct/delegated handlers is not provable. Form events always
+    // route through the existing authorization/permit/revalidation branch.
+    explicitChangeHandler: false, explicitSubmitHandler: false, pageControlledEventsAbsent: false,
+    domPath: createHash("sha256").update(JSON.stringify([tagName, attr("id"), attr("name"), attr("form"), attr("href")])).digest("hex"),
+  };
   if (!isBrowserTargetStructure(structure) || !boundedTargetStructure(structure)) {
     throw new Error("Browser interaction target structure could not be safely inspected within policy bounds.");
-  }
-  if (isolatedRole !== structure.role) {
-    throw new Error("Browser interaction target role could not be safely inspected.");
   }
   return structure;
 }
@@ -3193,25 +3256,32 @@ async function positionAppendCaret(locator: Locator): Promise<void> {
   if (!positioned) throw new Error("BrowserType could not establish a bounded append position.");
 }
 
-async function resolveExactSelectOptions(locator: Locator, values: readonly string[]): Promise<Array<"value" | "label">> {
-  const kinds = await locator.evaluate((element, exactValues) => {
-    if (element.tagName.toLocaleLowerCase("en-US") !== "select" || !Array.isArray(exactValues)) return null;
-    const select = element as HTMLSelectElement;
-    if (exactValues.length > 1 && !select.multiple) return null;
-    const resolvedIndexes: number[] = [];
-    const resolvedKinds: Array<"value" | "label"> = [];
-    for (const exact of exactValues) {
-      const matches = [...select.options].filter((option) => option.value === exact || option.label === exact);
-      if (matches.length !== 1 || resolvedIndexes.includes(matches[0]!.index)) return null;
-      resolvedIndexes.push(matches[0]!.index);
-      resolvedKinds.push(matches[0]!.value === exact ? "value" : "label");
-    }
-    return resolvedKinds;
-  }, values);
-  if (!Array.isArray(kinds) || kinds.length !== values.length || kinds.some((kind) => kind !== "value" && kind !== "label")) {
-    throw new Error("The requested exact option set was unavailable, ambiguous, or incompatible with this control.");
+async function resolveExactSelectOptions(locator: Locator, values: readonly string[]): Promise<{ kinds: Array<"value" | "label">; labels: string[] }> {
+  const options = locator.locator("option");
+  const count = await options.count();
+  if (count > 512 || (values.length > 1 && await locator.getAttribute("multiple") === null)) {
+    throw new Error("The requested option set exceeds bounded native selection limits.");
   }
-  return kinds;
+  const facts = await settleBrowserReads(Array.from({ length: count }, async (_, index) => {
+    const option = options.nth(index);
+    const [value, label, text] = await settleBrowserReads([option.getAttribute("value"), option.getAttribute("label"), option.textContent()]);
+    const normalizedText = (text ?? "").replace(/[\t\n\f\r ]+/g, " ").trim();
+    return { value: value ?? normalizedText, label: label || normalizedText, text: text ?? "" };
+  }));
+  const kinds: Array<"value" | "label"> = [];
+  const labels: string[] = [];
+  const indexes = new Set<number>();
+  for (const value of values) {
+    const matches = facts.map((fact, index) => ({ fact, index })).filter(({ fact }) => fact.value === value || fact.label === value);
+    if (matches.length !== 1 || indexes.has(matches[0]!.index)) {
+      throw new Error("The requested exact option set was unavailable, ambiguous, or incompatible with this control.");
+    }
+    const { fact, index } = matches[0]!;
+    indexes.add(index);
+    kinds.push(fact.value === value ? "value" : "label");
+    labels.push(fact.label, fact.text, fact.value);
+  }
+  return { kinds, labels };
 }
 
 function digestExactValues(values: readonly string[]): string {
@@ -3314,29 +3384,24 @@ async function validateNavigationUrl(rawUrl: string, resolveHostname: HostResolv
   return navigation;
 }
 
-async function assertControlledTopNavigation(locator: Locator, page: Page): Promise<void> {
-  const element = await locator.elementHandle();
-  if (!element) throw new Error("BrowserClick not_started: the owned frame target detached.");
-  try {
-    const frame = await element.ownerFrame();
-    if (frame !== page.mainFrame()) {
-      throw new Error("BrowserClick not_started: controlled navigation from a child frame is unsupported.");
-    }
-    const explicitTarget = await locator.getAttribute("target");
-    const base = frame.locator("xpath=/html/descendant::base[@target]").first();
-    const target = explicitTarget ?? (await base.count() ? await base.getAttribute("target") : null);
-    if (target && target.toLowerCase() !== "_self") {
-      throw new Error("BrowserClick not_started: controlled navigation requires the current frame as its effective target.");
-    }
-  } finally { await element.dispose(); }
+async function assertControlledTopNavigation(locator: Locator, _page: Page): Promise<void> {
+  const facts = await readIsolatedNavigationFacts(locator);
+  if (!facts.topLevel) {
+    throw new Error("BrowserClick not_started: controlled navigation from a child frame is unsupported.");
+  }
+  if (facts.target && facts.target.toLowerCase() !== "_self") {
+    throw new Error("BrowserClick not_started: controlled navigation requires the current frame as its effective target.");
+  }
 }
 
+class BrowserValidationError extends Error {}
+
 function invalidHandleError(): Error {
-  return new Error("Invalid or stale browser session/tab handle.");
+  return new BrowserValidationError("Invalid or stale browser session/tab handle.");
 }
 
 function invalidRefError(): Error {
-  return new Error("Invalid or stale browser semantic ref; take a fresh BrowserSnapshot for the current session, tab, and document.");
+  return new BrowserValidationError("Invalid or stale browser semantic ref; take a fresh BrowserSnapshot for the current session, tab, and document.");
 }
 
 function boundedElementClip(
@@ -3609,7 +3674,7 @@ async function readSemanticDetail(
   signal: AbortSignal,
 ): Promise<RawSemanticDetail> {
   const timeout = Math.max(1, timeoutMs);
-  const attributesPromise = Promise.all([
+  const attributesPromise = settleBrowserReads([
     locator.getAttribute("type", { timeout }),
     locator.getAttribute("href", { timeout }),
     locator.getAttribute("aria-checked", { timeout }),
@@ -3625,7 +3690,7 @@ async function readSemanticDetail(
   // instead; these use Playwright's isolated accessibility engine without
   // changing the ref registry or entering the page's main world.
   const semanticsCurrentPromise = verifyComputedSemantic(locator, page, computed);
-  const [attributes, tag, disabled, focused] = await Promise.all([
+  const [attributes, tag, disabled, focused] = await settleBrowserReads([
     attributesPromise, tagPromise, disabledPromise, focusedPromise, semanticsCurrentPromise,
   ]);
   throwIfAborted(signal);
@@ -3673,7 +3738,7 @@ async function readSemanticDetail(
 }
 
 async function identifySemanticTag(locator: Locator, page: Page): Promise<string> {
-  const matches = await Promise.all(INSPECT_TAG_ALLOWLIST.map(async (tag) =>
+  const matches = await settleBrowserReads(INSPECT_TAG_ALLOWLIST.map(async (tag) =>
     (await locator.and(page.locator(tag)).count()) === 1));
   const index = matches.indexOf(true);
   return index < 0 ? "other" : INSPECT_TAG_ALLOWLIST[index]!;
@@ -3689,7 +3754,7 @@ async function currentComputedBoolean(
   if (!semantic.role || !supportedRoles.has(semantic.role)) return null;
   const role = semantic.role as Parameters<Page["getByRole"]>[0];
   const common = { name: semantic.name, exact: true };
-  const [trueMatches, falseMatches] = await Promise.all([
+  const [trueMatches, falseMatches] = await settleBrowserReads([
     locator.and(page.getByRole(role, { ...common, [state]: true })).count(),
     locator.and(page.getByRole(role, { ...common, [state]: false })).count(),
   ]);
@@ -3699,7 +3764,7 @@ async function currentComputedBoolean(
 }
 
 async function currentDisclosureState(locator: Locator, page: Page): Promise<boolean | null> {
-  const [open, closed] = await Promise.all([
+  const [open, closed] = await settleBrowserReads([
     locator.and(page.locator("details[open] > summary")).count(),
     locator.and(page.locator("details:not([open]) > summary")).count(),
   ]);
@@ -3707,6 +3772,12 @@ async function currentDisclosureState(locator: Locator, page: Page): Promise<boo
 }
 
 async function ownerDocumentBaseUrl(locator: Locator): Promise<string> {
+  return (await readIsolatedNavigationFacts(locator)).baseUrl;
+}
+
+type IsolatedNavigationFacts = { baseUrl: string; topLevel: boolean; target: string | null };
+
+async function readIsolatedNavigationFacts(locator: Locator): Promise<IsolatedNavigationFacts> {
   // Use the in-process Playwright implementation's isolated selector evaluator.
   // Reading markup cannot account for CSP or frozen inherited document bases.
   // Do not use locator.evaluate / to.have.property, or acquire a main-world
@@ -3717,7 +3788,7 @@ async function ownerDocumentBaseUrl(locator: Locator): Promise<string> {
       selectors?: { callOnSelector?(
         selector: string,
         options: { strict: true; mainWorld: false },
-        read: (target: { elements: Element[] }) => string | null,
+        read: (target: { elements: Element[] }) => IsolatedNavigationFacts | null,
         arg: undefined,
       ): Promise<{ result: unknown } | null> };
     } } };
@@ -3734,12 +3805,21 @@ async function ownerDocumentBaseUrl(locator: Locator): Promise<string> {
     { strict: true, mainWorld: false },
     ({ elements }) => {
       const element = elements[0];
-      return element?.isConnected ? element.ownerDocument.baseURI : null;
+      if (elements.length !== 1 || !element?.isConnected) return null;
+      const document = element.ownerDocument;
+      const view = document.defaultView;
+      return {
+        baseUrl: document.baseURI,
+        topLevel: view !== null && view === view.top,
+        target: element.getAttribute("target") ?? document.querySelector("base[target]")?.getAttribute("target") ?? null,
+      };
     },
     undefined,
   );
-  if (typeof observed?.result !== "string") throw invalidRefError();
-  return observed.result;
+  const facts = observed?.result as Partial<IsolatedNavigationFacts> | null;
+  if (!facts || typeof facts.baseUrl !== "string" || typeof facts.topLevel !== "boolean"
+    || (facts.target !== null && typeof facts.target !== "string")) throw invalidRefError();
+  return facts as IsolatedNavigationFacts;
 }
 
 function parseAriaRoot(snapshot: string): {

@@ -227,7 +227,7 @@ export class WebToolManager {
           const opened = await this.interactiveBrowser.open(requiredString(params.url, "url"), signal);
           return textResult(formatBrowserState("Opened", opened), { response: opened });
         } catch (error) {
-          return textResult(`BrowserOpen failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserOpen", error);
         }
       },
     });
@@ -248,7 +248,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserState("Navigated", navigated), { response: navigated });
         } catch (error) {
-          return textResult(`BrowserNavigate failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserNavigate", error);
         }
       },
     });
@@ -271,7 +271,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserSnapshot(snapshot), { response: snapshot });
         } catch (error) {
-          return textResult(`BrowserSnapshot failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserSnapshot", error);
         }
       },
     });
@@ -294,7 +294,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserDiagnostics("console/error", result), { response: result });
         } catch (error) {
-          return textResult(`BrowserConsole failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserConsole", error);
         }
       },
     });
@@ -317,7 +317,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserDiagnostics("network", result), { response: result });
         } catch (error) {
-          return textResult(`BrowserNetwork failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserNetwork", error);
         }
       },
     });
@@ -339,7 +339,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserInspect(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserInspect failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserInspect", error);
         }
       },
     });
@@ -379,7 +379,7 @@ export class WebToolManager {
             isError: false,
           };
         } catch (error) {
-          return textResult(`BrowserScreenshot failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserScreenshot", error);
         }
       },
     });
@@ -408,7 +408,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserObservation("Scrolled", scrolled), { response: scrolled });
         } catch (error) {
-          return textResult(`BrowserScroll failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserScroll", error);
         }
       },
     });
@@ -429,14 +429,14 @@ export class WebToolManager {
           );
           return textResult(formatBrowserInteraction(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserHover failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserHover", error);
         }
       },
     });
     this.pi.registerTool({
       name: "BrowserClick",
       label: "BrowserClick",
-      description: "Click one current opaque BrowserSnapshot ref under the structural consequence policy. Proven HTTP(S) navigation and native local disclosure may proceed; consequential or unknown actions follow the user's Browser interaction approval setting (Ask by default; no UI rejects in Ask). Automatic approval retains all target and safety checks.",
+      description: "Click one current opaque BrowserSnapshot ref under the structural consequence policy. Proven HTTP(S) navigation may proceed; native disclosure and consequential or unknown actions follow the user's Browser interaction approval setting (Ask by default; no UI rejects in Ask). Automatic approval retains all target and safety checks.",
       promptGuidelines: browserInteractionGuidelines(),
       executionMode: "sequential",
       parameters: browserInteractionHandleSchema(),
@@ -451,14 +451,14 @@ export class WebToolManager {
           );
           return textResult(formatBrowserInteraction(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserClick failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserClick", error);
         }
       },
     });
     this.pi.registerTool({
       name: "BrowserFill",
       label: "BrowserFill",
-      description: "Replace the value of one supported editable control identified by a fresh opaque BrowserSnapshot ref. The exact bounded value is never echoed or retained in results, prompts, diagnostics, evidence, or logs.",
+      description: "Replace the value of one supported editable control identified by a fresh opaque BrowserSnapshot ref. Complete literal echoes are redacted from extension text outputs using bounded memory-only protection; page transformations and screenshot pixels are not guaranteed private.",
       promptGuidelines: browserFormGuidelines(),
       executionMode: "sequential",
       parameters: browserInteractionHandleSchema({
@@ -477,7 +477,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserInteraction(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserFill failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserFill", error);
         }
       },
     });
@@ -505,14 +505,14 @@ export class WebToolManager {
           );
           return textResult(formatBrowserInteraction(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserType failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserType", error);
         }
       },
     });
     this.pi.registerTool({
       name: "BrowserSelect",
       label: "BrowserSelect",
-      description: "Select a bounded nonempty set of exact native option labels or values through one fresh opaque BrowserSnapshot ref. Selected content is never returned or retained.",
+      description: "Select a bounded nonempty set of exact native option labels or values through one fresh opaque BrowserSnapshot ref. Complete literal selected-value/label echoes are redacted from extension text outputs; this is not a credential-safe secrecy guarantee.",
       promptGuidelines: browserFormGuidelines(),
       executionMode: "sequential",
       parameters: browserInteractionHandleSchema({
@@ -536,7 +536,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserInteraction(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserSelect failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserSelect", error);
         }
       },
     });
@@ -562,7 +562,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserInteraction(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserPress failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserPress", error);
         }
       },
     });
@@ -594,7 +594,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserObservation("Wait condition satisfied", waited), { response: waited });
         } catch (error) {
-          return textResult(`BrowserWait failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserWait", error);
         }
       },
     });
@@ -619,7 +619,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserHistory(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserHistory failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserHistory", error);
         }
       },
     });
@@ -646,7 +646,7 @@ export class WebToolManager {
           );
           return textResult(formatBrowserTabs(result), { response: result });
         } catch (error) {
-          return textResult(`BrowserTabs failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserTabs", error);
         }
       },
     });
@@ -666,7 +666,7 @@ export class WebToolManager {
             { response: closed },
           );
         } catch (error) {
-          return textResult(`BrowserClose failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          throw interactiveBrowserFailure("BrowserClose", error);
         }
       },
     });
@@ -812,7 +812,7 @@ function browserFormGuidelines(): string[] {
     ...browserInteractionGuidelines(),
     "Fill replaces while Type appends. Select uses only exact uniquely resolved native option labels/values. Press accepts only one allowlisted key or short editing chord.",
     "Ordinary structurally proven unsent local editing remains permitted in every approval mode. Sensitive/autocomplete/auth/terms/submit, explicit change/autosave, activation keys, and unknown or mixed targets follow the user's Browser interaction approval setting; Ask requires UI, Automatically Accept uses one-use revalidated approval, and Automatically Deny rejects before dispatch. Hard-denied targets remain denied.",
-    "Values and selections are secret-by-construction and never appear in results, prompts, diagnostics, durable evidence, or logs. Password/file controls, clipboard, upload, filesystem paths, selectors, coordinates, scripts, CDP, forced actions, and raw events are unsupported.",
+    "Literal entered/selected echoes are protected in extension text results by a bounded memory-only registry. Page transformations, fragments, pixels, and Pi/provider conversation retention are not guaranteed secret. Password/file controls, clipboard, upload, filesystem paths, selectors, coordinates, scripts, CDP, forced actions, and raw events are unsupported.",
   ];
 }
 
@@ -1048,6 +1048,35 @@ function pageParameters(maxOutputChars: number): Record<string, unknown> {
 
 function textResult(text: string, details: Record<string, unknown>, isError = false): Record<string, unknown> {
   return { content: [{ type: "text", text }], details, isError };
+}
+
+/** Pi agent-core marks fulfilled execute results successful, ignoring a nested
+ * isError. Throw only fixed, bounded text: raw Playwright/page errors can carry
+ * form values, URLs, DOM snippets and arbitrary page exceptions. No cause/data
+ * or images are attached. BrowserExtract/WebFetch intentionally stay unchanged.
+ */
+function interactiveBrowserFailure(name: string, error: unknown): Error {
+  const message = error instanceof Error ? error.message : "";
+  let reason = "operation failed; effect status is unknown; no rollback is claimed";
+  if (/closure is unconfirmed|teardown is unconfirmed|teardown could not be confirmed/i.test(message)) {
+    reason = "session closure is unconfirmed; effect status is unknown; no rollback is claimed";
+  } else if (/effect status is unknown|after dispatch|in.flight/i.test(message)) {
+    // Never infer confirmed containment from an arbitrary exception's text.
+    reason = "effect status is unknown; no rollback is claimed; check session containment";
+  } else if (/not_started|before dispatch/i.test(message)) {
+    reason = "not_started: target validation or authorization failed; refresh the snapshot or check approval";
+  } else if (/character limit|must be|requires|invalid bounded/i.test(message)) {
+    reason = "not_started: unsupported or out-of-bounds arguments";
+  } else if (/stale|invalid.*handle|semantic ref/i.test(message)) {
+    reason = "invalid or stale capability; take a fresh BrowserSnapshot";
+  } else if (/vision|image input|image.*support|support image/i.test(message)) {
+    reason = "the selected model does not support image input; use BrowserSnapshot";
+  } else if (/timeout|timed out|deadline/i.test(message)) {
+    reason = "deadline exceeded; effect status is unknown; no rollback is claimed";
+  } else if (/denied|policy|public|DNS|resolve|ENOTFOUND|ERR_NAME/i.test(message)) {
+    reason = "network or authorization policy rejected the operation; no rollback is claimed";
+  }
+  return new Error(`${name} failed: ${reason}.`);
 }
 
 function objectSchema(properties: Record<string, unknown>, required: readonly string[] = []): Record<string, unknown> {

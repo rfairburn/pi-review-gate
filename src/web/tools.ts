@@ -302,7 +302,7 @@ export class WebToolManager {
     this.pi.registerTool({
       name: "BrowserNetwork",
       label: "BrowserNetwork",
-      description: "Read only bounded redacted request/response/failure metadata already observed in one owned tab. It never returns paths, queries, bodies, headers, cookies, authorization, post data, WebSocket frames, or cache contents and creates no traffic.",
+      description: "Read only bounded redacted request/response/failure metadata already observed in one owned tab. Page-created WebSockets appear as websocket-kind records with metadata-only lifecycle (created at admission, closed at the terminal state the browser reports; no connected state is claimed) plus policy blocks; it never returns paths, queries, bodies, headers, cookies, authorization, post data, WebSocket frames, or cache contents and creates no traffic.",
       promptGuidelines: browserDiagnosticGuidelines(),
       executionMode: "sequential",
       parameters: browserDiagnosticHandleSchema(),

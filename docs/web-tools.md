@@ -100,7 +100,11 @@ immediately closes it, and only then should a Pi-native orchestrator or worker o
 short-lived interactive session. Start with `BrowserSnapshot`; escalate to `BrowserInspect`
 only for one referenced element that needs fixed state detail, and use `BrowserConsole` or
 `BrowserNetwork` only to diagnose behavior the rendered semantic view cannot explain.
-The session surface is bounded and semantic:
+Pages may open live `ws:`/`wss:` connections: each destination is validated with the same
+public-URL policy as navigation (no URL credentials, every resolved address public) and routed
+by Chromium through the session's authenticated loopback broker, so quiet connections survive idle,
+turns, and reviews and are drained on close or shutdown. The session surface is bounded
+and semantic:
 
 - `BrowserOpen` creates one isolated context and tab, navigates to a public HTTP(S) URL,
   and returns opaque random session, tab, and document-generation handles.
@@ -122,9 +126,15 @@ The session surface is bounded and semantic:
 - `BrowserNetwork` reads an equivalent bounded cursor ring containing only request,
   response, failure, and available browser-policy metadata: sequence/timing, method,
   public origin (path, query, fragment, and credentials removed), resource kind, status,
-  and bounded outcome/failure classification. It never returns request or response
-  bodies, headers, cookies, authorization, post data, WebSocket frames, cache contents,
-  or sensitive URL path/query data. Reading it creates no network traffic.
+  and bounded outcome/failure classification. Live page-created `ws:`/`wss:` connections
+  appear as websocket-kind records with metadata-only lifecycle states — created when the
+  route requests admission, closed at the terminal state reported by the browser's own WebSocket
+  stack (no connected state is ever claimed; a working connection is proven by page/app
+  state) — plus close codes only where the browser exposes them and policy-block reasons
+  for refused destinations. It never returns
+  request or response bodies, headers, cookies, authorization, post data, WebSocket
+  frames, cache contents, or sensitive URL path/query data. Reading it creates no
+  network traffic.
 - `BrowserInspect` accepts exactly one current opaque ref from the latest successful
   `BrowserSnapshot` for that owned session, tab, and document generation. It returns a
   fixed allowlist: browser-computed role/name semantics captured with the fresh
@@ -265,7 +275,7 @@ resolve only extension-issued semantic refs internally. Navigation, popup, dialo
 observers are armed before dispatch. Popup tabs stay in the same ownership/broker bound
 and are never auto-switched; overflow popups are closed. Unexpected downloads are
 canceled, and confirm/prompt/beforeunload dialogs are default-dismissed so they cannot
-hang an action. Service workers, WebSockets, external protocols, media, permissions,
+hang an action. Service workers, external protocols, media, permissions,
 direct QUIC/WebRTC, and proxy bypass are disabled. This initial observational implementation also disables images and
 custom/downloadable fonts in Chromium itself and blocks image/font requests at routing;
 no visual resource is allowed to bypass broker accounting through a generated `data:`
@@ -323,10 +333,12 @@ Cleanup can therefore extend the caller's elapsed time
 beyond the action deadline. Unsettled work reports unknown effects, never rollback.
 Ordinary invalid/stale capability validation and harmless screenshot mode/ref argument
 mistakes do not themselves retire a healthy session.
-There is no browser idle or elapsed-lifetime expiry. Quiet destination sockets are still
-evicted after 20 seconds without closing the browser or cancelling a pending permission
-prompt. Opaque evicted tunnels are conservatively recorded as incomplete transfers;
-future connections undergo fresh DNS validation and pinned dialing. No page action is
+There is no browser idle or elapsed-lifetime expiry. Interactive CONNECT tunnels are
+retained through ordinary idle because the broker cannot distinguish encrypted HTTPS
+from live WSS traffic. Ordinary plain-HTTP destination sockets still have a 20-second
+idle eviction without closing the browser or cancelling a pending permission prompt.
+Hard resource budgets and terminal cleanup still apply to all transports, and new
+connections undergo fresh DNS validation and pinned dialing. No page action is
 automatically replayed. Redirect chains are capped at 10 hops and semantic output at
 24,000 characters and depth 16. Console and network rings retain at most
 128 and 256 events per tab respectively; each read returns at most 64. Console/error text

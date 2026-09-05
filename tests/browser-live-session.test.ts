@@ -112,12 +112,16 @@ test("real CONNECT browser stays live through idle, permission wait, Pi turns/re
     await parent.emit("session_start", { reason: "startup" }, ctx);
     const opened = await manager.open(`https://live.test:${port}/first`);
     await delay(1_200);
-    assert.equal(manager.activeSessionCount(), 1, "idle CONNECT eviction is not browser expiry");
-    await eventually(async () => assert.equal(sockets.size, 0));
+    assert.equal(manager.activeSessionCount(), 1, "idle retention of quiet CONNECTs is not browser expiry");
+    // Interactive sessions intentionally retain quiet opaque CONNECT tunnels
+    // across idle (no broker eviction). Prove the usable-session contract:
+    // nudge Chromium's own pool from the origin side, then require a fresh,
+    // DNS-revalidated connection on the next navigation.
+    origin.closeAllConnections();
     await manager.screenshot(opened.session, opened.tab, "viewport", undefined);
     const beforeDns = resolutions;
     await manager.navigate(opened.session, opened.tab, `https://live.test:${port}/second`);
-    assert.ok(resolutions > beforeDns && dialCount >= 2, "new connections revalidate DNS after eviction");
+    assert.ok(resolutions > beforeDns && dialCount >= 2, "fresh connections revalidate DNS");
     const snapshot = await manager.snapshot(opened.session, opened.tab, 2_000);
     const ref = snapshot.snapshot.match(/button "Apply" \[ref=([^\]]+)\]/)?.[1];
     assert.ok(ref);
@@ -154,7 +158,8 @@ test("real CONNECT browser stays live through idle, permission wait, Pi turns/re
     await manager.screenshot(opened.session, opened.tab, "viewport", undefined);
     assert.equal(browsers.length, 1, "all turns and reviews retain the same browser");
     const closed = await manager.close(opened.session);
-    assert.ok(closed.broker && closed.broker.budgetAborts >= 1, "real tunnels were evicted, not merely mocked idle");
+    assert.ok(closed.broker && closed.broker.connections >= 1, "the ledger tracked real tunnels, not mocked idle");
+    assert.equal(sockets.size, 0, "terminal close drained every broker socket");
     const reopened = await manager.open(`https://live.test:${port}/reopened`);
     await parent.emit("session_shutdown", { reason: "reload" }, ctx);
     assert.equal(browsers.every((browser) => !browser.isConnected()), true);

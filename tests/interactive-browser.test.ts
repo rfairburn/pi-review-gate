@@ -59,6 +59,7 @@ class FakePage extends EventEmitter {
   mainFrame() { return this.frame; }
   url() { return this.currentUrl; }
   isClosed() { return this.closed; }
+  async routeWebSocket() {}
   async title() { return "Untrusted fixture title"; }
   viewportSize() { return { width: 1280, height: 720 }; }
   async ariaSnapshot() { return '- heading "Fixture" [level=1]\n- link "Next" [ref=e7]\n'; }

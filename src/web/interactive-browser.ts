@@ -12,6 +12,7 @@ import {
   type Page,
   type Request,
   type Response,
+  type WebSocketRoute,
 } from "playwright";
 import type { BrowserInteractionApproval, WebFetchConfig } from "../config";
 import { redactSensitiveText } from "../redaction";
@@ -53,6 +54,17 @@ export const BROWSER_SELECT_OPTION_MAX_CHARS = 256;
 export const BROWSER_PRESS_KEY_MAX_CHARS = 32;
 export const BROWSER_DIAGNOSTIC_CURSOR_MAX = Number.MAX_SAFE_INTEGER;
 export const BROWSER_DIAGNOSTIC_READ_MAX_EVENTS = 64;
+
+// Manager-side admission bounds for page-created ws/wss routes, checked
+// before Chromium's native stack is allowed to connect through the session
+// broker. The broker independently re-validates and pins every destination.
+const WS_MAX_URL_CHARS = 2_048;
+const WS_MAX_PROTOCOLS = 8;
+const WS_PROTOCOL_MAX_CHARS = 128;
+/** Per-session cap on concurrent in-flight WebSocket admissions (pre-DNS). */
+const WS_MAX_PENDING_ADMISSIONS = 8;
+/** Hard deadline for one admission's destination validation. */
+const WS_ADMISSION_MS = 5_000;
 
 /** Hard limits for the initial, observational browser surface. */
 export interface InteractiveBrowserLimits {
@@ -217,6 +229,17 @@ export interface BrowserNetworkEvent {
   durationMs?: number;
   outcome: "observed" | "succeeded" | "failed" | "policy_blocked";
   failure?: string;
+  /**
+   * WebSocket lifecycle marker, present only for websocket-kind records.
+   * Truthful by construction: "created" is the observed route admission,
+   * "closed" is the terminal state reported by the browser's own WebSocket
+   * stack (or the manager-issued refusal close). No connected state is ever
+   * claimed; a working connection is proven by page/app state. Frame content
+   * is never retained.
+   */
+  wsState?: "created" | "closed";
+  /** Close code as exposed by the browser's WebSocket stack, when present. */
+  closeCode?: number;
 }
 
 export interface BrowserDiagnosticResult<T> {
@@ -496,6 +519,10 @@ interface Session {
   tabs: Map<string, BrowserTab>;
   pendingPageClosures: Map<Page, Promise<void>>;
   pendingPageCreations: Set<Promise<void>>;
+  /** In-flight page-initiated WebSocket admissions; settled on teardown. */
+  pendingWebSocketAdmissions: Set<Promise<void>>;
+  /** Aborted when teardown begins so pending admissions stop waiting at once. */
+  admissionAbort: AbortController;
   browser: Browser;
   context: BrowserContext;
   broker: EgressBroker;
@@ -728,6 +755,10 @@ export class InteractiveBrowserManager {
         this.brokerBudgets(),
         auth,
         observer,
+        // Interactive sessions own the browser lifetime: quiet live ws/wss
+        // connections must survive ordinary idle, turns, and reviews. Hard
+        // byte/connection budgets and teardown still drain every socket.
+        { enabled: true, liveIdleSocketMs: null },
       );
       const port = await operation.run(broker.start(), "egress broker startup");
       launchPromise = this.launch({
@@ -777,6 +808,8 @@ export class InteractiveBrowserManager {
         tabs: new Map([[primaryTab.handle, primaryTab]]),
         pendingPageClosures: new Map(),
         pendingPageCreations: new Set(),
+        pendingWebSocketAdmissions: new Set(),
+        admissionAbort: new AbortController(),
         browser,
         context,
         broker,
@@ -788,7 +821,9 @@ export class InteractiveBrowserManager {
       };
       pendingSession = session;
       pendingFatal = (error) => this.failSession(session, error);
-      this.installPageGuards(session, primaryTab);
+      // Await tab-scoped WebSocket route activation before any page work so
+      // the first navigation's sockets can never hit the context backstop.
+      await operation.run(this.installPageGuards(session, primaryTab), "websocket route installation");
       browser.on("disconnected", () => {
         if (!session.teardown) this.failSession(session, new Error("Browser process disconnected unexpectedly; teardown started."));
       });
@@ -2052,7 +2087,13 @@ export class InteractiveBrowserManager {
     };
   }
 
-  private installPageGuards(session: Session, tab: BrowserTab): void {
+  /**
+   * Install every per-tab guard. Returns the WebSocket route registration
+   * promise so the caller can await it before dispatching page work; until it
+   * resolves, this tab's WebSockets fall through to the context backstop
+   * (fail closed), never to an unvalidated direct connection.
+   */
+  private installPageGuards(session: Session, tab: BrowserTab): Promise<void> {
     tab.page.on("request", (request: Request) => {
       this.recordNetworkRequest(session, tab, request);
       if (session.interactionCapture) {
@@ -2105,6 +2146,14 @@ export class InteractiveBrowserManager {
       // History identity is read from Chromium, not inferred from this event:
       // pushState, replaceState and same-URL traversal all emit it.
     });
+    // Live ws/wss admission: every WebSocket this tab creates is validated
+    // against the public-URL policy before Chromium's native stack connects
+    // through the session's authenticated broker proxy (the context proxy
+    // credentials carry the auth; no manager-side protocol code exists).
+    // The page-scoped route wins over the context backstop for this tab.
+    const webSocketRoute = tab.page.routeWebSocket("**/*", (route) => {
+      return this.handleLiveWebSocket(session, tab, route).catch(() => undefined);
+    });
     tab.page.on("dialog", (dialog) => this.dismissDialog(session, dialog));
     tab.page.on("download", (download) => this.cancelDownload(session, download));
     tab.page.on("crash", () => this.failSession(session, new Error("Browser tab crashed; teardown started.")));
@@ -2118,6 +2167,7 @@ export class InteractiveBrowserManager {
       }
       if (session.activeTab === tab.handle) session.activeTab = session.tabs.keys().next().value!;
     });
+    return webSocketRoute;
   }
 
   private recordConsoleMessage(session: Session, tab: BrowserTab, message: ConsoleMessage): void {
@@ -2230,6 +2280,175 @@ export class InteractiveBrowserManager {
     tab.networkDiagnostics.clear();
     tab.networkStartedAt = new WeakMap();
     tab.networkPolicy = new WeakMap();
+  }
+
+  /** Bounded per-tab WebSocket lifecycle metadata; never frame content. */
+  private recordWebSocketEvent(
+    session: Session,
+    tab: BrowserTab,
+    event: Omit<BrowserNetworkEvent, "sequence" | "elapsedMs">,
+  ): void {
+    if (!tab.diagnosticsActive || session.teardown) return;
+    tab.networkDiagnostics.push({
+      elapsedMs: diagnosticElapsed(this.now(), session.createdAt),
+      ...event,
+    });
+  }
+
+  /**
+   * One page-created WebSocket. The manager's role is admission and metadata,
+   * never protocol: validate the requested ws/wss destination against the
+   * same public-URL policy as ordinary navigation, then hand the socket to
+   * Chromium's native stack via connectToServer(). Frames relay transparently
+   * between page and origin (Playwright passthrough) and never enter manager
+   * memory. The terminal state is observed from the browser's own close
+   * event; no connected state is ever claimed, and a working connection is
+   * proven by page/app state, not by this metadata.
+   */
+  private async handleLiveWebSocket(session: Session, tab: BrowserTab, route: WebSocketRoute): Promise<void> {
+    const createdAtMs = this.now();
+    let rawUrl = "";
+    try { rawUrl = route.url(); } catch { /* fixed fallback */ }
+    const origin = diagnosticWsOrigin(rawUrl);
+    this.recordWebSocketEvent(session, tab, {
+      phase: "request",
+      method: "GET",
+      origin,
+      resourceKind: "websocket",
+      wsState: "created",
+      outcome: "observed",
+    });
+    let requestedProtocols: readonly string[] = [];
+    try { requestedProtocols = route.protocols(); } catch { /* fixed fallback */ }
+    const decision = validateLiveWebSocket(rawUrl, requestedProtocols);
+    if (!decision.allowed) {
+      await this.refuseLiveWebSocket(session, tab, route, origin, createdAtMs, decision.reason, true);
+      return;
+    }
+    // Bounded admission: excess concurrent requests are refused before any
+    // DNS resolution, and every in-flight validation is tracked so teardown
+    // can settle it. No unbounded validator fan-out survives the session.
+    if (session.pendingWebSocketAdmissions.size >= WS_MAX_PENDING_ADMISSIONS) {
+      await this.refuseLiveWebSocket(session, tab, route, origin, createdAtMs, "websocket admission limit exceeded", true);
+      return;
+    }
+    let admission!: Promise<void>;
+    admission = (async () => {
+      const verdict = await this.validateWebSocketDestination(decision.url, session.admissionAbort.signal);
+      // Teardown or tab closure during validation: contain without connecting.
+      if (session.teardown || tab.closing) return;
+      if (verdict === "refused") {
+        await this.refuseLiveWebSocket(session, tab, route, origin, createdAtMs, "websocket destination failed public validation", true);
+        return;
+      }
+      if (verdict === "timed_out") {
+        await this.refuseLiveWebSocket(session, tab, route, origin, createdAtMs, "websocket admission timed out", false);
+        return;
+      }
+      let server: WebSocketRoute;
+      try {
+        // Rechecked immediately before the native connect: a session that
+        // began tearing down during validation never reaches this point.
+        if (session.teardown || tab.closing) return;
+        // Native browser networking from here on: the in-page socket connects
+        // through the context proxy (authenticated) to the broker-pinned origin.
+        server = route.connectToServer();
+      } catch {
+        if (!session.teardown && !tab.closing) {
+          await this.refuseLiveWebSocket(session, tab, route, origin, createdAtMs, "browser websocket connect failed", false);
+        }
+        return;
+      }
+      let terminalRecorded = false;
+      server.onClose((code, reason) => {
+        if (terminalRecorded) return;
+        terminalRecorded = true;
+        const closeCode = boundedWsCloseCode(code);
+        // Without a clean/abnormal flag from the API, only codes that attest
+        // normal closure are recorded as success; everything else is failure.
+        const normal = closeCode === 1000 || (closeCode !== undefined && closeCode >= 3000 && closeCode <= 4999);
+        this.recordWebSocketEvent(session, tab, {
+          phase: normal ? "response" : "failure",
+          method: "GET",
+          origin,
+          resourceKind: "websocket",
+          wsState: "closed",
+          ...(closeCode === undefined ? {} : { closeCode }),
+          durationMs: diagnosticElapsed(this.now(), createdAtMs),
+          outcome: normal ? "succeeded" : "failed",
+          ...(normal ? {} : { failure: "ws_closed_abnormal" }),
+        });
+        // Relay the terminal to the page side exactly as passthrough would.
+        void route.close({ code: closeCode, reason: boundedWsCloseReason(reason) }).catch(() => undefined);
+      });
+    })().finally(() => { session.pendingWebSocketAdmissions.delete(admission); });
+    session.pendingWebSocketAdmissions.add(admission);
+    // Playwright synthesizes an open event when a route handler completes
+    // without connecting. Keep it pending until admission connects or closes
+    // the route; otherwise DNS-pending sockets would falsely appear open.
+    await admission;
+  }
+
+  /** Manager-issued refusal: bounded record + truthful page-side close. */
+  private async refuseLiveWebSocket(
+    session: Session,
+    tab: BrowserTab,
+    route: WebSocketRoute,
+    origin: string,
+    createdAtMs: number,
+    token: string,
+    policy: boolean,
+  ): Promise<void> {
+    // 1008 = policy violation, 1006 = abnormal failure; the page observes
+    // exactly the code issued here.
+    const closeCode = policy ? 1008 : 1006;
+    this.recordWebSocketEvent(session, tab, {
+      phase: policy ? "policy" : "failure",
+      method: "GET",
+      origin,
+      resourceKind: "websocket",
+      wsState: "closed",
+      closeCode,
+      durationMs: diagnosticElapsed(this.now(), createdAtMs),
+      outcome: policy ? "policy_blocked" : "failed",
+      failure: token,
+    });
+    await route.close({ code: closeCode }).catch(() => undefined);
+  }
+
+  /**
+   * Map the ws/wss authority onto the existing http/https public validator:
+   * the hostname is resolved exactly once and every address must be public.
+   * Bounded by a hard deadline and cancelable by session teardown, so no
+   * admission can wait unboundedly or act after the session is gone.
+   */
+  private async validateWebSocketDestination(
+    url: URL,
+    signal: AbortSignal,
+  ): Promise<"public" | "refused" | "timed_out"> {
+    const mapped = new URL(`${url.protocol === "wss:" ? "https:" : "http:"}//${url.host}/`);
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    try {
+      await Promise.race([
+        validatePublicUrl(mapped.href, this.resolveHostname).then(() => undefined),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => { timedOut = true; reject(new Error("websocket admission deadline")); }, WS_ADMISSION_MS);
+        }),
+        new Promise<never>((_resolve, reject) => {
+          if (signal.aborted) { reject(new Error("session teardown")); return; }
+          onAbort = () => reject(new Error("session teardown"));
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+      return "public";
+    } catch {
+      return timedOut ? "timed_out" : "refused";
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
   }
 
   private async operate<T>(
@@ -2351,6 +2570,9 @@ export class InteractiveBrowserManager {
       rejectTeardown = reject;
     });
     session.teardown = teardown;
+    // Pending WebSocket admissions stop waiting immediately on teardown and
+    // can never reach connectToServer after this point.
+    session.admissionAbort.abort();
     void (async () => {
       try {
         const summary = await cleanupSession(session, this.limits.cleanupMs);
@@ -2607,7 +2829,8 @@ export class InteractiveBrowserManager {
       networkPolicy: new WeakMap(),
     };
     session.tabs.set(tab.handle, tab);
-    this.installPageGuards(session, tab);
+    // The context backstop covers the registration gap; containment only.
+    void this.installPageGuards(session, tab).catch(() => undefined);
     return tab;
   }
 
@@ -2752,6 +2975,10 @@ async function installRoutePolicy(
   broker: EgressBroker,
   onPolicyBlocked?: (request: Request, reason: string) => void,
 ): Promise<void> {
+  // Backstop for any page whose per-tab WebSocket route has not been
+  // installed yet (the async registration window after a popup is adopted):
+  // fail closed exactly as before. Registered tabs take precedence in the
+  // Playwright dispatcher and are handled by their own tab-scoped route.
   await context.routeWebSocket("**/*", (socket) => {
     broker.note(`WebSocket blocked before destination connection: ${bounded(socket.url(), 300)}`);
     socket.close();
@@ -2784,6 +3011,11 @@ export function interactiveRouteDecision(resourceType: string, rawUrl: string): 
 }
 
 async function cleanupSession(session: Session, deadlineMs: number): Promise<EgressSummary> {
+  // Native page WebSockets die with the context close below; the broker
+  // drains its own sockets on client disconnect. Diagnostics were already
+  // cleared by beginTeardown. Pending WebSocket admissions were aborted by
+  // beginTeardown and settle here so no validator continuation outlives
+  // teardown.
   // Start every shutdown path immediately and bound them concurrently. Hung
   // tab closes must not delay the broker kill or parent-resource close.
   const pages = [...new Set([
@@ -2804,6 +3036,7 @@ async function cleanupSession(session: Session, deadlineMs: number): Promise<Egr
     ...pendingCreations.map((creation) => boundedCleanup(creation, deadlineMs, "late browser page creation containment")),
     boundedCleanup(session.context.close(), deadlineMs, "browser context close"),
     boundedCleanup(session.browser.close(), deadlineMs, "browser process close"),
+    boundedCleanup(Promise.allSettled([...session.pendingWebSocketAdmissions]), deadlineMs, "pending websocket admission settlement"),
     boundedCleanup(session.broker.close(), deadlineMs, "egress broker close"),
   ]);
   const operationFailures = operations
@@ -3718,6 +3951,50 @@ function diagnosticPublicOrigin(rawUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Bounded origin for WebSocket diagnostics: scheme+host+port only. */
+function diagnosticWsOrigin(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return "[non-public or redacted origin]";
+    return bounded(parsed.origin, 300);
+  } catch {
+    return "[non-public or redacted origin]";
+  }
+}
+
+function boundedWsCloseCode(code: unknown): number | undefined {
+  return typeof code === "number" && Number.isInteger(code) && code >= 1000 && code <= 4999 ? code : undefined;
+}
+
+/** Close reasons are page-channel data; bound them before they re-enter a route. */
+function boundedWsCloseReason(reason: unknown): string | undefined {
+  return typeof reason === "string" && reason.length > 0 ? reason.slice(0, 123) : undefined;
+}
+
+/** Synchronous admission checks for one page-created WebSocket URL. */
+function validateLiveWebSocket(
+  rawUrl: string,
+  protocols: readonly string[],
+): { allowed: true; url: URL; protocols: string[] } | { allowed: false; reason: string } {
+  if (rawUrl.length === 0 || rawUrl.length > WS_MAX_URL_CHARS) return { allowed: false, reason: "websocket URL exceeds bound" };
+  let url: URL;
+  try { url = new URL(rawUrl); } catch { return { allowed: false, reason: "websocket URL is malformed" }; }
+  if (url.protocol !== "ws:" && url.protocol !== "wss:") return { allowed: false, reason: "websocket protocol not allowed" };
+  if (url.username !== "" || url.password !== "") return { allowed: false, reason: "websocket credentials not allowed" };
+  if (!url.hostname) return { allowed: false, reason: "websocket URL is malformed" };
+  if (protocols.length > WS_MAX_PROTOCOLS) return { allowed: false, reason: "websocket subprotocol not allowed" };
+  const cleanProtocols: string[] = [];
+  for (const protocol of protocols) {
+    // RFC 6455 token characters only; anything else is refused fail-closed.
+    if (typeof protocol !== "string" || protocol.length === 0 || protocol.length > WS_PROTOCOL_MAX_CHARS
+      || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u.test(protocol)) {
+      return { allowed: false, reason: "websocket subprotocol not allowed" };
+    }
+    cleanProtocols.push(protocol);
+  }
+  return { allowed: true, url, protocols: cleanProtocols };
 }
 
 function semanticToken(value: unknown, maxChars: number, fallback: string): string {

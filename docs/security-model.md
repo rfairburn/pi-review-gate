@@ -64,11 +64,24 @@ public, and dials only that validated address set, with no fallback to system DN
 Original hostname semantics are preserved: the browser keeps its `Host` header for plain
 HTTP, and HTTPS traffic stays end-to-end through the CONNECT tunnel, so TLS SNI and
 certificate verification remain between Chromium and the origin (the broker never
-decrypts it). WebSockets are always closed, service workers are blocked, and every
-outbound connection is recorded in a broker-owned connection ledger that is audited
-before a `BrowserExtract` render result is returned; that one-shot browser and its
-broker sockets quiesce before extraction is exposed. Interactive browsers instead remain
-live across turns and reviews until explicit close or terminal session teardown. Local browser protocols (`about:`, `blob:`, `data:`) remain
+decrypts it). In one-shot `BrowserExtract` renders WebSockets are always closed; in
+interactive sessions page-created `ws:`/`wss:` connections use Chromium's native
+WebSocket stack through the same authenticated loopback broker (the context proxy
+credentials carry the authentication): before the browser is allowed to connect, each
+requested destination is validated against the public-URL policy (every address public,
+no URL credentials, no harness retry or replay). The broker independently revalidates
+and pins each actual connection. Chromium can tunnel both `ws:` and `wss:` through
+CONNECT; the broker also supports authenticated plain HTTP WebSocket upgrades for
+opted-in clients. WSS stays end-to-end TLS inside CONNECT. Neither the manager nor
+broker parses WebSocket frames or retains payloads in diagnostics. Service workers are
+blocked in both modes, and every outbound connection is recorded in a broker-owned
+connection ledger that is audited before a `BrowserExtract` render result is returned;
+that one-shot browser and its broker sockets quiesce before extraction is exposed.
+Interactive browsers instead remain live across turns and reviews until explicit close
+or terminal session teardown: all interactive CONNECT tunnels are exempt from ordinary
+idle eviction because the broker cannot distinguish encrypted HTTPS from live WSS,
+while hard budgets,
+close, and shutdown still drain every socket. Local browser protocols (`about:`, `blob:`, `data:`) remain
 narrowly allowed only for non-media, non-visual in-process resources; local image/font
 payloads are blocked so admitted visual resources cannot evade broker byte accounting.
 
@@ -94,7 +107,9 @@ bytes, authority/header lengths, socket idle time, and total time for one-shot r
 Interactive sessions have finite action deadlines but no elapsed browser-lifetime limit.
 Quiet socket eviction destroys the connection and records opaque tunnel completion as
 unconfirmed without sending a fatal policy/budget notification to the interactive
-owner. Fresh connections still revalidate DNS; actions are never replayed automatically.
+owner. Interactive CONNECT tunnels are instead retained through ordinary idle, but
+close, shutdown, and hard budget aborts still drain them. Fresh connections still
+revalidate DNS; actions are never replayed automatically.
 Hard security and byte/request/connection budget failures still contain the browser.
 For `BrowserExtract`, a budget that destroys an in-flight transfer is nonfatal only when
 the main document completed; main-document failures, non-2xx navigations, oversized
@@ -102,9 +117,13 @@ rendered HTML, and any ledger audit failure fail the render closed.
 
 Interactive diagnostics do not add an egress path. `BrowserNetwork` observes only
 capture-time-bounded method/origin/resource/status/timing/failure and available route-
-policy outcomes from traffic already governed by the authenticated broker; paths,
-queries, bodies, headers, cookies, authorization, post data, WebSocket frames, and cache
-contents are excluded. `BrowserConsole` retains only bounded redacted text and source
+policy outcomes from traffic already governed by the authenticated broker, including
+metadata-only WebSocket lifecycle for page-created live connections (created when
+admission is requested, closed at the terminal state reported by the browser's own WebSocket stack;
+no connected state is ever claimed; close codes only where the browser exposes them;
+and policy-block reasons for refused destinations); paths, queries, bodies, headers,
+cookies, authorization,
+post data, WebSocket frames, and cache contents are excluded. `BrowserConsole` retains only bounded redacted text and source
 origin/position metadata, never argument objects, source payloads, or stacks.
 `BrowserInspect` resolves only a current owned semantic ref and returns fixed bounded
 accessibility/state fields using the browser-computed semantics captured with the fresh

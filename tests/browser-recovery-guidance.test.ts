@@ -31,6 +31,7 @@ class FakePage extends EventEmitter {
   mainFrame() { return this.frame; }
   url() { return this.currentUrl; }
   isClosed() { return this.closedState; }
+  async routeWebSocket() {}
   async title() { return "Fixture title"; }
   viewportSize() { return { width: 1280, height: 720 }; }
   async ariaSnapshot() { return '- heading "Fixture" [level=1]\n- link "Next" [ref=e7]\n'; }

@@ -15,6 +15,7 @@ const common = loadReleaseModule<{
 const packaging = loadReleaseModule<PackagingModule>("packaging.cjs");
 const publish = loadReleaseModule<PublishModule & {
   tarballFilenameFor(version: string): string;
+  isOwnedDraft(release: unknown, eligibility: Eligibility): boolean;
 }>("publish.cjs");
 
 const TARGET = "c".repeat(40);
@@ -102,6 +103,7 @@ interface MockAsset {
 interface MockRelease {
   id: number;
   tag_name: string;
+  target_commitish: string;
   name: string;
   body: string;
   draft: boolean;
@@ -136,6 +138,23 @@ class MockGithub {
   private createPostSeen = false;
   // The next POST /releases conflicts even though no release exists yet.
   conflictWithoutRelease = false;
+
+  // Behavioral model of the GitHub draft-identity detachment CONFIRMED by a
+  // live API probe (issue #13; public release run 33971009517): a PATCH to an
+  // existing draft that OMITS tag_name re-stores the draft under a synthetic
+  // `untagged-<hash>` tag_name, while an omitted target_commitish PRESERVES
+  // its existing value; the default branch applies to target_commitish only
+  // on CREATE. The exact untagged hash is per-request and irrelevant to
+  // ownership, so the mock uses one generic synthetic untagged fixture value.
+  // Enabled by default so every orchestration test proves identity
+  // preservation under this pressure; the fixed builder never omits these
+  // fields.
+  modelsObservedDraftIdentityDetachment = true;
+  syntheticUntaggedTagName = "untagged-0123456789abcdef0123";
+  defaultTargetCommitish = "main";
+  // When set, the stored/returned draft of a create reports a detached tag
+  // name (models a create-time detachment variant).
+  detachCreatedDraftResponse = false;
 
   getApi() {
     return common.createApi({ fetchImpl: this.fetch.bind(this), token: TOKEN, repository: common.REPOSITORY });
@@ -201,6 +220,11 @@ class MockGithub {
       const release: MockRelease = {
         id,
         tag_name: String(input.tag_name),
+        // GitHub's documented default for target_commitish is the repository
+        // default branch on CREATE; an omitted create field must NOT be
+        // preserved as "unset" (a PATCH omission, by contrast, preserves the
+        // existing value — see the PATCH handler below).
+        target_commitish: typeof input.target_commitish === "string" ? input.target_commitish : this.defaultTargetCommitish,
         name: String(input.name ?? ""),
         body: String(input.body ?? ""),
         draft: Boolean(input.draft),
@@ -211,6 +235,9 @@ class MockGithub {
         // Documented upload_url form.
         upload_url: `${UPLOADS_BASE}/releases/${id}/assets?name={name}&label={label}`,
       };
+      if (this.detachCreatedDraftResponse) {
+        release.tag_name = this.syntheticUntaggedTagName;
+      }
       this.releases.set(release.id, release);
       return this.respond(201, this.releaseJson(release));
     }
@@ -243,10 +270,26 @@ class MockGithub {
       if (method === "GET") return this.respond(200, this.releaseJson(release));
       if (method === "PATCH") {
         const patch = bodyJson();
+        if (patch.tag_name !== undefined) release.tag_name = String(patch.tag_name);
+        if (patch.target_commitish !== undefined) release.target_commitish = String(patch.target_commitish);
         if (patch.draft !== undefined) release.draft = Boolean(patch.draft);
         if (patch.prerelease !== undefined) release.prerelease = Boolean(patch.prerelease);
         if (patch.make_latest !== undefined) release.make_latest = String(patch.make_latest);
         if (patch.body !== undefined) release.body = String(patch.body);
+        // Confirmed API mechanism (issue #13): a draft PATCH that omits
+        // tag_name detaches the stored tag (tag_name becomes the synthetic
+        // untagged fixture). An omitted target_commitish PRESERVES its
+        // existing value — fields absent from the patch are left untouched
+        // by the field-by-field application above, which is exactly the
+        // confirmed behavior. Published releases are bound to their tag and
+        // are never detached by this model.
+        if (
+          release.draft
+          && patch.tag_name === undefined
+          && this.modelsObservedDraftIdentityDetachment
+        ) {
+          release.tag_name = this.syntheticUntaggedTagName;
+        }
         return this.respond(200, this.releaseJson(release));
       }
     }
@@ -287,6 +330,7 @@ class MockGithub {
     return {
       id: release.id,
       tag_name: release.tag_name,
+      target_commitish: release.target_commitish,
       name: release.name,
       body: release.body,
       draft: release.draft,
@@ -376,6 +420,9 @@ function seedOwnedDraft(github: MockGithub, repo: SyntheticRepo, releaseId: numb
   github.releases.set(releaseId, {
     id: releaseId,
     tag_name: "b2",
+    // Old-style draft created before the identity fix: target_commitish fell
+    // back to GitHub's default branch.
+    target_commitish: "main",
     name: "b2",
     body: publish.releaseBody(eligibilityFor(repo), undefined),
     draft: true,
@@ -426,6 +473,7 @@ function seedPublishedRelease(github: MockGithub, repo: SyntheticRepo, releaseId
   github.releases.set(releaseId, {
     id: releaseId,
     tag_name: "b2",
+    target_commitish: repo.mergeCommit,
     name: `b2 (pi-review-gate ${eligibility.version})`,
     body: publish.releaseBody(eligibility, build.provenance),
     draft: false,
@@ -578,6 +626,7 @@ test("unowned draft fails closed without modification", async () => {
     github.releases.set(releaseId, {
       id: releaseId,
       tag_name: "b2",
+      target_commitish: "main",
       name: "b2",
       body: "some other builder's draft",
       draft: true,
@@ -765,6 +814,324 @@ test("a creation conflict with no readable release fails closed without blind re
       1,
       "a conflicted creation must never be blindly retried",
     );
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+// --- Regression: confirmed GitHub draft-identity detachment (issue #13) ------
+// Public release run 33971009517 failed closed with "draft release lost its
+// owned identity before publication" because the stored draft ended up
+// detached (a synthetic untagged-<hash> tag_name) while its body still carried
+// the exact ownership marker. A live API probe confirmed the mechanism: a
+// draft PATCH omitting tag_name detaches the tag, while an omitted
+// target_commitish preserves its existing value (the default branch applies
+// only on CREATE). The mock above models that confirmed behavior; these
+// tests prove the OLD payload shape (omitted tag_name on draft PATCH) fails
+// closed exactly as in production, and the fixed payload preserves the exact
+// eligibility end to end.
+
+test("observed detachment model: old payload shape fails closed exactly as run 33971009517", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    // Model the OLD builder payload: create without target_commitish, and
+    // draft updates without tag_name/target_commitish.
+    const upstream = github.fetch.bind(github);
+    github.fetch = async (url, init) => {
+      let requestInit = init;
+      if (typeof init?.body === "string" && (init.method === "POST" || init.method === "PATCH")) {
+        const parsed = JSON.parse(init.body) as Record<string, unknown>;
+        if (init.method === "POST" && new URL(url).pathname === "/repos/rfairburn/pi-review-gate/releases") {
+          delete parsed.target_commitish;
+        }
+        if (init.method === "PATCH" && /\/releases\/\d+$/.test(new URL(url).pathname)) {
+          delete parsed.tag_name;
+          delete parsed.target_commitish;
+        }
+        requestInit = { ...init, body: JSON.stringify(parsed) };
+      }
+      return upstream(url, requestInit);
+    };
+    await assert.rejects(publishWith(repo, github), /draft release lost its owned identity before publication; failing closed/);
+    // The draft is left exactly as GitHub stored it: detached, still a draft,
+    // body marker intact, target_commitish from the CREATE default, and no
+    // assets were ever uploaded to it.
+    const draft = [...github.releases.values()][0];
+    assert.ok(draft);
+    assert.equal(draft.draft, true);
+    assert.equal(draft.tag_name, github.syntheticUntaggedTagName);
+    assert.equal(draft.target_commitish, "main");
+    assert.ok(draft.body.includes(publish.identityMarker(eligibilityFor(repo))));
+    assert.equal(draft.assets.length, 0);
+    assert.equal(github.assetContents.size, 0, "no assets may be uploaded to a detached draft");
+    assert.equal(
+      github.countRequests((request) => request.method === "PATCH" && (request.body ?? "").includes('"draft":false')),
+      0,
+      "a detached draft must never be published",
+    );
+    // The ownership guard itself rejects the detached stored state.
+    assert.equal(publish.isOwnedDraft(draft, eligibilityFor(repo)), false);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("confirmed live mechanism: a draft PATCH omitting tag_name detaches the tag while the already-bound exact source stays preserved", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    // Model the live-probe state (issue #13): an owned draft whose tag is
+    // b2 and whose target_commitish is ALREADY the exact source SHA, with
+    // no assets and no publication. The old builder payload then PATCHes
+    // the draft while omitting tag_name and target_commitish.
+    seedOwnedDraft(github, repo, 102);
+    const draft = github.releases.get(102) as MockRelease & { id: number };
+    draft.target_commitish = repo.mergeCommit;
+    const upstream = github.fetch.bind(github);
+    github.fetch = async (url, init) => {
+      let requestInit = init;
+      if (
+        init?.method === "PATCH"
+        && /\/releases\/\d+$/.test(new URL(url).pathname)
+        && typeof init.body === "string"
+      ) {
+        const parsed = JSON.parse(init.body) as Record<string, unknown>;
+        delete parsed.tag_name;
+        delete parsed.target_commitish;
+        requestInit = { ...init, body: JSON.stringify(parsed) };
+      }
+      return upstream(url, requestInit);
+    };
+    await assert.rejects(
+      publishWith(repo, github),
+      /draft release lost its owned identity before publication; failing closed/,
+    );
+    // Exactly as the live probe observed against the real API: the tag
+    // detaches to the synthetic untagged fixture, but the already-bound
+    // exact source is PRESERVED — the default branch never enters on PATCH.
+    assert.equal(draft.draft, true);
+    assert.equal(draft.tag_name, github.syntheticUntaggedTagName);
+    assert.equal(
+      draft.target_commitish,
+      repo.mergeCommit,
+      "an omitted target_commitish on a draft PATCH must preserve the already-bound exact source",
+    );
+    assert.ok(draft.body.includes(publish.identityMarker(eligibilityFor(repo))));
+    assert.equal(draft.assets.length, 0);
+    assert.equal(github.assetContents.size, 0, "no assets may be uploaded to a draft whose tag detached");
+    assert.equal(
+      github.countRequests((request) => request.method === "PATCH" && (request.body ?? "").includes('"draft":false')),
+      0,
+      "a detached draft must never be published",
+    );
+    // The ownership guard rejects exactly this mixed state: bound source,
+    // detached tag identity.
+    assert.equal(publish.isOwnedDraft(draft, eligibilityFor(repo)), false);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("fixed payload preserves exact tag/source identity under the observed detachment model", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    const summary = await publishWith(repo, github);
+    assert.equal(summary.outcome, "published");
+    assert.equal(summary.tag, "b2");
+    assert.equal(summary.target, repo.mergeCommit);
+    // The create payload pins target_commitish to the exact source SHA...
+    const create = github.requests.find(
+      (request) => request.method === "POST" && new URL(request.url).pathname === "/repos/rfairburn/pi-review-gate/releases",
+    );
+    const createBody = JSON.parse(create?.body ?? "{}") as Record<string, unknown>;
+    assert.equal(createBody.tag_name, "b2");
+    assert.equal(createBody.target_commitish, repo.mergeCommit);
+    // ...and EVERY draft mutation re-asserts the bound tag and source.
+    const patches = github.requests.filter(
+      (request) => request.method === "PATCH" && /\/releases\/\d+$/.test(new URL(request.url).pathname),
+    );
+    assert.equal(patches.length, 2, "expected exactly the identity write and the publish PATCH");
+    for (const patch of patches) {
+      const body = JSON.parse(patch.body ?? "{}") as Record<string, unknown>;
+      assert.equal(body.tag_name, "b2", "every PATCH must carry the bound tag_name");
+      assert.equal(body.target_commitish, repo.mergeCommit, "every PATCH must carry the exact target_commitish");
+    }
+    // The stored published release kept the exact identity despite the
+    // mock's detachment pressure on every omitted field.
+    const release = github.releaseByTag("b2");
+    assert.ok(release);
+    assert.equal(release.draft, false);
+    assert.equal(release.tag_name, "b2");
+    assert.equal(release.target_commitish, repo.mergeCommit);
+    // The publication boundary re-verified the tag ref AFTER the publish PATCH.
+    const publishPatchIndex = github.requests.findIndex(
+      (request) => request.method === "PATCH" && (request.body ?? "").includes('"draft":false'),
+    );
+    assert.ok(publishPatchIndex >= 0);
+    assert.ok(
+      github.requests.slice(publishPatchIndex + 1).some(
+        (request) => request.method === "GET" && request.url === `${API_BASE}/git/ref/tags%2Fb2`,
+      ),
+      "the tag ref must be re-verified after publication",
+    );
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("created draft reporting a detached tag_name fails closed before any build or asset writes", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  const buildRecorder = { built: false };
+  try {
+    github.detachCreatedDraftResponse = true;
+    await assert.rejects(
+      publishWith(repo, github, { buildRecorder }),
+      /detached tag_name .*failing closed before any artifact build or asset writes/,
+    );
+    assert.equal(buildRecorder.built, false, "no fallible artifact build may follow a detached create response");
+    assert.equal(github.assetContents.size, 0, "no asset uploads may follow a detached create response");
+    assert.equal(
+      github.countRequests((request) => request.method === "PATCH"),
+      0,
+      "no release PATCH may follow a detached create response",
+    );
+    // The detached draft remains; a retry must hit the orphan diagnostic,
+    // never a duplicate creation.
+    assert.equal(github.releases.size, 1);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("created draft with expected tag but missing/wrong ownership identity fails closed before any build or writes", async () => {
+  const conflictingProvenanceBody = (repo: SyntheticRepo) =>
+    `${publish.releaseBody(eligibilityFor(repo), undefined)}\n\`\`\`json\n${JSON.stringify({
+      schema: packaging.PROVENANCE_SCHEMA,
+      source: {
+        repository: common.REPOSITORY,
+        sha: "d".repeat(40),
+        baseline: repo.baseline,
+        firstParentDistance: 2,
+      },
+      package: { name: "pi-review-gate", version: eligibilityFor(repo).version },
+    }, null, 2)}\n\`\`\`\n`;
+  const variants: Array<[string, (repo: SyntheticRepo) => string]> = [
+    ["missing marker", () => "some other builder's draft"],
+    // Marker present but pinned to a DIFFERENT source SHA: wrong ownership.
+    ["wrong-sha marker", (repo) => publish.releaseBody(
+      { ...eligibilityFor(repo), target: "d".repeat(40), prMergeCommitSha: "d".repeat(40) },
+      undefined,
+    )],
+    // Marker present but the embedded provenance conflicts with the identity.
+    ["conflicting provenance", conflictingProvenanceBody],
+  ];
+  for (const [label, forgedBodyFor] of variants) {
+    const repo = makeRepo();
+    const github = new MockGithub();
+    const buildRecorder = { built: false };
+    try {
+      // The API stores the draft with the expected tag but reports an
+      // unowned body (marker missing, wrong SHA, or conflicting provenance).
+      const upstream = github.fetch.bind(github);
+      github.fetch = async (url, init) => {
+        const response = await upstream(url, init);
+        if (init?.method === "POST" && new URL(url).pathname === "/repos/rfairburn/pi-review-gate/releases") {
+          const body = (JSON.parse(await response.text()) ?? {}) as Record<string, unknown>;
+          body.body = forgedBodyFor(repo);
+          return { ...response, text: async () => JSON.stringify(body) };
+        }
+        return response;
+      };
+      await assert.rejects(
+        publishWith(repo, github, { buildRecorder }),
+        /does not carry this builder's ownership identity .*failing closed before any artifact build or asset writes/,
+      );
+      assert.equal(buildRecorder.built, false, `(${label}) no fallible artifact build may follow an unowned create response`);
+      assert.equal(github.assetContents.size, 0, `(${label}) no asset uploads may follow an unowned create response`);
+      const writes = github.requests.filter((request) => request.method === "PATCH" || request.method === "DELETE");
+      assert.deepEqual(
+        writes.map((request) => `${request.method} ${new URL(request.url).pathname}`),
+        [],
+        `(${label}) no PATCH or DELETE may follow an unowned create response`,
+      );
+      // The unowned stored draft is left exactly as the API created it: its
+      // reported body was never overwritten by an identity write.
+      const draft = [...github.releases.values()][0];
+      assert.ok(draft);
+      assert.equal(draft.draft, true, `(${label}) the unowned draft must never be published`);
+      assert.equal(draft.tag_name, "b2");
+      assert.equal(draft.assets.length, 0);
+    } finally {
+      rmSync(repo.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("orphaned owned draft with detached tag identity fails closed without creating a duplicate draft", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    // Model the detached state left by public run 33971009517: a draft still
+    // carrying the exact b2 ownership marker in its body, but stored under a
+    // synthetic untagged tag_name. Tag-based discovery cannot see it; a
+    // retry that blindly created a new draft would duplicate it.
+    github.tags.set("refs/tags/b2", repo.mergeCommit);
+    const releaseId = 99;
+    github.releases.set(releaseId, {
+      id: releaseId,
+      tag_name: github.syntheticUntaggedTagName,
+      target_commitish: "main",
+      name: "b2 (pi-review-gate 0.1.0-dev.2)",
+      body: publish.releaseBody(eligibilityFor(repo), undefined),
+      draft: true,
+      prerelease: true,
+      make_latest: "false",
+      assets: [],
+      html_url: "https://example.com/orphan-draft",
+      upload_url: `${UPLOADS_BASE}/releases/${releaseId}/assets?name={name}&label={label}`,
+    });
+    await assert.rejects(
+      publishWith(repo, github),
+      /refusing to create a duplicate draft; operator recovery required; failing closed/,
+    );
+    // Exactly one release exists and nothing was written anywhere.
+    assert.equal(github.releases.size, 1);
+    const writes = github.requests.filter((request) => request.method !== "GET");
+    assert.deepEqual(writes.map((request) => `${request.method} ${new URL(request.url).pathname}`), []);
+    assert.equal(github.assetContents.size, 0);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("published release bound to a moved tag ref fails closed read-only at the publication boundary", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    seedPublishedRelease(github, repo, 101);
+    // The tag ref is correct for the initial reads but is reported moved at
+    // every LATER tag read (models a tag that changed after publication).
+    let tagReads = 0;
+    const upstream = github.fetch.bind(github);
+    github.fetch = async (url, init) => {
+      const response = await upstream(url, init);
+      if (new URL(url).pathname === "/repos/rfairburn/pi-review-gate/git/ref/tags%2Fb2") {
+        tagReads += 1;
+        if (tagReads >= 2) {
+          const body = (JSON.parse(await response.text()) ?? {}) as { object?: { sha?: string; type?: string } };
+          if (body.object) body.object.sha = "e".repeat(40);
+          return { ...response, text: async () => JSON.stringify(body) };
+        }
+      }
+      return response;
+    };
+    await assert.rejects(publishWith(repo, github), /refusing to retarget/);
+    // Verify-only boundary: the refusal mutated nothing.
+    const writes = github.requests.filter((request) => request.method !== "GET");
+    assert.deepEqual(writes.map((request) => `${request.method} ${new URL(request.url).pathname}`), []);
   } finally {
     rmSync(repo.root, { recursive: true, force: true });
   }

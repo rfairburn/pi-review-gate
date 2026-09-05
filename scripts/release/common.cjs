@@ -188,8 +188,14 @@ function createApi({ fetchImpl, token, repository }) {
     },
     // Authenticated release listing, which (unlike the tag endpoint) includes
     // draft releases. Bounded pagination: at most maxPages pages of perPage.
+    // A short (partial) page proves the listing is complete. Exhausting the
+    // cap with a still-full final page means the listing may be truncated, so
+    // it cannot certify the absence of any release (for example an orphaned
+    // owned draft); the walk then fails closed with a bounded, body-free
+    // error instead of returning a partial result or issuing more requests.
     async listReleases({ perPage = 100, maxPages = 5 } = {}) {
       const releases = [];
+      let complete = false;
       for (let page = 1; page <= maxPages; page += 1) {
         const result = await jsonRequest("GET", `/releases?per_page=${perPage}&page=${page}`);
         if (result.status !== 200) {
@@ -199,7 +205,15 @@ function createApi({ fetchImpl, token, repository }) {
           throw new ReleaseError("GitHub API list releases returned a malformed body");
         }
         releases.push(...result.json);
-        if (result.json.length < perPage) break;
+        if (result.json.length < perPage) {
+          complete = true;
+          break;
+        }
+      }
+      if (!complete) {
+        throw new ReleaseError(
+          `GitHub API list releases reached the bounded pagination cap of ${maxPages} pages of ${perPage} with a full final page; the listing may be truncated and cannot certify the absence of a release; failing closed (request count stays bounded)`,
+        );
       }
       return releases;
     },

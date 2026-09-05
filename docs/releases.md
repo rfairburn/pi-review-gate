@@ -103,9 +103,22 @@ otherwise do nothing. Any mismatch fails closed; nothing is replaced or clobbere
 
 ## Manual recovery
 
-Recovery is always a re-run of the original CI run that performed the push: the reusable
+Recovery depends on why the original run failed. For ordinary retryable failures,
+recovery is a re-run of the original CI run that performed the push: the reusable
 workflow inherits the original event, so the target SHA stays exact. Never dispatch a
 floating workflow to "publish whatever main is now" — that path does not exist by design.
+
+A re-run always executes that original run's immutable producer code, so merging a
+builder fix does not retroactively repair the producer of an earlier failed run; a newly
+merged fixed producer affects only future commits, which publish automatically. While an
+interrupted release is still a draft, retries of the original run repeat the original
+producer's behavior, so recovery from a producer bug may require a manual operator
+publication at the exact SHA. Once the release exists published, a later re-run of the
+original producer can legitimately succeed through its read-only already-published
+verification path, which idempotently verifies the published assets; such a green re-run
+does not mean the old producer's write path performed or repaired the publication, and
+the original failed attempt remains history.
+
 If a draft remains incomplete, a re-run of the same SHA resumes it after identity
 validation; if the failure was a fail-closed identity, integrity, or permission error,
 resolve the underlying condition (or recover manually at the same exact SHA) and re-run.

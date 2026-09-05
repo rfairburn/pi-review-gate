@@ -129,8 +129,8 @@ test("getPullRequest returns the detailed record and resolves 404 to null", asyn
   assert.equal(await api.getPullRequest(8), null);
 });
 
-test("listReleases stops at a short page and is bounded by maxPages", async () => {
-  // Page 1: full (2 items with per_page=2), page 2: short -> stop.
+test("listReleases stops at a partial page, which proves the result complete", async () => {
+  // Page 1: full (2 items with per_page=2), page 2: short -> complete result.
   const { api, calls } = makeClient((call) => {
     const page = Number(new URL(call.url).searchParams.get("page") ?? "1");
     const items = page === 1 ? [{ id: 1 }, { id: 2 }] : [{ id: 3 }];
@@ -138,22 +138,35 @@ test("listReleases stops at a short page and is bounded by maxPages", async () =
   });
   const releases = await api.listReleases({ perPage: 2, maxPages: 5 });
   assert.deepEqual(releases.map((release) => release.id), [1, 2, 3]);
-  assert.equal(calls.length, 2, "a short page must end pagination");
-
-  // All pages full: the maxPages cap bounds the walk.
-  const cappedCalls: CapturedCall[] = [];
-  const cappedFetch = async (url: string, init?: CapturedCall["init"]) => {
-    cappedCalls.push({ url, init });
-    return { status: 200, text: async () => JSON.stringify([{ id: 1 }, { id: 2 }]), arrayBuffer: async () => new ArrayBuffer(0) };
-  };
-  const cappedApi = common.createApi({ fetchImpl: cappedFetch, token: TOKEN, repository: common.REPOSITORY });
-  const capped = await cappedApi.listReleases({ perPage: 2, maxPages: 3 });
-  assert.equal(capped.length, 6);
-  assert.equal(cappedCalls.length, 3, "pagination must never exceed maxPages");
+  assert.equal(calls.length, 2, "a short page must end pagination as a complete result");
+  for (const call of calls) assertNativeRequestAccepts(call as CapturedCall);
 
   // Non-200 fails closed.
   const failing = makeClient(() => ({ status: 500, text: JSON.stringify({ message: "boom" }) }));
   await assert.rejects(failing.api.listReleases(), /list releases failed/);
+});
+
+test("listReleases fails closed with bounded requests when the cap ends on a full page", async () => {
+  // Every page up to the cap is full: the listing may be truncated, so it
+  // cannot certify the absence of a release (e.g. an orphaned owned draft).
+  // It must reject instead of silently returning a partial result, and the
+  // request count must stay exactly at the cap (no unbounded requests).
+  const { api, calls } = makeClient(() => ({ status: 200, text: JSON.stringify([{ id: 1 }, { id: 2 }]) }));
+  const error = await api.listReleases({ perPage: 2, maxPages: 3 }).then(
+    () => null,
+    (caught: unknown) => caught,
+  );
+  assert.ok(error instanceof Error, "cap exhaustion with a full page must fail closed");
+  assert.match(error.message, /bounded pagination cap/);
+  assert.match(error.message, /truncated/);
+  assert.ok(!error.message.includes(TOKEN), "the bounded error must not leak the token");
+  assert.ok(!error.message.includes("{"), "the bounded error must not leak a response body");
+  assert.equal(calls.length, 3, "the fail-closed walk must stop exactly at maxPages requests");
+  for (const call of calls) {
+    assertNativeRequestAccepts(call as CapturedCall);
+    assert.equal(call.init?.method, "GET");
+    assert.equal((call.init as { body?: unknown } | undefined)?.body, undefined);
+  }
 });
 
 test("getCommitPullRequests returns the list-shaped association and fails closed on malformed bodies", async () => {

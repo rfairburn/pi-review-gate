@@ -102,3 +102,24 @@ jobs:
         run: npm run build:test
       - name: Full test suite
         run: npm run test:run
+
+  release:
+    # Publishes the numbered prerelease for a validated main push by calling the
+    # reusable builder. It runs only after BOTH required check jobs succeeded:
+    # with `needs: [verify, full-tests]` GitHub's implicit success() guard skips
+    # this job when a needed job failed or was skipped, and the explicit `if`
+    # re-pins the trust boundary (original push event, refs/heads/main, this
+    # repository). PRs, manual dispatches, and foreign repositories can never
+    # reach the publisher. No secrets are passed: the callee reads the event's
+    # GITHUB_TOKEN from the `github.token` context, so `secrets: inherit` stays
+    # unused and the job grants exactly `contents: write` — the only write
+    # permission anywhere in this workflow.
+    name: Publish numbered prerelease
+    needs: [verify, full-tests]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'rfairburn/pi-review-gate'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml

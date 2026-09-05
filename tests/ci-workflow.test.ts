@@ -11,9 +11,29 @@ import test from "node:test";
 
 const projectRoot = join(dirname(__dirname), "..");
 const workflowPath = join(projectRoot, ".github", "workflows", "ci.yml");
+const releaseWorkflowPath = join(projectRoot, ".github", "workflows", "release.yml");
 
 function readWorkflow(): string {
   return readFileSync(workflowPath, "utf8");
+}
+
+function readReleaseWorkflow(): string {
+  return readFileSync(releaseWorkflowPath, "utf8");
+}
+
+/** Collapse whitespace/newlines so folded YAML block scalars compare as one line. */
+function flattened(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** Drop full-line YAML comments so prose mentions of forbidden constructs don't trip negative assertions. */
+function withoutComments(source: string): string {
+  return source.split("\n").filter((line) => !line.trimStart().startsWith("#")).join("\n");
+}
+
+/** Pinned `owner/repo@<sha>` references appearing in a workflow source. */
+function pinnedActions(source: string): Set<string> {
+  return new Set([...source.matchAll(/uses: (\S+@[0-9a-f]{40})/g)].map((match) => match[1]));
 }
 
 /**
@@ -223,6 +243,149 @@ test("full-suite always provides the Pi agent-core runtime for the native outer-
   assert.match(full, /PI_BROWSER_AGENT_RUNTIME=\$RUNNER_TEMP\/pi-agent-runtime\/node_modules\/@earendil-works\/pi-agent-core\/dist\/index\.js/,
     "the regression points at the installed agent-core entry, not a mock");
   assert.doesNotMatch(full, /continue-on-error/, "the runtime step must not be an optional skip");
+});
+
+// --- Release publisher integration ------------------------------------------
+// CI is the sole caller of the reusable prerelease builder. These assertions pin
+// the caller's trust boundary: correct event/ref/repository, both required check
+// jobs upstream, GitHub's implicit success() guard intact, no inherited secrets,
+// and a single narrowly-scoped write grant.
+
+const RELEASE_JOB = "release";
+
+function releaseJobBlock(): string {
+  return blockOf(readWorkflow(), RELEASE_JOB, 2);
+}
+
+const RELEASE_IF = "github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rfairburn/pi-review-gate'";
+
+function releaseJobCondition(): string {
+  const release = releaseJobBlock();
+  const match = release.match(/if: >-\n((?:.*\n)*?)(?:    permissions:|    uses:)/);
+  assert.ok(match, "the release caller job must carry an explicit if: condition");
+  return flattened(match[1]);
+}
+
+function topLevelJobIds(source: string): string[] {
+  return [...source.matchAll(/^  ([a-z][a-z0-9-]*):$/gm)].map((match) => match[1]);
+}
+
+function jobPermissions(jobBlock: string): string | null {
+  const match = jobBlock.match(/^    permissions:\n((?:      .*\n?)*)/m);
+  return match ? match[1] : null;
+}
+
+function callerReleaseConditions(): void {
+  const source = readWorkflow();
+  assert.match(source, /^  release:$/m, "the release caller job id must exist for the reusable publisher");
+  const release = releaseJobBlock();
+  assert.match(release, /uses: \.\/\.github\/workflows\/release\.yml$/m,
+    "the caller must invoke the local reusable release workflow");
+  assert.equal(flattened(releaseJobCondition()), RELEASE_IF,
+    "the caller must pin the original push event, refs/heads/main, and this exact repository; PRs, manual dispatch, forks, and other refs must not reach the publisher");
+  assert.doesNotMatch(release, /pull_request_target|workflow_dispatch|workflow_run/,
+    "the publisher must not gain alternate trigger paths through the caller");
+}
+
+function callerRunsOnlyAfterBothRequiredChecks(): void {
+  const source = readWorkflow();
+  const release = releaseJobBlock();
+  assert.match(release, /needs: \[verify, full-tests\]/,
+    "the publisher must need both required check jobs");
+  assert.match(source, /^  verify:$/m);
+  assert.match(source, /^  full-tests:$/m);
+  // GitHub evaluates a needed job as failure when it fails OR is skipped; the
+  // implicit success() guard therefore blocks the publisher in both cases, but
+  // only as long as the condition is not overridden.
+  assert.doesNotMatch(release, /always\(\)|failure\(\)|cancelled\(\)/,
+    "overriding the implicit success() guard would let failed or skipped checks publish");
+  for (const neededJob of ["verify", "full-tests"]) {
+    const job = blockOf(source, neededJob, 2);
+    assert.doesNotMatch(job, /continue-on-error/,
+      `a continue-on-error step or job in ${neededJob} would convert failure into success upstream of the publisher`);
+  }
+}
+
+function callerPassesNoSecrets(): void {
+  const source = withoutComments(readWorkflow());
+  assert.doesNotMatch(source, /secrets:\s*inherit/,
+    "the callee needs only the event's GITHUB_TOKEN (github.token context); inheriting caller secrets would widen the blast radius");
+  assert.doesNotMatch(releaseJobBlock(), /^    (secrets|with):/m,
+    "the caller job must not pass secrets or inputs to the reusable publisher");
+}
+
+function rootReadOnlyAndWriteOnlyPublisher(): void {
+  const source = withoutComments(readWorkflow());
+  const rootPermissions = blockOf(source, "permissions", 0);
+  assert.match(rootPermissions.trim(), /^contents:\s*read$/m,
+    "the workflow-level default must stay read-only");
+  const release = releaseJobBlock();
+  assert.match(jobPermissions(release) ?? "", /^      contents:\s*write$/m,
+    "the release caller job must grant contents: write for release and tag creation");
+  // Every job-level permissions block in the file: only the publisher may write.
+  for (const jobId of topLevelJobIds(source)) {
+    const jobPermissionsBlock = jobPermissions(blockOf(source, jobId, 2));
+    if (!jobPermissionsBlock) continue;
+    const grantsWrite = /write/.test(jobPermissionsBlock);
+    assert.ok(jobId === RELEASE_JOB || !grantsWrite,
+      `job ${jobId} must not carry a write-scoped permission`);
+  }
+  assert.doesNotMatch(source, /workflows:\s*write/,
+    "GITHUB_TOKEN cannot obtain the workflows permission; the caller must not request it");
+}
+
+function reusableReleaseWorkflowMirrorsTheBoundary(): void {
+  const source = withoutComments(readReleaseWorkflow());
+  const on = blockOf(source, "on", 0);
+  assert.match(on, /^  workflow_call:$/m, "the builder must stay reusable-workflow-call only");
+  assert.doesNotMatch(on, /^  (push|pull_request|pull_request_target|workflow_dispatch|schedule|workflow_run):/m,
+    "the builder must have no independent trigger path outside the CI caller");
+  // Independent enforcement of the same trust boundary (reusable runs inherit the
+  // caller's original event context, so the condition pins the triggering push).
+  const expectedCondition = "github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_type == 'branch' && github.repository == 'rfairburn/pi-review-gate'";
+  const conditions = [...source.matchAll(/if: >-\n((?:.*\n)*?)(?:    runs-on:)/g)].map((match) => flattened(match[1]));
+  assert.ok(conditions.length >= 2, "both the verify and publish jobs must re-validate the boundary");
+  for (const condition of conditions) {
+    assert.equal(condition, expectedCondition);
+  }
+  assert.doesNotMatch(source, /workflow_run/, "no workflow_run privilege chain");
+  const concurrency = blockOf(source, "concurrency", 0);
+  assert.match(concurrency, /group: release-publish-\$\{\{ github\.sha \}\}/,
+    "one publication group per exact target SHA");
+  assert.match(concurrency, /cancel-in-progress: false/,
+    "an in-flight publication must never be auto-cancelled");
+  const rootPermissions = blockOf(source, "permissions", 0);
+  assert.match(rootPermissions.trim(), /^contents:\s*read$/m);
+  assert.doesNotMatch(source, /workflows:\s*write|secrets:\s*inherit/,
+    "no unsupported permission and no inherited secrets anywhere in the builder");
+  const verify = blockOf(source, "verify", 2);
+  assert.match(jobPermissions(verify) ?? "", /^      contents:\s*read$/m,
+    "the builder's verify job stays read-only");
+  const publish = blockOf(source, "release", 2);
+  assert.match(publish, /needs: verify/);
+  assert.match(jobPermissions(publish) ?? "", /^      contents:\s*write$/m,
+    "the publish job is the only write grant, scoped to release and tag management");
+  // Same immutable action pins as CI, so the builder cannot drift to floating refs.
+  const ciPins = pinnedActions(readWorkflow());
+  for (const reference of pinnedActions(source)) {
+    assert.ok(ciPins.has(reference), `${reference} must match a SHA pinned in ci.yml`);
+    assert.doesNotMatch(source, new RegExp(`uses: \\S+@v\\d`), "no floating version tags");
+  }
+  assert.ok(pinnedActions(source).size >= 2, "checkout and setup-node must be SHA-pinned in the builder");
+}
+
+test("release caller publishes only correct main pushes after both required checks", () => {
+  callerReleaseConditions();
+  callerRunsOnlyAfterBothRequiredChecks();
+});
+
+test("release caller passes no secrets and carries the only write grant", () => {
+  callerPassesNoSecrets();
+  rootReadOnlyAndWriteOnlyPublisher();
+});
+
+test("reusable release builder independently enforces the same trust boundary", () => {
+  reusableReleaseWorkflowMirrorsTheBoundary();
 });
 
 test("activation tests keep the default runtime role in CI", () => {

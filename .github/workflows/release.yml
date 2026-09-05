@@ -1,0 +1,101 @@
+# Reusable numbered prerelease builder.
+#
+# The caller CI workflow invokes this only on push events to refs/heads/main
+# with `needs: [verify, full-tests]`. This workflow independently enforces the
+# same trust boundary: reusable workflow_call runs inherit the caller's
+# original event context (github.event / github.sha come from the triggering
+# push), so the job-level `if` plus the scripts' own env validation pin the
+# exact pushed commit. Every checkout uses that exact SHA; main is never
+# checked out at a floating ref. There is no workflow_run privilege chain, no
+# custom PAT, no GitHub App, and no workflows:write grant: the only write
+# permission anywhere is `contents: write` on the publish job, scoped to
+# release and tag creation.
+
+name: Release
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# One pending publication group per exact target SHA. Distinct main commits
+# therefore never share or drop each other's builds, and retries of the same
+# SHA are serialized with cancel-in-progress: false.
+concurrency:
+  group: release-publish-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
+
+jobs:
+  verify:
+    name: Verify exact commit (read-only)
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_type == 'branch' &&
+      github.repository == 'rfairburn/pi-review-gate'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact pushed commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Static checks
+        run: npm run check:static
+      - name: Fast tests
+        run: npm run test:fast
+
+  release:
+    name: Publish numbered prerelease (b<N> of the exact commit)
+    needs: verify
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_type == 'branch' &&
+      github.repository == 'rfairburn/pi-review-gate'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      # Minimal write grant: GitHub release and tag management only.
+      contents: write
+    steps:
+      - name: Check out the exact pushed commit (full history for first-parent numbering)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the current main tip (read-only, for first-parent verification)
+        # Eligibility requires the target to be on current main's strict
+        # first-parent history. This updates a remote-tracking ref only; it
+        # never checks out or builds floating main.
+        run: git fetch origin +refs/heads/main:refs/remotes/origin/main
+      - name: Set up Node 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify release eligibility (exact SHA, merged main PR, first-parent distance)
+        run: node scripts/release/eligibility.cjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Build, package, and publish the numbered prerelease
+        run: node scripts/release/publish.cjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

@@ -197,6 +197,7 @@ later landings until `SubtasksMarkClean` verifies the resolution. Details live i
 | Trust boundaries, egress hardening, read-only enforcement | [docs/security-model.md](docs/security-model.md) |
 | Crash recovery, restart, retry/failover | [docs/recovery.md](docs/recovery.md) |
 | Build, tests, static checks, launcher internals | [docs/development.md](docs/development.md) |
+| Numbered prereleases, artifacts, publication recovery | [docs/releases.md](docs/releases.md) |
 | Symptom-to-fix troubleshooting | [docs/troubleshooting.md](docs/troubleshooting.md) |
 
 ## Development

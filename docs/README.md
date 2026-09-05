@@ -42,3 +42,14 @@ each other instead of duplicating detail.
   and [LICENSES/](../LICENSES).
 - The persistent orchestrator skill shipped with the package:
   [skills/orchestrator/SKILL.md](../skills/orchestrator/SKILL.md).
+
+## Governance and contribution
+
+- [CONTRIBUTING](../CONTRIBUTING.md) — issue-first workflow, branch and merge
+  conventions, verification expectations, and the public release summary.
+- [SECURITY](../SECURITY.md) — private vulnerability reporting route.
+- [CHANGELOG](../CHANGELOG.md) — notable changes summarized under Unreleased pre-1.0.
+- Issue and pull request templates, code ownership, and external review guidance live in
+  the source-only `.github/` directory of the checkout (not shipped in the npm package);
+  see the [review guidance](https://github.com/rfairburn/pi-review-gate/blob/main/.github/REVIEW_GUIDANCE.md)
+  for reviewer expectations.

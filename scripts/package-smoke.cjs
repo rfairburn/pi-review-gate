@@ -18,6 +18,11 @@ try {
   for (const entry of [
     "package.json",
     "README.md",
+    // Root governance docs that ship in the npm package (source-only files such as
+    // AGENTS.md and .github/ are deliberately not staged or shipped).
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE",
     "LICENSES",
@@ -78,6 +83,11 @@ try {
     "scripts/fake-reviewer.cjs",
     "LICENSES/Apache-2.0.txt",
     "NOTICE",
+    // Root governance docs (required to ship in the npm package so README links
+    // resolve in the installed layout).
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
     // Public documentation tree (required to ship in the npm package).
     "docs/README.md",
     "docs/getting-started.md",
@@ -98,6 +108,11 @@ try {
     process.execPath,
     [path.join(projectRoot, "scripts", "check-docs.cjs"), installed],
     { stdio: "pipe" },
+  );
+  // Source-only governance must not leak into the installed package.
+  assert.ok(
+    !fs.existsSync(path.join(installed, ".github")),
+    "source-only .github directory must not ship in the package",
   );
   fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate"), fs.constants.X_OK);
   process.stdout.write(`package smoke passed: ${packedName}\n`);

@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose new functionality or material work for pi-review-gate.
+title: "[feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security note:** If your report describes a security vulnerability, do not file
+        it here. Use the private advisory route in [SECURITY.md](https://github.com/rfairburn/pi-review-gate/blob/main/SECURITY.md):
+        https://github.com/rfairburn/pi-review-gate/security/advisories/new
+
+        New features and material work are issue-first: this issue is scoped before
+        implementation starts, and the implementing PR must link this issue.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: The concrete user problem or gap this feature addresses, from the user's point of view.
+      placeholder: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: The behavior you expect, including how it interacts with existing review, execution, or web surfaces.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable conditions that would prove the problem is solved.
+    validations:
+      required: true
+  - type: textarea
+    id: security-privacy
+    attributes:
+      label: Security and privacy considerations
+      description: Any trust-boundary, egress, secret-handling, or data-retention impact. Paste only sanitized data (no tokens, credentials, private paths, or personal information).
+      placeholder: None, or describe the impact.
+    validations:
+      required: true

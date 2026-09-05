@@ -95,8 +95,8 @@ underlying behavior.
 ## Development and tests
 
 - **Resource-sensitive or ordering-sensitive test failures.** Use the full serial
-  fallback `npm run test:serial` instead of the concurrent run. See
-  [Development](development.md#build-and-test-commands).
+  fallback: `npm run build:test` followed by `npm run test:run:serial` instead of the
+  concurrent run. See [Development](development.md#build-and-test-commands).
 - **Package smoke fails on a missing file.** `npm run test:package` asserts that
   required files — including the public `docs/` tree — are packed. Check the `files`
   list in `package.json`. See [Development](development.md#static-checks-and-docs-validation).

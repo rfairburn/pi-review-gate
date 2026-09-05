@@ -199,7 +199,9 @@ test("internal executor uses the exact Pi model label and canonical value", asyn
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-model-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
-    enabled: true,
+    // This test exercises model selection and persistence, not executable discovery.
+    // Keep the master gate disabled so it does not require a full Pi CLI on PATH.
+    enabled: false,
     enabledReviewerIds: [],
     reviewers: [],
     execution: { activeExecutor: null, externalExecutors: [] },

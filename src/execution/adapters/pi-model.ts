@@ -289,7 +289,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       clearInterval(timer);
       request.signal?.removeEventListener("abort", onAbort);
       request.onLiveControl?.(undefined);
-      if (lastSettlementAcknowledged && !timedOut && !aborted && !interruptedByControl && !protocolFailure) rpc.closeInput();
+      if (lastSettlementAcknowledged && !timedOut && !aborted && !interruptedByControl && !protocolFailure && !rpc.failure) rpc.closeInput();
       else rpc.terminate();
     }
     let shutdownTimer: NodeJS.Timeout | undefined;
@@ -309,6 +309,11 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     if (!aborted && !interruptedByControl && !timedOut && (exit.signal || (exit.code !== null && exit.code !== 0))) {
       protocolFailure ??= `Pi executor process terminated unexpectedly (${exit.signal ?? exit.code}).`;
     }
+    // A latched transport failure (for example an EPIPE after the child
+    // closed its stdin, or a broken output pipe losing terminal-cleanup
+    // evidence) means the protocol exchange is untrustworthy even when the
+    // child exits zero.
+    protocolFailure ??= rpc.failure ? `Pi RPC transport failed: ${messageOf(rpc.failure)}.` : undefined;
     // Pi logs lifecycle hook failures rather than necessarily exiting nonzero.
     // A live-browser settlement receipt must not mask failed terminal cleanup.
     protocolFailure ??= rpc.shutdownFailure;
@@ -352,12 +357,20 @@ export class PiExecutorAdapter implements ExecutorAdapter {
   }
 }
 
-class PiRpc {
+export class PiRpc {
   private nextId = 1;
   private buffer = "";
   private pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
   private settledWaiters: Array<{ after: number; resolve: () => void; reject: (error: Error) => void }> = [];
   private settledCount = 0;
+  // The first failure of any child pipe is latched here. A broken transport
+  // cannot carry further protocol traffic, and the failure must survive even
+  // when it arrives with no request in flight (after the final response,
+  // during shutdown, while awaiting settlement): consulting this latch before
+  // reporting success keeps a later zero exit from masking the broken
+  // transport as successful execution.
+  private transportFailure?: Error;
+  private exitStatus?: { code: number | null; signal: NodeJS.Signals | null };
   private readonly exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   private readonly stdout = new BoundedTextAccumulator(100 * MEBIBYTE);
   private readonly stderr = new BoundedTextAccumulator(16 * MEBIBYTE);
@@ -369,8 +382,23 @@ class PiRpc {
   ) {
     proc.stdout?.on("data", (value: Buffer) => this.consume(value.toString("utf8")));
     proc.stderr?.on("data", (value: Buffer) => { this.stderr.append(value.toString("utf8")); });
+    // A child that dies (or closes its pipe read side) while the parent's side
+    // of the stream still reports writable emits an asynchronous EPIPE (or
+    // similar) stream error. Without a listener Node raises it as an uncaught
+    // exception, which would crash the parent before this adapter can settle
+    // the child's termination as a truthful protocol failure. Every child-pipe
+    // error is therefore latched as a transport failure: in-flight requests
+    // and settlement waiters fail through the existing protocol path, future
+    // protocol operations reject immediately without writing, and the latch is
+    // consulted before any exit can be reported as success. Output-pipe errors
+    // additionally mean captured terminal-cleanup evidence is incomplete, so
+    // they fail closed through the same latch instead of being discarded.
+    proc.stdin?.on("error", (error) => this.failTransport(error));
+    proc.stdout?.on("error", (error) => this.failTransport(error));
+    proc.stderr?.on("error", (error) => this.failTransport(error));
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
+        this.exitStatus = { code, signal };
         const error = new Error(`Pi RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`);
         for (const pending of this.pending.values()) pending.reject(error);
         this.pending.clear();
@@ -378,23 +406,50 @@ class PiRpc {
         this.settledWaiters = [];
         resolvePromise({ code, signal });
       });
-      proc.once("error", (error) => {
-        for (const pending of this.pending.values()) pending.reject(error);
-        this.pending.clear();
-      });
+      proc.once("error", (error) => this.failTransport(error));
     });
+  }
+
+  /** The first child-pipe failure, if any; once latched the transport is unusable. */
+  get failure(): Error | undefined {
+    return this.transportFailure;
+  }
+
+  private failTransport(error: unknown): void {
+    const transportError = error instanceof Error ? error : new Error(String(error));
+    if (!this.transportFailure) this.transportFailure = transportError;
+    for (const pending of this.pending.values()) pending.reject(transportError);
+    this.pending.clear();
+    for (const waiter of this.settledWaiters) waiter.reject(transportError);
+    this.settledWaiters = [];
   }
 
   request(type: string, fields: Record<string, unknown>, explicitId?: string): Promise<Record<string, unknown>> {
     const id = explicitId ?? `review-gate-${this.nextId++}`;
+    if (this.transportFailure) {
+      // The transport is already broken; never write to it again.
+      return Promise.reject(new Error(`Pi RPC transport failed: ${messageOf(this.transportFailure)}`));
+    }
     return new Promise((resolvePromise, reject) => {
       this.pending.set(id, { resolve: resolvePromise, reject });
       if (!this.proc.stdin?.writable) {
+        const error = new Error("Pi RPC stdin is not writable.");
         this.pending.delete(id);
-        reject(new Error("Pi RPC stdin is not writable."));
+        this.failTransport(error);
+        reject(error);
         return;
       }
-      this.proc.stdin.write(`${JSON.stringify({ id, type, ...fields })}\n`);
+      try {
+        this.proc.stdin.write(`${JSON.stringify({ id, type, ...fields })}\n`);
+      } catch (error) {
+        // A synchronous write failure means the transport is broken; latch it
+        // so the outcome stays a truthful protocol failure. Asynchronous EPIPE
+        // is contained by the same latch via the stdin error handler.
+        const writeError = error instanceof Error ? error : new Error(String(error));
+        this.pending.delete(id);
+        this.failTransport(writeError);
+        reject(writeError);
+      }
     });
   }
 
@@ -406,6 +461,12 @@ class PiRpc {
 
   waitForSettled(after = this.settledCount): Promise<void> {
     if (this.settledCount > after) return Promise.resolve();
+    if (this.transportFailure) return Promise.reject(this.transportFailure);
+    if (this.exitStatus) {
+      // The child is already gone; a settlement that never arrived cannot
+      // arrive, so fail now instead of waiting out the executor timeout.
+      return Promise.reject(new Error(`Pi RPC exited before protocol completion (${this.exitStatus.code ?? this.exitStatus.signal ?? "unknown"}).`));
+    }
     return new Promise((resolvePromise, reject) => this.settledWaiters.push({ after, resolve: resolvePromise, reject }));
   }
 
@@ -419,7 +480,14 @@ class PiRpc {
   }
 
   closeInput(): void {
-    if (this.proc.stdin?.writable) this.proc.stdin.end();
+    if (!this.proc.stdin?.writable) return;
+    try {
+      this.proc.stdin.end();
+    } catch (error) {
+      // Ending an already-broken transport must not crash the parent; latch
+      // it so a later zero exit cannot be reported as success.
+      this.failTransport(error);
+    }
   }
 
   closed(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
@@ -566,6 +634,10 @@ async function compactInterruptedSession(input: {
 
     proc.on("error", (error) => requestFinish(error));
     proc.stdin.on("error", (error) => requestFinish(error));
+    // Output-pipe errors would otherwise surface as uncaught stream
+    // exceptions; route them through the same fail-closed finish path.
+    proc.stdout.on("error", (error) => requestFinish(error));
+    proc.stderr.on("error", (error) => requestFinish(error));
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (chunk: string) => {
       stderr = `${stderr}${chunk}`.slice(-8_192);

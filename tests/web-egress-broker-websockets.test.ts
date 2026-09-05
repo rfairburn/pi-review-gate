@@ -1060,52 +1060,140 @@ test("a late-resolved dial for a vanished client never leaks a destination socke
 });
 
 // ---------------------------------------------------------------------------
-// Real Chromium through the authenticated broker (skipped when Chromium is not
-// installed). The resolver pins the TEST hostname to loopback; TLS trust for
-// the wss origin comes from a test-local --ignore-certificate-errors launch
-// flag, NOT from any broker-side TLS interception (there is none).
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Real Chromium through the opted-in broker (skipped when Chromium is not
-// installed). The resolver pins the TEST hostname to loopback; TLS trust for
-// the wss origin comes from a test-local --ignore-certificate-errors launch
-// flag, NOT from any broker-side TLS interception (there is none).
+// Real Chromium through the REQUIRED-auth broker (skipped when Chromium is
+// not installed). The resolver pins the TEST hostnames to loopback; TLS trust
+// for the wss fixture comes from a test-local --ignore-certificate-errors
+// launch flag, NOT from any broker-side TLS interception (there is none).
 //
-// These transports tests run the broker WITHOUT its per-render proxy
-// credential on purpose: Chromium's WebSocket network stack never supplies
-// proxy credentials (it fails a 407 challenge with "Proxy authentication
-// failed" without retrying), so an authenticated-broker ws/wss launch is
-// impossible at the BROWSER layer for ANY proxy, independent of this broker.
-// The authenticated upgrade path — 407 challenges, credential stripping at
-// the origin, full-value comparison — is covered by the raw-client
-// regressions above; here real Chromium proves admission, DNS pinning,
-// byte accounting, and bidirectional delivery of live browser traffic.
+// Unlike the raw-client regressions above, the broker here runs WITH its
+// proxy credential required, matching the browser's launch configuration.
+// launch.proxy carries the same username/password, and the initial page load
+// establishes proxy authentication before the WebSocket CONNECT. These tests
+// establish that combined path; they do not establish how an unwarmed socket
+// handles a 407 challenge or whether it can prompt or retry on its own.
+// Each test navigates a REAL HTTP(S) fixture page FIRST (matching
+// BrowserOpen's navigation before any live socket), then opens the socket and
+// judges only the final in-page message plus the broker's dial/ledger evidence.
 // ---------------------------------------------------------------------------
 
-test("real Chromium delivers plain ws through the opted-in broker", { skip: !chromiumInstalled }, async (t) => {
+interface BootstrapOrigin {
+  server: AnyServer;
+  port: number;
+  /** Request headers seen at the page origin (credential-leak probe). */
+  seenRequestHeaders: Array<Record<string, string>>;
+}
+
+/**
+ * Ordinary static HTML page origin: the pre-socket navigation that mirrors
+ * BrowserOpen. The inline data: icon suppresses Chromium's favicon request so
+ * the page load produces exactly one proxied request, and Connection: close
+ * keeps one request head per connection.
+ */
+function bootstrapPageOrigin(tlsOptions?: tls.TlsOptions): Promise<BootstrapOrigin> {
+  const page =
+    "<!doctype html><html><head><title>bootstrap</title>"
+    + '<link rel="icon" href="data:,"></head><body>ws-bootstrap-ok</body></html>';
+  const origin: BootstrapOrigin = {
+    server: undefined as unknown as AnyServer,
+    port: 0,
+    seenRequestHeaders: [],
+  };
+  const handler = (socket: net.Socket): void => {
+    socket.on("error", () => socket.destroy());
+    let buffer = Buffer.alloc(0);
+    socket.on("data", (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      const headEnd = buffer.indexOf("\r\n\r\n");
+      if (headEnd === -1) return;
+      const lines = buffer.subarray(0, headEnd).toString("utf8").split("\r\n");
+      const headers: Record<string, string> = {};
+      for (let index = 1; index < lines.length; index += 1) {
+        const separator = lines[index]!.indexOf(":");
+        if (separator === -1) continue;
+        headers[lines[index]!.slice(0, separator).trim().toLowerCase()] = lines[index]!.slice(separator + 1).trim();
+      }
+      origin.seenRequestHeaders.push(headers);
+      socket.end(
+        `HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n`
+        + `Content-Length: ${Buffer.byteLength(page)}\r\nConnection: close\r\n\r\n${page}`,
+      );
+    });
+  };
+  const server: AnyServer = tlsOptions
+    ? tls.createServer(tlsOptions, handler)
+    : net.createServer(handler);
+  origin.server = server;
+  return listen(server, "127.0.0.1").then((port) => {
+    origin.port = port;
+    return origin;
+  });
+}
+
+test("real Chromium delivers native ws through the required-auth broker after a real page load", { skip: !chromiumInstalled }, async (t) => {
   const origin = await echoOrigin();
-  const harness = await startBroker(testResolver({ "ws.test": [publicAnswer] }), {
+  const bootstrap = await bootstrapPageOrigin();
+  const { auth } = testAuth();
+  const harness = await startBroker(testResolver({ "ws.test": [publicAnswer], "bootstrap.test": [publicAnswer] }), {
+    auth,
     websockets: { enabled: true, liveIdleSocketMs: null },
   });
   let browser: import("playwright").Browser | undefined;
   try {
     browser = await chromium.launch({
       headless: true,
-      timeout: 20_000,
+      timeout: 30_000,
       args: chromiumEgressArgs(harness.port),
-      proxy: { server: `http://127.0.0.1:${harness.port}` },
+      // The launch carries the SAME credentials the broker requires; the
+      // ordinary page load authenticates before the native ws CONNECT.
+      proxy: { server: `http://127.0.0.1:${harness.port}`, username: auth.username, password: auth.password },
     });
     const page = await (await browser.newContext()).newPage();
+    // A real HTTP navigation happens FIRST — matching BrowserOpen's page load
+    // before any live socket — and warms the launch credentials into
+    // Chromium's proxy auth cache.
+    await page.goto(`http://bootstrap.test:${bootstrap.port}/`, { waitUntil: "load" });
     const result = await pageWebSocketProbe(page, `ws://ws.test:${origin.port}/echo`, "chromium-live-ws");
-    assert.equal(result.ok, true, `the page WebSocket must connect and echo: ${result.error ?? ""}`);
+    assert.equal(
+      result.ok,
+      true,
+      `the page WebSocket must connect and echo through the authenticated broker: ${result.error ?? ""}`,
+    );
     assert.equal(result.echoed, "chromium-live-ws");
-    assert.deepEqual(harness.dials, [{ hostname: "ws.test", port: origin.port, address: publicAnswer }]);
-    // Chromium tunnels even plain ws through CONNECT; the broker never sees
-    // or inspects the upgrade either way.
-    assert.equal(harness.broker.summary().ledger[0]?.kind, "connect");
+    const summary = harness.broker.summary();
+    // The auth broker challenged and was satisfied by the launch credentials:
+    // zero refusals, zero unauthenticated dials.
+    assert.equal(summary.refusals, 0);
+    // Complete transport-dial evidence — exactly two native dials, in order:
+    // first the bootstrap page load, then the ws CONNECT. Nothing else is
+    // dialed, and both are pinned to the fixture's validated public answer.
+    assert.deepEqual(harness.dials, [
+      { hostname: "bootstrap.test", port: bootstrap.port, address: publicAnswer },
+      { hostname: "ws.test", port: origin.port, address: publicAnswer },
+    ]);
+    // The broker's ledger agrees with the dial evidence: one http entry for
+    // the page load and one CONNECT tunnel for the socket (Chromium tunnels
+    // even plain ws through CONNECT; the broker never sees or inspects the
+    // upgrade either way).
+    assert.deepEqual(
+      summary.ledger.map((entry) => ({ hostname: entry.hostname, port: entry.port, address: entry.address, kind: entry.kind })),
+      [
+        { hostname: "bootstrap.test", port: bootstrap.port, address: publicAnswer, kind: "http" },
+        { hostname: "ws.test", port: origin.port, address: publicAnswer, kind: "connect" },
+      ],
+    );
+    // Proxy credentials stop at the broker's 407 challenge and never reach
+    // either origin. Both captures are non-vacuous (exactly one request each)
+    // and none carries a proxy-authorization header.
+    assert.equal(bootstrap.seenRequestHeaders.length, 1);
+    for (const headers of bootstrap.seenRequestHeaders) {
+      assert.equal(headers["proxy-authorization"], undefined);
+    }
+    assert.equal(origin.seenUpgradeHeaders.length, 1);
+    for (const headers of origin.seenUpgradeHeaders) {
+      assert.equal(headers["proxy-authorization"], undefined);
+    }
     assert.equal(origin.handshakes, 1);
-    assert.equal((origin.seenUpgradeHeaders[0] ?? {})["proxy-authorization"], undefined);
+    assert.equal(origin.seenUpgradeHeaders[0]?.host, `ws.test:${origin.port}`, "hostname-based Host semantics are preserved");
     assert.ok(origin.frames.includes("chromium-live-ws"));
     await browser.close();
     browser = undefined;
@@ -1114,47 +1202,155 @@ test("real Chromium delivers plain ws through the opted-in broker", { skip: !chr
   } finally {
     await browser?.close().catch(() => undefined);
     await harness.stop().catch(() => undefined);
-    await close(origin.server);
+    await Promise.all([close(origin.server), close(bootstrap.server)]);
   }
 });
 
-test("real Chromium delivers wss inside the opaque CONNECT tunnel", { skip: !chromiumInstalled }, async (t) => {
-  const fixture = await tlsFixture();
-  if (!fixture) {
-    t.skip("openssl is unavailable; the wss TLS fixture cannot be generated");
-    return;
-  }
-  const origin = await echoOrigin({ key: fixture.key, cert: fixture.cert });
-  const harness = await startBroker(testResolver({ "wss.test": [publicAnswer] }), {
+test("real Chromium routeWebSocket connectToServer rides the same required-auth native path", { skip: !chromiumInstalled }, async (t) => {
+  const origin = await echoOrigin();
+  const bootstrap = await bootstrapPageOrigin();
+  const { auth } = testAuth();
+  const harness = await startBroker(testResolver({ "ws.test": [publicAnswer], "bootstrap.test": [publicAnswer] }), {
+    auth,
     websockets: { enabled: true, liveIdleSocketMs: null },
   });
   let browser: import("playwright").Browser | undefined;
   try {
     browser = await chromium.launch({
       headless: true,
-      timeout: 20_000,
-      // Test-local trust instrumentation for the self-signed fixture; the
-      // broker never terminates or inspects TLS.
-      args: [...chromiumEgressArgs(harness.port), "--ignore-certificate-errors"],
-      proxy: { server: `http://127.0.0.1:${harness.port}` },
+      timeout: 30_000,
+      args: chromiumEgressArgs(harness.port),
+      proxy: { server: `http://127.0.0.1:${harness.port}`, username: auth.username, password: auth.password },
     });
     const page = await (await browser.newContext()).newPage();
+    // Owner route: hand the page's WebSocket straight through to the server
+    // natively. No frames are intercepted or synthesized — the exchange is
+    // judged only at the final page level plus the broker's dial evidence.
+    await page.routeWebSocket("**/*", (route) => route.connectToServer());
+    await page.goto(`http://bootstrap.test:${bootstrap.port}/`, { waitUntil: "load" });
+    const result = await pageWebSocketProbe(page, `ws://ws.test:${origin.port}/echo`, "chromium-routed-ws");
+    assert.equal(
+      result.ok,
+      true,
+      `the routed page WebSocket must connect and echo through the authenticated broker: ${result.error ?? ""}`,
+    );
+    assert.equal(result.echoed, "chromium-routed-ws");
+    const summary = harness.broker.summary();
+    assert.equal(summary.refusals, 0);
+    // The routed socket rides the SAME native transport as the unrouted
+    // probe: exactly two dials in order — the bootstrap page load, then one
+    // pinned ws CONNECT. Nothing else is dialed.
+    assert.deepEqual(harness.dials, [
+      { hostname: "bootstrap.test", port: bootstrap.port, address: publicAnswer },
+      { hostname: "ws.test", port: origin.port, address: publicAnswer },
+    ]);
+    assert.deepEqual(
+      summary.ledger.map((entry) => ({ hostname: entry.hostname, port: entry.port, address: entry.address, kind: entry.kind })),
+      [
+        { hostname: "bootstrap.test", port: bootstrap.port, address: publicAnswer, kind: "http" },
+        { hostname: "ws.test", port: origin.port, address: publicAnswer, kind: "connect" },
+      ],
+    );
+    // Proxy credentials stop at the broker's 407 challenge and never reach
+    // either origin. Both captures are non-vacuous (exactly one request each)
+    // and none carries a proxy-authorization header.
+    assert.equal(bootstrap.seenRequestHeaders.length, 1);
+    for (const headers of bootstrap.seenRequestHeaders) {
+      assert.equal(headers["proxy-authorization"], undefined);
+    }
+    assert.equal(origin.seenUpgradeHeaders.length, 1);
+    for (const headers of origin.seenUpgradeHeaders) {
+      assert.equal(headers["proxy-authorization"], undefined);
+    }
+    assert.equal(origin.handshakes, 1);
+    assert.ok(origin.frames.includes("chromium-routed-ws"));
+    await browser.close();
+    browser = undefined;
+    await harness.stop();
+    assert.equal(harness.broker.isQuiescent(), true, "the broker drains after the browser closes");
+  } finally {
+    await browser?.close().catch(() => undefined);
+    await harness.stop().catch(() => undefined);
+    await Promise.all([close(origin.server), close(bootstrap.server)]);
+  }
+});
+
+test("real Chromium delivers native wss through the required-auth broker after a real HTTPS page load", { skip: !chromiumInstalled }, async (t) => {
+  const fixture = await tlsFixture();
+  if (!fixture) {
+    t.skip("openssl is unavailable; the wss TLS fixture cannot be generated");
+    return;
+  }
+  const origin = await echoOrigin({ key: fixture.key, cert: fixture.cert });
+  const bootstrap = await bootstrapPageOrigin({ key: fixture.key, cert: fixture.cert });
+  const { auth } = testAuth();
+  const harness = await startBroker(testResolver({ "wss.test": [publicAnswer] }), {
+    auth,
+    websockets: { enabled: true, liveIdleSocketMs: null },
+  });
+  let browser: import("playwright").Browser | undefined;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      timeout: 30_000,
+      // Test-local trust instrumentation for the self-signed fixture (used by
+      // BOTH the HTTPS bootstrap page and the wss origin); the broker never
+      // terminates or inspects TLS.
+      args: [...chromiumEgressArgs(harness.port), "--ignore-certificate-errors"],
+      proxy: { server: `http://127.0.0.1:${harness.port}`, username: auth.username, password: auth.password },
+    });
+    const page = await (await browser.newContext()).newPage();
+    // A real HTTPS page load happens FIRST (matching BrowserOpen), warming the
+    // launch credentials into Chromium's proxy auth cache.
+    await page.goto(`https://wss.test:${bootstrap.port}/`, { waitUntil: "load" });
     const result = await pageWebSocketProbe(page, `wss://wss.test:${origin.port}/echo`, "chromium-live-wss");
-    assert.equal(result.ok, true, `the page wss WebSocket must connect and echo: ${result.error ?? ""}`);
+    assert.equal(
+      result.ok,
+      true,
+      `the page wss WebSocket must connect and echo through the authenticated broker: ${result.error ?? ""}`,
+    );
     assert.equal(result.echoed, "chromium-live-wss");
-    // The broker saw only an ordinary CONNECT tunnel; the upgrade and frames
-    // stayed inside the browser's end-to-end TLS.
-    assert.equal(harness.broker.summary().ledger[0]?.kind, "connect");
-    assert.deepEqual(harness.dials, [{ hostname: "wss.test", port: origin.port, address: publicAnswer }]);
+    const summary = harness.broker.summary();
+    assert.equal(summary.refusals, 0);
+    // Complete transport-dial evidence — exactly two native dials, in order:
+    // the HTTPS bootstrap page's CONNECT, then the wss CONNECT. Both are
+    // pinned to the SAME validated wss.test answer on distinct ports; nothing
+    // else is dialed.
+    assert.deepEqual(harness.dials, [
+      { hostname: "wss.test", port: bootstrap.port, address: publicAnswer },
+      { hostname: "wss.test", port: origin.port, address: publicAnswer },
+    ]);
+    // The ledger agrees: only ordinary CONNECT tunnels — the upgrade and
+    // frames stayed inside the browser's end-to-end TLS.
+    assert.deepEqual(
+      summary.ledger.map((entry) => ({ hostname: entry.hostname, port: entry.port, address: entry.address, kind: entry.kind })),
+      [
+        { hostname: "wss.test", port: bootstrap.port, address: publicAnswer, kind: "connect" },
+        { hostname: "wss.test", port: origin.port, address: publicAnswer, kind: "connect" },
+      ],
+    );
+    // Proxy credentials stop at the broker's 407 challenge and never reach
+    // either origin — including the HTTPS bootstrap page. Both captures are
+    // non-vacuous (exactly one request each) and none carries a
+    // proxy-authorization header.
+    assert.equal(bootstrap.seenRequestHeaders.length, 1);
+    for (const headers of bootstrap.seenRequestHeaders) {
+      assert.equal(headers["proxy-authorization"], undefined);
+    }
+    assert.equal(origin.seenUpgradeHeaders.length, 1);
+    for (const headers of origin.seenUpgradeHeaders) {
+      assert.equal(headers["proxy-authorization"], undefined);
+    }
     assert.equal(origin.handshakes, 1);
     assert.equal(origin.frames.includes("chromium-live-wss"), true);
     await browser.close();
     browser = undefined;
     await harness.stop();
+    assert.equal(harness.broker.isQuiescent(), true, "the broker drains after the browser closes");
   } finally {
     await browser?.close().catch(() => undefined);
     await harness.stop().catch(() => undefined);
-    await close(origin.server);
+    await Promise.all([close(origin.server), close(bootstrap.server)]);
   }
 });
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -56,6 +56,67 @@ async function gitInRepo(args: string[], repoPath: string): Promise<string> {
 
 async function mkTmp(prefix: string): Promise<string> {
   return realpath(await mkdtemp(join(tmpdir(), prefix)));
+}
+
+/** Minimal view of the wave manifest used by synchronization barriers. */
+interface ManifestTaskView {
+  taskId: string;
+  status: string;
+}
+
+interface ManifestView {
+  revision?: number;
+  tasks: ManifestTaskView[];
+}
+
+/**
+ * Poll until every file exists. Bounded safety net for fixture readiness
+ * (e.g., executor processes reaching a gate); the deadline is generous and is
+ * not part of the assertion under test.
+ */
+async function waitForFiles(paths: string[], timeoutMs: number, label: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const missing = (await Promise.all(paths.map(async (p) => {
+      try {
+        await access(p);
+        return undefined;
+      } catch {
+        return p;
+      }
+    }))).filter((p): p is string => p !== undefined);
+    if (missing.length === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}: missing ${missing.join(", ")}`);
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+/**
+ * Poll the atomically-published manifest until predicate matches and return
+ * the first matching document. Waiting for a specific published revision is an
+ * event boundary (the durable write has landed), not assertion retry.
+ */
+async function waitForManifest(
+  manifestPath: string,
+  timeoutMs: number,
+  predicate: (manifest: ManifestView) => boolean,
+  label: string,
+): Promise<ManifestView> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as ManifestView;
+      if (predicate(manifest)) return manifest;
+    } catch {
+      // Not published yet; retry until the deadline.
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}`);
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
 }
 
 /**
@@ -228,6 +289,64 @@ function makeConfigWithSlowExecutor(): ReviewGateConfig {
               '    process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
               "    process.exit(0);",
               "  }, 5000);",
+              "});",
+            ].join(""),
+          ],
+          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * Build a ReviewGateConfig with a file-gated fake executor for deterministic
+ * in-flight synchronization. Each spawned executor signals readiness by
+ * writing <gateDir>/ready-<taskId> (taskId derived from the worktree directory
+ * name) and then blocks until the test writes <gateDir>/release-<taskId>. On
+ * release it writes output.txt so the lifecycle produces a real candidate that
+ * gets pinned as completed_unreviewed.
+ */
+function makeConfigWithGatedExecutor(gateDir: string): ReviewGateConfig {
+  return {
+    enabled: false,
+    reviewerTimeoutMs: 600_000,
+    executorTimeoutMs: 1_800_000,
+    maxCorrectionCycles: 0,
+    implementationGuidanceAfterCorrectionAttempts: 1,
+    maxPatchBytes: 200_000,
+    maxFileBytes: 1_048_576,
+    maxSnapshotBytes: 52_428_800,
+    retainBundles: "never",
+    execution: {
+      activeExecutor: { source: "external", id: "fake-gated" },
+      externalExecutors: [
+        {
+          id: "fake-gated",
+          adapter: "run-as-binary",
+          protocol: "pi-review-executor-jsonl-v1",
+          command: process.execPath,
+          env: { PI_GATE_DIR: gateDir },
+          args: [
+            "-e",
+            [
+              "process.stdin.resume();",
+              "process.stdin.on('data',()=>{});",
+              "process.stdin.on('end',()=>{",
+              '  const fs=require("fs");',
+              '  const path=require("path");',
+              '  const dir=process.env.PI_GATE_DIR;',
+              '  const id=path.basename(process.cwd());',
+              '  if(dir){',
+              '    fs.writeFileSync(path.join(dir,"ready-"+id),String(process.pid));',
+              '    while(!fs.existsSync(path.join(dir,"release-"+id))){',
+              "      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,50);",
+              "    }",
+              "  }",
+              '  fs.writeFileSync(path.join(process.cwd(),"output.txt"),"hello from worker\\n");',
+              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+              '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+              "  process.exit(0);",
               "});",
             ].join(""),
           ],
@@ -1503,86 +1622,137 @@ test("capture consistency exhaustion throws WaveCaptureError with workspace_chan
 // ── In-flight manifest truthfulness ─────────────────────────────────────────
 
 test("in-flight manifest shows truthful statuses: queued/starting, not cancelled", async () => {
+  const taskIds = ["task-0", "task-1", "task-2"];
+  // Truthful statuses a manifest may show for tasks that have not settled yet:
+  // the queued state plus every live subtask phase (including "completing",
+  // which is emitted while the worker normalizes its candidate).
+  const inFlightStatuses = ["queued", "starting", "executing", "reviewing", "correcting", "confirming", "completing"];
+  const terminalStatuses = ["completed_unreviewed", "accepted", "no_changes"];
+
   const artifactDir = await mkTmp("pi-wc-manifest-truth-");
   const sourceDir = await mkTmp("pi-wc-manifest-truth-src-");
+  const gateDir = await mkTmp("pi-wc-manifest-truth-gate-");
   await git(["init", "--quiet"], sourceDir);
   await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
   await git(["add", "."], sourceDir);
   await git(["commit", "--quiet", "-m", "init"], sourceDir);
 
-  let manifestAfterFirstCompletion: unknown = null;
-  let firstCompletionSeen = false;
-  let manifestReadResolve: (() => void) | undefined;
-  const manifestReadPromise = new Promise<void>((resolve) => { manifestReadResolve = resolve; });
+  let waveRoot: string | undefined;
+  const abortController = new AbortController();
+  const resultPromise = executeWave({
+    cwd: sourceDir,
+    tasks: [
+      { title: "T1", instructions: "noop", acceptanceCriteria: [] },
+      { title: "T2", instructions: "noop", acceptanceCriteria: [] },
+      { title: "T3", instructions: "noop", acceptanceCriteria: [] },
+    ],
+    taskIds,
+    config: makeConfigWithGatedExecutor(gateDir),
+    maxWorkers: 2,
+    artifactDir,
+    waveId: "wc-manifest-truth",
+    signal: abortController.signal,
+    onWaveCreated: (root) => { waveRoot = root; },
+  });
 
   try {
-    const resultPromise = executeWave({
-      cwd: sourceDir,
-      tasks: [
-        { title: "T1", instructions: "noop", acceptanceCriteria: [] },
-        { title: "T2", instructions: "noop", acceptanceCriteria: [] },
-        { title: "T3", instructions: "noop", acceptanceCriteria: [] },
-      ],
-      config: makeConfigWithSlowExecutor(),
-      maxWorkers: 2,
-      artifactDir,
-      waveId: "wc-manifest-truth",
-      onProgress: async (update) => {
-        // Read the manifest after the first worker completes (completing phase).
-        // The manifest is written after the worker settles, so we wait a bit.
-        if (update.subtask?.phase === "completing" && update.waveRoot && !firstCompletionSeen) {
-          firstCompletionSeen = true;
-          // Delay to let the manifest write complete after the worker settles.
-          await new Promise((r) => setTimeout(r, 500));
-          try {
-            const manifestPath = join(update.waveRoot, "wave-manifest.json");
-            const manifestData = JSON.parse(await readFile(manifestPath, "utf8"));
-            manifestAfterFirstCompletion = manifestData;
-            manifestReadResolve?.();
-          } catch {
-            // ignore read errors
-          }
-        }
-      },
-    });
+    // Deterministic barrier: with maxWorkers=2, tasks 0 and 1 occupy both slots
+    // and block inside their executor processes at the gate. While held, no
+    // task can settle, so every manifest status is guaranteed to be a truthful
+    // in-flight one — no sleep, no sampling guess.
+    await waitForFiles(
+      ["task-0", "task-1"].map((id) => join(gateDir, `ready-${id}`)),
+      30_000,
+      "workers to reach their executor gates",
+    );
+    assert.ok(waveRoot, "wave root should be known once workers are running");
+    const manifestPath = join(waveRoot, "wave-manifest.json");
 
-    // Wait until we've read the manifest after first completion.
-    await Promise.race([
-      manifestReadPromise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout waiting for manifest read")), 20000)),
-    ]);
-
-    const result = await resultPromise;
-
-    // Verify the in-flight manifest read after first completion.
-    assert.ok(manifestAfterFirstCompletion, "Should have read the manifest after first completion");
-    const manifest = manifestAfterFirstCompletion as Record<string, unknown>;
-    const tasks = manifest.tasks as Array<Record<string, unknown>>;
-    assert.equal(tasks.length, 3, "Manifest should have all 3 tasks");
-
-    // None of the tasks should be "cancelled" during in-flight execution.
-    for (const task of tasks) {
-      const status = task.status as string;
-      assert.ok(
-        status !== "cancelled",
-        `Task ${task.taskId} should not be cancelled during in-flight execution; got ${status}`,
+    // In-flight observation: read the manifest while work is provably ongoing.
+    const inFlight = JSON.parse(await readFile(manifestPath, "utf8")) as ManifestView;
+    assert.equal(inFlight.tasks.length, 3, "Manifest should have all 3 tasks");
+    for (const task of inFlight.tasks) {
+      assert.notEqual(
+        task.status,
+        "cancelled",
+        `Task ${task.taskId} must not be fabricated as cancelled while the wave is running; got ${task.status}`,
       );
-      // Status should be one of the valid in-flight statuses.
       assert.ok(
-        ["queued", "starting", "executing", "reviewing", "correcting", "confirming", "completed_unreviewed", "accepted", "no_changes"].includes(status),
-        `Task ${task.taskId} has unexpected status: ${status}`,
+        inFlightStatuses.includes(task.status),
+        `Task ${task.taskId} should show a truthful in-flight status; got ${task.status}`,
+      );
+    }
+    // Nothing has settled yet (every executor is held at its gate), so no task
+    // may show a terminal status either.
+    const prematurelyTerminal = inFlight.tasks.filter((t) => terminalStatuses.includes(t.status));
+    assert.equal(
+      prematurelyTerminal.length,
+      0,
+      `No task may be terminal while all executors are gated; got ${prematurelyTerminal.map((t) => `${t.taskId}=${t.status}`).join(", ")}`,
+    );
+    // task-2 cannot start until a slot frees (maxWorkers=2, both slots held),
+    // so it must be truthfully represented as queued.
+    assert.equal(
+      inFlight.tasks.find((t) => t.taskId === "task-2")?.status,
+      "queued",
+      `task-2 should be queued while both worker slots are held; statuses: ${inFlight.tasks.map((t) => `${t.taskId}=${t.status}`).join(", ")}`,
+    );
+
+    // Durable boundary: release task-0 and wait until its completion is
+    // durably published — the first manifest revision showing it terminal.
+    // The settle-time manifest write is atomic, so this is the exact event
+    // boundary (replacing the old 500ms sleep guess).
+    await writeFile(join(gateDir, "release-task-0"), "", "utf8");
+    const settled = await waitForManifest(
+      manifestPath,
+      30_000,
+      (m) => m.tasks.some((t) => t.taskId === "task-0" && terminalStatuses.includes(t.status)),
+      "task-0 completion to be published in the manifest",
+    );
+    const settledTask = settled.tasks.find((t) => t.taskId === "task-0");
+    assert.ok(settledTask, "settled manifest should include task-0");
+    assert.ok(
+      terminalStatuses.includes(settledTask.status),
+      `task-0 should be terminal at its durable publication boundary; got ${settledTask.status}`,
+    );
+    // The other tasks are still in flight (task-1 gated, task-2 queued or just
+    // started) and must be represented truthfully, never as cancelled.
+    for (const task of settled.tasks.filter((t) => t.taskId !== "task-0")) {
+      assert.notEqual(
+        task.status,
+        "cancelled",
+        `Task ${task.taskId} must not be fabricated as cancelled while still in flight; got ${task.status}`,
+      );
+      assert.ok(
+        inFlightStatuses.includes(task.status),
+        `Task ${task.taskId} should show a truthful in-flight status; got ${task.status}`,
       );
     }
 
-    // At least one task should have a terminal status (completed_unreviewed or accepted).
-    const terminalTasks = tasks.filter((t) => ["completed_unreviewed", "accepted", "no_changes"].includes(t.status as string));
-    assert.ok(terminalTasks.length >= 1, `At least one task should have completed; statuses: ${tasks.map((t) => t.status).join(", ")}`);
+    // Release the remaining gates and verify the final result.
+    await writeFile(join(gateDir, "release-task-1"), "", "utf8");
+    await writeFile(join(gateDir, "release-task-2"), "", "utf8");
+    const result = await resultPromise;
 
-    // Final result should have all tasks completed.
+    // Final result: all 3 tasks completed.
     assert.equal(result.taskResults.length, 3);
+    for (const tr of result.taskResults) {
+      assert.ok(
+        tr.status === "completed_unreviewed" || tr.status === "accepted",
+        `Expected ${tr.taskId} to complete; got ${tr.status}`,
+      );
+    }
   } finally {
+    // Release any gates still held and cancel the wave if it is still running,
+    // so no executor process or manifest write races the directory deletion.
+    for (const id of taskIds) {
+      await writeFile(join(gateDir, `release-${id}`), "", "utf8").catch(() => undefined);
+    }
+    abortController.abort();
+    await resultPromise.catch(() => undefined);
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });
+    await rm(gateDir, { recursive: true, force: true });
   }
 });
 

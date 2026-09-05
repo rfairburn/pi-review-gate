@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { chmod, link, lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ChangedFile } from "../capture";
-import { sourceMutationCoordinator } from "../execution/source-mutation-lease";
 import { buildUnifiedPatch } from "../diff";
 import { applyDiff } from "./engine";
 
@@ -456,9 +455,9 @@ export function registerApplyPatchTool(pi: unknown, options: ApplyPatchToolOptio
 /**
  * Tool entry point. Per Pi's extension contract, failures throw so Pi marks
  * the tool result as an error and the model can recover from the diagnostic.
- * Parsing and validation complete before the mutation lease is acquired, and
- * each mutation is performed atomically, so a thrown failure never leaves a
- * partial write.
+ * Like Pi's built-in edit/write tools, foreground patches do not wait for
+ * background landing leases or conflict gates. Each mutation is validated and
+ * performed atomically, so a thrown failure never leaves a partial write.
  */
 async function executeApplyPatch(
   params: unknown,
@@ -468,15 +467,9 @@ async function executeApplyPatch(
 ): Promise<Record<string, unknown>> {
   const operation = parseApplyPatchOperation(params);
   const cwd = resolveToolCwd(options, ctx);
-  // Serialize the validated mutation window against background-task landing
-  // and honor an active conflict gate; abort while waiting is supported.
-  const release = await sourceMutationCoordinator.acquire(cwd, signal);
-  let outcome: ApplyPatchOutcome;
-  try {
-    outcome = await performApplyPatchOperation(cwd, operation, signal);
-  } finally {
-    release();
-  }
+  // The landing gate blocks automatic integration, not foreground recovery.
+  // Match built-in edit/write: callers must be able to resolve gated conflicts.
+  const outcome = await performApplyPatchOperation(cwd, operation, signal);
   return textResult(successSummary(outcome), outcomeDetails(outcome));
 }
 

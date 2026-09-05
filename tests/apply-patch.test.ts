@@ -9,6 +9,7 @@ import { activate } from "../src/index";
 import { ExecutionToolManager } from "../src/execution/tool";
 import { normalizeConfig } from "../src/config";
 import { createState } from "../src/state";
+import { sourceMutationCoordinator } from "../src/execution/source-mutation-lease";
 
 const executionToolNames = [
   "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
@@ -842,6 +843,32 @@ test("ApplyPatch evidence normalizes leading @ markers on operation.path and ope
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+for (const obstacle of ["conflict gate", "landing lease"] as const) {
+  test(`ApplyPatch matches foreground edit without waiting for a ${obstacle}`, { timeout: 3_000 }, async (t) => {
+    const dir = await tempWorkspace();
+    const release = obstacle === "conflict gate"
+      ? sourceMutationCoordinator.block(dir, "Resolve this foreground conflict first")
+      : await sourceMutationCoordinator.acquire(dir);
+    try {
+      const target = join(dir, "conflict.txt");
+      await writeFile(target, "unresolved\n");
+      const { execute } = harness();
+      await execute(updateOperation("conflict.txt", "-unresolved\n+resolved\n"), { cwd: dir, signal: t.signal });
+      assert.equal(await readFile(target, "utf8"), "resolved\n");
+      if (obstacle === "conflict gate") {
+        assert.equal(sourceMutationCoordinator.blocked(dir).blocked, true, "foreground editing must not clear the automatic landing gate");
+      }
+      const cancelled = new AbortController();
+      cancelled.abort(new Error("cancelled foreground patch"));
+      await assert.rejects(execute(updateOperation("conflict.txt", "-resolved\n+wrong\n"), { cwd: dir, signal: cancelled.signal }), /cancel/i);
+      assert.equal(await readFile(target, "utf8"), "resolved\n");
+    } finally {
+      release();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("ApplyPatch aborts before mutating when the signal is already aborted", async () => {
   const dir = await tempWorkspace();

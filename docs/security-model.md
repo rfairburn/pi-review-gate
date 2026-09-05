@@ -208,9 +208,10 @@ Behavior and safety properties:
   rechecks cancellation after the validation read. The declared
   `executionMode: "sequential"` additionally prevents `ApplyPatch` from racing sibling
   built-in edit/write calls within one parallel tool batch.
-- The complete validated mutation window runs under the same source-mutation coordinator
-  that serializes background-task landing, so a foreground patch cannot interleave with
-  a landing capture and an active conflict gate blocks patching until it is cleared.
+- Like Pi's built-in `edit` and `write`, foreground `ApplyPatch` calls do not wait for
+  background landing leases or conflict gates. This allows conflict resolution without
+  deadlocking behind the gate it must repair. Editing does not clear that gate:
+  automatic task landings remain blocked until `SubtasksMarkClean` validates resolution.
 - Updates preserve the original file's exact permission bits (independent of the process
   umask), byte-order mark, and line-ending style (LF or CRLF) where feasible;
   trailing-newline state is preserved by the upstream engine. An update whose patch

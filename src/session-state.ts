@@ -1,7 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { link, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { ReviewGateConfig } from "./config";
+import {
+  duplicateReviewerSelectionsFor,
+  resolveReviewers,
+  unresolvedReviewerSelectionsFor,
+  type DeciderConfig,
+  type ReviewGateConfig,
+} from "./config";
 import type { EvidenceCandidate, EvidenceState } from "./evidence";
 import type { ReattachmentBundle } from "./execution/operation-record";
 import type { FileSnapshot, SnapshotOmission, WorkspaceSnapshot } from "./capture";
@@ -150,6 +156,12 @@ interface PersistedSessionState {
   savedAt: string;
   integritySha256: string;
   reviewConfigDigest?: string;
+  /**
+   * Digest of the reviewer selection that produced the persisted state. Older
+   * sidecars predate the field; restore falls back to the broad
+   * reviewConfigDigest comparison for them.
+   */
+  reviewerSelectionDigest?: string;
   state: PersistedReviewGateState;
   execution: ExecutionAssociationsSnapshot;
 }
@@ -218,6 +230,7 @@ export interface RestoredSessionState {
   state: ReviewGateState;
   execution: ExecutionAssociationsSnapshot;
   reviewConfigDigest?: string;
+  reviewerSelectionDigest?: string;
 }
 
 export class SessionStateStore {
@@ -279,6 +292,7 @@ export class SessionStateStore {
       cwd: resolve(this.identity.cwd),
       savedAt: new Date().toISOString(),
       reviewConfigDigest: reviewConfig ? configDigest(reviewConfig) : undefined,
+      reviewerSelectionDigest: reviewConfig ? reviewerSelectionDigest(reviewConfig) : undefined,
       state: serializeState(state),
       execution: cloneExecutionAssociations(execution),
     };
@@ -350,6 +364,7 @@ export class SessionStateStore {
       state: deserializeState(parsed.state),
       execution: cloneExecutionAssociations(parsed.execution),
       reviewConfigDigest: parsed.reviewConfigDigest,
+      reviewerSelectionDigest: parsed.reviewerSelectionDigest,
     };
   }
 }
@@ -384,6 +399,42 @@ export function configDigest(config: ReviewGateConfig): string {
   }
   const { subtaskNotifications: _notifications, ...execution } = reviewRelevantConfig.execution;
   return createHash("sha256").update(stableJson({ ...reviewRelevantConfig, execution })).digest("hex");
+}
+
+/**
+ * Digest of the reviewer selection a config resolves to: the resolvable
+ * reviewers' full structural identity plus the typed unresolved/duplicated
+ * selections and the enabled flag. Unlike configDigest this is insensitive to
+ * unrelated settings (web tools, timeouts, patch limits), so reconciliation on
+ * restore triggers only when the reviewer configuration itself changed.
+ *
+ * Persistence always digests materialized (frozen) configurations, which carry
+ * only the resolvable subset; their unresolved and duplicated selections live
+ * beside the config object and are folded in here at that frozen identity
+ * boundary. Merging both sources keeps a live configuration and its
+ * materialization of the same effective selection hashing identically, so an
+ * unchanged reload never reports a change while swapping one unresolvable
+ * selection for another (or a duplicate-only change) is visible.
+ */
+export function reviewerSelectionDigest(config: ReviewGateConfig): string {
+  const resolution = resolveReviewers(config);
+  return createHash("sha256").update(stableJson({
+    enabled: config.enabled,
+    // Canonicalize each reviewer's identity so live and frozen (materialized)
+    // configurations with the same effective selection hash identically even
+    // though materialization may add keys with undefined values.
+    reviewers: resolution.reviewers.map(canonicalReviewerIdentity),
+    unknownIds: [...new Set([...resolution.unknownIds, ...unresolvedReviewerSelectionsFor(config)])],
+    duplicateEnabledIds: [...new Set([...resolution.duplicateEnabledIds, ...duplicateReviewerSelectionsFor(config)])],
+  })).digest("hex");
+}
+
+function canonicalReviewerIdentity(reviewer: DeciderConfig): Record<string, unknown> {
+  const canonical: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(reviewer)) {
+    if (value !== undefined) canonical[key] = value;
+  }
+  return canonical;
 }
 
 function serializeState(state: ReviewGateState): PersistedReviewGateState {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -449,11 +450,15 @@ export function resolveReviewers(config: ReviewGateConfig, scopedModels: string[
   };
 }
 
+/**
+ * Automatic review is enabled when the gate is on and at least one reviewer
+ * resolves. Unresolvable or duplicated selections no longer disable the whole
+ * gate: they produce explicit bounded outcomes at run time while every
+ * resolvable reviewer still runs (issue 15 reconciliation semantics).
+ */
 export function automaticReviewEnabled(config: ReviewGateConfig, scopedModels: string[] = []): boolean {
   const resolved = resolveReviewers(config, scopedModels);
-  return config.enabled && resolved.reviewers.length > 0
-    && resolved.unknownIds.length === 0
-    && resolved.duplicateEnabledIds.length === 0;
+  return config.enabled && resolved.reviewers.length > 0;
 }
 
 export function configWithReviewers(config: ReviewGateConfig, reviewers: DeciderConfig[], enabled: boolean): ReviewGateConfig {
@@ -468,15 +473,56 @@ export function configWithReviewers(config: ReviewGateConfig, reviewers: Decider
   };
 }
 
+/**
+ * Materialized (frozen) configurations carry only the resolvable reviewer
+ * subset, so the selections that could not be resolved are remembered beside
+ * the config object itself. Keying by the config object keeps an in-flight
+ * invocation bound to the exact selection it started with: reconciling a
+ * window later swaps in a new config object and never mutates this one.
+ */
+const unresolvedReviewerSelectionsByConfig = new WeakMap<ReviewGateConfig, string[]>();
+
+export function rememberUnresolvedReviewerSelections(config: ReviewGateConfig, selections: readonly string[]): void {
+  unresolvedReviewerSelectionsByConfig.set(config, [...selections]);
+}
+
+export function unresolvedReviewerSelectionsFor(config: ReviewGateConfig): string[] {
+  return unresolvedReviewerSelectionsByConfig.get(config) ?? [];
+}
+
+/**
+ * Duplicated selections of a materialized (frozen) configuration. Like the
+ * unresolved selections, this metadata is typed, non-secret identity data that
+ * only exists beside the config object: materialization collapses duplicates
+ * into the resolvable subset, so without it a duplicate-only settings change
+ * would be invisible in persisted digests.
+ */
+const duplicateReviewerSelectionsByConfig = new WeakMap<ReviewGateConfig, string[]>();
+
+export function rememberDuplicateReviewerSelections(config: ReviewGateConfig, selections: readonly string[]): void {
+  duplicateReviewerSelectionsByConfig.set(config, [...selections]);
+}
+
+export function duplicateReviewerSelectionsFor(config: ReviewGateConfig): string[] {
+  return duplicateReviewerSelectionsByConfig.get(config) ?? [];
+}
+
+/**
+ * Materialize the reviewers a live configuration would run. Must stay
+ * consistent with review-window freeze semantics: unresolvable selections do
+ * not disable the gate, they produce bounded outcomes at run time while every
+ * resolvable reviewer still runs.
+ */
 export function materializeReviewConfig(config: ReviewGateConfig, scopedModels: string[]): ReviewGateConfig {
   const resolution = resolveReviewers(config, scopedModels);
-  return configWithReviewers(
+  const materialized = configWithReviewers(
     config,
     resolution.reviewers,
-    config.enabled && resolution.reviewers.length > 0
-      && resolution.unknownIds.length === 0
-      && resolution.duplicateEnabledIds.length === 0,
+    automaticReviewEnabled(config, scopedModels),
   );
+  rememberUnresolvedReviewerSelections(materialized, resolution.unknownIds);
+  rememberDuplicateReviewerSelections(materialized, resolution.duplicateEnabledIds);
+  return materialized;
 }
 
 export function activeExternalExecutor(
@@ -607,6 +653,33 @@ export function reviewerDisplayLabels(reviewers: DeciderConfig[]): Record<string
   return Object.fromEntries(
     reviewers.map((reviewer) => [reviewer.id, reviewerDisplayLabel(reviewer)]),
   );
+}
+
+/**
+ * One-way SHA-256 fingerprint of the effective reviewer configuration that ran
+ * an invocation. The full canonical decider identity (id, adapter, model and
+ * thinking level where applicable, command, args, env, timeout) is hashed
+ * internally so a same-id replacement with different command/args/adapter/
+ * parameters is distinguishable after reload, while no raw configuration value
+ * ever crosses into persisted result metadata — only this digest does, the
+ * same privacy boundary as configDigest. The fingerprint is not reversible to
+ * a raw configuration snapshot.
+ */
+export function reviewerConfigFingerprint(reviewer: DeciderConfig): string {
+  const canonical: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(reviewer)) {
+    if (value !== undefined) canonical[key] = value;
+  }
+  return createHash("sha256").update(canonicalStableJson(canonical)).digest("hex");
+}
+
+function canonicalStableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalStableJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalStableJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 function findConfigPath(env: NodeJS.ProcessEnv): string | undefined {

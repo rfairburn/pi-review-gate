@@ -69,12 +69,10 @@ export function buildReviewReportFromOutputs(input: {
 }): SubtaskReviewReport | undefined {
   const cycles = input.outputs.flatMap(({ reviewOutput }, index) => {
     if (!reviewOutput.result || !reviewOutput.reviewerResults) return [];
-    const labels = new Map(Object.entries(reviewOutput.reviewerDisplayLabels ?? {}));
     return [buildCycleEvidence({
       sequence: reviewOutput.reviewSequence ?? index + 1,
       gateSummary: reviewOutput.result.summary,
       reviewerResults: reviewOutput.reviewerResults,
-      labels,
     })];
   });
   return reportFromCycles(cycles, input.artifactDir);
@@ -84,7 +82,6 @@ function buildCycleEvidence(input: {
   sequence: number;
   gateSummary: string;
   reviewerResults: ReviewResult[];
-  labels: Map<string, string>;
   disposition?: ReviewFeedbackContext["disposition"];
 }): ReviewCycleEvidence {
   return {
@@ -94,7 +91,10 @@ function buildCycleEvidence(input: {
     disposition: input.disposition,
     reviewers: input.reviewerResults.map((result) => ({
       reviewerId: result.reviewerId,
-      displayLabel: input.labels.get(result.reviewerId) ?? result.reviewerId,
+      // Results carry the label of the configuration that ran them; results
+      // without a saved identity (legacy or synthesized) render with their
+      // raw reviewer id rather than an invented current-configuration label.
+      displayLabel: result.displayLabel ?? result.reviewerId,
       verdict: result.verdict,
       summary: result.summary,
       guidance: result.guidance,

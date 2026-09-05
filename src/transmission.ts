@@ -49,12 +49,14 @@ export function buildReviewTransmission(input: {
   reviewSequence: number;
   gateVerdict: ReviewResult["verdict"];
   reviewerResults: ReviewResult[];
-  reviewerDisplayLabels?: Record<string, string>;
   bundleDir: string;
   action: ReviewTransmissionAction;
 }): ReviewTransmission {
   const reviewerResults = input.reviewerResults.map((result) => ({
-    displayLabel: input.reviewerDisplayLabels?.[result.reviewerId] ?? result.reviewerId,
+    // Results carry the label of the configuration that ran them; results
+    // without a saved identity (legacy or synthesized) render with their raw
+    // reviewer id rather than an invented current-configuration label.
+    displayLabel: result.displayLabel ?? result.reviewerId,
     result,
     findings: result.findings.map((finding, index) => ({
       id: findingId(input.reviewSequence, result.reviewerId, index + 1),
@@ -94,7 +96,6 @@ export async function createReviewTransmissionMessage(input: {
   reviewSequence: number;
   gateVerdict: ReviewResult["verdict"];
   reviewerResults: ReviewResult[];
-  reviewerDisplayLabels?: Record<string, string>;
   bundleDir: string;
   action: ReviewTransmissionAction;
 }): Promise<string> {

@@ -25,7 +25,9 @@ described only briefly here is owned by the linked page.
 - Top-level `enabled: false` is the automatic-review master switch only. It does **not**
   disable configured worker routes.
 - Clearing every reviewer in `/review-settings` disables automatic review without
-  disabling delegated execution.
+  disabling delegated execution. The preserved review window stays open (deferring
+  each review with a notice) until reviewers are configured again or the window is
+  cleared explicitly; it never turns into a pass.
 
 ## Top-level fields
 
@@ -55,6 +57,15 @@ Results from every reviewer are transmitted, including passing assessments, non-
 observations, guidance, disagreements, and reviewer errors. Blocking findings are
 identified as required corrections; passing and non-blocking material remains visible
 without becoming mandatory work.
+
+A reviewer selection that no longer resolves (removed, renamed, or currently unscoped)
+never blocks the rest of the review: every resolvable reviewer still runs, and each
+unresolvable selection appears in the results as an explicit bounded
+`reviewer_unavailable` error outcome instead of a hidden or resurrected reviewer.
+Duplicated selections run once. When no configured reviewer is currently usable, the
+gate defers the review with an actionable notice and keeps the preserved review window
+open until a reviewer can run; it never clears the window or turns the situation into a
+pass.
 
 Multi-reviewer example:
 
@@ -219,7 +230,11 @@ preserving unrelated JSON keys.
 Saved values are authoritative for execution stages that have not started.
 Already-running executor and reviewer processes finish with their launch values, while
 queued dispatch, waiting failover, later continuation turns, and later review cycles use
-the current routes, capacities, policies, and reviewer selection. Subtask notification
+the current routes, capacities, policies, and reviewer selection. Open review windows
+reconcile to the new reviewer selection immediately on save: the preserved baseline,
+evidence, and completed history are unchanged, a review already in flight finishes under
+its original selection, and later reviews use the new one (a window frozen with no
+usable reviewers becomes reviewable as soon as its settings are fixed). Subtask notification
 mode is a delivery preference and takes effect immediately for subsequent events from
 already-running tasks. Running capacity leases survive pool edits; removed entries
 receive no new work. A restarted task warns when its prior runtime configuration

@@ -253,7 +253,6 @@ async function buildReviewTransmission(
     reviewSequence,
     gateVerdict: result.verdict,
     reviewerResults: reviewOutput.reviewerResults ?? [result],
-    reviewerDisplayLabels: reviewOutput.reviewerDisplayLabels,
     bundleDir,
     action,
   });
@@ -1173,6 +1172,7 @@ export async function runWaveWorkerLifecycle(
         reviewSequence: reviewOutput.reviewSequence,
         source: "automatic",
         disposition,
+        displayLabels: reviewOutput.reviewerDisplayLabels,
       });
       if (reviewOutput.reviewedSnapshot) {
         armReviewResponseExchange(reviewState, reviewOutput.reviewedSnapshot);

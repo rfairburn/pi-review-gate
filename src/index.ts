@@ -1,4 +1,4 @@
-import { deferredPiToolsEnabled, loadConfig, materializeReviewConfig } from "./config";
+import { deferredPiToolsEnabled, loadConfig, materializeReviewConfig, resolveReviewers } from "./config";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
@@ -25,6 +25,8 @@ import {
   createState,
   freezeReviewWindowConfig,
   getCorrectionAttemptCount,
+  reconcileRestoredReviewWindows,
+  reconcileWindowReviewerSelection,
   recordReviewerFeedbackAndArmExchange,
   rememberUserRequest,
   setReviewWindowBaseline,
@@ -37,7 +39,7 @@ import { ExecutionToolManager } from "./execution/tool";
 import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
-import { configDigest, replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateParseError, SessionStateStore, type PendingDeliverySummary } from "./session-state";
+import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateParseError, SessionStateStore, type PendingDeliverySummary } from "./session-state";
 import { BackgroundProcessReadiness } from "./background-process-readiness";
 import {
   registerBackgroundShell,
@@ -418,12 +420,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         if (restored) {
           replaceReviewGateState(state, restored.state);
           await executionTools.restoreAssociations(restored.execution);
-          if (state.reviewWindow) freezeReviewWindowConfig(state, config, currentScopedModels);
-          const restoredConfig = state.reviewWindow?.reviewConfig ?? state.lastQuestionWindow?.reviewConfig;
-          if (restored.reviewConfigDigest && restoredConfig && restored.reviewConfigDigest !== configDigest(restoredConfig)) {
-            const message = "Persisted review state used a different reviewer configuration; clear or reconcile the review window before continuing.";
-            if (state.reviewWindow) state.reviewWindow.reviewConfigurationError = message;
-            if (state.lastQuestionWindow) state.lastQuestionWindow.reviewConfigurationError = message;
+          // Persisted windows never carry their frozen reviewer configuration;
+          // they are re-frozen against the current settings. When the review
+          // settings changed since the last save, reconcile by continuing with
+          // the current configuration instead of blocking: the preserved
+          // baseline, evidence, and completed history stay untouched and are
+          // reviewed with the currently configured reviewers.
+          const reconciliation = reconcileRestoredReviewWindows(state, restored, config, currentScopedModels);
+          if (reconciliation.configurationChanged && reconciliation.windows > 0) {
+            await sendNotice(context ?? pi, `review gate: review settings changed since the persisted state; reconciled ${reconciliation.windows} review window(s) with the current configuration (${reconciliation.reviewers} configured reviewer(s)); preserved evidence and history are unchanged`);
           }
           restoredRevision = restored.revision;
         } else {
@@ -686,15 +691,30 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     }
     const reviewConfig = window.reviewConfig ?? freezeReviewWindowConfig(state, config, currentScopedModels);
     if (window.reviewConfigurationError) {
+      // Defensive only: reconciliation clears this flag on restore and the
+      // current configuration no longer sets it. If a legacy flag ever
+      // survives, defer instead of destroying the preserved window.
       await sendNoticeWhileSessionActive(
         noticeTarget,
-        `review gate: reviewer selection error: ${window.reviewConfigurationError}; use /review-settings`,
+        `review gate: reviewer selection error: ${window.reviewConfigurationError}; review deferred; use /review-settings`,
         () => sessionActive,
       );
-      closeReviewWindow(state);
+      await persistSessionState();
       return;
     }
     if (!reviewConfig.enabled) {
+      if (config.enabled) {
+        // The gate is enabled but no configured reviewer is currently
+        // resolvable. Fail closed without clearing the preserved window: the
+        // evidence stays open until a reviewer can run.
+        await sendNoticeWhileSessionActive(
+          noticeTarget,
+          "review gate: automatic review deferred because no configured reviewer is currently available; the preserved review window stays open until a reviewer can run; use /review-settings",
+          () => sessionActive,
+        );
+        await persistSessionState();
+        return;
+      }
       closeReviewWindow(state, true);
       return;
     }
@@ -1004,10 +1024,27 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     pi,
     config,
     configPath: loaded.path,
-    onSaved: () => {
+    onSaved: async () => {
       executionTools.sync();
       deferredTools.setDeferredEnabled(deferredPiToolsEnabled(config));
       webTools?.sync(config);
+      // Reconcile existing review windows to the new reviewer selection
+      // immediately. The swap replaces each window's frozen config object
+      // without mutating it, so an invocation already running under the old
+      // selection keeps exactly the reviewers it started with; the next
+      // review uses the new selection. Captured evidence, baselines, and
+      // completed history are untouched.
+      let reconciled = 0;
+      for (const window of [state.reviewWindow, state.lastQuestionWindow]) {
+        if (window && reconcileWindowReviewerSelection(window, config, currentScopedModels)) {
+          reconciled += 1;
+        }
+      }
+      if (reconciled > 0) {
+        const reviewerCount = resolveReviewers(config, currentScopedModels).reviewers.length;
+        await sendNotice(pi, `review gate: ${reconciled} review window(s) reconciled to the updated reviewer settings (${reviewerCount} configured reviewer(s)); preserved evidence and history are unchanged`);
+        await persistSessionState();
+      }
     },
     onScopedModels: (models) => {
       currentScopedModels = [...models];
@@ -1122,7 +1159,6 @@ async function transmitReviewPass(input: {
     reviewSequence: input.output.reviewSequence!,
     gateVerdict: input.output.result!.verdict,
     reviewerResults: input.output.reviewerResults!,
-    reviewerDisplayLabels: input.output.reviewerDisplayLabels,
     bundleDir: input.output.bundleDir!,
     action: input.action,
   });
@@ -1133,6 +1169,7 @@ async function transmitReviewPass(input: {
     source: input.source,
     disposition: input.disposition,
     reviewedSnapshot: input.output.reviewedSnapshot!,
+    displayLabels: input.output.reviewerDisplayLabels,
   });
   return message;
 }

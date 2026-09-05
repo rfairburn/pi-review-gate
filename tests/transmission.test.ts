@@ -33,9 +33,9 @@ test("review transmissions preserve formatted findings and fenced implementation
     gateVerdict: "needs_changes",
     bundleDir: "/tmp/review-bundle",
     action: "correction_required",
-    reviewerDisplayLabels: { codex: "openai-codex/gpt-5.6-luna (max)" },
     reviewerResults: [{
       reviewerId: "codex",
+      displayLabel: "openai-codex/gpt-5.6-luna (max)",
       verdict: "needs_changes",
       summary: "The null case still fails.",
       guidance: "Apply this targeted guard:\n\n```diff\n-run(value)\n+if (value !== null) run(value)\n```",
@@ -82,6 +82,10 @@ test("review transmissions disclose provider diagnostics to the implementing mod
 
   assert.match(transmission.message, /Reviewer error: provider_error/);
   assert.match(transmission.message, /Reviewer diagnostic:\nCodex error: servers currently overloaded\./);
+
+  // Results without a saved identity keep their raw reviewer id.
+  assert.equal(transmission.envelope.reviewerResults[0]?.displayLabel, "passing");
+  assert.equal(transmission.envelope.reviewerResults[1]?.displayLabel, "luna");
 });
 
 test("delivery receipts retain every concurrent update with contiguous sequences", async () => {

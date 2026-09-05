@@ -15,13 +15,25 @@ test("reviewer command output shows internal model labels instead of encoded rev
   const displayLabel = "ollama/deepseek-v4-flash:0731-cloud";
   const answer = formatReviewerAnswer("is this safe?", [{
     reviewerId,
+    displayLabel,
     verdict: "pass",
     summary: "Looks safe.",
     findings: [],
-  }], { [reviewerId]: displayLabel });
+  }]);
 
   assert.match(answer, /## ollama\/deepseek-v4-flash:0731-cloud — pass/);
   assert.doesNotMatch(answer, /pi-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ/);
+
+  // A result without a saved identity (pre-migration history) renders with
+  // its raw reviewer id rather than an invented current-configuration label.
+  const legacyAnswer = formatReviewerAnswer("is this safe?", [{
+    reviewerId: "one",
+    verdict: "pass",
+    summary: "Looks safe.",
+    findings: [],
+  }]);
+
+  assert.match(legacyAnswer, /## one — pass/);
 
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
   const notices: string[] = [];

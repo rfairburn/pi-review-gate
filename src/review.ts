@@ -1,7 +1,7 @@
 import { cp, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { resolveReviewers, reviewerDisplayLabel, reviewerDisplayLabels, type DeciderConfig, type ReviewGateConfig } from "./config";
+import { resolveReviewers, reviewerConfigFingerprint, reviewerDisplayLabel, reviewerDisplayLabels, unresolvedReviewerSelectionsFor, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { compareSnapshots, createWorkspaceSnapshot, type ChangedFile, type SnapshotOmission, type WorkspaceSnapshot } from "./capture";
 import { buildUnifiedPatch } from "./diff";
@@ -242,8 +242,8 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   const sideEffectPatchResult = sideEffectChanges.length > 0
     ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
     : { patch: "", truncated: false, omitted: [] };
-  const reviewers = getReviewers(input.config);
-  if (reviewers.length === 0) {
+  const { reviewers, unavailableResults } = resolveExecutableReviewers(input.config);
+  if (reviewers.length === 0 && unavailableResults.length === 0) {
     return {
       changed: true,
       changes,
@@ -312,6 +312,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   await input.onInvocationPrepared?.();
   const invocation = await executeReviewerInvocation({
     reviewers,
+    unavailableResults,
     bundle,
     cwd: input.cwd,
     config: input.config,
@@ -397,8 +398,8 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   const sideEffectPatchResult = sideEffectChanges.length > 0
     ? buildUnifiedPatch(sideEffectChanges, input.config.maxPatchBytes)
     : { patch: "", truncated: false, omitted: [] };
-  const reviewers = getReviewers(input.config);
-  if (reviewers.length === 0) {
+  const { reviewers, unavailableResults } = resolveExecutableReviewers(input.config);
+  if (reviewers.length === 0 && unavailableResults.length === 0) {
     return {
       changes,
       error: "No reviewers configured.",
@@ -443,6 +444,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   await input.onInvocationPrepared?.();
   const invocation = await executeReviewerInvocation({
     reviewers,
+    unavailableResults,
     bundle,
     cwd: input.cwd,
     config: input.config,
@@ -487,6 +489,9 @@ function focusedCorrectionEvidence<T>(initial: T[] | undefined, latest: T[]): T[
 
 async function executeReviewerInvocation(input: {
   reviewers: DeciderConfig[];
+  /** Bounded error outcomes for selections that cannot be resolved; they are
+   * aggregated with the staged results but never invoked. */
+  unavailableResults?: ReviewResult[];
   bundle: ReviewBundle;
   cwd: string;
   config: ReviewGateConfig;
@@ -501,7 +506,10 @@ async function executeReviewerInvocation(input: {
   | { aborted: false; result: ReviewResult; reviewerResults: ReviewResult[]; bundleRetained: boolean }
 > {
   const verb = input.kind === "review" ? "reviewing changes with" : "asking reviewers";
-  await input.notify?.(`review gate: ${verb} ${input.reviewers.map(reviewerDisplayLabel).join(", ")}`);
+  const target = input.reviewers.length > 0
+    ? input.reviewers.map(reviewerDisplayLabel).join(", ")
+    : "(no resolvable reviewers; unavailable selections will be reported)";
+  await input.notify?.(`review gate: ${verb} ${target}`);
   const sessionsBeforeReview = new Map(input.window?.reviewerSessions ?? []);
   // Reviewer passes are intentionally stateless. Complete prior evidence remains
   // available in the immutable bundle, without carrying model/tool history into
@@ -521,11 +529,18 @@ async function executeReviewerInvocation(input: {
       signal: input.signal,
       onUpdate: (message) => input.onUpdate?.(`${label} · ${message}`),
     });
+    // Snapshot the identity of the configuration that actually ran this
+    // reviewer so the result stays attributable even after the window's
+    // configuration is reconciled to newer settings.
+    if (result.result.displayLabel === undefined) {
+      result.result.displayLabel = label;
+    }
+    stampReviewerIdentity(result.result, reviewer);
     input.onUpdate?.(`${label} finished · ${result.result.verdict}`);
     return result;
   }));
-  const reviewerResults = stagedReviewers.map((reviewer) => reviewer.result);
-  if (reviewWasAborted(input.signal, reviewerResults)) {
+  const stagedResults = stagedReviewers.map((reviewer) => reviewer.result);
+  if (reviewWasAborted(input.signal, stagedResults)) {
     await cleanupStagedReviewers(stagedReviewers);
     await recordCanceledInvocation(
       input.bundle.invocationDir,
@@ -537,6 +552,9 @@ async function executeReviewerInvocation(input: {
     );
     return { aborted: true, bundleRetained: false };
   }
+  // Unresolvable selections are aggregated with the staged results so every
+  // configured reviewer has an explicit bounded outcome in the pass.
+  const reviewerResults = [...stagedResults, ...(input.unavailableResults ?? [])];
 
   // Publish reviewer outputs as one completed set. Until this point each
   // reviewer writes outside the evidence bundle, so concurrently running
@@ -908,11 +926,58 @@ function sumUsage(usages: Array<NonNullable<ReviewResult["usage"]>>, key: keyof 
   return found ? total : undefined;
 }
 
-function getReviewers(config: ReviewGateConfig): DeciderConfig[] {
+/**
+ * Resolve the reviewers an invocation will actually run, plus explicit bounded
+ * error outcomes for selections that cannot be resolved from the current
+ * configuration. Removed or renamed reviewers are never resurrected: a stale
+ * selection becomes a visible `reviewer_unavailable` result while every
+ * resolvable reviewer still runs. Duplicated selections run once.
+ */
+function resolveExecutableReviewers(config: ReviewGateConfig): {
+  reviewers: DeciderConfig[];
+  unavailableResults: ReviewResult[];
+} {
   const resolution = resolveReviewers(config);
-  return resolution.unknownIds.length === 0 && resolution.duplicateEnabledIds.length === 0
-    ? resolution.reviewers
-    : [];
+  const seen = new Set<string>();
+  const reviewers: DeciderConfig[] = [];
+  for (const reviewer of resolution.reviewers) {
+    if (seen.has(reviewer.id)) continue;
+    seen.add(reviewer.id);
+    reviewers.push(reviewer);
+  }
+  // The frozen config materializes only the resolvable subset, so unresolvable
+  // selections are also remembered beside it at freeze time. Merge both
+  // sources (deduplicated) so every configured reviewer has an explicit
+  // bounded outcome without ever being invoked. Keying by the config object
+  // keeps an in-flight invocation bound to the selection it started with.
+  const unavailable = new Map<string, ReviewResult>();
+  for (const selection of [...resolution.unknownIds, ...unresolvedReviewerSelectionsFor(config)]) {
+    if (unavailable.has(selection)) continue;
+    unavailable.set(selection, {
+      reviewerId: selection,
+      verdict: "error",
+      summary: `Reviewer selection ${selection} is not available in the current configuration and was not run.`,
+      findings: [],
+      error: "reviewer_unavailable",
+    });
+  }
+  return { reviewers, unavailableResults: [...unavailable.values()] };
+}
+
+/**
+ * Stamp gate-owned identity metadata on a freshly produced result from the
+ * actual invocation configuration. Only safe values cross into persisted
+ * metadata: the adapter name and a one-way fingerprint of the effective
+ * reviewer config (command, args, env, and credentials are hashed internally,
+ * never stored). Already-stamped values are preserved; results without an
+ * invocation configuration (unavailable selections, gate aggregates) stay
+ * honestly unattributed rather than inheriting a current-configuration guess.
+ */
+function stampReviewerIdentity(result: ReviewResult, reviewer: DeciderConfig): void {
+  if (result.reviewerAdapter === undefined) result.reviewerAdapter = reviewer.adapter;
+  if (result.reviewerConfigFingerprint === undefined) {
+    result.reviewerConfigFingerprint = reviewerConfigFingerprint(reviewer);
+  }
 }
 
 function safePathSegment(value: string): string {

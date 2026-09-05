@@ -246,6 +246,24 @@ test("parseReviewResult enforces required and supported top-level fields", () =>
   assert.equal(extra.error, "schema_error");
 });
 
+test("parseReviewResult rejects gate-owned identity keys from model output", () => {
+  // Reviewer output can never stamp its own identity: every gate-owned
+  // identity key is outside the parse allowlist, so a model that emits one
+  // fails closed as a schema error instead of rewriting attribution.
+  for (const key of ["reviewerId", "displayLabel", "reviewerAdapter", "reviewerConfigFingerprint"]) {
+    const result = parseReviewResult("one", JSON.stringify({
+      verdict: "pass",
+      summary: "ok",
+      guidance: null,
+      findings: [],
+      error: null,
+      [key]: "forged-identity",
+    }));
+    assert.equal(result.verdict, "error", key);
+    assert.equal(result.error, "schema_error", key);
+  }
+});
+
 test("parseReviewResult treats unsupported null properties as absent", () => {
   const topLevel = parseReviewResult(
     "reviewer",

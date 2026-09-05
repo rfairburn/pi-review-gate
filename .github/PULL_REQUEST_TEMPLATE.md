@@ -45,5 +45,6 @@ explicitly.
 
 - [ ] Branch named `issue-N/short-slug` for the linked issue.
 - [ ] Focused commits; ready for the repository's squash-only merge.
-- [ ] No force-pushes or review bypasses; ready for a maintainer-authorized squash
-  merge after the required review and checks pass.
+- [ ] Main-branch safety protections, independent review, and required CI are
+  satisfied. Any formal-approval exemption is limited to an eligible
+  maintainer-authored, same-repository PR under the documented review policy.

@@ -58,6 +58,54 @@ async function mkTmp(prefix: string): Promise<string> {
   return realpath(await mkdtemp(join(tmpdir(), prefix)));
 }
 
+/**
+ * Bounded, prompt-free diagnostics for wave tasks that did not settle to an
+ * eligible status. Surfaces the recorded error plus executor incidents and
+ * attempt counts from the task result (falling back to the owned operation
+ * record) so a hosted failure names the actual cause — for example an exit
+ * code or a git error — instead of only the resulting status.
+ */
+async function describeTaskFailures(result: {
+  waveRoot: string;
+  taskResults: Array<{
+    taskId: string;
+    status: string;
+    summary?: string;
+    error?: string;
+    incidents?: Array<{ attempt?: number; cause?: string; stage?: string; message?: string; retryable?: boolean; terminalCode?: string }>;
+    attempts?: number;
+    operationRecord?: string;
+  }>;
+}): Promise<string> {
+  const lines: string[] = [];
+  for (const tr of result.taskResults) {
+    if (tr.status === "completed_unreviewed" || tr.status === "accepted") continue;
+    lines.push(`task ${tr.taskId}: status=${tr.status}`);
+    const detail = tr.error ?? tr.summary;
+    if (detail) lines.push(`  detail: ${String(detail).slice(0, 400)}`);
+    let incidents = tr.incidents;
+    if ((!incidents || incidents.length === 0) && tr.operationRecord) {
+      try {
+        const op = JSON.parse(await readFile(tr.operationRecord, "utf8")) as { incidents?: typeof incidents };
+        incidents = op.incidents;
+      } catch {
+        // Operation record unavailable; the recorded detail above still shows.
+      }
+    }
+    for (const inc of (incidents ?? []).slice(0, 5)) {
+      lines.push(
+        `  incident a${inc.attempt} ${inc.cause}@${inc.stage}: ${String(inc.message ?? "").slice(0, 300)}` +
+          `${inc.retryable ? "" : " (non-retryable)"}` +
+          (inc.terminalCode ? ` terminal=${inc.terminalCode}` : ""),
+      );
+    }
+    if (typeof tr.attempts === "number") {
+      lines.push(`  attempts: ${tr.attempts}`);
+    }
+  }
+  return lines.length > 0 ? `\n${lines.join("\n")}` : "";
+}
+
 /** Minimal view of the wave manifest used by synchronization barriers. */
 interface ManifestTaskView {
   taskId: string;
@@ -646,10 +694,11 @@ test("abort mid-flight stops new starts, settles active workers, skips integrati
       assert.equal(result.landing, undefined);
       assert.equal(result.taskResults.length, 3);
       // First worker may have completed or been cancelled; rest should be cancelled.
+      const abortFailures = await describeTaskFailures(result);
       for (const tr of result.taskResults) {
         assert.ok(
           tr.status === "cancelled" || tr.status === "completed_unreviewed" || tr.status === "accepted",
-          `Unexpected status ${tr.status}`,
+          `Unexpected status ${tr.status}${abortFailures}`,
         );
       }
     }
@@ -831,10 +880,11 @@ test("accepted and completed_unreviewed workers are eligible for integration", a
 
     assert.equal(result.taskResults.length, 2);
     // With review disabled and changes made, workers should be completed_unreviewed.
+    const eligibleFailures = await describeTaskFailures(result);
     for (const tr of result.taskResults) {
       assert.ok(
         tr.status === "completed_unreviewed" || tr.status === "accepted",
-        `Expected eligible status, got ${tr.status}`,
+        `Expected eligible status, got ${tr.status}${eligibleFailures}`,
       );
       assert.ok(tr.acceptedCommitSha, `Expected acceptedCommitSha for ${tr.taskId}`);
     }
@@ -1249,7 +1299,12 @@ test("no_changes contributes no commit and integration is no_changes", async () 
     });
 
     assert.equal(result.taskResults.length, 1);
-    assert.equal(result.taskResults[0].status, "no_changes");
+    const noChangeFailures = await describeTaskFailures(result);
+    assert.equal(
+      result.taskResults[0].status,
+      "no_changes",
+      `No-op worker should be no_changes, got ${result.taskResults[0].status}${noChangeFailures}`,
+    );
     assert.equal(result.taskResults[0].acceptedCommitSha, undefined);
 
     // Integration should be no_changes (no eligible workers).
@@ -1736,10 +1791,11 @@ test("in-flight manifest shows truthful statuses: queued/starting, not cancelled
 
     // Final result: all 3 tasks completed.
     assert.equal(result.taskResults.length, 3);
+    const boundaryFailures = await describeTaskFailures(result);
     for (const tr of result.taskResults) {
       assert.ok(
         tr.status === "completed_unreviewed" || tr.status === "accepted",
-        `Expected ${tr.taskId} to complete; got ${tr.status}`,
+        `Expected ${tr.taskId} to complete; got ${tr.status}${boundaryFailures}`,
       );
     }
   } finally {

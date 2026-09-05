@@ -1,4 +1,6 @@
 import { execFile, spawn } from "node:child_process";
+import type { ChildProcessByStdio } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import { promises as fs } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -781,13 +783,29 @@ async function adoptPriorCandidate(
 }
 
 /**
- * Create a commit object with a specific parent using the worktree's index.
+ * Minimal child-process factory surface used by createCommitWithParent.
+ * Production always uses the real spawn; tests may inject a scripted child to
+ * deterministically exercise stdout capture ordering (for example "exit" before
+ * the final data chunk).
  */
-async function createCommitWithParent(
+export type CommitTreeSpawn = (
+  command: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number; stdio: ["pipe", "pipe", "pipe"] },
+) => ChildProcessByStdio<Writable, Readable, Readable>;
+
+/**
+ * Create a candidate commit with the wave base as its sole parent.
+ *
+ * `spawnGit` is an internal/test seam (see CommitTreeSpawn); production callers
+ * always use the real spawn.
+ */
+export async function createCommitWithParent(
   worktreeRoot: string,
   treeSha: string,
   parentSha: string,
   message: string,
+  spawnGit: CommitTreeSpawn = spawn,
 ): Promise<string> {
   const commitEnv = {
     ...process.env,
@@ -799,7 +817,7 @@ async function createCommitWithParent(
   };
 
   return new Promise<string>((resolve, reject) => {
-    const child = spawn("git", ["commit-tree", treeSha, "-p", parentSha], {
+    const child = spawnGit("git", ["commit-tree", treeSha, "-p", parentSha], {
       cwd: worktreeRoot,
       env: commitEnv,
       timeout: 30_000,
@@ -811,12 +829,27 @@ async function createCommitWithParent(
     child.stdout.on("data", (chunk: Buffer | string) => { stdout += chunk; });
     child.stderr.on("data", (chunk: Buffer | string) => { stderr += chunk; });
     child.on("error", reject);
-    child.on("exit", (code, signal) => {
+    // Settle on "close", not "exit": "exit" can fire before the stdio streams
+    // are fully drained, which under load loses the final stdout chunk (the
+    // commit object name). An empty SHA then reaches update-ref as an empty
+    // new value and fails with a misleading "not a valid SHA1". "close" fires
+    // only after the process has exited and every stdio stream has ended.
+    child.on("close", (code, signal) => {
       if (code !== 0 || signal) {
         reject(new Error(`git commit-tree exited with code ${code} signal ${signal}: ${stderr.trim()}`));
-      } else {
-        resolve(stdout.trim());
+        return;
       }
+      const sha = stdout.trim();
+      // Fail closed on a missing or truncated object name instead of passing
+      // it to update-ref; the bounded diagnostic names the real cause.
+      if (!TREE_SHA_PATTERN.test(sha)) {
+        reject(new Error(
+          `git commit-tree produced no valid object name (stdout bytes: ${Buffer.byteLength(stdout, "utf8")}, ` +
+            `tail: ${JSON.stringify(stdout.slice(-120))}).`,
+        ));
+        return;
+      }
+      resolve(sha);
     });
 
     child.stdin.write(message);

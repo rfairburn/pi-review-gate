@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import type { ChildProcessByStdio } from "node:child_process";
+import { EventEmitter } from "node:events";
+import type { Readable, Writable } from "node:stream";
 import { rm, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +17,7 @@ import {
   normalizeCandidate,
   candidateRefName,
   buildCandidateReviewPatch,
+  createCommitWithParent,
   CandidateCommit,
 } from "../src/execution/wave-commits";
 
@@ -1017,6 +1021,90 @@ test("wave-commits — validates staged symlink blob, not worktree symlink", asy
     await rm(artifactDir, { recursive: true, force: true });
     await rm(outsideDir, { recursive: true, force: true });
   }
+});
+
+// ── createCommitWithParent: deterministic stdout capture ordering ───────────
+
+/**
+ * Build a scripted fake child process for createCommitWithParent's spawn seam.
+ * The returned emitters let the test control event ordering exactly (data vs
+ * exit vs close), which real subprocesses cannot guarantee under load.
+ */
+function makeScriptedChild(): {
+  child: ChildProcessByStdio<Writable, Readable, Readable>;
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+  stdinText: () => string;
+} {
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  let stdinText = "";
+  const child = Object.assign(new EventEmitter(), {
+    stdout,
+    stderr,
+    stdin: {
+      write: (chunk: unknown) => { stdinText += String(chunk); return true; },
+      end: () => undefined,
+    },
+  });
+  return {
+    child: child as unknown as ChildProcessByStdio<Writable, Readable, Readable>,
+    stdout,
+    stderr,
+    stdinText: () => stdinText,
+  };
+}
+
+test("wave-commits — commit-tree capture waits for close and keeps the final SHA chunk", async () => {
+  const fullSha = "324e5edc2725585dbaa20fe49a4fd3ac7967f0f0";
+  const { child, stdout, stdinText } = makeScriptedChild();
+  let resolved: string | undefined;
+  let rejected: unknown;
+  const settled = createCommitWithParent("/tmp", "tree-sha", "parent-sha", "candidate\n", () => child)
+    .then((sha) => { resolved = sha; }, (error) => { rejected = error; });
+
+  // Deterministic regression ordering for the CI race: the process reports
+  // "exit" while the final stdout chunk is still in flight — here the SHA line
+  // itself is split across the exit boundary. Settling on "exit" captures only
+  // the truncated prefix (or nothing) and downstream update-ref receives an
+  // empty new value ("fatal: : not a valid SHA1"); capture must wait for
+  // "close", which fires only after every stdio stream has been drained.
+  stdout.emit("data", Buffer.from(fullSha.slice(0, 8)));
+  child.emit("exit", 0, null);
+  stdout.emit("data", Buffer.from(fullSha.slice(8) + "\n"));
+  child.emit("close", 0, null);
+
+  await settled;
+  assert.equal(rejected, undefined, "must not reject when close delivers the full output");
+  assert.equal(resolved, fullSha, "resolved SHA must include the chunk that arrived after exit");
+  assert.equal(stdinText(), "candidate\n", "commit message must still be written to stdin");
+});
+
+test("wave-commits — commit-tree without an object name fails closed", async () => {
+  const { child } = makeScriptedChild();
+  let rejected: unknown;
+  const settled = createCommitWithParent("/tmp", "tree-sha", "parent-sha", "candidate\n", () => child)
+    .catch((error) => { rejected = error; });
+  // Zero exit with no stdout at all: must reject, never resolve an empty SHA.
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  await settled;
+  assert.ok(rejected instanceof Error, "must reject instead of resolving an empty SHA");
+  assert.match(rejected.message, /no valid object name/);
+});
+
+test("wave-commits — commit-tree failure still reports exit code and stderr", async () => {
+  const { child, stderr } = makeScriptedChild();
+  let rejected: unknown;
+  const settled = createCommitWithParent("/tmp", "tree-sha", "parent-sha", "candidate\n", () => child)
+    .catch((error) => { rejected = error; });
+  stderr.emit("data", Buffer.from("fatal: bad tree\n"));
+  child.emit("exit", 128, null);
+  child.emit("close", 128, null);
+  await settled;
+  assert.ok(rejected instanceof Error);
+  assert.match(rejected.message, /exited with code 128/);
+  assert.match(rejected.message, /fatal: bad tree/);
 });
 
 // Import readFile for the test above

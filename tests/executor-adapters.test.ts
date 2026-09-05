@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CodexExecutorAdapter } from "../src/execution/adapters/codex-cli";
-import { PiExecutorAdapter } from "../src/execution/adapters/pi-model";
+import { PiExecutorAdapter, PiRpc } from "../src/execution/adapters/pi-model";
+import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 import type { ExecutorLiveControl } from "../src/execution/types";
 
 // Minimal stand-in for the trusted child extension in fake RPC fixtures. Real
@@ -173,6 +176,198 @@ test("Pi executor does not turn child termination into successful completion", {
     });
     assert.equal(result.code, 1);
     assert.equal(result.failure?.category, "protocol");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor contains a late RPC write after the child closed its stdin and still fails the terminated child", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-late-write-epipe-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "late-write-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiSettlementReceipt,
+      "let input='';const out=(v)=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      // Publish the trusted receipt, hard-close the child's pipe read side
+      // (POSIX-guaranteed EPIPE for any later parent write), and only then
+      // announce agent_end: once the parent sees agent_end, its next RPC write
+      // deterministically lands on a peer whose read side is gone while the
+      // parent's own stream still reports writable. The child stays alive
+      // until the adapter's SIGTERM so the exit is an actual signal,
+      // not a benign race the fixture could mask.
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();fs.closeSync(0);setImmediate(()=>out({type:'agent_end'}));}",
+      "}});",
+      "setInterval(()=>{},1000);",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const exits: Array<{ pid: number; code: number | null; signal: string | null }> = [];
+    const result = await new PiExecutorAdapter({
+      model: "provider/model",
+      command,
+      settlementTimeoutMs: 100,
+    }).run({
+      cwd: root,
+      prompt: "terminate after late write",
+      artifactDir,
+      turn: 1,
+      allowedTools: ["read"],
+      onProcessExit: (exit) => {
+        exits.push(exit);
+      },
+    });
+    assert.equal(result.code, 1, "a broken RPC transport must never be reported as successful execution");
+    assert.equal(result.failure?.category, "protocol");
+    assert.equal(exits[0]!.signal, "SIGTERM", "the adapter must terminate the orphaned child itself");
+    assert.ok(exits[0]!.code === null, "the child exited by signal, not a success code");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PiRpc latches a transport error that arrives with no pending request and fails future operations", async () => {
+  // Deterministic stream-error regression: the EPIPE arrives after the final
+  // response, when nothing is in flight. The failure must be latched (not
+  // forgotten), settlement waiters must reject immediately instead of waiting
+  // out the executor timeout, and future protocol operations must reject
+  // without writing to the broken transport.
+  const { proc, stdin, stdout } = createFakePiChild();
+  const rpc = new PiRpc(proc, new BackgroundProcessReadiness(), () => undefined);
+  const prompt = rpc.request("prompt", { message: "hello" });
+  stdout.emit("data", Buffer.from(`${JSON.stringify({ type: "response", id: "review-gate-1", success: true })}\n`));
+  await prompt;
+  // Awaiting settlement with no RPC in flight, like waiting for agent_end.
+  const settling = rpc.waitForSettled(0);
+  stdin.emit("error", new Error("write EPIPE"));
+  assert.ok(rpc.failure instanceof Error, "the first transport failure must be latched even with no pending request");
+  assert.equal(rpc.failure.message, "write EPIPE");
+  await assert.rejects(settling, /EPIPE/, "settlement waiters must fail on the transport error");
+  const writesBefore = stdin.written.length;
+  await assert.rejects(rpc.request("get_state", {}), /transport failed/i, "future protocol operations must reject immediately on a failed transport");
+  assert.equal(stdin.written.length, writesBefore, "a failed transport must not receive further writes");
+  // The child's exit still settles so the adapter can finish truthfully.
+  proc.emit("close", 0, null);
+  assert.deepEqual(await rpc.closed(), { code: 0, signal: null });
+});
+
+test("PiRpc latches output-pipe errors through the same transport failure path", async () => {
+  // stdout carries terminal-cleanup evidence (session_shutdown events) and
+  // stderr carries child diagnostics; an error on either means captured
+  // output is incomplete, so it must fail closed instead of being discarded.
+  const { proc, stdout, stderr } = createFakePiChild();
+  const rpc = new PiRpc(proc, new BackgroundProcessReadiness(), () => undefined);
+  stdout.emit("error", new Error("read EIO"));
+  assert.ok(rpc.failure instanceof Error, "an output-pipe error must be latched, not discarded");
+  assert.equal(rpc.failure.message, "read EIO");
+  await assert.rejects(rpc.request("get_state", {}), /transport failed/i);
+  // The first failure stays authoritative; a later stderr error must not
+  // replace it or crash the parent.
+  stderr.emit("error", new Error("write EPIPE"));
+  assert.equal(rpc.failure.message, "read EIO");
+});
+
+test("Pi executor fails the shutdown/settlement race when the child exits zero before settling", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-zero-exit-settlement-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "zero-exit-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "let input='';process.stdin.setEncoding('utf8');const out=(v)=>console.log(JSON.stringify(v));",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      // Acknowledge the prompt, then exit zero without agent_end or a
+      // settlement receipt: the parent is left awaiting settlement against a
+      // child that is already gone. That race must settle as an immediate,
+      // truthful protocol failure, not as success and not via the executor
+      // timeout.
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});process.exit(0);}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const exits: Array<{ pid: number; code: number | null; signal: string | null }> = [];
+    const started = Date.now();
+    const result = await new PiExecutorAdapter({
+      model: "provider/model",
+      command,
+      settlementTimeoutMs: 100,
+    }).run({
+      cwd: root,
+      prompt: "exit before settling",
+      artifactDir,
+      turn: 1,
+      allowedTools: ["read"],
+      onProcessExit: (exit) => {
+        exits.push(exit);
+      },
+    });
+    assert.equal(result.code, 1, "a zero exit without settlement must not be reported as successful completion");
+    assert.equal(result.failure?.category, "protocol");
+    assert.match(result.failure?.message ?? "", /exited before protocol completion/);
+    assert.equal(exits[0]?.code, 0, "the child really did exit zero; the failure is truthful, not masked");
+    assert.ok(Date.now() - started < 5_000, "settlement must fail fast on child death, not wait out the executor deadline");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor fails a final-response/shutdown race when the child exits zero after its last response", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-zero-exit-final-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "zero-exit-final-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiSettlementReceipt,
+      "let input='';const out=(v)=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      // Complete the whole protocol (response, receipt, agent_end, clean
+      // get_state), then hard-close the stdin read side and exit zero before
+      // the parent's final get_last_assistant_text write: that write lands on
+      // a dead transport while every response already arrived. The run must
+      // still fail as a protocol error instead of reporting success.
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
+      "else if(c.type==='get_state'){out({type:'response',id:c.id,success:true,data:{isStreaming:false,pendingMessageCount:0}});fs.closeSync(0);process.exit(0);}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const exits: Array<{ pid: number; code: number | null; signal: string | null }> = [];
+    const result = await new PiExecutorAdapter({
+      model: "provider/model",
+      command,
+      settlementTimeoutMs: 100,
+    }).run({
+      cwd: root,
+      prompt: "exit after final response",
+      artifactDir,
+      turn: 1,
+      allowedTools: ["read"],
+      onProcessExit: (exit) => {
+        exits.push(exit);
+      },
+    });
+    assert.equal(result.code, 1, "a broken transport after the final response must never be reported as successful execution");
+    assert.equal(result.failure?.category, "protocol");
+    // The child calls process.exit(0) right after its last response; the
+    // adapter's containment SIGTERM may win that race. Either way the child is
+    // settled exactly once (no orphan) and the run is a truthful failure.
+    assert.equal(exits.length, 1, "the child must be settled exactly once, with no orphan process");
+    assert.ok(
+      exits[0]!.code === 0 || exits[0]!.signal === "SIGTERM",
+      `the child either exited zero on its own or was contained by the adapter's SIGTERM, got ${JSON.stringify(exits[0])}`,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -634,6 +829,34 @@ test("Codex research executor retains safe model reasoning configuration", async
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// Minimal fake child process for PiRpc transport-level regressions: real
+// EventEmitter pipes with no kernel timing, so stream errors can be emitted
+// deterministically at exactly the moment no request is in flight.
+function createFakePiChild(): {
+  proc: ChildProcess;
+  stdin: { writable: boolean; written: string[]; ended: boolean } & EventEmitter;
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+} {
+  const proc = new EventEmitter();
+  const stdin = Object.assign(new EventEmitter(), {
+    writable: true,
+    written: [] as string[],
+    ended: false,
+    write(chunk: unknown): boolean {
+      this.written.push(String(chunk));
+      return true;
+    },
+    end(): void {
+      this.ended = true;
+    },
+  });
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  Object.assign(proc, { pid: 4242, exitCode: null, signalCode: null, stdout, stderr, stdin });
+  return { proc: proc as unknown as ChildProcess, stdin, stdout, stderr };
+}
 
 async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 5_000;

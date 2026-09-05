@@ -13,14 +13,30 @@
 //   node scripts/check-docs.cjs [rootDir]
 //
 // Checks performed:
-//   1. Every relative link in README.md and docs/*.md resolves to an existing file
-//      or directory (external http/https/mailto links are skipped).
+//   1. Every relative link in README.md, the root governance docs, and docs/*.md
+//      resolves to an existing file or directory (external http/https/mailto links are
+//      skipped).
 //   2. Every local anchor (#fragment, including page.md#fragment) matches a heading
 //      in the target page using GitHub-style slug matching.
-//   3. The required public docs set exists and every docs page is reachable from the
-//      root README.md through relative links (core reachability).
+//   3. The required public docs set exists, every docs page is reachable from the root
+//      README.md through relative links, and the shipped root governance docs are linked
+//      directly from README.md (core reachability).
 //   4. Every fenced `json` code block parses as JSON.
 //   5. Referenced repository paths (examples, scripts, license files) exist.
+//   6. The public governance/docs surface (validated markdown plus .github/** when
+//      present) is free of private artifact references: absolute home-directory paths,
+//      numbered project-board references, private agent-skill locations, and prose
+//      mentions of markdown files outside the validated public inventory (inline code
+//      spans and fenced blocks may name product files, so only prose is checked for
+//      .md names). The allowed inventory is derived from the markdown actually
+//      validated plus known source-only .github pages, so new public docs validate
+//      without a hardcoded list while arbitrary local planning docs still fail. The
+//      patterns are identifier-free by design, so the check itself discloses nothing
+//      private.
+//
+// Source-only governance files (.github/, AGENTS.md) are validated when present (repo
+// checkout) and simply absent in the installed package layout; this checker never
+// requires them there.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -28,10 +44,17 @@ const path = require("node:path");
 const rootArg = process.argv[2];
 const ROOT = rootArg ? path.resolve(rootArg) : path.resolve(__dirname, "..");
 
-// The required public documentation set. README.md is the landing page; the rest
-// are the focused pages under docs/.
+// Root-level public docs that ship in the npm package and must be linked directly
+// from README.md so the contribution surface stays reachable in both layouts.
+const ROOT_LINKED_DOCS = ["CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md"];
+
+// Source-only governance docs: validated when present (repo checkout) but not required
+// in the installed package layout.
+const OPTIONAL_GOVERNANCE_DOCS = ["AGENTS.md"];
+
 const REQUIRED_DOCS = [
   "README.md",
+  ...ROOT_LINKED_DOCS,
   "docs/README.md",
   "docs/getting-started.md",
   "docs/configuration.md",
@@ -160,7 +183,13 @@ function main() {
   }
 
   // --- Collect and parse markdown files ------------------------------------
+  // README plus every root governance doc that exists (required ones are checked
+  // above; optional source-only ones are validated only when present) plus all
+  // docs/*.md pages.
   const mdFiles = ["README.md"];
+  for (const candidate of [...ROOT_LINKED_DOCS, ...OPTIONAL_GOVERNANCE_DOCS]) {
+    if (fs.existsSync(path.join(ROOT, candidate))) mdFiles.push(candidate);
+  }
   const docsDir = path.join(ROOT, "docs");
   if (fs.existsSync(docsDir) && fs.statSync(docsDir).isDirectory()) {
     for (const entry of fs.readdirSync(docsDir)) {
@@ -250,12 +279,13 @@ function main() {
         if (!pathPart || pathPart.endsWith("/")) continue;
         const resolved = path.resolve(info.dir, pathPart);
         const targetRel = rel(resolved);
-        if (targetRel.startsWith("docs/") && parsed.has(targetRel) && !reachable.has(targetRel)) {
+        const tracked = targetRel.startsWith("docs/") || ROOT_LINKED_DOCS.includes(targetRel);
+        if (tracked && parsed.has(targetRel) && !reachable.has(targetRel)) {
           queue.push(targetRel);
         }
       }
     }
-    for (const page of DOCS_PAGES) {
+    for (const page of [...DOCS_PAGES, ...ROOT_LINKED_DOCS]) {
       if (!reachable.has(page)) {
         fail(`docs page not reachable from README.md: ${page}`);
       }
@@ -266,6 +296,78 @@ function main() {
   for (const repoPath of REFERENCED_REPO_PATHS) {
     if (!fs.existsSync(path.join(ROOT, repoPath))) {
       fail(`referenced repository path missing: ${repoPath}`);
+    }
+  }
+
+  // --- Privacy scan over the public governance/docs surface ----------------
+  // Generic patterns for private work artifacts that must never appear in tracked
+  // public files. The patterns are deliberately identifier-free: they match classes
+  // of leaks (absolute home-directory paths, numbered project-board references,
+  // hidden agent-skill locations under the home directory, and prose mentions of
+  // markdown files outside the public docs set) without naming any real private
+  // artifact. Keep in sync with PRIVACY_PATTERNS in tests/governance-docs.test.ts.
+  const PRIVACY_PATTERNS = [
+    { name: "absolute home-directory path", re: /\/(?:Users|home)\/[A-Za-z0-9._-]+/ },
+    { name: "numbered project-board reference", re: /\bProject\s+\d{1,4}\b/i },
+    { name: "private agent-skill location", re: /~\/\.[A-Za-z0-9_-]+\/agent\/skills\b/ },
+  ];
+
+  const MD_TOKEN_RE = /(?<![\w.])(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.md\b/g;
+
+  // Basenames of markdown files that are part of the validated public surface, derived
+  // from the actual inventory (the markdown validated above) so new public docs such as
+  // a future releases page validate without editing a hardcoded list. Any other bare
+  // ".md" filename mention (outside URLs) is treated as a private artifact reference.
+  const PUBLIC_MD_BASENAMES = new Set(mdFiles.map((p) => path.basename(p).toLowerCase()));
+
+  const privacyTargets = [...mdFiles];
+  const githubDir = path.join(ROOT, ".github");
+  if (fs.existsSync(githubDir) && fs.statSync(githubDir).isDirectory()) {
+    const walkGithub = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const abs = path.join(dir, entry.name);
+        if (entry.isDirectory()) walkGithub(abs);
+        else if (entry.isFile()) {
+          privacyTargets.push(rel(abs));
+          // Known source-only governance pages are public repo artifacts (just not
+          // shipped in the npm package), so prose references to them validate.
+          if (entry.name.toLowerCase().endsWith(".md")) PUBLIC_MD_BASENAMES.add(entry.name.toLowerCase());
+        }
+      }
+    };
+    walkGithub(githubDir);
+  }
+  PUBLIC_MD_BASENAMES.add("skill.md"); // product skill file referenced by the docs
+
+  for (const fileRel of privacyTargets) {
+    const abs = path.join(ROOT, fileRel);
+    let content;
+    try {
+      content = fs.readFileSync(abs, "utf8");
+    } catch {
+      continue;
+    }
+    const lines = content.split(/\r?\n/);
+    let inFence = false;
+    for (let lineNo = 0; lineNo < lines.length; lineNo += 1) {
+      const line = lines[lineNo];
+      const fenceMatch = line.match(/^\s*(```+|~~~+)/);
+      if (fenceMatch) inFence = !inFence;
+      for (const pattern of PRIVACY_PATTERNS) {
+        if (pattern.re.test(line)) {
+          fail(`${fileRel}:${lineNo + 1} contains a ${pattern.name}`);
+        }
+      }
+      // Prose-only markdown filename mentions: code spans and fenced blocks may name
+      // product files, so only prose outside fences is checked. URLs are ignored.
+      if (!fenceMatch && !inFence) {
+        const prose = line.replace(/`[^`]*`/g, " ").replace(/https?:\/\/\S+/g, " ");
+        for (const match of prose.matchAll(MD_TOKEN_RE)) {
+          if (!PUBLIC_MD_BASENAMES.has(path.basename(match[0]).toLowerCase())) {
+            fail(`${fileRel}:${lineNo + 1} references non-public markdown file "${match[0]}"`);
+          }
+        }
+      }
     }
   }
 

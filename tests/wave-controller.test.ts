@@ -17,7 +17,6 @@ import { normalizeCandidate } from "../src/execution/wave-commits";
 import {
   executeWave,
   type WaveControllerInput,
-  type WaveResult,
   type WavePhase,
   type WaveProgressUpdate,
 } from "../src/execution/wave-controller";
@@ -56,6 +55,54 @@ async function gitInRepo(args: string[], repoPath: string): Promise<string> {
 
 async function mkTmp(prefix: string): Promise<string> {
   return realpath(await mkdtemp(join(tmpdir(), prefix)));
+}
+
+/**
+ * Bounded, prompt-free diagnostics for wave tasks that did not settle to an
+ * eligible status. Surfaces the recorded error plus executor incidents and
+ * attempt counts from the task result (falling back to the owned operation
+ * record) so a hosted failure names the actual cause — for example an exit
+ * code or a git error — instead of only the resulting status.
+ */
+async function describeTaskFailures(result: {
+  waveRoot: string;
+  taskResults: Array<{
+    taskId: string;
+    status: string;
+    summary?: string;
+    error?: string;
+    incidents?: Array<{ attempt?: number; cause?: string; stage?: string; message?: string; retryable?: boolean; terminalCode?: string }>;
+    attempts?: number;
+    operationRecord?: string;
+  }>;
+}): Promise<string> {
+  const lines: string[] = [];
+  for (const tr of result.taskResults) {
+    if (tr.status === "completed_unreviewed" || tr.status === "accepted") continue;
+    lines.push(`task ${tr.taskId}: status=${tr.status}`);
+    const detail = tr.error ?? tr.summary;
+    if (detail) lines.push(`  detail: ${String(detail).slice(0, 400)}`);
+    let incidents = tr.incidents;
+    if ((!incidents || incidents.length === 0) && tr.operationRecord) {
+      try {
+        const op = JSON.parse(await readFile(tr.operationRecord, "utf8")) as { incidents?: typeof incidents };
+        incidents = op.incidents;
+      } catch {
+        // Operation record unavailable; the recorded detail above still shows.
+      }
+    }
+    for (const inc of (incidents ?? []).slice(0, 5)) {
+      lines.push(
+        `  incident a${inc.attempt} ${inc.cause}@${inc.stage}: ${String(inc.message ?? "").slice(0, 300)}` +
+          `${inc.retryable ? "" : " (non-retryable)"}` +
+          (inc.terminalCode ? ` terminal=${inc.terminalCode}` : ""),
+      );
+    }
+    if (typeof tr.attempts === "number") {
+      lines.push(`  attempts: ${tr.attempts}`);
+    }
+  }
+  return lines.length > 0 ? `\n${lines.join("\n")}` : "";
 }
 
 /** Minimal view of the wave manifest used by synchronization barriers. */
@@ -613,49 +660,91 @@ test("abort mid-flight stops new starts, settles active workers, skips integrati
   await git(["add", "."], sourceDir);
   await git(["commit", "--quiet", "-m", "init"], sourceDir);
 
+  const taskIds = ["task-0", "task-1", "task-2"];
   const controller = new AbortController();
+  const gateDir = await mkTmp("pi-wc-abort-gate-");
+  let waveRoot: string | undefined;
+
+  const resultPromise = executeWave({
+    cwd: sourceDir,
+    tasks: [
+      { title: "T1", instructions: "noop", acceptanceCriteria: [] },
+      { title: "T2", instructions: "noop", acceptanceCriteria: [] },
+      { title: "T3", instructions: "noop", acceptanceCriteria: [] },
+    ],
+    taskIds,
+    // Gated executor with maxWorkers: 1 so only one worker starts at a time
+    // and the first stays blocked inside its executor process at the gate.
+    config: makeConfigWithGatedExecutor(gateDir),
+    maxWorkers: 1,
+    artifactDir,
+    waveId: "wc-abort-mid",
+    signal: controller.signal,
+    onWaveCreated: (root) => { waveRoot = root; },
+  });
 
   try {
-    // Use slow executor with maxWorkers: 1 so only one worker starts at a time.
-    // Abort after 150ms — the first worker is running, the rest haven't started.
-    const resultPromise = executeWave({
-      cwd: sourceDir,
-      tasks: [
-        { title: "T1", instructions: "noop", acceptanceCriteria: [] },
-        { title: "T2", instructions: "noop", acceptanceCriteria: [] },
-        { title: "T3", instructions: "noop", acceptanceCriteria: [] },
-      ],
-      config: makeConfigWithSlowExecutor(),
-      maxWorkers: 1,
-      artifactDir,
-      waveId: "wc-abort-mid",
-      signal: controller.signal,
-    });
-    setTimeout(() => controller.abort(), 150);
-    let result: WaveResult | undefined;
-    try {
-      result = await resultPromise;
-    } catch (error) {
-      assert.ok(error instanceof WaveCaptureError);
-      assert.equal(error.code, "cancelled");
+    // Deterministic phase boundary: abort only after the first executor
+    // process has verifiably started and blocked at its gate. A wall-clock
+    // timer cannot synchronize with executor startup — under CI load it can
+    // fire during capture (fake coverage) or land on a phase boundary where
+    // the abort reason surfaces as a raw AbortError rejection.
+    await waitForFiles([join(gateDir, "ready-task-0")], 30_000, "first worker to reach its executor gate");
+
+    // While the active worker holds the only slot, later workers must still be
+    // queued in the published manifest.
+    assert.ok(waveRoot, "wave root should be known once the first worker started");
+    const inFlight = await waitForManifest(
+      join(waveRoot, "wave-manifest.json"),
+      30_000,
+      (manifest) => manifest.tasks.length === 3,
+      "in-flight manifest with all three tasks",
+    );
+    assert.equal(inFlight.tasks.find((t) => t.taskId === "task-1")?.status, "queued", "task-1 must remain queued while task-0 holds the only worker slot");
+    assert.equal(inFlight.tasks.find((t) => t.taskId === "task-2")?.status, "queued", "task-2 must remain queued while task-0 holds the only worker slot");
+
+    const sourceHeadBefore = await git(["rev-parse", "HEAD"], sourceDir);
+
+    // Abort at the verified active-worker boundary — task-0 is genuinely
+    // mid-flight inside its executor process.
+    controller.abort();
+
+    // The wave must settle to an aborted result (not a rejection): workers were
+    // started, so the controller owns settlement and must report mid-flight
+    // cancellation instead of surfacing a raw AbortError.
+    const result = await resultPromise;
+    assert.equal(result.phase, "aborted");
+    assert.equal(result.integration, undefined, "integration must be skipped on abort");
+    assert.equal(result.landing, undefined, "landing must be skipped on abort");
+    assert.equal(result.taskResults.length, 3);
+
+    const abortFailures = await describeTaskFailures(result);
+    // The first task was provably executing (blocked inside its executor) when
+    // the abort fired: it must settle to cancelled, not complete or error.
+    assert.equal(result.taskResults[0].status, "cancelled", `mid-flight task must be cancelled, not ${result.taskResults[0].status}${abortFailures}`);
+    for (const tr of result.taskResults.slice(1)) {
+      assert.equal(tr.status, "cancelled", `queued task must not start after abort: ${tr.taskId}${abortFailures}`);
     }
 
-    if (result) {
-      assert.equal(result.phase, "aborted");
-      assert.equal(result.integration, undefined);
-      assert.equal(result.landing, undefined);
-      assert.equal(result.taskResults.length, 3);
-      // First worker may have completed or been cancelled; rest should be cancelled.
-      for (const tr of result.taskResults) {
-        assert.ok(
-          tr.status === "cancelled" || tr.status === "completed_unreviewed" || tr.status === "accepted",
-          `Unexpected status ${tr.status}`,
-        );
-      }
+    // No later worker may have started: only task-0 ever reached its gate.
+    for (const id of ["task-1", "task-2"]) {
+      await assert.rejects(access(join(gateDir, `ready-${id}`)), { code: "ENOENT" }, `${id} must never start after the abort`);
     }
+
+    // Source preservation: the aborted wave must not mutate the workspace.
+    assert.equal(await git(["rev-parse", "HEAD"], sourceDir), sourceHeadBefore, "source HEAD must be unchanged by an aborted wave");
+    assert.equal(await git(["status", "--porcelain"], sourceDir), "", "source workspace must stay clean through an aborted wave");
   } finally {
+    // Release any gate still held and cancel the wave if it is still running,
+    // so no executor process or manifest write races the directory deletion.
+    for (const id of taskIds) {
+      await writeFile(join(gateDir, `release-${id}`), "", "utf8").catch(() => undefined);
+    }
+    controller.abort();
+    await resultPromise.catch(() => undefined);
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });
+    await rm(gateDir, { recursive: true, force: true });
   }
 });
 
@@ -831,10 +920,11 @@ test("accepted and completed_unreviewed workers are eligible for integration", a
 
     assert.equal(result.taskResults.length, 2);
     // With review disabled and changes made, workers should be completed_unreviewed.
+    const eligibleFailures = await describeTaskFailures(result);
     for (const tr of result.taskResults) {
       assert.ok(
         tr.status === "completed_unreviewed" || tr.status === "accepted",
-        `Expected eligible status, got ${tr.status}`,
+        `Expected eligible status, got ${tr.status}${eligibleFailures}`,
       );
       assert.ok(tr.acceptedCommitSha, `Expected acceptedCommitSha for ${tr.taskId}`);
     }
@@ -1249,7 +1339,12 @@ test("no_changes contributes no commit and integration is no_changes", async () 
     });
 
     assert.equal(result.taskResults.length, 1);
-    assert.equal(result.taskResults[0].status, "no_changes");
+    const noChangeFailures = await describeTaskFailures(result);
+    assert.equal(
+      result.taskResults[0].status,
+      "no_changes",
+      `No-op worker should be no_changes, got ${result.taskResults[0].status}${noChangeFailures}`,
+    );
     assert.equal(result.taskResults[0].acceptedCommitSha, undefined);
 
     // Integration should be no_changes (no eligible workers).
@@ -1736,10 +1831,11 @@ test("in-flight manifest shows truthful statuses: queued/starting, not cancelled
 
     // Final result: all 3 tasks completed.
     assert.equal(result.taskResults.length, 3);
+    const boundaryFailures = await describeTaskFailures(result);
     for (const tr of result.taskResults) {
       assert.ok(
         tr.status === "completed_unreviewed" || tr.status === "accepted",
-        `Expected ${tr.taskId} to complete; got ${tr.status}`,
+        `Expected ${tr.taskId} to complete; got ${tr.status}${boundaryFailures}`,
       );
     }
   } finally {

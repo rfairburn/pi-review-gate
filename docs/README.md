@@ -22,6 +22,7 @@ each other instead of duplicating detail.
 | [Recovery](recovery.md) | Crash recovery for landing manifests, exact-session restart, executor retry and failover. |
 | [Development](development.md) | Build and test commands, test tiers, static checks, package smoke, launcher internals. |
 | [Troubleshooting](troubleshooting.md) | Symptom-to-fix entries for common setup, review, and recovery problems. |
+| [Releases](releases.md) | The automated numbered prerelease builder: version naming, eligibility, publication model, and recovery. |
 
 ## Suggested reading paths
 
@@ -42,3 +43,16 @@ each other instead of duplicating detail.
   and [LICENSES/](../LICENSES).
 - The persistent orchestrator skill shipped with the package:
   [skills/orchestrator/SKILL.md](../skills/orchestrator/SKILL.md).
+
+## Governance and contribution
+
+- [CONTRIBUTING](../CONTRIBUTING.md) — issue-first workflow, branch and merge
+  conventions, verification expectations, and the public release summary.
+- [SECURITY](../SECURITY.md) — private vulnerability reporting route.
+- [CHANGELOG](../CHANGELOG.md) — notable changes summarized under Unreleased pre-1.0.
+- [Releases](releases.md) — how each validated merge is published as a numbered prerelease,
+  and how a failed publication is recovered.
+- Issue and pull request templates, code ownership, and external review guidance live in
+  the source-only `.github/` directory of the checkout (not shipped in the npm package);
+  see the [review guidance](https://github.com/rfairburn/pi-review-gate/blob/main/.github/REVIEW_GUIDANCE.md)
+  for reviewer expectations.

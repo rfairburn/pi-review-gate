@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a defect in pi-review-gate behavior.
+title: "[bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security note:** If the bug is a security vulnerability, do not file it here.
+        Use the private advisory route in [SECURITY.md](https://github.com/rfairburn/pi-review-gate/blob/main/SECURITY.md):
+        https://github.com/rfairburn/pi-review-gate/security/advisories/new
+
+        Every fix PR must link this issue (`Closes #N` for full resolution, `Refs #N`
+        for partial work with the remaining scope stated).
+  - type: textarea
+    id: problem
+    attributes:
+      label: What went wrong
+      description: The user-facing problem, in the user's terms.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Exact steps to reproduce, including the relevant (sanitized) config shape and commands.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What you expected to happen and what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence (optional)
+      description: Sanitized logs, receipts, or diffs that demonstrate the defect. No tokens, credentials, private paths, or personal data.
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What a fixed behavior looks like, observably.
+    validations:
+      required: true
+  - type: textarea
+    id: security-privacy
+    attributes:
+      label: Security and privacy considerations
+      description: Any trust-boundary, egress, secret-handling, or data-retention impact. Paste only sanitized data (no tokens, credentials, private paths, or personal information).
+      placeholder: None, or describe the impact.
+    validations:
+      required: true

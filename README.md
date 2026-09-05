@@ -197,23 +197,46 @@ later landings until `SubtasksMarkClean` verifies the resolution. Details live i
 | Trust boundaries, egress hardening, read-only enforcement | [docs/security-model.md](docs/security-model.md) |
 | Crash recovery, restart, retry/failover | [docs/recovery.md](docs/recovery.md) |
 | Build, tests, static checks, launcher internals | [docs/development.md](docs/development.md) |
+| Numbered prereleases, artifacts, publication recovery | [docs/releases.md](docs/releases.md) |
 | Symptom-to-fix troubleshooting | [docs/troubleshooting.md](docs/troubleshooting.md) |
 
 ## Development
 
 ```bash
-npm install          # dependencies (downloads Chromium unless skipped)
-npm test             # build + full suite (up to four test files concurrently)
-npm run test:fast    # short pure/unit development loop
+npm install              # dependencies (downloads Chromium unless skipped)
+npm run build:test      # compile tests without touching the live dist/
+npm run test:run        # full compiled suite (up to four test files concurrently)
+npm run test:run:serial # full serial fallback after npm run build:test, for resource/ordering-sensitive diagnosis
+npm test                # build + full suite; rebuilds the live dist/, so reserve it for CI or an explicitly owned isolated build
+npm run test:fast       # short pure/unit development loop
 npm run test:execution  # serial background/recovery/pool/session/tool-contract tier
-npm run test:serial  # full serial fallback for resource/ordering-sensitive diagnosis
-npm run check:static # tsc --noEmit + shellcheck + docs link/anchor/JSON validation
-npm run test:package # pack, install into a scratch consumer, assert required files
+npm run test:serial     # build + serial suite; rebuilds the live dist/, so reserve it for CI or an explicitly owned isolated build
+npm run check:static    # tsc --noEmit + shellcheck + docs link/anchor/JSON validation
+npm run test:package    # pack, install into a scratch consumer, assert required files
 ```
 
-Use `npm test` (or `npm run test:integration`) for the process, Git, filesystem, and
-end-to-end suite before finalizing a phase. Build and workflow details live in
-[docs/development.md](docs/development.md).
+In a working checkout, run `npm run build:test` followed by `npm run test:run` for the
+process, Git, filesystem, and end-to-end suite before finalizing a phase; `npm test`
+rebuilds the live `dist/`, so reserve it for CI or an explicitly owned isolated build.
+Build and workflow details live in [docs/development.md](docs/development.md).
+
+## Contributing and governance
+
+Contributions are issue-first and reviewed: every pull request must accompany or link an
+issue (`Closes #N` for evidenced full resolution, `Refs #N` for partial or related work
+with the remaining scope stated), branches follow `issue-N/short-slug`, and merges are
+maintainer-authorized squash merges that happen only after the required review and
+checks pass. The project is pre-1.0; each validated merge publishes a GitHub
+prerelease with a unique `0.1.0-dev.N` package version, and no npm publishing is
+configured or authorized today.
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to propose, implement, and land work, plus the
+  public release summary.
+- [SECURITY.md](SECURITY.md) — private vulnerability reporting (no public security
+  issues).
+- [CHANGELOG.md](CHANGELOG.md) — notable changes, summarized under Unreleased pre-1.0.
+- [Review guidance](https://github.com/rfairburn/pi-review-gate/blob/main/.github/REVIEW_GUIDANCE.md)
+  — expectations for external reviewers (source-only governance page in the checkout).
 
 ## Third-party notices
 

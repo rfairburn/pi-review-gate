@@ -52,6 +52,54 @@ async function mkTmp(prefix: string): Promise<string> {
   return realpath(await mkdtemp(join(tmpdir(), prefix)));
 }
 
+/**
+ * Bounded, prompt-free diagnostics for wave tasks that did not settle to an
+ * eligible status. Surfaces the recorded error plus executor incidents and
+ * attempt counts from the task result (falling back to the owned operation
+ * record) so a hosted failure names the actual cause — for example an exit
+ * code or a git error — instead of only the resulting status.
+ */
+async function describeTaskFailures(result: {
+  waveRoot: string;
+  taskResults: Array<{
+    taskId: string;
+    status: string;
+    summary?: string;
+    error?: string;
+    incidents?: Array<{ attempt?: number; cause?: string; stage?: string; message?: string; retryable?: boolean; terminalCode?: string }>;
+    attempts?: number;
+    operationRecord?: string;
+  }>;
+}): Promise<string> {
+  const lines: string[] = [];
+  for (const tr of result.taskResults) {
+    if (tr.status === "completed_unreviewed" || tr.status === "accepted") continue;
+    lines.push(`task ${tr.taskId}: status=${tr.status}`);
+    const detail = tr.error ?? tr.summary;
+    if (detail) lines.push(`  detail: ${String(detail).slice(0, 400)}`);
+    let incidents = tr.incidents;
+    if ((!incidents || incidents.length === 0) && tr.operationRecord) {
+      try {
+        const op = JSON.parse(await readFile(tr.operationRecord, "utf8")) as { incidents?: typeof incidents };
+        incidents = op.incidents;
+      } catch {
+        // Operation record unavailable; the recorded detail above still shows.
+      }
+    }
+    for (const inc of (incidents ?? []).slice(0, 5)) {
+      lines.push(
+        `  incident a${inc.attempt} ${inc.cause}@${inc.stage}: ${String(inc.message ?? "").slice(0, 300)}` +
+          `${inc.retryable ? "" : " (non-retryable)"}` +
+          (inc.terminalCode ? ` terminal=${inc.terminalCode}` : ""),
+      );
+    }
+    if (typeof tr.attempts === "number") {
+      lines.push(`  attempts: ${tr.attempts}`);
+    }
+  }
+  return lines.length > 0 ? `\n${lines.join("\n")}` : "";
+}
+
 // ── Fake executor builders ───────────────────────────────────────────────────
 
 /**
@@ -245,10 +293,11 @@ test("regression: two-file parallel write reports completed_unreviewed, integrat
 
     // ── Verify worker statuses are NOT no_changes ──
     assert.equal(result.taskResults.length, 2);
+    const twoFileFailures = await describeTaskFailures(result);
     for (const tr of result.taskResults) {
       assert.ok(
         tr.status === "completed_unreviewed" || tr.status === "accepted",
-        `Task ${tr.taskId} should be completed_unreviewed or accepted, got ${tr.status}`,
+        `Task ${tr.taskId} should be completed_unreviewed or accepted, got ${tr.status}${twoFileFailures}`,
       );
       assert.ok(
         tr.acceptedCommitSha,
@@ -350,10 +399,11 @@ test("regression: true no-op reports no_changes/no_changes without false file cr
 
     // ── Verify worker reports no_changes ──
     assert.equal(result.taskResults.length, 1);
+    const noopFailures = await describeTaskFailures(result);
     assert.equal(
       result.taskResults[0].status,
       "no_changes",
-      `No-op task should be no_changes, got ${result.taskResults[0].status}`,
+      `No-op task should be no_changes, got ${result.taskResults[0].status}${noopFailures}`,
     );
 
     // ── Verify integration is no_changes ──
@@ -453,9 +503,10 @@ test("regression: ignored HTML paths remain excluded and not reported as landed"
 
     // ── Verify worker completed ──
     assert.equal(result.taskResults.length, 1);
+    const ignoredFailures = await describeTaskFailures(result);
     assert.ok(
       result.taskResults[0].status === "completed_unreviewed" || result.taskResults[0].status === "accepted",
-      `Task should be completed, got ${result.taskResults[0].status}`,
+      `Task should be completed, got ${result.taskResults[0].status}${ignoredFailures}`,
     );
 
     // ── Verify only non-ignored file is in applied paths ──
@@ -507,10 +558,11 @@ test("regression: non-Git source two-file write reports correctly", async () => 
 
     // ── Verify workers completed ──
     assert.equal(result.taskResults.length, 2);
+    const nonGitFailures = await describeTaskFailures(result);
     for (const tr of result.taskResults) {
       assert.ok(
         tr.status === "completed_unreviewed" || tr.status === "accepted",
-        `Task ${tr.taskId} should be completed, got ${tr.status}`,
+        `Task ${tr.taskId} should be completed, got ${tr.status}${nonGitFailures}`,
       );
     }
 
@@ -574,10 +626,11 @@ test("regression: absolute source path aliases are rewritten to worker paths", a
 
     // ── Verify tasks completed (not no_changes) ──
     assert.equal(result.taskResults.length, 2);
+    const aliasFailures = await describeTaskFailures(result);
     for (const tr of result.taskResults) {
       assert.ok(
         tr.status === "completed_unreviewed" || tr.status === "accepted",
-        `Task ${tr.taskId} should be completed, got ${tr.status}`,
+        `Task ${tr.taskId} should be completed, got ${tr.status}${aliasFailures}`,
       );
     }
 
@@ -801,9 +854,10 @@ test("regression: executor subprocess PWD matches actual cwd", async () => {
 
     // ── Verify task completed ──
     assert.equal(result.taskResults.length, 1);
+    const pwdFailures = await describeTaskFailures(result);
     assert.ok(
       result.taskResults[0].status === "completed_unreviewed" || result.taskResults[0].status === "accepted",
-      `Task should be completed, got ${result.taskResults[0].status}`,
+      `Task should be completed, got ${result.taskResults[0].status}${pwdFailures}`,
     );
 
     // ── Verify PWD is NOT the source directory ──

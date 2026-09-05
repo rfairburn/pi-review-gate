@@ -3665,7 +3665,24 @@ async function setupBlockingFailureHarness(options: { notifications: "quiet" | "
       instructions: "write draft.txt",
       acceptanceCriteria: ["draft.txt exists"],
     }]);
-    await waitFor(() => controller!.inspect(started.executionId).tasks[0]?.state === "running", 30_000);
+    // Gate at the authoritative launch boundary (issue 12): waiting only for
+    // the "running" state resolves at the worker's first progress event
+    // (phase "starting", "wave worker starting executor"), while the real
+    // launch path keeps writing state asynchronously — its final launch-path
+    // progress ("executor turn N running") lands later and
+    // can regress an injected synthetic failure back to "running" inside
+    // handleLaunchRejection's save/wake window. Waiting for that final
+    // progress event guarantees the blocking executor has the turn parked and
+    // no live fixture writer remains in flight, so the synthetic failure is
+    // deterministic. The executor produces no stdout, so nothing is emitted
+    // after this boundary until shutdown. (The wave controller relays worker
+    // progress with phase "working" and the message "<taskId>: executor turn
+    // N running", so the boundary is matched by message.)
+    await waitFor(() => {
+      const live = controller!.inspect(started.executionId).tasks[0];
+      return live?.state === "running"
+        && live.activity.some((event) => /executor turn \d+ running/.test(event.message));
+    }, 30_000);
     const internals = controller as unknown as {
       groups: Map<string, BackgroundExecutionGroup>;
       handleLaunchRejection: (group: BackgroundExecutionGroup, task: BackgroundTaskRecord, error: unknown) => Promise<void>;
@@ -3899,6 +3916,39 @@ test("quiet and noisy subtask notification modes both retain actionable wake fai
     } finally {
       await cleanup();
     }
+  }
+});
+
+// Regression for issue 12: the hosted Linux run observed the failure
+// diagnostic reporting "taskState": "running" with the live worker's
+// "wave worker starting executor" activity landing after the synthetic
+// failure — the fixture's "running" gate raced the real launch path's final
+// progress write. The harness now gates at the authoritative launch boundary;
+// this pins the cause deterministically.
+test("regression: synthetic launch failure stays terminal because the fixture gate precedes any live launch writer", async () => {
+  const scenario = await setupBlockingFailureHarness({ notifications: "quiet" });
+  const { controller, started, messages, internals, cleanup } = scenario;
+  try {
+    const group = internals.groups.get(started.executionId)!;
+    const task = group.tasks[0]!;
+    // Cause evidence: the launch path's final progress write (relayed as
+    // "executor turn N running") has already landed, so no in-flight launch
+    // writer can regress the injected failure.
+    assert.ok(
+      task.activity.some((event) => /executor turn \d+ running/.test(event.message)),
+      "the launch path emitted its final executor-turn progress before the fixture gate released",
+    );
+    injectAdversarialTaskData(scenario.root, group, task);
+    await internals.handleLaunchRejection(group, task, new Error("issue 12 regression: synthetic launch failure must stay terminal"));
+    assert.equal(task.state, "failed", "the synthetic failure must remain the terminal state");
+    assert.equal(task.stateHistory?.at(-1)?.state, "failed", "no later transition regresses the failed state");
+    const failureMessage = messages.find((message) => message.includes("Failure recovery diagnostic"));
+    assert.ok(failureMessage, "the regression delivers the curated failure notification");
+    assert.match(failureMessage!, /"taskState": "failed"/, "the diagnostic reports the failed state, never the racing live state");
+    assert.ok(failureMessage!.includes(started.executionId), "the execution handle survives");
+    assert.ok(failureMessage!.includes(task.taskId), "the task handle survives");
+  } finally {
+    await cleanup();
   }
 });
 

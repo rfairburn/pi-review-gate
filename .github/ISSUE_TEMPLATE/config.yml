@@ -1,0 +1,10 @@
+# Repository-level issue form configuration.
+#
+# Blank issues are disabled: every request is filed through the feature or bug form so
+# it carries the structured context reviewers need. Security vulnerabilities are never
+# reported through issues; use the private advisory route below (see SECURITY.md).
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/rfairburn/pi-review-gate/security/advisories/new
+    about: Use GitHub's private vulnerability reporting. Do not file security issues publicly.

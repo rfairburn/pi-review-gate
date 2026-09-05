@@ -25,7 +25,33 @@ evidence, and a review before it lands.
   land on GitHub; it does not rewrite local commits or ordinary git operations.
 - Merges are maintainer-authorized: each squash merge happens only after the required
   review and checks pass, and the merged branch is deleted on merge.
-- No force-pushes to an open PR and no review bypasses of any kind.
+- Working branches are unrestricted: the protected branch rules apply to `main` only;
+  branch creation, commits, and pushes to working branches are not restricted.
+
+## Review and approvals
+
+Main-branch pull requests are governed by two GitHub rulesets:
+
+- **Safety (no bypass):** every change lands through a pull request with the required
+  CI checks passing in verified form and all review threads resolved. Force-pushes and
+  branch deletion targeting `main` are prohibited with no bypass of any kind.
+- **Review:** every pull request requires one approval before merge.
+
+Approvals distinguish maintainer-authored PRs from external PRs, and the distinction is
+honest about GitHub's mechanics:
+
+- **Maintainer-authored, same-repository PRs** use the administrator exemption from
+  required GitHub approval, rather than a GitHub self-approval (authors cannot approve
+  their own PRs). This exempts only the formal approval requirement: independent review
+  (human or reviewer agent) and all required checks still gate every change. The
+  repository relies on this documented policy rather than an additional automated
+  authorship check.
+- **External contributions** require an approving maintainer review before merge. The
+  distinction above is actor-based, not authorship-enforced: GitHub technically permits
+  repository administrators to bypass the approval ruleset through pull requests,
+  regardless of PR author. Policy permits that bypass only for maintainer-authored,
+  same-repository PRs; a third-party pull request must never be merged without an
+  approving maintainer review, and the safety ruleset remains non-bypassable.
 
 ## Verification before opening a PR
 

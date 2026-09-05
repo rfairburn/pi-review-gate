@@ -465,6 +465,18 @@ test("CONTRIBUTING.md states the public workflow and release summary", () => {
     "must point at the safe full-suite commands for a working checkout",
   );
   assert.match(c, /no npm\s+publishing is configured or authorized/i, "must state the truthful current npm status");
+  assert.match(c, /self-approval/i, "must document the maintainer self-approval distinction honestly");
+  assert.match(c, /administrator/i, "must name the administrator merge path rather than implying GitHub enforces authorship exemptions");
+  assert.match(c, /approving maintainer review/i, "must require approving maintainer review for external contributions");
+  assert.match(
+    c,
+    /actor-based, not authorship-enforced/i,
+    "must distinguish the actor-based GitHub exemption from authorship-based policy enforcement",
+  );
+  assert.ok(
+    !/bypasses of any kind/i.test(c),
+    "must not overstate that GitHub bypass is impossible; policy distinctions must stay honest",
+  );
 });
 
 test("AGENTS.md links structure and safety docs", () => {
@@ -481,6 +493,7 @@ test("review guidance requires precise, actionable findings without fabrication 
   }
   assert.match(g, /fabricat/i, "must prohibit fabricated test results");
   assert.match(g, /arbitrary .*budgets?/i, "must prohibit arbitrary model/token budgets");
+  assert.match(g, /maintainer-authored/i, "must distinguish maintainer-authored PR review expectations");
 });
 
 test("generic privacy patterns catch synthetic private references", () => {

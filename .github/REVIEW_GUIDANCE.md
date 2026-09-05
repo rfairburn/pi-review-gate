@@ -33,6 +33,19 @@ after working through the checklist below.
 - Do not impose arbitrary model, token, or reviewer budgets on the work; reviewer
   selection and reasoning effort are product configuration, not review scope.
 
+## Who reviews what
+
+- Maintainer-authored pull requests are reviewed by independent reviewers — human or
+  agent. Authors cannot approve their own GitHub pull requests; eligible same-repository
+  maintainer PRs use the formal-approval exemption described in CONTRIBUTING.md instead.
+- External contributions require an approving maintainer review before merge; a
+  third-party PR merged without one is a blocker.
+- Independent review and the required CI checks apply to every pull request regardless
+  of author. GitHub technically permits repository administrators to bypass the approval
+  ruleset through pull requests, regardless of PR author; policy restricts that bypass
+  to maintainer-authored, same-repository PRs, so a third-party PR merged without an
+  approving maintainer review is a blocker.
+
 ## Verdicts
 
 - **approve** — no open blockers or majors; nits may remain.

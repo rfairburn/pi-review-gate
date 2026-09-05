@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import {
   compareSnapshots,
@@ -316,13 +317,7 @@ test("snapshot represents tracked gitlinks without traversing their directory", 
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-gitlink-"));
   const git = (args: string[]) => execFileAsync("git", args, {
     cwd: dir,
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "Test",
-      GIT_AUTHOR_EMAIL: "test@example.com",
-      GIT_COMMITTER_NAME: "Test",
-      GIT_COMMITTER_EMAIL: "test@example.com",
-    },
+    env: gitEnv(),
   });
   try {
     await git(["init", "--quiet"]);
@@ -605,6 +600,44 @@ test("snapshot omission ledger is bounded and flags truncation", async () => {
   }
 });
 
+test("fixture git helpers leave no detached maintenance racing teardown", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-fixture-quiesce-"));
+  try {
+    await initGit(dir);
+    await writeFile(join(dir, "seed.txt"), "seed\n", "utf8");
+    // GIT_TRACE2_EVENT records every spawned child with its argv, including
+    // the detached `git maintenance run --auto --quiet --detach` that plain
+    // `git commit` forks. The fixture env must suppress that spawn: the
+    // detached child creates `.git/objects/maintenance.lock` before it
+    // evaluates any gc threshold, so on a loaded CI runner that file can
+    // appear inside `.git/objects` while the fixture's recursive teardown
+    // rm is already deleting it, producing a spurious ENOTEMPTY (the
+    // observed flake in the bounded omission ledger fixture).
+    const traceEvents = join(dir, "trace2-events.jsonl");
+    await execFileAsync("git", ["add", "seed.txt"], { cwd: dir, env: gitEnv() });
+    await execFileAsync("git", ["commit", "--quiet", "-m", "seed"], {
+      cwd: dir,
+      env: { ...gitEnv(), GIT_TRACE2_EVENT: traceEvents },
+    });
+    const trace = await readFile(traceEvents, "utf8");
+    assert.equal(
+      trace.includes("maintenance"),
+      false,
+      "git commit must not spawn detached auto-maintenance in fixture repos",
+    );
+
+    // Bounded quiescence: once the awaited git calls settle, the object
+    // store must gain no new entries before the teardown rm runs.
+    const objectsDir = join(dir, ".git", "objects");
+    const before = (await readdir(objectsDir)).sort();
+    await delay(250);
+    assert.deepEqual((await readdir(objectsDir)).sort(), before,
+      "no late object-store writes after fixture git calls settle");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("git discovery warnings yield unreadable-directory omissions even when git succeeds", async (t) => {
   if (process.platform === "win32" || process.getuid?.() === 0) {
     t.skip("permission-based tests require a non-root POSIX user");
@@ -837,6 +870,19 @@ function gitEnv(): Record<string, string> {
     GIT_AUTHOR_EMAIL: "test@example.com",
     GIT_COMMITTER_NAME: "Test",
     GIT_COMMITTER_EMAIL: "test@example.com",
+    // `git commit` spawns a detached `git maintenance run --auto --quiet
+    // --detach` child that outlives the awaited execFile call. That child
+    // creates `.git/objects/maintenance.lock` (its lock lives at the object
+    // database path) before it even evaluates the gc thresholds, so on a
+    // loaded runner it can appear while a fixture's recursive teardown rm is
+    // already deleting `.git/objects`, producing a spurious ENOTEMPTY. Every
+    // fixture git invocation disables auto-maintenance and auto-gc so the
+    // object store is quiescent once the awaited git calls settle.
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "maintenance.auto",
+    GIT_CONFIG_VALUE_0: "false",
+    GIT_CONFIG_KEY_1: "gc.auto",
+    GIT_CONFIG_VALUE_1: "0",
   };
 }
 

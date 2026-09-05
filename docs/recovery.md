@@ -24,6 +24,20 @@ continuation. A stopped task with a durable bundle is then queued for continuati
 that continuation reconciles verified in-progress or recovery-required landing manifests
 before allowing further source mutation.
 
+Restored review windows reconcile to the current reviewer configuration. The persisted
+sidecar records which review settings produced it; when those settings changed before
+the reload, the window continues with the currently configured reviewers instead of
+blocking for a manual clear. The preserved baseline, accumulated evidence, and completed
+history are never rewritten: historical results keep the identity of the configuration
+that ran them, and resolvable reviewers under the new settings review the same
+evidence. A label/count-only notice reports the reconciliation (no prompts or secrets).
+The same reconciliation applies in-session: saving new reviewer settings through
+`/review-settings` immediately reconciles open review windows, so a window frozen with
+an outdated or empty selection does not wait for a reload; an in-flight review finishes
+under its original selection and later reviews use the new one. Genuine corruption still
+fails closed during restore: integrity, conversation, and cwd validation reject the
+sidecar before any state is applied.
+
 Queued inputs from a review interrupted by restart are not reordered automatically: use
 `/review-now` to finish the review and release them, or `/review-clear` to cancel them
 (see [Review workflow](review-workflow.md#commands)).

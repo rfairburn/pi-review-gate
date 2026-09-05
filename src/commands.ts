@@ -164,7 +164,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const reviewConfig = window.reviewConfig ?? currentConfig();
       if (!automaticReviewEnabled(reviewConfig)) {
-        await sendCommandNotice(ctx, "review gate: automatic review is disabled by settings");
+        await sendCommandNotice(ctx, input.config.enabled
+          ? "review gate: no configured reviewer is currently available for this review window; use /review-settings"
+          : "review gate: automatic review is disabled by settings");
         return;
       }
       // Manual review does not suspend or close the Pi session's browser;
@@ -223,6 +225,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           source: "manual",
           disposition: "sent_for_observation",
           reviewedSnapshot: output.reviewedSnapshot!,
+          displayLabels: output.reviewerDisplayLabels,
         });
         await sendCommandNotice(
           ctx,
@@ -241,6 +244,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           source: "manual",
           disposition: "sent_for_correction",
           reviewedSnapshot: output.reviewedSnapshot!,
+          displayLabels: output.reviewerDisplayLabels,
         });
         await deliverCommandTransmission(input, output, "correction_required", transmission, isSessionActive);
       } else {
@@ -254,6 +258,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
             source: "manual",
             disposition: "sent_review_error",
             reviewedSnapshot: output.reviewedSnapshot!,
+            displayLabels: output.reviewerDisplayLabels,
           });
           await deliverCommandTransmission(input, output, "review_error", transmission, isSessionActive);
         }
@@ -307,7 +312,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const currentReviewConfig = getReviewerQuestionWindow(input.state)?.reviewConfig ?? currentConfig();
       if (!automaticReviewEnabled(currentReviewConfig)) {
-        await sendCommandNotice(ctx, `review gate: reviewer use is disabled by settings; use /review-settings before /${commandName}`);
+        await sendCommandNotice(ctx, input.config.enabled
+          ? `review gate: no configured reviewer is currently available; use /review-settings before /${commandName}`
+          : `review gate: reviewer use is disabled by settings; use /review-settings before /${commandName}`);
         return;
       }
       const question = args.trim();
@@ -377,7 +384,6 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const payload = formatReviewerAnswer(
         question,
         output.reviewerResults ?? [],
-        output.reviewerDisplayLabels,
         output.bundleRetained ? output.bundleDir : undefined,
       );
       const submittedPayload = autoSubmit ? payload : await showPrivateReviewerAnswer(ctx, payload);
@@ -425,7 +431,6 @@ async function createCommandTransmission(
     reviewSequence: output.reviewSequence,
     gateVerdict: output.result.verdict,
     reviewerResults: output.reviewerResults,
-    reviewerDisplayLabels: output.reviewerDisplayLabels,
     bundleDir: output.bundleDir,
     action,
   });
@@ -495,7 +500,6 @@ function getRegisterCommand(pi: unknown): RegisterCommand | undefined {
 export function formatReviewerAnswer(
   question: string,
   results: ReviewResult[],
-  reviewerDisplayLabels?: Record<string, string>,
   bundleDir?: string,
 ): string {
   const lines = [
@@ -504,7 +508,10 @@ export function formatReviewerAnswer(
     `Question: ${question}`,
   ];
   for (const result of results) {
-    const displayLabel = reviewerDisplayLabels?.[result.reviewerId] ?? result.reviewerId;
+    // Results carry the label of the configuration that ran them; results
+    // without a saved identity render with their raw reviewer id rather than
+    // an invented current-configuration label.
+    const displayLabel = result.displayLabel ?? result.reviewerId;
     lines.push("", `## ${displayLabel} — ${result.verdict}`, "", `Answer: ${result.summary}`);
     if (result.guidance) {
       lines.push("", "Implementation guidance:", result.guidance);

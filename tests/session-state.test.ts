@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { normalizeConfig } from "../src/config";
+import { materializeReviewConfig, normalizeConfig, unresolvedReviewerSelectionsFor, type ReviewGateConfig } from "../src/config";
 import { queueModelDelivery } from "../src/durable-delivery";
 import { createEvidenceState } from "../src/evidence";
 import {
   configDigest,
   replaceReviewGateState,
+  reviewerSelectionDigest,
   SESSION_STATE_ENTRY_TYPE,
   SESSION_STATE_QUARANTINE_MARKER,
   SessionStateCwdMismatchError,
@@ -32,6 +34,7 @@ import {
   beginAgentRun,
   createState,
   freezeReviewWindowConfig,
+  reconcileRestoredReviewWindows,
   rememberUserRequest,
   setReviewWindowBaseline,
 } from "../src/state";
@@ -346,6 +349,217 @@ test("malformed sidecar JSON rejects with a typed error that never quotes file c
     // A structurally valid but wrong document also fails with a typed error.
     await writeFile(store.path, `${JSON.stringify({ hello: "world" })}\n`, "utf8");
     await assert.rejects(store.restore(root), SessionStateInvalidStateError);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Mirror of the store's canonical serialization for legacy-sidecar simulation.
+function stableJsonForTest(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJsonForTest).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJsonForTest(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+test("reviewerSelectionDigest is insensitive to unrelated settings but tracks reviewer changes", () => {
+  const base = {
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli" as const, command: process.execPath },
+      { id: "two", adapter: "generic-cli" as const, command: process.execPath },
+    ],
+  };
+  const a = normalizeConfig(base);
+
+  // Unrelated settings must not trigger reconciliation on restore.
+  assert.equal(reviewerSelectionDigest(a), reviewerSelectionDigest(normalizeConfig({ ...base, timeoutMs: 999999 })));
+  assert.equal(reviewerSelectionDigest(a), reviewerSelectionDigest(normalizeConfig({ ...base, maxPatchBytes: 123456 })));
+  assert.equal(reviewerSelectionDigest(a), reviewerSelectionDigest(normalizeConfig({ ...base, web: { enabled: true } })));
+
+  // Reviewer selection changes must be detected.
+  assert.notEqual(reviewerSelectionDigest(a), reviewerSelectionDigest(normalizeConfig({ ...base, enabledReviewerIds: ["two"] })));
+  // Adding a reviewer with default (all) selection changes the effective set.
+  const defaultSelection = normalizeConfig({ enabled: true, reviewers: base.reviewers });
+  assert.notEqual(
+    reviewerSelectionDigest(defaultSelection),
+    reviewerSelectionDigest(normalizeConfig({ enabled: true, reviewers: [...base.reviewers, { id: "three", adapter: "generic-cli" as const, command: process.execPath }] })),
+  );
+  // Adding an unselected catalog entry does not change the effective selection.
+  assert.equal(
+    reviewerSelectionDigest(a),
+    reviewerSelectionDigest(normalizeConfig({ ...base, reviewers: [...base.reviewers, { id: "three", adapter: "generic-cli" as const, command: process.execPath }] })),
+  );
+  assert.notEqual(
+    reviewerSelectionDigest(a),
+    reviewerSelectionDigest(normalizeConfig({ ...base, reviewers: [{ id: "one", adapter: "generic-cli" as const, command: "/usr/bin/other" }, base.reviewers[1]] })),
+  );
+  // A renamed selection (stale id) is part of the selection identity.
+  assert.notEqual(reviewerSelectionDigest(a), reviewerSelectionDigest(normalizeConfig({ ...base, enabledReviewerIds: ["gone"] })));
+});
+
+test("reviewer selection digest round-trips through sidecar save and restore", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-selection-digest-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "implement the durable change");
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, {
+      cwd: root,
+      capturedAt: "2026-08-16T00:00:00.000Z",
+      files: new Map(),
+      omissions: [],
+      omissionsTruncated: false,
+    });
+    const config = normalizeConfig({
+      enabled: true,
+      enabledReviewerIds: ["one"],
+      reviewers: [
+        { id: "one", adapter: "generic-cli", command: process.execPath },
+        { id: "two", adapter: "generic-cli", command: process.execPath },
+      ],
+    });
+    freezeReviewWindowConfig(state, config);
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    // Production saves pass the window's effective (frozen) configuration.
+    await store.save(state, { waveRoots: [], bundles: [] }, state.reviewWindow!.reviewConfig);
+
+    const restored = await store.restore(root);
+    // The selection digest is canonical: it matches the live configuration.
+    assert.equal(restored?.reviewerSelectionDigest, reviewerSelectionDigest(config));
+    // The broad digest is persisted from the window's frozen configuration,
+    // as in production saves.
+    assert.equal(restored?.reviewConfigDigest, configDigest(state.reviewWindow!.reviewConfig!));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reviewerSelectionDigest distinguishes unresolved-only and duplicate-only changes on materialized configs", () => {
+  const base = {
+    enabled: true,
+    reviewers: [{ id: "alpha", adapter: "generic-cli" as const, command: process.execPath }],
+  };
+  const missingA = normalizeConfig({ ...base, enabledReviewerIds: ["alpha", "missingA"] });
+  const missingB = normalizeConfig({ ...base, enabledReviewerIds: ["alpha", "missingB"] });
+
+  // The actual persistence boundary digests materialized configs; a change
+  // that swaps one unresolvable selection for another must be visible there.
+  assert.notEqual(
+    reviewerSelectionDigest(materializeReviewConfig(missingA, [])),
+    reviewerSelectionDigest(materializeReviewConfig(missingB, [])),
+  );
+  // Live and materialized forms of the same effective selection stay
+  // equivalent, so an unchanged reload never reports a change.
+  assert.equal(reviewerSelectionDigest(missingA), reviewerSelectionDigest(materializeReviewConfig(missingA, [])));
+  assert.equal(reviewerSelectionDigest(missingB), reviewerSelectionDigest(materializeReviewConfig(missingB, [])));
+
+  // Duplicate-only changes are part of the selection identity as well.
+  const noDuplicate = normalizeConfig({ ...base, enabledReviewerIds: ["alpha"] });
+  const duplicated = normalizeConfig({ ...base, enabledReviewerIds: ["alpha", "alpha"] });
+  assert.notEqual(
+    reviewerSelectionDigest(materializeReviewConfig(noDuplicate, [])),
+    reviewerSelectionDigest(materializeReviewConfig(duplicated, [])),
+  );
+  assert.equal(reviewerSelectionDigest(duplicated), reviewerSelectionDigest(materializeReviewConfig(duplicated, [])));
+});
+
+test("frozen selection digest reports a missing-only reviewer change across save and restore, not on unchanged reload", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-missing-only-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const alpha = { id: "alpha", adapter: "generic-cli" as const, command: process.execPath };
+    const configA = normalizeConfig({ enabled: true, enabledReviewerIds: ["alpha", "missingA"], reviewers: [alpha] });
+    const configB = normalizeConfig({ enabled: true, enabledReviewerIds: ["alpha", "missingB"], reviewers: [alpha] });
+
+    // Save under A exactly as production does: the store receives the window's
+    // frozen (materialized) configuration, whose unresolved selection lives
+    // beside the config object.
+    const freshState = () => {
+      const state = createState();
+      rememberUserRequest(state, "implement the durable change");
+      beginAgentRun(state);
+      setReviewWindowBaseline(state, {
+        cwd: root,
+        capturedAt: "2026-08-16T00:00:00.000Z",
+        files: new Map(),
+        omissions: [],
+        omissionsTruncated: false,
+      });
+      return state;
+    };
+
+    const saved = freshState();
+    freezeReviewWindowConfig(saved, configA);
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    await store.save(saved, { waveRoots: [], bundles: [] }, saved.reviewWindow!.reviewConfig!);
+    const restored = await store.restore(root);
+    assert.ok(restored);
+
+    // Unchanged reload: the re-frozen window digests identically, so no
+    // reconciliation notice repeats.
+    const unchangedState = freshState();
+    unchangedState.reviewWindow!.reviewConfig = undefined; // persisted windows never carry their frozen config
+    assert.equal(reconcileRestoredReviewWindows(unchangedState, restored, configA).configurationChanged, false);
+
+    // The settings change swaps only the unresolvable selection: the healthy
+    // reviewer still runs and the unresolved selection stays a visible bounded
+    // outcome of the reconciled window.
+    const changedState = freshState();
+    changedState.reviewWindow!.reviewConfig = undefined;
+    assert.equal(reconcileRestoredReviewWindows(changedState, restored, configB).configurationChanged, true);
+    // Re-read through a fresh reference: reconciliation replaced the window's
+    // frozen configuration object (the earlier `= undefined` assignment keeps
+    // TypeScript narrowing the property, so widen it explicitly).
+    const reconciledConfig = changedState.reviewWindow?.reviewConfig as ReviewGateConfig | undefined;
+    assert.ok(reconciledConfig);
+    assert.deepEqual(reconciledConfig.enabledReviewerIds, ["alpha"]);
+    assert.deepEqual(unresolvedReviewerSelectionsFor(reconciledConfig), ["missingB"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy sidecars without a reviewer selection digest restore with an undefined value", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-legacy-digest-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "implement the durable change");
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, {
+      cwd: root,
+      capturedAt: "2026-08-16T00:00:00.000Z",
+      files: new Map(),
+      omissions: [],
+      omissionsTruncated: false,
+    });
+    const config = normalizeConfig({ enabled: true, decider: { id: "reviewer", adapter: "generic-cli", command: process.execPath } });
+    freezeReviewWindowConfig(state, config);
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: [], bundles: [] }, state.reviewWindow!.reviewConfig);
+
+    // Simulate a legacy sidecar by removing the new field and recomputing
+    // the integrity hash over the modified document (same canonical form the
+    // store uses: sha256 of stableJson of the unsigned payload).
+    const raw = JSON.parse(await readFile(store.path, "utf8"));
+    delete raw.reviewerSelectionDigest;
+    const { integritySha256: _integrity, ...unsigned } = raw;
+    const canonical = JSON.parse(JSON.stringify(unsigned));
+    raw.integritySha256 = createHash("sha256").update(stableJsonForTest(canonical)).digest("hex");
+    await writeFile(store.path, `${JSON.stringify(raw)}\n`, "utf8");
+
+    const restored = await store.restore(root);
+    assert.equal(restored?.reviewerSelectionDigest, undefined);
+    assert.ok(typeof restored?.reviewConfigDigest === "string");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

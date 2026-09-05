@@ -10,12 +10,15 @@ import {
   getReviewerQuestionWindow,
   getCorrectionAttemptCount,
   markCappedFeedbackSent,
+  reconcileRestoredReviewWindows,
+  reconcileWindowReviewerSelection,
   recordAcceptedReviewerQuestion,
   recordReviewerFeedback,
   rememberUserRequest,
   setReviewWindowBaseline,
 } from "../src/state";
-import { normalizeConfig } from "../src/config";
+import { duplicateReviewerSelectionsFor, materializeReviewConfig, normalizeConfig, unresolvedReviewerSelectionsFor } from "../src/config";
+import { configDigest, reviewerSelectionDigest } from "../src/session-state";
 
 test("rememberUserRequest appends guidance to the active review window without clearing evidence", () => {
   const state = createState();
@@ -332,6 +335,9 @@ test("historical review context shows internal model labels instead of encoded r
   }), ["ollama/deepseek-v4-flash:0731-cloud"]);
   const reviewer = frozen.reviewers?.[0];
   assert.ok(reviewer);
+  // Production snapshots the running configuration's labels at record time;
+  // the history entry then renders from that snapshot, never from whatever
+  // configuration is current later.
   recordReviewerFeedback(state, {
     source: "automatic",
     disposition: "sent_for_observation",
@@ -341,11 +347,333 @@ test("historical review context shows internal model labels instead of encoded r
       summary: "No issue found.",
       findings: [],
     },
+    displayLabels: { [reviewer.id]: "ollama/deepseek-v4-flash:0731-cloud (high)" },
   });
 
   const context = buildRequestContext(state);
   assert.match(context, /ollama\/deepseek-v4-flash:0731-cloud \(high\) \(pass\)/);
   assert.doesNotMatch(context, new RegExp(reviewer.id));
+});
+
+function reconciledWindowState() {
+  const state = createState();
+  beginAgentRun(state);
+  setReviewWindowBaseline(state, {
+    cwd: "/tmp/project",
+    capturedAt: "2026-07-01T00:00:00.000Z",
+    files: new Map(),
+    omissions: [],
+    omissionsTruncated: false,
+  });
+  state.reviewWindow!.evidence.events.push({
+    sequence: 1,
+    phase: "tool_call",
+    toolName: "edit",
+    summary: "preserved evidence",
+    candidatePaths: ["index.ts"],
+    riskSignals: [],
+  });
+  return state;
+}
+
+test("reconcileRestoredReviewWindows re-freezes restored windows onto the current configuration", () => {
+  const state = reconciledWindowState();
+  const configA = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  // Simulate a restored window whose frozen config was dropped by persistence
+  // and which still carries the legacy blocking flag from an old version.
+  state.reviewWindow!.reviewConfig = undefined;
+  state.reviewWindow!.reviewConfigurationError = "Persisted review state used a different reviewer configuration; clear or reconcile the review window before continuing.";
+
+  const configB = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["two"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+
+  const reconciliation = reconcileRestoredReviewWindows(state, {
+    reviewConfigDigest: configDigest(configA),
+    reviewerSelectionDigest: reviewerSelectionDigest(configA),
+  }, configB);
+
+  assert.equal(reconciliation.windows, 1);
+  assert.equal(reconciliation.reviewers, 1);
+  assert.equal(reconciliation.configurationChanged, true);
+  assert.equal(state.reviewWindow!.reviewConfigurationError, undefined);
+  const reconciledConfig = state.reviewWindow!.reviewConfig as import("../src/config").ReviewGateConfig | undefined;
+  assert.deepEqual(reconciledConfig?.enabledReviewerIds, ["two"]);
+  // Preserved evidence survives reconciliation untouched.
+  assert.equal(state.reviewWindow!.evidence.events.length, 1);
+  assert.equal(state.reviewWindow!.evidence.events[0]?.summary, "preserved evidence");
+});
+
+test("reconcileRestoredReviewWindows reports no change when the reviewer selection is identical", () => {
+  const state = reconciledWindowState();
+  const configA = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  state.reviewWindow!.reviewConfig = undefined;
+
+  // Only unrelated settings changed between save and restore.
+  const configB = normalizeConfig({
+    enabled: true,
+    timeoutMs: 999999,
+    maxPatchBytes: 123456,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+
+  const reconciliation = reconcileRestoredReviewWindows(state, {
+    reviewConfigDigest: configDigest(configA),
+    reviewerSelectionDigest: reviewerSelectionDigest(configA),
+  }, configB);
+
+  assert.equal(reconciliation.configurationChanged, false);
+});
+
+test("reconcileWindowReviewerSelection swaps only the reviewer selection of a frozen window", () => {
+  const state = reconciledWindowState();
+  const configA = normalizeConfig({
+    enabled: true,
+    reviewerTimeoutMs: 555,
+    maxPatchBytes: 100,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  freezeReviewWindowConfig(state, configA);
+  const frozenA = state.reviewWindow!.reviewConfig!;
+
+  // A later in-session settings change selects a different reviewer.
+  const configB = normalizeConfig({
+    enabled: true,
+    reviewerTimeoutMs: 777,
+    maxPatchBytes: 200,
+    enabledReviewerIds: ["two"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+
+  assert.equal(reconcileWindowReviewerSelection(state.reviewWindow!, configB), true);
+  const reconciled = state.reviewWindow!.reviewConfig!;
+  assert.notEqual(reconciled, frozenA);
+  // Only the reviewer selection (and enabled flag) is replaced.
+  assert.deepEqual(reconciled.enabledReviewerIds, ["two"]);
+  assert.equal(reconciled.reviewers?.length, 1);
+  assert.equal(reconciled.reviewers?.[0]?.id, "two");
+  // Evidence-affecting frozen settings and captured state are preserved.
+  assert.equal(reconciled.reviewerTimeoutMs, 555);
+  assert.equal(reconciled.maxPatchBytes, 100);
+  assert.equal(state.reviewWindow!.evidence.events.length, 1);
+  // The previous frozen config object is never mutated: an invocation that
+  // already started under it keeps the exact selection it began with.
+  assert.deepEqual(frozenA.enabledReviewerIds, ["one"]);
+});
+
+test("reconcileWindowReviewerSelection recovers a zero-usable frozen window without reload", () => {
+  const state = reconciledWindowState();
+  // Frozen while the only selection was unresolvable: nothing usable to run.
+  const staleConfig = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["gone"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  freezeReviewWindowConfig(state, staleConfig);
+  assert.equal(state.reviewWindow!.reviewConfig!.reviewers?.length, 0);
+
+  // The settings are fixed in-session; the next review must be able to run.
+  const fixedConfig = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  assert.equal(reconcileWindowReviewerSelection(state.reviewWindow!, fixedConfig), true);
+  assert.equal(state.reviewWindow!.reviewConfig!.reviewers?.length, 1);
+
+  // An unfrozen window needs no reconciliation.
+  const fresh = createState();
+  fresh.reviewWindow = {
+    ...state.reviewWindow!,
+    reviewConfig: undefined,
+  };
+  assert.equal(reconcileWindowReviewerSelection(fresh.reviewWindow!, fixedConfig), false);
+});
+
+test("unresolved reviewer selections travel with the frozen config object", () => {
+  const state = reconciledWindowState();
+  const staleConfig = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one", "gone"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  freezeReviewWindowConfig(state, staleConfig);
+  const frozenStale = state.reviewWindow!.reviewConfig!;
+  assert.deepEqual(unresolvedReviewerSelectionsFor(frozenStale), ["gone"]);
+
+  // Reconciling replaces the window's config object; the old one still
+  // reports its own unresolved selection, so an in-flight invocation under
+  // it observes exactly what it started with.
+  const fixedConfig = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  assert.equal(reconcileWindowReviewerSelection(state.reviewWindow!, fixedConfig), true);
+  assert.deepEqual(unresolvedReviewerSelectionsFor(frozenStale), ["gone"]);
+  assert.deepEqual(unresolvedReviewerSelectionsFor(state.reviewWindow!.reviewConfig!), []);
+});
+
+test("duplicated and unresolved selections travel with the materialized config object", () => {
+  const state = reconciledWindowState();
+  const staleConfig = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one", "one", "gone"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  const frozenStale = freezeReviewWindowConfig(state, staleConfig);
+  assert.deepEqual(unresolvedReviewerSelectionsFor(frozenStale), ["gone"]);
+  assert.deepEqual(duplicateReviewerSelectionsFor(frozenStale), ["one"]);
+
+  // Materialization used outside review windows carries the same metadata.
+  const materialized = materializeReviewConfig(staleConfig, []);
+  assert.deepEqual(unresolvedReviewerSelectionsFor(materialized), ["gone"]);
+  assert.deepEqual(duplicateReviewerSelectionsFor(materialized), ["one"]);
+
+  // Reconciling replaces the window's config object; the old one keeps its
+  // own selection metadata.
+  const fixedConfig = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  assert.equal(reconcileWindowReviewerSelection(state.reviewWindow!, fixedConfig), true);
+  assert.deepEqual(duplicateReviewerSelectionsFor(frozenStale), ["one"]);
+  assert.deepEqual(duplicateReviewerSelectionsFor(state.reviewWindow!.reviewConfig!), []);
+});
+
+test("historical results without a saved identity render by raw reviewer id, not current labels", () => {
+  const state = reconciledWindowState();
+  // The window is frozen under a configuration where reviewer id "one" maps
+  // to a codex-cli selection with model-b.
+  const configB = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "codex-cli", model: "model-b" },
+    ],
+  });
+  freezeReviewWindowConfig(state, configB);
+
+  // A pre-migration history entry: no displayLabel was ever persisted for it.
+  recordReviewerFeedback(state, {
+    result: { reviewerId: "one", verdict: "pass", summary: "No defect found.", findings: [] },
+    reviewerResults: [{ reviewerId: "one", verdict: "pass", summary: "No defect found.", findings: [] }],
+    source: "automatic",
+    disposition: "sent_for_observation",
+  });
+
+  const context = buildRequestContext(state);
+  assert.match(context, /- one \(pass\): No defect found\./);
+  // The current configuration's label for the same id must not be invented.
+  assert.doesNotMatch(context, /model-b/);
+});
+
+test("reconcileRestoredReviewWindows falls back to the broad digest for legacy sidecars", () => {
+  const state = reconciledWindowState();
+  const configA = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["one"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+  state.reviewWindow!.reviewConfig = undefined;
+
+  const configB = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["two"],
+    reviewers: [
+      { id: "one", adapter: "generic-cli", command: process.execPath },
+      { id: "two", adapter: "generic-cli", command: process.execPath },
+    ],
+  });
+
+  // Legacy restore: only the broad digest is available.
+  const reconciliation = reconcileRestoredReviewWindows(state, {
+    reviewConfigDigest: configDigest(configA),
+  }, configB);
+
+  assert.equal(reconciliation.configurationChanged, true);
+});
+
+test("recordReviewerFeedback snapshots reviewer display labels for history attribution", () => {
+  const state = reconciledWindowState();
+  recordReviewerFeedback(state, {
+    source: "automatic",
+    disposition: "sent_for_observation",
+    result: { reviewerId: "one", verdict: "pass", summary: "ok", findings: [] },
+    reviewerResults: [
+      { reviewerId: "one", verdict: "pass", summary: "ok", findings: [] },
+      { reviewerId: "gone", verdict: "error", summary: "not available", findings: [], error: "reviewer_unavailable" },
+    ],
+    displayLabels: { one: "Alpha (cli)" },
+  });
+
+  const recorded = state.reviewWindow!.reviewHistory[0]?.reviewerResults;
+  assert.equal(recorded?.[0]?.displayLabel, "Alpha (cli)");
+  // Unknown selections keep an honest missing label rather than an invented one.
+  assert.equal(recorded?.[1]?.displayLabel, undefined);
+
+  // A later configuration rename must not re-label the completed history.
+  const context = buildRequestContext(state);
+  assert.match(context, /Alpha \(cli\) \(pass\)/);
+  assert.doesNotMatch(context, /one \(pass\)/);
+});
+
+test("recordReviewerFeedback prefers an already-stamped display label", () => {
+  const state = reconciledWindowState();
+  recordReviewerFeedback(state, {
+    source: "automatic",
+    disposition: "sent_for_observation",
+    result: { reviewerId: "one", verdict: "pass", summary: "ok", findings: [], displayLabel: "Original label" },
+    displayLabels: { one: "Renamed label" },
+  });
+
+  assert.equal(state.reviewWindow!.reviewHistory[0]?.reviewerResults[0]?.displayLabel, "Original label");
 });
 
 test("an accepted answer after a passed review seeds the next review window evidence", () => {

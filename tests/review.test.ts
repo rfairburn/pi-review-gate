@@ -3,11 +3,20 @@ import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { reviewerDisplayLabel, type ReviewGateConfig } from "../src/config";
+import { reviewerConfigFingerprint, reviewerDisplayLabel, type ReviewGateConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { createEvidenceState, recordAcceptedReviewerQuestion, recordToolCallEvidence } from "../src/evidence";
 import { runAskReviewer, runReview } from "../src/review";
-import { beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
+import { SessionStateStore } from "../src/session-state";
+import {
+  beginAgentRun,
+  createState,
+  freezeReviewWindowConfig,
+  reconcileWindowReviewerSelection,
+  recordReviewerFeedback,
+  rememberUserRequest,
+  setReviewWindowBaseline,
+} from "../src/state";
 import { fakeNeedsChangesConfig } from "./helpers";
 
 const baseConfig = fakeNeedsChangesConfig({ maxCorrectionCycles: 1 });
@@ -268,6 +277,265 @@ test("multi-review aggregation returns error when no reviewer completes a usable
 
     assert.equal(output.result?.verdict, "error");
     assert.equal(output.result?.summary, "2 error");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale enabled reviewer id produces a bounded outcome while resolvable reviewers run", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-stale-id-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [jsonReviewer("ok", "{verdict:'pass',summary:'healthy reviewer ran',findings:[]}")],
+      enabledReviewerIds: ["ok", "gone"],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    // Documented policy: at least one completed pass with another unresolved
+    // selection passes with warnings; the stale selection stays visible.
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.result?.error, "partial_reviewer_error");
+    assert.deepEqual(
+      output.reviewerResults?.map((result) => ({ reviewerId: result.reviewerId, verdict: result.verdict })),
+      [
+        { reviewerId: "ok", verdict: "pass" },
+        { reviewerId: "gone", verdict: "error" },
+      ],
+    );
+    assert.equal(output.reviewerResults?.[1]?.error, "reviewer_unavailable");
+    assert.match(output.reviewerResults?.[1]?.summary ?? "", /not available in the current configuration/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("same-id reviewer replacement keeps the original configuration fingerprint on historical results", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-same-id-replace-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const secret = "top-secret-value-123";
+    const originalScript = "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'healthy reviewer ran',findings:[]})))";
+    const configA: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [{
+        id: "one",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: ["-e", originalScript],
+        env: { REVIEW_GATE_TEST_SECRET: secret },
+        timeoutMs: 15000,
+      }],
+    };
+
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, before);
+    const frozenA = freezeReviewWindowConfig(state, configA);
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: frozenA,
+      window: state.reviewWindow,
+    });
+
+    assert.equal(output.result?.verdict, "pass");
+    const ranResult = output.reviewerResults?.[0];
+    assert.ok(ranResult);
+    // Gate-owned identity is stamped from the actual invocation configuration.
+    assert.equal(ranResult.reviewerAdapter, "generic-cli");
+    assert.match(ranResult.reviewerConfigFingerprint ?? "", /^[0-9a-f]{64}$/);
+
+    // The settings are replaced in-session: same id, different command/args.
+    const configB: ReviewGateConfig = {
+      ...configA,
+      reviewers: [{
+        id: "one",
+        adapter: "generic-cli",
+        command: "/usr/bin/env",
+        args: ["node", "-e", "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'replacement ran',findings:[]})))"],
+        timeoutMs: 20000,
+      }],
+    };
+    assert.notEqual(reviewerConfigFingerprint(configB.reviewers![0]), ranResult.reviewerConfigFingerprint);
+    assert.equal(reconcileWindowReviewerSelection(state.reviewWindow!, configB), true);
+
+    // Record the completed pass in history (as transmitReviewPass does) and
+    // add a pre-migration entry that never carried any identity metadata.
+    recordReviewerFeedback(state, {
+      result: output.result!,
+      reviewerResults: output.reviewerResults,
+      source: "automatic",
+      disposition: "sent_for_observation",
+      displayLabels: output.reviewerDisplayLabels,
+    });
+    state.reviewWindow!.reviewHistory.push({
+      sequence: 0,
+      source: "manual",
+      disposition: "sent_for_observation",
+      verdict: "pass",
+      reviewerResults: [{ reviewerId: "one", verdict: "pass", summary: "legacy entry", findings: [] }],
+    });
+
+    // Persist with the current (replaced) configuration, as production saves do.
+    const sessionFile = join(dir, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    await store.save(state, { waveRoots: [], bundles: [] }, state.reviewWindow!.reviewConfig!);
+
+    const restored = await store.restore(dir);
+    assert.ok(restored);
+    const history = restored.state.reviewWindow?.reviewHistory ?? [];
+    const legacy = history.find((entry) => entry.sequence === 0)?.reviewerResults[0];
+    const stamped = history.find((entry) => entry.sequence !== 0)?.reviewerResults[0];
+    assert.equal(stamped?.reviewerId, "one");
+    // The old configuration's fingerprint stays attributed after reload even
+    // though the current settings no longer match it.
+    assert.equal(stamped?.reviewerAdapter, "generic-cli");
+    assert.equal(stamped?.reviewerConfigFingerprint, ranResult.reviewerConfigFingerprint);
+    assert.notEqual(stamped?.reviewerConfigFingerprint, reviewerConfigFingerprint(configB.reviewers![0]));
+    // Legacy entries are not relabeled or backfilled from the current config.
+    assert.equal(legacy?.displayLabel, undefined);
+    assert.equal(legacy?.reviewerAdapter, undefined);
+    assert.equal(legacy?.reviewerConfigFingerprint, undefined);
+
+    // No configuration secret or raw command material leaks into persisted
+    // result metadata: only the one-way fingerprint crosses the boundary.
+    const sidecar = await readFile(store.path, "utf8");
+    assert.doesNotMatch(sidecar, new RegExp(secret));
+    assert.doesNotMatch(sidecar, /REVIEW_GATE_TEST_SECRET/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a review with only unresolvable selections errors without invoking any reviewer", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-all-stale-"));
+  const okInvocations = join(dir, "ok-invocations.txt");
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [{
+        id: "ok",
+        adapter: "generic-cli" as const,
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `const p=${JSON.stringify(okInvocations)};`,
+            "fs.writeFileSync(p,'ran');",
+            "process.stdin.resume();",
+            "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'must not run',findings:[]})))",
+          ].join(""),
+        ],
+        timeoutMs: 15000,
+      }],
+      enabledReviewerIds: ["gone"],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    // Fail closed: zero usable reviewers never becomes a pass.
+    assert.equal(output.result?.verdict, "error");
+    assert.deepEqual(
+      output.reviewerResults?.map((result) => ({ reviewerId: result.reviewerId, verdict: result.verdict })),
+      [{ reviewerId: "gone", verdict: "error" }],
+    );
+    assert.equal(output.reviewerResults?.[0]?.error, "reviewer_unavailable");
+    assert.equal(await readFile(okInvocations, "utf8").catch(() => "absent"), "absent");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a duplicate enabled reviewer id runs once instead of blocking the whole review", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-duplicate-id-"));
+  const invocations = join(dir, "codex-invocations.txt");
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const counting = jsonReviewer("codex", "{verdict:'pass',summary:'ran once',findings:[]}");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      retainBundles: "always",
+      decider: undefined,
+      reviewers: [{
+        ...counting,
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            `const p=${JSON.stringify(invocations)};`,
+            "fs.writeFileSync(p,String((Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0))+1));",
+            counting.args![1],
+          ].join(""),
+        ],
+      }],
+      enabledReviewerIds: ["codex", "codex"],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.reviewerResults?.length, 1);
+    assert.equal(await readFile(invocations, "utf8"), "1", "a duplicated selection must not run twice");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a review with zero configured reviewers keeps the bounded configuration error", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-zero-configured-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      decider: undefined,
+      reviewers: [],
+    };
+
+    const output = await runReview({ cwd: dir, request: "change index", before, config });
+
+    assert.equal(output.changed, true);
+    assert.equal(output.result, undefined);
+    assert.equal(output.error, "No reviewers configured.");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

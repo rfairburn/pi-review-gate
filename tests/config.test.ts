@@ -15,6 +15,8 @@ import {
   MAX_WEB_SEARCH_RESULTS,
   normalizeConfig,
   resolveReviewers,
+  reviewerConfigFingerprint,
+  type DeciderConfig,
   resolvedExecutorPool,
   resolvedWorkerResources,
   resolvedWorkerRoute,
@@ -581,7 +583,72 @@ test("resolveReviewers reports stale and duplicate enabled ids without rejecting
 
   assert.deepEqual(resolution.unknownIds, ["missing"]);
   assert.deepEqual(resolution.duplicateEnabledIds, ["codex"]);
-  assert.equal(automaticReviewEnabled(config), false);
+  // Stale or duplicated selections no longer disable the whole gate: the
+  // resolvable subset still runs and the unresolved selections produce
+  // explicit bounded outcomes at run time.
+  assert.equal(automaticReviewEnabled(config), true);
+  // Materialization (used for command paths and persistence digests) stays
+  // consistent with window-freeze semantics.
+  const materialized = materializeReviewConfig(config, []);
+  assert.equal(materialized.enabled, true);
+  assert.deepEqual(materialized.reviewers?.map((reviewer) => reviewer.id), ["codex"]);
+  const onlyStale = normalizeConfig({
+    enabled: true,
+    enabledReviewerIds: ["missing"],
+    reviewers: [{ id: "codex", adapter: "codex-cli" }],
+  });
+  assert.equal(materializeReviewConfig(onlyStale, []).enabled, false);
+});
+
+test("reviewerConfigFingerprint distinguishes same-id replacements without exposing raw configuration", () => {
+  const secret = "top-secret-value-123";
+  const baseRaw = {
+    enabled: true,
+    reviewers: [{
+      id: "one",
+      adapter: "generic-cli" as const,
+      command: process.execPath,
+      args: ["-e", "review-script-marker"],
+      env: { REVIEW_GATE_TEST_SECRET: secret },
+      timeoutMs: 15000,
+    }],
+  };
+  const original = normalizeConfig(baseRaw).reviewers![0];
+  const fingerprint = reviewerConfigFingerprint(original);
+
+  // Hash-only identity: a 64-character hex digest that never contains raw
+  // configuration values (command, args, env).
+  assert.match(fingerprint, /^[0-9a-f]{64}$/);
+  assert.doesNotMatch(fingerprint, new RegExp(secret));
+  assert.doesNotMatch(fingerprint, /review-script-marker/);
+
+  // Deterministic for the same effective configuration, including key order.
+  assert.equal(reviewerConfigFingerprint(normalizeConfig(baseRaw).reviewers![0]), fingerprint);
+  const reordered: DeciderConfig = {
+    timeoutMs: original.timeoutMs!,
+    env: { ...original.env! },
+    args: [...original.args!],
+    command: original.command!,
+    adapter: "generic-cli",
+    id: "one",
+  };
+  assert.equal(reviewerConfigFingerprint(reordered), fingerprint);
+
+  // Every same-id replacement that changes the effective configuration is
+  // distinguishable after reload.
+  const varied = normalizeConfig({
+    ...baseRaw,
+    reviewers: [{ ...baseRaw.reviewers![0], command: "/usr/bin/env", args: ["other-script"], env: { OTHER: "value" }, timeoutMs: 20000 }],
+  }).reviewers![0];
+  assert.notEqual(reviewerConfigFingerprint(varied), fingerprint);
+
+  // Model and thinking level participate where applicable.
+  const modelA = normalizeConfig({ enabled: true, reviewers: [{ id: "m", adapter: "codex-cli" as const, model: "model-a" }] }).reviewers![0];
+  const modelB = normalizeConfig({ enabled: true, reviewers: [{ id: "m", adapter: "codex-cli" as const, model: "model-b" }] }).reviewers![0];
+  assert.notEqual(reviewerConfigFingerprint(modelA), reviewerConfigFingerprint(modelB));
+  const thinkingA = normalizeConfig({ enabled: true, reviewers: [{ id: "p", adapter: "pi-model" as const, model: "m1", thinkingLevel: "low" }] }).reviewers![0];
+  const thinkingB = normalizeConfig({ enabled: true, reviewers: [{ id: "p", adapter: "pi-model" as const, model: "m1", thinkingLevel: "high" }] }).reviewers![0];
+  assert.notEqual(reviewerConfigFingerprint(thinkingA), reviewerConfigFingerprint(thinkingB));
 });
 
 test("shared external agents resolve independently for review and execution", () => {

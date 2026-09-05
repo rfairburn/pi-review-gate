@@ -13,10 +13,12 @@ import type { TokenUsage } from "./usage";
 import {
   automaticReviewEnabled,
   configWithReviewers,
+  rememberDuplicateReviewerSelections,
+  rememberUnresolvedReviewerSelections,
   resolveReviewers,
-  reviewerDisplayLabels,
   type ReviewGateConfig,
 } from "./config";
+import { configDigest, reviewerSelectionDigest } from "./session-state";
 
 export type ReviewFeedbackSource = "automatic" | "manual";
 export type ReviewFeedbackDisposition =
@@ -204,23 +206,107 @@ export function activeExchangeBaseline(state: ReviewGateState): WorkspaceSnapsho
 
 export function freezeReviewWindowConfig(state: ReviewGateState, config: ReviewGateConfig, scopedModels: string[] = []): ReviewGateConfig {
   const window = state.reviewWindow ?? openReviewWindow(state);
+  return freezeWindowConfig(window, config, scopedModels);
+}
+
+function freezeWindowConfig(window: ReviewWindow, config: ReviewGateConfig, scopedModels: string[] = []): ReviewGateConfig {
   if (window.reviewConfig) {
     return window.reviewConfig;
   }
   const resolution = resolveReviewers(config, scopedModels);
-  const issues = [
-    resolution.unknownIds.length > 0 ? `unknown enabled reviewer ids: ${resolution.unknownIds.join(", ")}` : "",
-    resolution.duplicateEnabledIds.length > 0
-      ? `duplicate enabled reviewer ids: ${resolution.duplicateEnabledIds.join(", ")}`
-      : "",
-  ].filter(Boolean);
-  window.reviewConfigurationError = config.enabled && issues.length > 0 ? issues.join("; ") : undefined;
-  window.reviewConfig = configWithReviewers(
+  // Unresolvable or duplicated selections are not a hard selection error:
+  // they produce explicit bounded outcomes at run time while every resolvable
+  // reviewer still runs. The frozen config materializes only the resolvable
+  // subset, so the unresolved selections are remembered beside it.
+  const frozen = configWithReviewers(
     config,
     resolution.reviewers,
     automaticReviewEnabled(config, scopedModels),
   );
+  rememberUnresolvedReviewerSelections(frozen, resolution.unknownIds);
+  rememberDuplicateReviewerSelections(frozen, resolution.duplicateEnabledIds);
+  window.reviewConfig = frozen;
   return window.reviewConfig;
+}
+
+/**
+ * Reconcile an already-frozen review window to the current reviewer selection
+ * after an in-session settings change. Only the reviewer selection (and its
+ * enabled flag) is replaced: evidence-affecting frozen settings (snapshot and
+ * patch limits, timeouts) and every captured baseline, evidence event, and
+ * completed history entry are preserved untouched. The previous frozen config
+ * object is never mutated, so an invocation that already started under it
+ * keeps the exact selection it began with.
+ */
+export function reconcileWindowReviewerSelection(
+  window: ReviewWindow,
+  config: ReviewGateConfig,
+  scopedModels: string[] = [],
+): boolean {
+  if (!window.reviewConfig) {
+    // Not frozen yet: the next freeze already uses the current configuration.
+    return false;
+  }
+  const resolution = resolveReviewers(config, scopedModels);
+  const reconciled = configWithReviewers(
+    window.reviewConfig,
+    resolution.reviewers,
+    automaticReviewEnabled(config, scopedModels),
+  );
+  rememberUnresolvedReviewerSelections(reconciled, resolution.unknownIds);
+  rememberDuplicateReviewerSelections(reconciled, resolution.duplicateEnabledIds);
+  window.reviewConfig = reconciled;
+  return true;
+}
+
+export interface RestoredReviewConfigReconciliation {
+  /** Number of persisted windows re-frozen against the current configuration. */
+  windows: number;
+  /** Number of reviewers the effective reconciled configuration resolves to. */
+  reviewers: number;
+  /** True when the persisted state was saved under a different review configuration. */
+  configurationChanged: boolean;
+}
+
+/**
+ * Reconcile restored review windows onto the current reviewer configuration.
+ *
+ * Persisted windows never carry their frozen reviewer configuration; they are
+ * re-frozen against the live settings here. When the persisted digest differs
+ * from the reconciled one, the settings changed between save and restore: the
+ * preserved baseline, evidence, and completed history are kept untouched and
+ * reviewed with the current configuration instead of being blocked or
+ * cleared. Legacy sidecars may carry the blocking reviewConfigurationError
+ * flag from versions that hard-blocked mismatches; reconciliation clears it.
+ * Genuine corruption never reaches this point: the store rejects it during
+ * restore before any state is applied.
+ */
+export function reconcileRestoredReviewWindows(
+  state: ReviewGateState,
+  restored: { reviewConfigDigest?: string; reviewerSelectionDigest?: string },
+  config: ReviewGateConfig,
+  scopedModels: string[] = [],
+): RestoredReviewConfigReconciliation {
+  let windows = 0;
+  for (const window of [state.reviewWindow, state.lastQuestionWindow]) {
+    if (!window) continue;
+    window.reviewConfigurationError = undefined;
+    freezeWindowConfig(window, config, scopedModels);
+    windows += 1;
+  }
+  const effective = state.reviewWindow?.reviewConfig ?? state.lastQuestionWindow?.reviewConfig;
+  let configurationChanged = false;
+  if (effective !== undefined) {
+    configurationChanged = restored.reviewerSelectionDigest !== undefined
+      ? restored.reviewerSelectionDigest !== reviewerSelectionDigest(effective)
+      : restored.reviewConfigDigest !== undefined
+        && restored.reviewConfigDigest !== configDigest(effective);
+  }
+  return {
+    windows,
+    reviewers: effective?.reviewers?.length ?? 0,
+    configurationChanged,
+  };
 }
 
 export function checkpointReviewWindow(state: ReviewGateState, snapshot: WorkspaceSnapshot): void {
@@ -332,6 +418,8 @@ export function recordReviewerFeedback(
     reviewSequence?: number;
     source: ReviewFeedbackSource;
     disposition: ReviewFeedbackDisposition;
+    /** Display labels of the configuration that actually ran this review. */
+    displayLabels?: Record<string, string>;
   },
 ): void {
   const window = state.reviewWindow;
@@ -343,7 +431,18 @@ export function recordReviewerFeedback(
     source: input.source,
     disposition: input.disposition,
     verdict: input.result.verdict,
-    reviewerResults: (input.reviewerResults ?? [input.result]).map(cloneReviewResult),
+    reviewerResults: (input.reviewerResults ?? [input.result]).map((result) => {
+      const cloned = cloneReviewResult(result);
+      // Snapshot the label of the configuration that actually ran this
+      // reviewer so completed history stays attributable after the window's
+      // configuration is reconciled to newer settings. Unknown ids keep an
+      // honest missing label rather than an invented one.
+      if (cloned.displayLabel === undefined) {
+        const label = input.displayLabels?.[result.reviewerId];
+        if (typeof label === "string" && label.length > 0) cloned.displayLabel = label;
+      }
+      return cloned;
+    }),
   });
 }
 
@@ -356,6 +455,7 @@ export function recordReviewerFeedbackAndArmExchange(
     source: ReviewFeedbackSource;
     disposition: ReviewFeedbackDisposition;
     reviewedSnapshot: WorkspaceSnapshot;
+    displayLabels?: Record<string, string>;
   },
 ): void {
   recordReviewerFeedback(state, input);
@@ -393,12 +493,6 @@ export function buildRequestContext(
     "",
     ...renderUserRequestContext(window),
   ];
-  const displayLabels = new Map(
-    Object.entries(reviewerDisplayLabels(
-      window.reviewConfig ? resolveReviewers(window.reviewConfig).reviewers : [],
-    )),
-  );
-
   if (window.reviewHistory.length > 0) {
     lines.push(
       "",
@@ -416,7 +510,12 @@ export function buildRequestContext(
       if (feedback.reviewerResults.length > 0) {
         lines.push("Complete individual reviewer results delivered to the implementing model:");
         for (const reviewer of feedback.reviewerResults) {
-          const displayLabel = displayLabels.get(reviewer.reviewerId) ?? reviewer.reviewerId;
+          // Historical entries render with the label snapshotted at record
+          // time, or their raw reviewer id when that identity was never
+          // persisted (pre-migration sidecars). Current configuration labels
+          // are never consulted: a replaced reviewer that kept its id must
+          // not re-label completed results.
+          const displayLabel = reviewer.displayLabel ?? reviewer.reviewerId;
           lines.push(`- ${displayLabel} (${reviewer.verdict}): ${reviewer.summary}`);
           if (reviewer.guidance) {
             lines.push(`  Guidance: ${reviewer.guidance}`);

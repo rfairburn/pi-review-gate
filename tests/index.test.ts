@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
@@ -729,6 +730,839 @@ test("review state restores only when the same persisted conversation resumes", 
     await activate(fresh.pi);
     await trigger(fresh.hooks, "session_start", { type: "session_start", reason: "new" }, fresh.ctx);
     assert.doesNotMatch(fresh.notices.join("\n"), /restored conversation state revision/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/** Deterministic fake generic-cli reviewer that counts invocations and passes. */
+function countingPassReviewer(id: string, invocationPath: string) {
+  return {
+    id,
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [
+      "-e",
+      [
+        "const fs=require('node:fs');",
+        `const invocationPath=${JSON.stringify(invocationPath)};`,
+        "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+        "fs.writeFileSync(invocationPath,String(count+1));",
+        "process.stdin.resume();",
+        `process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:${JSON.stringify(`${id} passed`)},findings:[]})));`,
+      ].join(""),
+    ],
+    timeoutMs: 15000,
+  };
+}
+
+/** countingPassReviewer that also appends the full review prompt (the
+ *  request context included) so tests can inspect what a reviewer saw. */
+function countingPassReviewerWithPromptDump(id: string, invocationPath: string, promptPath: string) {
+  return {
+    id,
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [
+      "-e",
+      [
+        "const fs=require('node:fs');",
+        `const invocationPath=${JSON.stringify(invocationPath)};`,
+        "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+        "fs.writeFileSync(invocationPath,String(count+1));",
+        "let prompt='';",
+        "process.stdin.on('data',(chunk)=>{prompt+=chunk;});",
+        `process.stdin.on('end',()=>{fs.appendFileSync(${JSON.stringify(promptPath)},prompt);process.stdout.write(JSON.stringify({verdict:'pass',summary:${JSON.stringify(`${id} passed`)},findings:[]}));});`,
+      ].join(""),
+    ],
+    timeoutMs: 15000,
+  };
+}
+
+/** Canonical JSON with sorted object keys (same form the sidecar integrity
+ *  hash uses), for simulating pre-migration sidecars in tests. */
+function stableJsonForTest(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJsonForTest).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJsonForTest(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Recursively removes every displayLabel key (simulating a pre-migration
+ *  sidecar whose results never carried a snapshotted identity). */
+function stripDisplayLabels(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripDisplayLabels);
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
+      if (key === "displayLabel") delete record[key];
+      else record[key] = stripDisplayLabels(record[key]);
+    }
+  }
+  return value;
+}
+
+/** Like countingPassReviewer but records an explicit readiness marker and then
+ *  blocks until the parent test writes the release file, so a settings change
+ *  can be scripted while the invocation is provably still in flight. A verdict
+ *  marker is written only once the release gate opens and the verdict is about
+ *  to be emitted, giving the parent a deterministic not-yet-settled probe.
+ *  Same poll-for-release pattern as the clean-exit-order decider fixture. */
+function releaseGatedCountingPassReviewer(id: string, invocationPath: string, startedPath: string, releasePath: string, emittedPath: string) {
+  return {
+    id,
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [
+      "-e",
+      [
+        "const fs=require('node:fs');",
+        `const invocationPath=${JSON.stringify(invocationPath)};`,
+        "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+        "fs.writeFileSync(invocationPath,String(count+1));",
+        `fs.writeFileSync(${JSON.stringify(startedPath)},'started');`,
+        "const timer=setInterval(()=>{",
+        `if(!fs.existsSync(${JSON.stringify(releasePath)}))return;`,
+        "clearInterval(timer);",
+        `fs.writeFileSync(${JSON.stringify(emittedPath)},'emitted');`,
+        `process.stdout.write(JSON.stringify({verdict:'pass',summary:${JSON.stringify(`${id} passed`)},findings:[]}));`,
+        "},10);",
+      ].join(""),
+    ],
+    timeoutMs: 15000,
+  };
+}
+
+async function runFirstReviewSession(dir: string, sessionFile: string) {
+  const first = createSessionRuntime("conversation-a", sessionFile, dir);
+  await activate(first.pi);
+  await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+  await trigger(first.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, first.ctx);
+  await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+  await writeFile(join(dir, "index.ts"), "v1\n", "utf8");
+  await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo reconcile-evidence" } }, first.ctx);
+  await triggerAgentEnd(first.hooks, {
+    cwd: dir,
+    messages: [{ role: "assistant", content: "first assistant summary" }],
+  });
+  await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+  return first;
+}
+
+test("a persisted review window reconciles to changed reviewer settings on reload without clearing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-ab-"));
+  try {
+    const alphaInvocations = join(dir, "alpha-invocations.txt");
+    const betaInvocations = join(dir, "beta-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    const writeConfig = (value: Record<string, unknown>) => writeFile(configPath, JSON.stringify({ ...indexTestConfig, ...value }), "utf8");
+    await writeConfig({ reviewers: [countingPassReviewer("alpha", alphaInvocations)] });
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    // Session 1 persists a passed review window under reviewer set A.
+    const first = await runFirstReviewSession(dir, sessionFile);
+    assert.match(first.notices.join("\n"), /review gate: passed/);
+    assert.equal(await readFile(alphaInvocations, "utf8"), "1");
+
+    // The user changes the reviewer settings to set B and resumes.
+    await writeConfig({ reviewers: [countingPassReviewer("beta", betaInvocations)] });
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+
+    const restoredStore = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const restoredAfterStart = await restoredStore.restore(dir);
+    assert.ok(restoredAfterStart?.state.reviewWindow, "reconciliation must not clear the persisted review window");
+    assert.equal(restoredAfterStart.state.reviewWindow?.requestHistory[0]?.text, "implement the change");
+    assert.match(
+      restoredAfterStart.state.reviewWindow?.evidence.events.map((event) => event.summary).join(" ") ?? "",
+      /reconcile-evidence/,
+      "captured evidence must survive reconciliation",
+    );
+    assert.equal(restoredAfterStart.state.reviewWindow?.reviewHistory.length, 1);
+    assert.equal(restoredAfterStart.state.reviewWindow?.reviewHistory[0]?.reviewerResults[0]?.reviewerId, "alpha");
+
+    // The next turn reviews the same captured baseline/evidence with B.
+    await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
+    await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
+    await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
+    await trigger(resumed.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo second-evidence" } }, resumed.ctx);
+    await triggerAgentEnd(resumed.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "second assistant summary" }],
+    });
+
+    assert.equal(await readFile(betaInvocations, "utf8"), "1", "the current reviewer set must review the preserved window");
+    assert.equal(await readFile(alphaInvocations, "utf8"), "1", "a removed reviewer must never be resurrected");
+    assert.match(resumed.notices.join("\n"), /review gate: passed/);
+
+    const finalState = await restoredStore.restore(dir);
+    const history = finalState?.state.reviewWindow?.reviewHistory ?? [];
+    assert.equal(history.length, 2, "the completed historical result and the reconciled review are both retained");
+    assert.equal(history[0]?.verdict, "pass");
+    assert.equal(history[0]?.reviewerResults[0]?.reviewerId, "alpha", "history stays attributed to its original reviewer");
+    assert.equal(history[1]?.reviewerResults[0]?.reviewerId, "beta");
+
+    // A repeated reload under the same settings is idempotent: no second
+    // reconciliation notice and no further state change.
+    const again = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(again.pi);
+    await trigger(again.hooks, "session_start", { type: "session_start", reason: "resume" }, again.ctx);
+    assert.doesNotMatch(again.notices.join("\n"), /reconciled/);
+    assert.match(again.notices.join("\n"), /restored conversation state revision/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("in-session reviewer settings changes reconcile open review windows without reload", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-insession-"));
+  try {
+    const alphaInvocations = join(dir, "alpha-invocations.txt");
+    const betaInvocations = join(dir, "beta-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    // Both reviewers exist in the catalog; only alpha is selected initially.
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      enabledReviewerIds: ["alpha"],
+      reviewers: [countingPassReviewer("alpha", alphaInvocations), countingPassReviewer("beta", betaInvocations)],
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    let reviewSettings: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    const session = createSessionRuntime("conversation-a", sessionFile, dir, {
+      reviewSettings: (handler) => { reviewSettings = handler; },
+    });
+    await activate(session.pi);
+    assert.ok(reviewSettings, "the /review-settings command must be registered");
+
+    await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
+    await trigger(session.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, session.ctx);
+    await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
+    await writeFile(join(dir, "index.ts"), "v1\n", "utf8");
+    await trigger(session.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo reconcile-evidence" } }, session.ctx);
+    await triggerAgentEnd(session.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "first assistant summary" }],
+    });
+
+    assert.equal(await readFile(alphaInvocations, "utf8"), "1");
+    assert.match(session.notices.join("\n"), /review gate: passed/);
+
+    // In-session settings change: swap the selection from alpha to beta via
+    // the /review-settings UI. No reload happens.
+    let rootMenu = 0;
+    let reviewerMenu = 0;
+    await reviewSettings!("", {
+      ui: {
+        select: async (title: string, options: string[]) => {
+          if (title === "Review settings") {
+            return rootMenu++ === 0
+              ? options.find((option) => option.startsWith("Reviewers"))!
+              : "Save changes";
+          }
+          if (title.startsWith("Reviewers —")) {
+            const step = reviewerMenu++;
+            if (step === 0) return options.find((option) => option.startsWith("alpha [generic-cli]"))!;
+            if (step === 1) return options.find((option) => option.startsWith("beta [generic-cli]"))!;
+            return "Back";
+          }
+          return undefined;
+        },
+        notify() {},
+      },
+    });
+
+    assert.match(
+      session.notices.join("\n"),
+      /1 review window\(s\) reconciled to the updated reviewer settings \(1 configured reviewer\(s\)\)/,
+    );
+
+    // The next turn reviews the same preserved window under beta.
+    await trigger(session.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, session.ctx);
+    await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
+    await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
+    await trigger(session.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo second-evidence" } }, session.ctx);
+    await triggerAgentEnd(session.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "second assistant summary" }],
+    });
+
+    assert.equal(await readFile(betaInvocations, "utf8"), "1", "the updated selection must review the preserved window without reload");
+    assert.equal(await readFile(alphaInvocations, "utf8"), "1", "the old selection must not be resurrected");
+    assert.match(session.notices.join("\n"), /review gate: passed/);
+
+    await trigger(session.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, session.ctx);
+
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const finalState = await store.restore(dir);
+    const history = finalState?.state.reviewWindow?.reviewHistory ?? [];
+    assert.equal(history.length, 2, "both completed reviews are retained");
+    assert.equal(history[0]?.reviewerResults[0]?.reviewerId, "alpha", "history stays attributed to its original reviewer");
+    assert.equal(history[1]?.reviewerResults[0]?.reviewerId, "beta");
+    // Captured evidence survives the in-session reconciliation.
+    assert.match(
+      finalState?.state.reviewWindow?.evidence.events.map((event) => event.summary).join(" ") ?? "",
+      /reconcile-evidence/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a zero-usable frozen window recovers when reviewer settings are fixed in-session", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-zero-usable-"));
+  try {
+    const alphaInvocations = join(dir, "alpha-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    // The only selection is unresolvable: the window freezes with nothing
+    // usable to run and reviews must fail closed without clearing it.
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      enabledReviewerIds: ["gone"],
+      reviewers: [countingPassReviewer("alpha", alphaInvocations)],
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    let reviewSettings: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    const session = createSessionRuntime("conversation-a", sessionFile, dir, {
+      reviewSettings: (handler) => { reviewSettings = handler; },
+    });
+    await activate(session.pi);
+
+    await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
+    await trigger(session.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, session.ctx);
+    await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
+    await writeFile(join(dir, "index.ts"), "v1\n", "utf8");
+    await trigger(session.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo zero-usable-evidence" } }, session.ctx);
+    await triggerAgentEnd(session.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "first assistant summary" }],
+    });
+
+    assert.match(session.notices.join("\n"), /no configured reviewer is currently available/);
+    await assert.rejects(access(alphaInvocations), /ENOENT/, "nothing may run while no reviewer is usable");
+
+    // Fix the selection in-session: enable alpha via /review-settings.
+    let rootMenu = 0;
+    let reviewerMenu = 0;
+    await reviewSettings!("", {
+      ui: {
+        select: async (title: string, options: string[]) => {
+          if (title === "Review settings") {
+            return rootMenu++ === 0
+              ? options.find((option) => option.startsWith("Reviewers"))!
+              : "Save changes";
+          }
+          if (title.startsWith("Reviewers —")) {
+            const step = reviewerMenu++;
+            if (step === 0) return options.find((option) => option.startsWith("alpha [generic-cli]"))!;
+            return "Back";
+          }
+          return undefined;
+        },
+        notify() {},
+      },
+    });
+
+    assert.match(session.notices.join("\n"), /1 review window\(s\) reconciled to the updated reviewer settings/);
+
+    // The next turn runs alpha over the same preserved window — no reload.
+    await trigger(session.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, session.ctx);
+    await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
+    await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
+    await trigger(session.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo second-evidence" } }, session.ctx);
+    await triggerAgentEnd(session.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "second assistant summary" }],
+    });
+
+    assert.equal(await readFile(alphaInvocations, "utf8"), "1");
+    assert.match(session.notices.join("\n"), /review gate: passed/);
+
+    await trigger(session.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, session.ctx);
+
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const finalState = await store.restore(dir);
+    assert.match(
+      finalState?.state.reviewWindow?.evidence.events.map((event) => event.summary).join(" ") ?? "",
+      /zero-usable-evidence/,
+      "the deferred window's evidence must survive the settings fix",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a reviewer settings change during an active invocation keeps the in-flight selection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-inflight-"));
+  const alphaStarted = join(dir, "alpha-started.txt");
+  const alphaRelease = join(dir, "alpha-release.txt");
+  const alphaEmitted = join(dir, "alpha-verdict-emitted.txt");
+  // The un-awaited settle promise for the turn whose review is in flight, plus
+  // a flag confirming whether it has resolved. Used both for the "still blocked
+  // during the settings change" assertion and for bounded teardown.
+  let settled: Promise<void> | undefined;
+  let settledDone = false;
+  // Kept accessible to teardown so a stuck settle can be escalated through a
+  // session shutdown (which aborts the in-flight review) before the workspace
+  // is deleted.
+  let sessionRef: ReturnType<typeof createSessionRuntime> | undefined;
+  try {
+    const alphaInvocations = join(dir, "alpha-invocations.txt");
+    const betaInvocations = join(dir, "beta-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      enabledReviewerIds: ["alpha"],
+      reviewers: [releaseGatedCountingPassReviewer("alpha", alphaInvocations, alphaStarted, alphaRelease, alphaEmitted), countingPassReviewer("beta", betaInvocations)],
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    let reviewSettings: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    const session = createSessionRuntime("conversation-a", sessionFile, dir, {
+      reviewSettings: (handler) => { reviewSettings = handler; },
+    });
+    sessionRef = session;
+    await activate(session.pi);
+
+    await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
+    await trigger(session.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, session.ctx);
+    await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
+    await writeFile(join(dir, "index.ts"), "v1\n", "utf8");
+    await trigger(session.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo inflight-evidence" } }, session.ctx);
+
+    // Start the settle without awaiting it; alpha's invocation is in flight
+    // and provably cannot finish until the parent writes the release file.
+    settled = triggerAgentEnd(session.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "first assistant summary" }],
+    }).finally(() => { settledDone = true; });
+    // Guard against an unhandled rejection if the reviewer dies before the
+    // happy-path await; awaiting `settled` below still surfaces the error.
+    settled.catch(() => {});
+    // Explicit readiness gate: alpha has started and recorded its invocation.
+    await waitForFile(alphaStarted);
+
+    // Swap the selection to beta while alpha is still running.
+    let rootMenu = 0;
+    let reviewerMenu = 0;
+    await reviewSettings!("", {
+      ui: {
+        select: async (title: string, options: string[]) => {
+          if (title === "Review settings") {
+            return rootMenu++ === 0
+              ? options.find((option) => option.startsWith("Reviewers"))!
+              : "Save changes";
+          }
+          if (title.startsWith("Reviewers —")) {
+            const step = reviewerMenu++;
+            if (step === 0) return options.find((option) => option.startsWith("alpha [generic-cli]"))!;
+            if (step === 1) return options.find((option) => option.startsWith("beta [generic-cli]"))!;
+            return "Back";
+          }
+          return undefined;
+        },
+        notify() {},
+      },
+    });
+
+    // The settings save reconciled the open window while the original reviewer
+    // was provably still blocked in flight.
+    assert.match(
+      session.notices.join("\n"),
+      /1 review window\(s\) reconciled to the updated reviewer settings \(1 configured reviewer\(s\)\)/,
+      "settings reconciliation must complete while the original reviewer is blocked in flight",
+    );
+    assert.equal(settledDone, false, "the in-flight invocation must not settle before the parent releases the reviewer");
+    // Deterministic in-flight proof: the reviewer only writes its verdict
+    // marker after the release gate opens, so its absence here means the
+    // original invocation is provably still blocked during the settings save.
+    await assert.rejects(access(alphaEmitted), /ENOENT/, "the reviewer must not have emitted a verdict before the parent released it");
+
+    // Release the gate; the in-flight pass completes under its original selection.
+    await writeFile(alphaRelease, "release\n", "utf8");
+    await settled;
+    assert.equal(await readFile(alphaInvocations, "utf8"), "1", "the in-flight invocation completes under its original selection");
+    assert.equal(await access(betaInvocations).then(() => true, () => false), false, "beta must not join an already-started review");
+
+    // The next turn uses the new selection.
+    await trigger(session.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, session.ctx);
+    await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
+    await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
+    await trigger(session.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo second-evidence" } }, session.ctx);
+    await triggerAgentEnd(session.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "second assistant summary" }],
+    });
+
+    assert.equal(await readFile(betaInvocations, "utf8"), "1");
+    assert.equal(await readFile(alphaInvocations, "utf8"), "1");
+
+    await trigger(session.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, session.ctx);
+
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const finalState = await store.restore(dir);
+    const history = finalState?.state.reviewWindow?.reviewHistory ?? [];
+    assert.equal(history.length, 2);
+    // The in-flight pass keeps alpha's identity; the later pass is beta.
+    assert.equal(history[0]?.reviewerResults[0]?.reviewerId, "alpha");
+    assert.equal(history[0]?.reviewerResults[0]?.displayLabel, "alpha", "the result is stamped with the configuration that ran it");
+    assert.equal(history[1]?.reviewerResults[0]?.reviewerId, "beta");
+  } finally {
+    if (sessionRef && settled && !settledDone) {
+      // Bounded teardown on assertion failure: release the gate so the
+      // reviewer can finish normally, then await settlement. If a bounded
+      // grace period expires first, escalate to session shutdown — which
+      // aborts the in-flight review and kills its child (the reviewer's own
+      // timeoutMs is the hard backstop) — and still await the original settle
+      // so no test-owned work outlives this test. The workspace is deleted
+      // only after settlement completes.
+      try { await writeFile(alphaRelease, "release\n", "utf8"); } catch { /* release is best-effort */ }
+      let graceTimer: NodeJS.Timeout | undefined;
+      const grace = new Promise<void>((resolve) => {
+        graceTimer = setTimeout(resolve, 3000);
+      });
+      await Promise.race([settled.catch(() => {}), grace]);
+      clearTimeout(graceTimer);
+      if (!settledDone) {
+        // Grace expired: the settle is stuck. Shut the session down to abort
+        // the in-flight review, then await the original settle before
+        // deleting anything.
+        await trigger(
+          sessionRef.hooks,
+          "session_shutdown",
+          { type: "session_shutdown", reason: "quit" },
+          sessionRef.ctx,
+        ).catch(() => {});
+        await settled.catch(() => {});
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a pre-migration sidecar keeps historical identities honest after reconciliation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-legacy-"));
+  try {
+    const oneInvocationsA = join(dir, "one-a-invocations.txt");
+    const oneInvocationsB = join(dir, "one-b-invocations.txt");
+    const promptB = join(dir, "prompt-b.txt");
+    const configPath = join(dir, "review-gate.json");
+    // Session 1: reviewer id "one" under identity A.
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      enabledReviewerIds: ["one"],
+      reviewers: [countingPassReviewerWithPromptDump("one", oneInvocationsA, join(dir, "prompt-a.txt"))],
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(first.pi);
+    await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
+    await trigger(first.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
+    await writeFile(join(dir, "index.ts"), "v1\n", "utf8");
+    await trigger(first.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo legacy-evidence" } }, first.ctx);
+    await triggerAgentEnd(first.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "first assistant summary" }],
+    });
+    assert.equal(await readFile(oneInvocationsA, "utf8"), "1");
+    await trigger(first.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, first.ctx);
+
+    // Simulate a pre-migration sidecar: the persisted history entries carry
+    // no displayLabel at all. Strip the field and recompute the integrity
+    // hash over the modified document (same canonical form the store uses).
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const raw = JSON.parse(await readFile(store.path, "utf8")) as Record<string, unknown>;
+    stripDisplayLabels(raw);
+    const { integritySha256: _integrity, ...unsigned } = raw;
+    raw.integritySha256 = createHash("sha256").update(stableJsonForTest(JSON.parse(JSON.stringify(unsigned)))).digest("hex");
+    await writeFile(store.path, `${JSON.stringify(raw)}\n`, "utf8");
+
+    // Session 2: the same reviewer id now has a different identity (B).
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      enabledReviewerIds: ["one"],
+      reviewers: [countingPassReviewerWithPromptDump("one", oneInvocationsB, promptB)],
+    }), "utf8");
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+
+    // Restore must not backfill the missing historical identity from B.
+    const restored = await store.restore(dir);
+    assert.equal(
+      restored?.state.reviewWindow?.reviewHistory[0]?.reviewerResults[0]?.displayLabel,
+      undefined,
+      "a pre-migration result must stay honestly unlabeled",
+    );
+
+    // The next turn reviews the preserved window under identity B.
+    await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
+    await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
+    await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
+    await trigger(resumed.hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo second-evidence" } }, resumed.ctx);
+    await triggerAgentEnd(resumed.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "second assistant summary" }],
+    });
+
+    assert.equal(await readFile(oneInvocationsB, "utf8"), "1");
+    const prompt = await readFile(promptB, "utf8");
+    // The request context renders the legacy entry by its raw stored id.
+    assert.match(prompt, /- one \(pass\): one passed/);
+
+    await trigger(resumed.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, resumed.ctx);
+
+    const finalState = await store.restore(dir);
+    const history = finalState?.state.reviewWindow?.reviewHistory ?? [];
+    assert.equal(history.length, 2);
+    assert.equal(
+      history[0]?.reviewerResults[0]?.displayLabel,
+      undefined,
+      "the legacy entry must not be backfilled after the reconciled review",
+    );
+    assert.equal(history[1]?.reviewerResults[0]?.displayLabel, "one", "new results are stamped with their running identity");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a persisted review window reconciles with a label/count-only notice and no prompts or secrets", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-notice-"));
+  try {
+    const alphaInvocations = join(dir, "alpha-invocations.txt");
+    const betaInvocations = join(dir, "beta-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      reviewers: [countingPassReviewer("alpha", alphaInvocations)],
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = await runFirstReviewSession(dir, sessionFile);
+    assert.match(first.notices.join("\n"), /review gate: passed/);
+
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      reviewers: [countingPassReviewer("beta", betaInvocations)],
+    }), "utf8");
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+
+    const noticeText = resumed.notices.join("\n");
+    assert.match(noticeText, /reconciled 1 review window/);
+    assert.match(noticeText, /1 configured reviewer/);
+    assert.doesNotMatch(noticeText, /clear or reconcile/);
+    assert.doesNotMatch(noticeText, /reviewer selection error/);
+    // The notice labels and counts only: no request text, evidence content,
+    // or prior review summaries may be disclosed.
+    assert.doesNotMatch(noticeText, /implement the change/);
+    assert.doesNotMatch(noticeText, /reconcile-evidence/);
+    assert.doesNotMatch(noticeText, /alpha passed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale reviewer selection reconciles with bounded outcomes while healthy reviewers run", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-stale-"));
+  try {
+    const alphaInvocations = join(dir, "alpha-invocations.txt");
+    const betaInvocations = join(dir, "beta-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      reviewers: [countingPassReviewer("alpha", alphaInvocations)],
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = await runFirstReviewSession(dir, sessionFile);
+    assert.match(first.notices.join("\n"), /review gate: passed/);
+
+    // Set B renames/replaces the reviewer but leaves a stale selection behind.
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      reviewers: [countingPassReviewer("beta", betaInvocations)],
+      enabledReviewerIds: ["beta", "gone"],
+    }), "utf8");
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+    await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
+    await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
+    await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
+    await triggerAgentEnd(resumed.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "second assistant summary" }],
+    });
+
+    // Documented aggregation policy is unchanged through reconciliation:
+    // at least one completed pass with another unavailable selection passes
+    // with warnings instead of silently dropping the unresolved selection.
+    assert.equal(await readFile(betaInvocations, "utf8"), "1", "the healthy reviewer must still run");
+    assert.match(resumed.notices.join("\n"), /passed with reviewer warnings/);
+
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const state = await store.restore(dir);
+    const history = state?.state.reviewWindow?.reviewHistory ?? [];
+    assert.equal(history.length, 2);
+    const latest = history.at(-1);
+    assert.equal(latest?.verdict, "pass");
+    assert.deepEqual(
+      latest?.reviewerResults.map((result) => ({ reviewerId: result.reviewerId, verdict: result.verdict })),
+      [
+        { reviewerId: "beta", verdict: "pass" },
+        { reviewerId: "gone", verdict: "error" },
+      ],
+      "the stale selection keeps an explicit bounded error outcome",
+    );
+    assert.equal(latest?.reviewerResults[1]?.error, "reviewer_unavailable");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a persisted window with zero usable reviewers is retained with an actionable notice", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-zero-"));
+  try {
+    const alphaInvocations = join(dir, "alpha-invocations.txt");
+    const betaInvocations = join(dir, "beta-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      reviewers: [countingPassReviewer("alpha", alphaInvocations)],
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = await runFirstReviewSession(dir, sessionFile);
+    assert.match(first.notices.join("\n"), /review gate: passed/);
+
+    // Set B references only a stale selection: no reviewer can be invoked.
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      reviewers: [countingPassReviewer("beta", betaInvocations)],
+      enabledReviewerIds: ["gone"],
+    }), "utf8");
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+    await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
+    await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
+    await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
+    await triggerAgentEnd(resumed.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "second assistant summary" }],
+    });
+
+    // Fail closed without clearing: the preserved window stays open and the
+    // notice is actionable (counts/labels only).
+    assert.match(resumed.notices.join("\n"), /no configured reviewer is currently available/);
+    assert.doesNotMatch(resumed.notices.join("\n"), /clear or reconcile/);
+    assert.equal(await readFile(betaInvocations, "utf8").catch(() => "absent"), "absent", "nothing may run without a usable reviewer");
+
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const state = await store.restore(dir);
+    assert.ok(state?.state.reviewWindow, "the review window must not be auto-cleared for zero usable reviewers");
+    assert.equal(state.state.reviewWindow?.requestHistory[0]?.text, "implement the change");
+    assert.match(
+      state.state.reviewWindow?.evidence.events.map((event) => event.summary).join(" ") ?? "",
+      /reconcile-evidence/,
+    );
+    assert.equal(state.state.reviewWindow?.reviewHistory.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a persisted window reconciles to an added reviewer and runs the whole current set", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reconcile-added-"));
+  try {
+    const alphaInvocations = join(dir, "alpha-invocations.txt");
+    const betaInvocations = join(dir, "beta-invocations.txt");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      reviewers: [countingPassReviewer("alpha", alphaInvocations)],
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const sessionFile = join(dir, "conversation-a.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+
+    const first = await runFirstReviewSession(dir, sessionFile);
+    assert.match(first.notices.join("\n"), /review gate: passed/);
+    assert.equal(await readFile(alphaInvocations, "utf8"), "1");
+
+    // Set B adds a second reviewer alongside the original one.
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      reviewers: [
+        countingPassReviewer("alpha", alphaInvocations),
+        countingPassReviewer("beta", betaInvocations),
+      ],
+    }), "utf8");
+
+    const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
+    await activate(resumed.pi);
+    await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
+    assert.match(resumed.notices.join("\n"), /reconciled 1 review window/);
+
+    await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
+    await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
+    await writeFile(join(dir, "index.ts"), "v2\n", "utf8");
+    await triggerAgentEnd(resumed.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "second assistant summary" }],
+    });
+
+    // Both current reviewers review the preserved window.
+    assert.equal(await readFile(alphaInvocations, "utf8"), "2");
+    assert.equal(await readFile(betaInvocations, "utf8"), "1");
+    assert.match(resumed.notices.join("\n"), /review gate: passed/);
+
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
+    const state = await store.restore(dir);
+    const latest = state?.state.reviewWindow?.reviewHistory.at(-1)?.reviewerResults ?? [];
+    assert.deepEqual(
+      latest.map((result) => result.reviewerId).sort(),
+      ["alpha", "beta"],
+      "the reconciled review records every current reviewer",
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -3442,7 +4276,12 @@ function escapeRegExp(value: string): string {
  * Build a minimal Pi host + session context for session_start integration
  * tests, mirroring the runtime helper used by the conversation-restore test.
  */
-function createSessionRuntime(sessionId: string, file: string, cwd: string) {
+function createSessionRuntime(
+  sessionId: string,
+  file: string,
+  cwd: string,
+  capture?: { reviewSettings?: (handler: (args: string, ctx: unknown) => Promise<void>) => void },
+) {
   const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
   const notices: string[] = [];
   const entries: Array<{ type: string; data: unknown }> = [];
@@ -3451,7 +4290,9 @@ function createSessionRuntime(sessionId: string, file: string, cwd: string) {
     on(name: string, handler: (...args: unknown[]) => unknown) {
       hooks.set(name, [...(hooks.get(name) ?? []), handler]);
     },
-    registerCommand() {},
+    registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      if (name === "review-settings") capture?.reviewSettings?.(options.handler);
+    },
     appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
     notify(message: string) { notices.push(message); },
     sendUserMessage(message: string, options: unknown) { sent.push({ message, options }); },

@@ -31,3 +31,34 @@ Current feature surface of the repository, summarized:
   `ShellStop`) with detached process groups and lifecycle wakes.
 - Durable evidence and recovery: integrity-checked execution manifests, landing-manifest
   crash recovery, and exact-session restart restoration.
+
+### Changed
+
+- Review windows now reconcile to changed reviewer settings instead of blocking:
+  a window saved under one reviewer configuration restores on reload with its
+  preserved baseline, evidence, and completed history intact and is reviewed with
+  the currently configured reviewers, and saving new reviewer settings through
+  `/review-settings` reconciles open windows immediately in-session (an in-flight
+  review finishes under its original selection; a window frozen with no usable
+  reviewers becomes reviewable once its settings are fixed). A label/count-only
+  notice reports the reconciliation; manual clearing remains for genuine
+  corruption or an explicit operator choice. The persisted selection digest
+  also covers unresolvable and duplicated selections, so a change that only
+  swaps which configured selection is unavailable is reported on reload.
+- Stale or duplicated reviewer selections no longer disable the whole gate:
+  every resolvable reviewer still runs, each unresolvable selection produces an
+  explicit bounded `reviewer_unavailable` outcome in the review results, and a
+  window with zero usable reviewers is deferred (not cleared) until a reviewer
+  can run. The documented mixed pass/error policy is unchanged: at least one
+  completed `pass` still gates as `pass` (`pass_with_warnings`) alongside other
+  reviewer errors, any `needs_changes` still blocks, and zero usable reviews
+  still error rather than pass.
+- Completed review history snapshots the display label of the configuration that
+  actually ran each reviewer, so historical results keep their original reviewer
+  identity after the window's configuration is reconciled to newer settings. New
+  results additionally carry gate-owned non-secret identity — the adapter name and a
+  one-way SHA-256 fingerprint of the effective reviewer configuration — so a same-id
+  configuration replacement stays distinguishable after reload; the fingerprint is
+  hash-only, not a reconstructable raw configuration snapshot. History entries without
+  a saved identity (pre-migration sidecars) render with their raw reviewer id and are
+  never relabeled or backfilled from current settings.

@@ -1,3 +1,4 @@
+import type { DeciderConfig } from "./config";
 import type { TokenUsage } from "./usage";
 
 export type ReviewVerdict = "pass" | "needs_changes" | "error";
@@ -54,6 +55,30 @@ export interface ReviewResult {
   error?: string;
   diagnostic?: string;
   telemetry?: ReviewerInvocationTelemetry;
+  /**
+   * Display label of the reviewer that produced this result, snapshotted at
+   * record time from the configuration that actually ran it. Completed
+   * history stays attributable to its original reviewer identity after the
+   * window's configuration is reconciled to newer settings; legacy persisted
+   * results predate the field and render with their raw reviewer id.
+   */
+  displayLabel?: string;
+  /**
+   * Adapter of the configuration that actually ran this reviewer, stamped by
+   * the gate at invocation time from its own configuration. Reviewer output
+   * can never set it (the parse allowlist rejects identity keys). Legacy
+   * persisted results predate the field and stay honestly unknown.
+   */
+  reviewerAdapter?: DeciderConfig["adapter"];
+  /**
+   * One-way SHA-256 fingerprint of the effective reviewer configuration that
+   * ran this result, computed by the gate at invocation time. Hash-only: it is
+   * not a reconstructable raw configuration snapshot — command, args, env, and
+   * other sensitive values are hashed internally and never persisted as
+   * identity metadata. Lets a same-id configuration replacement be
+   * distinguished after reload; legacy persisted results predate the field.
+   */
+  reviewerConfigFingerprint?: string;
 }
 
 export interface ReviewerInvocationTelemetry {

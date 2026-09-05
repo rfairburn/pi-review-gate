@@ -1,23 +1,37 @@
 name: CI
 
 on:
+  pull_request:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-#  pull_request:
-#  push:
-#    branches: [main]
 
 permissions:
   contents: read
 
+# Concurrency groups are separated by event type so no event can cancel or
+# replace another event's queued run. Per current GitHub docs, with the
+# default pending policy ("single") a newly queued run CANCELS and replaces
+# any pending run sharing a group, so:
+# - pull_request runs group per PR NUMBER (not head branch name): same-named
+#   branches in different forks keep distinct groups, and a branch named after
+#   a main SHA cannot cancel that push's run.
+# - push runs group per unique commit SHA: distinct merged commits on main
+#   never share a pending slot, so no queued run for another merged commit is
+#   dropped (future release form).
+# - workflow_dispatch runs of a SHA keep their own group: a dispatch can never
+#   replace the pending push run of the same SHA; repeated dispatches of one
+#   SHA serialize instead.
+# cancel-in-progress stays limited to pull_request events, so superseded PR
+# heads cancel only their own previous run.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-env:
-  PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
 
 jobs:
   verify:
+    # Stable required-check name (do not rename without updating branch settings).
     name: Verify (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -25,9 +39,12 @@ jobs:
       fail-fast: false
       matrix:
         node-version: [20.x, 24.x]
+    # Pure/unit tier plus packaging: no browser needed, so provisioning stays skipped.
+    env:
+      PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -37,21 +54,51 @@ jobs:
         run: npm run check:static
       - name: Fast tests
         run: npm run test:fast
+      - name: CI workflow contract tests
+        run: node --test dist-test/tests/ci-workflow.test.js
       - name: Package smoke
         run: npm run test:package
 
   full-tests:
-    name: Full tests (default branch)
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # Stable required-check name (do not rename without updating branch settings).
+    name: Full suite (Node 24)
+    # Runs for pull requests, pushes to the default branch, AND manual dispatch;
+    # only pushes to non-default branches are excluded (no hidden skip on the
+    # enforced trigger paths).
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24.x
           cache: npm
+      # Skip the best-effort postinstall provisioning during npm ci so the
+      # browser is installed exactly once, with Linux OS dependencies, below.
       - name: Install dependencies
         run: npm ci
+        env:
+          PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
+      - name: Install Chromium with Linux OS dependencies
+        # Narrow: only the Chromium browser plus its system libraries.
+        run: npx playwright install --with-deps chromium
+      - name: Install pinned Pi agent-core runtime
+        # tests/browser-native-error.test.ts drives the real agentLoop from an
+        # installed Pi agent-core build. 0.85.0 is verified against the current
+        # extension sources (and needs Node >=22.19.0, so this job pins Node 24).
+        # The test skips itself when PI_BROWSER_AGENT_RUNTIME is unset; this job
+        # always sets it, so the regression genuinely runs in CI.
+        run: |
+          mkdir -p "$RUNNER_TEMP/pi-agent-runtime"
+          cd "$RUNNER_TEMP/pi-agent-runtime"
+          echo '{"private":true}' > package.json
+          npm install --no-audit --no-fund --no-save @earendil-works/pi-agent-core@0.85.0
+      - name: Export Pi runtime path
+        run: echo "PI_BROWSER_AGENT_RUNTIME=$RUNNER_TEMP/pi-agent-runtime/node_modules/@earendil-works/pi-agent-core/dist/index.js" >> "$GITHUB_ENV"
+      # PI_REVIEW_GATE_RUNTIME_ROLE must stay unset so activation tests observe
+      # the default (no executor role) behavior; test files manage it themselves.
+      - name: Build test bundle
+        run: npm run build:test
       - name: Full test suite
-        run: npm run test
+        run: npm run test:run

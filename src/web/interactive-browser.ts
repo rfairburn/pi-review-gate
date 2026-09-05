@@ -37,6 +37,7 @@ import { defaultHostResolver, validatePublicUrl } from "./network";
 import {
   BrowserConfirmationPermits,
   BrowserConsequencePolicy,
+  type BrowserClickButton,
   type BrowserConfirmationBinding,
   type BrowserConsequence,
   type BrowserFormOperation,
@@ -372,6 +373,8 @@ export interface BrowserInteractionResult {
   tab: string;
   generation: string;
   operation: "hover" | "click" | BrowserFormOperation;
+  /** Selected mouse button; present only for click operations, including controlled navigation. */
+  button?: BrowserClickButton;
   consequence: BrowserConsequence | "observational";
   /** True only for interactive human confirmation, never automatic approval. */
   confirmed: boolean;
@@ -1279,9 +1282,11 @@ export class InteractiveBrowserManager {
     ref: string,
     confirmation?: BrowserClickConfirmation,
     signal?: AbortSignal,
+    options?: { button?: BrowserClickButton },
   ): Promise<BrowserInteractionResult> {
     try {
-      return await this.interact(sessionHandle, tabHandle, ref, "click", this.privateConfirmation(confirmation), signal);
+      const button = normalizeBrowserClickButton(options?.button);
+      return await this.interact(sessionHandle, tabHandle, ref, "click", this.privateConfirmation(confirmation), signal, button);
     } catch (error) {
       throw normalizedInteractionFailure("BrowserClick", error);
     }
@@ -1513,6 +1518,7 @@ export class InteractiveBrowserManager {
     operationName: "hover" | "click",
     confirmation: BrowserClickConfirmation | undefined,
     signal: AbortSignal | undefined,
+    button: BrowserClickButton = "left",
   ): Promise<BrowserInteractionResult> {
     assertBoundedInteractionCapability(sessionHandle, BROWSER_INTERACTION_SESSION_MAX_CHARS);
     assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
@@ -1533,16 +1539,16 @@ export class InteractiveBrowserManager {
         const locator = this.currentRefLocator(tab, ref);
         await operation.run(locator.waitFor({ state: "visible", timeout: operation.remainingMs() }), "semantic target validation");
         const structure = await operation.run(readTargetStructure(locator, tab.page), "structural consequence inspection");
-        const decision = this.consequencePolicy.classify(structure);
+        const decision = this.consequencePolicy.classify(structure, button);
         let approval: BrowserInteractionResult["approval"] = "not_required";
 
         if (operationName === "click" && decision.consequential) {
           const authorization = this.interactionAuthorization(name, confirmation);
-          const binding = this.confirmationBinding(session, tab, ref, capturedOrigin, structure, decision.consequence, decision.destination);
+          const binding = this.confirmationBinding(session, tab, ref, capturedOrigin, structure, decision.consequence, decision.destination, button);
           const permit = this.confirmationPermits.issue(binding);
           let approved = false;
           try {
-            approved = await operation.run(authorization.confirm(confirmationPrompt(decision.consequence, capturedOrigin, decision.destination)), "interaction approval");
+            approved = await operation.run(authorization.confirm(confirmationPrompt(decision.consequence, capturedOrigin, decision.destination, button)), "interaction approval");
           } catch {
             this.confirmationPermits.revoke(permit);
             throw new Error("BrowserClick not_started: interaction approval was unavailable or cancelled.");
@@ -1562,7 +1568,7 @@ export class InteractiveBrowserManager {
               throw new Error("BrowserClick not_started: the document or origin changed after approval; take a fresh BrowserSnapshot.");
             }
             const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref), tab.page), "post-approval target revalidation");
-            const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure);
+            const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure, button);
             const rebound = this.confirmationBinding(
               session,
               tab,
@@ -1571,6 +1577,7 @@ export class InteractiveBrowserManager {
               revalidatedStructure,
               revalidatedDecision.consequence,
               revalidatedDecision.destination,
+              button,
             );
             if (!this.confirmationPermits.consume(permit, rebound)) {
               this.invalidateInteractionRefs(tab, capturedGeneration);
@@ -1590,7 +1597,7 @@ export class InteractiveBrowserManager {
             throw new Error("BrowserClick not_started: the document or origin changed before controlled activation; take a fresh BrowserSnapshot.");
           }
           const revalidatedStructure = await operation.run(readTargetStructure(this.currentRefLocator(tab, ref), tab.page), "safe-target revalidation");
-          const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure);
+          const revalidatedDecision = this.consequencePolicy.classify(revalidatedStructure, button);
           if (
             revalidatedDecision.consequential
             || revalidatedDecision.consequence !== decision.consequence
@@ -1611,12 +1618,16 @@ export class InteractiveBrowserManager {
         started = true;
         if (operationName === "hover") {
           await operation.run(locator.hover({ timeout: operation.remainingMs() }), "semantic hover dispatch");
-        } else if (decision.consequence === "ordinary_navigation" && decision.destination) {
+        } else if (decision.consequence === "ordinary_navigation" && decision.destination && button !== "right") {
           // Do not dispatch page-controlled click listeners for a silent link.
           // Activate the freshly revalidated HTTP(S) destination through the
-          // existing brokered navigation path instead.
+          // existing brokered navigation path instead. A right-click never takes
+          // this shortcut: it is always consequential and dispatched as a real
+          // Playwright right-click so page contextmenu handlers can run.
           await this.navigateSession(session, tab, decision.destination, operation, false);
 
+        } else if (button === "right") {
+          await operation.run(locator.click({ button: "right", timeout: operation.remainingMs() }), "approved semantic right-click dispatch");
         } else {
           await operation.run(locator.click({ timeout: operation.remainingMs() }), "approved semantic click dispatch");
         }
@@ -1630,6 +1641,7 @@ export class InteractiveBrowserManager {
           tab: tab.handle,
           generation: tab.generation,
           operation: operationName,
+          ...(operationName === "click" ? { button } : {}),
           consequence: operationName === "hover" ? "observational" : decision.consequence,
           confirmed: approval === "human",
           approval,
@@ -2643,6 +2655,7 @@ export class InteractiveBrowserManager {
     structure: BrowserTargetStructure,
     consequence: BrowserConsequence,
     destination: string | null,
+    button: BrowserClickButton,
   ): BrowserConfirmationBinding {
     return {
       session: session.handle,
@@ -2657,6 +2670,7 @@ export class InteractiveBrowserManager {
       valueDigest: null,
       valueLengths: [],
       key: null,
+      button,
     };
   }
 
@@ -2686,6 +2700,7 @@ export class InteractiveBrowserManager {
       valueDigest,
       valueLengths,
       key,
+      button: null,
     };
   }
 
@@ -3425,11 +3440,12 @@ function confirmationPrompt(
   consequence: BrowserConsequence,
   origin: string,
   destination: string | null,
+  button: BrowserClickButton = "left",
 ): BrowserInteractionConfirmationRequest {
   return {
     title: "Confirm consequential browser click",
     message: [
-      `The target is classified as ${consequence.replaceAll("_", " ")}.`,
+      `The ${button}-click on this target is classified as ${consequence.replaceAll("_", " ")}.`,
       `Current site: ${redactedInteractionUrl(origin)}.`,
       ...(destination ? [`Destination site: ${redactedInteractionUrl(destination)}.`] : []),
       "Approve this one exact click? The page can have external effects; cancellation does not imply rollback.",
@@ -4027,6 +4043,14 @@ function implicitSemanticRole(tag: string, type: string | null): string | null {
 function safely<T>(operation: () => T, fallback: T): T {
   try { return operation(); }
   catch { return fallback; }
+}
+
+function normalizeBrowserClickButton(value: unknown): BrowserClickButton {
+  if (value === undefined) return "left";
+  if (value !== "left" && value !== "right") {
+    throw new Error("BrowserClick not_started: button must be exactly left or right.");
+  }
+  return value;
 }
 
 function normalizedInteractionFailure(

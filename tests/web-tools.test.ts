@@ -493,7 +493,9 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.deepEqual(tools.get("BrowserScreenshot").parameters.required, ["session", "tab", "mode"]);
   assert.deepEqual(Object.keys(tools.get("BrowserScroll").parameters.properties), ["session", "tab", "target", "direction", "amount", "ref"]);
   assert.deepEqual(Object.keys(tools.get("BrowserHover").parameters.properties), ["session", "tab", "ref"]);
-  assert.deepEqual(Object.keys(tools.get("BrowserClick").parameters.properties), ["session", "tab", "ref"]);
+  assert.equal(tools.get("BrowserHover").parameters.properties.button, undefined, "hover must not inherit the click button option");
+  assert.deepEqual(Object.keys(tools.get("BrowserClick").parameters.properties), ["session", "tab", "ref", "button"]);
+  assert.deepEqual(tools.get("BrowserClick").parameters.properties.button.enum, ["left", "right"]);
   assert.deepEqual(tools.get("BrowserHover").parameters.required, ["session", "tab", "ref"]);
   assert.deepEqual(tools.get("BrowserClick").parameters.required, ["session", "tab", "ref"]);
   assert.deepEqual(Object.keys(tools.get("BrowserFill").parameters.properties), ["session", "tab", "ref", "value"]);

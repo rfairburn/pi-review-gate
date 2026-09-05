@@ -192,7 +192,9 @@ and semantic:
 - `BrowserHover` hovers exactly one current opaque semantic ref. It is observational,
   accepts no action options, and invalidates that tab's refs after a successful dispatch
   because hover-driven page changes can make prior evidence stale.
-- `BrowserClick` clicks exactly one current opaque semantic ref. A centralized policy
+- `BrowserClick` clicks exactly one current opaque semantic ref. It accepts an optional
+  `button` parameter limited to `left` (default) or `right`; no other button, modifier,
+  double-click, or coordinate form is exposed. A centralized policy
   inspects a freshly resolved target's structural properties and fingerprint; accessible
   names, page claims, and model assertions never establish safety. Structurally proven
   ordinary HTTP(S) links may proceed without a
@@ -209,15 +211,21 @@ and semantic:
   falling back to main-world evaluation or element-handle previews.
   Silent links are activated as controlled brokered navigation rather than by
   dispatching page click handlers; known consequential destinations such as logout,
-  destructive, authorization, publish, send, purchase, or account paths are not silent. Forms, downloads, authentication/terms/permissions, destructive/publish/send/
+  destructive, authorization, publish, send, purchase, or account paths are not silent.
+  A `right` button is always consequential on every target: it is dispatched as a real
+  Playwright right-click so page-controlled `contextmenu` and mouse handlers can run, it
+  never uses the controlled ordinary-link navigation or any other silent shortcut, and
+  the selected button is shown in the confirmation prompt and result metadata. Forms,
+  downloads, authentication/terms/permissions, destructive/publish/send/
   purchase/account actions, unknown buttons or menu items, and every unknown or mixed
   result are consequential and require approval under
   [Browser interaction approval](#browser-interaction-approval). With the default
   **Ask**, a top-level interactive Pi session must approve one exact, short-lived click
   through Pi's confirmation UI. The permit is bound to the session,
-  tab, document generation, origin and destination, operation, target fingerprint, and
-  consequence; it is single-use, expires absolutely, and is consumed only after the
+  tab, document generation, origin and destination, operation, mouse button, target
+  fingerprint, and consequence; it is single-use, expires absolutely, and is consumed only after the
   target is re-resolved and all fields still match, including with automatic approval.
+  A permit issued for a left-click cannot be consumed for a right-click or vice versa.
   Denial, cancellation, timeout, changed structure/origin, or stale refs prevents
   dispatch. Absent UI also rejects in **Ask**; authorized non-UI executor sessions may
   use **Automatically Accept** but never claim human confirmation.

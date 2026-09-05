@@ -53,6 +53,9 @@ export interface BrowserConsequenceDecision {
 
 export type BrowserFormOperation = "fill" | "type" | "select" | "press";
 
+/** Exact mouse button for BrowserClick; only left and right are supported. */
+export type BrowserClickButton = "left" | "right";
+
 export interface BrowserFormAction {
   operation: BrowserFormOperation;
   key?: string;
@@ -63,7 +66,21 @@ export interface BrowserFormAction {
  * callers cannot provide a safety assertion and accessible names never enter a decision.
  */
 export class BrowserConsequencePolicy {
-  classify(target: BrowserTargetStructure): BrowserConsequenceDecision {
+  /**
+   * Classify one click target for the exact mouse button. A right-click never
+   * performs the ordinary left-button action: it can only reach page-controlled
+   * contextmenu/mouse handlers, whose effects cannot be proven absent. The
+   * silent ordinary-left-link exemption therefore never applies to it.
+   */
+  classify(target: BrowserTargetStructure, button: BrowserClickButton = "left"): BrowserConsequenceDecision {
+    const decision = this.classifyLeftButton(target);
+    if (button === "right" && !decision.consequential) {
+      return { consequence: "unknown_or_mixed", consequential: true, destination: null };
+    }
+    return decision;
+  }
+
+  private classifyLeftButton(target: BrowserTargetStructure): BrowserConsequenceDecision {
     const destination = normalizedHttpUrl(target.href ?? target.formAction);
     if (target.download) return { consequence: "download", consequential: true, destination };
     if (target.inputType === "file") return { consequence: "permissions", consequential: true, destination };
@@ -180,6 +197,8 @@ export interface BrowserConfirmationBinding {
   valueDigest: string | null;
   valueLengths: readonly number[];
   key: string | null;
+  /** Exact mouse button for click operations; null for non-click operations. */
+  button: BrowserClickButton | null;
 }
 
 export interface BrowserConfirmationPermit {
@@ -237,7 +256,7 @@ function bindingDigest(binding: BrowserConfirmationBinding, expiresAt: number): 
   return createHash("sha256").update(JSON.stringify([
     binding.session, binding.tab, binding.generation, binding.operation, binding.ref,
     binding.origin, binding.destination, binding.targetFingerprint, binding.consequence,
-    binding.valueDigest, binding.valueLengths, binding.key, expiresAt,
+    binding.valueDigest, binding.valueLengths, binding.key, binding.button, expiresAt,
   ])).digest();
 }
 

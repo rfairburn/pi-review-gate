@@ -32,6 +32,7 @@ import {
 } from "./interactive-browser";
 import { WebPageCache, type WebFetchResult } from "./cache";
 import { searchDdgs, type SearchResponse } from "./network";
+import type { BrowserClickButton } from "./browser-interaction-policy";
 
 interface PiWebExecutionContext {
   model?: { input?: readonly string[] };
@@ -437,10 +438,12 @@ export class WebToolManager {
     this.pi.registerTool({
       name: "BrowserClick",
       label: "BrowserClick",
-      description: "Click one current opaque BrowserSnapshot ref under the structural consequence policy. Proven HTTP(S) navigation may proceed; native disclosure and consequential or unknown actions follow the user's Browser interaction approval setting (Ask by default; no UI rejects in Ask). Automatic approval retains all target and safety checks.",
+      description: "Click one current opaque BrowserSnapshot ref under the structural consequence policy. Proven HTTP(S) navigation may proceed; native disclosure and consequential or unknown actions follow the user's Browser interaction approval setting (Ask by default; no UI rejects in Ask). Automatic approval retains all target and safety checks. Optional button is left (default) or right; right-click bypasses the controlled link-navigation shortcut and dispatches a native contextual click. Page-controlled handlers can have external effects, so right-click always follows consequential approval.",
       promptGuidelines: browserInteractionGuidelines(),
       executionMode: "sequential",
-      parameters: browserInteractionHandleSchema(),
+      parameters: browserInteractionHandleSchema({
+        button: enumSchema(["left", "right"], "Optional mouse button; defaults to left. Right-click is consequential on every target and does not use controlled link navigation."),
+      }),
       execute: async (_id, params, signal, _onUpdate, context) => {
         try {
           const result = await this.interactiveBrowser.click(
@@ -449,6 +452,7 @@ export class WebToolManager {
             requiredBoundedString(params.ref, "ref", BROWSER_INTERACTION_REF_MAX_CHARS),
             interactiveConfirmation(context),
             signal,
+            { button: clickButton(params.button) },
           );
           return textResult(formatBrowserInteraction(result), { response: result });
         } catch (error) {
@@ -913,6 +917,7 @@ function formatBrowserInteraction(value: BrowserInteractionResult): string {
   return [
     `Browser ${value.operation} ${value.effect}.`,
     `Session: ${value.session} · Tab: ${value.tab} · New document generation: ${value.generation}`,
+    ...(value.button ? [`Button: ${value.button}.`] : []),
     `Consequence class: ${value.consequence} · approval: ${value.approval} · interactive confirmation used: ${value.confirmed}.`,
     `Observed effects: navigation ${value.effects.navigation}; network ${value.effects.network ?? "not_observed"}; popup tabs ${value.effects.observedPopupTabs}; overflow popups closed ${value.effects.observedOverflowPopupsClosed}; dialogs dismissed ${value.effects.observedDialogsDismissed}; download ${value.effects.download}; accounting ${value.effects.accounting}.`,
     ...(value.consequence === "local_editing" && value.effects.network !== "observed"
@@ -957,6 +962,14 @@ function interactiveConfirmation(context: PiWebExecutionContext | undefined) {
 function screenshotMode(value: unknown): BrowserScreenshotMode {
   if (value === "viewport" || value === "element") return value;
   throw new Error("mode must be viewport or element.");
+}
+
+function clickButton(value: unknown): BrowserClickButton {
+  if (value === undefined) return "left";
+  if (value !== "left" && value !== "right") {
+    throw new Error("button must be left or right.");
+  }
+  return value;
 }
 
 function scrollTarget(value: unknown): BrowserScrollTarget {

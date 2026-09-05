@@ -101,6 +101,7 @@ test("confirmation permits bind every action field, expire absolutely, and canno
     valueDigest: null,
     valueLengths: [],
     key: null,
+    button: "left",
   };
 
   const mismatch = permits.issue(binding);

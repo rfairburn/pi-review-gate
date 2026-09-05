@@ -30,6 +30,27 @@
  *   exhaustion destroys the affected connections, records bounded omissions,
  *   and refuses new ones; the render decides fatality (main-document failures
  *   are fatal, subresource omissions stay nonfatal).
+ *
+ * Browser-owned live WebSocket transport is OPT IN ONLY
+ * (EgressBrokerWebSocketPolicy, default OFF). With the policy absent every
+ * WebSocket upgrade is refused before any dial, exactly as the default passive
+ * extraction behavior always did. When the owning interactive session
+ * explicitly opts in:
+ * - Plain `ws://` upgrades arrive as authenticated absolute-form HTTP Upgrade
+ *   requests; the broker re-issues the upgrade to the validated public
+ *   destination, strips its own proxy credentials (they never reach the
+ *   origin), and on a 101 becomes a byte-accounted bidirectional pipe.
+ * - `wss://` travels as an ordinary CONNECT tunnel: the WebSocket handshake
+ *   and frames are INSIDE the browser's end-to-end TLS, so the broker never
+ *   sees the upgrade or the frames and cannot — and does not need to — inspect
+ *   them. Exemption from ordinary idle eviction for such tunnels is granted
+ *   only by the same explicit opt-in; the tunnel stays fully subject to the
+ *   hard byte/connection budgets and to deterministic broker teardown. The
+ *   opt-in therefore controls the live transport without any TLS MITM.
+ * Opted-in live connections are never evicted for ordinary elapsed lifetime
+ * (no such expiry exists); quiet sockets are evicted by the ordinary idle
+ * bound unless the owner explicitly disables that for live transports, and
+ * owner closes plus hard budget failures still drain every socket.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
@@ -98,11 +119,37 @@ export interface BrokerLedgerEntry {
   port: number;
   /** The validated public address chosen for this dial. */
   address: string;
-  kind: "http" | "connect";
+  /** "ws" is an opted-in plain WebSocket upgrade; wss rides inside "connect". */
+  kind: "http" | "connect" | "ws";
   bytesSent: number;
   bytesReceived: number;
   /** False when the connection was destroyed at a budget (never completed). */
   completed: boolean;
+}
+
+/**
+ * Explicit opt-in for browser-owned live WebSocket transport. Absent (or
+ * `enabled: false`), every WebSocket upgrade and every upgrade-bearing request
+ * is refused before any dial and the default passive/HTTP behavior is exactly
+ * as before. When enabled by the owning interactive session:
+ * - authenticated plain `ws://` upgrades are brokered to validated public
+ *   destinations as "ws" ledger entries, and
+ * - CONNECT tunnels (the only path `wss://` can take, opaque under the
+ *   browser's end-to-end TLS) use `liveIdleSocketMs` instead of the ordinary
+ *   HTTP idle bound, because quiet live transports must not be evicted by a
+ *   timer meant for request/response traffic. `null` disables ordinary idle
+ *   eviction for live transports entirely; hard byte/connection budgets and
+ *   broker teardown still destroy them. There is no elapsed-lifetime expiry
+ *   for live connections in either case.
+ */
+export interface EgressBrokerWebSocketPolicy {
+  enabled: boolean;
+  /**
+   * Idle bound for live transports (opted-in ws upgrades and, because they
+   * are opaque, CONNECT tunnels). Defaults to the broker's idleSocketMs;
+   * `null` means no ordinary idle eviction.
+   */
+  liveIdleSocketMs?: number | null;
 }
 
 export interface EgressSummary {
@@ -211,6 +258,8 @@ export class EgressBroker {
   private connectionCount = 0;
   private totalBytes = 0;
   private readonly expectedAuthorization?: string;
+  /** Set only when live WebSocket transport was explicitly opted in. */
+  private readonly websocketPolicy?: EgressBrokerWebSocketPolicy;
 
   constructor(
     private readonly resolve: HostResolver,
@@ -218,7 +267,9 @@ export class EgressBroker {
     private readonly budgets: EgressBudgets = DEFAULT_EGRESS_BUDGETS,
     auth?: BrokerAuth,
     private readonly observer?: EgressBrokerObserver,
+    websockets?: EgressBrokerWebSocketPolicy,
   ) {
+    this.websocketPolicy = websockets?.enabled === true ? websockets : undefined;
     if (auth) {
       this.expectedAuthorization = `Basic ${Buffer.from(`${auth.username}:${auth.password}`, "utf8").toString("base64")}`;
     }
@@ -252,6 +303,11 @@ export class EgressBroker {
     server.on("connection", (socket) => this.admitClient(socket));
     server.on("request", (request, response) => {
       void this.handlePlainProxyRequest(request, response).catch(() => undefined);
+    });
+    server.on("upgrade", (request, duplexSocket, head) => {
+      // Upgrade sockets on an http.Server are always real net.Sockets.
+      const socket = duplexSocket as net.Socket;
+      void this.handleUpgrade(request, socket, head).catch(() => undefined);
     });
     server.on("connect", (request, duplexSocket, head) => {
       // CONNECT sockets on an http.Server are always real net.Sockets.
@@ -487,7 +543,7 @@ export class EgressBroker {
    * back when validation fails (they still consumed the request budget, which
    * bounds refusal work too).
    */
-  private async admit(url: URL, kind: "http" | "connect"): Promise<ValidatedUrl | undefined> {
+  private async admit(url: URL, kind: "http" | "connect" | "ws"): Promise<ValidatedUrl | undefined> {
     if (this.closed) {
       this.note(`${kind} destination refused: broker is closing.`);
       return undefined;
@@ -497,6 +553,9 @@ export class EgressBroker {
       return undefined;
     }
     const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    // Opted-in WebSocket upgrades must never disclose the request path, query,
+    // or userinfo in diagnostics: only the validated hostname and port.
+    const target = kind === "ws" ? boundedText(`${hostname}:${url.port || 80}`) : boundedText(url.href);
     const firstSeenHost = !this.hosts.has(hostname);
     // Synchronous reservation: no await may happen between these checks and
     // the increments.
@@ -505,7 +564,7 @@ export class EgressBroker {
       return undefined;
     }
     if (this.connectionCount >= this.budgets.maxConnections) {
-      this.recordPolicyRefusal(`${kind} destination refused: connection budget (${this.budgets.maxConnections}) exhausted for ${boundedText(url.href)}.`);
+      this.recordPolicyRefusal(`${kind} destination refused: connection budget (${this.budgets.maxConnections}) exhausted for ${target}.`);
       return undefined;
     }
     if (this.totalBytes >= this.budgets.maxTotalBytes) {
@@ -525,7 +584,7 @@ export class EgressBroker {
       // first-seen hostname reservation stay consumed, bounding adversarial
       // refusal loops).
       this.connectionCount -= 1;
-      this.recordPolicyRefusal(`${kind} destination refused: ${error instanceof Error ? error.message : String(error)} (${boundedText(url.href)}).`);
+      this.recordPolicyRefusal(`${kind} destination refused: ${error instanceof Error ? error.message : String(error)} (${target}).`);
       return undefined;
     }
   }
@@ -545,6 +604,14 @@ export class EgressBroker {
       }
     };
     try {
+      // Any upgrade-bearing request that reached the plain request path (the
+      // real Upgrade event path handles genuine upgrades) is fail-closed: an
+      // upgrade can never be forwarded as a mangled plain request.
+      if (request.headers.upgrade !== undefined) {
+        this.recordPolicyRefusal("proxy request refused: upgrade header on the plain request path.");
+        finish(403, "Egress broker refuses upgrades on this path.");
+        return;
+      }
       // Validate the client credential BEFORE consuming the request budget so
       // an unauthenticated local process cannot exhaust it (local DoS on the
       // active render).
@@ -731,7 +798,12 @@ export class EgressBroker {
         refuse(400);
         return;
       }
-      if (WEBSOCKET_REQUEST_HEADERS.some((name) => request.headers[name] !== undefined)) {
+      if (WEBSOCKET_REQUEST_HEADERS.some((name) => request.headers[name] !== undefined)
+        // Any upgrade-bearing CONNECT is rejected outright: a genuine wss
+        // handshake travels INSIDE the opaque TLS tunnel, never on the
+        // CONNECT itself, so such a request is a malformed direct-upgrade or
+        // non-WebSocket tunneling attempt and fails closed.
+        || request.headers.upgrade !== undefined) {
         const diagnostic = `CONNECT refused: WebSocket upgrade to ${parsed.host}:${parsed.port}.`;
         this.recordPolicyRefusal(diagnostic);
         refuse(403);
@@ -782,14 +854,206 @@ export class EgressBroker {
       }
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) destination.write(head);
-      this.pipeTunnel(socket, destination, entry);
+      this.pipeTunnel(socket, destination, entry, this.liveIdleSocketMs());
     } catch (error) {
       this.refusals += 1;
       refuse(502, `CONNECT tunnel failed: ${boundedText(error instanceof Error ? error.message : String(error))}.`);
     }
   }
 
-  private pipeTunnel(client: net.Socket, destination: net.Socket, entry: BrokerLedgerEntry): void {
+  /**
+   * Idle bound for live transports. Without the explicit WebSocket opt-in this
+   * is exactly the ordinary budgets.idleSocketMs (default behavior unchanged);
+   * only the opt-in can relax (liveIdleSocketMs) or disable (null) it.
+   */
+  private liveIdleSocketMs(): number | null {
+    if (!this.websocketPolicy) return this.budgets.idleSocketMs;
+    return this.websocketPolicy.liveIdleSocketMs === undefined ? this.budgets.idleSocketMs : this.websocketPolicy.liveIdleSocketMs;
+  }
+
+  /**
+   * Handle one authenticated plain-`ws://` HTTP upgrade through the proxy
+   * path. This is reachable only when the owner explicitly opted in via
+   * EgressBrokerWebSocketPolicy; otherwise the upgrade is refused 403 BEFORE
+   * any budget consumption beyond the request attempt and before any dial.
+   * The origin's credentials-free upgrade request is re-issued verbatim (minus
+   * hop-by-hop and proxy headers) to the validated public destination; a 101
+   * switches both sockets into the same byte-accounted, budget-enforced pipe
+   * used by CONNECT tunnels.
+   */
+  private async handleUpgrade(request: IncomingMessage, socket: net.Socket, head: Buffer): Promise<void> {
+    this.track(socket);
+    const refuse = (status: number, diagnostic?: string) => {
+      if (diagnostic) this.note(diagnostic);
+      if (!socket.destroyed && socket.writable) {
+        socket.end(
+          `HTTP/1.1 ${status} ${status === 407 ? "Proxy Authentication Required" : status === 502 ? "Bad Gateway" : "Forbidden"}\r\n`
+          + `${status === 407 ? 'Proxy-Authenticate: Basic realm="pi-review-gate-egress-broker"\r\n' : ""}Connection: close\r\n\r\n`,
+          () => socket.destroy(),
+        );
+      } else {
+        socket.destroy();
+      }
+    };
+    try {
+      if (this.closed) {
+        socket.destroy();
+        return;
+      }
+      if (!this.authorized(request)) {
+        refuse(407);
+        return;
+      }
+      this.markClientAuthorized(socket);
+      this.requests += 1;
+      if (this.requests > this.budgets.maxRequests) {
+        this.recordPolicyRefusal(`websocket upgrade refused: request budget (${this.budgets.maxRequests}) exhausted.`);
+        refuse(403);
+        return;
+      }
+      if (!this.websocketPolicy) {
+        this.recordPolicyRefusal("websocket upgrade refused: live WebSocket transport is not enabled for this broker.");
+        refuse(403);
+        return;
+      }
+      const parsed = this.parseUpgradeRequest(request);
+      if (!parsed) {
+        // Fixed text only: the request target may carry a path, query, or
+        // userinfo that must never reach diagnostics, summaries, or observers.
+        this.recordPolicyRefusal("websocket upgrade refused: malformed upgrade target.");
+        refuse(400);
+        return;
+      }
+      // Bytes pipelined after the upgrade request head are protocol violations
+      // before the 101 completes; fail closed (they are counted first).
+      if (head.length > 0) {
+        this.totalBytes += head.length;
+        this.note("websocket upgrade refused: pipelined bytes before the upgrade completed.");
+        socket.destroy();
+        return;
+      }
+      const validated = await this.admit(parsed.url, "ws");
+      if (this.closed || !validated) {
+        refuse(403);
+        return;
+      }
+      const entry: BrokerLedgerEntry = {
+        hostname: validated.hostname,
+        port: parsed.port,
+        address: preferredPinnedAddress(validated.addresses) ?? "",
+        kind: "ws",
+        bytesSent: 0,
+        bytesReceived: 0,
+        completed: false,
+      };
+      const originHead = this.buildOriginUpgradeHead(request, parsed.url);
+      if (!originHead) {
+        this.refusals += 1;
+        refuse(400, "websocket upgrade refused: unforwardable upgrade request.");
+        return;
+      }
+      const destination = this.dial(validated, parsed.port);
+      this.track(destination);
+      // If the client goes away while the dial or the origin handshake is in
+      // flight, the destination must go away too (a FIN from the peer ends the
+      // readable side without destroying our socket, so poll readableEnded
+      // explicitly and hook close as a backstop).
+      const onClientGone = () => destination.destroy();
+      socket.once("close", onClientGone);
+      await awaitSocketConnect(destination);
+      // A late-resolved dial for a vanished client must never leak a
+      // destination socket or complete a handshake on its behalf.
+      if (this.closed || socket.destroyed || socket.readableEnded || socket.readyState === "closed") {
+        socket.destroy();
+        destination.destroy();
+        return;
+      }
+      this.ledger.push(entry);
+      const handshakeDeadline = setTimeout(() => destination.destroy(), this.budgets.preAuthSocketMs);
+      handshakeDeadline.unref?.();
+      try {
+        destination.write(originHead);
+        const responseHead = await readHttpHead(destination, this.budgets.maxHeaderChars, this.budgets.preAuthSocketMs);
+        const status = parseStatusLine(responseHead.head);
+        if (!status || status.code !== 101 || !headerContains(responseHead.head, "upgrade", "websocket")) {
+          // Non-101 (or a 101 without the required header): relay only the
+          // status line, never origin headers or payload, and fail closed.
+          entry.completed = true;
+          this.note(`websocket upgrade refused by destination with HTTP ${status?.code ?? 0} for ${validated.hostname}:${parsed.port}.`);
+          if (!socket.destroyed && socket.writable) {
+            socket.end(`HTTP/1.1 ${status?.code ?? 502} ${status?.reason ?? "Bad Gateway"}\r\nConnection: close\r\n\r\n`, () => socket.destroy());
+          } else {
+            socket.destroy();
+          }
+          destination.destroy();
+          return;
+        }
+        socket.write(responseHead.head);
+        // Bytes the origin coalesced with the 101 (e.g. the first
+        // server-initiated frame) are forwarded exactly once, byte-accounted,
+        // BEFORE the pipe takes over; same-socket write ordering keeps them
+        // ahead of all subsequent destination data.
+        if (responseHead.remainder.length > 0) {
+          entry.bytesReceived += responseHead.remainder.length;
+          this.totalBytes += responseHead.remainder.length;
+          if (!this.enforceByteBudget(entry, [socket, destination])) {
+            socket.write(responseHead.remainder);
+          }
+        }
+        if (socket.destroyed || destination.destroyed) return;
+        this.pipeTunnel(socket, destination, entry, this.liveIdleSocketMs());
+      } finally {
+        clearTimeout(handshakeDeadline);
+      }
+    } catch (error) {
+      this.refusals += 1;
+      socket.destroy();
+      refuse(403, `websocket upgrade failed: ${boundedText(error instanceof Error ? error.message : String(error))}.`);
+    }
+  }
+
+  /**
+   * Validate one client upgrade request: absolute-form `http:` target, GET,
+   * `Upgrade: websocket`, no body, bounded authority/headers. Returns undefined
+   * (refuse) for anything else.
+   */
+  private parseUpgradeRequest(request: IncomingMessage): { url: URL; port: number } | undefined {
+    if (request.method !== "GET") return undefined;
+    const upgrade = typeof request.headers.upgrade === "string" ? request.headers.upgrade.trim().toLowerCase() : "";
+    if (upgrade !== "websocket") return undefined;
+    if (request.headers["content-length"] !== undefined || request.headers["transfer-encoding"] !== undefined) return undefined;
+    return this.parseProxyRequest(request);
+  }
+
+  /**
+   * Build the origin-bound upgrade request head: origin-form target, original
+   * Host, forwarded non-hop-by-hop headers (proxy credentials and proxy hops
+   * are stripped — the broker's credentials must never reach the origin), and
+   * the fixed upgrade headers. Returns undefined when the request cannot be
+   * forwarded safely.
+   */
+  private buildOriginUpgradeHead(request: IncomingMessage, target: URL): string | undefined {
+    const lines = [`GET ${target.pathname}${target.search || ""} HTTP/1.1`];
+    let sawHost = false;
+    for (let index = 0; index + 1 < request.rawHeaders.length; index += 2) {
+      const name = request.rawHeaders[index]!;
+      const value = request.rawHeaders[index + 1]!;
+      const lower = name.toLowerCase();
+      if (HOP_BY_HOP_REQUEST_HEADERS.has(lower)) continue;
+      // Duplicate Host headers could smuggle a different authority at the
+      // origin; only a single Host header is forwarded.
+      if (lower === "host") {
+        if (sawHost) return undefined;
+        sawHost = true;
+      }
+      lines.push(`${name}: ${value}`);
+    }
+    if (!sawHost) lines.push(`Host: ${target.host}`);
+    lines.push("Connection: Upgrade", "Upgrade: websocket");
+    return `${lines.join("\r\n")}\r\n\r\n`;
+  }
+
+  private pipeTunnel(client: net.Socket, destination: net.Socket, entry: BrokerLedgerEntry, idleMs: number | null = this.budgets.idleSocketMs): void {
     const countFrom = (from: net.Socket, direction: "bytesSent" | "bytesReceived") => {
       from.on("data", (chunk: Buffer) => {
         entry[direction] += chunk.length;
@@ -801,8 +1065,10 @@ export class EgressBroker {
     countFrom(destination, "bytesReceived");
     client.pipe(destination);
     destination.pipe(client);
-    this.attachIdle(client, entry, [client, destination]);
-    this.attachIdle(destination, entry, [client, destination]);
+    if (idleMs !== null) {
+      this.attachIdle(client, entry, [client, destination], idleMs);
+      this.attachIdle(destination, entry, [client, destination], idleMs);
+    }
     const destroyBoth = () => {
       if (!this.abortedEntries.has(entry)) entry.completed = true;
       client.destroy();
@@ -814,16 +1080,16 @@ export class EgressBroker {
     destination.on("close", destroyBoth);
   }
 
-  private attachIdle(socket: net.Socket, entry: BrokerLedgerEntry, peers: net.Socket[]): void {
+  private attachIdle(socket: net.Socket, entry: BrokerLedgerEntry, peers: net.Socket[], idleMs: number = this.budgets.idleSocketMs): void {
     // Only ever call this on sockets dedicated to ONE connection (dialed
     // destination sockets, CONNECT tunnel sockets) — never on Chromium's
     // reused keep-alive client socket. The WeakSet guard additionally makes
     // the attachment idempotent so timeout listeners cannot accumulate.
-    socket.setTimeout(this.budgets.idleSocketMs);
+    socket.setTimeout(idleMs);
     if (this.idleAttached.has(socket)) return;
     this.idleAttached.add(socket);
     socket.on("timeout", () => {
-      this.note(`idle timeout (${this.budgets.idleSocketMs}ms) destroyed connection to ${entry.hostname}:${entry.port}.`);
+      this.note(`idle timeout (${idleMs}ms) destroyed connection to ${entry.hostname}:${entry.port}.`);
       // Evict quiet sockets, not their owning browser. TLS tunnels are opaque:
       // we cannot attest completion, but idleness is not a security violation.
       // Subsequent connections still pass admit() and fresh DNS validation.
@@ -893,8 +1159,7 @@ export function parseConnectAuthority(authority: string): ParsedConnectAuthority
 }
 
 /** Await a dialed socket's connect event without hanging on error/close. */
-async function awaitSocketConnect(socket: net.Socket): Promise<void> {
-  if (socket.readyState === "open") return;
+async function awaitSocketConnect(socket: net.Socket): Promise<void> {  if (socket.readyState === "open") return;
   if (socket.destroyed) throw new Error("Dial socket was destroyed before connecting.");
   await new Promise<void>((resolve, reject) => {
     const cleanup = () => {
@@ -918,6 +1183,101 @@ async function awaitSocketConnect(socket: net.Socket): Promise<void> {
     socket.once("error", onError);
     socket.once("close", onClose);
   });
+}
+
+/** One HTTP response head plus any bytes that arrived coalesced behind it. */
+interface ReadHttpHeadResult {
+  /** The status line and headers, through and including CRLFCRLF. */
+  head: Buffer;
+  /**
+   * Bytes the origin sent in the same segment(s) as the head. For a WebSocket
+   * 101 this is legitimately the first server-initiated frame; the caller
+   * must forward it exactly once, in order, before piped data resumes.
+   */
+  remainder: Buffer;
+}
+
+/**
+ * Read one HTTP head (through CRLFCRLF) from a raw socket, bounded in bytes
+ * and time. Fails closed on truncation, oversized heads, timeouts, and early
+ * closes. The bound is enforced against the ACTUAL head length through
+ * CRLFCRLF regardless of chunk boundaries, and bytes coalesced behind the
+ * delimiter are returned as `remainder` instead of destroying the connection:
+ * a WebSocket origin may legitimately send its 101 and first frame together.
+ * Never inspects or retains payload content beyond returning it to the caller.
+ */
+async function readHttpHead(socket: net.Socket, maxChars: number, deadlineMs: number): Promise<ReadHttpHeadResult> {
+  return await new Promise<ReadHttpHeadResult>((resolveHead, rejectHead) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let timer: NodeJS.Timeout | undefined;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      socket.pause();
+    };
+    const fail = (error: Error) => {
+      cleanup();
+      rejectHead(error);
+    };
+    const onData = (chunk: Buffer) => {
+      chunks.push(chunk);
+      size += chunk.length;
+      const joined = Buffer.concat(chunks);
+      const headEnd = joined.indexOf("\r\n\r\n");
+      if (headEnd === -1) {
+        // Early bound: do not buffer an unbounded oversized head when the
+        // delimiter has not arrived yet.
+        if (size > maxChars) {
+          socket.destroy();
+          fail(new Error(`HTTP head exceeded ${maxChars} characters.`));
+        }
+        return;
+      }
+      cleanup();
+      // Exact bound on the real head length through CRLFCRLF: an oversized
+      // head whose delimiter arrives in the same (or final) chunk must fail
+      // closed, not slip past the early size check.
+      if (headEnd + 4 > maxChars) {
+        socket.destroy();
+        rejectHead(new Error(`HTTP head exceeded ${maxChars} characters.`));
+        return;
+      }
+      resolveHead({ head: joined.subarray(0, headEnd + 4), remainder: joined.subarray(headEnd + 4) });
+    };
+    const onError = (error: Error) => fail(error);
+    const onClose = () => fail(new Error("Connection closed before the HTTP head completed."));
+    timer = setTimeout(() => {
+      socket.destroy();
+      fail(new Error(`HTTP head did not arrive within ${deadlineMs}ms.`));
+    }, deadlineMs);
+    timer.unref?.();
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+  });
+}
+
+/** Parse an HTTP/1.x status line; returns undefined when malformed. */
+function parseStatusLine(head: Buffer): { code: number; reason: string } | undefined {
+  const statusLine = head.toString("latin1").split("\r\n", 1)[0] ?? "";
+  const match = /^HTTP\/1\.[01] (\d{3})(?: (.*))?$/.exec(statusLine);
+  if (!match) return undefined;
+  return { code: Number(match[1]), reason: (match[2] ?? "").slice(0, 64) };
+}
+
+/** True when the head carries `name: value` (case-insensitive, token-contained). */
+function headerContains(head: Buffer, name: string, value: string): boolean {
+  const lines = head.toString("latin1").split("\r\n");
+  for (let index = 1; index < lines.length; index += 1) {
+    const separator = lines[index]!.indexOf(":");
+    if (separator === -1) continue;
+    if (lines[index]!.slice(0, separator).trim().toLowerCase() !== name) continue;
+    if (lines[index]!.slice(separator + 1).trim().toLowerCase().split(/\s*,\s*/).includes(value)) return true;
+  }
+  return false;
 }
 
 async function closeHttpServer(server: http.Server): Promise<void> {

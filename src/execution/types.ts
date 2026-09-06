@@ -1,5 +1,6 @@
 import type { TokenUsage } from "../usage";
 import type { PiLifecycleSummary } from "../usage";
+import type { ExecutorSelection } from "../config";
 import type { ExecutorToolCatalog } from "./tool-catalog";
 
 export interface ExecutorSession {
@@ -103,6 +104,10 @@ export interface SubtaskProgressUpdate {
   executorTurn?: number;
   reviewCycle?: number;
   reviewers?: string[];
+  /** Pool entry actually serving this update (tracks failovers). */
+  executorEntryId?: string;
+  /** Authoritative selection of the executor actually serving this update. */
+  executorSelection?: ExecutorSelection;
 }
 
 export type ContinuationProgressPhase =

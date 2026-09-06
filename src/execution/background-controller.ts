@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ReviewGateConfig } from "../config";
+import type { ExecutorSelection, ReviewGateConfig } from "../config";
 import { resolvedWorkerResources, resolvedWorkerRoute } from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
@@ -1891,6 +1891,28 @@ export class BackgroundExecutionController {
     }
   }
 
+  /**
+   * Stamp the authoritative final executor identity from the settled operation
+   * record so display labels reflect failovers and settings changes instead of
+   * the entry id captured at launch.
+   */
+  private async applySettledExecutorIdentity(task: BackgroundTaskRecord): Promise<void> {
+    if (!task.waveRoot) return;
+    try {
+      const record = await readOperationRecord(join(task.waveRoot, "artifacts", task.taskId, "operation.json"));
+      if (record.executorEntryId) task.executorEntryId = record.executorEntryId;
+      // Same semantics as the live path: the recorded selection re-establishes
+      // the model identity, clearing a stale value when the final executor has
+      // no configured model.
+      if (record.executorSelection) {
+        task.executorSelection = record.executorSelection;
+        task.executorModel = record.model;
+      }
+    } catch {
+      // Best effort: the label falls back to the entry-id lookup.
+    }
+  }
+
   private researchProgress(
     group: BackgroundExecutionGroup,
     task: BackgroundTaskRecord,
@@ -1901,6 +1923,7 @@ export class BackgroundExecutionController {
       : undefined;
     const previous = next ? transitionTaskState(task, next) : task.state;
     this.addActivity(task, `research:${update.phase}`, update.message);
+    this.applyExecutorIdentity(task, update);
     const saved = this.save(group);
     void saved.catch((error) => this.input.notify?.(`review gate: failed to persist research progress: ${messageOf(error)}`));
     const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
@@ -2054,6 +2077,7 @@ export class BackgroundExecutionController {
       },
     });
     task.result = result;
+    await this.applySettledExecutorIdentity(task);
     const undeliveredSteering = this.failUndeliveredSteering(task, "The executor turn ended before the queued steering instruction reached a verified transport.");
     const worker = result.taskResults[0];
     task.bundle = worker?.bundle;
@@ -2190,6 +2214,7 @@ export class BackgroundExecutionController {
             }],
           };
           task.summary = lifecycle.summary;
+          await this.applySettledExecutorIdentity(task);
           await this.save(group);
           await this.publishAssociations();
         },
@@ -2292,12 +2317,36 @@ export class BackgroundExecutionController {
     transitionTaskState(task, "conflicted");
   }
 
+  /**
+   * Apply the live executor identity from a progress update before persistence,
+   * transition snapshots, and indicator updates so widget/watch labels track
+   * failovers while the task is still active — not only after it settles. The
+   * model comes from the actual adapter invocation, which is immutable
+   * identity: later catalog or settings changes can never relabel a task that
+   * already ran.
+   */
+  private applyExecutorIdentity(
+    task: BackgroundTaskRecord,
+    update: { executorEntryId?: string; executorSelection?: ExecutorSelection; model?: string },
+  ): void {
+    if (update.executorEntryId) task.executorEntryId = update.executorEntryId;
+    // An authoritative selection always re-establishes the model identity —
+    // including clearing it: models are optional for external executors, so a
+    // model-less successor must not keep displaying the predecessor's model.
+    if (update.executorSelection) {
+      task.executorSelection = update.executorSelection;
+      task.executorModel = update.model;
+    }
+    if (update.model) task.executorModel = update.model;
+  }
+
   private progress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: WaveProgressUpdate): void {
     const next = stateFromWaveProgress(update);
     const previous = next ? transitionTaskState(task, next) : task.state;
     if (!next) task.updatedAt = new Date().toISOString();
     this.updateReviewStatus(task, update, next);
     for (const message of update.activity ?? [update.message]) this.addActivity(task, update.phase, message);
+    if (update.subtask) this.applyExecutorIdentity(task, update.subtask);
     const saved = this.save(group);
     void saved.catch((error) => this.input.notify?.(`review gate: failed to persist task progress: ${messageOf(error)}`));
     const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
@@ -2345,6 +2394,7 @@ export class BackgroundExecutionController {
     const next = stateFromContinuationProgress(update);
     const previous = transitionTaskState(task, next);
     this.addActivity(task, update.phase, update.message);
+    this.applyExecutorIdentity(task, update);
     task.updatedAt = new Date().toISOString();
     const saved = this.save(group);
     void saved.catch(() => undefined);
@@ -2924,6 +2974,8 @@ export class BackgroundExecutionController {
         state: task.state,
         updatedAt: task.updatedAt,
         executorEntryId: task.executorEntryId,
+        executorSelection: task.executorSelection,
+        executorModel: task.executorModel,
         reviewStatus: task.reviewStatus
           ? { phase: task.reviewStatus.phase, reviewers: [...task.reviewStatus.reviewers] }
           : undefined,

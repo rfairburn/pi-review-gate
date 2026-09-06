@@ -7,7 +7,7 @@
  * in the controller (finding 14). No controller state, scheduling, or delivery
  * policy lives here.
  */
-import { externalAgentCatalog, resolvedWorkerResources, resolvedWorkerRoute, type ReviewGateConfig } from "../config";
+import { externalAgentCatalog, resolvedWorkerResources, resolvedWorkerRoute, type ExecutorSelection, type ReviewGateConfig } from "../config";
 import {
   clipActivity,
   type BackgroundActivityEvent,
@@ -18,7 +18,27 @@ import {
 const SHORT_LINE_EXPANDED_LIMIT = 16;
 const SHORT_LINE_COMPACT_LIMIT = 3;
 
-export function executorDisplayLabel(task: { executorEntryId?: string }, config: ReviewGateConfig, kind: BackgroundTaskKind = "execute"): string {
+export function executorDisplayLabel(
+  task: { executorEntryId?: string; executorSelection?: ExecutorSelection; executorModel?: string },
+  config: ReviewGateConfig,
+  kind: BackgroundTaskKind = "execute",
+): string {
+  // The model reported by the actual invocation is immutable identity: it
+  // tracks failovers, shows execution-level model overrides exactly as
+  // executed, and can never be relabeled by later catalog or settings changes.
+  if (task.executorModel) return task.executorModel;
+  // A recorded selection is authoritative identity for the task even before
+  // (or without) a reported model: a pi selection carries its own model, and
+  // an external selection keeps the recorded catalog handle — the handle was
+  // what actually served the task, while a current-config lookup could
+  // resolve the same entry id to a model that never did.
+  const selection = task.executorSelection;
+  if (selection) {
+    if (selection.source === "pi") return selection.model;
+    return selection.id || "unknown";
+  }
+  // Legacy fallback only (tasks recorded before selections were durable): an
+  // entry id resolved against current configuration.
   if (!task.executorEntryId) return "executor pending";
   const entry = resolvedWorkerRoute(config, kind).find((candidate) => candidate.entryId === task.executorEntryId)
     ?? resolvedWorkerResources(config).find((candidate) => candidate.entryId === task.executorEntryId);
@@ -39,6 +59,10 @@ export interface SubtaskWidgetTaskSnapshot {
   state: BackgroundTaskState;
   updatedAt: string;
   executorEntryId?: string;
+  /** Authoritative selection of the executor actually serving this task. */
+  executorSelection?: ExecutorSelection;
+  /** Model reported by the actual adapter invocation that last served it. */
+  executorModel?: string;
   reviewStatus?: { phase: string; reviewers: string[] };
   latestCommand?: { action: string; status: string };
   /** Queued task whose executor was already assigned and is starting up. */

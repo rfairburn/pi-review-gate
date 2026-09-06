@@ -137,6 +137,12 @@ export interface OperationRecord {
   executorEntryId?: string;
   executorPriority?: number;
   executorSelection?: ExecutorSelection;
+  /**
+   * Resolved adapter/command/model identity of the selection that created the
+   * current session. External agent ids are mutable catalog handles, so this
+   * fingerprint — not the id alone — proves old-session compatibility.
+   */
+  executorAgentFingerprint?: string;
   /** Canonical durable authorization and initial activation for every attempt. */
   executorToolCatalog?: ExecutorToolCatalog;
   /** @deprecated Compatibility mirror for older operation consumers. */

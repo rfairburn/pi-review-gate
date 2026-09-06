@@ -150,8 +150,11 @@ Stopped tasks retain verified checkpoints and reattachment bundles for
 recovery ref before bounded retry. If same-executor recovery is exhausted, a verified
 checkpoint may be handed to the next lower-priority pool entry; that adapter starts a
 new native session in the same isolated worktree, so different providers and CLI
-harnesses can take over without pretending to share conversation state. The full
-recovery story — compaction lifecycle, protected refs, restart behavior, and the
+harnesses can take over without pretending to share conversation state. A failover is
+announced explicitly in the activity stream, recorded durably in the operation's
+assignment history, and every later turn — corrections, steering, pass confirmation,
+and continuations — follows the successor that actually served the previous turn. The
+full recovery story — compaction lifecycle, protected refs, restart behavior, and the
 `recoverLandingManifest` API — is owned by [Recovery](recovery.md).
 
 Every failed or non-landed execution-tool operation returns the complete group and task

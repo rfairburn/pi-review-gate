@@ -14,6 +14,7 @@ import {
   MAX_WEB_OUTPUT_CHARS,
   MAX_WEB_SEARCH_RESULTS,
   normalizeConfig,
+  executorAgentFingerprint,
   resolveReviewers,
   reviewerConfigFingerprint,
   type DeciderConfig,
@@ -649,6 +650,137 @@ test("reviewerConfigFingerprint distinguishes same-id replacements without expos
   const thinkingA = normalizeConfig({ enabled: true, reviewers: [{ id: "p", adapter: "pi-model" as const, model: "m1", thinkingLevel: "low" }] }).reviewers![0];
   const thinkingB = normalizeConfig({ enabled: true, reviewers: [{ id: "p", adapter: "pi-model" as const, model: "m1", thinkingLevel: "high" }] }).reviewers![0];
   assert.notEqual(reviewerConfigFingerprint(thinkingA), reviewerConfigFingerprint(thinkingB));
+});
+
+test("executorAgentFingerprint covers the fully merged invocation with canonical hash-only encoding", () => {
+  const secret = "top-secret-env-value";
+  const baseRaw = {
+    enabled: true,
+    externalAgents: [{
+      id: "exec-a",
+      adapter: "run-as-binary" as const,
+      command: "/usr/bin/agent",
+      args: ["--base"],
+      env: { INHERITED: "one", SHARED: "base" },
+      model: "base-model",
+      execution: {
+        protocol: "pi-review-executor-jsonl-v1" as const,
+        args: ["--role"],
+        env: { SHARED: "role", EXTRA: secret },
+        model: "role-model",
+      },
+    }],
+  };
+  const selection = { source: "external" as const, id: "exec-a" };
+  const fingerprint = executorAgentFingerprint(normalizeConfig(baseRaw), selection);
+
+  // Hash-only identity: a full SHA-256 hex digest that never contains raw
+  // configuration values (command, args, env, model).
+  assert.match(fingerprint, /^external:[0-9a-f]{64}$/);
+  assert.doesNotMatch(fingerprint, new RegExp(secret));
+  assert.doesNotMatch(fingerprint, /INHERITED|SHARED|--base|--role|base-model|role-model/);
+
+  // Deterministic for the same effective configuration, including env key order.
+  const reloaded = normalizeConfig(JSON.parse(JSON.stringify(baseRaw)));
+  assert.equal(executorAgentFingerprint(reloaded, selection), fingerprint);
+  const reorderedEnv = normalizeConfig({
+    ...baseRaw,
+    externalAgents: [{
+      ...baseRaw.externalAgents![0],
+      env: { SHARED: "base", INHERITED: "one" },
+      execution: {
+        protocol: "pi-review-executor-jsonl-v1" as const,
+        args: ["--role"],
+        env: { EXTRA: secret, SHARED: "role" },
+        model: "role-model",
+      },
+    }],
+  });
+  assert.equal(executorAgentFingerprint(reorderedEnv, selection), fingerprint);
+
+  // Inherited (agent-level) args participate even when role args are present.
+  const inheritedArgsChanged = normalizeConfig({
+    ...baseRaw,
+    externalAgents: [{ ...baseRaw.externalAgents![0], args: ["--other"] }],
+  });
+  assert.notEqual(executorAgentFingerprint(inheritedArgsChanged, selection), fingerprint);
+
+  // Inherited (agent-level) env participates even when role env is present.
+  const inheritedEnvChanged = normalizeConfig({
+    ...baseRaw,
+    externalAgents: [{ ...baseRaw.externalAgents![0], env: { INHERITED: "two", SHARED: "base" } }],
+  });
+  assert.notEqual(executorAgentFingerprint(inheritedEnvChanged, selection), fingerprint);
+
+  // A base value that the role overrides is not part of the effective
+  // invocation: changing it must not change the fingerprint.
+  const shadowedBaseEnv = normalizeConfig({
+    ...baseRaw,
+    externalAgents: [{ ...baseRaw.externalAgents![0], env: { INHERITED: "one", SHARED: "replaced-anyway" } }],
+  });
+  assert.equal(executorAgentFingerprint(shadowedBaseEnv, selection), fingerprint);
+  const shadowedBaseModel = normalizeConfig({
+    ...baseRaw,
+    externalAgents: [{ ...baseRaw.externalAgents![0], model: "other-base-model" }],
+  });
+  assert.equal(executorAgentFingerprint(shadowedBaseModel, selection), fingerprint);
+
+  // Delimiter-bearing values cannot collide across command/args boundaries:
+  // command "a|b" with no args must differ from command "a" with arg "b".
+  const collisionCommand = normalizeConfig({
+    enabled: true,
+    externalAgents: [{
+      id: "x",
+      adapter: "run-as-binary" as const,
+      command: "a|b",
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+    }],
+  });
+  const collisionArgs = normalizeConfig({
+    enabled: true,
+    externalAgents: [{
+      id: "x",
+      adapter: "run-as-binary" as const,
+      command: "a",
+      args: ["b"],
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+    }],
+  });
+  assert.notEqual(
+    executorAgentFingerprint(collisionCommand, { source: "external", id: "x" }),
+    executorAgentFingerprint(collisionArgs, { source: "external", id: "x" }),
+  );
+
+  // Delimiter-bearing env keys/values cannot collide either.
+  const collisionEnvKey = normalizeConfig({
+    enabled: true,
+    externalAgents: [{
+      id: "x",
+      adapter: "run-as-binary" as const,
+      command: "bin",
+      env: { "a=b": "c" },
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+    }],
+  });
+  const collisionEnvValue = normalizeConfig({
+    enabled: true,
+    externalAgents: [{
+      id: "x",
+      adapter: "run-as-binary" as const,
+      command: "bin",
+      env: { a: "b=c" },
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+    }],
+  });
+  assert.notEqual(
+    executorAgentFingerprint(collisionEnvKey, { source: "external", id: "x" }),
+    executorAgentFingerprint(collisionEnvValue, { source: "external", id: "x" }),
+  );
+
+  // Pi selections keep their existing selection-key semantics, and a missing
+  // catalog entry stays explicitly unresolvable.
+  assert.equal(executorAgentFingerprint(normalizeConfig(baseRaw), { source: "pi", model: "m1" }), "pi:m1");
+  assert.equal(executorAgentFingerprint(normalizeConfig(baseRaw), { source: "external", id: "nope" }), "external:missing:nope");
 });
 
 test("shared external agents resolve independently for review and execution", () => {

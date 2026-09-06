@@ -62,3 +62,29 @@ Current feature surface of the repository, summarized:
   hash-only, not a reconstructable raw configuration snapshot. History entries without
   a saved identity (pre-migration sidecars) render with their raw reviewer id and are
   never relabeled or backfilled from current settings.
+
+### Fixed
+
+- Executor assignment continuity across the review lifecycle: correction turns,
+  steering, and pass confirmation now follow the executor that actually served the
+  previous turn — including a failover successor — instead of silently re-resolving
+  to the first configured pool entry. A genuine failover is announced explicitly in
+  the activity stream, recorded durably in the operation's assignment history, and
+  every later turn follows the successor. Continuations hold at most one live lease
+  at a time (the predecessor is released before the successor is acquired), so pool
+  capacity no longer overcounts a failed-over task.
+- Recovery session compatibility is now proven by the durable record: a persisted
+  executor session is resumed only when the recorded selection matches the effective
+  assignment, and — for external agents, whose id is a mutable catalog handle — only
+  when that id still resolves to the same adapter/command/model fingerprint recorded
+  at session creation. A changed assignment, an unverifiable legacy record, or a
+  re-pointed agent id all fail closed to a new session with an explicit announcement
+  naming the executor that takes over, so the announced assignment, the actual
+  adapter invocation, the persisted record, and the UI agree.
+- Subtask UI and watch labels carry the live executor identity through execution,
+  continuation, and research progress — not only after settlement — and prefer the
+  model reported by the actual adapter invocation (which shows execution-level model
+  overrides exactly as executed) over resolving a stale entry id or external agent id
+  against current settings. Catalog or settings changes can no longer relabel a task
+  that already ran, and historical activity text is never re-labeled from current
+  settings.

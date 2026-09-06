@@ -627,9 +627,16 @@ export async function runWaveWorkerLifecycle(
     artifactDir: resolvedArtifactDir,
   });
 
+  // Authoritative effective assignment: seeded from the pre-existing result
+  // (or the caller's lease) and updated after every turn so steering,
+  // corrections, and pass confirmation follow the executor that actually
+  // served the previous turn — including failover successors.
+  let effectiveAssignment = input.initialResult?.effectiveAssignment ?? input.executorAssignment;
+
   let initialResult: WaveWorkerResult;
   try {
     initialResult = input.initialResult ?? await runWaveWorker({ ...input, onLiveControl: publishLiveControl });
+    effectiveAssignment = initialResult.effectiveAssignment ?? effectiveAssignment;
     await steeringEvidence.flush();
   } catch (error) {
     const result: WaveWorkerLifecycleResult = {
@@ -780,6 +787,8 @@ export async function runWaveWorkerLifecycle(
         signal,
         onUpdate: input.onUpdate,
         onLiveControl: publishLiveControl,
+        executorAssignment: effectiveAssignment,
+        acquireFailover: input.acquireFailover,
       });
       await steeringEvidence.flush();
     } catch (error) {
@@ -797,6 +806,7 @@ export async function runWaveWorkerLifecycle(
       await writeResult(resolvedArtifactDir, result);
       return result;
     }
+    effectiveAssignment = steeredResult.effectiveAssignment ?? effectiveAssignment;
     nextExecutorTurn = (steeredResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
     if (["executor_error", "timeout", "cancelled", "no_changes"].includes(steeredResult.status)) {
       const status: WaveWorkerLifecycleStatus = steeredResult.status === "executor_error"
@@ -1056,6 +1066,8 @@ export async function runWaveWorkerLifecycle(
           signal,
           onUpdate: input.onUpdate,
           onLiveControl: publishLiveControl,
+          executorAssignment: effectiveAssignment,
+          acquireFailover: input.acquireFailover,
         });
         await steeringEvidence.flush();
       } catch (error) {
@@ -1073,6 +1085,7 @@ export async function runWaveWorkerLifecycle(
         await writeResult(resolvedArtifactDir, result);
         return result;
       }
+      effectiveAssignment = steeredResult.effectiveAssignment ?? effectiveAssignment;
       nextExecutorTurn = (steeredResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
       if (["executor_error", "timeout", "cancelled", "no_changes"].includes(steeredResult.status)) {
         const status: WaveWorkerLifecycleStatus = steeredResult.status === "no_changes"
@@ -1286,6 +1299,8 @@ export async function runWaveWorkerLifecycle(
           signal,
           onUpdate: input.onUpdate,
           onLiveControl: publishLiveControl,
+          executorAssignment: effectiveAssignment,
+          acquireFailover: input.acquireFailover,
         });
         await steeringEvidence.flush();
       } catch (error) {
@@ -1304,6 +1319,7 @@ export async function runWaveWorkerLifecycle(
         return result;
       }
 
+      effectiveAssignment = correctionResult.effectiveAssignment ?? effectiveAssignment;
       nextExecutorTurn = (correctionResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
 
       // Handle correction result.
@@ -1438,6 +1454,8 @@ export async function runWaveWorkerLifecycle(
         signal,
         onUpdate: input.onUpdate,
         onLiveControl: publishLiveControl,
+        executorAssignment: effectiveAssignment,
+        acquireFailover: input.acquireFailover,
       });
       await steeringEvidence.flush();
     } catch (error) {
@@ -1457,6 +1475,7 @@ export async function runWaveWorkerLifecycle(
       return result;
     }
 
+    effectiveAssignment = confirmResult.effectiveAssignment ?? effectiveAssignment;
     nextExecutorTurn = (confirmResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
 
     // Handle confirmation result.

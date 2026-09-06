@@ -123,7 +123,18 @@ Executor failures are checkpointed to a protected recovery ref before bounded re
 is exhausted, a verified checkpoint may be handed to the next lower-priority pool entry.
 That adapter starts a new native session in the same isolated worktree, so different
 providers and CLI harnesses can take over without pretending to share conversation
-state. Durable diagnostics include the complete executor assignment history.
+state. Durable diagnostics include the complete executor assignment history, and every
+failover is announced explicitly in the activity stream; later turns — corrections,
+steering, pass confirmation, and continuations — always follow the successor that
+actually served the previous turn.
+
+A persisted executor session is resumed only when the durable record proves
+compatibility with the effective assignment: the recorded selection must match, and
+for external agents — whose id is a mutable catalog handle — the id must still resolve
+to the same adapter/command/model fingerprint recorded at session creation. A changed
+assignment, an unverifiable legacy record (no recorded selection or fingerprint), or a
+re-pointed agent id therefore starts a new session from the verified checkpoint with an
+explicit announcement instead of silently resuming an incompatible session.
 
 Compaction is a lifecycle transition: an interrupted Pi session is reopened by exact
 UUID, explicitly compacted through Pi RPC, and only then prompted to continue.

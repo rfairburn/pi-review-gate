@@ -44,6 +44,162 @@ test("executorDisplayLabel resolves pi models, external agents, and fallbacks", 
   assert.equal(executorDisplayLabel({ executorEntryId: "unknown-entry" }, config), "unknown-entry");
 });
 
+test("executorDisplayLabel prefers the recorded selection over stale entry-id resolution", () => {
+  // Failover case: the task's entry id still points at the original pool
+  // entry, but the recorded pi selection is what actually served the turn.
+  assert.equal(
+    executorDisplayLabel({ executorEntryId: "pi-entry", executorSelection: { source: "pi", model: "gpt-y" } }, config),
+    "gpt-y",
+  );
+  // An external selection is honored as recorded identity even without a
+  // model: the label is the recorded catalog handle, never a re-resolution of
+  // the entry id against mutable current configuration.
+  assert.equal(
+    executorDisplayLabel({ executorEntryId: "external-fake", executorSelection: { source: "external", id: "fake" } }, config),
+    "fake",
+  );
+  // A recorded external selection stays honest even when its id no longer
+  // resolves anywhere: the recorded id is what actually served the task.
+  assert.equal(executorDisplayLabel({ executorSelection: { source: "external", id: "gone" } }, config), "gone");
+  // A recorded external selection without a usable id degrades to an explicit
+  // unknown label instead of silently falling through to current settings.
+  assert.equal(executorDisplayLabel({ executorSelection: { source: "external", id: "" } }, config), "unknown");
+  // Without a recorded selection the legacy entry-id resolution is unchanged,
+  // and historical activity text is never re-labeled from current settings.
+  assert.equal(executorDisplayLabel({ executorEntryId: "pi-entry" }, config), "gpt-x");
+});
+
+test("executorDisplayLabel prefers the actual invocation model over mutable settings", () => {
+  const modelAgentConfig = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "with-model",
+      adapter: "run-as-binary",
+      command: process.execPath,
+      model: "agent-model-9",
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const, model: "execution-override-7" },
+    }],
+  });
+  const rePointedConfig = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "with-model",
+      adapter: "run-as-binary",
+      command: process.execPath,
+      model: "catalog-changed-later",
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+    }],
+  });
+  // The execution-level override is what actually ran — the label shows it
+  // exactly, not the agent-level default.
+  assert.equal(
+    executorDisplayLabel({ executorModel: "execution-override-7", executorSelection: { source: "external", id: "with-model" } }, modelAgentConfig),
+    "execution-override-7",
+  );
+  // A catalog change under an already-running task can never relabel it:
+  // the same live task renders identically against both configurations.
+  const liveTask = { executorModel: "execution-override-7", executorEntryId: "external-with-model", executorSelection: { source: "external" as const, id: "with-model" } };
+  assert.equal(executorDisplayLabel(liveTask, modelAgentConfig), executorDisplayLabel(liveTask, rePointedConfig));
+  // The invocation model also wins over a recorded pi selection (they agree
+  // in practice; the reported value is the ground truth).
+  assert.equal(
+    executorDisplayLabel({ executorModel: "actual-1", executorSelection: { source: "pi", model: "stale-2" } }, config),
+    "actual-1",
+  );
+});
+
+test("executorDisplayLabel keeps the recorded model-less external identity under later catalog edits", () => {
+  const modelLessConfig = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "fake",
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+    }],
+    execution: {
+      executorPool: [
+        { entryId: "external-fake", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 },
+      ],
+    },
+  });
+  // Later catalog edit: the same agent id now claims a model that never
+  // served this model-less invocation.
+  const catalogGainedModel = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "fake",
+      adapter: "run-as-binary",
+      command: process.execPath,
+      model: "never-served-9",
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+    }],
+    execution: {
+      executorPool: [
+        { entryId: "external-fake", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 },
+      ],
+    },
+  });
+  // Resource reassignment: the same entry id now resolves to an entirely
+  // different executor selection.
+  const entryReassigned = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: [{
+      id: "fake",
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+    }],
+    execution: {
+      executorPool: [
+        { entryId: "external-fake", selection: { source: "pi" as const, model: "gpt-reassigned" }, maxConcurrent: 1 },
+      ],
+    },
+  });
+  // A model-less external invocation reports no executorModel: the recorded
+  // selection must stay the authoritative identity no matter how the catalog
+  // or pool later edits the same entry id.
+  const modelLessTask = {
+    executorEntryId: "external-fake",
+    executorSelection: { source: "external" as const, id: "fake" },
+  };
+  assert.equal(executorDisplayLabel(modelLessTask, modelLessConfig), "fake");
+  assert.equal(executorDisplayLabel(modelLessTask, catalogGainedModel), "fake");
+  assert.equal(executorDisplayLabel(modelLessTask, entryReassigned), "fake");
+
+  // The widget line stays honest under the edited catalog as well.
+  const rendered = renderSubtaskWidget({
+    expanded: true,
+    tasks: [widgetTask({ executorEntryId: "external-fake", executorSelection: { source: "external" as const, id: "fake" } })],
+    recent: [],
+  }, catalogGainedModel).component!().render(400);
+  const taskLine = rendered.find((line) => line.startsWith("  execute · "))!;
+  assert.ok(taskLine.includes("· fake"), taskLine);
+  assert.ok(!taskLine.includes("never-served-9"), taskLine);
+
+  // The true legacy path is untouched: without a recorded selection the entry
+  // id still resolves against current configuration.
+  assert.equal(executorDisplayLabel({ executorEntryId: "external-fake" }, catalogGainedModel), "never-served-9");
+  assert.equal(executorDisplayLabel({ executorEntryId: "external-fake" }, entryReassigned), "gpt-reassigned");
+});
+
+test("compact widget count stays one per task regardless of executor identity", () => {
+  const rendered = renderSubtaskWidget({
+    expanded: false,
+    tasks: [
+      widgetTask({ taskId: "task-1", title: "One", executorEntryId: "pi-entry", executorSelection: { source: "pi", model: "gpt-x" } }),
+      widgetTask({ taskId: "task-2", title: "Two", executorEntryId: "external-fake", executorSelection: { source: "external", id: "fake" } }),
+    ],
+    recent: [],
+  }, config);
+  assert.deepEqual(rendered.lines, ["⟳ 2 background subtasks — One (running), Two (running)"]);
+});
+
 test("renderSubtaskWidget compact view renders queue states, overflow, conflicts, and clearing", () => {
   const waiting = renderSubtaskWidget({
     expanded: false,

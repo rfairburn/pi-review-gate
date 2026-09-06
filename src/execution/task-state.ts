@@ -7,6 +7,7 @@
  * group store owns durable format mechanics.
  */
 import { randomUUID } from "node:crypto";
+import type { ExecutorSelection } from "../config";
 import type { ReattachmentBundle } from "./operation-record";
 import type { ContinuationProgressUpdate, SubtaskProgressPhase } from "./types";
 import type { WaveProgressUpdate, WaveResult } from "./wave-controller";
@@ -118,6 +119,19 @@ export interface BackgroundTaskRecord {
   waveRoot?: string;
   bundle?: ReattachmentBundle;
   executorEntryId?: string;
+  /**
+   * Authoritative selection of the executor actually serving this task.
+   * Tracks failovers and settings changes so display labels never infer the
+   * active model from stale entry ids alone.
+   */
+  executorSelection?: ExecutorSelection;
+  /**
+   * Model reported by the actual adapter invocation that last served this
+   * task. Immutable identity: catalog or settings changes can never relabel
+   * a task that already ran, and execution-level model overrides are shown
+   * exactly as executed.
+   */
+  executorModel?: string;
   lastRuntimeConfigDigest?: string;
   result?: WaveResult;
   researchResult?: WaveWorkerResult;

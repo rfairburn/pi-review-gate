@@ -448,15 +448,21 @@ export async function continueOperation(input: {
   instructionRecord.deliveredAt = new Date().toISOString();
   await writeOperationRecord(record);
   const continuationPool = input.executorPool ?? new ExecutorPoolScheduler(resolvedExecutorPool(input.config));
-  let failoverLease: ExecutorPoolLease | undefined;
+  // One live lease at a time: it starts as the caller's lease and is swapped
+  // on failover (the predecessor is released before the successor is taken,
+  // so one task never holds two leases). The finally blocks release whatever
+  // is live; callers releasing their own reference again is a no-op.
+  let currentLease: ExecutorPoolLease | undefined = input.executorAssignment;
   const acquireFailover = async (currentAssignment: ExecutorPoolAssignment) => {
-    failoverLease?.release();
-    failoverLease = await continuationPool.acquireAfterRoute(
+    currentLease?.release();
+    const next = await continuationPool.acquireAfterRoute(
       currentAssignment,
       () => resolvedExecutorPool(input.config),
       input.signal,
     );
-    return failoverLease;
+    if (!next) return undefined;
+    currentLease = next;
+    return next;
   };
   let continued: WaveWorkerResult;
   try {
@@ -491,7 +497,8 @@ export async function continueOperation(input: {
     }
     record.state = "paused_recoverable";
     await writeOperationRecord(record);
-    failoverLease?.release();
+    currentLease?.release();
+    currentLease = undefined;
     throw error;
   }
 
@@ -508,7 +515,9 @@ export async function continueOperation(input: {
       sourceRootAliases: [capture.discovery.requestedCwd],
       scopedModels: input.scopedModels,
       signal: input.signal,
-      executorAssignment: input.executorAssignment,
+      // Follow the assignment that actually served the resumed turn (which
+      // may be a failover successor), not the original caller lease.
+      executorAssignment: continued.effectiveAssignment ?? input.executorAssignment,
       acquireFailover,
       onLiveControl: publishLiveControl,
       takeDeferredSteering: input.takeDeferredSteering,
@@ -516,7 +525,8 @@ export async function continueOperation(input: {
       initialResult: continued,
     });
   } finally {
-    failoverLease?.release();
+    currentLease?.release();
+    currentLease = undefined;
   }
   record = await readOperationRecord(operationRecordPath(record.artifactDir));
   const persistedInstruction = record.instructions.find((item) => item.instructionId === input.instructionId);

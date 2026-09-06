@@ -127,6 +127,7 @@ export interface RunAsBinaryExecutorConfig extends ExternalExecutorBase {
   adapter: "run-as-binary";
   protocol: "pi-review-executor-jsonl-v1";
   command: string;
+  model?: string;
 }
 
 export type ExternalExecutorConfig = CodexExecutorConfig | ClaudeExecutorConfig | RunAsBinaryExecutorConfig;
@@ -596,6 +597,36 @@ export function executorEntryId(selection: ExecutorSelection): string {
 
 export function executorSelectionKey(selection: ExecutorSelection): string {
   return selection.source === "external" ? `external:${selection.id}` : `pi:${selection.model}`;
+}
+
+/**
+ * Stable identity of what an executor selection actually resolves to under the
+ * current configuration. A pi selection carries its own model, so the
+ * selection key already proves compatibility; an external agent id is a
+ * mutable handle into the agent catalog, and only this fingerprint records
+ * which adapter/command/args/env/model that id served when a session was
+ * created. The material is the fully merged invocation — inherited
+ * (agent-level) args concatenated with role args and agent env overridden by
+ * role env exactly as executorFromExternalAgent resolves them — encoded as
+ * canonical JSON and reduced to a full SHA-256 digest, so delimiter-bearing
+ * values cannot collide across command/args/env boundaries and no raw
+ * configuration value ever crosses into persisted identity.
+ */
+export function executorAgentFingerprint(config: ReviewGateConfig, selection: ExecutorSelection): string {
+  if (selection.source === "pi") return `pi:${selection.model}`;
+  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === selection.id);
+  if (!agent) return `external:missing:${selection.id}`;
+  const merged = mergedAgentRole(agent, agent.execution ?? {}, config.executorTimeoutMs);
+  const resolved: Record<string, unknown> = {
+    adapter: agent.adapter,
+    command: agent.command
+      ?? (agent.adapter === "codex-cli" ? "codex" : agent.adapter === "claude-cli" ? "claude" : ""),
+    args: merged.args,
+    env: merged.env,
+    model: merged.model ?? "",
+  };
+  if (agent.adapter === "run-as-binary") resolved.protocol = "pi-review-executor-jsonl-v1";
+  return `external:${createHash("sha256").update(canonicalStableJson(resolved)).digest("hex")}`;
 }
 
 export function externalAgentCatalog(config: ReviewGateConfig): ExternalAgentConfig[] {
@@ -1218,6 +1249,7 @@ function executorFromExternalAgent(agent: ExternalAgentConfig, defaultTimeoutMs:
     command: agent.command!,
     args: common.args,
     env: common.env,
+    model: common.model,
     timeoutMs: common.timeoutMs,
     protocol: "pi-review-executor-jsonl-v1",
   };

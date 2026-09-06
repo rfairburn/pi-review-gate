@@ -8,6 +8,7 @@ import type { WorkerWorktree } from "./wave-worktrees";
 import type { WaveCaptureResult } from "./wave-repository";
 import {
   DEFAULT_EXECUTION_RETRY_POLICY,
+  executorAgentFingerprint,
   executorSelectionKey,
   resolvedExecutorPool,
   type ReviewGateConfig,
@@ -243,6 +244,12 @@ export interface WaveWorkerResult {
   candidate?: CandidateCommit;
   adapter: string;
   model?: string;
+  /**
+   * Authoritative pool assignment that actually served this turn (after any
+   * failover). Callers that drive further turns must follow this value rather
+   * than re-resolving from configuration.
+   */
+  effectiveAssignment?: ExecutorPoolAssignment;
   usage?: TokenUsage;
   error?: string;
   operationRecord?: string;
@@ -576,6 +583,8 @@ function reportProgress(
 interface PoolRunResult {
   adapter?: ExecutorAdapter;
   recovered: RecoveredExecutorRun;
+  /** Assignment that actually served the final turn (after any failover). */
+  effectiveAssignment?: ExecutorPoolAssignment;
 }
 
 function configuredAssignment(config: ReviewGateConfig): ExecutorPoolAssignment | undefined {
@@ -607,10 +616,14 @@ function beginAssignment(
   operation: OperationRecord,
   assignment: ExecutorPoolAssignment,
   reason: ExecutorAssignmentRecord["reason"],
+  config: ReviewGateConfig,
 ): ExecutorAssignmentRecord {
   operation.executorEntryId = assignment.entry.entryId;
   operation.executorPriority = assignment.priority;
   operation.executorSelection = assignment.entry.selection;
+  // Refresh the resolved-identity fingerprint on every assignment so the
+  // record always describes what created the current session.
+  operation.executorAgentFingerprint = executorAgentFingerprint(config, assignment.entry.selection);
   const record: ExecutorAssignmentRecord = {
     entryId: assignment.entry.entryId,
     priority: assignment.priority,
@@ -667,8 +680,20 @@ async function runWithPoolFailover(input: {
   let startingTurn = input.startingTurn;
   let reason = input.reason;
 
+  // A failover must be explicit: the activity stream records which executor
+  // is being replaced by which, and every later turn follows the successor.
+  const announceFailover = (from: ExecutorPoolAssignment, to: ExecutorPoolAssignment): void => {
+    reportProgress(input.worker, {
+      phase: "executing",
+      message: `executor failover: ${from.entry.entryId} -> ${to.entry.entryId} after a recorded failure; continuing from the verified checkpoint in a new session`,
+      artifactDir: input.resolvedArtifactDir,
+      executorEntryId: to.entry.entryId,
+      executorSelection: { ...to.entry.selection },
+    });
+  };
+
   for (;;) {
-    const assignmentRecord = beginAssignment(input.operation, assignment, reason);
+    const assignmentRecord = beginAssignment(input.operation, assignment, reason, input.worker.config);
     let adapter: ExecutorAdapter | undefined;
     try {
       adapter = createExecutorAdapter(input.worker.config, assignment.entry.selection);
@@ -735,10 +760,11 @@ async function runWithPoolFailover(input: {
       if (!next) {
         input.operation.state = "paused_recoverable";
         await writeOperationRecord(input.operation);
-        return { recovered };
+        return { recovered, effectiveAssignment: assignment };
       }
       incident.resolvedAt = new Date().toISOString();
       incident.resolution = "executor_pool_failover";
+      announceFailover(assignment, next);
       input.operation.generation += 1;
       input.operation.session = undefined;
       assignment = next;
@@ -755,6 +781,8 @@ async function runWithPoolFailover(input: {
       adapter: adapter.kind,
       model: adapter.model,
       executorTurn: startingTurn,
+      executorEntryId: assignment.entry.entryId,
+      executorSelection: { ...assignment.entry.selection },
     });
 
     const executorToolCatalog = resolveExecutorToolCatalog(input.worker.task);
@@ -799,23 +827,23 @@ async function runWithPoolFailover(input: {
     if (recovered.status === "completed") {
       finishAssignment(assignmentRecord, "completed");
       await writeOperationRecord(input.operation);
-      return { adapter, recovered };
+      return { adapter, recovered, effectiveAssignment: assignment };
     }
     if (recovered.status === "cancelled") {
       finishAssignment(assignmentRecord, "cancelled");
       await writeOperationRecord(input.operation);
-      return { adapter, recovered };
+      return { adapter, recovered, effectiveAssignment: assignment };
     }
     finishAssignment(assignmentRecord, "failed");
     if (recovered.status === "critical" || !recovered.checkpoint?.verified) {
       await writeOperationRecord(input.operation);
-      return { adapter, recovered };
+      return { adapter, recovered, effectiveAssignment: assignment };
     }
 
     const next = await input.worker.acquireFailover?.(assignment);
     if (!next) {
       await writeOperationRecord(input.operation);
-      return { adapter, recovered };
+      return { adapter, recovered, effectiveAssignment: assignment };
     }
     for (const incident of recovered.incidents) {
       if (!incident.resolvedAt) {
@@ -823,6 +851,7 @@ async function runWithPoolFailover(input: {
         incident.resolution = "verified_checkpoint_failover";
       }
     }
+    announceFailover(assignment, next);
     input.operation.generation += 1;
     input.operation.session = undefined;
     assignment = next;
@@ -947,6 +976,7 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     taskId,
     title: task.title,
     summary: recovered.error ?? "Executor failed.",
+    effectiveAssignment: poolRun.effectiveAssignment,
     session: recovered.turn?.session,
     turn: recovered.turn,
     adapter: adapterKind,
@@ -1006,6 +1036,7 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
       taskId,
       title: task.title,
       summary: message,
+      effectiveAssignment: poolRun.effectiveAssignment,
       session: turn.session,
       turn,
       adapter: adapter.kind,
@@ -1030,6 +1061,7 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
   const result: WaveWorkerResult = candidate.differsFromBase
     ? {
       status: "completed",
+      effectiveAssignment: poolRun.effectiveAssignment,
       taskId,
       title: task.title,
       summary: turn.text,
@@ -1048,6 +1080,7 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
     }
     : {
       status: "no_changes",
+      effectiveAssignment: poolRun.effectiveAssignment,
       taskId,
       title: task.title,
       summary: turn.text,
@@ -1215,6 +1248,8 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     phase: "correcting",
     message: `resuming executor turn ${turn}`,
     artifactDir: resolvedArtifactDir,
+    executorEntryId: assignment.entry.entryId,
+    executorSelection: { ...assignment.entry.selection },
   });
 
   // ── Resume the exact executor session ──
@@ -1230,14 +1265,44 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     "Current continuation instructions:",
     rewrittenFeedback,
   ].join("\n");
+  // Session compatibility is proven by the durable record: a persisted
+  // session may only be resumed when the recorded executor selection matches
+  // the effective assignment, and — for external agents, whose id is a
+  // mutable handle into the agent catalog — when that id still resolves to
+  // the same adapter/command/model fingerprint recorded at session creation.
+  // A missing recorded selection or fingerprint (legacy or corrupted records)
+  // cannot be verified and must fail closed to a new session with an explicit
+  // announcement.
   const selectionChanged = priorExecutorSelection !== undefined
     && executorSelectionKey(priorExecutorSelection) !== executorSelectionKey(assignment.entry.selection);
-  const resumableSession = selectionChanged ? undefined : priorResult.session;
+  const selectionUnrecorded = priorExecutorSelection === undefined;
+  const resolutionDrifted = !selectionChanged && !selectionUnrecorded
+    && priorExecutorSelection!.source === "external"
+    && (operation.executorAgentFingerprint ?? "") !== executorAgentFingerprint(config, assignment.entry.selection);
+  const resumableSession = selectionChanged || selectionUnrecorded || resolutionDrifted ? undefined : priorResult.session;
   if (priorResult.session && selectionChanged) {
     reportProgress(input, {
       phase: "correcting",
       message: `current /review-settings changed the executor assignment; starting a new ${assignment.entry.entryId} session from the durable checkpoint`,
       artifactDir: resolvedArtifactDir,
+      executorEntryId: assignment.entry.entryId,
+      executorSelection: { ...assignment.entry.selection },
+    });
+  } else if (priorResult.session && selectionUnrecorded) {
+    reportProgress(input, {
+      phase: "correcting",
+      message: `the prior executor assignment is not durably recorded, so the previous session cannot be verified against ${assignment.entry.entryId}; starting a new session from the durable checkpoint`,
+      artifactDir: resolvedArtifactDir,
+      executorEntryId: assignment.entry.entryId,
+      executorSelection: { ...assignment.entry.selection },
+    });
+  } else if (priorResult.session && resolutionDrifted) {
+    reportProgress(input, {
+      phase: "correcting",
+      message: `the recorded executor agent no longer resolves to the adapter and model that created the previous session; starting a new ${assignment.entry.entryId} session from the durable checkpoint`,
+      artifactDir: resolvedArtifactDir,
+      executorEntryId: assignment.entry.entryId,
+      executorSelection: { ...assignment.entry.selection },
     });
   }
   const poolRun = await runWithPoolFailover({
@@ -1259,6 +1324,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       taskId,
       title: task.title,
       summary: recovered.error ?? "Executor continuation failed.",
+      effectiveAssignment: poolRun.effectiveAssignment,
       session: recovered.turn?.session ?? priorResult.session,
       turn: recovered.turn,
       adapter: adapter?.kind ?? "none",
@@ -1279,6 +1345,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       taskId,
       title: task.title,
       summary: "Executor completed without an adapter record.",
+      effectiveAssignment: poolRun.effectiveAssignment,
       adapter: "none",
       error: "Executor completed without an adapter record.",
       operationRecord: operationRecordPath(resolvedArtifactDir),
@@ -1331,6 +1398,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       taskId,
       title: task.title,
       summary: message,
+      effectiveAssignment: poolRun.effectiveAssignment,
       session: turnResult.session,
       turn: turnResult,
       adapter: adapter.kind,
@@ -1360,6 +1428,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     taskId,
     title: task.title,
     summary: turnResult.text,
+    effectiveAssignment: poolRun.effectiveAssignment,
     session: turnResult.session,
     turn: turnResult,
     candidate,

@@ -24,7 +24,7 @@
  * this module instead of re-deriving the policy inline. Everything here is
  * pure: no I/O, no controller state, no scheduling side effects.
  */
-import { DEFAULT_SUBTASK_NOTIFICATION_MODE, type ReviewGateConfig } from "../config";
+import { DEFAULT_SUBTASK_NOTIFICATION_MODE, type ExecutorSelection, type ReviewGateConfig } from "../config";
 import type { BackgroundExecutionGroup } from "./background-group-store";
 import {
   clipActivity,
@@ -331,6 +331,9 @@ export interface SubtaskWatchTaskSnapshot {
   state: BackgroundTaskState;
   updatedAt: string;
   executorEntryId?: string;
+  /** Live executor identity so watch labels track failovers like the widget. */
+  executorSelection?: ExecutorSelection;
+  executorModel?: string;
   activity: BackgroundActivityEvent[];
   timing: { totalMs: number };
   liveControl?: { steer: boolean };

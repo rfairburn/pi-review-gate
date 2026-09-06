@@ -8,6 +8,15 @@ import type { ExecutorAdapter, ExecutorRequest, ExecutorTurn } from "../types";
 
 export class RunAsBinaryExecutorAdapter implements ExecutorAdapter {
   readonly kind = "run-as-binary";
+  /**
+   * The effective model of the actual invocation (execution-role override,
+   * else the agent-level model). External agent ids are mutable handles, so
+   * this reported value — not a later catalog lookup — is the task's model
+   * identity.
+   */
+  get model(): string | undefined {
+    return this.config.model;
+  }
 
   constructor(private readonly config: RunAsBinaryExecutorConfig) {}
 

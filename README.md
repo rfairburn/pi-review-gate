@@ -54,22 +54,6 @@ receipts of exactly what the model was told.
 - **Not an OS sandbox.** Task isolation is worktree and instruction isolation; a hostile
   custom executor process can still access paths allowed by the host account
   ([Security model](docs/security-model.md#isolation-limits)).
-- **No general browser automation.** The public-web-only browser exposes bounded
-  observation plus fresh-semantic-ref hover, click, fill, type, exact select, and
-  allowlisted key press. Only edits with proven absence of relevant page-controlled
-  events may remain ephemeral; hidden direct or delegated listeners fail closed.
-  Sensitive, submit/activation, handler-bearing, unknown, or consequential actions need
-  single-use revalidated approval: **Ask** (default) requires top-level Pi confirmation
-  and rejects without UI; **Automatically Accept** and **Automatically Deny** under
-  `/review-settings` → **Web** control only that approval-required branch. Neither
-  automatic mode removes hard safety or role restrictions.
-  Entered/selected values are excluded from review-gate-owned results, evidence,
-  diagnostics, and logs. Pi/provider-native conversation and session retention is
-  outside that guarantee, so do not enter secrets. Research roles cannot use form
-  actions. There is no password/file entry, upload/download saving, arbitrary
-  selector/script/event, forced option, coordinate, filesystem path, clipboard,
-  permission, or CDP escape hatch
-  ([Web tools](docs/web-tools.md#interactive-browser)).
 - **No forced verification theater.** Force merges and `interrupt_with_merge` are
   mechanical landing attempts, not verification; the main workspace must always be
   inspected manually afterward

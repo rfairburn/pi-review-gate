@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.10]
+
+### Changed
+
+- Removed the obsolete "No general browser automation" non-goal bullet from the README
+  Non-goals list, including its explanatory prose: interactive browsing with
+  approval-required consequential actions is already documented as a shipped
+  capability, so the stale non-goal no longer applied (Closes #43).
+
 ## [0.1.0-dev.9]
 
 ### Added

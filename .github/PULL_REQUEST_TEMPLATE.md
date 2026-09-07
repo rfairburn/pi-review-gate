@@ -32,8 +32,11 @@ placeholder results.
 
 ## Changelog
 
-- [ ] Entry added under `## [Unreleased]` in CHANGELOG.md, or state why no entry is
-  needed.
+- [ ] Candidate entry added under the per-build candidate heading in CHANGELOG.md
+  (`## [0.1.0-dev.N]`, where `N` is the next build number predicted from this PR's
+  base), or state why no entry is needed. If main advanced after the branch was cut,
+  update the candidate number and integrate the current main before merging; CI checks
+  the prediction against the exact PR base and fails closed on a stale number.
 
 ## Compatibility
 

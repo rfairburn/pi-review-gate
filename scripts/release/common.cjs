@@ -11,6 +11,17 @@ const crypto = require("node:crypto");
 
 const REPOSITORY = "rfairburn/pi-review-gate";
 const BASELINE_SHA = "f7c174f1c12c81447bce2ab1aa39fb5faf4331ec";
+// Policy-adoption anchor for per-build changelog attribution and release
+// notes: the main commit at the moment per-build attribution was adopted
+// (b4, `0.1.0-dev.4`, the last build published in the legacy body format). The
+// boundary is this immutable source SHA — not a scan of section presence, so
+// the very first adopted build cannot be reclassified as legacy by omitting
+// its own notes, and not mutable "latest release" state. Every strict
+// first-parent descendant of this commit published by a producer carrying this
+// policy requires exact per-build notes; this commit and its ancestors keep
+// read-only legacy verification (a producer always runs from the pushed
+// commit's own source, so earlier builds verify with their own code).
+const POLICY_ADOPTION_ANCHOR = "bba091c2058fa05eab44e76a59b1b16845c2671c";
 const BASE_VERSION = "0.1.0";
 const TAG_PREFIX = "b";
 const MAIN_REF = "refs/heads/main";
@@ -286,6 +297,7 @@ module.exports = {
   API_VERSION,
   BASELINE_SHA,
   BASE_VERSION,
+  POLICY_ADOPTION_ANCHOR,
   HEX40,
   MAIN_REF,
   ReleaseError,

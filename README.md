@@ -234,7 +234,8 @@ configured or authorized today.
   public release summary.
 - [SECURITY.md](SECURITY.md) — private vulnerability reporting (no public security
   issues).
-- [CHANGELOG.md](CHANGELOG.md) — notable changes, summarized under Unreleased pre-1.0.
+- [CHANGELOG.md](CHANGELOG.md) — notable changes per build, with the preserved
+  pre-adoption aggregate history.
 - [Review guidance](https://github.com/rfairburn/pi-review-gate/blob/main/.github/REVIEW_GUIDANCE.md)
   — expectations for external reviewers (source-only governance page in the checkout).
 

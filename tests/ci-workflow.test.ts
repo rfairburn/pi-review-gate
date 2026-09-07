@@ -187,6 +187,10 @@ test("verify job keeps its stable check name, Node matrix, and fast tiers", () =
   assert.match(verify, /fail-fast: false/);
   assert.match(verify, /timeout-minutes: \d+/);
   assert.match(verify, /run: npm run check:static/);
+  assert.match(verify, /fetch-depth: 0/,
+    "the PR candidate check needs full first-parent history from the immutable baseline");
+  assert.match(verify, /run: node scripts\/release\/pr-candidate\.cjs/,
+    "the verify job runs the read-only per-build changelog candidate prediction");
   assert.match(verify, /run: npm run test:fast/);
   assert.match(verify, /run: npm run test:package/);
   assert.match(verify, /PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"/,

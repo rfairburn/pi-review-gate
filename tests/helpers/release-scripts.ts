@@ -25,6 +25,8 @@ const requireFromRoot = createRequire(__filename);
 export interface ReleaseCommon {
   BASELINE_SHA: string;
   BASE_VERSION: string;
+  POLICY_ADOPTION_ANCHOR: string;
+  HEX40: RegExp;
   ReleaseError: new (message: string) => Error;
   REPOSITORY: string;
   TAG_PREFIX: string;
@@ -113,17 +115,43 @@ export interface PublishSummary {
   assets?: { uploaded: string[]; kept: string[]; replaced: string[] };
 }
 
+export interface ChangelogModule {
+  ChangelogError: new (message: string) => Error;
+  buildHeadingFor(n: number): string;
+  devVersionFor(n: number): string;
+  extractBuildSection(text: string, n: number): { content: string } | null;
+  parseChangelog(text: string): {
+    numbered: Array<{ n: number; version: string; headingLine: number; content: string }>;
+    malformedHeadings: Array<{ line: number; text: string }>;
+    hasUnreleased: boolean;
+    previousBuilds: number;
+  };
+  renderChangesDetails(options: { tag: string; n: number; content: string }): string;
+  topmostNumberedBuild(text: string): number | null;
+  validateCandidateChangelog(text: string, predictedN: number): { problems: string[] };
+  deriveReleaseNotes(options: { text: string; n: number; tag: string }): { content: string; notesBlock: string };
+}
+
 export interface PublishModule {
   identityMarker(eligibility: Eligibility): string;
   ensureTag(options: { api: ReleaseApi; tag: string; target: string }): Promise<{ created: boolean; sha: string }>;
   expectedAssetNames(tarballFilename: string): string[];
   parseProvenanceFromBody(body: string): Record<string, unknown> | null;
+  bodyWithoutNotes(body: string): string;
+  changelogPolicyAdopted(options: { repoRoot: string; target: string; policyAnchor: string }): boolean;
+  deriveReleaseNotes(options: {
+    projectRoot: string;
+    repoRoot: string;
+    eligibility: Eligibility;
+    policyAnchor: string;
+  }): { notesBlock: string | null };
   publishRelease(options: {
     env: Record<string, string | undefined>;
     fetchImpl: FetchLike;
     projectRoot: string;
     scratchRoot?: string;
     baseline?: string;
+    policyAnchor?: string;
     buildArtifacts?(options: { eligibility: Eligibility; projectRoot: string; scratch: string }): Promise<{
       assets: Array<{ filename: string; buffer: Buffer; sha256: string; size: number }>;
       provenance: Record<string, unknown>;
@@ -131,12 +159,12 @@ export interface PublishModule {
       tarballEntryCount: number;
     }>;
   }): Promise<PublishSummary>;
-  releaseBody(eligibility: Eligibility, provenance?: Record<string, unknown>): string;
+  releaseBody(eligibility: Eligibility, provenance?: Record<string, unknown>, notesBlock?: string): string;
   findReleaseByTag(options: { api: ReleaseApi; tag: string }): Promise<Record<string, unknown> | null>;
   resolveOrCreateDraftRelease(options: {
     api: ReleaseApi;
     eligibility: Eligibility;
-    provenance: Record<string, unknown>;
+    notesBlock?: string;
   }): Promise<{ release: Record<string, unknown>; mode: string }>;
   syncDraftAssets(options: { api: ReleaseApi; release: Record<string, unknown>; assets: Array<{
     filename: string;
@@ -148,7 +176,13 @@ export interface PublishModule {
     kept: string[];
     replaced: string[];
   }>;
-  verifyPublishedRelease(options: { api: ReleaseApi; release: Record<string, unknown>; eligibility: Eligibility }): Promise<{ verified: boolean; tarballSha256: string }>;
+  verifyPublishedRelease(options: {
+    api: ReleaseApi;
+    release: Record<string, unknown>;
+    eligibility: Eligibility;
+    tarballFilename?: string;
+    expectedNotesBlock?: string | null;
+  }): Promise<{ verified: boolean; tarballSha256: string }>;
   buildReleaseArtifacts(options: { eligibility: Eligibility; projectRoot: string; scratch: string }): Promise<{
     assets: Array<{ filename: string; buffer: Buffer; sha256: string; size: number }>;
     provenance: Record<string, unknown>;

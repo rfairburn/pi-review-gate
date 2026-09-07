@@ -17,7 +17,8 @@ import test from "node:test";
 //   - CODEOWNERS is ordinary public default ownership for @rfairburn;
 //   - SECURITY.md routes to the private advisory URL without time promises and keeps
 //     dependency impact on this package reportable under private embargo coordination;
-//   - CHANGELOG.md stays truthful pre-1.0 (Unreleased summary, no fake dated releases);
+//   - CHANGELOG.md stays truthful pre-1.0 (per-build candidate sections, preserved aggregate
+//     history, no fake dated releases);
 //   - the governance surface contains no private work-artifact references;
 //   - the docs checker accepts a new public doc in repo and installed layouts while
 //     arbitrary local planning doc references still fail.
@@ -415,6 +416,7 @@ test("PR template requires linked issues and docs/changelog/compatibility declar
     assert.ok(pr.includes(token), `PR template missing "${token}"`);
   }
   assert.match(pr, /linked issue/i, "PR template must require a linked issue");
+  assert.ok(!/Unreleased/i.test(pr), "the aggregate Unreleased bucket is gone; candidates are per-build sections");
   assert.ok(!/rebase/i.test(pr), "no rebase merge exception may remain in the PR template");
   assert.ok(!/never automatic/i.test(pr), "must not promise merges are never automatic");
 });
@@ -440,10 +442,24 @@ test("SECURITY.md routes to the private advisory without time promises", () => {
   );
 });
 
-test("CHANGELOG.md is truthful pre-1.0", () => {
+test("CHANGELOG.md is truthful pre-1.0 (per-build candidate policy)", () => {
   const cl = read("CHANGELOG.md");
-  assert.ok(cl.includes("## [Unreleased]"), "must have an Unreleased section");
-  assert.ok(!/^##\s*\[?0\.1\.0\b/m.test(cl), "no dated 0.1.0 release section may exist");
+  // The aggregate bucket is gone; changes land in a per-build candidate section.
+  assert.ok(!/^##\s*\[Unreleased\]/m.test(cl), "no aggregate Unreleased section may remain");
+  // Every numbered build heading is well-formed and unique.
+  const numbered = [...cl.matchAll(/^## \[(0\.1\.0-dev\.[1-9]\d*)\]$/gm)].map((m) => m[1]);
+  assert.ok(numbered.length >= 1, "at least one per-build candidate section must exist");
+  assert.equal(new Set(numbered).size, numbered.length, "build numbers must be unique");
+  // No stable 0.1.0 release section pre-1.0 (dev builds only).
+  assert.ok(!/^## \[0\.1\.0(?!-dev)/m.test(cl), "no stable 0.1.0 release section may exist pre-1.0");
+  // The aggregate history is preserved exactly once, without shipped-date claims.
+  const previous = [...cl.matchAll(/^## Previous builds$/gm)];
+  assert.equal(previous.length, 1, "exactly one Previous builds section must preserve the aggregate history");
+  const previousBody = cl.slice(cl.indexOf("## Previous builds"));
+  assert.ok(
+    previousBody.trim().length > "## Previous builds".length,
+    "Previous builds must not be empty",
+  );
   assert.ok(!/releases\.md/i.test(cl), "must not link a releases page that does not exist yet");
 });
 

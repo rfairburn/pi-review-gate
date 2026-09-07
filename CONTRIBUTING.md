@@ -71,7 +71,16 @@ truthful tests only, never fabricated or placeholder results:
 ## Documentation and changelog
 
 - Public behavior changes update the public docs (`README.md`, `docs/`).
-- Notable changes get an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md).
+- Notable changes get an entry in the candidate build section of
+  [CHANGELOG.md](CHANGELOG.md): the topmost numbered section `## [0.1.0-dev.N]` names
+  the next prerelease build, where N is one more than the first-parent distance of the
+  pull request's current base from the immutable baseline (the squash merge lands
+  exactly one first-parent step above that base). CI validates that prediction; if
+  main advances while the pull request is open, update the section number and integrate
+  the current main so strict CI re-validates against the new base — a stale number
+  never publishes. The publisher re-checks the exact merged commit before any remote
+  write and derives the release's collapsed change notes from that exact source. A
+  build with no notable changes still carries the section, stating that explicitly.
 - The pull request template requires explicit documentation, changelog, and
   compatibility declarations.
 
@@ -86,8 +95,11 @@ Public summary of the release policy:
 - A curated normal `v0.1.0` release may be cut later at maintainer discretion. No npm
   publishing is configured or authorized today; a future npm publication would require
   explicit setup against a trusted registry and a corresponding docs update.
-- Until then, [CHANGELOG.md](CHANGELOG.md) summarizes the current feature surface under
-  Unreleased rather than listing dated releases that do not exist.
+- From the build that adopted per-build changelog attribution onward, each release body
+  also carries that build's human-readable changes in a collapsed-by-default details
+  block derived from the exact source changelog. Earlier immutable releases keep their
+  original bodies and verify read-only; pre-adoption history stays under Previous builds
+  in [CHANGELOG.md](CHANGELOG.md) rather than dated releases that do not exist.
 
 ## Security
 

@@ -1,12 +1,42 @@
 # Changelog
 
-Notable changes to `pi-review-gate` are recorded here, grouped under `## [Unreleased]`
-until a curated release is cut. The project is pre-1.0: no dated release exists yet, and
-per-merge prereleases (GitHub prereleases with unique `0.1.0-dev.N` package versions)
-do not create dated sections on their own — see the release summary in
-[CONTRIBUTING.md](CONTRIBUTING.md#releases).
+Notable changes to `pi-review-gate` are recorded here as per-build sections keyed to
+the exact numbered prerelease each change ships in (`## [0.1.0-dev.N]`, matching the
+`bN` tag and package version). The project is pre-1.0: no dated release exists yet,
+and a curated normal `v0.1.0` release may be cut later at maintainer discretion — see
+the release summary in [CONTRIBUTING.md](CONTRIBUTING.md#releases).
 
-## [Unreleased]
+While a pull request is open, its topmost numbered section is a candidate for the next
+build: CI predicts that number from the pull request's current base (first-parent
+distance plus one), and the publisher re-validates it against the exact merged commit
+before any remote write. If the base advances, the candidate is updated against the
+new base and strict CI re-runs; a stale number never publishes. Changes made before
+per-build attribution was adopted are preserved verbatim under
+[Previous builds](#previous-builds), without invented per-build splits or release
+dates.
+
+## [0.1.0-dev.5]
+
+### Changed
+
+- Changelog entries are now attributed to the specific numbered prerelease build they
+  ship in instead of accumulating under an aggregate Unreleased bucket: each pull
+  request carries a candidate section for the next build, CI validates that number
+  against the pull request's current base, and the publisher re-validates it against
+  the exact merged commit before any remote write (#36).
+- Numbered prereleases from this build onward carry their own human-readable changes
+  in a collapsed-by-default details block in the GitHub release body, derived
+  deterministically from the exact source changelog of the released commit;
+  publication fails closed on missing, duplicate, empty, or mismatched notes, and
+  retries verify the published notes against that same exact source (#36).
+
+### Added
+
+- A Previous builds section preserving the pre-adoption aggregate history verbatim,
+  with no invented per-build attribution or release dates for the old aggregate
+  (#36).
+
+## Previous builds
 
 Current feature surface of the repository, summarized:
 

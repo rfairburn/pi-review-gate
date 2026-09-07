@@ -49,7 +49,8 @@ each other instead of duplicating detail.
 - [CONTRIBUTING](../CONTRIBUTING.md) — issue-first workflow, branch and merge
   conventions, verification expectations, and the public release summary.
 - [SECURITY](../SECURITY.md) — private vulnerability reporting route.
-- [CHANGELOG](../CHANGELOG.md) — notable changes summarized under Unreleased pre-1.0.
+- [CHANGELOG](../CHANGELOG.md) — notable changes per build, with the preserved
+  pre-adoption aggregate history.
 - [Releases](releases.md) — how each validated merge is published as a numbered prerelease,
   and how a failed publication is recovered.
 - Issue and pull request templates, code ownership, and external review guidance live in

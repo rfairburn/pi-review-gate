@@ -42,6 +42,18 @@ export interface SubtaskEvidenceContextInput {
   worktreeRoot?: string;
   /** Authorized task root the worktree must resolve inside for untracked enumeration. */
   waveRoot?: string;
+  /**
+   * Latest completed durable review cycle, summarized from the task's
+   * persisted cycle records (#50): present while a worker is still
+   * correcting, before any final task result exists.
+   */
+  durableReview?: {
+    aggregate: string;
+    cycles: number;
+    latestSequence: number;
+    reviewers: Array<{ reviewerId: string; verdict: string; summary: string }>;
+    caveat?: string;
+  };
 }
 
 function selectionParts(selection: ExecutorSelection | undefined): { adapter?: string; model?: string } {
@@ -180,6 +192,20 @@ export async function buildSubtaskEvidenceContext(
         verdict: redactedText(reviewer.verdict),
         summary: redactedText(reviewer.summary),
       })),
+    };
+  } else if (input.durableReview) {
+    // Completed review evidence persisted before final settlement (#50):
+    // the same redaction and bounding apply to the durable cycle records.
+    context.review = {
+      aggregate: redactedText(input.durableReview.aggregate),
+      cycles: input.durableReview.cycles,
+      latestSequence: input.durableReview.latestSequence,
+      reviewers: input.durableReview.reviewers.map((reviewer) => ({
+        reviewerId: redactedText(reviewer.reviewerId),
+        verdict: redactedText(reviewer.verdict),
+        summary: redactedText(reviewer.summary),
+      })),
+      ...(input.durableReview.caveat !== undefined ? { caveat: input.durableReview.caveat } : {}),
     };
   }
 

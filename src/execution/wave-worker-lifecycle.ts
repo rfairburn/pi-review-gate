@@ -65,10 +65,14 @@ import {
 import type { ReviewResult } from "../schema";
 import type { TokenUsage } from "../usage";
 import {
+  buildReviewCycleRecord,
+  buildReviewCycleUnpublishedMarker,
   buildReviewReportFromOutputs,
   hasPartialReviewerFailure,
+  type ReviewCycleRecord,
   type SubtaskReviewReport,
 } from "../review-report";
+import { atomicWriteExclusive } from "./durable-write";
 import type { SubtaskProgressUpdate } from "./types";
 import { createWorkspaceSnapshot, type WorkspaceSnapshot } from "../capture";
 import {
@@ -447,6 +451,63 @@ async function executionRetryDelay(base: number, max: number, jitter: boolean, r
     if (signal?.aborted) abort();
     else signal?.addEventListener("abort", abort, { once: true });
   });
+}
+
+// ── durable review cycle records (#50) ───────────────────────────────────────
+
+/** True when an exclusive publication failed because the target already exists. */
+function isAlreadyPublished(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "EEXIST";
+}
+
+/**
+ * Persist one completed review cycle as durable official reviewer evidence.
+ *
+ * The record lands in the task's artifact directory — the same tree that
+ * SubtasksInspect derives from the restart-safe task metadata (wave root +
+ * task id) — so a completed review stays inspectable while the worker is
+ * still correcting and across controller restarts, without waiting for the
+ * final result.json. Publication is write-once under the immutable cycle
+ * identity (waveId + taskId + cycle, mirroring the per-cycle alias ref):
+ * an already-published record is never overwritten. A failed publication
+ * leaves a best-effort explicit bounded marker (`cycle-NNNN.json.unpublished`)
+ * carrying the authoritative cycle identity and official gate verdict, so
+ * evidence reads can report that this completed cycle has no persisted
+ * record instead of presenting an older readable cycle as current. If the
+ * marker write also fails (a shared fault such as ENOSPC), the gap stays
+ * invisible — and readers compensate by never asserting a stale cycle
+ * current: without authoritative freshness metadata they report the newest
+ * readable cycle as latest available with unknown completeness until
+ * settlement. The lifecycle itself is never affected: the authoritative
+ * verdict still settles into result.json, and a failed optional evidence
+ * write never becomes a review bypass or an invented verdict.
+ */
+async function persistReviewCycleRecord(artifactDir: string, record: ReviewCycleRecord): Promise<void> {
+  const path = join(
+    artifactDir,
+    "reviews",
+    record.waveId,
+    `cycle-${String(record.cycle).padStart(6, "0")}.json`,
+  );
+  try {
+    await atomicWriteExclusive(path, `${JSON.stringify(record, null, 2)}\n`);
+  } catch (error) {
+    if (isAlreadyPublished(error)) return; // write-once: the record already exists
+    // A failed publication must not vanish silently: without any trace, an
+    // older readable cycle would be presented as the current review state.
+    try {
+      await atomicWriteExclusive(
+        `${path}.unpublished`,
+        `${JSON.stringify(buildReviewCycleUnpublishedMarker(record, error), null, 2)}\n`,
+      );
+    } catch {
+      // If the marker also fails (shared fault: ENOSPC, permissions), no
+      // durable trace of this cycle exists. Readers then conservatively
+      // report the newest readable cycle as latest available with unknown
+      // completeness — never definitively current — and the final
+      // result.json still carries every completed cycle on settlement.
+    }
+  }
 }
 
 // ── result writing ───────────────────────────────────────────────────────────
@@ -1170,6 +1231,24 @@ export async function runWaveWorkerLifecycle(
       reviewOutput,
     };
     reviewCycles.push(cycle);
+
+    // Durable official reviewer evidence for this completed cycle (#50):
+    // available to SubtasksInspect during the correction turn and after a
+    // restart, before any final task result exists.
+    await persistReviewCycleRecord(resolvedArtifactDir, buildReviewCycleRecord({
+      taskId,
+      waveId: capture.waveId,
+      cycle: reviewCycle,
+      reviewSequence: reviewOutput.reviewSequence,
+      candidate: {
+        baseCommit: capture.baseCommit,
+        commitSha: currentCandidate.commitSha,
+        treeSha: currentCandidate.treeSha,
+        ref: reviewAliasRef,
+      },
+      result: reviewOutput.result,
+      reviewerResults: reviewOutput.reviewerResults,
+    }));
 
     // Record reviewer feedback and arm the exchange for serial behavior.
     if (reviewOutput.result) {

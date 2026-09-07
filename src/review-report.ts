@@ -45,6 +45,134 @@ export interface SubtaskReviewReport {
   artifactDir?: string;
 }
 
+/**
+ * Durable per-cycle review record (#50).
+ *
+ * Written by the gate itself — never reconstructed from transcripts or
+ * caller-supplied paths — into the task's artifact directory as soon as a
+ * review cycle completes, so SubtasksInspect can expose the official verdict
+ * and findings while the worker is still correcting, before any final task
+ * result exists. Identity mirrors the immutable per-cycle review alias
+ * (waveId + taskId + cycle): one record per completed cycle, write-once.
+ */
+export interface ReviewCycleRecord {
+  version: 1;
+  taskId: string;
+  waveId: string;
+  /** Lifecycle review cycle number; matches the immutable per-cycle alias. */
+  cycle: number;
+  /** Review-window sequence of the invocation that produced this cycle. */
+  reviewSequence: number;
+  completedAt: string;
+  candidate: {
+    baseCommit: string;
+    commitSha: string;
+    treeSha: string;
+    /** Immutable per-cycle review alias ref pinning the reviewed candidate. */
+    ref: string;
+  };
+  /** Gate-level aggregate verdict for this cycle. */
+  aggregate: ReviewAggregateDisposition;
+  summary: string;
+  reviewers: Array<{
+    reviewerId: string;
+    displayLabel?: string;
+    verdict: ReviewResult["verdict"];
+    summary: string;
+    guidance?: string;
+    error?: string;
+    findings: Array<Pick<ReviewFinding, "severity" | "file" | "line" | "issue" | "recommendation">>;
+  }>;
+}
+
+/**
+ * Publication-failure marker for a durable review cycle record (#50).
+ *
+ * Written by the gate itself — next to where the record would have been
+ * published (`cycle-NNNN.json.unpublished`) — when a completed cycle's record
+ * could not be persisted. It carries authoritative lifecycle metadata: which
+ * cycle completed, its official gate-level verdict, and why the record is
+ * missing. Evidence reads index it as an explicit unavailable note so an
+ * older readable cycle is never presented as the current review state merely
+ * because a newer cycle's record is absent. It is never a substitute for the
+ * record: per-reviewer findings exist only in the (missing) record.
+ */
+export interface ReviewCycleUnpublishedMarker {
+  version: 1;
+  taskId: string;
+  waveId: string;
+  /** Lifecycle review cycle number; matches the immutable per-cycle alias. */
+  cycle: number;
+  /** Review-window sequence of the invocation that produced this cycle. */
+  reviewSequence: number;
+  completedAt: string;
+  /** Official gate-level aggregate verdict for the unpublished cycle. */
+  aggregate: ReviewAggregateDisposition;
+  summary: string;
+  /** Bounded reason the record publication failed. */
+  reason: string;
+}
+
+const MAX_MARKER_REASON_CHARS = 200;
+
+/** Build the bounded publication-failure marker from the official record and the write error. */
+export function buildReviewCycleUnpublishedMarker(record: ReviewCycleRecord, error: unknown): ReviewCycleUnpublishedMarker {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    version: 1,
+    taskId: record.taskId,
+    waveId: record.waveId,
+    cycle: record.cycle,
+    reviewSequence: record.reviewSequence,
+    completedAt: record.completedAt,
+    aggregate: record.aggregate,
+    summary: record.summary,
+    reason: message.length > MAX_MARKER_REASON_CHARS ? `${message.slice(0, MAX_MARKER_REASON_CHARS - 1)}…` : message,
+  };
+}
+
+/** Build the durable record for one completed review cycle from official gate outputs. */
+export function buildReviewCycleRecord(input: {
+  taskId: string;
+  waveId: string;
+  cycle: number;
+  reviewSequence?: number;
+  candidate: ReviewCycleRecord["candidate"];
+  result?: ReviewResult;
+  reviewerResults?: ReviewResult[];
+}): ReviewCycleRecord {
+  const gate = input.result;
+  const reviewers = (input.reviewerResults ?? (gate ? [gate] : [])).map((reviewer) => ({
+    reviewerId: reviewer.reviewerId,
+    ...(reviewer.displayLabel !== undefined ? { displayLabel: reviewer.displayLabel } : {}),
+    verdict: reviewer.verdict,
+    summary: reviewer.summary,
+    ...(reviewer.guidance !== undefined ? { guidance: reviewer.guidance } : {}),
+    ...(reviewer.verdict === "error" && reviewer.error !== undefined ? { error: reviewer.error } : {}),
+    findings: reviewer.findings.map((finding) => ({
+      severity: finding.severity,
+      file: finding.file,
+      line: finding.line,
+      issue: finding.issue,
+      recommendation: finding.recommendation,
+    })),
+  }));
+  return {
+    version: 1,
+    taskId: input.taskId,
+    waveId: input.waveId,
+    cycle: input.cycle,
+    reviewSequence: input.reviewSequence ?? input.cycle,
+    completedAt: new Date().toISOString(),
+    candidate: { ...input.candidate },
+    aggregate: gate?.verdict === "pass" || gate?.verdict === "needs_changes" || gate?.verdict === "error"
+      ? gate.verdict
+      : "error",
+    summary: gate?.summary ?? "Review completed without a gate result.",
+    reviewers,
+  };
+}
+
 export function aggregateReviewDisposition(results: ReviewResult[]): ReviewAggregateDisposition {
   if (results.some((result) => result.verdict === "needs_changes")) {
     return "needs_changes";

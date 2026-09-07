@@ -23,8 +23,10 @@ import {
 } from "./background-group-store";
 import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
 import { continueOperation, inspectOperation, readVerifiedAcceptedResult, verifyRecoveryCheckpoint } from "./operation-actions";
-import type { ReattachmentBundle } from "./operation-record";
+import type { OperationRecord, ReattachmentBundle } from "./operation-record";
 import { createReattachmentBundle, operationOwnershipStatus, readOperationRecord } from "./operation-record";
+import { resolveArtifactRoot } from "./evidence/sources";
+import { buildSubtaskEvidence, readConfinedOperationRecord, readSubtaskEvidence, type SubtaskEvidenceRead, type SubtaskEvidenceSelector, type SubtaskEvidenceUnavailable } from "./subtask-evidence";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 import {
   appendActivity,
@@ -225,6 +227,8 @@ export interface BackgroundInspection {
    */
   archivedCount: number;
   scheduling: BackgroundSchedulingSnapshot;
+  /** Issue #33: bounded evidence navigation result (only for evidence-mode inspect). */
+  evidence?: SubtaskEvidenceRead;
   conflictGate?: BackgroundConflictGate;
   tasks: Array<BackgroundTaskRecord & {
     timing: BackgroundTaskTimingSummary;
@@ -657,7 +661,13 @@ export class BackgroundExecutionController {
    * fails closed with its integrity diagnostic. Bounded list inspections stay
    * synchronous via inspect(); every list discloses archivedCount omissions.
    */
-  async inspectTask(executionId?: string, taskId?: string, offset?: number, lines?: number): Promise<BackgroundInspection> {
+  async inspectTask(
+    executionId?: string,
+    taskId?: string,
+    offset?: number,
+    lines?: number,
+    evidence?: SubtaskEvidenceSelector,
+  ): Promise<BackgroundInspection> {
     const group = this.resolveGroup(executionId);
     for (const task of group.tasks.filter((task) => !taskId || task.taskId === taskId)) {
       if (group.kind !== "execute" || !task.waveRoot || isArchivableTaskState(task.state)
@@ -669,15 +679,65 @@ export class BackgroundExecutionController {
       }
       await this.save(group);
     }
+    let inspection: BackgroundInspection;
+    let task: BackgroundTaskRecord | undefined;
     try {
-      return this.inspect(executionId, taskId, offset, lines);
+      inspection = this.inspect(executionId, taskId, offset, lines);
+      if (taskId) task = group.tasks.find((candidate) => candidate.taskId === taskId);
     } catch (error) {
       if (!taskId) throw error;
-      const group = this.resolveGroup(executionId);
       const archived = await this.loadArchivedTask(group, taskId);
       if (!archived) throw error;
-      return this.buildInspection(group, [archived], offset, lines);
+      inspection = this.buildInspection(group, [archived], offset, lines);
+      task = archived;
     }
+    if (evidence) {
+      if (!taskId || !task) throw new Error("Evidence inspection requires a known taskId.");
+      return { ...inspection, evidence: await this.buildEvidenceRead(task, evidence) };
+    }
+    return inspection;
+  }
+
+  /**
+   * Issue #33: bounded read-only evidence navigation for one task. Sources are
+   * derived only from the task's durable artifacts (never caller-supplied
+   * paths); all content is redacted before retention or display. Cursor and
+   * navigation failures propagate as explicit errors.
+   */
+  private async buildEvidenceRead(task: BackgroundTaskRecord, selector: SubtaskEvidenceSelector): Promise<SubtaskEvidenceRead> {
+    const artifactDir = task.waveRoot ? join(task.waveRoot, "artifacts", task.taskId) : undefined;
+    let operation: OperationRecord | undefined;
+    const contextUnavailable: SubtaskEvidenceUnavailable[] = [];
+    if (artifactDir) {
+      // Validate the artifact root against the authorized wave root BEFORE
+      // reading anything through it: a symlinked or moved artifact directory
+      // must not become a read path outside the wave. Escapes throw
+      // (fail closed); missing/non-directory roots are noted and skipped.
+      const authorizedRoot = await resolveArtifactRoot(task.waveRoot, artifactDir, contextUnavailable);
+      if (authorizedRoot) {
+        // The operation record is optional evidence context. It is read through
+        // the same bounded, confined regular-file reader as every other
+        // evidence artifact and ownership-validated before use; refusals,
+        // oversized or wrong-task records are reported explicitly and never used.
+        const loaded = await readConfinedOperationRecord(authorizedRoot, task.taskId);
+        operation = loaded.record;
+        if (loaded.unavailable) contextUnavailable.push(loaded.unavailable);
+      }
+    }
+    const bundle = await buildSubtaskEvidence({
+      taskId: task.taskId,
+      artifactDir,
+      waveRoot: task.waveRoot,
+      operation,
+      contextUnavailable,
+      result: task.result,
+      state: task.state,
+      commands: task.commands,
+      executorSelection: task.executorSelection,
+      updatedAt: task.updatedAt,
+      worktreeRoot: operation?.worktreeRoot,
+    });
+    return readSubtaskEvidence(bundle, selector);
   }
 
   private buildInspection(

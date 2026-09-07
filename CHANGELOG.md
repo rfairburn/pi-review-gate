@@ -15,6 +15,40 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.9]
+
+### Added
+
+- `SubtasksInspect` gains an optional `evidence` selector that reads a task's bounded,
+  indexed executor evidence natively instead of parsing raw session histories by hand.
+  Evidence mode is mutually exclusive with the legacy activity `offset`/`lines`
+  interface, which remains byte-compatible. It indexes only authorized per-task
+  artifacts under the task's wave root (executor session files or per-turn raw streams,
+  final responses, process results, the durable operation record, and the latest review
+  report) with explicit `unavailable` notes for missing, unreadable, unsupported, or
+  truncated sources; symlinks and path escapes are refused. Entries carry stable
+  `entryId`s, timestamps, kinds, statuses, and provenance separating executor-observed
+  data from worker claims (which never imply verification) and reviewer verdicts. Tool
+  calls and results pair by real call ids, unpaired calls stay explicitly `in_flight`,
+  private model reasoning is excluded from every view, and all content is redacted
+  before search or display under per-entry, total, bounded tail-byte-window (per
+  source), global newest-entry, and shared raw retention budgets with immediate release
+  of evicted content, honest omission and truncation markers, and directory enumeration
+  that applies its bound during iteration.
+  Navigation supports paged ranges with `nextIndex`,
+  case-insensitive `find` over the redacted view, `filter` narrowing, deep reads of
+  large entries in bounded chunks via `entryId`/`chunkIndex`, call/result resolution by
+  real `callId`, and incremental continuation through per-source watermark cursors whose
+  chained digest covers every covered record salted with the opened file's generation
+  (device/inode/birth time), so atomic replacement is rejected even with an identical
+  covered prefix while appends continue exactly once. Each evidence read also returns
+  the authoritative context: task state, assignment history and current selection,
+  steering acknowledgements, changed files with honest landing status, and latest review
+  verdicts; the artifact root is validated against the authorized wave root before any
+  read through it, and the operation record informs that context only when it is a
+  regular file inside that verified directory, fits the bounded context size, belongs to
+  this task, and records an artifact directory that verifies as this task's (Closes #33).
+
 ## [0.1.0-dev.8]
 
 ### Fixed

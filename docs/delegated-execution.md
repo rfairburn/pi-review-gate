@@ -163,6 +163,90 @@ incidents, checkpoint/bundle data, artifact paths, conflicts, and concrete recov
 actions. This state remains inspectable after compaction or an exact-session restart.
 Only `landed` means that worker changes reached the source workspace.
 
+## Subtask evidence
+
+`SubtasksInspect` accepts an optional `evidence` selector that reads a task's bounded,
+indexed executor evidence instead of the legacy activity window. The two interfaces are
+mutually exclusive: combining `evidence` with `offset`/`lines` is a hard error, and
+legacy activity behavior is unchanged when `evidence` is absent.
+
+Evidence indexes only authorized per-task artifacts under the task's wave root: executor
+session files (Pi) or per-turn raw streams (Claude/Codex/binary), final responses,
+process results, the durable operation record, and the latest review report. Every source
+that is missing, unreadable, unsupported, or truncated appears as an explicit
+`unavailable` note; nothing is invented to fill a gap, and no caller-supplied path can
+widen the read boundary (symlinks and path escapes are refused). For a Pi turn whose
+session file is missing, that turn falls back explicitly to its own stdout stream and is
+never double-counted from both.
+
+Each entry carries a stable `entryId`, timestamp, kind, tool name, status, and
+provenance. Provenance separates what an executor process observed
+(`executor_observed`) from what a worker wrote in its final response (`worker_claim`,
+which never implies verification) from reviewer verdicts (`reviewer_verdict`). Tool calls
+and results are paired by real call ids; a call without an observed result stays
+`in_flight`, which is never evidence of success. Private model reasoning (Pi thinking
+blocks, Codex reasoning items) is excluded from every view, and all retained content is
+redacted before search or display. Reads are bounded: per-entry and total byte budgets,
+a bounded tail byte window per source (only the newest bytes of each stream are
+scanned, so evidence appended beyond any fixed offset stays reachable; earlier bytes
+and the boundary record are disclosed as `scan_budget`), a global rolling entry window
+that retains the newest entries across all sources (`records_omitted` when older ones
+overflow), and a shared raw retention budget across all sources that evicts the oldest
+retained content first — releasing it immediately — so discovery memory stays bounded
+no matter how many artifacts exist. Directory enumeration applies its bound during
+iteration, before the whole directory is allocated. Every bound reports an explicit
+`unavailable` note or `truncated` marker instead of cutting silently.
+
+Navigation follows the same block model as the web tools. Each object below is a
+complete `SubtasksInspect` argument value — the registered schema has no `action`
+field, because each operation has its own exact-schema tool:
+
+```jsonc
+// Find a failure across all indexed evidence (case-insensitive, redacted view)
+{ "executionId": "exec-…", "taskId": "task-…",
+  "evidence": { "find": "E2E-FAILURE-MARKER" } }
+
+// Page the index; nextIndex continues the range. Unfiltered reads also return a cursor.
+{ "executionId": "exec-…", "taskId": "task-…",
+  "evidence": { "index": 0, "limit": 20 } }
+
+// A later turn: continue from the cursor to receive only newer evidence. Cursors are
+// watermark-scoped per source and carry a chained digest of every covered record,
+// salted with the opened file's generation (device/inode/birth time); they are rejected
+// explicitly when a covered source is missing, atomically replaced — even with an
+// identical covered prefix — or any covered record was rewritten. Appends to the same
+// file preserve the generation and continue exactly once (no silent skip, duplicate,
+// or stale continuation).
+{ "executionId": "exec-…", "taskId": "task-…",
+  "evidence": { "cursor": "ev1.…" } }
+
+// Deep-read one large entry in bounded chunks
+{ "executionId": "exec-…", "taskId": "task-…",
+  "evidence": { "entryId": "turn:0001/line:12", "chunkIndex": 0 } }
+
+// Resolve one call and its paired result by real call id
+{ "executionId": "exec-…", "taskId": "task-…",
+  "evidence": { "callId": "toolu_…" } }
+```
+
+`filter` narrows a range to `tool_call`, `tool_result`, `command`, `lifecycle`,
+`claim`, or `review` entries (filtered reads do not issue cursors). Evidence reads also
+return the authoritative context: current task state, assignment history and current
+selection, steering acknowledgements, changed files with honest landing status, and the
+latest review verdicts. The artifact root is validated against the authorized wave root
+before anything under it is read (a symlinked or moved artifacts directory is refused,
+never followed), and the operation record informs that context only when it is a
+regular file inside that verified directory, fits the bounded context size, belongs to
+this task, and records an artifact directory that verifies as this task's; every other
+case is reported as an explicit unavailable note rather than read unbounded or trusted.
+
+Prefer `SubtasksWatch` when you must wait for a state change (it returns immediately
+and arms one deliberate future checkpoint while work remains active; it never waits
+synchronously or rearms itself); use evidence-mode `SubtasksInspect` when you need to
+understand *what happened* — locating a failure, checking whether a command result was
+observed versus merely claimed, reading reviewer findings, or confirming unlanded
+changes.
+
 ## Notifications and UI
 
 The default **Quiet** notification mode keeps ordinary running and reviewing transitions

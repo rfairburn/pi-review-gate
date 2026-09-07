@@ -289,6 +289,9 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
       text,
       bytes,
       fetchedAt: new Date().toISOString(),
+      // The captured body is rendered DOM: always a complete HTML document,
+      // independent of the main response's declared content type.
+      rendered: true,
       ...(browserOmissions ? { browserOmissions } : {}),
     };
   } catch (error) {

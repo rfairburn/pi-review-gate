@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { WebFetchConfig } from "../config";
 import type { BrowserOmissions } from "./network";
 import { downloadText } from "./network";
-import { extractWebPage, findInWebPage, renderWebPage, type ExtractedWebPage, type RenderedWebPage, type WebPageFindResult } from "./page";
+import { extractFetchedDocument, findInWebPage, renderWebPage, type ExtractedWebPage, type RenderedWebPage, type WebPageFindResult } from "./page";
 import { extractPdfDocument, isPdfResponse } from "./pdf";
 
 interface CacheEntry {
@@ -150,7 +150,9 @@ export class WebPageCache {
     const pdf = isPdfResponse(downloaded.contentType, rawData, downloaded.text);
     const page = pdf
       ? await extractPdfDocument(rawData!, downloaded.finalUrl)
-      : extractWebPage(downloaded.text, downloaded.finalUrl);
+      : extractFetchedDocument(downloaded.contentType, downloaded.text, downloaded.finalUrl, {
+          rendered: downloaded.rendered === true,
+        });
     const root = await this.ensureRoot();
     const key = createHash("sha256").update(requestedUrl).digest("hex");
     const rawPath = join(root, `${key}.source`);

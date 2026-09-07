@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.8]
+
+### Fixed
+
+- `WebFetch` handles non-HTML and structure-less responses instead of failing with an
+  internal parser exception: explicitly non-HTML text responses (for example
+  `application/json` or `text/plain`) are now indexed verbatim as bounded text blocks
+  with the declared content type disclosed, so JSON and plain-text payloads remain
+  readable and searchable without any markup interpretation. Empty bodies, undecodable
+  non-text bodies, comment-only, rooted-but-empty, or otherwise structure-less
+  responses, and pages made only of non-renderable markup now fail with an explicit
+  bounded diagnostic instead of
+  a raw parser error or a silent empty result; script-only shells keep the
+  JavaScript-shell BrowserExtract escalation, and BrowserExtract's rendered output
+  still parses as HTML regardless of the main response's declared content type
+  (Closes #41).
+
 ## [0.1.0-dev.7]
 
 ### Added

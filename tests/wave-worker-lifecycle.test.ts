@@ -6,6 +6,8 @@ import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
 import { createWorkerWorktree, removeWorktree, workerRefName } from "../src/execution/wave-worktrees";
 import { reviewerProgressLabel, runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "../src/execution/wave-worker-lifecycle";
+import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
+import { buildSubtaskEvidence, readSubtaskEvidence } from "../src/execution/subtask-evidence";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import type { WaveWorkerTask } from "../src/execution/wave-worker";
 
@@ -1391,6 +1393,307 @@ test("lifecycle: review cycles pin immutable per-cycle aliases and acceptance ma
       await gitInRepo(["rev-parse", result.acceptedRef!], capture.repositoryPath),
       result.acceptedCommitSha,
     );
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: completed review cycles persist durable official records before final settlement (#50)", async () => {
+  const root = await mkTmp("pi-wwl-durablereview-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-durable-review");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-durable-review");
+    await mkdir(artifactDir, { recursive: true });
+
+    // The executor writes the initial candidate on turn 1 and a different
+    // file on correction turns (PI_REVIEW_EXECUTOR_TURN), so the second cycle
+    // reviews a new candidate instead of tripping no-progress detection.
+    const firstCommand = join(root, "durable-first.cjs");
+    await writeFile(firstCommand, [
+      "const fs = require('node:fs');",
+      "const turn = Number(process.env.PI_REVIEW_EXECUTOR_TURN || '1');",
+      "if (turn === 1) fs.writeFileSync('initial.txt', 'initial\\n');",
+      "else fs.writeFileSync('corrected.txt', 'corrected\\n');",
+      "console.log(JSON.stringify({ type: 'session', sessionId: process.env.PI_REVIEW_EXECUTOR_SESSION_ID || 'durable-review-session' }));",
+      "console.log(JSON.stringify({ type: 'assistant', text: 'Turn ' + turn + ' complete.' }));",
+    ].join("\n"), "utf8");
+    await chmod(firstCommand, 0o755);
+
+    const config = buildNeedsChangesReviewerConfig(firstCommand);
+    config.maxCorrectionCycles = 1;
+
+    let correctingAsserted: Promise<void> | undefined;
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-durable-review",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      onUpdate: (update) => {
+        if (update.phase !== "correcting" || correctingAsserted) return;
+        correctingAsserted = (async () => {
+          // While the worker is actively correcting, the completed review
+          // cycle must already be durably persisted and no final result may
+          // exist yet.
+          let resultExists = true;
+          try { await access(join(artifactDir, "result.json")); } catch { resultExists = false; }
+          assert.equal(resultExists, false, "result.json must not exist while the correction turn is active");
+          const during = JSON.parse(await readFile(
+            join(artifactDir, "reviews", capture.waveId, "cycle-000001.json"), "utf8"));
+          assert.equal(during.aggregate, "needs_changes");
+        })();
+      },
+    });
+    // The assertions captured during the "correcting" phase must have held.
+    if (correctingAsserted) await correctingAsserted;
+    assert.ok(correctingAsserted, "the lifecycle must enter an active correction turn");
+
+    assert.equal(result.status, "correction_cap", `expected correction_cap, got ${result.status}`);
+    assert.equal(result.reviewCycles.length, 2, "two review cycles completed");
+
+    // Both completed cycles are durably persisted with official identity.
+    for (const cycle of result.reviewCycles) {
+      const path = join(artifactDir, "reviews", capture.waveId, `cycle-${String(cycle.cycle).padStart(6, "0")}.json`);
+      const record = JSON.parse(await readFile(path, "utf8"));
+      assert.equal(record.version, 1);
+      assert.equal(record.taskId, "task-durable-review");
+      assert.equal(record.waveId, capture.waveId);
+      assert.equal(record.cycle, cycle.cycle);
+      assert.equal(typeof record.reviewSequence, "number");
+      assert.equal(record.aggregate, "needs_changes");
+      assert.equal(record.candidate.commitSha, cycle.candidateCommit, "record pins the reviewed candidate");
+      assert.equal(record.candidate.treeSha, cycle.candidateTreeSha);
+      assert.equal(record.candidate.ref, cycle.candidateRef, "record carries the immutable cycle alias");
+      assert.ok(Array.isArray(record.reviewers) && record.reviewers.length >= 1);
+      const blocking = record.reviewers[0];
+      assert.equal(blocking.verdict, "needs_changes");
+      assert.equal(blocking.findings[0].severity, "blocking");
+      assert.equal(blocking.findings[0].file, "x.ts");
+      assert.equal(blocking.findings[0].issue, "missing test");
+      assert.equal(blocking.findings[0].recommendation, "add coverage");
+    }
+
+    // The final result still settles normally and agrees with the durable records.
+    const settled = JSON.parse(await readFile(join(artifactDir, "result.json"), "utf8"));
+    assert.equal(settled.status, "correction_cap");
+    assert.equal(settled.reviewReport.aggregate, "needs_changes");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: a failed record publication leaves an explicit marker and never alters the lifecycle (#50)", async () => {
+  const root = await mkTmp("pi-wwl-pubfail-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-pubfail");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-pubfail");
+    await mkdir(artifactDir, { recursive: true });
+
+    // The executor writes a different file per turn (PI_REVIEW_EXECUTOR_TURN),
+    // so every cycle reviews a new candidate instead of tripping no-progress
+    // detection. With maxCorrectionCycles = 2, a correction turn is still
+    // active after cycle 2's failed publication.
+    const firstCommand = join(root, "pubfail-first.cjs");
+    await writeFile(firstCommand, [
+      "const fs = require('node:fs');",
+      "const turn = Number(process.env.PI_REVIEW_EXECUTOR_TURN || '1');",
+      "if (turn === 1) fs.writeFileSync('initial.txt', 'initial\\n');",
+      "else fs.writeFileSync('corrected-' + turn + '.txt', 'corrected\\n');",
+      "console.log(JSON.stringify({ type: 'session', sessionId: process.env.PI_REVIEW_EXECUTOR_SESSION_ID || 'pubfail-session' }));",
+      "console.log(JSON.stringify({ type: 'assistant', text: 'Turn ' + turn + ' complete.' }));",
+    ].join("\n"), "utf8");
+    await chmod(firstCommand, 0o755);
+
+    const config = buildNeedsChangesReviewerConfig(firstCommand);
+    config.maxCorrectionCycles = 2;
+
+    let secondCorrecting: Promise<void> | undefined;
+    // Fail only cycle 2's record publication (before its atomic commit point),
+    // leaving no file; the marker write for the same cycle must still succeed.
+    setDurableWriteFaultInjectionForTesting((stage, path) => {
+      if (stage === "before_rename" && path.endsWith("cycle-000002.json")) {
+        throw new Error("injected: review cycle record publication failed");
+      }
+    });
+    try {
+      const result = await runWaveWorkerLifecycle({
+        sourceRoot: capture.discovery.captureRoot,
+        taskId: "task-pubfail",
+        task: testTask(),
+        capture,
+        worktree: worker,
+        artifactDir,
+        config,
+        onUpdate: (update) => {
+          // The lifecycle's correction loop emits "correction N/M"; the
+          // executor-turn runner also reports phase "correcting" for resume
+          // bookkeeping, so key on the exact correction-loop message.
+          if (update.phase !== "correcting" || update.message !== `correction 2/${config.maxCorrectionCycles}`) return;
+          if (!secondCorrecting) {
+            secondCorrecting = (async () => {
+              // Active correction after cycle 2's failed publication: no final
+              // result exists, cycle 1 is readable, and cycle 2 left only its
+              // explicit marker — never a silent gap.
+              let resultExists = true;
+              try { await access(join(artifactDir, "result.json")); } catch { resultExists = false; }
+              assert.equal(resultExists, false, "result.json must not exist while the correction turn is active");
+              const record1 = JSON.parse(await readFile(
+                join(artifactDir, "reviews", capture.waveId, "cycle-000001.json"), "utf8"));
+              assert.equal(record1.aggregate, "needs_changes");
+              let record2Exists = true;
+              try { await access(join(artifactDir, "reviews", capture.waveId, "cycle-000002.json")); } catch { record2Exists = false; }
+              assert.equal(record2Exists, false, "the failed publication must not leave a record file");
+              const marker = JSON.parse(await readFile(
+                join(artifactDir, "reviews", capture.waveId, "cycle-000002.json.unpublished"), "utf8"));
+              assert.equal(marker.version, 1);
+              assert.equal(marker.taskId, "task-pubfail");
+              assert.equal(marker.waveId, capture.waveId);
+              assert.equal(marker.cycle, 2);
+              assert.equal(typeof marker.reviewSequence, "number");
+              assert.equal(marker.aggregate, "needs_changes", "the official gate verdict stays visible in the marker");
+              assert.match(String(marker.reason), /injected/);
+            })();
+          }
+        },
+      });
+      // The assertions captured during the second "correcting" phase must have held.
+      if (secondCorrecting) await secondCorrecting;
+      assert.ok(secondCorrecting, "the lifecycle must be actively correcting after cycle 2's failed publication");
+
+      // The publication failure never alters the lifecycle itself.
+      assert.equal(result.status, "correction_cap", `expected correction_cap, got ${result.status}`);
+      assert.equal(result.reviewCycles.length, 3, "all three review cycles completed");
+
+      // The final result still settles with every official verdict (final-result
+      // reconciliation is preserved), and cycle 3's record persisted normally.
+      const settled = JSON.parse(await readFile(join(artifactDir, "result.json"), "utf8"));
+      assert.equal(settled.status, "correction_cap");
+      assert.equal(settled.reviewCycles.length, 3);
+      assert.equal(settled.reviewReport.aggregate, "needs_changes");
+      await access(join(artifactDir, "reviews", capture.waveId, "cycle-000003.json"));
+    } finally {
+      setDurableWriteFaultInjectionForTesting(undefined);
+    }
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: when both record and marker publication fail, currentness is never asserted (#50)", async () => {
+  // A shared fault (ENOSPC, directory permissions) can prevent BOTH cycle 2's
+  // record and its failure marker from publishing, leaving no durable trace of
+  // the completed cycle at all. During the active correction that follows,
+  // evidence reads must keep prior findings readable but must NOT assert the
+  // older cycle current — currentness is never inferred from the absence of a
+  // newer file; completeness uncertainty stays model-visible until settlement.
+  const root = await mkTmp("pi-wwl-pubfail2-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-pubfail2");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-pubfail2");
+    await mkdir(artifactDir, { recursive: true });
+
+    // The executor writes a different file per turn (PI_REVIEW_EXECUTOR_TURN),
+    // so every cycle reviews a new candidate instead of tripping no-progress
+    // detection. With maxCorrectionCycles = 2, a correction turn is still
+    // active after cycle 2's failed publications.
+    const firstCommand = join(root, "pubfail2-first.cjs");
+    await writeFile(firstCommand, [
+      "const fs = require('node:fs');",
+      "const turn = Number(process.env.PI_REVIEW_EXECUTOR_TURN || '1');",
+      "if (turn === 1) fs.writeFileSync('initial.txt', 'initial\\n');",
+      "else fs.writeFileSync('corrected-' + turn + '.txt', 'corrected\\n');",
+      "console.log(JSON.stringify({ type: 'session', sessionId: process.env.PI_REVIEW_EXECUTOR_SESSION_ID || 'pubfail2-session' }));",
+      "console.log(JSON.stringify({ type: 'assistant', text: 'Turn ' + turn + ' complete.' }));",
+    ].join("\n"), "utf8");
+    await chmod(firstCommand, 0o755);
+
+    const config = buildNeedsChangesReviewerConfig(firstCommand);
+    config.maxCorrectionCycles = 2;
+
+    let secondCorrecting: Promise<void> | undefined;
+    // Reject both cycle 2's record and its .unpublished marker at the atomic
+    // commit point — a shared durable-write failure, not two independent ones.
+    setDurableWriteFaultInjectionForTesting((stage, path) => {
+      if (stage === "before_rename"
+        && (path.endsWith("cycle-000002.json") || path.endsWith("cycle-000002.json.unpublished"))) {
+        throw new Error("injected: shared durable-write failure");
+      }
+    });
+    try {
+      const result = await runWaveWorkerLifecycle({
+        sourceRoot: capture.discovery.captureRoot,
+        taskId: "task-pubfail2",
+        task: testTask(),
+        capture,
+        worktree: worker,
+        artifactDir,
+        config,
+        onUpdate: (update) => {
+          if (update.phase !== "correcting" || update.message !== `correction 2/${config.maxCorrectionCycles}`) return;
+          if (!secondCorrecting) {
+            secondCorrecting = (async () => {
+              // Neither the record nor the marker exists: no durable trace.
+              for (const name of ["cycle-000002.json", "cycle-000002.json.unpublished"]) {
+                let exists = true;
+                try { await access(join(artifactDir, "reviews", capture.waveId, name)); } catch { exists = false; }
+                assert.equal(exists, false, `${name} must not exist`);
+              }
+
+              // Evidence read during active correction: prior findings stay readable…
+              const bundle = await buildSubtaskEvidence({ taskId: "task-pubfail2", waveRoot: capture.waveRoot, artifactDir });
+              const filtered = readSubtaskEvidence(bundle, { filter: "review" });
+              assert.equal(filtered.entries?.length, 1, "cycle 1's reviewer verdict must stay inspectable");
+              const found = readSubtaskEvidence(bundle, { find: "missing test" });
+              assert.ok((found.matchSummary?.totalMatches ?? 0) >= 1, "cycle 1's findings must stay searchable");
+
+              // …but its currentness is never asserted from the absence of a
+              // newer file: latest available with unknown completeness.
+              const lifecycle = readSubtaskEvidence(bundle, { filter: "lifecycle" });
+              const status = (lifecycle.entries ?? []).find((entry) => entry.source.recordKey === "status" && entry.source.sourceId === `review:${capture.waveId}:cycle-000001`);
+              assert.ok(status, "cycle 1 must carry a lifecycle status entry");
+              assert.match(String(status!.preview), /latest available review evidence/);
+              assert.match(String(status!.preview), /cannot be confirmed/);
+              assert.ok(
+                !String(status!.preview).includes("is the most recently completed review for this task"),
+                "absence of a newer file must never prove currentness",
+              );
+
+              // Review-completeness uncertainty is model-visible in context.
+              assert.equal(bundle.context?.review?.aggregate, "needs_changes", "the readable cycle is still summarized…");
+              assert.match(bundle.context?.review?.caveat ?? "", /failed to publish without leaving a trace/);
+            })();
+          }
+        },
+      });
+      // The assertions captured during the second "correcting" phase must have held.
+      if (secondCorrecting) await secondCorrecting;
+      assert.ok(secondCorrecting, "the lifecycle must be actively correcting after cycle 2's failed publications");
+
+      // The shared publication failure never alters the lifecycle itself.
+      assert.equal(result.status, "correction_cap", `expected correction_cap, got ${result.status}`);
+      assert.equal(result.reviewCycles.length, 3, "all three review cycles completed");
+
+      // Final-result reconciliation is preserved: every official verdict still
+      // settles into result.json.
+      const settled = JSON.parse(await readFile(join(artifactDir, "result.json"), "utf8"));
+      assert.equal(settled.status, "correction_cap");
+      assert.equal(settled.reviewCycles.length, 3);
+      assert.equal(settled.reviewReport.aggregate, "needs_changes");
+    } finally {
+      setDurableWriteFaultInjectionForTesting(undefined);
+    }
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {

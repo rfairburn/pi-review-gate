@@ -40,6 +40,8 @@ export const EVIDENCE_OPERATION_CONTEXT_BYTES = 1024 * 1024;
 export const EVIDENCE_RAW_SNAPSHOT_BUDGET_BYTES = 16 * 1024 * 1024;
 /** Raw record content cap applied before redaction, in bytes. */
 export const EVIDENCE_RAW_RECORD_CONTENT_BYTES = 128 * 1024;
+/** Bounded size for one durable review cycle record, in bytes (#50). */
+export const EVIDENCE_REVIEW_RECORD_BYTES = 256 * 1024;
 
 export type SubtaskEvidenceKind = "tool_call" | "tool_result" | "process" | "claim" | "review" | "lifecycle";
 export type SubtaskEvidenceStatus = "in_flight" | "returned" | "succeeded" | "failed" | "unknown";
@@ -61,6 +63,8 @@ export const EVIDENCE_COMMAND_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 export type SubtaskEvidenceUnavailableReason =
   | "artifact_dir_missing"
+  | "review_unavailable"
+  | "unpublished"
   | "unreadable"
   | "unsupported_adapter"
   | "missing_stream"
@@ -209,6 +213,8 @@ export interface SubtaskEvidenceReviewSummary {
   cycles: number;
   latestSequence: number;
   reviewers: Array<{ reviewerId: string; verdict: string; summary: string }>;
+  /** Set when a review cycle record could not be read or was never published and this summary may no longer be current. */
+  caveat?: string;
 }
 
 export interface SubtaskEvidenceCurrentCommand {

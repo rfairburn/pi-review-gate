@@ -15,6 +15,49 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.12]
+
+### Added
+
+- `SubtasksInspect` evidence reads now expose completed `needs_changes` review findings
+  while a worker is actively correcting, before any final task result exists: each
+  completed review cycle is persisted immediately as an official record under the task's
+  artifact directory (`reviews/<waveId>/cycle-NNNN.json`, numbered to match the immutable
+  per-cycle review alias) and indexed with `reviewer_verdict` provenance — verdict,
+  reviewer, cycle identity, summary and guidance, and findings with stable ids, severity
+  and blocking status, location, and recommendation — reachable through the existing
+  `find`, `filter: "review"`, and deep-read paths. Before settlement, no cycle is
+  asserted to be definitively current — the newest readable cycle is presented as the
+  latest available review evidence with unknown completeness (a later cycle's record
+  could have failed to publish without leaving a trace), and earlier cycles are
+  explicitly marked as superseded, so a historical blocker is never presented as the
+  current verdict while both remain searchable. When no completed
+  review evidence exists at all (a review in flight, or a disabled or unreviewed run),
+  evidence reads report an explicit `review_unavailable` note instead of a silent empty
+  success; unreadable, malformed, oversized, foreign-task, or symlinked cycle records
+  are refused with per-file notes and never indexed. If a completed cycle's record fails
+  to publish, the lifecycle best-effort leaves an explicit marker
+  (`cycle-NNNN.json.unpublished`) beside the missing record carrying the official gate
+  verdict, summary, and a bounded failure reason: that cycle counts toward review
+  completeness and its verdict stays visible through its lifecycle entry, but its
+  per-reviewer findings are not readable because no durable record exists, and malformed
+  or foreign markers are refused with an explicit note. When a later unusable sibling —
+  an unreadable or refused record, or a publication-failure marker — exists before
+  settlement, its lifecycle entry and the context summary say the newest readable cycle
+  cannot be confirmed (or name the superseding unpublished cycle when the marker
+  identifies one) rather than presenting a possibly superseded verdict as current; if
+  both writes fail under a shared fault such as ENOSPC or directory permissions, no trace
+  of the completed cycle exists at all and the same conservative qualification applies —
+  latest available with unknown completeness until settlement. Once
+  a final result with a review report exists, it is reconciled with the durable cycles
+  by review identity: cycle persistence is best-effort, so when the latest cycle's
+  record is missing or unreadable (or left only as an explicit publication-failure
+  marker) the report covers a newer review and is indexed — with each earlier cycle
+  marked superseded by the final report — so a later
+  official pass is never hidden behind an older persisted blocker; when the durable
+  cycles already cover the report's latest review, the report is not counted twice
+  (Closes #50).
+
 ## [0.1.0-dev.11]
 
 ### Added

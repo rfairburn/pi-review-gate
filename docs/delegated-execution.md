@@ -172,7 +172,8 @@ legacy activity behavior is unchanged when `evidence` is absent.
 
 Evidence indexes only authorized per-task artifacts under the task's wave root: executor
 session files (Pi) or per-turn raw streams (Claude/Codex/binary), final responses,
-process results, the durable operation record, and the latest review report. Every source
+process results, the durable operation record, completed review cycles, and the latest
+review report. Every source
 that is missing, unreadable, unsupported, or truncated appears as an explicit
 `unavailable` note; nothing is invented to fill a gap, and no caller-supplied path can
 widen the read boundary (symlinks and path escapes are refused). For a Pi turn whose
@@ -186,7 +187,44 @@ which never implies verification) from reviewer verdicts (`reviewer_verdict`). T
 and results are paired by real call ids; a call without an observed result stays
 `in_flight`, which is never evidence of success. Private model reasoning (Pi thinking
 blocks, Codex reasoning items) is excluded from every view, and all retained content is
-redacted before search or display. Reads are bounded: per-entry and total byte budgets,
+redacted before search or display.
+
+Completed review cycles are persisted as official records under the task's artifact
+directory (`reviews/<waveId>/cycle-NNNN.json`, one per cycle, numbered to match the
+immutable per-cycle review alias) at the moment each cycle completes — so a
+`needs_changes` verdict and its findings (stable finding ids, severity and blocking
+status, location, and recommendation, plus the reviewer's summary and guidance) are
+inspectable through `find`, `filter: "review"`, and deep reads while a worker is actively
+correcting, before any final task result exists. Each cycle also contributes lifecycle
+entries: before settlement, no cycle is asserted to be definitively current — the
+newest readable cycle is presented as the latest available review evidence with unknown
+completeness (a later cycle's record could have failed to publish without leaving a
+trace), and every earlier cycle is explicitly marked as superseded, so a historical
+blocker is never presented as the current verdict while both remain searchable. When no completed review evidence exists at all (a review
+in flight, or a disabled or unreviewed run), evidence reads report an explicit
+`review_unavailable` note instead of a silent empty success; unreadable, malformed,
+oversized, foreign-task, or symlinked cycle records are likewise refused with per-file
+notes and never indexed. If a completed cycle's record fails to publish, the lifecycle
+best-effort leaves an explicit marker (`cycle-NNNN.json.unpublished`) beside the missing
+record carrying the official gate verdict, summary, and a bounded failure reason: that
+cycle counts toward review completeness and its verdict stays visible through its
+lifecycle entry, but its per-reviewer findings are not readable because no durable record
+exists, and the marker itself is refused with an explicit note when it is malformed or
+foreign. When a later unusable sibling — an unreadable or refused record, or a
+publication-failure marker — exists before settlement, its lifecycle entry and the
+context summary say the newest readable cycle cannot be confirmed (or name the
+superseding unpublished cycle when the marker identifies one), rather than presenting a
+possibly superseded verdict as the current one. If both writes fail under a shared fault
+such as ENOSPC or directory permissions, no trace of the completed cycle exists at all,
+and the same conservative qualification applies: the newest readable cycle is latest
+available with unknown completeness until settlement. Once a final
+result with a review report exists, it is reconciled with the durable cycles by review
+identity: cycle persistence is best-effort, so when the latest cycle's record is missing
+or unreadable (or left only as an explicit publication-failure marker) the report covers
+a newer review than every usable durable cycle and is indexed — with
+each earlier cycle marked superseded by the final report — so a later official pass is
+never hidden behind an older persisted blocker. When the durable cycles already cover the
+report's latest review, the report is not counted twice. Reads are bounded: per-entry and total byte budgets,
 a bounded tail byte window per source (only the newest bytes of each stream are
 scanned, so evidence appended beyond any fixed offset stays reachable; earlier bytes
 and the boundary record are disclosed as `scan_budget`), a global rolling entry window

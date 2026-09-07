@@ -12,7 +12,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { BoundedJsonlDecoder, MAX_JSONL_RECORD_BYTES, utf8Prefix } from "../../jsonl";
 import { readBoundedTextFile } from "../../bounded-file";
-import { EVIDENCE_RAW_RECORD_CONTENT_BYTES, EVIDENCE_SCAN_BYTES_PER_SOURCE, type SubtaskEvidenceUnavailableReason } from "./types";
+import { EVIDENCE_RAW_RECORD_CONTENT_BYTES, EVIDENCE_SCAN_BYTES_PER_SOURCE, type IndexedSource, type SubtaskEvidenceUnavailable, type SubtaskEvidenceUnavailableReason } from "./types";
 
 /** Refusal of a path that violates artifact confinement (fail closed). */
 export class EvidenceRefusalError extends Error {
@@ -28,6 +28,40 @@ export function evidenceErrorMessage(error: unknown): string {
 /** Caps raw record content before redaction (retention happens later). */
 export function capRawContent(content: string): string {
   return utf8Prefix(content, EVIDENCE_RAW_RECORD_CONTENT_BYTES);
+}
+
+/** sha256 of a source line/record, by recordKey (cursor validation digests). */
+export function sha256HexOf(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/** Caps source content and records whether the source exceeded the raw cap. */
+export function capped(content: string): { content: string; truncatedSource?: boolean } {
+  const text = capRawContent(content);
+  return Buffer.byteLength(text) < Buffer.byteLength(content)
+    ? { content: text, truncatedSource: true }
+    : { content: text };
+}
+
+/** Explicit disclosure that earlier records of a source were not retained. */
+export function omittedNote(sourceId: string, omitted: number): SubtaskEvidenceUnavailable[] {
+  if (omitted <= 0) return [];
+  return [{
+    source: sourceId,
+    reason: "records_omitted",
+    detail: `${omitted} earlier record(s) of this source are outside the retained window or shared retention budget; they are not indexed in this snapshot.`,
+  }];
+}
+
+/** Enforces unique recordKeys within a source (stable identity is a contract). */
+export function finalizeSource(source: IndexedSource): IndexedSource {
+  const seen = new Set<string>();
+  source.records = source.records.filter((record) => {
+    if (seen.has(record.recordKey)) return false;
+    seen.add(record.recordKey);
+    return true;
+  });
+  return source;
 }
 
 function escapesRoot(rootResolved: string, candidate: string): boolean {
@@ -163,7 +197,7 @@ export async function streamJsonlBounded(path: string, maxRecords: number, optio
         if (budgetConstrained) budget.exhausted = true;
         budget.remainingBytes -= lineBytes;
       }
-      ring.push({ text: line, digest: sha256Hex(`${generation}\n${line}`) });
+      ring.push({ text: line, digest: sha256HexOf(`${generation}\n${line}`) });
       while (ring.length - ringStart > maxRecords) evictOldest(); // window eviction
       // Amortized compaction so the backing array never grows past ~2x retained.
       if (ringStart > 4096 && ringStart * 2 >= ring.length) {
@@ -203,10 +237,6 @@ export async function streamJsonlBounded(path: string, maxRecords: number, optio
     await handle.close();
   }
   return out;
-}
-
-function sha256Hex(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 /** Reads and parses a small bounded JSON record; undefined when missing/invalid. */

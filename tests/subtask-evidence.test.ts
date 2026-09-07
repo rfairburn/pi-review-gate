@@ -1228,3 +1228,610 @@ test("controller: an operation record naming an unverifiable artifact directory 
     await manager.shutdown();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Active-correction review evidence (#50): durable per-cycle records are
+// indexed with provenance and supersession, unavailability is explicit,
+// cursors discover newly completed cycles, and a real controller + lifecycle
+// regression proves findings are inspectable before any final result exists.
+// ---------------------------------------------------------------------------
+
+import { access } from "node:fs/promises";
+import { dirname } from "node:path";
+import { runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "../src/execution/wave-worker-lifecycle";
+import { captureWaveBase, type WaveCaptureResult } from "../src/execution/wave-repository";
+import { createWorkerWorktree, removeWorktree, type WorkerWorktree } from "../src/execution/wave-worktrees";
+
+/** One durable completed review cycle record (reviews/<waveId>/cycle-NNNN.json). */
+function reviewCycleFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    taskId: "task-1",
+    waveId: "wave-1",
+    cycle: 1,
+    reviewSequence: 1,
+    completedAt: "2025-06-03T10:00:00.000Z",
+    candidate: {
+      baseCommit: "basecommitsha",
+      commitSha: "cand1commitsha",
+      treeSha: "tree1sha",
+      ref: "refs/pi-review-gate/waves/wave-1/review-candidates/task-1/cycle-000001",
+    },
+    aggregate: "needs_changes",
+    summary: "gate: 1 needs_changes",
+    reviewers: [{
+      reviewerId: "reviewer-1",
+      displayLabel: "R1",
+      verdict: "needs_changes",
+      summary: "blocking issues found in the candidate",
+      guidance: "address every blocking finding before re-review",
+      findings: [
+        { severity: "blocking", file: "src/app.ts", line: 12, issue: "ACTIVE-CORRECTION-FINDING-ALPHA is missing", recommendation: "implement the missing behavior" },
+        { severity: "blocking", file: null, line: null, issue: "FINDING-BETA-MARKER coverage gap", recommendation: "add regression tests" },
+      ],
+    }],
+    ...overrides,
+  };
+}
+
+async function writeCycleRecord(artifactDir: string, record: Record<string, unknown>): Promise<string> {
+  const path = join(artifactDir, "reviews", String(record.waveId), `cycle-${String(record.cycle).padStart(6, "0")}.json`);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  return path;
+}
+
+function unpublishedMarkerFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    taskId: "task-1",
+    waveId: "wave-1",
+    cycle: 2,
+    reviewSequence: 2,
+    completedAt: "2025-06-03T11:00:00.000Z",
+    aggregate: "needs_changes",
+    summary: "gate: 1 needs_changes",
+    reason: "injected publication failure",
+    ...overrides,
+  };
+}
+
+async function writeUnpublishedMarker(artifactDir: string, marker: Record<string, unknown>): Promise<string> {
+  const path = join(artifactDir, "reviews", String(marker.waveId), `cycle-${String(marker.cycle).padStart(6, "0")}.json.unpublished`);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(marker, null, 2)}\n`, "utf8");
+  return path;
+}
+
+function statusEntriesBySource(bundle: SubtaskEvidenceBundle): Map<string, string> {
+  const lifecycle = readSubtaskEvidence(bundle, { filter: "lifecycle" });
+  return new Map(
+    (lifecycle.entries ?? [])
+      .filter((entry) => entry.source.recordKey === "status")
+      .map((entry) => [entry.source.sourceId, entry.preview]),
+  );
+}
+
+test("active correction: durable review cycles are indexed with provenance, find, deep read, and explicit supersession", async () => {
+  const { waveRoot, artifactDir } = await makeTaskArtifacts("review-active");
+  await writeCycleRecord(artifactDir, reviewCycleFixture());
+  await writeCycleRecord(artifactDir, reviewCycleFixture({
+    cycle: 2,
+    reviewSequence: 2,
+    completedAt: "2025-06-03T11:00:00.000Z",
+    candidate: {
+      baseCommit: "basecommitsha",
+      commitSha: "cand2commitsha",
+      treeSha: "tree2sha",
+      ref: "refs/pi-review-gate/waves/wave-1/review-candidates/task-1/cycle-000002",
+    },
+    aggregate: "pass",
+    summary: "gate: 1 pass",
+    reviewers: [{ reviewerId: "reviewer-1", displayLabel: "R1", verdict: "pass", summary: "all findings resolved", findings: [] }],
+  }));
+
+  const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
+  assert.deepEqual(
+    bundle.snapshot.sources.filter((source) => source.sourceId.startsWith("review:")).map((source) => source.sourceId).sort(),
+    ["review:wave-1:cycle-000001", "review:wave-1:cycle-000002"],
+  );
+
+  // Review-filtered reads expose the official findings with reviewer_verdict provenance.
+  const filtered = readSubtaskEvidence(bundle, { filter: "review" });
+  assert.equal(filtered.entries?.length, 2, "one reviewer entry per completed cycle");
+  for (const entry of filtered.entries ?? []) {
+    assert.equal(entry.provenance, "reviewer_verdict");
+  }
+
+  // find: a generic term matches the findings; a unique marker pins one entry.
+  const generic = readSubtaskEvidence(bundle, { find: "finding", filter: "review" });
+  assert.ok((generic.matchSummary?.totalMatches ?? 0) >= 2, "find 'finding' must not be a zero-match success");
+  const unique = readSubtaskEvidence(bundle, { find: "FINDING-BETA-MARKER" });
+  assert.equal(unique.matchSummary?.totalMatches, 1);
+  assert.equal(unique.matches?.[0]?.kind, "review");
+
+  // Deep-read the selected entry for bounded detail.
+  const deep = readSubtaskEvidence(bundle, { entryId: unique.matches![0]!.entryId });
+  assert.equal(deep.mode, "entry");
+  assert.match(deep.deepContent!.content, /"severity":"blocking"/);
+  assert.match(deep.deepContent!.content, /add regression tests/);
+
+  // Lifecycle entries distinguish the historical blocker from the current verdict.
+  const lifecycle = readSubtaskEvidence(bundle, { filter: "lifecycle" });
+  const statusEntries = (lifecycle.entries ?? []).filter((entry) => entry.source.recordKey === "status");
+  assert.equal(statusEntries.length, 2);
+  const bySource = new Map(statusEntries.map((entry) => [entry.source.sourceId, entry.preview]));
+  assert.match(bySource.get("review:wave-1:cycle-000001")!, /superseded by review cycle 2/);
+  assert.match(bySource.get("review:wave-1:cycle-000002")!, /most recently completed/);
+
+  // The authoritative context reflects the latest durable cycle.
+  assert.equal(bundle.context?.review?.aggregate, "pass");
+  assert.equal(bundle.context?.review?.cycles, 2);
+  assert.equal(bundle.context?.review?.latestSequence, 2);
+  assert.equal(bundle.context?.review?.reviewers[0]?.verdict, "pass");
+
+  // Completed review evidence present: no review_unavailable note.
+  assert.ok(!bundle.snapshot.unavailable.some((item) => item.reason === "review_unavailable"));
+});
+
+test("active correction: missing, invalid, foreign, or refused review records are explicit, never silent", async () => {
+  // (a) No completed review evidence at all: an explicit review-specific note.
+  const none = await makeTaskArtifacts("review-none");
+  const bundleNone = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: none.waveRoot, artifactDir: none.artifactDir });
+  assert.equal(bundleNone.snapshot.entries.filter((entry) => entry.kind === "review").length, 0);
+  const noteNone = bundleNone.snapshot.unavailable.find((item) => item.reason === "review_unavailable");
+  assert.ok(noteNone, "absence of review evidence must be explicit");
+  assert.match(noteNone!.detail, /no completed review evidence/i);
+
+  // (b) A record owned by a different task is refused with an ownership note.
+  const foreign = await makeTaskArtifacts("review-foreign");
+  await writeCycleRecord(foreign.artifactDir, reviewCycleFixture({ taskId: "task-other" }));
+  const bundleForeign = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: foreign.waveRoot, artifactDir: foreign.artifactDir });
+  assert.equal(bundleForeign.snapshot.entries.filter((entry) => entry.kind === "review").length, 0);
+  const noteForeign = bundleForeign.snapshot.unavailable.find((item) => item.source?.includes("cycle-000001") && item.reason === "unreadable");
+  assert.ok(noteForeign, "foreign record must produce an explicit unavailable note");
+  assert.match(noteForeign!.detail, /belongs to task "task-other"/);
+
+  // (c) Invalid JSON is reported, not silently skipped.
+  const invalid = await makeTaskArtifacts("review-invalid");
+  await mkdir(join(invalid.artifactDir, "reviews", "wave-1"), { recursive: true });
+  await writeFile(join(invalid.artifactDir, "reviews", "wave-1", "cycle-000001.json"), "{not json\n", "utf8");
+  const bundleInvalid = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: invalid.waveRoot, artifactDir: invalid.artifactDir });
+  assert.equal(bundleInvalid.snapshot.entries.filter((entry) => entry.kind === "review").length, 0);
+  const noteInvalid = bundleInvalid.snapshot.unavailable.find((item) => item.source?.includes("cycle-000001") && item.reason === "unreadable");
+  assert.ok(noteInvalid, "invalid record must produce an explicit unavailable note");
+  assert.match(noteInvalid!.detail, /not valid JSON/);
+
+  // (d) A symlinked record is refused by confinement and reported.
+  const symlinked = await makeTaskArtifacts("review-symlink");
+  const outside = join(root, "outside-review-record.json");
+  await writeFile(outside, `${JSON.stringify(reviewCycleFixture(), null, 2)}\n`, "utf8");
+  await mkdir(join(symlinked.artifactDir, "reviews", "wave-1"), { recursive: true });
+  await symlink(outside, join(symlinked.artifactDir, "reviews", "wave-1", "cycle-000001.json"));
+  const bundleSymlink = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: symlinked.waveRoot, artifactDir: symlinked.artifactDir });
+  assert.equal(bundleSymlink.snapshot.entries.filter((entry) => entry.kind === "review").length, 0);
+  const noteSymlink = bundleSymlink.snapshot.unavailable.find((item) => item.source?.includes("cycle-000001"));
+  assert.ok(noteSymlink, "symlinked record must produce an explicit unavailable note");
+  assert.match(String(noteSymlink!.reason), /non_regular_file|path_escape/);
+
+  // (e) An unusable durable file must not suppress the settled-result fallback.
+  const fallback = await makeTaskArtifacts("review-fallback");
+  await writeCycleRecord(fallback.artifactDir, reviewCycleFixture({ taskId: "task-other" }));
+  const resultWithReport = {
+    waveId: "wave-1", waveRoot: fallback.waveRoot, sourceRoot: "/tmp/src", phase: "completed" as const,
+    taskResults: [{
+      taskId: "task-1", title: "t", status: "accepted" as const, summary: "ok",
+      reviewReport: {
+        aggregate: "pass" as const, summary: "settled", reviewCycles: 3, latestReviewSequence: 3,
+        reviewers: [{ reviewerId: "reviewer-9", displayLabel: "R9", verdict: "pass" as const, summary: "settled pass", findings: [] }],
+        history: [],
+      },
+    }],
+  };
+  const bundleFallback = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: fallback.waveRoot, artifactDir: fallback.artifactDir, result: resultWithReport as never });
+  assert.ok(bundleFallback.snapshot.sources.some((source) => source.sourceId === "report:result.json"), "settled-result report must remain available when durable records are unusable");
+  const fallbackReview = readSubtaskEvidence(bundleFallback, { filter: "review" });
+  assert.equal(fallbackReview.entries?.length, 1);
+});
+
+function settledResult(waveRoot: string, latestReviewSequence: number): unknown {
+  return {
+    waveId: "wave-1", waveRoot, sourceRoot: "/tmp/src", phase: "completed",
+    taskResults: [{
+      taskId: "task-1", title: "t", status: "accepted", summary: "ok",
+      reviewReport: {
+        aggregate: "pass", summary: "settled pass", reviewCycles: latestReviewSequence, latestReviewSequence,
+        reviewers: [{ reviewerId: "reviewer-1", displayLabel: "R1", verdict: "pass", summary: "SETTLED-PASS-MARKER all findings resolved", findings: [] }],
+        history: [],
+      },
+    }],
+  };
+}
+
+test("active correction: the settled report is reconciled with durable cycles by review identity, never double-counted", async () => {
+  // (A) The latest cycle's best-effort record failed to persist: the settled
+  // report covers a newer review than every usable durable cycle, so it must
+  // be indexed and the historical blocker marked superseded — the official
+  // pass must not be hidden behind an older durable needs_changes record.
+  const newer = await makeTaskArtifacts("review-newer");
+  await writeCycleRecord(newer.artifactDir, reviewCycleFixture()); // cycle 1, seq 1, needs_changes
+  const bundleNewer = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: newer.waveRoot, artifactDir: newer.artifactDir, result: settledResult(newer.waveRoot, 2) as never });
+  assert.ok(bundleNewer.snapshot.sources.some((source) => source.sourceId === "report:result.json"), "a newer settled report must be indexed alongside older durable cycles");
+  const foundNewer = readSubtaskEvidence(bundleNewer, { find: "SETTLED-PASS-MARKER" });
+  assert.ok((foundNewer.matchSummary?.totalMatches ?? 0) >= 1, "the later official pass must be searchable");
+  const lifecycleNewer = readSubtaskEvidence(bundleNewer, { filter: "lifecycle" });
+  const statusNewer = new Map((lifecycleNewer.entries ?? []).filter((entry) => entry.source.recordKey === "status").map((entry) => [entry.source.sourceId, entry.preview]));
+  assert.match(statusNewer.get("review:wave-1:cycle-000001")!, /superseded by the final review report/);
+  assert.equal(bundleNewer.context?.review?.aggregate, "pass", "context must reflect the later official pass");
+
+  // (B) Every cycle persisted: the settled report covers the same review
+  // identity as the newest durable cycle and must not be counted twice.
+  const covered = await makeTaskArtifacts("review-covered");
+  await writeCycleRecord(covered.artifactDir, reviewCycleFixture()); // cycle 1, seq 1
+  await writeCycleRecord(covered.artifactDir, reviewCycleFixture({
+    cycle: 2,
+    reviewSequence: 2,
+    completedAt: "2025-06-03T11:00:00.000Z",
+    aggregate: "pass",
+    summary: "gate: 1 pass",
+    reviewers: [{ reviewerId: "reviewer-1", displayLabel: "R1", verdict: "pass", summary: "all findings resolved", findings: [] }],
+  }));
+  const bundleCovered = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: covered.waveRoot, artifactDir: covered.artifactDir, result: settledResult(covered.waveRoot, 2) as never });
+  assert.ok(!bundleCovered.snapshot.sources.some((source) => source.sourceId === "report:result.json"), "the settled report must not duplicate cycles it does not go beyond");
+  assert.equal(bundleCovered.snapshot.entries.filter((entry) => entry.kind === "review").length, 2, "exactly one reviewer entry per completed cycle");
+
+  // (C) Without usable durable records the legacy result-based path still works.
+  const plain = await makeTaskArtifacts("review-legacy");
+  const bundlePlain = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: plain.waveRoot, artifactDir: plain.artifactDir, result: settledResult(plain.waveRoot, 2) as never });
+  assert.ok(bundlePlain.snapshot.sources.some((source) => source.sourceId === "report:result.json"));
+});
+
+test("active correction: an unreadable later cycle never hides the settled pass and never asserts a stale current verdict", async () => {
+  // Settled: cycle 1 (needs_changes) persisted, cycle 2's record is unreadable,
+  // and the final report carries the official pass. The pass must be
+  // searchable and the earlier blocker historical.
+  const settled = await makeTaskArtifacts("review-unreadable-settled");
+  await writeCycleRecord(settled.artifactDir, reviewCycleFixture()); // cycle 1, seq 1, needs_changes
+  await mkdir(join(settled.artifactDir, "reviews", "wave-1"), { recursive: true });
+  await writeFile(join(settled.artifactDir, "reviews", "wave-1", "cycle-000002.json"), "{corrupt\n", "utf8");
+  const bundleSettled = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: settled.waveRoot, artifactDir: settled.artifactDir, result: settledResult(settled.waveRoot, 2) as never });
+  assert.ok(bundleSettled.snapshot.sources.some((source) => source.sourceId === "report:result.json"), "the newer settled report must be indexed despite the unreadable cycle file");
+  const foundSettled = readSubtaskEvidence(bundleSettled, { find: "SETTLED-PASS-MARKER" });
+  assert.ok((foundSettled.matchSummary?.totalMatches ?? 0) >= 1, "the later official pass must be searchable");
+  const lifecycleSettled = readSubtaskEvidence(bundleSettled, { filter: "lifecycle" });
+  const statusSettled = new Map((lifecycleSettled.entries ?? []).filter((entry) => entry.source.recordKey === "status").map((entry) => [entry.source.sourceId, entry.preview]));
+  assert.match(statusSettled.get("review:wave-1:cycle-000001")!, /superseded by the final review report/);
+  const noteSettled = bundleSettled.snapshot.unavailable.find((item) => item.source?.includes("cycle-000002"));
+  assert.ok(noteSettled, "the unreadable cycle file must keep its explicit unavailable note");
+
+  // Pre-settlement: the same unreadable sibling means the older readable
+  // verdict cannot be asserted as definitively current — in entries or context.
+  const active = await makeTaskArtifacts("review-unreadable-active");
+  await writeCycleRecord(active.artifactDir, reviewCycleFixture()); // cycle 1, seq 1, needs_changes
+  await mkdir(join(active.artifactDir, "reviews", "wave-1"), { recursive: true });
+  await writeFile(join(active.artifactDir, "reviews", "wave-1", "cycle-000002.json"), "{corrupt\n", "utf8");
+  const bundleActive = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: active.waveRoot, artifactDir: active.artifactDir });
+  const lifecycleActive = readSubtaskEvidence(bundleActive, { filter: "lifecycle" });
+  const statusActive = new Map((lifecycleActive.entries ?? []).filter((entry) => entry.source.recordKey === "status").map((entry) => [entry.source.sourceId, entry.preview]));
+  assert.match(statusActive.get("review:wave-1:cycle-000001")!, /cannot be confirmed to be the current review state/);
+  assert.ok(!statusActive.get("review:wave-1:cycle-000001")!.includes("is the most recently completed review for this task"), "a stale verdict must not be asserted as current");
+  assert.equal(bundleActive.context?.review?.aggregate, "needs_changes", "the readable cycle is still summarized…");
+  assert.match(bundleActive.context?.review?.caveat ?? "", /may no longer be the current review state/);
+});
+
+test("regression #50: a later cycle whose record never published leaves no false current verdict while correcting", async () => {
+  // Cycle 1 persisted normally; cycle 2 completed but its publication failed,
+  // leaving only the explicit marker. No final result exists yet (active
+  // correction): prior findings must stay readable, must not be presented as
+  // the current review state, and the completeness gap must be model-visible.
+  const { waveRoot, artifactDir } = await makeTaskArtifacts("review-unpublished-active");
+  await writeCycleRecord(artifactDir, reviewCycleFixture()); // cycle 1, seq 1, needs_changes
+  await writeUnpublishedMarker(artifactDir, unpublishedMarkerFixture()); // cycle 2: marker only
+
+  const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
+
+  // The marker is explicit evidence of the completed-but-unpublished cycle.
+  assert.ok(
+    bundle.snapshot.sources.some((source) => source.sourceId === "review:wave-1:cycle-000002-unpublished"),
+    "the publication-failure marker must be indexed as its own source",
+  );
+  const note = bundle.snapshot.unavailable.find((item) => item.reason === "unpublished" && (item.source ?? "").includes("cycle-000002"));
+  assert.ok(note, "the unpublished cycle must carry an explicit unavailable note");
+  assert.match(note!.detail, /completed but its durable record was never published/);
+
+  // Prior findings remain readable with their official provenance.
+  const filtered = readSubtaskEvidence(bundle, { filter: "review" });
+  assert.equal(filtered.entries?.length, 1, "cycle 1's reviewer verdict must stay inspectable");
+  assert.equal(filtered.entries?.[0]?.provenance, "reviewer_verdict");
+  const found = readSubtaskEvidence(bundle, { find: "FINDING-BETA-MARKER" });
+  assert.ok((found.matchSummary?.totalMatches ?? 0) >= 1, "cycle 1's findings must stay searchable");
+
+  // …but are not falsely current: the later unpublished cycle supersedes them.
+  const status = statusEntriesBySource(bundle);
+  assert.match(status.get("review:wave-1:cycle-000001")!, /superseded by review cycle 2/);
+  assert.ok(
+    !status.get("review:wave-1:cycle-000001")!.includes("is the most recently completed review for this task"),
+    "a stale verdict must not be asserted as current",
+  );
+
+  // Review completeness uncertainty is model-visible in the authoritative context.
+  assert.equal(bundle.context?.review?.aggregate, "needs_changes", "the readable cycle is still summarized…");
+  assert.equal(bundle.context?.review?.cycles, 2, "the completed-but-unpublished cycle counts toward completeness");
+  assert.match(bundle.context?.review?.caveat ?? "", /cycle 2 .*completed without a persisted record/s);
+  assert.match(bundle.context?.review?.caveat ?? "", /may no longer be the current review state/);
+
+  // The official gate verdict of the unpublished cycle stays visible in its lifecycle entry.
+  const markerEntry = (readSubtaskEvidence(bundle, { filter: "lifecycle" }).entries ?? [])
+    .find((entry) => entry.source.recordKey === "unpublished");
+  assert.ok(markerEntry, "the marker's lifecycle entry must be present");
+  assert.match(String(markerEntry!.preview), /needs_changes/);
+});
+
+test("regression #50: an unpublished later cycle never hides the settled pass", async () => {
+  // Settled: cycle 1 (needs_changes) persisted, cycle 2's record was never
+  // published (marker only), and the final report carries the official pass.
+  // The pass must be indexed and searchable; earlier cycles are historical.
+  const { waveRoot, artifactDir } = await makeTaskArtifacts("review-unpublished-settled");
+  await writeCycleRecord(artifactDir, reviewCycleFixture()); // cycle 1, seq 1, needs_changes
+  await writeUnpublishedMarker(artifactDir, unpublishedMarkerFixture()); // cycle 2: marker only
+  const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir, result: settledResult(waveRoot, 2) as never });
+
+  assert.ok(
+    bundle.snapshot.sources.some((source) => source.sourceId === "report:result.json"),
+    "the newer settled report must be indexed despite the unpublished cycle",
+  );
+  const found = readSubtaskEvidence(bundle, { find: "SETTLED-PASS-MARKER" });
+  assert.ok((found.matchSummary?.totalMatches ?? 0) >= 1, "the later official pass must be searchable");
+  const status = statusEntriesBySource(bundle);
+  assert.match(status.get("review:wave-1:cycle-000001")!, /superseded by the final review report/);
+  assert.equal(bundle.context?.review?.aggregate, "pass", "context must reflect the later official pass");
+});
+
+test("regression #50: malformed or foreign publication-failure markers are explicit, never silent", async () => {
+  // (a) An invalid marker file still blocks a false current verdict.
+  const invalid = await makeTaskArtifacts("review-unpublished-invalid");
+  await writeCycleRecord(invalid.artifactDir, reviewCycleFixture()); // cycle 1, seq 1
+  await mkdir(join(invalid.artifactDir, "reviews", "wave-1"), { recursive: true });
+  await writeFile(join(invalid.artifactDir, "reviews", "wave-1", "cycle-000002.json.unpublished"), "{not json\n", "utf8");
+  const bundleInvalid = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: invalid.waveRoot, artifactDir: invalid.artifactDir });
+  const noteInvalid = bundleInvalid.snapshot.unavailable.find((item) => (item.source ?? "").includes("cycle-000002.json.unpublished") && item.reason === "unreadable");
+  assert.ok(noteInvalid, "an invalid marker must produce an explicit unavailable note");
+  assert.match(noteInvalid!.detail, /not valid JSON/);
+  const statusInvalid = statusEntriesBySource(bundleInvalid);
+  assert.match(statusInvalid.get("review:wave-1:cycle-000001")!, /cannot be confirmed to be the current review state/);
+  assert.ok(
+    !statusInvalid.get("review:wave-1:cycle-000001")!.includes("is the most recently completed review for this task"),
+    "an unusable marker sibling must prevent a false current verdict",
+  );
+
+  // (b) A marker owned by a different task is refused with an ownership note.
+  const foreign = await makeTaskArtifacts("review-unpublished-foreign");
+  await writeCycleRecord(foreign.artifactDir, reviewCycleFixture()); // cycle 1, seq 1
+  await writeUnpublishedMarker(foreign.artifactDir, unpublishedMarkerFixture({ taskId: "task-other" }));
+  const bundleForeign = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: foreign.waveRoot, artifactDir: foreign.artifactDir });
+  const noteForeign = bundleForeign.snapshot.unavailable.find((item) => (item.source ?? "").includes("cycle-000002.json.unpublished") && item.reason === "unreadable");
+  assert.ok(noteForeign, "a foreign marker must produce an explicit unavailable note");
+  assert.match(noteForeign!.detail, /belongs to task "task-other"/);
+});
+
+test("active correction: a newly completed review cycle is discoverable through an existing cursor", async () => {
+  const { waveRoot, artifactDir } = await makeTaskArtifacts("review-cursor");
+  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(...piSessionEntries()), "utf8");
+  const bundle1 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
+  const first = readSubtaskEvidence(bundle1, { index: 0, limit: 50 });
+  assert.ok(first.cursor, "unfiltered ranged reads must issue a cursor");
+  assert.equal((first.entries ?? []).some((entry) => entry.kind === "review"), false);
+
+  // The review cycle completes while the worker is correcting.
+  await writeCycleRecord(artifactDir, reviewCycleFixture());
+  const bundle2 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
+  const continued = readSubtaskEvidence(bundle2, { cursor: first.cursor! });
+  assert.equal(continued.mode, "cursor");
+  const newIds = (continued.entries ?? []).map((entry) => entry.entryId);
+  assert.ok(newIds.some((id) => id.startsWith("review:wave-1:cycle-000001/reviewer:")), "the new cycle's findings must be returned by continuation");
+  const firstIds = (first.entries ?? []).map((entry) => entry.entryId);
+  assert.deepEqual(newIds.filter((id) => firstIds.includes(id)), [], "no duplicates across cursor continuation");
+
+  // Continuing again yields nothing new.
+  const idle = readSubtaskEvidence(bundle2, { cursor: continued.cursor! });
+  assert.equal(idle.entries?.length ?? 0, 0);
+});
+
+test("regression #50: registered SubtasksInspect exposes completed needs_changes findings while the worker actively corrects", async () => {
+  const previousRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  let releasePath: string | undefined;
+  let lifecyclePromise: Promise<WaveWorkerLifecycleResult> | undefined;
+  let capture: WaveCaptureResult | undefined;
+  let worker: WorkerWorktree | undefined;
+  let worktreeRemoved = false;
+  const settleLifecycle = async (): Promise<void> => {
+    if (releasePath) await writeFile(releasePath, "released\n", "utf8").catch(() => {});
+    if (lifecyclePromise) await lifecyclePromise.catch(() => {});
+    if (worker && capture && !worktreeRemoved) {
+      worktreeRemoved = true;
+      await removeWorktree(worker.worktreeRoot, capture.repositoryPath).catch(() => {});
+    }
+  };
+  try {
+    const base = join(root, "active-review-e2e");
+    const sourceRoot = join(base, "source");
+    await mkdir(sourceRoot, { recursive: true });
+
+    // Real repository + capture + isolated worker worktree.
+    const { execFileSync } = await import("node:child_process");
+    const GIT_ENV = {
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@test.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@test.com",
+    };
+    execFileSync("git", ["init", "--quiet"], { cwd: sourceRoot, env: { ...process.env, ...GIT_ENV } });
+    await writeFile(join(sourceRoot, "readme.md"), "# hello\n", "utf8");
+    await writeFile(join(sourceRoot, "app.js"), "console.log('hi');\n", "utf8");
+    execFileSync("git", ["add", "."], { cwd: sourceRoot, env: { ...process.env, ...GIT_ENV } });
+    execFileSync("git", ["commit", "--quiet", "-m", "init"], { cwd: sourceRoot, env: { ...process.env, ...GIT_ENV } });
+
+    // Executor: turn 1 implements; correction turns wait for the release file.
+    const executorScript = join(base, "active-executor.cjs");
+    releasePath = join(base, "release.txt");
+    process.env.PI_TEST_RELEASE_PATH = releasePath;
+    await writeFile(executorScript, [
+      "const fs = require('node:fs');",
+      "const turn = Number(process.env.PI_REVIEW_EXECUTOR_TURN || '1');",
+      "process.stdin.resume();",
+      "process.stdin.on('end', async () => {",
+      "  if (turn === 1) {",
+      "    fs.writeFileSync('impl.txt', 'implementation\\n');",
+      "  } else {",
+      "    const start = Date.now();",
+      "    while (!fs.existsSync(process.env.PI_TEST_RELEASE_PATH)) {",
+      "      if (Date.now() - start > 50000) { console.error('release wait timeout'); process.exit(1); }",
+      "      await new Promise((resolveWait) => setTimeout(resolveWait, 25));",
+      "    }",
+      "    fs.writeFileSync('corrected.txt', 'corrected\\n');",
+      "  }",
+      "  console.log(JSON.stringify({ type: 'session', sessionId: process.env.PI_REVIEW_EXECUTOR_SESSION_ID || 'active-review-session' }));",
+      "  console.log(JSON.stringify({ type: 'assistant', text: 'Turn ' + turn + ' complete.' }));",
+      "});",
+    ].join("\n"), "utf8");
+
+    const captureResult = await captureWaveBase({
+      cwd: sourceRoot,
+      maxSnapshotBytes: 1_000_000,
+      waveId: "active-review-wave",
+      artifactDir: base,
+    });
+    capture = captureResult;
+    const workerWorktree = await createWorkerWorktree(captureResult, "task-active-review");
+    worker = workerWorktree;
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-active-review");
+    await mkdir(artifactDir, { recursive: true });
+
+    // A reviewer that always blocks with a unique finding marker.
+    const config = normalizeConfig({
+      enabled: true,
+      execution: { activeExecutor: { source: "external", id: "active-exec" } },
+      externalAgents: [{
+        id: "active-exec",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1",
+          args: [executorScript],
+          timeoutMs: 60_000,
+        },
+      }],
+    });
+    config.decider = {
+      id: "blocking",
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'impl.txt',line:null,issue:'ACTIVE-CORRECTION-FINDING-MARKER must be addressed',recommendation:'add the missing behavior'}]})))",
+      ],
+      timeoutMs: 30_000,
+    };
+    config.maxCorrectionCycles = 1;
+
+    let resolveCorrecting: () => void = () => {};
+    const correctionStarted = new Promise<void>((resolvePromise) => { resolveCorrecting = () => resolvePromise(); });
+
+    const lifecycleCall = runWaveWorkerLifecycle({
+      sourceRoot,
+      taskId: "task-active-review",
+      task: { title: "active review regression", instructions: "implement the feature", acceptanceCriteria: ["feature implemented"] },
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      onUpdate: (update) => {
+        if (update.phase === "correcting") resolveCorrecting();
+      },
+    });
+    lifecyclePromise = lifecycleCall;
+
+    // Wait until the worker is actively correcting (cycle 1 completed).
+    await correctionStarted;
+    let resultExists = true;
+    try { await access(join(artifactDir, "result.json")); } catch { resultExists = false; }
+    assert.equal(resultExists, false, "no final result may exist while correcting");
+
+    // A controller restored from durable state (restart simulation) must see
+    // the completed review through the registered tool surface.
+    const groupRoot = join(base, "pi-review-execution-active");
+    await mkdir(groupRoot, { recursive: true });
+    const resolvedGroupRoot = await realpath(groupRoot);
+    const now = new Date().toISOString();
+    const task = newTask({ title: "active review regression", instructions: "implement the feature", acceptanceCriteria: ["feature implemented"] });
+    task.taskId = "task-active-review";
+    task.state = "running";
+    task.waveRoot = capture.waveRoot;
+    task.executorSelection = { source: "external", id: "active-exec" };
+    const group: BackgroundExecutionGroup = {
+      version: 3, revision: 1, integritySha256: "", executionId: "exec-active", kind: "execute",
+      root: resolvedGroupRoot, cwd: sourceRoot, createdAt: now, updatedAt: now, peakConcurrency: 1, tasks: [task],
+    };
+    await writeGroupSnapshot(resolvedGroupRoot, serializeGroupSnapshot(group, new Map()));
+
+    const tools: Array<Record<string, any>> = [];
+    const pi: Record<string, any> = {
+      registerTool(tool: Record<string, any>) { tools.push(tool); },
+      registerCommand() {},
+      setToolActive() {},
+    };
+    const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
+    manager.sync();
+    const controller = (manager as unknown as { controller: BackgroundExecutionController }).controller;
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [resolvedGroupRoot] });
+    try {
+      const inspectTool = tools.find((tool) => tool.name === "SubtasksInspect")!;
+      assert.ok(inspectTool, "SubtasksInspect must be registered");
+      const execute = inspectTool.execute as ToolExecute;
+
+      // The completed needs_changes review is visible while the worker corrects.
+      const filtered = await execute("active-filter", { executionId: "exec-active", taskId: "task-active-review", evidence: { filter: "review" } });
+      assert.equal(filtered.isError, false);
+      const reviewEntries = (filtered.details.evidence.entries ?? []).filter((entry: { kind: string }) => entry.kind === "review");
+      assert.equal(reviewEntries.length, 1, "the completed cycle's reviewer verdict must be inspectable");
+      assert.match(String(reviewEntries[0]!.preview), /needs_changes/);
+
+      const found = await execute("active-find", { executionId: "exec-active", taskId: "task-active-review", evidence: { find: "ACTIVE-CORRECTION-FINDING-MARKER" } });
+      assert.equal(found.isError, false);
+      assert.ok((found.details.evidence.matchSummary?.totalMatches ?? 0) >= 1, "the unique finding marker must be findable");
+
+      const deep = await execute("active-deep", { executionId: "exec-active", taskId: "task-active-review", evidence: { entryId: reviewEntries[0]!.entryId } });
+      assert.equal(deep.isError, false);
+      assert.match(String(deep.details.evidence.deepContent?.content), /"severity":"blocking"/);
+      assert.match(String(deep.details.evidence.deepContent?.content), /add the missing behavior/);
+
+      // The authoritative context reports the current review state. A restored
+      // controller with no live runtime honestly reports the active task as
+      // paused_recoverable (writer ownership unverified); either way it is an
+      // active/recoverable state, never a terminal one.
+      assert.equal(filtered.details.evidence.context?.review?.aggregate, "needs_changes");
+      assert.ok(["running", "paused_recoverable"].includes(filtered.details.evidence.context?.state), `context state must be active/recoverable, got ${filtered.details.evidence.context?.state}`);
+    } finally {
+      await manager.shutdown();
+    }
+
+    // Release the correction turn and let the lifecycle settle.
+    await writeFile(releasePath, "released\n", "utf8");
+    const result = await lifecycleCall;
+    assert.equal(result.status, "correction_cap", `expected correction_cap, got ${result.status}`);
+    assert.ok(await (async () => { try { await access(join(artifactDir, "result.json")); return true; } catch { return false; } })(), "final result settles after correction");
+
+    // Both completed cycles remain durably inspectable after settlement.
+    for (const cycle of [1, 2]) {
+      const recordPath = join(artifactDir, "reviews", capture.waveId, `cycle-${String(cycle).padStart(6, "0")}.json`);
+      await access(recordPath);
+    }
+  } finally {
+    await settleLifecycle();
+    delete process.env.PI_TEST_RELEASE_PATH;
+    if (previousRole === undefined) delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+    else process.env.PI_REVIEW_GATE_RUNTIME_ROLE = previousRole;
+  }
+});

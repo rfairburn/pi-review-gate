@@ -3,20 +3,21 @@
  *
  * Sources are derived exclusively from the task's durable artifact directory
  * (never from caller-supplied paths): Pi session files under
- * `executor-sessions/`, per-turn directories under `executor/NNNN/`, and the
- * durable review report. Pi turns are indexed from their session file as the
+ * `executor-sessions/`, per-turn directories under `executor/NNNN/`, durable
+ * completed review cycle records and publication-failure markers (see
+ * `./review-cycles.ts`), and the durable review report. Pi turns are indexed
+ * from their session file as the
  * single source of truth; a pi turn whose session file is missing falls back
  * to its RPC stdout stream explicitly (never both, so no evidence is
  * double-counted). Unknown adapter shapes are reported unavailable — never
  * dumped raw.
  */
-import { createHash } from "node:crypto";
 import { opendir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExecutorSelection } from "../../config";
 import type { OperationRecord } from "../operation-record";
-import type { WaveResult } from "../wave-controller";
-import { EvidenceRefusalError, capRawContent, evidenceErrorMessage, readBoundedJson, resolveReadableArtifact, resolveReadableDirectory, streamJsonlBounded } from "./artifacts";
+import { EvidenceRefusalError, capped, evidenceErrorMessage, finalizeSource, omittedNote, readBoundedJson, resolveReadableArtifact, resolveReadableDirectory, sha256HexOf, streamJsonlBounded } from "./artifacts";
+import { REVIEW_CYCLE_MARKER_NAME, REVIEW_CYCLE_RECORD_NAME, indexReviewCycleSource, indexReviewCycleUnpublishedSource } from "./review-cycles";
 import { readBoundedTextFile } from "../../bounded-file";
 import { utf8Prefix } from "../../jsonl";
 import { redactSensitiveText } from "../../redaction";
@@ -55,14 +56,6 @@ export function selectionLabel(selection: ExecutorSelection | undefined): string
   return selection.source === "pi" ? `pi/${selection.model}` : selection.id;
 }
 
-/** Caps source content and records whether the source exceeded the raw cap. */
-function capped(content: string): { content: string; truncatedSource?: boolean } {
-  const text = capRawContent(content);
-  return Buffer.byteLength(text) < Buffer.byteLength(content)
-    ? { content: text, truncatedSource: true }
-    : { content: text };
-}
-
 function firstAtOf(records: RawEvidenceRecord[]): string | undefined {
   for (const record of records) if (record.at) return record.at;
   return undefined;
@@ -79,17 +72,6 @@ export function sourceUnavailable(sourceId: string, streamed: { tornTail: boolea
   if (streamed.oversizedRecords > 0) out.push({ source: sourceId, reason: "oversized_records", detail: `${streamed.oversizedRecords} record(s) exceeded the per-record size limit and were dropped.` });
   if (streamed.scanBudgetReached) out.push({ source: sourceId, reason: "scan_budget", detail: "Only the bounded tail byte window was scanned; earlier bytes and the initial boundary record are unavailable in this snapshot." });
   return out;
-}
-
-/** Enforces unique recordKeys within a source (stable identity is a contract). */
-function finalizeSource(source: IndexedSource): IndexedSource {
-  const seen = new Set<string>();
-  source.records = source.records.filter((record) => {
-    if (seen.has(record.recordKey)) return false;
-    seen.add(record.recordKey);
-    return true;
-  });
-  return source;
 }
 
 async function indexSessionSource(artifactRoot: string, fileName: string, mtimeMs: number, budget: RawRetentionBudget): Promise<IndexedSource | undefined> {
@@ -114,16 +96,6 @@ async function indexSessionSource(artifactRoot: string, fileName: string, mtimeM
     unavailable: [...sourceUnavailable(sourceId, streamed), ...omittedNote(sourceId, streamed.recordsOmitted)],
     stats: { recordsScanned: streamed.lines.length, oversizedRecords: streamed.oversizedRecords, skippedRecords: parsed.skippedRecords, ...(streamed.recordsOmitted > 0 ? { recordsOmitted: streamed.recordsOmitted } : {}), ...(streamed.budgetOmitted > 0 ? { budgetOmitted: streamed.budgetOmitted } : {}) },
   });
-}
-
-/** Explicit disclosure that earlier records of a source were not retained. */
-function omittedNote(sourceId: string, omitted: number): SubtaskEvidenceUnavailable[] {
-  if (omitted <= 0) return [];
-  return [{
-    source: sourceId,
-    reason: "records_omitted",
-    detail: `${omitted} earlier record(s) of this source are outside the retained window or shared retention budget; they are not indexed in this snapshot.`,
-  }];
 }
 
 async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: number, sessionFileNames: ReadonlySet<string>, budget: RawRetentionBudget): Promise<IndexedSource> {
@@ -308,59 +280,6 @@ export async function readConfinedOperationRecord(
   return { record: parsed as OperationRecord };
 }
 
-function sha256HexOf(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
-}
-
-/** Reviewer verdicts/findings from the durable review report (reviewer_verdict provenance). */
-export function buildReviewSource(result: WaveResult | undefined, updatedAt: string | undefined, budget: RawRetentionBudget): IndexedSource | undefined {
-  const report = result?.taskResults?.[0]?.reviewReport;
-  if (!report) return undefined;
-  const sourceId = "report:result.json";
-  const records: RawEvidenceRecord[] = [];
-  const digests = new Map<string, string>();
-  const unavailable: SubtaskEvidenceUnavailable[] = [];
-  let omitted = 0;
-  const retain = (recordKey: string, kind: "review" | "lifecycle", content: string): void => {
-    const bounded = capped(content);
-    const bytes = Buffer.byteLength(bounded.content, "utf8");
-    if (budget.exhausted || budget.remainingBytes < bytes) {
-      budget.exhausted = true;
-      omitted += 1;
-      return;
-    }
-    budget.remainingBytes -= bytes;
-    records.push({ recordKey, kind, provenance: "reviewer_verdict", ...bounded });
-    digests.set(recordKey, sha256HexOf(content));
-  };
-  const latestCycle = report.history.at(-1);
-  for (const reviewer of (latestCycle?.reviewers ?? report.reviewers)) {
-    const recordKey = `cycle:${latestCycle?.reviewSequence ?? report.latestReviewSequence}:${reviewer.reviewerId}`;
-    retain(recordKey, "review", compactJson({
-      verdict: reviewer.verdict,
-      summary: reviewer.summary,
-      ...(reviewer.guidance ? { guidance: reviewer.guidance } : {}),
-      findings: reviewer.findings,
-    }));
-  }
-  if (report.history.length > 1) {
-    retain("cycles", "lifecycle", `review history: ${report.history.map((cycle) => `cycle ${cycle.reviewSequence} ${cycle.aggregate}`).join("; ")}`);
-  }
-  if (records.length === 0) return undefined;
-  for (const item of omittedNote(sourceId, omitted)) unavailable.push(item);
-  return finalizeSource({
-    sourceId,
-    adapter: "record",
-    stream: "result",
-    file: "result.json",
-    orderKey: updatedAt ?? "9999-12-31T23:59:59.999Z",
-    records,
-    digests,
-    unavailable,
-    stats: { recordsScanned: records.length, oversizedRecords: 0, skippedRecords: 0 },
-  });
-}
-
 /**
  * Validate the artifact directory against its wave root (fail closed): the
  * directory must exist, be a directory, and canonicalize inside the wave root.
@@ -413,7 +332,7 @@ async function enumerateNames(dir: string, dirLabel: string, pattern: (name: str
 }
 
 /** Discovers and indexes every authorized source under the artifact root. */
-export async function discoverAndIndexSources(artifactRoot: string, unavailable: SubtaskEvidenceUnavailable[], budget: RawRetentionBudget): Promise<IndexedSource[]> {
+export async function discoverAndIndexSources(taskId: string, artifactRoot: string, unavailable: SubtaskEvidenceUnavailable[], budget: RawRetentionBudget): Promise<IndexedSource[]> {
   const sources: IndexedSource[] = [];
 
   const sessionsDir = await resolveReadableDirectory(artifactRoot, join(artifactRoot, "executor-sessions"));
@@ -453,6 +372,36 @@ export async function discoverAndIndexSources(artifactRoot: string, unavailable:
     } catch (error) {
       if (error instanceof EvidenceRefusalError) unavailable.push({ source: `turn:${name}`, reason: error.reason, detail: evidenceErrorMessage(error) });
       else throw error;
+    }
+  }
+
+  // Durable completed review cycles (#50): reviews/<waveId>/cycle-NNNN.json,
+  // written by the gate itself when each cycle completes. They carry the
+  // official verdict and findings with task/wave/cycle identity, so a
+  // completed review is inspectable while the worker is still correcting.
+  // A cycle whose record publication failed leaves an explicit marker
+  // (cycle-NNNN.json.unpublished) instead of a silent gap.
+  const reviewsDir = await resolveReadableDirectory(artifactRoot, join(artifactRoot, "reviews"));
+  if (reviewsDir) {
+    const waveNames = await enumerateNames(reviewsDir, "reviews/", () => true, unavailable);
+    for (const waveName of waveNames) {
+      const waveDir = await resolveReadableDirectory(artifactRoot, join(artifactRoot, "reviews", waveName));
+      if (!waveDir) continue; // not a directory: no canonical cycle layout here
+      const cycleNames = await enumerateNames(waveDir, `reviews/${waveName}/`, (name) => REVIEW_CYCLE_RECORD_NAME.test(name) || REVIEW_CYCLE_MARKER_NAME.test(name), unavailable);
+      for (const cycleName of cycleNames) {
+        if (sources.length >= EVIDENCE_MAX_SOURCES) {
+          unavailable.push({ source: `review:${waveName}:${cycleName}`, reason: "source_budget", detail: `Source limit ${EVIDENCE_MAX_SOURCES} reached; remaining sources are not indexed.` });
+          continue;
+        }
+        try {
+          sources.push(REVIEW_CYCLE_MARKER_NAME.test(cycleName)
+            ? await indexReviewCycleUnpublishedSource(artifactRoot, waveName, cycleName, taskId, budget)
+            : await indexReviewCycleSource(artifactRoot, waveName, cycleName, taskId, budget));
+        } catch (error) {
+          if (error instanceof EvidenceRefusalError) unavailable.push({ source: `review:${waveName}:${cycleName}`, reason: error.reason, detail: evidenceErrorMessage(error) });
+          else throw error;
+        }
+      }
     }
   }
 

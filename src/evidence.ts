@@ -6,6 +6,7 @@ import {
   type FileSnapshot,
   type SnapshotOptions,
 } from "./capture";
+import { extractEnvelopeCandidatePaths } from "./apply-patch/envelope";
 import { normalizeApplyPatchPathMarker } from "./apply-patch/tool";
 import { redactBrowserToolInput, redactSensitiveText, redactSensitiveValue } from "./redaction";
 
@@ -262,22 +263,28 @@ export function extractCandidatePaths(
   }
 
   if (normalizedName === APPLY_PATCH_TOOL) {
-    // ApplyPatch carries its mutation targets in the nested structured
-    // operation argument: operation.path (all types) and operation.moveTo
-    // (update_file renames). Both are pre-captured as mutation candidates.
-    const operation = input.operation;
-    if (isRecord(operation)) {
+    // The canonical envelope carries every mutation target in its operation
+    // headers; the legacy structured argument uses operation.path and
+    // operation.moveTo. Both are pre-captured as mutation candidates.
+    const addCandidate = (value: string, source: string): void => {
+      // Normalize the leading '@' convention marker exactly like the tool
+      // does, so candidates point at the files ApplyPatch actually mutates.
+      const normalized = normalizeApplyPatchPathMarker(value);
+      if (normalized) {
+        paths.push({ path: normalized, source });
+        riskSignals.push("apply_patch_mutation");
+      }
+    };
+    if (typeof input.patch === "string") {
+      // Best-effort header scan so review evidence stays accurate even when
+      // the request later fails validation.
+      for (const candidate of extractEnvelopeCandidatePaths(input.patch)) {
+        addCandidate(candidate.path, `${toolName}:patch`);
+      }
+    } else if (isRecord(input.operation)) {
       for (const key of ["path", "moveTo"]) {
-        const value = operation[key];
-        if (typeof value === "string" && value.trim()) {
-          // Normalize the leading '@' convention marker exactly like the tool
-          // does, so candidates point at the files ApplyPatch actually mutates.
-          const normalized = normalizeApplyPatchPathMarker(value);
-          if (normalized) {
-            paths.push({ path: normalized, source: `${toolName}:operation.${key}` });
-            riskSignals.push("apply_patch_mutation");
-          }
-        }
+        const value = input.operation[key];
+        if (typeof value === "string" && value.trim()) addCandidate(value, `${toolName}:operation.${key}`);
       }
     }
   }

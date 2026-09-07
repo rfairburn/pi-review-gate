@@ -1,13 +1,29 @@
-import { randomUUID } from "node:crypto";
-import { chmod, link, lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { ChangedFile } from "../capture";
-import { buildUnifiedPatch } from "../diff";
-import { applyDiff } from "./engine";
+/// ApplyPatch tool registration and argument parsing.
+///
+/// The advertised contract is the canonical OpenAI/Codex apply_patch envelope
+/// carried in a single `patch` string (Pi's JSON tool transport carries one
+/// argument value, so the whole multi-file envelope travels as that string —
+/// the minimal transport difference from Codex's stdin/heredoc delivery). The
+/// legacy single-file structured `operation` object remains accepted for
+/// compatibility but is deliberately not part of the model-facing guidance.
+/// Execution is delegated to the sequential request engine (request.ts),
+/// which applies file operations in envelope order, stops at the first
+/// failure, retains earlier successes, and reports applied / failed /
+/// not-attempted operations plus any uncertain effects of the failed one.
+
+import { isAbsolute } from "node:path";
+import { parseApplyPatchEnvelope, type ApplyPatchFileOp } from "./envelope";
+import { normalizeApplyPatchPath, normalizeApplyPatchPathMarker } from "./paths";
+import { performApplyPatchRequest, type AppliedOperation, type ApplyPatchFailure, type ApplyPatchOperationType } from "./request";
 
 export const APPLY_PATCH_TOOL_NAME = "ApplyPatch";
 
-export type ApplyPatchOperationType = "create_file" | "update_file" | "delete_file";
+export type { AppliedOperation, ApplyPatchFailure, ApplyPatchOperationType };
+export { normalizeApplyPatchPathMarker };
+
+// ---------------------------------------------------------------------------
+// Legacy structured operation (compatibility)
+// ---------------------------------------------------------------------------
 
 export interface ApplyPatchCreateOperation {
   type: "create_file";
@@ -29,24 +45,7 @@ export interface ApplyPatchDeleteOperation {
 
 export type ParsedApplyPatchOperation = ApplyPatchCreateOperation | ApplyPatchUpdateOperation | ApplyPatchDeleteOperation;
 
-export interface ApplyPatchOutcome {
-  operation: ApplyPatchOperationType;
-  path: string;
-  moveTo?: string;
-  absolutePath: string;
-  changed: boolean;
-  addedLines: number;
-  removedLines: number;
-  bytes: number;
-  requestedDiff: string;
-  finalDiff?: string;
-  mutated: boolean;
-}
-
 const OPERATION_TYPES: readonly ApplyPatchOperationType[] = ["create_file", "update_file", "delete_file"];
-const MAX_REQUESTED_DIFF_CHARS = 4_000;
-const MAX_FINAL_DIFF_BYTES = 8_000;
-const MAX_DELETE_SOURCE_BYTES = 262_144;
 
 /**
  * File-level V4A header lines. The engine treats them as section terminators,
@@ -66,10 +65,11 @@ function rejectDiffHeaders(diff: string): void {
 }
 
 /**
- * Validates the strict structured `operation` argument and rejects unknown or
- * operation-inconsistent fields with informative errors. Paths are normalized
- * (a single leading `@` convention marker is stripped) but not yet confined to
- * the workspace; confinement happens immediately before mutation.
+ * Validates the strict legacy structured `operation` argument. Kept for
+ * compatibility with earlier sessions; the canonical `patch` envelope is the
+ * preferred contract. Paths are normalized (a single leading `@` convention
+ * marker is stripped) but not yet confined to the workspace; confinement
+ * happens during request preflight.
  */
 export function parseApplyPatchOperation(params: unknown): ParsedApplyPatchOperation {
   if (!isRecord(params)) throw new Error("request must be an object with an operation argument");
@@ -93,7 +93,7 @@ export function parseApplyPatchOperation(params: unknown): ParsedApplyPatchOpera
     if (!allowedKeys.has(key)) throw new Error(`operation.${key} is not valid for operation type ${operationType}`);
   }
 
-  const path = normalizePath(operation.path, "operation.path");
+  const path = normalizeApplyPatchPath(operation.path, "operation.path");
   if (operationType === "delete_file") {
     return { type: operationType, path };
   }
@@ -109,10 +109,56 @@ export function parseApplyPatchOperation(params: unknown): ParsedApplyPatchOpera
 
   const moveToRaw = operation.moveTo;
   if (moveToRaw === undefined) return { type: operationType, path, diff };
-  const moveTo = normalizePath(moveToRaw, "operation.moveTo");
+  const moveTo = normalizeApplyPatchPath(moveToRaw, "operation.moveTo");
   if (moveTo === path) throw new Error("operation.moveTo must differ from operation.path");
   return { type: operationType, path, diff, moveTo };
 }
+
+// ---------------------------------------------------------------------------
+// Request parsing (canonical envelope preferred, legacy operation accepted)
+// ---------------------------------------------------------------------------
+
+export interface ParsedApplyPatchRequest {
+  operations: ApplyPatchFileOp[];
+  /** Raw canonical envelope text (legacy structured requests carry none). */
+  patch?: string;
+}
+
+/**
+ * Validates the tool arguments and returns the ordered file operations of the
+ * request. Exactly one of `patch` (canonical multi-file envelope) or
+ * `operation` (legacy single-file object) may be present.
+ */
+export function parseApplyPatchRequest(params: unknown): ParsedApplyPatchRequest {
+  if (!isRecord(params)) throw new Error("request must be an object with a patch or operation argument");
+  const keys = Object.keys(params);
+  const hasPatch = keys.includes("patch");
+  const hasOperation = keys.includes("operation");
+  if (hasPatch === hasOperation) {
+    throw new Error(
+      `ApplyPatch takes exactly one argument, either the canonical patch envelope or the legacy operation object; got ${keys.length === 0 ? "none" : keys.join(", ")}`,
+    );
+  }
+  if (hasOperation) {
+    const operation = parseApplyPatchOperation(params);
+    return { operations: [legacyOperationToFileOp(operation)] };
+  }
+  const operations = parseApplyPatchEnvelope(params.patch);
+  if (operations.length === 0) {
+    throw new Error("patch contains no file operations; every ApplyPatch request must modify at least one file");
+  }
+  return { operations, patch: typeof params.patch === "string" ? params.patch : undefined };
+}
+
+function legacyOperationToFileOp(operation: ParsedApplyPatchOperation): ApplyPatchFileOp {
+  if (operation.type === "delete_file") return { type: "delete_file", path: operation.path };
+  if (operation.type === "create_file") return { type: "create_file", path: operation.path, diff: operation.diff };
+  return { type: "update_file", path: operation.path, diff: operation.diff, ...(operation.moveTo ? { moveTo: operation.moveTo } : {}) };
+}
+
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
 
 export function applyPatchToolSchema(): Record<string, unknown> {
   const path = {
@@ -129,11 +175,20 @@ export function applyPatchToolSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["operation"],
     properties: {
+      patch: {
+        type: "string",
+        minLength: 1,
+        description:
+          "Canonical OpenAI/Codex apply_patch envelope: '*** Begin Patch', then one or more file operations — " +
+          "'*** Add File: <path>' (each following line starts with '+'), " +
+          "'*** Update File: <path>' with an optional '*** Move to: <path>' rename followed by '@@ [anchor]' hunks of ' ' context, '-' removal, and '+' addition lines (optionally ending a chunk with '*** End of File'), or " +
+          "'*** Delete File: <path>' — then '*** End Patch'. " +
+          "A single request may mix operations across multiple files. Operations are applied sequentially in order and the request stops at the first failure: earlier operations remain applied, later ones are not attempted, and the error reports which operations applied, failed, and were skipped.",
+      },
       operation: {
         description:
-          "Exactly one structured OpenAI apply-patch file operation. One file operation per call; each operation type has its own required and forbidden fields.",
+          "Legacy single-file structured operation, kept for compatibility with earlier sessions. Prefer the canonical patch envelope.",
         oneOf: [
           {
             type: "object",
@@ -173,6 +228,10 @@ export function applyPatchToolSchema(): Record<string, unknown> {
         ],
       },
     },
+    oneOf: [
+      { type: "object", required: ["patch"] },
+      { type: "object", required: ["operation"] },
+    ],
   };
 }
 
@@ -180,171 +239,9 @@ export interface ApplyPatchToolOptions {
   cwd?: () => string;
 }
 
-export async function performApplyPatchOperation(
-  cwd: string,
-  operation: ParsedApplyPatchOperation,
-  signal?: AbortSignal,
-): Promise<ApplyPatchOutcome> {
-  ensureNotAborted(signal);
-  const rootLexical = resolve(cwd);
-  const rootReal = await realpath(rootLexical);
-
-  const requestedDiff = clipText(operation.type === "delete_file" ? "" : operation.diff, MAX_REQUESTED_DIFF_CHARS);
-  const base = {
-    operation: operation.type,
-    path: operation.path,
-    ...(operation.type === "update_file" && operation.moveTo ? { moveTo: operation.moveTo } : {}),
-    requestedDiff,
-    mutated: false,
-  };
-
-  if (operation.type === "create_file") {
-    const target = await confinePath(rootLexical, rootReal, operation.path, "operation.path");
-    await requireAbsent(target.absolute, operation.path);
-    ensureNotAborted(signal);
-    const content = createContent(operation.diff, operation.path);
-    // Commit through the same atomic no-overwrite link as move destinations:
-    // a target created between the absence check and the commit is rejected
-    // with EEXIST instead of being overwritten.
-    await atomicCreate(target.absolute, content, operation.path, signal);
-    const diff = renderFinalDiff({ path: operation.path, status: "added", newContent: content });
-    return {
-      ...base,
-      absolutePath: target.absolute,
-      changed: true,
-      ...countDiffLines(diff),
-      bytes: Buffer.byteLength(content, "utf8"),
-      finalDiff: diff,
-      mutated: true,
-    };
-  }
-
-  if (operation.type === "delete_file") {
-    const target = await confinePath(rootLexical, rootReal, operation.path, "operation.path");
-    const stats = await requireRegularFile(target.absolute, operation.path);
-    // Validate the complete source before mutating: ApplyPatch only handles
-    // UTF-8 text files, and a cancellation arriving during this read must not
-    // lead to an unlink.
-    const original = await decodeText(target.absolute, operation.path);
-    const { text: body } = splitEncoding(original);
-    if (body.includes("\0")) {
-      throw new Error(`delete_file ${operation.path}: refusing to delete binary content (NUL byte)`);
-    }
-    // Render a bounded deletion diff for reasonably sized sources.
-    let finalDiff: string | undefined;
-    if (stats.size <= MAX_DELETE_SOURCE_BYTES) {
-      finalDiff = renderFinalDiff({ path: operation.path, status: "deleted", oldContent: body });
-    }
-    ensureNotAborted(signal);
-    await unlink(target.absolute);
-    return {
-      ...base,
-      absolutePath: target.absolute,
-      changed: true,
-      addedLines: 0,
-      removedLines: finalDiff !== undefined ? countDiffLines(finalDiff).removedLines : 0,
-      bytes: stats.size,
-      ...(finalDiff !== undefined ? { finalDiff } : {}),
-      mutated: true,
-    };
-  }
-
-  // update_file: patch the content, then either write it in place or commit
-  // it at the moveTo destination before removing the source.
-  const source = await confinePath(rootLexical, rootReal, operation.path, "operation.path");
-  const stats = await requireRegularFile(source.absolute, operation.path);
-  const original = await decodeText(source.absolute, operation.path);
-  const { text: body, hadBom, hadCrlf } = splitEncoding(original);
-
-  let updated: string;
-  try {
-    updated = applyDiff(body, operation.diff, "default");
-  } catch (error) {
-    throw new Error(`update_file ${operation.path}: ${messageOf(error)}`);
-  }
-  if (updated.includes("\0") || body.includes("\0")) {
-    throw new Error(`update_file ${operation.path}: refusing to write binary content (NUL byte)`);
-  }
-  const content = joinEncoding(updated, hadBom, hadCrlf);
-  const changed = updated !== body;
-
-  if (operation.moveTo === undefined) {
-    if (!changed) {
-      // A patch that changes nothing must not replace the file: rewriting
-      // would change the inode and timestamps and could discard hard-link
-      // identity or extended metadata.
-      ensureNotAborted(signal);
-      return {
-        ...base,
-        absolutePath: source.absolute,
-        changed: false,
-        addedLines: 0,
-        removedLines: 0,
-        bytes: Buffer.byteLength(content, "utf8"),
-        mutated: false,
-      };
-    }
-    const diff = renderFinalDiff({ path: operation.path, status: "modified", oldContent: body, newContent: updated });
-    ensureNotAborted(signal);
-    await atomicWrite(source.absolute, content, stats.mode, signal);
-    return {
-      ...base,
-      absolutePath: source.absolute,
-      changed,
-      ...countDiffLines(diff),
-      bytes: Buffer.byteLength(content, "utf8"),
-      finalDiff: diff,
-      mutated: true,
-    };
-  }
-
-  const moveTo = operation.moveTo;
-  // Validate the move destination before mutating anything so an unsafe move
-  // rejects the whole operation without touching the source file.
-  const destination = await confinePath(rootLexical, rootReal, moveTo, "operation.moveTo");
-  if (destination.absolute === source.absolute || destination.real === source.real) {
-    throw new Error(`operation.moveTo ${moveTo} resolves to the same file as operation.path ${operation.path}`);
-  }
-  await requireAbsent(destination.absolute, moveTo);
-
-  // Stage and commit the patched content at the destination first; the source
-  // is removed only after the destination exists, so any destination-side
-  // failure leaves the original source bytes in place.
-  const temp = await stageContent(dirname(destination.absolute), basename(destination.absolute), content, stats.mode, signal);
-  try {
-    await commitStaged(
-      temp,
-      destination.absolute,
-      `operation.moveTo ${moveTo} already exists; refusing to overwrite an existing destination`,
-    );
-  } catch (error) {
-    // The source was never touched; only the staged temporary file remains.
-    await unlink(temp).catch(() => undefined);
-    throw new Error(`update_file ${operation.path}: moving to ${moveTo} failed and the source was left unchanged: ${messageOf(error)}`);
-  }
-  try {
-    ensureNotAborted(signal);
-    await unlink(source.absolute);
-  } catch (error) {
-    // The destination commit succeeded but the source could not be removed;
-    // roll back by removing the destination so the original file remains.
-    await unlink(destination.absolute).catch(() => undefined);
-    throw new Error(
-      `update_file ${operation.path}: ${moveTo} was created but removing ${operation.path} failed, so the move was rolled back: ${messageOf(error)}`,
-    );
-  }
-
-  const finalDiff = renderFinalDiff({ path: moveTo, renamedFrom: operation.path, status: "modified", oldContent: body, newContent: updated });
-  return {
-    ...base,
-    absolutePath: destination.absolute,
-    changed,
-    ...countDiffLines(finalDiff),
-    bytes: Buffer.byteLength(content, "utf8"),
-    finalDiff,
-    mutated: true,
-  };
-}
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 
 type ApplyPatchThemeColor =
   | "accent"
@@ -362,6 +259,12 @@ export interface ApplyPatchRendererTheme {
 }
 
 export function renderApplyPatchCall(args: unknown, theme: ApplyPatchRendererTheme): unknown {
+  if (isRecord(args) && typeof args.patch === "string") {
+    const suffix = ` · ${summarizeEnvelopeForCall(args.patch)}`;
+    return textComponent((width) => [
+      clip(theme.fg("toolTitle", theme.bold(APPLY_PATCH_TOOL_NAME)) + theme.fg("accent", suffix), width),
+    ]);
+  }
   const operation = isRecord(args) && isRecord(args.operation) ? args.operation : undefined;
   const type = typeof operation?.type === "string" ? operation.type : "operation";
   const path = typeof operation?.path === "string" ? operation.path : "";
@@ -370,6 +273,22 @@ export function renderApplyPatchCall(args: unknown, theme: ApplyPatchRendererThe
   return textComponent((width) => [
     clip(theme.fg("toolTitle", theme.bold(APPLY_PATCH_TOOL_NAME)) + theme.fg("accent", suffix), width),
   ]);
+}
+
+/** Compact header scan for the call renderer: counts and first few paths. */
+function summarizeEnvelopeForCall(patch: string): string {
+  const paths: string[] = [];
+  for (const line of patch.split(/\r?\n/)) {
+    const t = line.trim();
+    if (t.startsWith("*** Add File: ") || t.startsWith("*** Update File: ") || t.startsWith("*** Delete File: ")) {
+      const p = t.slice(t.indexOf(": ") + 2).trim();
+      if (p) paths.push(p);
+    }
+  }
+  if (paths.length === 0) return "patch";
+  const shown = paths.slice(0, 3).join(", ");
+  const more = paths.length > 3 ? `, … +${paths.length - 3} more` : "";
+  return `${paths.length} file operation(s) · ${shown}${more}`;
 }
 
 const MAX_RENDERED_FINAL_DIFF_LINES = 16;
@@ -388,7 +307,7 @@ export function renderApplyPatchResult(value: unknown, _options: unknown, theme:
     if (!isError) {
       // The final diff shows what actually landed (including rename from/to
       // for moves and the full deletion for deletes); the requested diff is
-      // the shorter V4A body the model sent.
+      // the shorter V4A body or envelope the model sent.
       lines.push(...renderDiffBlock(finalDiff, MAX_RENDERED_FINAL_DIFF_LINES, "Final diff:", width, theme));
       lines.push(...renderDiffBlock(requestedDiff, MAX_RENDERED_REQUESTED_DIFF_LINES, "Requested diff:", width, theme));
     }
@@ -415,6 +334,10 @@ function renderDiffBlock(diff: string, maxLines: number, label: string, width: n
   return lines;
 }
 
+// ---------------------------------------------------------------------------
+// Registration and execution
+// ---------------------------------------------------------------------------
+
 export interface ApplyPatchHost {
   registerTool(tool: Record<string, unknown>): unknown;
 }
@@ -430,16 +353,15 @@ export function registerApplyPatchTool(pi: unknown, options: ApplyPatchToolOptio
     name: APPLY_PATCH_TOOL_NAME,
     label: APPLY_PATCH_TOOL_NAME,
     description:
-      "Apply one structured OpenAI apply_patch (V4A) file operation — create_file, update_file (with optional moveTo rename), or delete_file — to a single file inside the current workspace. " +
-      "The headerless V4A diff body anchors changes with '@@' context lines and ' ' context, '-' removal, and '+' addition lines; failed calls never leave partial writes. " +
-      "With moveTo, the patched content is committed at the destination before the source is removed, so a failed move leaves the source unchanged. " +
-      "One file operation per call: call ApplyPatch repeatedly for multiple files; there is no cross-call or multi-file rollback.",
+      "Apply a canonical OpenAI/Codex apply_patch envelope to the current workspace. One request carries '*** Begin Patch' ... '*** End Patch' and may mix " +
+      "'*** Add File:' (plus-prefixed lines), '*** Update File:' (with optional '*** Move to:' rename and '@@ [anchor]' hunks of ' '/'-'/'+' lines, optionally anchored with '*** End of File'), " +
+      "and '*** Delete File:' operations across multiple files; disjoint hunks per file are supported. The complete envelope is parsed before any mutation, then operations are applied sequentially in order and the request stops at the first failure: earlier operations remain applied, later ones are not attempted, and the error reports which operations applied, failed, and were skipped (including any uncertain effects of the failed operation). A legacy single-file structured 'operation' argument remains accepted for compatibility; prefer the patch envelope.",
     promptSnippet:
-      "Use ApplyPatch for precise single-file create/update/delete/rename mutations with V4A diffs; every call is sequential and confined to the current workspace.",
+      "Use ApplyPatch with the canonical apply_patch envelope ('*** Begin Patch' ... '*** End Patch') for precise multi-file create/update/rename/delete mutations; the whole envelope is parsed before mutation, operations are applied sequentially and stop at the first failure (earlier successes stay applied), and every path is confined to the current workspace.",
     promptGuidelines: [
-      "ApplyPatch performs exactly one file operation per call; for several files, call it once per file and treat each result as independent.",
-      "Pass the V4A diff headerless in operation.diff because operation.type and paths are structured fields; create_file diff lines must all start with '+'.",
-      "ApplyPatch failures are atomic and reported as tool errors; fix the diff or path from the diagnostic and retry rather than working around it with shell commands.",
+      "Send one canonical patch envelope per ApplyPatch call: '*** Begin Patch', then '*** Add File: <path>' (+ lines), '*** Update File: <path>' (optional '*** Move to: <path>', '@@ [anchor]' hunks, optional '*** End of File'), or '*** Delete File: <path>', then '*** End Patch'. Mix operations for multiple files in one envelope; disjoint hunks per file are supported.",
+      "ApplyPatch applies operations sequentially in envelope order and stops at the first failure: earlier operations stay applied, later ones are skipped, and the error lists the applied, failed, and not-attempted operations. Fix the diagnostic and resubmit only the remaining operations rather than working around a failed patch with shell commands.",
+      "Paths are workspace-relative (a leading '@' is stripped). The legacy single-file 'operation' argument is still accepted but the patch envelope is the preferred contract.",
     ],
     executionMode: "sequential",
     parameters: applyPatchToolSchema(),
@@ -456,8 +378,9 @@ export function registerApplyPatchTool(pi: unknown, options: ApplyPatchToolOptio
  * Tool entry point. Per Pi's extension contract, failures throw so Pi marks
  * the tool result as an error and the model can recover from the diagnostic.
  * Like Pi's built-in edit/write tools, foreground patches do not wait for
- * background landing leases or conflict gates. Each mutation is validated and
- * performed atomically, so a thrown failure never leaves a partial write.
+ * background landing leases or conflict gates. A partial failure throws with
+ * an explicit applied / failed / not-attempted report so review evidence and
+ * the model both see which earlier operations remain applied.
  */
 async function executeApplyPatch(
   params: unknown,
@@ -465,29 +388,109 @@ async function executeApplyPatch(
   ctx: unknown,
   options: ApplyPatchToolOptions,
 ): Promise<Record<string, unknown>> {
-  const operation = parseApplyPatchOperation(params);
+  const request = parseApplyPatchRequest(params);
   const cwd = resolveToolCwd(options, ctx);
   // The landing gate blocks automatic integration, not foreground recovery.
   // Match built-in edit/write: callers must be able to resolve gated conflicts.
-  const outcome = await performApplyPatchOperation(cwd, operation, signal);
-  return textResult(successSummary(outcome), outcomeDetails(outcome));
+  const result = await performApplyPatchRequest(cwd, request.operations, signal);
+  const { applied, failed, notAttempted } = result;
+  if (failed !== undefined) {
+    throw new Error(failureMessage(applied, failed, notAttempted));
+  }
+  const requestedDiff = clipText(request.patch ?? request.operations[0]!.diff ?? "", MAX_REQUESTED_DIFF_CHARS);
+  // Canonical envelope calls get the upstream Codex print_summary text; legacy
+  // structured calls keep the familiar per-operation summaries.
+  const summary = request.patch !== undefined ? canonicalSuccessSummary(applied) : requestSummary(applied);
+  const details: Record<string, unknown> = {
+    operations: applied.map(outcomeDetails),
+    requestedDiff,
+    ...(result.finalDiff !== undefined ? { finalDiff: result.finalDiff } : {}),
+    mutated: applied.some((outcome) => outcome.mutated),
+  };
+  if (applied.length === 1) {
+    // Single-operation requests keep the familiar flat details shape.
+    Object.assign(details, outcomeDetails(applied[0]!), { requestedDiff });
+  }
+  return textResult(summary, details);
 }
 
-function successSummary(outcome: ApplyPatchOutcome): string {
+/**
+ * Model-facing success text for canonical envelope calls, following the
+ * upstream Codex print_summary format: "Success. Updated the following
+ * files:" followed by git-style A/M/D lines grouped by status (application
+ * order within a group), using the patch's path spelling. A moved file is
+ * reported under its source path, exactly like upstream. Pi's structured
+ * details remain additive.
+ */
+function canonicalSuccessSummary(applied: AppliedOperation[]): string {
+  const markFor = (operation: ApplyPatchOperationType): "A" | "M" | "D" =>
+    operation === "create_file" ? "A" : operation === "delete_file" ? "D" : "M";
+  const lines = ["Success. Updated the following files:"];
+  for (const mark of ["A", "M", "D"] as const) {
+    for (const outcome of applied) {
+      if (markFor(outcome.operation) === mark) lines.push(`${mark} ${outcome.path}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+const MAX_REQUESTED_DIFF_CHARS = 4_000;
+
+/**
+ * Builds the explicit partial-failure diagnostic. The message names every
+ * applied operation, the failed one with its error and uncertain effects, and
+ * every operation that was not attempted, so review capture and the model see
+ * the accumulated delta even though the call itself is an error.
+ */
+function failureMessage(applied: AppliedOperation[], failed: ApplyPatchFailure, notAttempted: string[]): string {
+  const parts = [
+    `ApplyPatch failed at operation ${failed.index + 1} (${displayOf(failed)}) with ${applied.length} earlier operation(s) still applied.`,
+  ];
+  if (applied.length > 0) {
+    parts.push(`Applied: ${applied.map(summaryClause).join("; ")}.`);
+  } else {
+    parts.push("No earlier operations were applied.");
+  }
+  parts.push(`Failed: ${failed.error}`);
+  if (failed.uncertainEffects.length > 0) {
+    parts.push(`Uncertain effects of the failed operation: ${failed.uncertainEffects.join("; ")}.`);
+  }
+  if (notAttempted.length > 0) {
+    parts.push(`Not attempted: ${notAttempted.join(", ")}.`);
+  }
+  return parts.join(" ");
+}
+
+function displayOf(failed: ApplyPatchFailure): string {
+  const label = `${failed.operation} ${failed.path}`;
+  return failed.moveTo !== undefined ? `${label} (moveTo ${failed.moveTo})` : label;
+}
+
+/** Familiar per-operation summaries, kept for legacy structured calls. */
+function requestSummary(outcomes: AppliedOperation[]): string {
+  if (outcomes.length === 1) return successSummary(outcomes[0]!);
+  return `ApplyPatch applied ${outcomes.length} file operation(s): ${outcomes.map(summaryClause).join("; ")}.`;
+}
+
+function successSummary(outcome: AppliedOperation): string {
+  return `ApplyPatch ${summaryClause(outcome)}.`;
+}
+
+function summaryClause(outcome: AppliedOperation): string {
   switch (outcome.operation) {
     case "create_file":
-      return `ApplyPatch created ${outcome.path} (${outcome.bytes} bytes).`;
+      return `created ${outcome.path} (${outcome.bytes} bytes)`;
     case "delete_file":
-      return `ApplyPatch deleted ${outcome.path}.`;
+      return `deleted ${outcome.path}`;
     case "update_file": {
       const moved = outcome.moveTo ? ` and moved it to ${outcome.moveTo}` : "";
-      if (!outcome.changed) return `ApplyPatch updated ${outcome.path}${moved} with no content change.`;
-      return `ApplyPatch updated ${outcome.path}${moved} (+${outcome.addedLines} −${outcome.removedLines} lines).`;
+      if (!outcome.changed) return `updated ${outcome.path}${moved} with no content change`;
+      return `updated ${outcome.path}${moved} (+${outcome.addedLines} −${outcome.removedLines} lines)`;
     }
   }
 }
 
-function outcomeDetails(outcome: ApplyPatchOutcome): Record<string, unknown> {
+function outcomeDetails(outcome: AppliedOperation): Record<string, unknown> {
   return {
     operation: outcome.operation,
     path: outcome.path,
@@ -503,135 +506,6 @@ function outcomeDetails(outcome: ApplyPatchOutcome): Record<string, unknown> {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Path confinement
-// ---------------------------------------------------------------------------
-
-async function confinePath(rootLexical: string, rootReal: string, rawPath: string, field: string): Promise<{ absolute: string; real: string }> {
-  const absolute = isAbsolute(rawPath) ? resolve(rawPath) : resolve(rootLexical, rawPath);
-  assertWithinRoot(rootLexical, absolute, field, rawPath);
-  let real: string;
-  try {
-    real = await nearestRealPath(absolute);
-  } catch (error) {
-    throw new Error(`${field} ${rawPath} could not be resolved within the current workspace: ${messageOf(error)}`);
-  }
-  assertWithinRoot(rootReal, real, field, rawPath);
-  return { absolute, real };
-}
-
-function assertWithinRoot(root: string, candidate: string, field: string, rawPath: string): void {
-  const rel = relative(root, candidate);
-  if (rel === "") {
-    throw new Error(`${field} ${rawPath} must reference a file inside the current workspace, not the workspace root`);
-  }
-  if (rel.startsWith("..") || isAbsolute(rel)) {
-    throw new Error(`${field} ${rawPath} resolves outside the current workspace (${root}); traversal is rejected`);
-  }
-}
-
-/** Realpath of the nearest existing ancestor with the remainder re-joined; detects symlink escapes. */
-async function nearestRealPath(absolute: string): Promise<string> {
-  let prefix = absolute;
-  const suffixes: string[] = [];
-  for (;;) {
-    try {
-      const real = await realpath(prefix);
-      return suffixes.length > 0 ? join(real, ...suffixes) : real;
-    } catch {
-      const parent = dirname(prefix);
-      if (parent === prefix) throw new Error(`could not resolve path: ${absolute}`);
-      suffixes.unshift(basename(prefix));
-      prefix = parent;
-    }
-  }
-}
-
-async function requireAbsent(absolute: string, display: string): Promise<void> {
-  let stats;
-  try {
-    stats = await lstat(absolute);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return;
-    if (code === "ENOTDIR") {
-      throw new Error(`${display} cannot exist because an intermediate path component is not a directory`);
-    }
-    throw new Error(`${display}: ${messageOf(error)}`);
-  }
-  if (stats.isDirectory()) {
-    throw new Error(`${display} already exists and is a directory; create_file requires a non-existing file path`);
-  }
-  throw new Error(`${display} already exists; create_file and moveTo destinations must not exist`);
-}
-
-async function requireRegularFile(absolute: string, display: string): Promise<{ mode: number | undefined; size: number }> {
-  let stats;
-  try {
-    stats = await lstat(absolute);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(`${display} does not exist; only create_file may add a new file`);
-    }
-    throw new Error(`${display}: ${messageOf(error)}`);
-  }
-  if (stats.isSymbolicLink()) {
-    throw new Error(`${display} is a symlink; ApplyPatch refuses to follow, modify, or replace symlinks`);
-  }
-  if (!stats.isFile()) {
-    throw new Error(`${display} is not a regular file`);
-  }
-  return { mode: stats.mode, size: stats.size };
-}
-
-async function decodeText(absolute: string, display: string): Promise<string> {
-  const bytes = await readFile(absolute);
-  try {
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-  } catch {
-    throw new Error(`${display} is binary or not valid UTF-8; ApplyPatch only mutates UTF-8 text files`);
-  }
-}
-
-function splitEncoding(content: string): { text: string; hadBom: boolean; hadCrlf: boolean } {
-  const hadBom = content.charCodeAt(0) === 0xfeff;
-  const withoutBom = hadBom ? content.slice(1) : content;
-  const hadCrlf = withoutCrlfAmbiguity(withoutBom);
-  const text = hadCrlf ? withoutBom.replace(/\r\n/g, "\n") : withoutBom;
-  return { text, hadBom, hadCrlf };
-}
-
-function joinEncoding(content: string, hadBom: boolean, hadCrlf: boolean): string {
-  let result = hadCrlf ? content.replace(/\n/g, "\r\n") : content;
-  if (hadBom) result = `\uFEFF${result}`;
-  return result;
-}
-
-function withoutCrlfAmbiguity(content: string): boolean {
-  return content.includes("\r\n");
-}
-
-/**
- * Strips surrounding whitespace and the single leading `@` convention marker
- * used by built-in file tools. Exported so evidence extraction normalizes
- * operation paths identically to the tool's own path handling.
- */
-export function normalizeApplyPatchPathMarker(value: string): string {
-  let candidate = value.trim();
-  if (candidate.startsWith("@")) candidate = candidate.slice(1).trim();
-  return candidate;
-}
-
-function normalizePath(value: unknown, field: string): string {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`${field} is required and must be a non-empty string`);
-  }
-  const candidate = normalizeApplyPatchPathMarker(value);
-  if (!candidate) throw new Error(`${field} is empty after removing the leading '@'`);
-  if (candidate.includes("\0")) throw new Error(`${field} contains a NUL byte`);
-  return candidate;
-}
-
 function resolveToolCwd(options: ApplyPatchToolOptions, ctx: unknown): string {
   const provided = options.cwd?.();
   if (typeof provided === "string" && isAbsolute(provided)) return provided;
@@ -639,145 +513,9 @@ function resolveToolCwd(options: ApplyPatchToolOptions, ctx: unknown): string {
   return process.cwd();
 }
 
-/**
- * Writes the replacement content to a same-directory temporary file and
- * returns its path. When a mode is provided, chmod restores the exact
- * original permission bits: open(2) masks the requested mode with the
- * process umask, so writeFile alone would not preserve e.g. 0o666 under
- * umask 022.
- */
-async function stageContent(directory: string, fileName: string, content: string, mode: number | undefined, signal?: AbortSignal): Promise<string> {
-  await mkdir(directory, { recursive: true });
-  const temp = join(directory, `.${fileName}.apply-patch-${process.pid}-${randomUUID()}.tmp`);
-  try {
-    ensureNotAborted(signal);
-    await writeFile(temp, content, mode !== undefined ? { mode } : undefined);
-    if (mode !== undefined) await chmod(temp, mode & 0o7777);
-    ensureNotAborted(signal);
-  } catch (error) {
-    await unlink(temp).catch(() => undefined);
-    throw error instanceof Error ? error : new Error(String(error));
-  }
-  return temp;
-}
-
-async function atomicWrite(absolute: string, content: string, mode: number | undefined, signal?: AbortSignal): Promise<void> {
-  const temp = await stageContent(dirname(absolute), basename(absolute), content, mode, signal);
-  try {
-    ensureNotAborted(signal);
-    await rename(temp, absolute);
-  } catch (error) {
-    await unlink(temp).catch(() => undefined);
-    throw error instanceof Error ? error : new Error(String(error));
-  }
-}
-
-/**
- * Creates a new file from staged content with no-overwrite semantics: the
- * link fails with EEXIST if the target appeared after requireAbsent, so a
- * concurrently created file is never destroyed.
- */
-async function atomicCreate(absolute: string, content: string, display: string, signal?: AbortSignal): Promise<void> {
-  const temp = await stageContent(dirname(absolute), basename(absolute), content, undefined, signal);
-  try {
-    ensureNotAborted(signal);
-    await commitStaged(
-      temp,
-      absolute,
-      `operation.path ${display} already exists; create_file refuses to overwrite an existing target`,
-    );
-  } catch (error) {
-    await unlink(temp).catch(() => undefined);
-    throw error instanceof Error ? error : new Error(String(error));
-  }
-}
-
-/**
- * Commits staged content at the destination using link(), which is atomic and
- * fails with EEXIST when the destination already exists — no-overwrite
- * semantics without a separate check-then-commit window. If hard links are
- * unavailable, fail safely rather than falling back to rename(), which could
- * overwrite a destination created after validation.
- */
-async function commitStaged(temp: string, destination: string, existsMessage: string): Promise<void> {
-  try {
-    await link(temp, destination);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "EEXIST") throw new Error(existsMessage);
-    throw error instanceof Error ? error : new Error(String(error));
-  }
-  await unlink(temp).catch(() => undefined);
-}
-
-function ensureNotAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) {
-    throw signal.reason instanceof Error ? signal.reason : new Error("ApplyPatch was cancelled");
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Bounded rendering helpers
 // ---------------------------------------------------------------------------
-
-function renderFinalDiff(options: {
-  path: string;
-  renamedFrom?: string;
-  status: "added" | "modified" | "deleted";
-  oldContent?: string;
-  newContent?: string;
-}): string {
-  const change: ChangedFile = {
-    path: options.path,
-    status: options.status,
-    binary: false,
-    oversized: false,
-    ...(options.renamedFrom ? { renamedFrom: options.renamedFrom } : {}),
-    ...(options.oldContent !== undefined ? { oldContent: options.oldContent } : {}),
-    ...(options.newContent !== undefined ? { newContent: options.newContent } : {}),
-  };
-  const { patch } = buildUnifiedPatch([change], MAX_FINAL_DIFF_BYTES);
-  return patch.trimEnd();
-}
-
-/**
- * Counts added/removed content lines in a unified patch. Only the first
- * `--- `/`+++ ` line of each file section is a header; later lines that start
- * with those sequences are content (e.g. a removed line reading `-- flag`).
- */
-function countDiffLines(patch: string): { addedLines: number; removedLines: number } {
-  let added = 0;
-  let removed = 0;
-  let sawOldHeader = false;
-  let sawNewHeader = false;
-  for (const line of patch.split("\n")) {
-    if (line.startsWith("diff --git ")) {
-      sawOldHeader = false;
-      sawNewHeader = false;
-      continue;
-    }
-    if (line.startsWith("rename from ") || line.startsWith("rename to ")) continue;
-    if (!sawOldHeader && line.startsWith("--- ")) { sawOldHeader = true; continue; }
-    if (!sawNewHeader && line.startsWith("+++ ")) { sawNewHeader = true; continue; }
-    if (line.startsWith("@@")) continue;
-    if (line.startsWith("+")) added += 1;
-    else if (line.startsWith("-")) removed += 1;
-  }
-  return { addedLines: added, removedLines: removed };
-}
-
-function createContent(diff: string, display: string): string {
-  let content: string;
-  try {
-    content = applyDiff("", diff, "create");
-  } catch (error) {
-    throw new Error(`create_file ${display}: ${messageOf(error)}`);
-  }
-  if (content.includes("\0")) {
-    throw new Error(`create_file ${display}: refusing to write binary content (NUL byte)`);
-  }
-  return content;
-}
 
 function textResult(text: string, details: Record<string, unknown>): Record<string, unknown> {
   return { content: [{ type: "text", text }], details, isError: false };
@@ -798,8 +536,4 @@ function textComponent(render: (width: number) => string[]) {
 
 function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

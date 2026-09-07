@@ -359,6 +359,43 @@ test("child navigation invalidates old refs and approval-time targets; capture f
   } finally { await boundary.cleanup(); }
 });
 
+for (const code of [
+  "PROXY_CONNECTION_FAILED", "CONNECTION_CLOSED", "CONNECTION_RESET", "CONNECTION_REFUSED",
+  "CONNECTION_ABORTED", "SOCKET_NOT_CONNECTED", "EMPTY_RESPONSE", "TOO_MANY_RETRIES",
+  "FAILED", "ABORTED", "TIMED_OUT", "BLOCKED_BY_CLIENT",
+]) test(`settled navigation transport result: ${code}`, async () => {
+  const recoverable = !["FAILED", "ABORTED", "TIMED_OUT", "BLOCKED_BY_CLIENT"].includes(code);
+  const { manager, browser } = managerFixture();
+  const page = browser.context.page;
+  const goto = page.goto.bind(page);
+  const failure = new Error(`page.goto: net::ERR_${code}`);
+  try {
+    const opened = await manager.open("https://example.com/");
+    const snapshot = await manager.snapshot(opened.session, opened.tab, 1000);
+    const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)![1]!;
+    page.goto = async () => { throw failure; };
+    await assert.rejects(manager.navigate(opened.session, opened.tab, "https://example.com/next"), error => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.cause, failure);
+      return true;
+    });
+    assert.equal(manager.activeSessionCount(), recoverable ? 1 : 0, code);
+    if (recoverable) {
+      await assert.rejects(manager.inspect(opened.session, opened.tab, ref), /stale|snapshot|ref/i);
+      page.goto = goto;
+      await manager.navigate(opened.session, opened.tab, "https://example.com/recovered");
+    }
+  } finally { await manager.shutdown(); }
+
+  // The same rejection during initial open must never retain a session.
+  const initial = managerFixture();
+  initial.browser.context.page.goto = async () => { throw failure; };
+  try {
+    await assert.rejects(initial.manager.open("https://example.com/"), /net::ERR_/);
+    assert.equal(initial.manager.activeSessionCount(), 0);
+  } finally { await initial.manager.shutdown(); }
+});
+
 test("manager capacity refusals remain local, observable and recover after client close", async () => {
   const browser = new FakeBrowser();
   let port = 0;

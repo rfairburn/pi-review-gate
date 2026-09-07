@@ -5,9 +5,27 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { chromium, type Browser } from "playwright";
 import { normalizeConfig } from "../src/config";
-import { InteractiveBrowserManager } from "../src/web/interactive-browser";
+import { BrowserFailureError, InteractiveBrowserManager } from "../src/web/interactive-browser";
 
-for (const control of ["recover", "security", "pending"] as const) test(`real navigation capacity failure: ${control}`, { timeout: 30000 }, async () => {
+// Only emit fixed tokens, never URLs, credentials or arbitrary error messages.
+function failureDiagnostic(error: unknown): string {
+  const chain: string[] = [];
+  for (let depth = 0; error instanceof Error && depth < 4; depth++) {
+    chain.push(JSON.stringify({
+      phase: error instanceof BrowserFailureError ? error.phase : undefined,
+      category: error instanceof BrowserFailureError ? error.category : undefined,
+      codes: error.message.slice(0, 4096).match(/\bnet::ERR_[A-Z_]{1,64}\b/g)?.slice(0, 8),
+      timeout: /timeout|deadline/i.test(error.message),
+      pending: /in flight|unknown/i.test(error.message),
+      policy: /blocked|non-public|policy/i.test(error.message),
+      closed: /closed|disconnect/i.test(error.message),
+    }));
+    error = error.cause;
+  }
+  return chain.join(" caused by ");
+}
+
+for (const control of ["recover", "security", "pending"] as const) test(`real navigation capacity failure: ${control}`, { timeout: 30000 }, async t => {
   const origin = createServer((_req, res) => {
     res.setHeader("Connection", "close");
     res.end('<title>Capacity fixture</title><button>Apply</button>');
@@ -39,17 +57,19 @@ for (const control of ["recover", "security", "pending"] as const) test(`real na
       await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
     }
     await delay(50);
-    if (control !== "recover") {
+    let originalFailure: unknown;
+    {
       const page = browser!.contexts()[0]!.pages()[0]!;
       const goto = page.goto.bind(page);
       page.goto = async (...args) => {
         try { return await goto(...args); } catch (error) {
+          originalFailure = error;
           assert.match(String(error), /net::ERR_/);
           if (control === "pending") {
             // The original connection failed, but manager-owned command work
             // has not settled. Capacity cannot excuse this uncertainty.
             await new Promise<void>(resolve => page.once("close", () => resolve()));
-          } else {
+          } else if (control === "security") {
             sockets[0]!.destroy();
             await delay(50);
             const denied = net.connect({ host: "127.0.0.1", port: proxyPort });
@@ -73,8 +93,14 @@ for (const control of ["recover", "security", "pending"] as const) test(`real na
       assert.equal(manager.activeSessionCount(), 0, `${control} must remain fatal despite capacity refusal`);
       return;
     }
-    await assert.rejects(navigating, /net::ERR_/);
-    assert.equal(manager.activeSessionCount(), 1, "settled connection refusal must not destroy healthy browser");
+    let navigationFailure: unknown;
+    await assert.rejects(navigating, error => {
+      navigationFailure = error;
+      assert.match(String(error), /net::ERR_/);
+      return true;
+    });
+    t.diagnostic(failureDiagnostic(navigationFailure));
+    assert.equal(manager.activeSessionCount(), 1, `settled connection refusal must not destroy healthy browser: manager=${failureDiagnostic(navigationFailure)}; goto=${failureDiagnostic(originalFailure)}`);
     assert.ok((await manager.network(opened.session, opened.tab)).brokerCapacityRefusals > 0);
     await assert.rejects(manager.inspect(opened.session, opened.tab, ref), /stale|snapshot|ref/i);
     for (const socket of sockets) socket.destroy();

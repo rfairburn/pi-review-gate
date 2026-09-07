@@ -2259,7 +2259,11 @@ export class InteractiveBrowserManager {
       // it is the root cause and is already structured where manager-owned.
       if (session.fatalError) throw session.fatalError;
       const failure = browserFailure(asError(error), "navigation", classifyNavigationError(asError(error)));
-      if (!initial && /\bnet::ERR_(?:PROXY_CONNECTION_FAILED|CONNECTION_CLOSED|CONNECTION_RESET|CONNECTION_REFUSED|EMPTY_RESPONSE)\b/u.test(asError(error).message)) {
+      if (!initial && /\bnet::ERR_(?:PROXY_CONNECTION_FAILED|CONNECTION_CLOSED|CONNECTION_RESET|CONNECTION_REFUSED|CONNECTION_ABORTED|SOCKET_NOT_CONNECTED|EMPTY_RESPONSE|TOO_MANY_RETRIES)\b/u.test(asError(error).message)) {
+        // Include transport abort/disconnected-socket and Chromium's exhausted
+        // connection retry result, not generic ERR_FAILED or ERR_ABORTED.
+        // These describe a failed request, not a failed browser. This exemption
+        // never overrides broker policy, pending work, or operation cancellation.
         // A rejected, settled connection command is not in-flight uncertainty.
         // It also does not prove no effects or that the old document survived.
         // Revoke all old capabilities even when Chromium emits no commit event.

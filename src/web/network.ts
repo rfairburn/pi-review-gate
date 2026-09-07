@@ -57,6 +57,13 @@ export interface DownloadedText {
   fetchedAt: string;
   /** Present only for BrowserExtract: bounded omissions of subresources. */
   browserOmissions?: BrowserOmissions;
+  /**
+   * Present only for BrowserExtract: the body is Chromium-rendered DOM, which
+   * is always a complete HTML document even when the main response declared
+   * another content type (for example a JSON endpoint rendered by the
+   * browser's text viewer). Content-type routing must not apply to it.
+   */
+  rendered?: boolean;
 }
 
 export interface SearchResult {

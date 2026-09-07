@@ -43,12 +43,26 @@ therefore remain part of the trusted setup boundary.
 
 ## WebFetch
 
-`WebFetch` downloads and indexes the complete selected HTML page or PDF, but returns
-only a bounded structural range. Its result includes `nextIndex` when more blocks
-remain. HTML results include a whole-page table inventory, possible site-pagination
-URLs, and `dynamic_content_suspected`; PDF results preserve page numbers, expose
-document metadata, and identify likely scanned/image-only files when little or no text
-can be extracted.
+`WebFetch` downloads and indexes the complete selected HTML page, PDF, or non-HTML
+text response, but returns only a bounded structural range. Its result includes
+`nextIndex` when more blocks remain. HTML results include a whole-page table inventory,
+possible site-pagination URLs, and `dynamic_content_suspected`; PDF results preserve
+page numbers, expose document metadata, and identify likely scanned/image-only files
+when little or no text can be extracted.
+
+- Responses declared as non-HTML text (for example `application/json` or `text/plain`)
+  are indexed verbatim as bounded text blocks with the declared content type disclosed:
+  JSON and plain-text payloads stay readable and searchable, and angle-bracket sequences
+  in them are never interpreted as markup — including raw HTML source served as
+  `text/plain`, which remains literal text. BrowserExtract's rendered output is always
+  parsed as HTML regardless of the main response's declared type, and bodies with a
+  missing content type that begin like an HTML document are parsed as HTML; other
+  HTML-declared responses without parseable structure fall back to the same verbatim
+  text indexing when they carry readable text.
+- Empty bodies, undecodable (non-text) bodies, comment-only or otherwise
+  structure-less HTML, and pages made only of non-renderable markup fail with an
+  explicit bounded diagnostic instead of a silent empty result or an internal parser
+  error; script-only shells report the usual `dynamic_content_suspected` escalation.
 
 - Use `find` on that same `WebFetch` URL to locate text anywhere in the indexed
   document; an accompanying `index` starts the case-insensitive search at that block.

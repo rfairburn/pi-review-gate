@@ -50,7 +50,7 @@ export interface WebPaginationLink {
 export interface ExtractedWebPage {
   url: string;
   title: string;
-  documentType: "html" | "pdf";
+  documentType: "html" | "pdf" | "text";
   byline?: string;
   siteName?: string;
   excerpt?: string;
@@ -101,13 +101,180 @@ export interface WebPageFindResult {
   matchesTruncated: boolean;
 }
 
+export interface FetchedDocumentOptions {
+  /**
+   * True when the body is Chromium-rendered DOM (BrowserExtract): it is always
+   * a complete HTML document, so content-type routing must not apply and it
+   * goes straight to the HTML parser.
+   */
+  rendered?: boolean;
+}
+
+/**
+ * Routes one downloaded (non-PDF) response body to the extraction path that
+ * matches its declared content type. Explicitly non-HTML text responses are
+ * indexed verbatim and never reinterpreted as markup — including raw HTML
+ * source served as `text/plain`, which is valid literal text. Only rendered
+ * acquisitions, HTML-declared bodies, or bodies with a missing content type
+ * (`application/octet-stream` fallback) that begin like an HTML document go
+ * through the HTML parser; explicit types are never sniffed.
+ */
+export function extractFetchedDocument(
+  contentType: string,
+  text: string,
+  url: string,
+  options: FetchedDocumentOptions = {},
+): ExtractedWebPage {
+  const missingType = mediaTypeOf(contentType) === "application/octet-stream";
+  if (options.rendered || isHtmlContentType(contentType) || (missingType && looksLikeHtmlBody(text))) {
+    return extractWebPage(text, url);
+  }
+  return extractTextDocument(text, url);
+}
+
+export function isHtmlContentType(contentType: string): boolean {
+  const mediaType = mediaTypeOf(contentType);
+  return mediaType === "text/html" || mediaType === "application/xhtml+xml";
+}
+
+/** The lowercased media type of a Content-Type value, without parameters. */
+export function mediaTypeOf(contentType: string): string {
+  const first = contentType.split(";")[0];
+  return (first ?? "").trim().toLowerCase();
+}
+
+function looksLikeHtmlBody(text: string): boolean {
+  const head = text.slice(0, 1_024).replace(/^\s+/, "").toLowerCase();
+  return head.startsWith("<!doctype html") || head.startsWith("<html");
+}
+
+/**
+ * Indexes a non-HTML response body (JSON, plain text, and other text
+ * payloads) as verbatim bounded text blocks. The original meaningful text is
+ * preserved exactly: no HTML parsing or markup reinterpretation is applied,
+ * so tag-like sequences inside JSON or script strings remain literal.
+ * Empty or undecodable bodies fail with an explicit bounded diagnostic
+ * instead of producing a silent empty result.
+ */
+export function extractTextDocument(text: string, url: string): ExtractedWebPage {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error("The fetched response had an empty body; there is no content to index.");
+  if (!hasReadableText(trimmed)) {
+    throw new Error("The fetched response is not readable text; WebFetch indexes HTML, PDF, and plain-text responses only.");
+  }
+  const blocks: WebPageBlock[] = [];
+  for (const part of splitVerbatimText(text, MAX_BLOCK_CHARS)) blocks.push({ index: blocks.length, kind: "text", markdown: part });
+  return {
+    url,
+    title: textDocumentTitle(url),
+    documentType: "text",
+    blocks,
+    tables: [],
+    pagination: [],
+    dynamicContentSuspected: false,
+    dynamicContentReasons: [],
+  };
+}
+
+/**
+ * Bounded readability probe for a decoded non-HTML body. Genuine text (any
+ * valid encoding) decodes with no UTF-8 replacement characters; binary
+ * payloads decode to far more, so a generous replacement-character ratio
+ * rejects them without an allowlist of binary MIME types.
+ */
+function hasReadableText(text: string): boolean {
+  let significant = 0;
+  let replacements = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code === 0x20 || (code >= 0x09 && code <= 0x0d)) continue;
+    significant += 1;
+    if (code === 0xfffd) replacements += 1;
+  }
+  return significant > 0 && replacements * 4 < significant;
+}
+
+/**
+ * Splits a verbatim text body into bounded chunks without dropping or
+ * altering any character (unlike splitBlock, which trims chunk edges while
+ * reflowing HTML markdown). Concatenating the returned parts reproduces the
+ * input exactly, so long JSON string values and whitespace-sensitive plain
+ * text survive chunking byte-for-byte.
+ */
+function splitVerbatimText(text: string, limit: number): string[] {
+  if (text.length <= limit) return text === "" ? [] : [text];
+  const parts: string[] = [];
+  let start = 0;
+  while (text.length - start > limit) {
+    let end = start + limit;
+    // Never split a surrogate pair across two blocks.
+    if (end < text.length && isHighSurrogate(text.charCodeAt(end - 1))) end -= 1;
+    parts.push(text.slice(start, end));
+    start = end;
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function textDocumentTitle(url: string): string {
+  const maxChars = 200;
+  try {
+    const parsed = new URL(url);
+    const location = `${parsed.pathname === "/" ? "" : parsed.pathname}${parsed.search}`;
+    return (location || parsed.hostname).slice(0, maxChars);
+  } catch {
+    return url.slice(0, maxChars);
+  }
+}
+
 export function extractWebPage(html: string, url: string): ExtractedWebPage {
   const parsed = parseHTML(html);
+  if (!parsed.document.documentElement) {
+    // linkedom leaves documentElement null for empty, whitespace-only,
+    // comment-only, and unstructured text input, and its head/body getters
+    // then throw an internal TypeError. Resolve those cases deliberately:
+    // readable unstructured text is preserved verbatim as a text document,
+    // and everything else fails with a bounded diagnostic.
+    const trimmed = html.trim();
+    if (!trimmed) throw new Error("The fetched page returned an empty document; there is no readable content.");
+    if (html.includes("<!--")) {
+      throw new Error("The fetched page returned HTML comments or malformed markup with no readable structure.");
+    }
+    return extractTextDocument(html, url);
+  }
   const document = parsed.document as unknown as Document;
   absolutizeLinks(document, url);
   const dynamicContentReasons = dynamicReasons(document, html);
   const scriptSignals = executableScriptSignals(document);
   for (const element of [...document.querySelectorAll("script,style,noscript,template,svg,img,picture,source")]) element.remove();
+  if (!document.documentElement) {
+    // The top-level elements were all non-renderable (scripts, styles,
+    // graphics): sanitization removed the root itself, and head/body getters
+    // would now throw an internal TypeError. Preserve any document-level
+    // visible text verbatim; script-only shells normalize to an empty page
+    // that keeps the executable-script suspicion signal (and therefore the
+    // BrowserExtract escalation); anything else fails with an explicit
+    // bounded diagnostic rather than a silent empty success.
+    const residual = cleanText(documentLevelText(document));
+    if (residual) return extractTextDocument(residual, url);
+    if (scriptSignals.count > 0) {
+      return {
+        url,
+        title: "Untitled page",
+        documentType: "html",
+        blocks: [],
+        tables: [],
+        pagination: [],
+        dynamicContentSuspected: true,
+        dynamicContentReasons: extractionDynamicReasons([], scriptSignals),
+      };
+    }
+    throw new Error("The fetched page contained only non-renderable markup (styles, graphics, or similar) with no readable content.");
+  }
 
   const readable = readArticle(document, url);
   const sourceHtml = readable?.content || document.body?.innerHTML || html;
@@ -132,7 +299,12 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
   }
   if (blocks.length === 0) {
     const fallback = cleanText(contentDocument.body?.textContent ?? document.body?.textContent ?? "");
-    for (const part of splitBlock(fallback, MAX_BLOCK_CHARS)) blocks.push({ index: blocks.length, kind: "text", markdown: part });
+    // Never materialize an empty block: a content-less body yields zero
+    // blocks, which the post-extraction check below turns into an explicit
+    // bounded diagnostic instead of a silent empty success.
+    if (fallback) {
+      for (const part of splitBlock(fallback, MAX_BLOCK_CHARS)) blocks.push({ index: blocks.length, kind: "text", markdown: part });
+    }
   }
 
   const tables: WebTableDescriptor[] = [];
@@ -169,6 +341,12 @@ export function extractWebPage(html: string, url: string): ExtractedWebPage {
     });
   }
   dynamicContentReasons.push(...extractionDynamicReasons(blocks, scriptSignals));
+  if (blocks.length === 0 && dynamicContentReasons.length === 0) {
+    // Rooted but content-less documents (empty body, style/SVG-only, ...)
+    // fail explicitly; a justified dynamic-content signal keeps the
+    // BrowserExtract escalation instead.
+    throw new Error("The fetched page returned an empty document; there is no readable content.");
+  }
 
   return {
     url,
@@ -712,6 +890,18 @@ function extractionDynamicReasons(blocks: WebPageBlock[], scripts: ExecutableScr
     return ["executable script payload greatly exceeds extracted readable content"];
   }
   return [];
+}
+
+/**
+ * Joins the document's direct text nodes (visible top-level text that sits
+ * outside any element). Only called when no element remains in the document.
+ */
+function documentLevelText(document: Document): string {
+  const parts: string[] = [];
+  for (const node of [...document.childNodes]) {
+    if (node.nodeType === 3 /* TEXT_NODE */) parts.push(node.textContent ?? "");
+  }
+  return parts.join(" ");
 }
 
 function cleanText(value: string): string {

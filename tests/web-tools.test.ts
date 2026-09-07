@@ -4,9 +4,9 @@ import test from "node:test";
 import { normalizeConfig } from "../src/config";
 import { assertChromiumAvailable, assertSuccessfulBrowserNavigation, missingChromiumError } from "../src/web/browser";
 import { WebPageCache } from "../src/web/cache";
-import { canonicalSearchUrl, normalizeDdgsResults, searchDdgs, type DdgsRunner } from "../src/web/network";
+import { canonicalSearchUrl, decodeResponseText, normalizeDdgsResults, searchDdgs, type DdgsRunner } from "../src/web/network";
 import { parseHTML } from "linkedom";
-import { collectBoundedElements, extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
+import { collectBoundedElements, extractFetchedDocument, extractTextDocument, extractWebPage, findInWebPage, renderWebPage } from "../src/web/page";
 import { extractPdfDocument, isPdfResponse } from "../src/web/pdf";
 import type { InteractiveBrowserManager } from "../src/web/interactive-browser";
 import { formatSearch, WebToolManager } from "../src/web/tools";
@@ -167,14 +167,31 @@ test("dynamic-content suspicion detects a modern hydration shell from extraction
   assert.deepEqual(page.dynamicContentReasons, ["no readable content despite executable scripts"]);
 });
 
-test("an empty static page or structured-data-only page does not imply dynamic rendering", () => {
-  const empty = extractWebPage("<html><body></body></html>", "https://example.com/empty");
-  const structured = extractWebPage(
-    `<html><body><script type="application/ld+json">${JSON.stringify({ name: "Metadata only" })}</script></body></html>`,
-    "https://example.com/structured",
+test("an empty static page or structured-data-only page fails with a bounded diagnostic instead of a silent empty result", () => {
+  assert.throws(() => extractWebPage("<html><body></body></html>", "https://example.com/empty"), /empty document/);
+  assert.throws(
+    () =>
+      extractWebPage(
+        `<html><body><script type="application/ld+json">${JSON.stringify({ name: "Metadata only" })}</script></body></html>`,
+        "https://example.com/structured",
+      ),
+    /empty document/,
   );
-  assert.equal(empty.dynamicContentSuspected, false);
-  assert.equal(structured.dynamicContentSuspected, false);
+});
+
+test("rooted but content-less HTML documents fail explicitly, keeping the full-document script-shell escalation", () => {
+  for (const input of [
+    "<html><head></head><body></body></html>",
+    "<html><body>   </body></html>",
+    "<html><body><style>body{}</style></body></html>",
+    "<html><body><svg></svg></body></html>",
+  ]) {
+    assert.throws(() => extractWebPage(input, "https://example.com/rooted-empty"), /empty document/, input);
+  }
+  const shell = extractWebPage("<html><head></head><body><script>boot()</script></body></html>", "https://example.com/shell");
+  assert.equal(shell.blocks.length, 0);
+  assert.equal(shell.dynamicContentSuspected, true);
+  assert.deepEqual(shell.dynamicContentReasons, ["no readable content despite executable scripts"]);
 });
 
 test("dynamic-content suspicion compares executable payload with sparse readable output", () => {
@@ -1031,4 +1048,331 @@ test("multi-row spanned headers cannot amplify past text and Markdown budgets", 
   assert.ok(table.truncationNotes!.includes("combined table header text truncated to 2000 characters"));
   assert.ok(table.headers.reduce((total, header) => total + header.length, 0) <= 512_000);
   assert.ok(page.blocks.filter((block) => block.tableId === table.id).every((block) => block.markdown.length <= 7_000));
+});
+
+test("extractFetchedDocument routes by declared content type without reinterpreting non-HTML payloads", () => {
+  const json = '{"tags":["cloud"]}\n';
+  const fromJson = extractFetchedDocument("application/json", json, "https://example.com/tags");
+  assert.equal(fromJson.documentType, "text");
+  assert.deepEqual(fromJson.blocks.map((block) => block.markdown), [json], "JSON body is preserved byte-for-byte");
+
+  const html = "<!doctype html><html><head><title>T</title></head><body><p>Body text.</p></body></html>";
+  assert.equal(extractFetchedDocument("text/html; charset=utf-8", html, "https://example.com/page").documentType, "html");
+  assert.equal(extractFetchedDocument("application/xhtml+xml", html, "https://example.com/page").documentType, "html");
+
+  // A missing content type (the application/octet-stream fallback) is the only
+  // explicitly non-HTML case that may be sniffed for an HTML document marker.
+  const undeclared = "<!doctype html>\n<html><body><p>Undeclared HTML body.</p></body></html>";
+  assert.equal(extractFetchedDocument("application/octet-stream", undeclared, "https://example.com/undeclared").documentType, "html");
+  assert.equal(extractFetchedDocument("application/octet-stream", json, "https://example.com/undeclared-json").documentType, "text");
+
+  // Explicitly non-HTML types are never sniffed: raw HTML source served as
+  // text/plain is valid literal text and must stay verbatim.
+  const rawHtmlAsText = "<!doctype html>\n<html><head><title>Source</title></head><body><p>Served as text.</p></body></html>";
+  const fromRawText = extractFetchedDocument("text/plain", rawHtmlAsText, "https://example.com/source.html.txt");
+  assert.equal(fromRawText.documentType, "text");
+  assert.deepEqual(fromRawText.blocks.map((block) => block.markdown), [rawHtmlAsText]);
+
+  // Rendered acquisitions are marked explicitly at the download boundary and
+  // always parse as HTML, even when the main response declared JSON.
+  const renderedViewer = "<!DOCTYPE html>\n<html><head><title>api.json</title></head><body><pre>{\"key\":\"value\"}</pre></body></html>";
+  const fromRendered = extractFetchedDocument("application/json", renderedViewer, "https://example.com/api.json", { rendered: true });
+  assert.equal(fromRendered.documentType, "html");
+  assert.ok(fromRendered.blocks.some((block) => block.markdown.includes('{"key":"value"}')));
+  // Without the marker the same body under an explicit JSON type stays verbatim.
+  assert.equal(extractFetchedDocument("application/json", renderedViewer, "https://example.com/api.json").documentType, "text");
+
+  // Explicitly non-HTML types are never parsed as markup, even when tag-like.
+  const tricky = 'value "<script>alert(1)</script>" and a < b';
+  const fromTricky = extractFetchedDocument("text/plain", tricky, "https://example.com/tricky");
+  assert.equal(fromTricky.documentType, "text");
+  assert.deepEqual(fromTricky.blocks.map((block) => block.markdown), [tricky]);
+});
+
+test("rootless HTML input resolves to verbatim text or a bounded diagnostic, never a parser exception", () => {
+  const json = extractWebPage('{"tags":["cloud"]}\n', "https://example.com/tags");
+  assert.equal(json.documentType, "text");
+  assert.deepEqual(json.blocks.map((block) => block.markdown), ['{"tags":["cloud"]}\n']);
+
+  const comparisons = extractWebPage("a < b and c > d", "https://example.com/compare");
+  assert.equal(comparisons.documentType, "text");
+  assert.equal(comparisons.blocks[0]?.markdown, "a < b and c > d");
+
+  const failures: Array<[string, RegExp]> = [
+    ["", /empty document/],
+    ["   \n\t ", /empty document/],
+    ["<!-- only -->", /no readable structure/],
+  ];
+  for (const [input, pattern] of failures) {
+    assert.throws(() => extractWebPage(input, "https://example.com/broken"), pattern);
+  }
+});
+
+test("root fragments made only of non-renderable elements normalize without a parser exception", () => {
+  // The sanitizer removes these roots themselves; head/body getters would
+  // then throw the internal linkedom TypeError unless handled.
+  const scriptOnly = extractWebPage("<script>console.log(1)</script>", "https://example.com/shell");
+  assert.equal(scriptOnly.documentType, "html");
+  assert.equal(scriptOnly.blocks.length, 0);
+  assert.equal(scriptOnly.dynamicContentSuspected, true, "script-only shells keep the BrowserExtract escalation signal");
+  assert.deepEqual(scriptOnly.dynamicContentReasons, ["no readable content despite executable scripts"]);
+
+  // Non-script root loss is an explicit bounded failure, never a silent
+  // empty success.
+  for (const input of ["<style>body{}</style>", "<svg></svg>", "<img src=\"marker.svg\">"]) {
+    assert.throws(() => extractWebPage(input, "https://example.com/graphics"), /only non-renderable markup.*no readable content/, input);
+  }
+
+  // A doctype-prefixed script bootstrap has no element root either and keeps
+  // the same escalation signal as a full-document shell.
+  const bootstrapped = extractWebPage("<!doctype html><script>boot()</script>", "https://example.com/boot");
+  assert.equal(bootstrapped.blocks.length, 0);
+  assert.equal(bootstrapped.dynamicContentSuspected, true);
+  assert.deepEqual(bootstrapped.dynamicContentReasons, ["no readable content despite executable scripts"]);
+
+  // Document-level visible text next to a removed element is preserved verbatim.
+  const mixed = extractWebPage("<script>console.log(1)</script>hello", "https://example.com/mixed");
+  assert.equal(mixed.documentType, "text");
+  assert.deepEqual(mixed.blocks.map((block) => block.markdown), ["hello"]);
+
+  // A surviving sibling element keeps the ordinary HTML path (the root is
+  // live after sanitization), including its suspicion signal.
+  const sibling = extractWebPage("<script>console.log(1)</script><div>kept</div>", "https://example.com/sibling");
+  assert.equal(sibling.documentType, "html");
+  assert.equal(sibling.dynamicContentSuspected, true);
+});
+
+test("WebFetch keeps the BrowserExtract escalation for script-only fragments without crashing", async () => {
+  const config = normalizeConfig({});
+  const shell = "<script>console.log(1)</script>";
+  const cache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "text/html",
+    text: shell,
+    bytes: Buffer.byteLength(shell),
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, cache);
+  manager.register();
+  const result = await tools.get("WebFetch").execute("shell", { url: "https://example.com/shell" });
+  assert.equal(result.isError, false);
+  const text = result.content[0].text as string;
+  assert.match(text, /dynamic_content_suspected: true — no readable content despite executable scripts/);
+  assert.match(text, /use BrowserExtract/i);
+  assert.doesNotMatch(text, /firstElementChild|documentElement|Cannot destructure/i);
+  await manager.cleanup();
+});
+
+test("long text documents are indexed verbatim with lossless bounded chunking", () => {
+  const jsonBody = `{"tags":["cloud","${"x".repeat(9_000)} <not markup>"],"note":"line one\n    indented line two"}`;
+  const jsonPage = extractTextDocument(jsonBody, "https://example.com/long.json");
+  assert.ok(jsonPage.blocks.length >= 2);
+  assert.equal(jsonPage.blocks.map((block) => block.markdown).join(""), jsonBody);
+
+  const padded = `head\n${" ".repeat(8_000)}tail  \n`;
+  const textPage = extractTextDocument(padded, "https://example.com/padded.txt");
+  assert.ok(textPage.blocks.length >= 2);
+  assert.equal(textPage.blocks.map((block) => block.markdown).join(""), padded);
+});
+
+test("extractTextDocument rejects empty and undecodable bodies with bounded diagnostics", () => {
+  assert.throws(() => extractTextDocument("", "https://example.com/empty"), /empty body/);
+  assert.throws(() => extractTextDocument("\uFFFD\uFFFD\uFFFD", "https://example.com/binary"), /not readable text/);
+  const page = extractTextDocument("plain words\nsecond line", "https://example.com/plain.txt");
+  assert.equal(page.documentType, "text");
+  assert.equal(page.title, "/plain.txt");
+  assert.deepEqual(page.blocks.map((block) => block.markdown), ["plain words\nsecond line"]);
+  assert.equal(page.dynamicContentSuspected, false);
+});
+
+test("WebFetch indexes an exact JSON response verbatim with find, refresh, and pagination metadata", async () => {
+  const config = normalizeConfig({});
+  const jsonBody = '{"tags":["cloud"]}\n';
+  let downloads = 0;
+  const cache = new WebPageCache(config.web!.fetch, async (url) => {
+    downloads += 1;
+    return {
+      requestedUrl: url,
+      finalUrl: url,
+      contentType: "application/json",
+      text: jsonBody,
+      bytes: Buffer.byteLength(jsonBody),
+      fetchedAt: "2026-08-23T00:00:00.000Z",
+    };
+  });
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, cache);
+  manager.register();
+
+  const fetched = await tools.get("WebFetch").execute("json", { url: "https://ollama.com/library/glm-5.3-flash/tags" });
+  assert.equal(fetched.isError, false);
+  const text = fetched.content[0].text as string;
+  assert.match(text, /Text response \(application\/json\): \/library\/glm-5\.3-flash\/tags/);
+  assert.match(text, /Source: https:\/\/ollama\.com\/library\/glm-5\.3-flash\/tags/);
+  assert.match(text, /19 network bytes/);
+  assert.match(text, /\{"tags":\["cloud"\]\}/);
+  assert.match(text, /Response format: application\/json — indexed verbatim as bounded text blocks; no HTML interpretation was applied/);
+  assert.doesNotMatch(text, /firstElementChild|documentElement|Cannot destructure/i);
+  const response = fetched.details.response as { documentType: string; contentType: string; downloadedBytes: number; totalBlocks: number; nextIndex?: number };
+  assert.equal(response.documentType, "text");
+  assert.equal(response.contentType, "application/json");
+  assert.equal(response.downloadedBytes, 19);
+  assert.equal(response.totalBlocks, 1);
+  assert.equal(response.nextIndex, undefined);
+
+  const found = await tools.get("WebFetch").execute("json-find", { url: "https://ollama.com/library/glm-5.3-flash/tags", find: "cloud" });
+  assert.equal(found.isError, false);
+  assert.match(found.content[0].text as string, /Find "cloud" from index 0: 1 matching block/);
+  assert.equal(downloads, 1, "find reuses the session cache");
+
+  const refreshed = await tools.get("WebFetch").execute("json-refresh", { url: "https://ollama.com/library/glm-5.3-flash/tags", refresh: true });
+  assert.equal(refreshed.isError, false);
+  assert.match(refreshed.content[0].text as string, /19 network bytes/);
+  assert.doesNotMatch(refreshed.content[0].text as string, /session cache/);
+  assert.equal(downloads, 2, "refresh forces a new acquisition");
+  await manager.cleanup();
+});
+
+test("WebFetch preserves tag-free plain text and markup-like strings in non-HTML responses verbatim", async () => {
+  const config = normalizeConfig({});
+  const body = [
+    "First paragraph of a tag-free plain-text report about Phoenix population.",
+    "",
+    JSON.stringify({ html: "<div class='x'>not markup</div>", js: "a < b && c > d", note: "5 < 6" }),
+  ].join("\n");
+  const cache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "text/plain; charset=utf-8",
+    text: body,
+    bytes: Buffer.byteLength(body),
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, cache);
+  manager.register();
+
+  const fetched = await tools.get("WebFetch").execute("plain", { url: "https://example.com/report.txt" });
+  assert.equal(fetched.isError, false);
+  const text = fetched.content[0].text as string;
+  assert.match(text, /Text response \(text\/plain\): \/report\.txt/);
+  assert.match(text, /<div class='x'>not markup<\/div>/, "tag-like JSON content stays literal");
+  assert.match(text, /a < b && c > d/, "comparison operators stay literal");
+  const found = await tools.get("WebFetch").execute("plain-find", { url: "https://example.com/report.txt", find: "not markup" });
+  assert.equal(found.isError, false);
+  assert.match(found.content[0].text as string, /1 matching block/);
+  await manager.cleanup();
+});
+
+test("WebFetch fails with bounded diagnostics for empty, undecodable, and structure-less responses", async () => {
+  const config = normalizeConfig({});
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0x80, 0x81, 0x82]);
+  const cases: Array<{ name: string; contentType: string; text: string; data?: Uint8Array; pattern: RegExp }> = [
+    { name: "empty-json", contentType: "application/json", text: "", pattern: /empty body/ },
+    { name: "blank-html", contentType: "text/html", text: "   \n\t ", pattern: /empty document/ },
+    { name: "comment-only", contentType: "text/html; charset=utf-8", text: "<!-- nothing else -->", pattern: /no readable structure/ },
+    { name: "style-only", contentType: "text/html", text: "<style>body{}</style>", pattern: /only non-renderable markup/ },
+    { name: "svg-only", contentType: "text/html", text: "<svg></svg>", pattern: /only non-renderable markup/ },
+    { name: "rooted-empty-html", contentType: "text/html", text: "<html><head></head><body></body></html>", pattern: /empty document/ },
+    { name: "rooted-style-only", contentType: "text/html", text: "<html><body><style>body{}</style></body></html>", pattern: /empty document/ },
+    { name: "rooted-svg-only", contentType: "text/html", text: "<html><body><svg></svg></body></html>", pattern: /empty document/ },
+    { name: "binary-png", contentType: "image/png", text: decodeResponseText("image/png", pngBytes), data: pngBytes, pattern: /not readable text/ },
+  ];
+  for (const item of cases) {
+    const cache = new WebPageCache(config.web!.fetch, async (url) => ({
+      requestedUrl: url,
+      finalUrl: url,
+      contentType: item.contentType,
+      text: item.text,
+      data: item.data,
+      bytes: item.data?.byteLength ?? Buffer.byteLength(item.text),
+      fetchedAt: "2026-08-23T00:00:00.000Z",
+    }));
+    const tools = new Map<string, any>();
+    const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, cache);
+    manager.register();
+    const result = await tools.get("WebFetch").execute(item.name, { url: `https://example.com/${item.name}` });
+    assert.equal(result.isError, true, `${item.name} must error`);
+    const text = result.content[0].text as string;
+    assert.match(text, /WebFetch failed:/, item.name);
+    assert.match(text, item.pattern, item.name);
+    assert.doesNotMatch(text, /firstElementChild|documentElement|Cannot destructure/i, `${item.name} must not leak the parser exception`);
+    await manager.cleanup();
+  }
+});
+
+test("WebFetch paginates long non-HTML text through nextIndex and locates late blocks with find", async () => {
+  const config = normalizeConfig({});
+  const body = Array.from({ length: 200 }, (_, index) => `Record ${index} describes Phoenix population context for indexed continuation.`).join("\n");
+  assert.ok(body.length > 14_000, "fixture must span multiple bounded blocks");
+  const cache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "text/plain",
+    text: body,
+    bytes: Buffer.byteLength(body),
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, cache);
+  manager.register();
+
+  const first = await tools.get("WebFetch").execute("long", { url: "https://example.com/records.txt", maxChars: 1_000 });
+  assert.equal(first.isError, false);
+  const firstResponse = first.details.response as { totalBlocks: number; nextIndex?: number };
+  assert.ok(firstResponse.totalBlocks >= 3);
+  assert.equal(firstResponse.nextIndex, 1);
+
+  const second = await tools.get("WebFetch").execute("long-2", { url: "https://example.com/records.txt", index: 1 });
+  assert.equal(second.isError, false);
+  assert.match(second.content[0].text as string, /Record 1\d\d|Record [2-9]\d/);
+
+  const found = await tools.get("WebFetch").execute("long-find", { url: "https://example.com/records.txt", find: "Record 199" });
+  assert.equal(found.isError, false);
+  const foundResponse = found.details.response as { find?: { totalMatches: number; matches: Array<{ index: number }> } };
+  assert.equal(foundResponse.find?.totalMatches, 1);
+  assert.equal(foundResponse.find!.matches[0]!.index, 2, "the final record lives in the last bounded block");
+  await manager.cleanup();
+});
+
+test("BrowserExtract-style rendered acquisitions parse as HTML despite the main response's content type", async () => {
+  const config = normalizeConfig({});
+  const renderedDom = "<!DOCTYPE html>\n<html><head><title>api.json</title></head><body><pre>{\"key\":\"value\"}</pre></body></html>";
+  const browserCache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "application/json",
+    text: renderedDom,
+    bytes: Buffer.byteLength(renderedDom),
+    fetchedAt: "2026-08-23T00:00:01.000Z",
+    rendered: true,
+  }));
+  const tools = new Map<string, any>();
+  const manager = new WebToolManager({ registerTool: (tool) => tools.set(tool.name, tool) }, config, undefined, browserCache);
+  manager.register();
+  const result = await tools.get("BrowserExtract").execute("rendered-json", { url: "https://example.com/api.json" });
+  assert.equal(result.isError, false);
+  const response = result.details.response as { documentType: string };
+  assert.equal(response.documentType, "html");
+  assert.match(result.content[0].text as string, /\{"key":"value"\}/);
+  await manager.cleanup();
+});
+
+test("an HTML-declared response without structure keeps its readable text verbatim", async () => {
+  const config = normalizeConfig({});
+  const body = 'Server fallback message: {"status":"ok"}';
+  const cache = new WebPageCache(config.web!.fetch, async (url) => ({
+    requestedUrl: url,
+    finalUrl: url,
+    contentType: "text/html; charset=utf-8",
+    text: body,
+    bytes: Buffer.byteLength(body),
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+  }));
+  const fetched = await cache.fetch({ url: "https://example.com/fallback" });
+  assert.equal(fetched.documentType, "text");
+  assert.match(fetched.content, /Server fallback message: \{"status":"ok"\}/);
+  await cache.cleanup();
 });

@@ -108,7 +108,13 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
   a parent pi session cannot silently redirect the gate; it deliberately does **not**
   unset `PI_REVIEW_GATE_DISABLED`, the documented kill switch, and warns when it is set.
 - Selects the first existing config from `~/.config/pi-review-gate/config.json` or
-  `~/.config/pi/review-gate.json`, failing with a clear message when none exists.
+  `~/.config/pi/review-gate.json`. When neither exists, it initializes a private
+  (directory `0700`, file `0600`) zero-model default config at the primary path —
+  explicitly empty reviewer and worker selections, written to a temporary name and
+  published atomically so concurrent first launches can never clobber each other or
+  expose partial JSON — and continues normal startup. Existing or malformed configs are
+  never overwritten; creation failures (permission errors, non-regular paths at the
+  config location) fail closed with distinct actionable diagnostics.
 - Builds the extension when `src/index.ts` is present, otherwise requires the packaged
   `dist/src/index.js`.
 - Runs `scripts/ensure-ddgs.sh` to provision the pinned web-search dependency.

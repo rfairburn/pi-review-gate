@@ -93,18 +93,25 @@ Chromium is missing.
 ## Minimal configuration and launch
 
 The persistent launcher reads its config from a fixed location and deliberately ignores
-an exported `PI_REVIEW_GATE_CONFIG`, so a parent pi session cannot redirect it. Place (or
-copy) your config at one of these paths before launching — the launcher uses the first
-that exists and fails with a clear message if neither is present:
+an exported `PI_REVIEW_GATE_CONFIG`, so a parent pi session cannot redirect it. It uses
+the first path that exists:
 
 - `~/.config/pi-review-gate/config.json`
 - `~/.config/pi/review-gate.json`
+
+On its first launch, when neither is present, the launcher creates a private zero-model
+default config at the primary path (no reviewers or workers selected) and continues;
+you then configure models through `/review-settings` or by editing the file. To start
+from an existing config instead, place (or copy) it before launching:
 
 ```bash
 mkdir -p ~/.config/pi-review-gate
 cp /path/to/review-gate.json ~/.config/pi-review-gate/config.json
 ./scripts/pi-review-gate.sh
 ```
+
+The first launch prints a notice when it creates the default config; automatic review
+stays off until at least one reviewer is selected.
 
 A minimal config using Codex as the reviewer:
 

@@ -1,12 +1,121 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import {
+  automaticReviewEnabled,
+  externalAgentCatalog,
+  loadConfig,
+  normalizeConfig,
+  resolveReviewers,
+  resolvedWorkerResources,
+  resolvedWorkerRoute,
+} from "../src/config";
+import { persistSubtasksViewPreference } from "../src/settings/persistence";
 
 const execFileAsync = promisify(execFile);
+
+/** The exact zero-model default the launcher writes on first launch (issue 32). */
+const zeroModelDefaultConfig = {
+  enabled: true,
+  review: { activeReviewers: [] },
+  execution: {
+    workerResources: [],
+    routes: { execute: [], research: [] },
+  },
+};
+
+interface LauncherFixture {
+  root: string;
+  home: string;
+  bin: string;
+  capture: string;
+  ddgsVenv: string;
+  primaryConfigPath: string;
+  fallbackConfigPath: string;
+}
+
+async function makeLauncherFixture(prefix: string): Promise<LauncherFixture> {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const home = join(root, "home");
+  const bin = join(root, "bin");
+  const capture = join(root, "capture");
+  const ddgsVenv = join(root, "ddgs");
+  await Promise.all([
+    mkdir(home, { recursive: true }),
+    mkdir(bin, { recursive: true }),
+    mkdir(capture, { recursive: true }),
+    mkdir(join(ddgsVenv, "bin"), { recursive: true }),
+  ]);
+  const npmPath = join(bin, "npm");
+  const piPath = join(bin, "pi");
+  const ddgsPythonPath = join(ddgsVenv, "bin", "python");
+  await writeFile(npmPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  await writeFile(ddgsPythonPath, "#!/usr/bin/env bash\nexit 0\n", "utf8");
+  await writeFile(piPath, [
+    "#!/usr/bin/env bash",
+    "printf '%s' \"${PI_REVIEW_GATE_CONFIG:-unset}\" > \"$CAPTURE_DIR/config-env\"",
+    "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
+  ].join("\n"), "utf8");
+  await Promise.all([chmod(npmPath, 0o755), chmod(piPath, 0o755), chmod(ddgsPythonPath, 0o755)]);
+  return {
+    root,
+    home,
+    bin,
+    capture,
+    ddgsVenv,
+    primaryConfigPath: join(home, ".config", "pi-review-gate", "config.json"),
+    fallbackConfigPath: join(home, ".config", "pi", "review-gate.json"),
+  };
+}
+
+function launcherEnv(fixture: LauncherFixture, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  // Sanitize inherited gate variables so the tests observe the launcher's own
+  // resolution (and role-sensitive behavior stays at its default).
+  delete env.PI_REVIEW_GATE_CONFIG;
+  delete env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  delete env.PI_REVIEW_GATE_DISABLED;
+  return {
+    ...env,
+    HOME: fixture.home,
+    PATH: `${fixture.bin}:${process.env.PATH ?? ""}`,
+    CAPTURE_DIR: fixture.capture,
+    PI_REVIEW_GATE_DDGS_VENV: fixture.ddgsVenv,
+    ...overrides,
+  };
+}
+
+async function runLauncher(args: string[], env: NodeJS.ProcessEnv): Promise<{ stdout: string; stderr: string }> {
+  return execFileAsync(resolve("scripts/pi-review-gate.sh"), args, { env });
+}
+
+async function runLauncherWithUmask(
+  umask: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<{ stdout: string; stderr: string }> {
+  return execFileAsync(
+    "bash",
+    ["-c", "umask \"$1\"; exec bash \"$2\" \"${@:3}\"", "launcher", umask, resolve("scripts/pi-review-gate.sh"), ...args],
+    { env },
+  );
+}
+
+async function capturedConfigPath(fixture: LauncherFixture): Promise<string> {
+  return readFile(join(fixture.capture, "config-env"), "utf8");
+}
+
+async function assertNoTempLitter(dir: string): Promise<void> {
+  const entries = await readdir(dir);
+  assert.ok(
+    !entries.some((entry) => entry.startsWith(".config.json.")),
+    `temporary config files left behind in ${dir}: ${entries.join(", ")}`,
+  );
+}
 
 test("persistent launcher uses the Pi fallback config and forwards arguments", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-launcher-"));
@@ -213,22 +322,325 @@ test("orchestrator recovery reference covers recoverable execution states", asyn
   ]) assert.match(recovery, new RegExp(phrase));
 });
 
-test("persistent launcher fails clearly when no fallback config exists", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-review-launcher-empty-"));
-  const home = join(root, "home");
-  await mkdir(home);
+test("persistent launcher first launch creates a private zero-model default config and continues", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-first-");
 
+  // An inherited PI_REVIEW_GATE_CONFIG must not redirect the first launch:
+  // sanitization still applies, and initialization targets the primary path.
+  const result = await runLauncher(["--model", "example"], launcherEnv(fixture, {
+    PI_REVIEW_GATE_CONFIG: "/wrong/config.json",
+  }));
+
+  assert.match(result.stderr, /no persistent config found; created default zero-model config at/);
+  assert.match(result.stderr, /no reviewers or workers are selected yet; configure them with \/review-settings/);
+  assert.equal(await capturedConfigPath(fixture), fixture.primaryConfigPath);
+  assert.match(result.stdout, new RegExp(escapeRegExp(fixture.primaryConfigPath)));
+
+  const fileStat = await stat(fixture.primaryConfigPath);
+  assert.ok(fileStat.isFile(), "primary config must be a regular file");
+  assert.equal(fileStat.mode & 0o777, 0o600, "new config file must be private (0600)");
+  const dirStat = await stat(join(fixture.home, ".config", "pi-review-gate"));
+  assert.ok(dirStat.isDirectory());
+  assert.equal(dirStat.mode & 0o777, 0o700, "new config directory must be private (0700)");
+
+  const generated = JSON.parse(await readFile(fixture.primaryConfigPath, "utf8")) as unknown;
+  assert.deepEqual(generated, zeroModelDefaultConfig);
+  assert.equal(await stat(fixture.fallbackConfigPath).then(() => true, () => false), false,
+    "first launch must not create the fallback config");
+  await assertNoTempLitter(join(fixture.home, ".config", "pi-review-gate"));
+});
+
+test("persistent launcher subsequent launch preserves an existing primary config", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-second-");
+  const prior = '{"enabled":true,"retainBundles":"always","reviewerTimeoutMs":123456}\n';
+  await mkdir(join(fixture.home, ".config", "pi-review-gate"), { recursive: true });
+  await writeFile(fixture.primaryConfigPath, prior, "utf8");
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  assert.doesNotMatch(result.stderr, /created default zero-model config/);
+  assert.equal(await capturedConfigPath(fixture), fixture.primaryConfigPath);
+  assert.equal(await readFile(fixture.primaryConfigPath, "utf8"), prior, "existing config must not be rewritten");
+  const entries = await readdir(join(fixture.home, ".config", "pi-review-gate"));
+  assert.deepEqual(entries, ["config.json"]);
+});
+
+test("persistent launcher keeps fallback discovery and does not initialize when a fallback exists", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-fallback-keep-");
+  const prior = '{"enabled":true,"marker":"fallback"}\n';
+  await mkdir(join(fixture.home, ".config", "pi"), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, prior, "utf8");
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  assert.equal(await capturedConfigPath(fixture), fixture.fallbackConfigPath);
+  assert.equal(await readFile(fixture.fallbackConfigPath, "utf8"), prior);
+  assert.equal(
+    await stat(join(fixture.home, ".config", "pi-review-gate")).then(() => true, () => false),
+    false,
+    "a present fallback config must not trigger primary initialization",
+  );
+});
+
+test("persistent launcher prefers the primary config over the fallback", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-precedence-");
+  await mkdir(join(fixture.home, ".config", "pi-review-gate"), { recursive: true });
+  await mkdir(join(fixture.home, ".config", "pi"), { recursive: true });
+  await writeFile(fixture.primaryConfigPath, '{"enabled":true,"marker":"primary"}\n', "utf8");
+  await writeFile(fixture.fallbackConfigPath, '{"enabled":true,"marker":"fallback"}\n', "utf8");
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  assert.equal(await capturedConfigPath(fixture), fixture.primaryConfigPath);
+});
+
+test("persistent launcher never replaces a malformed existing config", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-malformed-");
+  const malformed = "{not json";
+  await mkdir(join(fixture.home, ".config", "pi-review-gate"), { recursive: true });
+  await writeFile(fixture.primaryConfigPath, malformed, "utf8");
+
+  // The launcher does not parse the config; it must still hand the malformed
+  // file through untouched so the extension reports its own config error.
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  assert.equal(await capturedConfigPath(fixture), fixture.primaryConfigPath);
+  assert.equal(await readFile(fixture.primaryConfigPath, "utf8"), malformed, "malformed config must be preserved");
+});
+
+test("first-launch default config validates under normalization with zero reviewers and workers", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-zero-model-");
+  await runLauncher([], launcherEnv(fixture));
+
+  const raw = await readFile(fixture.primaryConfigPath, "utf8");
+  const normalized = normalizeConfig(JSON.parse(raw) as unknown);
+  assert.equal(normalized.enabled, true);
+
+  // Explicitly empty selections: nothing resolves, so no model is invoked and
+  // no provider or credential is requested until the user configures one.
+  const resolution = resolveReviewers(normalized);
+  assert.deepEqual(resolution.reviewers, []);
+  assert.deepEqual(resolution.unknownIds, []);
+  assert.equal(automaticReviewEnabled(normalized), false);
+  assert.deepEqual(resolvedWorkerResources(normalized), []);
+  assert.deepEqual(resolvedWorkerRoute(normalized, "execute"), []);
+  assert.deepEqual(resolvedWorkerRoute(normalized, "research"), []);
+  assert.deepEqual(externalAgentCatalog(normalized), []);
+
+  // The actual loader entry point used at extension startup accepts the file.
+  const loaded = loadConfig({ PI_REVIEW_GATE_CONFIG: fixture.primaryConfigPath });
+  assert.equal(loaded.path, fixture.primaryConfigPath);
+  assert.equal(loaded.config.enabled, true);
+  assert.equal(automaticReviewEnabled(loaded.config), false);
+});
+
+test("first-launch default config stays usable for settings persistence", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-settings-");
+  await runLauncher([], launcherEnv(fixture));
+
+  // /review-settings writes through the same atomic update path; the
+  // zero-model file must round-trip without gaining any model selection.
+  const saved = await persistSubtasksViewPreference(fixture.primaryConfigPath, true);
+  assert.equal(saved.ui?.subtasksViewExpanded, true);
+  assert.deepEqual(resolveReviewers(saved).reviewers, []);
+  assert.deepEqual(resolvedWorkerResources(saved), []);
+
+  const updated = JSON.parse(await readFile(fixture.primaryConfigPath, "utf8")) as Record<string, unknown>;
+  assert.deepEqual(updated.review, { activeReviewers: [] });
+  assert.equal((await stat(fixture.primaryConfigPath)).mode & 0o777, 0o600,
+    "settings persistence must keep the private file mode");
+});
+
+test("persistent launcher fails closed when the config directory is not writable", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-perm-");
+  const configDir = join(fixture.home, ".config", "pi-review-gate");
+  await mkdir(configDir, { recursive: true });
+  await chmod(configDir, 0o500);
+  try {
+    await assert.rejects(
+      runLauncher([], launcherEnv(fixture)),
+      (error: unknown) => {
+        assert.ok(isExecError(error));
+        assert.equal(error.code, 2);
+        assert.match(error.stderr, /could not create a temporary file/);
+        return true;
+      },
+    );
+    const entries = await readdir(configDir);
+    assert.deepEqual(entries, [], "no partial config or temp file may be left behind");
+  } finally {
+    await chmod(configDir, 0o755);
+  }
+});
+
+test("persistent launcher fails closed over an existing invalid path at the primary location", async () => {
+  // A directory where the config file belongs.
+  const fixture = await makeLauncherFixture("pi-review-launcher-nonreg-");
+  await mkdir(fixture.primaryConfigPath, { recursive: true });
   await assert.rejects(
-    execFileAsync(resolve("scripts/pi-review-gate.sh"), [], {
-      env: { ...process.env, HOME: home },
-    }),
+    runLauncher([], launcherEnv(fixture)),
     (error: unknown) => {
       assert.ok(isExecError(error));
       assert.equal(error.code, 2);
-      assert.match(error.stderr, /no persistent config found/);
+      assert.match(error.stderr, /exists but is not a regular file/);
       return true;
     },
   );
+  assert.ok((await stat(fixture.primaryConfigPath)).isDirectory(), "the non-regular path must not be removed");
+
+  // A plain file where the .config directory belongs.
+  const blocked = await makeLauncherFixture("pi-review-launcher-dotcfg-");
+  await writeFile(join(blocked.home, ".config"), "not a directory\n", "utf8");
+  await assert.rejects(
+    runLauncher([], launcherEnv(blocked)),
+    (error: unknown) => {
+      assert.ok(isExecError(error));
+      assert.equal(error.code, 2);
+      assert.match(error.stderr, /exists but is not a directory/);
+      return true;
+    },
+  );
+});
+
+test("first launch creates private paths even under a permissive umask", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-umask-");
+  // Record the mode of every directory the launcher's mkdir creates, observed
+  // immediately after creation, so a transient permissive state is caught.
+  // Measure with Node (fs.statSync): it prints exactly one octal value on
+  // every platform, unlike stat(1), whose -f flag means "file system" in GNU
+  // coreutils and can print filesystem info to stdout before failing.
+  const mkdirShim = join(fixture.bin, "mkdir");
+  await writeFile(mkdirShim, [
+    "#!/usr/bin/env bash",
+    "tab=$'\\t'",
+    '/bin/mkdir "$@"',
+    "status=$?",
+    'for a in "$@"; do',
+    '  [[ "$a" == "$HOME/"* && -d "$a" ]] || continue',
+    '  if ! grep -qF "${a}${tab}" "$CAPTURE_DIR/mkdir-modes" 2>/dev/null; then',
+    "    printf '%s\\t%s\\n' \"$a\" \"$(node -e 'process.stdout.write((require(\"node:fs\").statSync(process.argv[1]).mode&0o777).toString(8))' \"$a\")\" >> \"$CAPTURE_DIR/mkdir-modes\"",
+    "  fi",
+    "done",
+    "exit $status",
+  ].join("\n"), "utf8");
+  await chmod(mkdirShim, 0o755);
+
+  // With umask 0, naively created directories would be world-writable; every
+  // config level the launcher creates must be private from the instant of
+  // creation.
+  await runLauncherWithUmask("0", [], launcherEnv(fixture));
+
+  const logged = (await readFile(join(fixture.capture, "mkdir-modes"), "utf8"))
+    .split("\n")
+    .filter((line) => line.length > 0);
+  const configDirs = logged.filter((line) => line.startsWith(join(fixture.home, ".config")));
+  assert.ok(configDirs.length >= 2, `expected the created config directories to be recorded: ${logged.join(" | ")}`);
+  for (const line of configDirs) {
+    const [path, mode] = line.split("\t");
+    assert.equal(parseInt(mode, 8) & 0o777, 0o700,
+      `config directory ${path} must be private from the instant of creation despite umask 0`);
+  }
+  assert.equal((await stat(join(fixture.home, ".config"))).mode & 0o777, 0o700,
+    "newly created .config must be private despite umask 0");
+  assert.equal((await stat(join(fixture.home, ".config", "pi-review-gate"))).mode & 0o777, 0o700,
+    "newly created gate directory must be private despite umask 0");
+  assert.equal((await stat(fixture.primaryConfigPath)).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(await readFile(fixture.primaryConfigPath, "utf8")), zeroModelDefaultConfig);
+});
+
+test("first launch preserves permissions of directories created by a competing process", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-dirmode-");
+  // Simulate the creation race deterministically: every directory the launcher
+  // tries to create already exists (created at 0755 by the shim, standing in
+  // for a concurrent launch) before the real mkdir runs and fails with EEXIST.
+  const mkdirShim = join(fixture.bin, "mkdir");
+  await writeFile(mkdirShim, [
+    "#!/usr/bin/env bash",
+    'for a in "$@"; do',
+    '  [[ "$a" == "$HOME/"* ]] || continue',
+    '/bin/mkdir -m 755 -p "$a" 2>/dev/null || true',
+    "done",
+    'exec /bin/mkdir "$@"',
+  ].join("\n"), "utf8");
+  await chmod(mkdirShim, 0o755);
+
+  // A directory created by another process keeps its permissions:
+  // initialization must only create what is missing, never re-chmod a level
+  // it did not create itself.
+  await runLauncher([], launcherEnv(fixture));
+
+  assert.equal((await stat(join(fixture.home, ".config"))).mode & 0o777, 0o755,
+    "a .config directory created by another process must keep its permissions");
+  assert.equal((await stat(join(fixture.home, ".config", "pi-review-gate"))).mode & 0o777, 0o755,
+    "a gate directory created by another process must not be chmodded by initialization");
+  assert.equal((await stat(fixture.primaryConfigPath)).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(await readFile(fixture.primaryConfigPath, "utf8")), zeroModelDefaultConfig);
+});
+
+test("persistent launcher fails closed when a directory appears at the config path before publication", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-dir-race-");
+  // Deterministically race the publish step: intercept the launcher's node
+  // invocation and create a directory at the exact destination before the
+  // linkSync call runs. Exact-destination link semantics must reject it.
+  const nodeShim = join(fixture.bin, "node");
+  await writeFile(nodeShim, [
+    "#!/usr/bin/env bash",
+    'if [[ "$1" == "-e" && "$2" == *linkSync* ]]; then',
+    '  mkdir -p "$4" 2>/dev/null || true',
+    "fi",
+    `exec "${process.execPath}" "$@"`,
+  ].join("\n"), "utf8");
+  await chmod(nodeShim, 0o755);
+
+  await assert.rejects(
+    runLauncher([], launcherEnv(fixture)),
+    (error: unknown) => {
+      assert.ok(isExecError(error));
+      assert.equal(error.code, 2);
+      assert.match(error.stderr, /appeared during initialization but is not a regular file/);
+      return true;
+    },
+  );
+
+  const configDir = join(fixture.home, ".config", "pi-review-gate");
+  assert.ok((await stat(fixture.primaryConfigPath)).isDirectory(), "the racing directory must not be removed");
+  assert.deepEqual(await readdir(fixture.primaryConfigPath), [], "no file may be linked into the directory");
+  await assertNoTempLitter(configDir);
+  assert.equal(
+    await readFile(join(fixture.capture, "config-env"), "utf8").then(() => true, () => false),
+    false,
+    "the launcher must not start pi when publication fails",
+  );
+});
+
+test("concurrent first launches never clobber or expose partial JSON", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-race-");
+  const racerCount = 8;
+  const racers = Array.from({ length: racerCount }, async (_value, index) => {
+    const capture = join(fixture.root, `capture-${index + 1}`);
+    await mkdir(capture, { recursive: true });
+    const env = launcherEnv({ ...fixture, capture });
+    const result = await runLauncher([], env);
+    return { result, capture };
+  });
+
+  const settled = await Promise.all(racers);
+  for (const { result, capture } of settled) {
+    assert.doesNotMatch(
+      result.stderr,
+      /refusing to|could not (create|write|set)|unexpected failure/,
+      "racers must not report initialization failures",
+    );
+    assert.equal(await readFile(join(capture, "config-env"), "utf8"), fixture.primaryConfigPath,
+      "every racer must resolve the same primary config");
+  }
+
+  const fileStat = await stat(fixture.primaryConfigPath);
+  assert.ok(fileStat.isFile());
+  assert.equal(fileStat.mode & 0o777, 0o600);
+  const generated = JSON.parse(await readFile(fixture.primaryConfigPath, "utf8")) as unknown;
+  assert.deepEqual(generated, zeroModelDefaultConfig, "the surviving config must be the complete default");
+  await assertNoTempLitter(join(fixture.home, ".config", "pi-review-gate"));
 });
 
 test("ensure-ddgs provisions and validates Python in isolated mode", async () => {

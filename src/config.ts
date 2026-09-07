@@ -28,6 +28,7 @@ export type BrowserInteractionApproval = "ask" | "automatically-accept" | "autom
 export interface WebConfig {
   enabled: boolean;
   browserInteractionApproval: BrowserInteractionApproval;
+  browserIdleExpiryMinutes: number;
   search: WebSearchConfig;
   fetch: WebFetchConfig;
 }
@@ -257,6 +258,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   web: {
     enabled: true,
     browserInteractionApproval: "ask",
+    browserIdleExpiryMinutes: 15,
     search: { provider: "ddgs", timeoutMs: 20_000, maxResults: 10 },
     fetch: {
       timeoutMs: 30_000,
@@ -372,6 +374,9 @@ function normalizeWeb(value: unknown): WebConfig {
   return {
     enabled: value.enabled ?? defaults.enabled,
     browserInteractionApproval: browserInteractionApproval as BrowserInteractionApproval,
+    browserIdleExpiryMinutes: positiveIntegerOrDefault(
+      value.browserIdleExpiryMinutes, defaults.browserIdleExpiryMinutes, "web.browserIdleExpiryMinutes",
+    ),
     search: {
       provider,
       timeoutMs: positiveIntegerOrDefault(search.timeoutMs, defaults.search.timeoutMs, "web.search.timeoutMs"),

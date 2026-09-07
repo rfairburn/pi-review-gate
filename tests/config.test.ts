@@ -72,6 +72,18 @@ test("browser interaction approval defaults to Ask and rejects every invalid con
   }
 });
 
+test("browser idle expiry defaults to 15 positive integer minutes", () => {
+  for (const input of [{}, { web: {} }, { web: { browserIdleExpiryMinutes: undefined } }]) {
+    assert.equal(normalizeConfig(input).web!.browserIdleExpiryMinutes, 15);
+  }
+  for (const minutes of [1, 30, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(normalizeConfig({ web: { browserIdleExpiryMinutes: minutes } }).web!.browserIdleExpiryMinutes, minutes);
+  }
+  for (const minutes of [0, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, null, "15", false]) {
+    assert.throws(() => normalizeConfig({ web: { browserIdleExpiryMinutes: minutes } }), /web.browserIdleExpiryMinutes must be a positive safe integer/);
+  }
+});
+
 test("native web tooling has bounded defaults and validates overrides", () => {
   const defaults = normalizeConfig({}).web!;
   assert.equal(defaults.enabled, true);

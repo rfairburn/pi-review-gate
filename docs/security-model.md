@@ -78,18 +78,17 @@ blocked in both modes, and every outbound connection is recorded in a broker-own
 connection ledger that is audited before a `BrowserExtract` render result is returned;
 that one-shot browser and its broker sockets quiesce before extraction is exposed.
 Interactive browsers instead remain live across turns and reviews until explicit close
-or terminal session teardown: all interactive CONNECT tunnels are exempt from ordinary
-idle eviction because the broker cannot distinguish encrypted HTTPS from live WSS,
-while hard budgets,
-close, and shutdown still drain every socket. Local browser protocols (`about:`, `blob:`, `data:`) remain
-narrowly allowed only for non-media, non-visual in-process resources; local image/font
-payloads are blocked so admitted visual resources cannot evade broker byte accounting.
+or terminal session teardown, subject to configured tool-inactivity expiry. Interactive
+established streams are not idle-evicted; concurrent capacity, close, expiry and shutdown
+still bound owned sockets. Local browser protocols (`about:`, `blob:`, `data:`) support
+in-process rendering, including images/fonts/media; they do not themselves open network
+connections. Background page traffic does not renew the tool-activity lease.
 
 `BrowserExtract` aborts images, media, and fonts before any connection. Interactive
-sessions block media, images, and custom/downloadable fonts as well. Images are disabled
-in Chromium's rendering engine, remote fonts are disabled, and image/font requests are
-also denied at routing so generated `data:` or `blob:` visual payloads cannot bypass
-broker byte accounting. `BrowserScreenshot` captures only the already-rendered viewport
+sessions instead allow images, downloadable fonts, media, SSE and HTTP beacons through
+the same protected broker. Dedicated/shared workers retain broker-only egress; service
+workers remain blocked. CSP, CORS, TLS validation, nonproxied-WebRTC restrictions,
+default-deny DNS, and no-QUIC/proxy-bypass defenses are unchanged. `BrowserScreenshot` captures only the already-rendered viewport
 or an element addressed by a current opaque semantic ref; it does not admit a new
 network path. Bounded scroll/wait/history/form controls and every owned tab or admitted
 popup stay inside the same context and authenticated broker; the four-tab cap closes
@@ -101,16 +100,19 @@ final encoded bytes are capped, and a conservative
 allocation charge includes decoded, encoded, and base64-content storage. Image bytes are
 excluded from review-gate diagnostics/details and are retained only where Pi's native
 image message itself requires them. Results disclose bounded omission diagnostics (capped samples plus
-a dropped count) alongside explicit per-render or per-session budgets (distinct hostnames, concurrent broker client connections and their
-pre-authentication idle deadline, destination connections, per-connection and aggregate
-bytes, authority/header lengths, socket idle time, and total time for one-shot renders).
+a dropped count). Extraction retains cumulative host/connection/request/byte and render
+time budgets. Interactive mode instead admits at most 64 concurrent client and 64 upstream
+connections, retains pre-authentication deadlines and authority/header bounds, and has
+no cumulative traffic, host or operation quotas. Excess capacity refusals are local and
+observable, not session-fatal; closed ledger history is bounded to 256 plus active entries,
+with pruned history counted. Console/network retention is separately capped at 256 events
+and 1 MiB per channel across the session. This does not bound Chromium page memory.
 Interactive sessions have finite action deadlines but no elapsed browser-lifetime limit.
-Quiet socket eviction destroys the connection and records opaque tunnel completion as
-unconfirmed without sending a fatal policy/budget notification to the interactive
-owner. Interactive CONNECT tunnels are instead retained through ordinary idle, but
-close, shutdown, and hard budget aborts still drain them. Fresh connections still
-revalidate DNS; actions are never replayed automatically.
-Hard security and byte/request/connection budget failures still contain the browser.
+Close, expiry, shutdown and genuine security refusals still drain owned resources. Fresh
+connections revalidate DNS; actions are never replayed automatically. Local Chromium gets
+five seconds for graceful teardown before verified-owned forced termination, followed by
+up to five seconds of verification. The pinned local Playwright ownership bridge preserves
+isolated selectors and fails closed if unsupported; no arbitrary PID kill is permitted.
 For `BrowserExtract`, a budget that destroys an in-flight transfer is nonfatal only when
 the main document completed; main-document failures, non-2xx navigations, oversized
 rendered HTML, and any ledger audit failure fail the render closed.

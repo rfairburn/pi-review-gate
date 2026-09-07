@@ -960,7 +960,8 @@ test("the request budget bounds upgrade attempts like every other request", asyn
 // HTTP idle timer unless the owner opts into an idle bound.
 // ---------------------------------------------------------------------------
 
-test("quiet live connections survive ordinary idle windows only under the explicit opt-in", async () => {
+for (const interactive of [false, true]) {
+test(`quiet live connections survive ordinary idle windows (interactive=${interactive})`, async () => {
   const origin = await echoOrigin();
   const { auth, credentials } = testAuth();
   // Broker A: opted in with a SHORT live idle bound — eviction still happens,
@@ -973,8 +974,8 @@ test("quiet live connections survive ordinary idle windows only under the explic
   // Broker B: opted in with idle eviction DISABLED for live transports.
   const live = await startBroker(testResolver({ "ws.test": [publicAnswer] }), {
     auth,
-    budgets: { idleSocketMs: 300 },
-    websockets: { enabled: true, liveIdleSocketMs: null },
+    budgets: { idleSocketMs: 300, mode: interactive ? "interactive" : "extraction" },
+    websockets: { enabled: true, liveIdleSocketMs: interactive ? 300 : null },
   });
   const strictClient = new TestWsClient(strict.port);
   const liveClient = new TestWsClient(live.port);
@@ -1002,6 +1003,7 @@ test("quiet live connections survive ordinary idle windows only under the explic
     await close(origin.server);
   }
 });
+}
 
 test("owner close and hard failure still drain opted-in live connections", async () => {
   const origin = await echoOrigin();

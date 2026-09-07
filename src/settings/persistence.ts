@@ -33,6 +33,7 @@ export interface ReviewSettingsSelection {
   subtasksViewExpanded: boolean;
   webMaxDownloadBytes?: number;
   browserInteractionApproval?: BrowserInteractionApproval;
+  browserIdleExpiryMinutes?: number;
 }
 
 const configUpdateTails = new Map<string, Promise<void>>();
@@ -81,7 +82,7 @@ export async function persistReviewSettings(
     const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
     ui.subtasksViewExpanded = selection.subtasksViewExpanded;
     parsed.ui = ui;
-    if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined) {
+    if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined) {
       const web = isRecord(parsed.web) ? { ...parsed.web } : {};
       if (selection.webMaxDownloadBytes !== undefined) {
         const fetch = isRecord(web.fetch) ? { ...web.fetch } : {};
@@ -90,6 +91,9 @@ export async function persistReviewSettings(
       }
       if (selection.browserInteractionApproval !== undefined) {
         web.browserInteractionApproval = selection.browserInteractionApproval;
+      }
+      if (selection.browserIdleExpiryMinutes !== undefined) {
+        web.browserIdleExpiryMinutes = selection.browserIdleExpiryMinutes;
       }
       parsed.web = web;
     }

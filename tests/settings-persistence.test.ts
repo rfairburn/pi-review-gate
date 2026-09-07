@@ -45,6 +45,29 @@ test("browser approval persistence round-trips every mode and preserves unrelate
   }
 });
 
+test("idle expiry persists safely and omitted or invalid updates preserve existing settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-idle-expiry-"));
+  const configPath = join(dir, "config.json");
+  try {
+    const web = { enabled: false, future: { keep: true }, browserInteractionApproval: "automatically-deny", search: { maxResults: 7 }, fetch: { timeoutMs: 12345 } };
+    await writeFile(configPath, JSON.stringify({ futureRoot: true, web }));
+    const normalized = await persistReviewSettings(configPath, { ...selection, browserIdleExpiryMinutes: 42 });
+    assert.equal(normalized.web!.browserIdleExpiryMinutes, 42);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.futureRoot, true);
+    assert.deepEqual(saved.web, { ...web, browserIdleExpiryMinutes: 42 });
+    assert.equal((await persistReviewSettings(configPath, selection)).web!.browserIdleExpiryMinutes, 42);
+    const before = await readFile(configPath, "utf8");
+    for (const minutes of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(persistReviewSettings(configPath, { ...selection, browserIdleExpiryMinutes: minutes }), /web.browserIdleExpiryMinutes/);
+      assert.equal(await readFile(configPath, "utf8"), before);
+    }
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("persistReviewSettings preserves restrictive configuration permissions", async (t) => {
   if (process.platform === "win32") t.skip("POSIX modes are required");
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-mode-"));

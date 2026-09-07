@@ -506,6 +506,9 @@ test("first launch creates private paths even under a permissive umask", async (
   const fixture = await makeLauncherFixture("pi-review-launcher-umask-");
   // Record the mode of every directory the launcher's mkdir creates, observed
   // immediately after creation, so a transient permissive state is caught.
+  // Measure with Node (fs.statSync): it prints exactly one octal value on
+  // every platform, unlike stat(1), whose -f flag means "file system" in GNU
+  // coreutils and can print filesystem info to stdout before failing.
   const mkdirShim = join(fixture.bin, "mkdir");
   await writeFile(mkdirShim, [
     "#!/usr/bin/env bash",
@@ -515,7 +518,7 @@ test("first launch creates private paths even under a permissive umask", async (
     'for a in "$@"; do',
     '  [[ "$a" == "$HOME/"* && -d "$a" ]] || continue',
     '  if ! grep -qF "${a}${tab}" "$CAPTURE_DIR/mkdir-modes" 2>/dev/null; then',
-    "    printf '%s\\t%s\\n' \"$a\" \"$(stat -f '%Lp' \"$a\" 2>/dev/null || stat -c '%a' \"$a\")\" >> \"$CAPTURE_DIR/mkdir-modes\"",
+    "    printf '%s\\t%s\\n' \"$a\" \"$(node -e 'process.stdout.write((require(\"node:fs\").statSync(process.argv[1]).mode&0o777).toString(8))' \"$a\")\" >> \"$CAPTURE_DIR/mkdir-modes\"",
     "  fi",
     "done",
     "exit $status",

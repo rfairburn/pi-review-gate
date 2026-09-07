@@ -105,7 +105,7 @@ test("operation-specific execution tools expose exact durable schemas", () => {
   const expectedProperties: Record<string, string[]> = {
     SubtasksStart: ["kind", "tasks"],
     SubtasksAdd: ["executionId", "tasks"],
-    SubtasksInspect: ["executionId", "taskId", "offset", "lines"],
+    SubtasksInspect: ["executionId", "taskId", "offset", "lines", "evidence"],
     SubtasksWatch: ["executionId", "after"],
     SubtasksContinue: ["executionId", "taskId", "bundle", "instructions", "instructionId"],
     SubtasksSteer: ["executionId", "taskId", "instructions", "instructionId"],

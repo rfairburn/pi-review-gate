@@ -13,6 +13,7 @@ import {
   type BackgroundTaskDefinition,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
+import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_MAX, type SubtaskEvidenceSelector } from "./subtask-evidence";
 import {
   completionNotificationGuidanceLine,
   lifecycleWakeGuidanceLine,
@@ -135,6 +136,7 @@ interface NormalizedInput {
   mergeAnyhow?: boolean;
   offset?: number;
   lines?: number;
+  evidence?: SubtaskEvidenceSelector;
   afterMs?: number;
 }
 
@@ -386,7 +388,7 @@ export class ExecutionToolManager {
         case "inspect": {
           // Finding 15: exact task handles also recover settled tasks whose
           // records were archived (lazily loaded and integrity-checked).
-          const inspection = await this.controller.inspectTask(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines);
+          const inspection = await this.controller.inspectTask(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines, normalized.evidence);
           return backgroundResult("inspect", inspection, false);
         }
         case "watch": {
@@ -559,8 +561,23 @@ function toolSchema(action: Action): Record<string, unknown> {
     case "inspect":
       properties.executionId = executionId;
       properties.taskId = taskId;
-      properties.offset = { type: "integer", minimum: 0, description: "Absolute activity offset for detailed inspection." };
-      properties.lines = { type: "integer", minimum: 1, maximum: 500, description: "Activity lines to return, up to 500." };
+      properties.offset = { type: "integer", minimum: 0, description: "Absolute activity offset for detailed inspection. Mutually exclusive with evidence." };
+      properties.lines = { type: "integer", minimum: 1, maximum: 500, description: "Activity lines to return, up to 500. Mutually exclusive with evidence." };
+      properties.evidence = {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          find: { type: "string", minLength: 1, description: "Case-insensitive search across the task's indexed executor evidence (tool calls/results, process outcomes, worker claims, reviewer findings). Returns bounded snippets; continue with entryId deep reads." },
+          index: { type: "integer", minimum: 0, description: "Start position for a ranged evidence read (within the filtered sequence when filter is set)." },
+          limit: { type: "integer", minimum: 1, maximum: EVIDENCE_LIMIT_MAX, description: `Entries per evidence read, up to ${EVIDENCE_LIMIT_MAX}.` },
+          cursor: { type: "string", minLength: 1, description: "Opaque cursor from a prior unfiltered evidence read; returns only newer entries. Expired, replaced, or ambiguous cursors are rejected explicitly." },
+          callId: { type: "string", minLength: 1, description: "Read one tool call and its linked result by pairing id (in-flight calls report no observed result)." },
+          filter: { type: "string", enum: [...EVIDENCE_FILTERS], description: "Restrict evidence navigation to one category." },
+          entryId: { type: "string", minLength: 1, description: "Deep-read one evidence entry's retained content in bounded chunks (continue with chunkIndex)." },
+          chunkIndex: { type: "integer", minimum: 0, description: "Chunk number for an entryId deep read." },
+        },
+        description: "Bounded read-only navigation over the task's durable executor evidence. Mutually exclusive with offset/lines. Streams are observed data; worker claims never imply verification.",
+      };
       break;
     case "watch":
       properties.executionId = executionId;
@@ -663,6 +680,12 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     if (typeof value.mergeAnyhow !== "boolean") throw new Error("mergeAnyhow must be boolean");
     normalized.mergeAnyhow = value.mergeAnyhow;
   }
+  if (value.evidence !== undefined) {
+    normalized.evidence = normalizeEvidenceSelector(value.evidence);
+    if (normalized.offset !== undefined || normalized.lines !== undefined) {
+      throw new Error("evidence navigation is mutually exclusive with offset/lines activity paging");
+    }
+  }
   const allowed = allowedKeys(action);
   for (const key of Object.keys(value)) if (!allowed.has(key)) throw new Error(`${key} is not valid for action ${action}`);
   if ((action === "start" || action === "add") && !normalized.tasks) throw new Error(`${action} requires tasks`);
@@ -679,7 +702,7 @@ function allowedKeys(action: Action): Set<string> {
   switch (action) {
     case "start": return new Set(["kind", "tasks"]);
     case "add": return new Set(["executionId", "tasks"]);
-    case "inspect": return new Set(["executionId", "taskId", "offset", "lines"]);
+    case "inspect": return new Set(["executionId", "taskId", "offset", "lines", "evidence"]);
     case "watch": return new Set(["executionId", "after"]);
     case "continue": return new Set(["executionId", "taskId", "bundle", "instructions", "instructionId"]);
     case "steer": return new Set(["executionId", "taskId", "instructions", "instructionId"]);
@@ -687,6 +710,32 @@ function allowedKeys(action: Action): Set<string> {
     case "force_merge": return new Set(["executionId", "taskId", "mergeAnyhow", "instructionId"]);
     case "mark_clean": return new Set();
   }
+}
+
+function normalizeEvidenceSelector(value: unknown): SubtaskEvidenceSelector {
+  if (!isRecord(value)) throw new Error("evidence must be an object");
+  const allowed = new Set(["find", "index", "limit", "cursor", "callId", "filter", "entryId", "chunkIndex"]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`evidence.${key} is not a valid evidence navigation field`);
+  }
+  const selector: SubtaskEvidenceSelector = {};
+  for (const name of ["find", "cursor", "callId", "entryId"] as const) {
+    const fieldValue = value[name];
+    if (fieldValue === undefined) continue;
+    if (typeof fieldValue !== "string" || fieldValue.length === 0) throw new Error(`evidence.${name} must be a non-empty string`);
+    selector[name] = fieldValue;
+  }
+  if (value.filter !== undefined) {
+    if (!EVIDENCE_FILTERS.includes(value.filter)) throw new Error(`evidence.filter must be one of: ${EVIDENCE_FILTERS.join(", ")}`);
+    selector.filter = value.filter;
+  }
+  if (value.index !== undefined) selector.index = optionalInteger(value.index, "evidence.index", 0, Number.MAX_SAFE_INTEGER)!;
+  if (value.limit !== undefined) selector.limit = optionalInteger(value.limit, "evidence.limit", 1, EVIDENCE_LIMIT_MAX)!;
+  if (value.chunkIndex !== undefined) selector.chunkIndex = optionalInteger(value.chunkIndex, "evidence.chunkIndex", 0, Number.MAX_SAFE_INTEGER)!;
+  const exclusiveModes = [selector.find, selector.cursor, selector.callId].filter((field) => field !== undefined).length;
+  if (selector.entryId && exclusiveModes > 0) throw new Error("evidence.entryId cannot be combined with find/cursor/callId");
+  if (exclusiveModes > 1) throw new Error("evidence.find, evidence.cursor, and evidence.callId are mutually exclusive");
+  return selector;
 }
 
 function normalizeTasks(value: unknown): BackgroundTaskDefinition[] {
@@ -779,6 +828,83 @@ function formatInspectionForModel(summary: string, inspection: BackgroundInspect
     if (activity.length > 0) {
       lines.push("  recent historical activity (earlier phases may be superseded; the current state/outcome above is authoritative):");
       for (const event of activity) lines.push(`  - ${event.sequence} · ${event.phase} · ${clipPlain(event.message, 500)}`);
+    }
+  }
+  if (inspection.evidence) {
+    const evidence = inspection.evidence;
+    lines.push(
+      `Evidence (${evidence.mode}): ${evidence.snapshot.totalEntries} indexed entr${evidence.snapshot.totalEntries === 1 ? "y" : "ies"} across ${evidence.snapshot.sources.length} source(s). Streams are observed data; worker claims never imply verification.`,
+    );
+    for (const source of evidence.snapshot.sources.slice(0, 8)) {
+      lines.push(`  source: ${source.sourceId} · ${source.adapter}/${source.stream} · ${source.records} record(s)`);
+    }
+    if (evidence.snapshot.capability.toolEvidence === "unavailable") {
+      lines.push(`  tool evidence unavailable: ${evidence.snapshot.capability.reason ?? "no tool records"}`);
+    }
+    for (const item of evidence.snapshot.unavailable.slice(0, 5)) {
+      lines.push(`  unavailable: ${item.source ?? "task"} · ${item.reason} · ${clipPlain(item.detail, 300)}`);
+    }
+    const context = evidence.context;
+    if (context) {
+      if (context.state) lines.push(`  authoritative state: ${context.state}`);
+      if (context.currentCommand) {
+        lines.push(
+          `  current command (in flight; result NOT yet observed): ${context.currentCommand.toolName ?? "tool"} ${clipPlain(context.currentCommand.preview, 200)}${context.currentCommand.elapsedMs !== undefined ? ` · running ~${Math.round(context.currentCommand.elapsedMs / 1000)}s` : ""} · entry ${context.currentCommand.entryId}`,
+        );
+      }
+      if (context.assignment?.history.length) {
+        const current = context.assignment.current ? `current: ${context.assignment.current.adapter ?? "?"}${context.assignment.current.model ? `/${context.assignment.current.model}` : ""}; ` : "";
+        lines.push(`  assignments: ${current}${context.assignment.history.map((item) => `${item.reason}@${item.at.slice(0, 19)} (${item.adapter ?? "?"})`).join(", ")}`);
+      }
+      if (context.steering?.length) {
+        lines.push(`  steering: ${context.steering.map((item) => `${item.action} ${item.instructionId} · ${item.status}`).join(", ")}`);
+      }
+      if (context.changedFiles) {
+        const paths = context.changedFiles.untrackedPaths && context.changedFiles.untrackedPaths.length > 0
+          ? `[tracked: ${context.changedFiles.trackedPaths.join(", ")} | untracked task files: ${context.changedFiles.untrackedPaths.join(", ")}]`
+          : `paths: ${context.changedFiles.trackedPaths.join(", ") || "(none recorded)"}`;
+        lines.push(`  changed files (${context.changedFiles.landingStatus}): ${paths} — ${clipPlain(context.changedFiles.note, 300)}`);
+      }
+      if (context.review) {
+        lines.push(`  review: aggregate ${context.review.aggregate} over ${context.review.cycles} cycle(s); latest reviewers: ${context.review.reviewers.map((reviewer) => `${reviewer.reviewerId}=${reviewer.verdict}`).join(", ")}`);
+      }
+    }
+    for (const entry of evidence.entries ?? []) {
+      const meta = [
+        entry.kind,
+        entry.toolName,
+        entry.status,
+        entry.provenance,
+        entry.at ? entry.at.slice(0, 19) : undefined,
+      ].filter(Boolean).join(" · ");
+      lines.push(`  [${entry.index}] ${entry.entryId} — ${meta}${entry.truncatedContent ? " · truncated" : ""}`);
+      if (entry.preview) lines.push(`    ${clipPlain(entry.preview, 400)}`);
+      if (entry.pairedWith) lines.push(`    paired with: ${entry.pairedWith}`);
+    }
+    if (evidence.nextIndex !== undefined) {
+      lines.push(`  more entries available: continue the ranged read with index=${evidence.nextIndex}.`);
+    }
+    if (evidence.cursor) {
+      lines.push(`  incremental continuation: pass this cursor back in a later inspect to receive only newer evidence (expired/replaced cursors are rejected explicitly): ${evidence.cursor}`);
+    }
+    if (evidence.matchSummary) {
+      lines.push(`  matches for \"${clipPlain(evidence.matchSummary.query, 80)}\": ${evidence.matchSummary.totalMatches} total${evidence.matchSummary.matchesTruncated ? " (list truncated)" : ""}.`);
+      for (const match of evidence.matches ?? []) {
+        lines.push(`  match [${match.index}] ${match.entryId} (${match.kind}): ${clipPlain(match.snippet, 300)}`);
+      }
+    }
+    if (evidence.deepContent) {
+      const deep = evidence.deepContent;
+      lines.push(`  deep read ${deep.entryId} · chunk ${deep.chunkIndex} · ${deep.contentBytes} retained byte(s)${deep.truncatedContent ? " · source record truncated at retention cap" : ""}:`);
+      for (const contentLine of clipPlain(deep.content, 8_000).split("\n")) lines.push(`    ${contentLine}`);
+      if (deep.note) lines.push(`  note: ${clipPlain(deep.note, 200)}`);
+      if (deep.hasMore) lines.push(`  more content: continue with entryId=${deep.entryId} chunkIndex=${deep.nextChunk}.`);
+    }
+    if (evidence.callPair) {
+      const pair = evidence.callPair;
+      lines.push(`  call ${pair.call?.callId ?? "?"}: status ${pair.status}${pair.call ? ` · call [${pair.call.index}] ${clipPlain(pair.call.preview, 300)}` : " · no call record found"}`);
+      if (pair.result) lines.push(`    result [${pair.result.index}] · ${pair.result.status ?? "unknown"}: ${clipPlain(pair.result.preview, 400)}`);
+      else lines.push("    result: not observed yet (in flight). A later in-flight status is never evidence of success.");
     }
   }
   return lines.join("\n");

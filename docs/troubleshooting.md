@@ -8,16 +8,21 @@ underlying behavior.
 - **The gate does not activate.**
   - `PI_REVIEW_GATE_DISABLED=1` (or `true`/`yes`) disables the whole extension,
     including delegated execution. The launcher warns loudly when it is set.
-  - No config file was found. For the launcher, create one of its two persistent paths
-    (`~/.config/pi-review-gate/config.json` first, then `~/.config/pi/review-gate.json`) —
-    it deliberately ignores an exported `PI_REVIEW_GATE_CONFIG`. For direct `pi -e`
-    loading, set `PI_REVIEW_GATE_CONFIG` instead. See
+  - No config file was found on a direct `pi -e` load. Set `PI_REVIEW_GATE_CONFIG`, or
+    create one of the two persistent paths (`~/.config/pi-review-gate/config.json`
+    first, then `~/.config/pi/review-gate.json`). The launcher deliberately ignores an
+    exported `PI_REVIEW_GATE_CONFIG`; it creates a zero-model default config at the
+    primary path on first launch instead of failing. See
     [Configuration](configuration.md#config-discovery).
   - The config file must be a JSON object; malformed JSON fails with an error.
-- **`pi-review-gate.sh: no persistent config found`.** Neither persistent path exists.
-  The launcher only reads `~/.config/pi-review-gate/config.json` or
-  `~/.config/pi/review-gate.json` and deliberately ignores an exported
-  `PI_REVIEW_GATE_CONFIG`; create one of the two files. See
+- **First launch reports it could not create the default config.** The launcher
+  initializes `~/.config/pi-review-gate/config.json` only when neither persistent path
+  exists, and fails closed without touching anything else. `could not create directory`
+  or `could not create a temporary file` means your user cannot write to the target
+  location under `$HOME`; fix permissions (or provide a writable `HOME`).
+  `exists but is not a directory` or `exists but is not a regular file` means something
+  else occupies `.config`, the gate directory, or the config file; move or rename it.
+  Then re-run, or create a config manually at either persistent path. See
   [Getting started](getting-started.md#launching).
 - **`pi-review-gate: packaged extension is missing`.** The launcher could not find
   `dist/src/index.js` and no `src/index.ts` was present to build from. Run

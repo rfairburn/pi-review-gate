@@ -24,6 +24,135 @@ unset PI_REVIEW_GATE_CONFIG
 # the extension so loadConfig() cleanly refuses to activate. Unsetting it here
 # would silently defeat the kill switch.
 
+# First-launch initialization (issue 32): when neither discovered config exists,
+# create a private zero-model default config at the preferred location and
+# continue normal startup. It never overwrites an existing or malformed config,
+# never exposes partial JSON at the final path, and never clobbers a config that
+# a concurrent launch created in the same window. Only the resolved path is
+# printed to stdout; all notices go to stderr.
+initialize_default_review_gate_config() {
+  local primary="$HOME/.config/pi-review-gate/config.json"
+  local fallback="$HOME/.config/pi/review-gate.json"
+  local dir probe parent level tmp i prev_umask
+  local missing=()
+
+  # Re-check discovery: another launch (or the user) may have created a config
+  # between the first pass and now. Preserve the same precedence.
+  for candidate in "$primary" "$fallback"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  dir="$(dirname "$primary")"
+  # Collect the missing directory levels (leaf first) without touching any
+  # level that already exists, so pre-existing directories keep their mode.
+  probe="$dir"
+  while [[ ! -d "$probe" ]]; do
+    missing+=("$probe")
+    parent="$(dirname "$probe")"
+    if [[ "$parent" == "$probe" ]]; then
+      break
+    fi
+    if [[ -e "$parent" && ! -d "$parent" ]]; then
+      echo "pi-review-gate: $parent exists but is not a directory; cannot create $dir for the default config" >&2
+      echo "pi-review-gate: move or rename that path, or create a config manually at $primary or $fallback" >&2
+      return 1
+    fi
+    probe="$parent"
+  done
+  # Create top-down. Each level is created private from the instant of
+  # creation (local umask 077 plus mkdir -m 700), so no level ever exists in a
+  # permissive state; if a concurrent launch wins the creation race, mkdir
+  # fails with EEXIST and its permissions are left untouched.
+  prev_umask="$(umask)"
+  umask 077
+  for ((i = ${#missing[@]} - 1; i >= 0; i--)); do
+    level="${missing[i]}"
+    if ! mkdir -m 700 "$level" 2>/dev/null && [[ ! -d "$level" ]]; then
+      umask "$prev_umask"
+      echo "pi-review-gate: could not create directory $level (permission denied?); check write access to your home directory, or create a config manually at $primary or $fallback" >&2
+      return 1
+    fi
+  done
+  umask "$prev_umask"
+
+  if [[ -e "$primary" || -L "$primary" ]]; then
+    # It appeared after the discovery re-check; only a regular file is usable.
+    if [[ -f "$primary" ]]; then
+      printf '%s\n' "$primary"
+      return 0
+    fi
+    echo "pi-review-gate: $primary exists but is not a regular file; refusing to initialize over it" >&2
+    echo "pi-review-gate: move or rename that path, or create a config manually at $fallback" >&2
+    return 1
+  fi
+
+  tmp="$(mktemp "$dir/.config.json.XXXXXXXX")" || {
+    echo "pi-review-gate: could not create a temporary file in $dir (permission denied?); check write access to your home directory, or create a config manually at $primary or $fallback" >&2
+    return 1
+  }
+  if ! chmod 600 "$tmp"; then
+    rm -f "$tmp"
+    echo "pi-review-gate: could not set private permissions on the new default config; refusing to continue with a non-private config file" >&2
+    return 1
+  fi
+  # Zero-model defaults: explicitly empty reviewer and worker selections, so
+  # nothing is invoked or configured implicitly until the user opts in.
+  if ! cat > "$tmp" <<'EOF'
+{
+  "enabled": true,
+  "review": {
+    "activeReviewers": []
+  },
+  "execution": {
+    "workerResources": [],
+    "routes": {
+      "execute": [],
+      "research": []
+    }
+  }
+}
+EOF
+  then
+    rm -f "$tmp"
+    echo "pi-review-gate: could not write the default config content to $dir (permission denied? or disk full?); create a config manually at $primary or $fallback" >&2
+    return 1
+  fi
+
+  # Publish atomically with exact-destination link(2) semantics (Node's
+  # fs.linkSync): the call fails when the target already exists in any form —
+  # file, directory, or symlink — so a concurrent first launch can never be
+  # clobbered, a destination that turns into a directory is rejected instead
+  # of linked into, and the final path never holds partial JSON. The temporary
+  # name stays private in $dir until it is linked into place or removed.
+  if ! command -v node >/dev/null 2>&1; then
+    rm -f "$tmp"
+    echo "pi-review-gate: the node runtime is required to publish the default config (install Node.js 20 or newer); create a config manually at $primary or $fallback" >&2
+    return 1
+  fi
+  if node -e 'require("node:fs").linkSync(process.argv[1], process.argv[2]);' "$tmp" "$primary" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "pi-review-gate: no persistent config found; created default zero-model config at $primary" >&2
+    echo "pi-review-gate: no reviewers or workers are selected yet; configure them with /review-settings" >&2
+    printf '%s\n' "$primary"
+    return 0
+  fi
+  rm -f "$tmp"
+  if [[ -f "$primary" ]]; then
+    # A concurrent launch won the race; its config is authoritative from here.
+    printf '%s\n' "$primary"
+    return 0
+  fi
+  if [[ -e "$primary" || -L "$primary" ]]; then
+    echo "pi-review-gate: $primary appeared during initialization but is not a regular file; refusing to continue" >&2
+    return 1
+  fi
+  echo "pi-review-gate: unexpected failure publishing the default config to $primary (the target path changed mid-initialization?); re-run the launcher or create a config manually at $primary" >&2
+  return 1
+}
+
 REVIEW_GATE_CONFIG=""
 for candidate in \
   "$HOME/.config/pi-review-gate/config.json" \
@@ -36,11 +165,7 @@ do
 done
 
 if [[ -z "$REVIEW_GATE_CONFIG" ]]; then
-  echo "pi-review-gate: no persistent config found" >&2
-  echo "checked:" >&2
-  echo "  $HOME/.config/pi-review-gate/config.json" >&2
-  echo "  $HOME/.config/pi/review-gate.json" >&2
-  exit 2
+  REVIEW_GATE_CONFIG="$(initialize_default_review_gate_config)" || exit 2
 fi
 
 if [[ -f "$REVIEW_GATE_ROOT/src/index.ts" ]]; then

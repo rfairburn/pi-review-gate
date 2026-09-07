@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.11]
+
+### Added
+
+- First launch no longer requires a hand-created config: when neither
+  `~/.config/pi-review-gate/config.json` nor `~/.config/pi/review-gate.json` exists,
+  the persistent launcher now initializes a private (directory `0700`, file `0600`)
+  default config at the preferred location and continues normal startup. The generated
+  config is valid with explicitly empty reviewer and worker selections — no models are
+  selected, providers invoked, or credentials requested — so automatic review stays off
+  until reviewers are configured through `/review-settings` or by editing the file,
+  which remains fully usable from this state. Existing primary and fallback configs keep
+  their discovery precedence and are never overwritten, including malformed ones;
+  concurrent first launches publish atomically and can never clobber each other's config
+  or expose partial JSON, and creation failures (permission errors, non-regular paths at
+  the config location) fail closed with distinct actionable diagnostics (Closes #32).
+
 ## [0.1.0-dev.10]
 
 ### Changed

@@ -10,8 +10,12 @@ described only briefly here is owned by the linked page.
 - The persistent launcher (`scripts/pi-review-gate.sh`) selects the first existing file
   from `~/.config/pi-review-gate/config.json` or `~/.config/pi/review-gate.json` and
   deliberately re-resolves (and re-exports) the variable so an inherited value from a
-  parent pi session cannot silently redirect the gate elsewhere.
-- With no config file found, `enabled` defaults to `false`, so automatic review does not
+  parent pi session cannot silently redirect the gate elsewhere. When neither exists,
+  it initializes a private zero-model default config at the primary path — explicitly
+  empty reviewer and worker selections, never overwriting or replacing anything that is
+  already there — and continues normal startup.
+- With no config file found on a direct `pi -e` load (no `PI_REVIEW_GATE_CONFIG` and
+  neither persistent path), `enabled` defaults to `false`, so automatic review does not
   run — but the extension still loads `WebSearch`, `WebFetch`, `ApplyPatch`, and the
   background shell. Model-facing subtask tools require at least one resolvable configured
   worker resource. Only `PI_REVIEW_GATE_DISABLED` disables the whole extension.

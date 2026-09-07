@@ -453,6 +453,41 @@ test("deferred Pi tools toggle is staged, persisted, and labeled for local/new-s
   assert.equal(appliedImmediately, false);
 });
 
+test("browser idle expiry validates, stages, cancels and reloads through Web settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-idle-"));
+  const configPath = join(dir, "review-gate.json");
+  const original = JSON.stringify({ enabled: false, review: { activeReviewers: [] }, web: { future: true } });
+  await writeFile(configPath, original);
+  const config = normalizeConfig(JSON.parse(original));
+  const registered = commandHarness();
+  const reloaded: number[] = [];
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: (next) => { reloaded.push(next.web!.browserIdleExpiryMinutes); } });
+  const webRow = rootSettingsRow("Web", "50 MiB max download");
+  const idleRow = webSettingsRow("Browser idle expiry", "15 minutes");
+  await registered.handler("", contextWithSelections([webRow, idleRow, "Back", "Cancel"], [], ["30"]));
+  assert.equal(await readFile(configPath, "utf8"), original);
+  assert.equal(config.web!.browserIdleExpiryMinutes, 15);
+  assert.deepEqual(reloaded, []);
+
+  const invalid = ["0", "-1", "1.5", "NaN", "Infinity", "9007199254740992", "", "abc"];
+  const errors: string[] = [];
+  const ctx = contextWithSelections([
+    webRow, ...invalid.map(() => idleRow), idleRow, idleRow,
+    webSettingsRow("Browser idle expiry", "30 minutes"), "Back", "Save changes",
+  ], [], [...invalid, undefined, "30", undefined]) as { ui: { notify: (message: string, type?: string) => void } };
+  ctx.ui.notify = (message, type) => { if (type === "error") errors.push(message); };
+  await registered.handler("", ctx);
+  assert.equal(errors.length, invalid.length);
+  assert.ok(errors.every((message) => message.includes("positive safe whole number of minutes")));
+  assert.equal(config.web!.browserIdleExpiryMinutes, 30);
+  assert.deepEqual(reloaded, [30]);
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserIdleExpiryMinutes, 30);
+  assert.equal(saved.web.future, true);
+  assert.equal(saved.web.browserInteractionApproval, "ask");
+  assert.equal(saved.web.fetch.maxDownloadBytes, 50 * 1024 * 1024);
+});
+
 test("web settings stage and save the maximum download size in MiB", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-web-"));
   const configPath = join(dir, "review-gate.json");
@@ -692,7 +727,7 @@ const RETRY_SETTING_LABELS = [
   "Delay jitter",
 ] as const;
 
-const WEB_SETTING_LABELS = ["Maximum download", "Browser interaction approval"] as const;
+const WEB_SETTING_LABELS = ["Maximum download", "Browser interaction approval", "Browser idle expiry"] as const;
 
 function rootSettingsRow(label: typeof ROOT_SETTING_LABELS[number], value: string): string {
   return alignedTestRow(label, value, ROOT_SETTING_LABELS);

@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import {
+  DEFAULT_CONFIG,
   DEFAULT_DEFERRED_PI_TOOLS,
   DEFAULT_EXECUTION_RETRY_POLICY,
   DEFAULT_MAX_WORKERS,
@@ -86,6 +87,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
   let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
   let browserInteractionApproval = input.config.web!.browserInteractionApproval ?? "ask";
+  let browserIdleExpiryMinutes = input.config.web!.browserIdleExpiryMinutes ?? DEFAULT_CONFIG.web!.browserIdleExpiryMinutes;
 
   while (true) {
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
@@ -201,8 +203,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       continue;
     }
     if (choice === webRow) {
-      ({ maxDownloadBytes: webMaxDownloadBytes, browserInteractionApproval } = await selectWebSettings(
-        input.ui, webMaxDownloadBytes, browserInteractionApproval,
+      ({ maxDownloadBytes: webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes } = await selectWebSettings(
+        input.ui, webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes,
       ));
       continue;
     }
@@ -228,6 +230,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       subtasksViewExpanded,
       webMaxDownloadBytes,
       browserInteractionApproval,
+      browserIdleExpiryMinutes,
     });
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config);
@@ -246,16 +249,19 @@ async function selectWebSettings(
   ui: UiContext,
   initialMaxDownloadBytes: number,
   initialApproval: BrowserInteractionApproval,
-): Promise<{ maxDownloadBytes: number; browserInteractionApproval: BrowserInteractionApproval }> {
+  initialIdleExpiryMinutes: number,
+): Promise<{ maxDownloadBytes: number; browserInteractionApproval: BrowserInteractionApproval; browserIdleExpiryMinutes: number }> {
   let maxDownloadBytes = initialMaxDownloadBytes;
   let browserInteractionApproval = initialApproval;
+  let browserIdleExpiryMinutes = initialIdleExpiryMinutes;
   while (true) {
-    const [downloadRow, approvalRow] = alignedSettingsRows([
+    const [downloadRow, approvalRow, idleExpiryRow] = alignedSettingsRows([
       ["Maximum download", formatByteSize(maxDownloadBytes)],
       ["Browser interaction approval", BROWSER_APPROVAL_CHOICES[browserInteractionApproval]],
+      ["Browser idle expiry", `${browserIdleExpiryMinutes} minutes`],
     ]);
-    const choice = await ui.select("Web settings", [downloadRow, approvalRow, "Back"]);
-    if (!choice || choice === "Back") return { maxDownloadBytes, browserInteractionApproval };
+    const choice = await ui.select("Web settings", [downloadRow, approvalRow, idleExpiryRow, "Back"]);
+    if (!choice || choice === "Back") return { maxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes };
     if (choice === approvalRow) {
       await notify(ui, "Only confirmation-required actions: Ask prompts (no UI rejects); Automatically Accept approves without UI; Automatically Deny rejects. Already-permitted observations/local actions stay permitted; hard safety and role restrictions remain. Saved changes apply locally now and to newly launched workers.", "info");
       const selected = await ui.select("Browser interaction approval", Object.values(BROWSER_APPROVAL_CHOICES));
@@ -265,6 +271,17 @@ async function selectWebSettings(
     }
     if (!ui.input) {
       await notify(ui, "This UI does not support numeric input.", "error");
+      continue;
+    }
+    if (choice === idleExpiryRow) {
+      const entered = await ui.input("Browser idle expiry in minutes", String(browserIdleExpiryMinutes));
+      if (entered === undefined) continue;
+      const minutes = Number(entered.trim());
+      if (!Number.isSafeInteger(minutes) || minutes <= 0) {
+        await notify(ui, "Enter a positive safe whole number of minutes (at least 1); idle expiry cannot be disabled.", "error");
+        continue;
+      }
+      browserIdleExpiryMinutes = minutes;
       continue;
     }
     const entered = await ui.input("Maximum download size in MiB", String(maxDownloadBytes / (1024 * 1024)));

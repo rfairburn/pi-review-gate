@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import * as net from "node:net";
 import type { AddressInfo } from "node:net";
@@ -9,6 +10,7 @@ import { normalizeConfig, type BrowserInteractionApproval } from "../src/config"
 import { WebToolManager } from "../src/web/tools";
 import { BrowserConfirmationPermits, type BrowserTargetStructure } from "../src/web/browser-interaction-policy";
 import {
+  BrowserFailureError,
   InteractiveBrowserManager,
   interactiveChromiumArgs,
   interactiveRouteDecision,
@@ -18,6 +20,42 @@ const ONE_PIXEL_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
 );
+
+test("WebToolManager constructor and sync apply idle expiry and tool activity renews it", async () => {
+  let now = 0;
+  const browser = new FakeBrowser();
+  const config = normalizeConfig({ web: { browserIdleExpiryMinutes: 1 } });
+  const manager = new InteractiveBrowserManager(config.web!.fetch, {
+    now: () => now,
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => browser as unknown as Browser,
+  });
+  const tools: Array<{ name: string; execute(id: string, params: Record<string, unknown>): Promise<any> }> = [];
+  const boundary = new WebToolManager({ registerTool: tool => tools.push(tool as never) }, config, undefined, undefined, manager);
+  boundary.register();
+  const call = (name: string, params: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("idle-test", params);
+  try {
+    const result = await call("BrowserOpen", { url: "https://example.com/" });
+    const { session, tab } = result.details.response;
+    now = 59_000;
+    await call("BrowserSnapshot", { session, tab });
+    now = 118_999;
+    boundary.sync(config);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(manager.activeSessionCount(), 1);
+    // A longer persisted setting must take effect on the existing session.
+    boundary.sync(normalizeConfig({ web: { browserIdleExpiryMinutes: 2 } }));
+    now = 120_000;
+    boundary.sync(normalizeConfig({ web: { browserIdleExpiryMinutes: 2 } }));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(manager.activeSessionCount(), 1);
+    now = 179_000;
+    boundary.sync(normalizeConfig({ web: { browserIdleExpiryMinutes: 2 } }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await assert.rejects(call("BrowserSnapshot", { session, tab }), /expired.*BrowserOpen/s);
+    assert.equal(manager.activeSessionCount(), 0);
+  } finally { await boundary.cleanup(); }
+});
 
 function pngWithDimensions(width: number, height: number, bytes = ONE_PIXEL_PNG.byteLength) {
   const image = Buffer.alloc(Math.max(bytes, 24));
@@ -292,6 +330,73 @@ function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boo
   return { manager, browser };
 }
 
+test("child navigation invalidates old refs and approval-time targets; capture failure remains typed through tools", async () => {
+  const { manager, browser } = managerFixture();
+  const page = browser.context.page;
+  const child = { url: () => "https://frame.example/" };
+  const tools: Array<{ name: string; execute(id: string, params: Record<string, unknown>): Promise<unknown> }> = [];
+  const boundary = new WebToolManager({ registerTool: tool => tools.push(tool as never) }, normalizeConfig({}), undefined, undefined, manager);
+  boundary.register();
+  try {
+    const opened = await manager.open("https://example.com/");
+    const first = await manager.snapshot(opened.session, opened.tab, 1000);
+    const oldRef = first.snapshot.match(/\[ref=([^\]]+)\]/)![1]!;
+    page.emit("framenavigated", child);
+    await assert.rejects(manager.click(opened.session, opened.tab, oldRef), /invalid or stale/);
+    const next = await manager.snapshot(opened.session, opened.tab, 1000);
+    const ref = next.snapshot.match(/\[ref=([^\]]+)\]/)![1]!;
+    page.targetStructure.inlineEventHandler = true;
+    await assert.rejects(manager.click(opened.session, opened.tab, ref, async () => {
+      page.emit("framenavigated", child);
+      return true;
+    }), /not_started/);
+    assert.equal(page.clickCalls, 0);
+    const snapshot = page.ariaSnapshot.bind(page);
+    page.ariaSnapshot = async () => { page.emit("framenavigated", child); return snapshot(); };
+    await assert.rejects(tools.find(tool => tool.name === "BrowserSnapshot")!.execute("frame-test", { session: opened.session, tab: opened.tab }),
+      /phase=capture; category=document_changed.*stale evidence was rejected.*session was closed/);
+    assert.equal(manager.activeSessionCount(), 0);
+  } finally { await boundary.cleanup(); }
+});
+
+test("manager capacity refusals remain local, observable and recover after client close", async () => {
+  const browser = new FakeBrowser();
+  let port = 0;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async options => {
+      port = Number(new URL(options!.proxy!.server).port);
+      return browser as unknown as Browser;
+    },
+  });
+  const sockets: net.Socket[] = [];
+  const connect = async () => {
+    const socket = net.connect({ host: "127.0.0.1", port });
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+    return socket;
+  };
+  try {
+    const opened = await manager.open("https://example.com/");
+    for (let i = 0; i < 64; i++) await connect();
+    const excess = await connect();
+    await new Promise<void>(resolve => excess.once("close", resolve));
+    assert.equal(manager.activeSessionCount(), 1);
+    const diagnostics = await manager.network(opened.session, opened.tab);
+    assert.equal(diagnostics.brokerCapacityRefusals, 1);
+    sockets[0]!.destroy();
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const replacement = await connect();
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(replacement.destroyed, false);
+    assert.equal((await manager.network(opened.session, opened.tab)).brokerCapacityRefusals, 1);
+    await manager.snapshot(opened.session, opened.tab, 1000);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await manager.shutdown();
+  }
+});
+
 test("inspect sanitization does not turn readonly or disabled controls editable", async () => {
   const fixture = managerFixture();
   try {
@@ -332,15 +437,17 @@ test("inspect fails closed without the isolated base reader rather than falling 
 });
 
 test("interactive browser route and launch policy has no direct-network escape hatch", () => {
-  assert.equal(interactiveRouteDecision("image", "https://cdn.example/a.png").allowed, false);
-  assert.equal(interactiveRouteDecision("font", "https://cdn.example/a.woff2").allowed, false);
-  assert.equal(interactiveRouteDecision("media", "https://cdn.example/a.mp4").allowed, false);
-  assert.equal(interactiveRouteDecision("media", "blob:https://example.com/media-id").allowed, false);
-  assert.equal(interactiveRouteDecision("media", "data:video/mp4;base64,AAAA").allowed, false);
-  assert.equal(interactiveRouteDecision("image", "blob:https://example.com/image-id").allowed, false);
-  assert.equal(interactiveRouteDecision("image", "data:image/png;base64,AAAA").allowed, false);
-  assert.equal(interactiveRouteDecision("font", "data:font/woff2;base64,AAAA").allowed, false);
-  assert.equal(interactiveRouteDecision("eventsource", "https://example.com/events").allowed, false);
+  assert.equal(interactiveRouteDecision("image", "https://cdn.example/a.png").allowed, true);
+  assert.equal(interactiveRouteDecision("font", "https://cdn.example/a.woff2").allowed, true);
+  assert.equal(interactiveRouteDecision("media", "https://cdn.example/a.mp4").allowed, true);
+  assert.equal(interactiveRouteDecision("media", "blob:https://example.com/media-id").allowed, true);
+  assert.equal(interactiveRouteDecision("media", "data:video/mp4;base64,AAAA").allowed, true);
+  assert.equal(interactiveRouteDecision("image", "blob:https://example.com/image-id").allowed, true);
+  assert.equal(interactiveRouteDecision("image", "data:image/png;base64,AAAA").allowed, true);
+  assert.equal(interactiveRouteDecision("font", "data:font/woff2;base64,AAAA").allowed, true);
+  assert.equal(interactiveRouteDecision("eventsource", "https://example.com/events").allowed, true);
+  assert.equal(interactiveRouteDecision("ping", "https://example.com/beacon").allowed, true);
+  assert.equal(interactiveRouteDecision("websocket", "wss://example.com/ws").allowed, false);
   assert.equal(interactiveRouteDecision("document", "file:///etc/passwd").allowed, false);
   assert.equal(interactiveRouteDecision("document", "mailto:test@example.com").allowed, false);
   assert.equal(interactiveRouteDecision("script", "data:text/javascript,void(0)").allowed, true);
@@ -351,8 +458,7 @@ test("interactive browser route and launch policy has no direct-network escape h
   assert.match(args, /disable-quic/);
   assert.match(args, /disable_non_proxied_udp/);
   assert.match(args, /host-resolver-rules=MAP \* ~NOTFOUND/);
-  assert.match(args, /blink-settings=imagesEnabled=false/);
-  assert.match(args, /disable-remote-fonts/);
+  assert.doesNotMatch(args, /imagesEnabled=false|disable-remote-fonts|no-pings/);
   assert.match(args, /disable-background-networking/);
 });
 
@@ -1940,9 +2046,14 @@ test("real Chromium follows a public redirect only through the pinned broker dia
     assert.ok(animatedImage.metadata.width <= 65 && animatedImage.metadata.height <= 25,
       "paused finite animation is not fast-forwarded to its oversized final keyframe after preflight");
 
+    // The exact SSRF boundary: a main-document redirect target that resolves
+    // to a private address fails the navigation with the structured denial
+    // category, not a generic network error.
     await assert.rejects(
       manager.navigate(opened.session, opened.tab, `http://public.test:${originPort}/private-redirect`),
-      /egress policy|ERR_FAILED|navigation/i,
+      (error: unknown) => error instanceof BrowserFailureError
+        && error.phase === "broker_admission"
+        && error.category === "non_public_address_denied",
     );
     assert.equal(dials.some((dial) => dial.startsWith("127.0.0.1:")), false, "private redirect is refused before dial");
     const closed = await manager.close(opened.session);
@@ -1955,13 +2066,13 @@ test("real Chromium follows a public redirect only through the pinned broker dia
   }
 });
 
-test("real Chromium does not load data/blob images or custom downloadable fonts", async () => {
+test("real Chromium loads data/blob images and valid downloadable fonts", async () => {
   const requests: string[] = [];
   const origin = createServer((request, response) => {
     requests.push(request.url ?? "");
     if (request.url === "/font.ttf") {
       response.writeHead(200, { "content-type": "font/ttf" });
-      response.end(Buffer.alloc(256, 1));
+      response.end(readFileSync(require.resolve("pdfjs-dist/standard_fonts/LiberationSans-Regular.ttf")));
       return;
     }
     const port = (origin.address() as AddressInfo).port;
@@ -2003,11 +2114,10 @@ test("real Chromium does not load data/blob images or custom downloadable fonts"
   try {
     const opened = await manager.open(`http://visual.test:${port}/visual`);
     const snapshot = await manager.snapshot(opened.session, opened.tab, 4_000);
-    assert.match(snapshot.snapshot, /data image blocked/);
-    assert.match(snapshot.snapshot, /blob image blocked/);
-    assert.match(snapshot.snapshot, /custom font blocked/);
-    assert.doesNotMatch(snapshot.snapshot, /(?:data image|blob image|custom font) loaded/);
-    assert.equal(requests.includes("/font.ttf"), false, "custom font is blocked before broker/origin transfer");
+    assert.match(snapshot.snapshot, /data image loaded/);
+    assert.match(snapshot.snapshot, /blob image loaded/);
+    assert.match(snapshot.snapshot, /custom font loaded/);
+    assert.equal(requests.includes("/font.ttf"), true, "valid custom font transfers through the broker");
     await manager.close(opened.session);
   } finally {
     await manager.shutdown();
@@ -2106,8 +2216,8 @@ test("browser diagnostics are bounded, redacted, cursor-based, ref-scoped, and m
   page.emit("requestfailed", failed);
   const policyRequest = {
     method: () => "GET",
-    url: () => "https://images.example.com/secret/path?token=never",
-    resourceType: () => "image",
+    url: () => "file:///secret/path?token=never",
+    resourceType: () => "document",
     frame: () => ({ page: () => page }),
   };
   await browser.context.routeHandler?.({
@@ -2123,7 +2233,7 @@ test("browser diagnostics are bounded, redacted, cursor-based, ref-scoped, and m
   assert.doesNotMatch(serializedNetwork, /customer|another|authorization|Bearer-secret|cookie=secret|failure-secret|headers|postData|body/);
   assert.match(serializedNetwork, /https:\/\/api\.example\.com/);
   assert.match(serializedNetwork, /policy_blocked/);
-  assert.match(serializedNetwork, /image resource blocked/);
+  assert.match(serializedNetwork, /external protocol file: blocked/);
 
   const snapshot = await manager.snapshot(opened.session, opened.tab, 1_000);
   const ref = snapshot.snapshot.match(/\[ref=([^\]]+)\]/)?.[1];

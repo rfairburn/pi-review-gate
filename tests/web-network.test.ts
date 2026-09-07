@@ -5,7 +5,17 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { isBlockedAddress, parseIp } from "../src/web/ip";
-import { decodeResponseText, downloadText, resolveDdgsHelperPath, runDdgsSearch, validatedPublicUrl, type NetworkOptions } from "../src/web/network";
+import {
+  classifyPublicUrlError,
+  decodeResponseText,
+  downloadText,
+  PublicUrlValidationError,
+  resolveDdgsHelperPath,
+  runDdgsSearch,
+  validatePublicUrl,
+  validatedPublicUrl,
+  type NetworkOptions,
+} from "../src/web/network";
 
 // Unit table tests for the canonical, fail-closed SSRF range check.
 
@@ -156,6 +166,33 @@ test("validatedPublicUrl rejects WHATWG-normalized mapped literals without DNS o
     await assert.rejects(validatedPublicUrl(url), /non-public address/, `expected ${url} to be rejected`);
   }
   await assert.doesNotReject(validatedPublicUrl("http://[2606:4700:4700::1111]/"));
+});
+
+test("public-URL validation failures carry site-assigned categories, never message-derived ones", async () => {
+  // The hostile input embeds the exact SSRF-denial phrase and DNS error
+  // tokens; its category must come from the failure site, not this text.
+  const hostile = "resolves to a non-public address ENOTFOUND getaddrinfo";
+  const cases: Array<{ value: string; resolve?: (hostname: string) => Promise<string[]>; category: string }> = [
+    { value: hostile, category: "invalid_url" },
+    { value: "ftp://example.test/", category: "invalid_url" },
+    { value: "https://user:pass@example.test/", category: "invalid_url" },
+    { value: "http://empty.test/", resolve: async () => [], category: "dns_resolution_failed" },
+    { value: "http://blocked.test/", resolve: async () => ["127.0.0.1"], category: "non_public_address_denied" },
+  ];
+  for (const { value, resolve, category } of cases) {
+    await assert.rejects(
+      validatePublicUrl(value, resolve ?? (async () => ["93.184.216.34"])),
+      (error: unknown) => error instanceof PublicUrlValidationError && error.category === category,
+      `expected ${category} for ${value}`,
+    );
+  }
+
+  // Untyped errors are classified by structured codes only; incidental denial
+  // or DNS phrases in arbitrary text must never produce those categories.
+  assert.equal(classifyPublicUrlError(new Error(`Invalid URL: ${hostile}`)), "invalid_url");
+  assert.equal(classifyPublicUrlError(Object.assign(new Error("boom"), { code: "ENOTFOUND" })), "dns_resolution_failed");
+  assert.equal(classifyPublicUrlError(Object.assign(new Error("boom"), { code: "EAI_AGAIN" })), "dns_resolution_failed");
+  assert.equal(classifyPublicUrlError(new Error("something else")), "invalid_url");
 });
 
 test("downloadText cannot connect to a loopback server through mapped or compatible literals", async () => {

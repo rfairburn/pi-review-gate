@@ -58,9 +58,19 @@ import * as http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as net from "node:net";
 import type { AddressInfo } from "node:net";
-import { validatePublicUrl, type HostResolver, type ValidatedUrl } from "./network";
+import { classifyPublicUrlError, validatePublicUrl, type HostResolver, type ValidatedUrl } from "./network";
+
+/** Interactive removes lifetime and established-transport idle quotas only.
+ * Authentication, public resolution/pinning, header limits, pre-auth and WS
+ * handshake deadlines remain enforced. WebSocket enablement is separate.
+ */
+export type EgressBrokerMode = "extraction" | "interactive";
+export const INTERACTIVE_EGRESS_CAPACITY = 64;
+export const INTERACTIVE_EGRESS_HISTORY = 256;
 
 export interface EgressBudgets {
+  /** Explicit opt-in; omitted means extraction. Interactive ignores lifetime quotas. */
+  mode?: EgressBrokerMode;
   /** Distinct destination hostnames admitted per render. */
   maxDistinctHosts: number;
   /** Outbound connections (dialed sockets) per render. */
@@ -154,6 +164,8 @@ export interface EgressBrokerWebSocketPolicy {
 
 export interface EgressSummary {
   ledger: readonly BrokerLedgerEntry[];
+  /** Closed interactive entries pruned from the ledger; extraction never prunes. */
+  ledgerDropped?: number;
   /** Bounded omission diagnostics (each entry is length-bounded). */
   omissions: readonly string[];
   /** Omissions beyond the diagnostics cap, counted only. */
@@ -164,13 +176,49 @@ export interface EgressSummary {
   refusals: number;
 }
 
+/** Structured identity of one refused or budget-aborted destination. */
+export interface EgressPolicyDestination {
+  kind: "http" | "connect" | "ws";
+  /** Validated public hostname (lowercase, brackets stripped); safe to retain. */
+  hostname: string;
+  port: number;
+}
+
+/**
+ * Safe refusal category chosen at the broker call site. Fixed codes only:
+ * owners classify from this field instead of parsing diagnostic text.
+ */
+export type EgressRefusalCategory =
+  | "invalid_url"
+  | "budget_exhausted"
+  | "dns_resolution_failed"
+  | "non_public_address_denied"
+  | "policy_refused";
+
+/** Structured, safe context for one observer policyFailure notification. */
+export interface EgressPolicyFailureContext {
+  destination?: EgressPolicyDestination;
+  category?: EgressRefusalCategory;
+}
+
 /**
  * Optional lifecycle observer used by a persistent interactive browser
  * session. BrowserExtract deliberately omits it and keeps its existing
  * per-render result policy.
  */
+export interface EgressCapacityRefusalContext {
+  category: "capacity_exhausted";
+  destination?: EgressPolicyDestination;
+}
+
 export interface EgressBrokerObserver {
-  policyFailure(reason: "refusal" | "budget_abort", diagnostic: string): void;
+  /** Local overload only: never sent to policyFailure and never requires teardown. */
+  capacityRefusal?(context: EgressCapacityRefusalContext): void;
+  policyFailure(
+    reason: "refusal" | "budget_abort",
+    diagnostic: string,
+    context?: EgressPolicyFailureContext,
+  ): void;
 }
 
 /**
@@ -250,7 +298,53 @@ export class EgressBroker {
   private readonly idleAttached = new WeakSet<net.Socket>();
   private readonly ledger: BrokerLedgerEntry[] = [];
   private readonly omissionEntries: string[] = [];
-  private readonly abortedEntries = new Set<BrokerLedgerEntry>();
+  private readonly abortedEntries = new WeakSet<BrokerLedgerEntry>();
+  private readonly activeEntries = new Set<BrokerLedgerEntry>();
+  private activeUpstreams = 0;
+  private readonly clientUpstreams = new WeakMap<net.Socket, Set<net.Socket>>();
+  private ledgerDropped = 0;
+  private readonly reservations = new WeakMap<ValidatedUrl, () => void>();
+
+  private get interactive(): boolean { return this.budgets.mode === "interactive"; }
+
+  private releaseAdmission(validated: ValidatedUrl | undefined): void {
+    if (!validated) return;
+    this.reservations.get(validated)?.();
+    this.reservations.delete(validated);
+  }
+
+  private dialAdmitted(validated: ValidatedUrl, port: number, client: net.Socket): net.Socket {
+    if (this.closed || client.destroyed || client.readableEnded) throw new Error("Egress client closed before dial.");
+    const socket = this.dial(validated, port);
+    const release = this.reservations.get(validated);
+    this.reservations.delete(validated);
+    if (release) socket.once("close", release);
+    this.track(socket);
+    let peers = this.clientUpstreams.get(client);
+    if (!peers) {
+      peers = new Set();
+      this.clientUpstreams.set(client, peers);
+    }
+    peers.add(socket);
+    socket.once("close", () => peers.delete(socket));
+    return socket;
+  }
+
+  private recordEntry(entry: BrokerLedgerEntry, socket: net.Socket): void {
+    this.ledger.push(entry);
+    if (!this.interactive) return;
+    this.activeEntries.add(entry);
+    socket.once("close", () => {
+      this.activeEntries.delete(entry);
+      let historical = this.ledger.length - this.activeEntries.size;
+      for (let i = 0; historical > INTERACTIVE_EGRESS_HISTORY && i < this.ledger.length;) {
+        if (this.activeEntries.has(this.ledger[i]!)) { i++; continue; }
+        this.ledger.splice(i, 1);
+        historical--;
+        this.ledgerDropped++;
+      }
+    });
+  }
   private readonly hosts = new Set<string>();
   private omissionsDropped = 0;
   private budgetAborts = 0;
@@ -300,6 +394,10 @@ export class EgressBroker {
 
   private async startListening(): Promise<number> {
     const server = http.createServer();
+    if (this.interactive) {
+      server.keepAliveTimeout = 0;
+      server.requestTimeout = 0;
+    }
     server.on("connection", (socket) => this.admitClient(socket));
     server.on("request", (request, response) => {
       void this.handlePlainProxyRequest(request, response).catch(() => undefined);
@@ -435,6 +533,7 @@ export class EgressBroker {
   summary(): EgressSummary {
     return {
       ledger: [...this.ledger],
+      ledgerDropped: this.ledgerDropped,
       omissions: [...this.omissionEntries],
       omissionsDropped: this.omissionsDropped,
       budgetAborts: this.budgetAborts,
@@ -443,10 +542,14 @@ export class EgressBroker {
   }
 
   /** Record and surface a policy refusal to persistent-session owners. */
-  private recordPolicyRefusal(diagnostic: string): void {
+  private recordPolicyRefusal(diagnostic: string, context?: EgressPolicyFailureContext | EgressCapacityRefusalContext): void {
     this.refusals += 1;
     this.note(diagnostic);
-    this.observer?.policyFailure("refusal", diagnostic);
+    if (context?.category === "capacity_exhausted") {
+      this.observer?.capacityRefusal?.(context);
+    } else {
+      this.observer?.policyFailure("refusal", diagnostic, context);
+    }
   }
 
   private track(socket: net.Socket): void {
@@ -459,6 +562,8 @@ export class EgressBroker {
     // errored socket must be torn down (autoDestroy), never crash the process.
     socket.on("error", () => undefined);
     socket.on("close", () => {
+      for (const upstream of this.clientUpstreams.get(socket) ?? []) upstream.destroy();
+      this.clientUpstreams.delete(socket);
       this.sockets.delete(socket);
       this.clientSockets.delete(socket);
     });
@@ -480,8 +585,8 @@ export class EgressBroker {
       socket.destroy();
       return;
     }
-    if (this.clientSockets.size >= this.budgets.maxClientConnections) {
-      this.recordPolicyRefusal(`egress broker refused client connection: client-connection budget (${this.budgets.maxClientConnections}) exhausted.`);
+    if (this.clientSockets.size >= (this.interactive ? INTERACTIVE_EGRESS_CAPACITY : this.budgets.maxClientConnections)) {
+      this.recordPolicyRefusal(`egress broker refused client connection: client-connection budget (${this.interactive ? INTERACTIVE_EGRESS_CAPACITY : this.budgets.maxClientConnections}) exhausted.`, { category: this.interactive ? "capacity_exhausted" : "budget_exhausted" });
       socket.destroy();
       return;
     }
@@ -504,7 +609,6 @@ export class EgressBroker {
     socket.on("timeout", () => {
       if (!this.preAuthSockets.has(socket)) return;
       this.note(`pre-authentication idle deadline (${this.budgets.preAuthSocketMs}ms) destroyed an idle client socket.`);
-      this.clientSockets.delete(socket);
       socket.destroy();
     });
   }
@@ -548,43 +652,77 @@ export class EgressBroker {
       this.note(`${kind} destination refused: broker is closing.`);
       return undefined;
     }
-    if (this.budgets.maxTotalMs !== null && Date.now() - this.startedAtMs >= this.budgets.maxTotalMs) {
-      this.recordPolicyRefusal(`${kind} destination refused: total-time budget (${this.budgets.maxTotalMs}ms) exhausted.`);
+    if (!this.interactive && this.budgets.maxTotalMs !== null && Date.now() - this.startedAtMs >= this.budgets.maxTotalMs) {
+      const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+      this.recordPolicyRefusal(
+        `${kind} destination refused: total-time budget (${this.budgets.maxTotalMs}ms) exhausted.`,
+        { category: "budget_exhausted", destination: { kind, hostname, port: Number(url.port) || (kind === "http" ? 80 : 443) } },
+      );
       return undefined;
     }
     const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
     // Opted-in WebSocket upgrades must never disclose the request path, query,
     // or userinfo in diagnostics: only the validated hostname and port.
     const target = kind === "ws" ? boundedText(`${hostname}:${url.port || 80}`) : boundedText(url.href);
+    const destination: EgressPolicyDestination = {
+      kind,
+      hostname,
+      port: Number(url.port) || (kind === "http" ? 80 : 443),
+    };
     const firstSeenHost = !this.hosts.has(hostname);
     // Synchronous reservation: no await may happen between these checks and
     // the increments.
-    if (firstSeenHost && this.hosts.size >= this.budgets.maxDistinctHosts) {
-      this.recordPolicyRefusal(`${kind} destination refused: distinct-host budget (${this.budgets.maxDistinctHosts}) exhausted for ${boundedText(hostname)}.`);
+    if (!this.interactive && firstSeenHost && this.hosts.size >= this.budgets.maxDistinctHosts) {
+      this.recordPolicyRefusal(
+        `${kind} destination refused: distinct-host budget (${this.budgets.maxDistinctHosts}) exhausted for ${boundedText(hostname)}.`,
+        { destination, category: "budget_exhausted" },
+      );
       return undefined;
     }
-    if (this.connectionCount >= this.budgets.maxConnections) {
-      this.recordPolicyRefusal(`${kind} destination refused: connection budget (${this.budgets.maxConnections}) exhausted for ${target}.`);
+    if (!this.interactive && this.connectionCount >= this.budgets.maxConnections) {
+      this.recordPolicyRefusal(
+        `${kind} destination refused: connection budget (${this.budgets.maxConnections}) exhausted for ${target}.`,
+        { destination, category: "budget_exhausted" },
+      );
       return undefined;
     }
-    if (this.totalBytes >= this.budgets.maxTotalBytes) {
-      this.recordPolicyRefusal(`${kind} destination refused: aggregate byte budget (${this.budgets.maxTotalBytes}) exhausted.`);
+    if (!this.interactive && this.totalBytes >= this.budgets.maxTotalBytes) {
+      this.recordPolicyRefusal(
+        `${kind} destination refused: aggregate byte budget (${this.budgets.maxTotalBytes}) exhausted.`,
+        { destination, category: "budget_exhausted" },
+      );
       return undefined;
     }
     // Keep first-seen hostnames reserved for the whole render, including
     // failed DNS attempts: deleting here could erase another concurrent
     // request's reservation and let the distinct-host cap be exceeded.
-    if (firstSeenHost) this.hosts.add(hostname);
+    if (!this.interactive && firstSeenHost) this.hosts.add(hostname);
+    if (this.interactive && this.activeUpstreams >= INTERACTIVE_EGRESS_CAPACITY) {
+      this.recordPolicyRefusal(`${kind} destination refused: upstream capacity exhausted.`, { destination, category: "capacity_exhausted" });
+      return undefined;
+    }
+    if (this.interactive) this.activeUpstreams++;
+    let released = false;
+    const release = () => {
+      if (released || !this.interactive) return;
+      released = true;
+      this.activeUpstreams--;
+    };
     this.connectionCount += 1;
     try {
       const validated = await validatePublicUrl(url.href, this.resolve);
+      if (this.interactive) this.reservations.set(validated, release);
       return validated;
     } catch (error) {
+      release();
       // Roll back the connection reservation (the request budget and any
       // first-seen hostname reservation stay consumed, bounding adversarial
       // refusal loops).
       this.connectionCount -= 1;
-      this.recordPolicyRefusal(`${kind} destination refused: ${error instanceof Error ? error.message : String(error)} (${target}).`);
+      this.recordPolicyRefusal(
+        `${kind} destination refused: ${error instanceof Error ? error.message : String(error)} (${target}).`,
+        { destination, category: classifyPublicUrlError(error) },
+      );
       return undefined;
     }
   }
@@ -603,6 +741,7 @@ export class EgressBroker {
         response.destroy();
       }
     };
+    let admission: ValidatedUrl | undefined;
     try {
       // Any upgrade-bearing request that reached the plain request path (the
       // real Upgrade event path handles genuine upgrades) is fail-closed: an
@@ -621,7 +760,7 @@ export class EgressBroker {
       }
       this.markClientAuthorized(clientSocket);
       this.requests += 1;
-      if (this.requests > this.budgets.maxRequests) {
+      if (!this.interactive && this.requests > this.budgets.maxRequests) {
         const diagnostic = `proxy request refused: request budget (${this.budgets.maxRequests}) exhausted.`;
         this.recordPolicyRefusal(diagnostic);
         finish(502, "Egress broker request budget exhausted.");
@@ -634,7 +773,7 @@ export class EgressBroker {
         finish(400, "Egress broker refuses this proxy request.");
         return;
       }
-      const validated = await this.admit(target.url, "http");
+      const validated = admission = await this.admit(target.url, "http");
       if (this.closed || !validated) {
         finish(403, "Egress broker refused the requested destination.");
         return;
@@ -649,7 +788,7 @@ export class EgressBroker {
         bytesReceived: 0,
         completed: false,
       };
-      const destination = this.dial(validated, port);
+      const destination = this.dialAdmitted(validated, port, clientSocket);
       this.track(destination);
       await awaitSocketConnect(destination);
       if (this.closed) {
@@ -657,7 +796,7 @@ export class EgressBroker {
         finish(502, "Egress broker is closing.");
         return;
       }
-      this.ledger.push(entry);
+      this.recordEntry(entry, destination);
       // Idle budget applies to the dedicated destination socket only; the
       // client socket is Chromium's reused keep-alive connection.
       this.attachIdle(destination, entry, [destination, clientSocket]);
@@ -719,6 +858,8 @@ export class EgressBroker {
     } catch (error) {
       this.refusals += 1;
       finish(502, "Egress broker request failed.", undefined, `proxy request failed: ${boundedText(error instanceof Error ? error.message : String(error))}.`);
+    } finally {
+      this.releaseAdmission(admission);
     }
   }
 
@@ -757,6 +898,7 @@ export class EgressBroker {
         socket.destroy();
       }
     };
+    let admission: ValidatedUrl | undefined;
     try {
       if (this.closed) {
         socket.destroy();
@@ -768,7 +910,7 @@ export class EgressBroker {
       }
       this.markClientAuthorized(socket);
       this.requests += 1;
-      if (this.requests > this.budgets.maxRequests) {
+      if (!this.interactive && this.requests > this.budgets.maxRequests) {
         const diagnostic = `CONNECT refused: request budget (${this.budgets.maxRequests}) exhausted.`;
         this.recordPolicyRefusal(diagnostic);
         refuse(502);
@@ -821,7 +963,7 @@ export class EgressBroker {
         refuse(400);
         return;
       }
-      const validated = await this.admit(url, "connect");
+      const validated = admission = await this.admit(url, "connect");
       if (this.closed || !validated) {
         refuse(403, undefined);
         return;
@@ -835,7 +977,7 @@ export class EgressBroker {
         bytesReceived: 0,
         completed: false,
       };
-      const destination = this.dial(validated, parsed.port);
+      const destination = this.dialAdmitted(validated, parsed.port, socket);
       this.track(destination);
       await awaitSocketConnect(destination);
       if (this.closed) {
@@ -843,7 +985,7 @@ export class EgressBroker {
         destination.destroy();
         return;
       }
-      this.ledger.push(entry);
+      this.recordEntry(entry, destination);
       // Bytes pipelined after the CONNECT header arrive in `head`; they are
       // counted and budget-enforced BEFORE they reach the destination, so
       // pipelined payloads can never bypass the byte caps.
@@ -858,6 +1000,8 @@ export class EgressBroker {
     } catch (error) {
       this.refusals += 1;
       refuse(502, `CONNECT tunnel failed: ${boundedText(error instanceof Error ? error.message : String(error))}.`);
+    } finally {
+      this.releaseAdmission(admission);
     }
   }
 
@@ -867,6 +1011,7 @@ export class EgressBroker {
    * only the opt-in can relax (liveIdleSocketMs) or disable (null) it.
    */
   private liveIdleSocketMs(): number | null {
+    if (this.interactive) return null;
     if (!this.websocketPolicy) return this.budgets.idleSocketMs;
     return this.websocketPolicy.liveIdleSocketMs === undefined ? this.budgets.idleSocketMs : this.websocketPolicy.liveIdleSocketMs;
   }
@@ -895,6 +1040,7 @@ export class EgressBroker {
         socket.destroy();
       }
     };
+    let admission: ValidatedUrl | undefined;
     try {
       if (this.closed) {
         socket.destroy();
@@ -906,7 +1052,7 @@ export class EgressBroker {
       }
       this.markClientAuthorized(socket);
       this.requests += 1;
-      if (this.requests > this.budgets.maxRequests) {
+      if (!this.interactive && this.requests > this.budgets.maxRequests) {
         this.recordPolicyRefusal(`websocket upgrade refused: request budget (${this.budgets.maxRequests}) exhausted.`);
         refuse(403);
         return;
@@ -932,7 +1078,7 @@ export class EgressBroker {
         socket.destroy();
         return;
       }
-      const validated = await this.admit(parsed.url, "ws");
+      const validated = admission = await this.admit(parsed.url, "ws");
       if (this.closed || !validated) {
         refuse(403);
         return;
@@ -952,7 +1098,7 @@ export class EgressBroker {
         refuse(400, "websocket upgrade refused: unforwardable upgrade request.");
         return;
       }
-      const destination = this.dial(validated, parsed.port);
+      const destination = this.dialAdmitted(validated, parsed.port, socket);
       this.track(destination);
       // If the client goes away while the dial or the origin handshake is in
       // flight, the destination must go away too (a FIN from the peer ends the
@@ -968,7 +1114,7 @@ export class EgressBroker {
         destination.destroy();
         return;
       }
-      this.ledger.push(entry);
+      this.recordEntry(entry, destination);
       const handshakeDeadline = setTimeout(() => destination.destroy(), this.budgets.preAuthSocketMs);
       handshakeDeadline.unref?.();
       try {
@@ -1009,6 +1155,8 @@ export class EgressBroker {
       this.refusals += 1;
       socket.destroy();
       refuse(403, `websocket upgrade failed: ${boundedText(error instanceof Error ? error.message : String(error))}.`);
+    } finally {
+      this.releaseAdmission(admission);
     }
   }
 
@@ -1085,6 +1233,9 @@ export class EgressBroker {
     // destination sockets, CONNECT tunnel sockets) — never on Chromium's
     // reused keep-alive client socket. The WeakSet guard additionally makes
     // the attachment idempotent so timeout listeners cannot accumulate.
+    // Interactive transport lifetime belongs to the session owner, not the
+    // extraction inactivity timer. Pre-auth and WS handshake deadlines remain.
+    if (this.interactive) { socket.setTimeout(0); return; }
     socket.setTimeout(idleMs);
     if (this.idleAttached.has(socket)) return;
     this.idleAttached.add(socket);
@@ -1099,6 +1250,7 @@ export class EgressBroker {
 
   /** Returns true when the budget was exceeded and the connection destroyed. */
   private enforceByteBudget(entry: BrokerLedgerEntry, peers: net.Socket[]): boolean {
+    if (this.interactive) return false;
     const connectionBytes = entry.bytesSent + entry.bytesReceived;
     if (connectionBytes <= this.budgets.maxConnectionBytes && this.totalBytes <= this.budgets.maxTotalBytes) return false;
     this.note(
@@ -1119,6 +1271,10 @@ export class EgressBroker {
       if (reason === "budget") this.observer?.policyFailure(
         "budget_abort",
         `Egress budget aborted a connection to ${entry.hostname}:${entry.port}.`,
+        {
+          destination: { kind: entry.kind, hostname: entry.hostname, port: entry.port },
+          category: "budget_exhausted",
+        },
       );
     }
     for (const socket of peers) socket.destroy();

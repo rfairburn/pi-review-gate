@@ -12,7 +12,11 @@ import {
   BROWSER_SELECT_OPTION_MAX_CHARS,
   BROWSER_TYPE_MAX_CHARS,
   BROWSER_TYPE_MAX_DELAY_MS,
+  BrowserFailureCategory,
+  BrowserCaptureInvalidatedError,
+  BrowserFailureError,
   BrowserRecoveryError,
+  BrowserSessionClosedError,
   InteractiveBrowserManager,
   normalizeBrowserPressKey,
   type BrowserHistoryOperation,
@@ -94,7 +98,7 @@ export class WebToolManager {
     this.cache = cache ?? new WebPageCache(this.webConfig.fetch);
     this.browserCache = browserCache ?? new WebPageCache(this.webConfig.fetch, renderWithChromium);
     this.interactiveBrowser = interactiveBrowser ?? new InteractiveBrowserManager(this.webConfig.fetch);
-    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval);
+    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes);
     registerProcessExitCleanup(this.cache);
     registerProcessExitCleanup(this.browserCache);
   }
@@ -683,7 +687,7 @@ export class WebToolManager {
     this.webConfig = config.web ?? DEFAULT_CONFIG.web!;
     this.cache.updateConfig(this.webConfig.fetch);
     this.browserCache.updateConfig(this.webConfig.fetch);
-    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval);
+    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes);
   }
 
   async cleanup(): Promise<void> {
@@ -1064,17 +1068,53 @@ function textResult(text: string, details: Record<string, unknown>, isError = fa
   return { content: [{ type: "text", text }], details, isError };
 }
 
+/** Fixed, bounded per-category guidance; no dynamic or raw error text. */
+const BROWSER_FAILURE_HINTS: Record<BrowserFailureCategory, string> = {
+  invalid_url: "The URL was not accepted for validation.",
+  dns_resolution_failed: "The destination hostname did not resolve through the validated resolver.",
+  non_public_address_denied: "The destination resolves to a non-public address; this SSRF denial is a permanent boundary, not transient.",
+  policy_refused: "The egress broker refused the destination under its fixed policy.",
+  budget_exhausted: "A bounded session or egress budget was exhausted for this destination.",
+  browser_network_failure: "Chromium reported a network failure during navigation.",
+  browser_process_failure: "The owned Chromium process failed or disconnected.",
+  timeout: "The operation exceeded its bounded deadline.",
+  internal_error: "An internal manager error occurred.",
+};
+
+const PRE_NAVIGATION_FAILURE_PHASES = new Set([
+  "url_validation",
+  "broker_startup",
+  "chromium_startup",
+  "context_creation",
+]);
+
 /** Pi agent-core marks fulfilled execute results successful, ignoring a nested
  * isError. Throw only fixed, bounded text: raw Playwright/page errors can carry
  * form values, URLs, DOM snippets and arbitrary page exceptions. No cause/data
  * or images are attached. BrowserExtract/WebFetch intentionally stay unchanged.
  *
- * Structured manager-owned recovery metadata is classified first, so
- * cancellation, stale-handle, duplicate-open, and unconfirmed-teardown
- * guidance never depends on parsing arbitrary exception text. Handle reveals
- * are bounded authenticated recovery data, never arbitrary passthrough.
+ * Structured manager-owned metadata is classified first: recovery state and
+ * failure phase/category drive fixed text, so cancellation, stale-handle,
+ * duplicate-open, unconfirmed-teardown, and network-failure guidance never
+ * depends on parsing arbitrary exception text. Handle reveals are bounded
+ * authenticated recovery data, never arbitrary passthrough.
  */
 function interactiveBrowserFailure(name: string, error: unknown): Error {
+  if (error instanceof BrowserCaptureInvalidatedError) {
+    return new Error(`${name} failed: phase=capture; category=document_changed. A page or child frame navigated during capture; stale evidence was rejected and the session was closed. Use BrowserOpen to reopen; no rollback is claimed.`);
+  }
+  if (error instanceof BrowserSessionClosedError && error.closure?.kind === "idle_expiry") {
+    return new Error(`${name} failed: browser session expired from tool inactivity; cleanup was confirmed. Use BrowserOpen to reopen; previous state is lost. Do not replay uncertain actions automatically.`);
+  }
+  if (error instanceof BrowserFailureError) {
+    const effect = PRE_NAVIGATION_FAILURE_PHASES.has(error.phase)
+      ? "No page effects occurred."
+      : "Effect status is unknown.";
+    return new Error(
+      `${name} failed: phase=${error.phase}; category=${error.category}. ` +
+      `${BROWSER_FAILURE_HINTS[error.category]} ${effect} No rollback is claimed.`,
+    );
+  }
   if (error instanceof BrowserRecoveryError) {
     const recovery = error.recovery;
     if (recovery.kind === "duplicate_open") {
@@ -1125,7 +1165,9 @@ function interactiveBrowserFailure(name: string, error: unknown): Error {
   } else if (/timeout|timed out|deadline/i.test(message)) {
     reason = "deadline exceeded; effect status is unknown; no rollback is claimed";
   } else if (/denied|policy|public|DNS|resolve|ENOTFOUND|ERR_NAME/i.test(message)) {
-    reason = "network or authorization policy rejected the operation; no rollback is claimed";
+    // String matches alone do not prove an intentional authorization denial;
+    // report the condition without claiming a proven policy rejection.
+    reason = "the browser network path reported a DNS, resolution, or egress condition; the failing phase was not confirmed by structured diagnostics; no rollback is claimed";
   }
   return new Error(`${name} failed: ${reason}.`);
 }

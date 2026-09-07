@@ -15,6 +15,41 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.6]
+
+### Changed
+
+- Interactive browsing now uses a sustained QA session rather than extraction-style
+  rendering: images, downloadable fonts, media, local data/blob resources, SSE and
+  HTTP beacons render through protected networking. Dedicated/shared workers retain
+  broker egress. Cumulative host, connection, request, byte, navigation and action
+  quotas no longer retire interactive sessions; extraction limits remain unchanged.
+  Concurrent broker capacity is 64 client and 64 upstream connections, with local,
+  observable overload refusal and bounded retained history (Refs #35).
+- Console and network diagnostics retain the latest 256 events and at most 1 MiB of
+  sanitized UTF-8 data per channel across a session, with tab-isolated reads and
+  truthful eviction cursors. Structured failure phase/category reporting preserves
+  safe DNS, SSRF, startup and navigation diagnoses without guessing authorization
+  from untrusted error text. SSRF, pinned DNS, broker authentication, isolated
+  selectors, approvals and finite per-operation/output limits remain in force.
+- Local Chromium receives five seconds for graceful close, then verified-owned force
+  termination with an additional bounded verification allowance. The exact Playwright
+  dependency is pinned for the guarded local ownership bridge; unsupported ownership
+  fails closed without switching transport or signalling unrelated processes.
+
+### Added
+
+- Persisted Browser idle expiry under `/review-settings` → Web, default 15 minutes.
+  Browser-tool activity renews it, active operations are protected, background page
+  activity does not renew it, and expired handles require explicit reopening.
+- Real QA regressions cover painted network-image pixels, valid fonts/audio,
+  dedicated/shared workers, SSE beyond 32 MiB, approved synthetic search submission,
+  sustained navigation beyond former quotas, and owner-alive forced Chromium-tree
+  cleanup. Fleet tool navigation/screenshots show the graphical homepage; CNN captures
+  expose advertising-frame settling and remaining third-party ad/player errors rather
+  than claiming unrestricted site fidelity. Visibility, password/upload overrides and
+  service-worker support are not added by this candidate (Refs #35).
+
 ## [0.1.0-dev.5]
 
 ### Changed

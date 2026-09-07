@@ -1,4 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { BrowserIdleLease, validateIdleExpiryMinutes } from "./browser-idle-lifecycle.js";
+import { BrowserOwnershipError, browserCleanupDeadline, ownedBrowserQuiescent, prepareOwnedBrowser } from "./browser-owned-process";
 import {
   chromium,
   type Browser,
@@ -26,6 +28,7 @@ import {
   chromiumEgressArgs,
 } from "./browser";
 import {
+  DEFAULT_EGRESS_BUDGETS,
   EgressBroker,
   type BrokerDial,
   type EgressBrokerObserver,
@@ -33,7 +36,7 @@ import {
   type EgressSummary,
 } from "./egress-broker";
 import type { HostResolver } from "./network";
-import { defaultHostResolver, validatePublicUrl } from "./network";
+import { classifyPublicUrlError, defaultHostResolver, PublicUrlValidationError, validatePublicUrl } from "./network";
 import {
   BrowserConfirmationPermits,
   BrowserConsequencePolicy,
@@ -71,9 +74,9 @@ const WS_ADMISSION_MS = 5_000;
 export interface InteractiveBrowserLimits {
   maxSessions: number;
   maxTabsPerSession: number;
-  maxNavigations: number;
-  maxActions: number;
-  maxMainDocumentRequests: number;
+  maxNavigations: number | null;
+  maxActions: number | null;
+  maxMainDocumentRequests: number | null;
   maxHistoryEntries: number;
   maxScrollPages: number;
   maxWaitTextChars: number;
@@ -99,19 +102,21 @@ export interface InteractiveBrowserLimits {
   confirmationMs: number;
   idleSocketMs: number;
   cleanupMs: number;
-  maxDistinctHosts: number;
-  maxConnections: number;
-  maxRequests: number;
-  maxConnectionBytes: number;
-  maxTotalBytes: number;
+  maxDistinctHosts: number | null;
+  maxConnections: number | null;
+  maxRequests: number | null;
+  maxConnectionBytes: number | null;
+  maxTotalBytes: number | null;
 }
 
 export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Object.freeze({
   maxSessions: 1,
   maxTabsPerSession: 4,
-  maxNavigations: 12,
-  maxActions: 64,
-  maxMainDocumentRequests: 32,
+  // Lifetime accounting is not a session-expiry policy. Individual operations
+  // retain their deadlines and output bounds; test overrides can impose quotas.
+  maxNavigations: null,
+  maxActions: null,
+  maxMainDocumentRequests: null,
   maxHistoryEntries: 32,
   maxScrollPages: 3,
   maxWaitTextChars: 512,
@@ -124,7 +129,7 @@ export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Ob
   maxScreenshotPixels: 4_000_000,
   maxScreenshotBytes: 4 * 1024 * 1024,
   maxScreenshotAllocationBytes: 32 * 1024 * 1024,
-  maxConsoleEvents: 128,
+  maxConsoleEvents: 256,
   maxConsoleTextChars: 1_000,
   maxConsoleSourceChars: 300,
   maxNetworkEvents: 256,
@@ -137,11 +142,11 @@ export const INTERACTIVE_BROWSER_LIMITS: Readonly<InteractiveBrowserLimits> = Ob
   confirmationMs: 30_000,
   idleSocketMs: 20_000,
   cleanupMs: CLEANUP_DEADLINE_MS,
-  maxDistinctHosts: 16,
-  maxConnections: 96,
-  maxRequests: 256,
-  maxConnectionBytes: 8 * 1024 * 1024,
-  maxTotalBytes: 32 * 1024 * 1024,
+  maxDistinctHosts: null,
+  maxConnections: null,
+  maxRequests: null,
+  maxConnectionBytes: null,
+  maxTotalBytes: null,
 });
 
 export interface BrowserOpenResult {
@@ -161,7 +166,7 @@ export interface BrowserNavigateResult {
   url: string;
   title: string;
   status: number;
-  navigationsRemaining: number;
+  navigationsRemaining: number | null;
 }
 
 export interface BrowserSnapshotResult {
@@ -244,6 +249,8 @@ export interface BrowserNetworkEvent {
 }
 
 export interface BrowserDiagnosticResult<T> {
+  /** Session-wide broker overload count, not attributed to an individual tab. */
+  brokerCapacityRefusals: number;
   session: string;
   tab: string;
   generation: string;
@@ -340,7 +347,7 @@ export interface BrowserHistoryResult {
   entries: Array<{ index: number; url: string; generation: string; current: boolean }>;
   truncated: boolean;
   omittedEntries: number;
-  navigationsRemaining: number;
+  navigationsRemaining: number | null;
 }
 
 export type BrowserTabsOperation = "list" | "open" | "switch" | "close";
@@ -394,8 +401,15 @@ export type BrowserInteractionConfirmation = (request: BrowserInteractionConfirm
 export type BrowserClickConfirmation = BrowserInteractionConfirmation;
 
 export interface BrowserClosureReason {
-  kind: "explicit_close" | "session_shutdown" | "fatal_error";
+  kind: "explicit_close" | "session_shutdown" | "fatal_error" | "idle_expiry";
   message: string;
+}
+
+/** Typed capture rejection; page text cannot manufacture this classification. */
+export class BrowserCaptureInvalidatedError extends Error {}
+
+class BrowserIdleExpiredError extends Error {
+  constructor() { super("Browser session expired from tool inactivity. Use BrowserOpen to reopen; previous state is lost."); }
 }
 
 /** Only issued for a handle authenticated by this manager, never guesses. */
@@ -443,12 +457,53 @@ export class BrowserRecoveryError extends Error {
   }
 }
 
+/** Bounded failure phase for structured browser tool errors. */
+export type BrowserFailurePhase =
+  | "url_validation"
+  | "broker_admission"
+  | "broker_startup"
+  | "chromium_startup"
+  | "context_creation"
+  | "navigation"
+  | "teardown";
+
+/** Safe error category: fixed codes only, never raw network or page text. */
+export type BrowserFailureCategory =
+  | "invalid_url"
+  | "dns_resolution_failed"
+  | "non_public_address_denied"
+  | "policy_refused"
+  | "budget_exhausted"
+  | "browser_network_failure"
+  | "browser_process_failure"
+  | "timeout"
+  | "internal_error";
+
+/**
+ * Structured, manager-owned failure state for browser tool errors. Phase and
+ * category are the public contract: sanitization emits fixed bounded text
+ * from them and never parses arbitrary exception text. The original error
+ * stays internally attributable through the cause chain; no rollback or
+ * cleanup is ever claimed from it.
+ */
+export class BrowserFailureError extends Error {
+  constructor(
+    message: string,
+    readonly phase: BrowserFailurePhase,
+    readonly category: BrowserFailureCategory,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "BrowserFailureError";
+  }
+}
+
 export interface BrowserCloseResult {
   session: string;
   closed: true;
   alreadyClosed: boolean;
   quiescent: true;
-  broker: (Pick<EgressSummary, "budgetAborts" | "refusals"> & { connections: number }) | null;
+  broker: (Pick<EgressSummary, "budgetAborts" | "refusals"> & { connections: number; ledgerDropped: number; capacityRefusals: number }) | null;
   diagnosticsRetained: boolean;
   closure?: BrowserClosureReason;
 }
@@ -529,6 +584,7 @@ interface Session {
   browser: Browser;
   context: BrowserContext;
   broker: EgressBroker;
+  capacityRefusals: number;
   createdAt: number;
   navigations: number;
   actions: number;
@@ -550,23 +606,59 @@ type BrowserCancellationKind = "close" | "shutdown" | "caller";
 
 type DiagnosticEvent = { sequence: number; textTruncated?: boolean };
 
+/** Shared capture quota: tabs cannot multiply the session retention allowance. */
+export class BrowserDiagnosticQuota {
+  private retained: { owner: object; bytes: number; evict: () => void }[] = [];
+  private bytes = 0;
+
+  constructor(readonly capacity = 256, readonly maxBytes = 1024 * 1024) {}
+
+  retain(owner: object, bytes: number, evict: () => void): void {
+    this.retained.push({ owner, bytes, evict });
+    this.bytes += bytes;
+    while (this.retained.length > this.capacity || this.bytes > this.maxBytes) {
+      const oldest = this.retained.shift()!;
+      this.bytes -= oldest.bytes;
+      oldest.evict();
+    }
+  }
+
+  release(owner: object): void {
+    this.retained = this.retained.filter((entry) => {
+      if (entry.owner !== owner) return true;
+      this.bytes -= entry.bytes;
+      return false;
+    });
+  }
+}
+
 /** A capture-time-bounded, memory-only ring with a never-reused tab-local cursor. */
-class DiagnosticRing<T extends DiagnosticEvent> {
+export class DiagnosticRing<T extends DiagnosticEvent> {
   private events: T[] = [];
   private nextSequence = 1;
   private dropped = 0;
   private captureTruncated = 0;
 
-  constructor(readonly capacity: number) {}
+  constructor(readonly capacity: number, private readonly quota = new BrowserDiagnosticQuota(capacity)) {}
 
   push(event: Omit<T, "sequence">): void {
     const captured = { ...event, sequence: this.nextSequence++ } as T;
     if (captured.textTruncated) this.captureTruncated += 1;
     if (this.events.length >= this.capacity) {
-      this.events.shift();
+      const oldest = this.events.shift()!;
+      this.quota.release(oldest);
       this.dropped += 1;
     }
     this.events.push(captured);
+    // Count the UTF-8 serialized safe capture, including metadata, not raw page
+    // strings or UTF-16 code units. No bodies/headers are captured here.
+    this.quota.retain(captured, Buffer.byteLength(JSON.stringify(captured), "utf8"), () => {
+      const index = this.events.indexOf(captured);
+      if (index >= 0) {
+        this.events.splice(index, 1);
+        this.dropped += 1;
+      }
+    });
   }
 
   read(after: number, maximum: number): {
@@ -605,6 +697,7 @@ class DiagnosticRing<T extends DiagnosticEvent> {
   }
 
   clear(): void {
+    for (const event of this.events) this.quota.release(event);
     this.events = [];
     this.nextSequence = 1;
     this.dropped = 0;
@@ -618,6 +711,33 @@ class DiagnosticRing<T extends DiagnosticEvent> {
  * this extension process.
  */
 export class InteractiveBrowserManager {
+  private readonly consoleQuota = new BrowserDiagnosticQuota();
+  private readonly networkQuota = new BrowserDiagnosticQuota();
+  private idleExpiryMinutes = 15;
+  private readonly idleLeases = new Map<Session, BrowserIdleLease>();
+
+  private renewIdleLease(session: Session): void {
+    if (session.teardown || session.fatalError) return;
+    this.idleLeases.get(session)?.renew();
+  }
+
+  private noteToolActivity(sessionHandle: string): void {
+    const session = this.sessions.get(sessionHandle);
+    if (session) this.renewIdleLease(session);
+  }
+
+  private startIdleLease(session: Session): void {
+    this.idleLeases.set(session, new BrowserIdleLease(
+      this.idleExpiryMinutes,
+      () => session.operationActive || this.openings.size > 0,
+      () => {
+        if (session.teardown || session.fatalError) return;
+        session.fatalError = new BrowserIdleExpiredError();
+        void this.beginTeardown(session).catch(() => undefined);
+      },
+      this.now,
+    ));
+  }
   // One manager belongs to one Pi session. Retain across browser close/reopen
   // because later tabs can redisplay previously entered content.
   private readonly outputPrivacy = new BrowserOutputPrivacy();
@@ -656,7 +776,7 @@ export class InteractiveBrowserManager {
     private readonly dependencies: InteractiveBrowserDependencies = {},
   ) {
     this.resolveHostname = dependencies.resolveHostname ?? defaultHostResolver;
-    this.launch = dependencies.launch ?? chromium.launch.bind(chromium);
+    this.launch = dependencies.launch ?? (async (options) => prepareOwnedBrowser(await chromium.launch(options)));
     this.now = dependencies.now ?? Date.now;
     this.randomHandle = dependencies.randomHandle ?? ((kind) => `browser_${kind}_${randomBytes(24).toString("base64url")}`);
     this.consequencePolicy = dependencies.consequencePolicy ?? new BrowserConsequencePolicy();
@@ -683,9 +803,12 @@ export class InteractiveBrowserManager {
     });
   }
 
-  updateConfig(config: WebFetchConfig, interactionApproval: BrowserInteractionApproval = "ask"): void {
+  updateConfig(config: WebFetchConfig, interactionApproval: BrowserInteractionApproval = "ask", idleExpiryMinutes: number = 15): void {
+    validateIdleExpiryMinutes(idleExpiryMinutes);
     this.config = config;
     this.interactionApproval = interactionApproval;
+    this.idleExpiryMinutes = idleExpiryMinutes;
+    for (const lease of this.idleLeases.values()) lease.update(idleExpiryMinutes);
   }
 
   /** Select policy at the approval-required branch, after target restrictions.
@@ -711,6 +834,7 @@ export class InteractiveBrowserManager {
     this.assertAcceptingOperations();
     const existing = this.sessions.values().next().value as Session | undefined;
     if (existing) {
+      this.renewIdleLease(existing);
       throw duplicateOpenError(existing);
     }
     if (this.opening > 0) {
@@ -739,18 +863,35 @@ export class InteractiveBrowserManager {
     let contextPromise: Promise<BrowserContext> | undefined;
     let resourcesTransferredToSession = false;
     let navigationDispatched = false;
+    // Startup stage for structured failure classification; the outcome and
+    // every cleanup behavior are unchanged by the classification.
+    let stage: BrowserFailurePhase = "url_validation";
     try {
       // This is a no-dial preflight. The broker independently validates and
       // pins the actual browser request before opening its destination socket.
       const requested = await operation.run(validateNavigationUrl(url, this.resolveHostname), "URL validation");
+      stage = "chromium_startup";
       assertChromiumAvailable();
       const auth = {
         username: `pi-browser-${randomBytes(8).toString("hex")}`,
         password: randomBytes(32).toString("base64url"),
       };
       let pendingFatal: ((error: Error) => void) | undefined;
+      let pendingSession: Session | undefined;
+      let pendingCapacityRefusals = 0;
+      // Hard broker refusals remain session-fatal (fail closed). The error is
+      // structured so the tool boundary reports the phase and a safe category
+      // instead of a generic message that misclassifies the refusal.
       const observer: EgressBrokerObserver = {
-        policyFailure: (_reason, diagnostic) => pendingFatal?.(new Error(`Interactive browser egress policy failed: ${bounded(diagnostic, 500)}`)),
+        capacityRefusal: () => {
+          if (pendingSession) pendingSession.capacityRefusals = Math.min(Number.MAX_SAFE_INTEGER, pendingSession.capacityRefusals + 1);
+          else pendingCapacityRefusals = Math.min(Number.MAX_SAFE_INTEGER, pendingCapacityRefusals + 1);
+        },
+        policyFailure: (_reason, diagnostic, context) => pendingFatal?.(new BrowserFailureError(
+          `Interactive browser egress policy failed: ${bounded(diagnostic, 500)}`,
+          "broker_admission",
+          context?.category ?? "policy_refused",
+        )),
       };
       broker = new EgressBroker(
         this.resolveHostname,
@@ -760,10 +901,12 @@ export class InteractiveBrowserManager {
         observer,
         // Interactive sessions own the browser lifetime: quiet live ws/wss
         // connections must survive ordinary idle, turns, and reviews. Hard
-        // byte/connection budgets and teardown still drain every socket.
+        // concurrent capacity and teardown still bound owned sockets.
         { enabled: true, liveIdleSocketMs: null },
       );
+      stage = "broker_startup";
       const port = await operation.run(broker.start(), "egress broker startup");
+      stage = "chromium_startup";
       launchPromise = this.launch({
         headless: true,
         timeout: operation.remainingMs(),
@@ -771,6 +914,7 @@ export class InteractiveBrowserManager {
         proxy: { server: `http://127.0.0.1:${port}`, username: auth.username, password: auth.password },
       });
       browser = await operation.run(launchPromise, "Chromium startup");
+      stage = "context_creation";
       contextPromise = browser.newContext({
         acceptDownloads: false,
         javaScriptEnabled: true,
@@ -784,7 +928,6 @@ export class InteractiveBrowserManager {
       context.setDefaultTimeout(this.limits.actionMs);
       context.setDefaultNavigationTimeout(this.limits.navigationMs);
       await operation.run(context.clearPermissions(), "permission denial");
-      let pendingSession: Session | undefined;
       await operation.run(installRoutePolicy(context, broker, (request, reason) => {
         if (pendingSession) this.recordNetworkPolicy(pendingSession, request, reason);
       }), "network route policy installation");
@@ -800,8 +943,8 @@ export class InteractiveBrowserManager {
         documentRequestPending: false,
         closing: false,
         diagnosticsActive: true,
-        consoleDiagnostics: new DiagnosticRing(this.limits.maxConsoleEvents),
-        networkDiagnostics: new DiagnosticRing(this.limits.maxNetworkEvents),
+        consoleDiagnostics: new DiagnosticRing(this.limits.maxConsoleEvents, this.consoleQuota),
+        networkDiagnostics: new DiagnosticRing(this.limits.maxNetworkEvents, this.networkQuota),
         networkStartedAt: new WeakMap(),
         networkPolicy: new WeakMap(),
       };
@@ -816,6 +959,7 @@ export class InteractiveBrowserManager {
         browser,
         context,
         broker,
+        capacityRefusals: pendingCapacityRefusals,
         createdAt: this.now(),
         navigations: 0,
         actions: 0,
@@ -845,12 +989,14 @@ export class InteractiveBrowserManager {
         }
       });
       this.sessions.set(session.handle, session);
+      this.startIdleLease(session);
       resourcesTransferredToSession = true;
       try {
         const navigation = await this.navigateSession(session, primaryTab, requested.href, operation, true, () => {
           navigationDispatched = true;
         });
         session.operationActive = false;
+        this.renewIdleLease(session);
         return this.protectOutput({ ...navigation, limits: this.limits });
       } catch (error) {
         session.operationActive = false;
@@ -895,8 +1041,16 @@ export class InteractiveBrowserManager {
           throw unconfirmedOpenCleanupError();
         }
       }
+      if (error instanceof BrowserOwnershipError) {
+        this.recordOpeningTeardownFailure(opening, error);
+        throw unconfirmedOpenCleanupError();
+      }
       if (cancellation) throw openCancellationError(cancellation, navigationDispatched);
-      throw error;
+      // After resource transfer the inner catch already confirmed teardown and
+      // rethrew the typed navigation failure; classify startup-stage failures
+      // only, preserving every cleanup outcome above.
+      if (resourcesTransferredToSession) throw error;
+      throw classifySetupFailure(asError(error), stage);
     } finally {
       operation.dispose();
       this.opening -= 1;
@@ -956,7 +1110,7 @@ export class InteractiveBrowserManager {
         const snapshotUrl = publicPageUrl(tab.page.url());
         const title = bounded(this.outputPrivacy.text(await operation.run(tab.page.title(), "browser title read")), 500);
         if (tab.generation !== capturedGeneration) {
-          throw new Error("Browser document changed during semantic snapshot capture; snapshot rejected.");
+          throw new BrowserCaptureInvalidatedError("Browser document changed during semantic snapshot capture; snapshot rejected.");
         }
         // Only refs wholly present in the returned, bounded snapshot remain
         // current. A new snapshot replaces this map rather than accumulating
@@ -1012,6 +1166,7 @@ export class InteractiveBrowserManager {
     ref: string,
     signal?: AbortSignal,
   ): Promise<BrowserInspectResult> {
+    this.noteToolActivity(sessionHandle);
     assertBoundedInteractionCapability(sessionHandle, BROWSER_INTERACTION_SESSION_MAX_CHARS);
     assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
     assertBoundedInteractionCapability(ref, BROWSER_INTERACTION_REF_MAX_CHARS);
@@ -1030,7 +1185,7 @@ export class InteractiveBrowserManager {
         }, operation.remainingMs(), operation.signal), "bounded semantic detail read");
         throwIfAborted(operation.signal);
         if (tab.generation !== generation) {
-          throw new Error("Browser document changed during semantic detail read; result rejected.");
+          throw new BrowserCaptureInvalidatedError("Browser document changed during semantic detail read; result rejected.");
         }
         return {
           session: session.handle,
@@ -1058,6 +1213,7 @@ export class InteractiveBrowserManager {
     signal: AbortSignal | undefined,
     kind: K,
   ): Promise<BrowserDiagnosticResult<K extends "consoleDiagnostics" ? BrowserConsoleEvent : BrowserNetworkEvent>> {
+    this.noteToolActivity(sessionHandle);
     if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > this.limits.maxDiagnosticReadEvents) {
       throw new Error(`${name} maxEvents must be an integer from 1-${this.limits.maxDiagnosticReadEvents}.`);
     }
@@ -1086,6 +1242,7 @@ export class InteractiveBrowserManager {
           totalCaptureTruncated: read.totalCaptureTruncated,
         },
         capacity: ring.capacity,
+        brokerCapacityRefusals: session.capacityRefusals,
         untrusted: true,
       } as BrowserDiagnosticResult<K extends "consoleDiagnostics" ? BrowserConsoleEvent : BrowserNetworkEvent>;
     });
@@ -1098,6 +1255,7 @@ export class InteractiveBrowserManager {
     ref: string | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserScreenshotResult> {
+    this.noteToolActivity(sessionHandle);
     if (mode !== "viewport" && mode !== "element") {
       throw new Error("BrowserScreenshot mode must be viewport or element.");
     }
@@ -1157,7 +1315,7 @@ export class InteractiveBrowserManager {
         const snapshotUrl = publicPageUrl(tab.page.url());
         const title = bounded(this.outputPrivacy.text(await operation.run(tab.page.title(), "browser title read")), 500);
         if (tab.generation !== capturedGeneration) {
-          throw new Error("Browser document changed during screenshot capture; screenshot rejected.");
+          throw new BrowserCaptureInvalidatedError("Browser document changed during screenshot capture; screenshot rejected.");
         }
         return {
           image,
@@ -1197,6 +1355,7 @@ export class InteractiveBrowserManager {
     ref: string | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserScrollResult> {
+    this.noteToolActivity(sessionHandle);
     if (target !== "page" && target !== "ref_container" && target !== "ref") {
       throw new Error("BrowserScroll target must be page, ref_container, or ref.");
     }
@@ -1285,6 +1444,7 @@ export class InteractiveBrowserManager {
     options?: { button?: BrowserClickButton },
   ): Promise<BrowserInteractionResult> {
     try {
+      this.noteToolActivity(sessionHandle);
       const button = normalizeBrowserClickButton(options?.button);
       return await this.interact(sessionHandle, tabHandle, ref, "click", this.privateConfirmation(confirmation), signal, button);
     } catch (error) {
@@ -1301,6 +1461,7 @@ export class InteractiveBrowserManager {
     signal?: AbortSignal,
   ): Promise<BrowserInteractionResult> {
     try {
+      this.noteToolActivity(sessionHandle);
       assertExactText(value, BROWSER_FILL_MAX_CHARS, true);
       return await this.formInteract(sessionHandle, tabHandle, ref, { operation: "fill", values: [value] }, confirmation, signal);
     } catch (error) {
@@ -1318,6 +1479,7 @@ export class InteractiveBrowserManager {
     signal?: AbortSignal,
   ): Promise<BrowserInteractionResult> {
     try {
+      this.noteToolActivity(sessionHandle);
       assertExactText(text, BROWSER_TYPE_MAX_CHARS, false);
       if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > BROWSER_TYPE_MAX_DELAY_MS) throw new Error("invalid bounded delay");
       return await this.formInteract(sessionHandle, tabHandle, ref, { operation: "type", values: [text], delayMs }, confirmation, signal);
@@ -1335,6 +1497,7 @@ export class InteractiveBrowserManager {
     signal?: AbortSignal,
   ): Promise<BrowserInteractionResult> {
     try {
+      this.noteToolActivity(sessionHandle);
       assertSelectValues(options);
       return await this.formInteract(sessionHandle, tabHandle, ref, { operation: "select", values: [...options] }, confirmation, signal);
     } catch (error) {
@@ -1351,6 +1514,7 @@ export class InteractiveBrowserManager {
     signal?: AbortSignal,
   ): Promise<BrowserInteractionResult> {
     try {
+      this.noteToolActivity(sessionHandle);
       const normalizedKey = normalizeBrowserPressKey(key);
       return await this.formInteract(sessionHandle, tabHandle, ref, { operation: "press", values: [], key: normalizedKey }, confirmation, signal);
     } catch (error) {
@@ -1520,6 +1684,7 @@ export class InteractiveBrowserManager {
     signal: AbortSignal | undefined,
     button: BrowserClickButton = "left",
   ): Promise<BrowserInteractionResult> {
+    this.noteToolActivity(sessionHandle);
     assertBoundedInteractionCapability(sessionHandle, BROWSER_INTERACTION_SESSION_MAX_CHARS);
     assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
     assertBoundedInteractionCapability(ref, BROWSER_INTERACTION_REF_MAX_CHARS);
@@ -1679,6 +1844,7 @@ export class InteractiveBrowserManager {
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<BrowserWaitResult> {
+    this.noteToolActivity(sessionHandle);
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > this.limits.maxWaitMs) {
       throw new Error(`BrowserWait timeoutMs must be an integer from 1-${this.limits.maxWaitMs}.`);
     }
@@ -1776,6 +1942,7 @@ export class InteractiveBrowserManager {
     maxEntries: number,
     signal?: AbortSignal,
   ): Promise<BrowserHistoryResult> {
+    this.noteToolActivity(sessionHandle);
     if (!["list", "back", "forward", "reload"].includes(operationName)) throw new Error("BrowserHistory operation is not allowlisted.");
     if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > this.limits.maxHistoryEntries) {
       throw new Error(`BrowserHistory maxEntries must be an integer from 1-${this.limits.maxHistoryEntries}.`);
@@ -1837,6 +2004,7 @@ export class InteractiveBrowserManager {
     url?: string,
     signal?: AbortSignal,
   ): Promise<BrowserTabsResult> {
+    this.noteToolActivity(sessionHandle);
     if (!["list", "open", "switch", "close"].includes(operationName)) throw new Error("BrowserTabs operation is not allowlisted.");
     const session = this.requireOwnedSession(sessionHandle);
     return this.operate(session, signal, async (operationSignal) => {
@@ -2059,10 +2227,26 @@ export class InteractiveBrowserManager {
     return this.sessions.size;
   }
 
+  // Only settled goto connection failures qualify; never infer causality from
+  // a session-wide capacity counter (another request may have been refused).
+  private readonly settledNavigationFailures = new WeakSet<Error>();
+
   private async navigateSession(session: Session, tab: BrowserTab, rawUrl: string, operation: OperationDeadline, initial: boolean, onDispatch?: () => void): Promise<BrowserNavigateResult> {
     if (!initial) this.consumeNavigation(session);
     else session.navigations += 1;
-    const requested = await operation.run(validateNavigationUrl(rawUrl, this.resolveHostname), "URL validation");
+    let requested: URL;
+    try {
+      requested = await operation.run(validateNavigationUrl(rawUrl, this.resolveHostname), "URL validation");
+    } catch (error) {
+      const failure = asError(error);
+      // Site-assigned typed categories are authoritative; a deadline that
+      // expired during validation is a timeout, not an invalid URL.
+      let category: BrowserFailureCategory;
+      if (failure instanceof PublicUrlValidationError) category = failure.category;
+      else if (DEADLINE_ERROR_PATTERN.test(failure.message)) category = "timeout";
+      else category = classifyPublicUrlError(failure);
+      throw browserFailure(failure, "url_validation", category);
+    }
     let response: Response | null;
     try {
       // Invoking goto may dispatch the request; after this point cancellation
@@ -2071,32 +2255,52 @@ export class InteractiveBrowserManager {
       onDispatch?.();
       response = await operation.run(goto, "main-document navigation");
     } catch (error) {
-      throw session.fatalError ?? asError(error);
+      // A session-fatal broker refusal or process failure takes precedence:
+      // it is the root cause and is already structured where manager-owned.
+      if (session.fatalError) throw session.fatalError;
+      const failure = browserFailure(asError(error), "navigation", classifyNavigationError(asError(error)));
+      if (!initial && /\bnet::ERR_(?:PROXY_CONNECTION_FAILED|CONNECTION_CLOSED|CONNECTION_RESET|CONNECTION_REFUSED|EMPTY_RESPONSE)\b/u.test(asError(error).message)) {
+        // A rejected, settled connection command is not in-flight uncertainty.
+        // It also does not prove no effects or that the old document survived.
+        // Revoke all old capabilities even when Chromium emits no commit event.
+        tab.generation = this.uniqueHandle("generation");
+        tab.semanticRefs.clear();
+        tab.documentStatus = undefined;
+        failure.message += " Navigation failed after dispatch; page effects are not rolled back. Previous refs were invalidated; retry navigation or take a fresh snapshot.";
+        this.settledNavigationFailures.add(failure);
+      }
+      throw failure;
     }
-    // A successful same-document goto has no response; retain document status.
-    tab.documentStatus ??= response?.status();
-    await operation.run(
-      tab.page.waitForLoadState("networkidle", { timeout: Math.min(2_000, operation.remainingMs()) }).catch(() => undefined),
-      "browser rendering settle",
-    );
-    if (session.fatalError) throw session.fatalError;
-    await operation.run(this.refreshHistory(session, tab), "browser history read");
-    const generation = tab.generation;
-    const finalUrl = publicPageUrl(tab.page.url());
-    const title = bounded(this.outputPrivacy.text(await operation.run(tab.page.title(), "browser title read")), 500);
-    if (tab.documentRequestPending || generation !== tab.generation || finalUrl !== publicPageUrl(tab.page.url())) {
-      throw new Error("Browser document changed during navigation metadata read; result rejected.");
+    try {
+      // A successful same-document goto has no response; retain document status.
+      tab.documentStatus ??= response?.status();
+      await operation.run(
+        tab.page.waitForLoadState("networkidle", { timeout: Math.min(2_000, operation.remainingMs()) }).catch(() => undefined),
+        "browser rendering settle",
+      );
+      if (session.fatalError) throw session.fatalError;
+      await operation.run(this.refreshHistory(session, tab), "browser history read");
+      const generation = tab.generation;
+      const finalUrl = publicPageUrl(tab.page.url());
+      const title = bounded(this.outputPrivacy.text(await operation.run(tab.page.title(), "browser title read")), 500);
+      if (tab.documentRequestPending || generation !== tab.generation || finalUrl !== publicPageUrl(tab.page.url())) {
+        throw new Error("Browser document changed during navigation metadata read; result rejected.");
+      }
+      if (tab.documentStatus === undefined) throw new Error("Browser navigation has no committed HTTP document status.");
+      return {
+        session: session.handle,
+        tab: tab.handle,
+        generation: tab.generation,
+        url: finalUrl,
+        title,
+        status: tab.documentStatus,
+        navigationsRemaining: this.limits.maxNavigations === null ? null : Math.max(0, this.limits.maxNavigations - session.navigations),
+      };
+    } catch (error) {
+      if (error instanceof BrowserFailureError || error instanceof BrowserRecoveryError) throw error;
+      const failure = asError(error);
+      throw browserFailure(failure, "navigation", DEADLINE_ERROR_PATTERN.test(failure.message) ? "timeout" : "internal_error");
     }
-    if (tab.documentStatus === undefined) throw new Error("Browser navigation has no committed HTTP document status.");
-    return {
-      session: session.handle,
-      tab: tab.handle,
-      generation: tab.generation,
-      url: finalUrl,
-      title,
-      status: tab.documentStatus,
-      navigationsRemaining: Math.max(0, this.limits.maxNavigations - session.navigations),
-    };
   }
 
   /**
@@ -2126,7 +2330,7 @@ export class InteractiveBrowserManager {
       if (redirectHops > MAX_MAIN_DOCUMENT_REDIRECTS) {
         this.failSession(session, new Error(`Browser navigation exceeded ${MAX_MAIN_DOCUMENT_REDIRECTS} redirect hops.`));
       }
-      if (session.mainDocumentRequests > this.limits.maxMainDocumentRequests) {
+      if (this.limits.maxMainDocumentRequests !== null && session.mainDocumentRequests > this.limits.maxMainDocumentRequests) {
         this.failSession(session, new Error(`Browser main-document request limit (${this.limits.maxMainDocumentRequests}) exhausted.`));
       }
     });
@@ -2471,8 +2675,9 @@ export class InteractiveBrowserManager {
   ): Promise<T> {
     this.assertAcceptingOperations();
     this.assertUsable(session);
+    this.renewIdleLease(session);
     if (session.operationActive) throw new Error("Browser session is busy with another bounded operation.");
-    if (session.actions >= this.limits.maxActions) {
+    if (this.limits.maxActions !== null && session.actions >= this.limits.maxActions) {
       const error = new Error(`Browser action limit (${this.limits.maxActions}) exhausted.`);
       await this.failAndWait(session, error);
       throw error;
@@ -2522,7 +2727,7 @@ export class InteractiveBrowserManager {
         if (cancellation) throw operationCancellationError(cancellation, "dispatched");
         throw new Error(`${uncertain.message} Session teardown is confirmed.`);
       }
-      if ((fatalOnError && !(failure instanceof BrowserValidationError)) || operationSignal.aborted || session.fatalError) {
+      if ((fatalOnError && !(failure instanceof BrowserValidationError) && !this.settledNavigationFailures.has(failure)) || operationSignal.aborted || session.fatalError) {
         try {
           await this.failAndWait(session, session.fatalError ?? failure);
         } catch {
@@ -2534,6 +2739,7 @@ export class InteractiveBrowserManager {
       throw failure;
     } finally {
       session.operationActive = false;
+      this.renewIdleLease(session);
       this.activeOperations.delete(active);
       active.settle();
     }
@@ -2551,7 +2757,9 @@ export class InteractiveBrowserManager {
   }
 
   private failSession(session: Session, error: Error): void {
-    session.fatalError ??= error;
+    // Structured where manager-owned; the fatal outcome and teardown are
+    // exactly as before. The original message text is preserved.
+    session.fatalError ??= classifyFatalSessionError(error);
     void this.beginTeardown(session, session.fatalError).catch(() => undefined);
   }
 
@@ -2566,8 +2774,10 @@ export class InteractiveBrowserManager {
 
   private beginTeardown(session: Session, cause?: Error): Promise<BrowserCloseResult> {
     if (session.teardown) return session.teardown;
+    this.idleLeases.get(session)?.stop();
+    this.idleLeases.delete(session);
     const closure: BrowserClosureReason = session.fatalError
-      ? { kind: "fatal_error", message: bounded(session.fatalError.message, 500) }
+      ? { kind: session.fatalError instanceof BrowserIdleExpiredError ? "idle_expiry" : "fatal_error", message: bounded(session.fatalError.message, 500) }
       : cause
         ? { kind: "session_shutdown", message: "Pi session shutdown, replacement, or reload." }
         : { kind: "explicit_close", message: "BrowserClose was called." };
@@ -2595,7 +2805,9 @@ export class InteractiveBrowserManager {
           alreadyClosed: false,
           quiescent: true,
           broker: {
-            connections: summary.ledger.length,
+            connections: summary.ledger.length + (summary.ledgerDropped ?? 0),
+            ledgerDropped: summary.ledgerDropped ?? 0,
+            capacityRefusals: session.capacityRefusals,
             budgetAborts: summary.budgetAborts,
             refusals: summary.refusals,
           },
@@ -2605,7 +2817,7 @@ export class InteractiveBrowserManager {
         this.rememberClosed(session.handle, result);
         resolveTeardown(result);
       } catch (error) {
-        const failure = new Error(`Browser closure is unconfirmed: ${asError(error).message}`, { cause: error });
+        const failure = new Error(`Browser closure is unconfirmed: ${asError(error).message} Closure reason: ${closure.message}`, { cause: error });
         this.rememberFailed(session.handle, failure);
         rejectTeardown(failure);
       } finally {
@@ -2623,7 +2835,10 @@ export class InteractiveBrowserManager {
 
   private requireOwnedSession(sessionHandle: string): Session {
     const session = this.sessions.get(sessionHandle);
-    if (session) return session;
+    if (session) {
+      this.renewIdleLease(session);
+      return session;
+    }
     const failed = this.failedTombstones.get(sessionHandle);
     if (failed) throw failed;
     if (this.authenticatesSessionHandle(sessionHandle)) {
@@ -2740,7 +2955,7 @@ export class InteractiveBrowserManager {
   }
 
   private consumeNavigation(session: Session): void {
-    if (session.navigations >= this.limits.maxNavigations) {
+    if (this.limits.maxNavigations !== null && session.navigations >= this.limits.maxNavigations) {
       throw new Error(`Browser navigation limit (${this.limits.maxNavigations}) exhausted.`);
     }
     session.navigations += 1;
@@ -2806,7 +3021,7 @@ export class InteractiveBrowserManager {
       })),
       truncated: omittedEntries > 0,
       omittedEntries,
-      navigationsRemaining: Math.max(0, this.limits.maxNavigations - session.navigations),
+      navigationsRemaining: this.limits.maxNavigations === null ? null : Math.max(0, this.limits.maxNavigations - session.navigations),
     };
   }
 
@@ -2838,8 +3053,8 @@ export class InteractiveBrowserManager {
       documentRequestPending: false,
       closing: false,
       diagnosticsActive: true,
-      consoleDiagnostics: new DiagnosticRing(this.limits.maxConsoleEvents),
-      networkDiagnostics: new DiagnosticRing(this.limits.maxNetworkEvents),
+      consoleDiagnostics: new DiagnosticRing(this.limits.maxConsoleEvents, this.consoleQuota),
+      networkDiagnostics: new DiagnosticRing(this.limits.maxNetworkEvents, this.networkQuota),
       networkStartedAt: new WeakMap(),
       networkPolicy: new WeakMap(),
     };
@@ -2951,16 +3166,13 @@ export class InteractiveBrowserManager {
 
   private brokerBudgets(): EgressBudgets {
     return {
-      maxDistinctHosts: this.limits.maxDistinctHosts,
-      maxConnections: this.limits.maxConnections,
+      ...DEFAULT_EGRESS_BUDGETS,
+      mode: "interactive",
       maxClientConnections: 64,
       preAuthSocketMs: 5_000,
-      maxRequests: this.limits.maxRequests,
       // The Pi session owns browser lifetime; action deadlines remain finite.
       maxTotalMs: null,
       maxCleanupMs: this.limits.cleanupMs,
-      maxConnectionBytes: this.limits.maxConnectionBytes,
-      maxTotalBytes: this.limits.maxTotalBytes,
       maxAuthorityChars: 2_048,
       maxHeaderChars: 32_768,
       maxDiagnostics: 32,
@@ -2973,13 +3185,10 @@ export class InteractiveBrowserManager {
 export function interactiveChromiumArgs(brokerPort: number): string[] {
   return [
     ...chromiumEgressArgs(brokerPort),
-    "--blink-settings=imagesEnabled=false",
-    "--disable-remote-fonts",
     "--disable-background-networking",
     "--disable-component-update",
     "--disable-domain-reliability",
     "--disable-sync",
-    "--no-pings",
     "--autoplay-policy=user-gesture-required",
     "--disable-features=MediaRouter,OptimizationHints,InterestFeedContentSuggestions",
   ];
@@ -3015,7 +3224,9 @@ async function installRoutePolicy(
 export function interactiveRouteDecision(resourceType: string, rawUrl: string): { allowed: boolean; reason?: string } {
   let url: URL;
   try { url = new URL(rawUrl); } catch { return { allowed: false, reason: "unparseable browser request blocked" }; }
-  if (["image", "font", "media", "websocket", "eventsource", "ping"].includes(resourceType)) {
+  // WebSockets use the separately validated per-tab native transport. Ordinary
+  // rendering, SSE and beacon HTTP traffic use the authenticated broker.
+  if (resourceType === "websocket") {
     return { allowed: false, reason: `${resourceType} resource blocked` };
   }
   if (SAFE_LOCAL_PROTOCOLS.has(url.protocol)) return { allowed: true };
@@ -3050,7 +3261,7 @@ async function cleanupSession(session: Session, deadlineMs: number): Promise<Egr
     ...pendingContainments.map((closure) => boundedCleanup(closure, deadlineMs, "refused browser page containment")),
     ...pendingCreations.map((creation) => boundedCleanup(creation, deadlineMs, "late browser page creation containment")),
     boundedCleanup(session.context.close(), deadlineMs, "browser context close"),
-    boundedCleanup(session.browser.close(), deadlineMs, "browser process close"),
+    boundedCleanup(session.browser.close(), browserCleanupDeadline(session.browser, deadlineMs), "browser process close"),
     boundedCleanup(Promise.allSettled([...session.pendingWebSocketAdmissions]), deadlineMs, "pending websocket admission settlement"),
     boundedCleanup(session.broker.close(), deadlineMs, "egress broker close"),
   ]);
@@ -3082,7 +3293,7 @@ async function cleanupSession(session: Session, deadlineMs: number): Promise<Egr
   // page, context, and browser postconditions below independently prove it
   // closed. Late page *creation* can still acquire ownership and must drain.
   if (session.pendingPageCreations.size > 0) stateFailures.push(new Error("late browser page creation remains unsettled"));
-  if (session.browser.isConnected()) stateFailures.push(new Error("browser process remains connected"));
+  if (!ownedBrowserQuiescent(session.browser)) stateFailures.push(new Error("owned browser process disappearance is unconfirmed"));
   if (session.browser.contexts().includes(session.context)) stateFailures.push(new Error("browser context remains registered"));
   if (!session.broker.isQuiescent()) stateFailures.push(new Error("egress broker is not quiescent"));
   // Concurrent parent/child close calls can reject one Playwright command
@@ -3105,13 +3316,13 @@ async function cleanupPartial(
 ): Promise<void> {
   const results = await Promise.allSettled([
     boundedCleanup(context?.close() ?? Promise.resolve(), deadlineMs, "partial browser context close"),
-    boundedCleanup(browser?.close() ?? Promise.resolve(), deadlineMs, "partial browser process close"),
+    boundedCleanup(browser?.close() ?? Promise.resolve(), browserCleanupDeadline(browser, deadlineMs), "partial browser process close"),
     boundedCleanup(broker.close(), deadlineMs, "partial egress broker close"),
     boundedCleanup(lateContextCleanup ?? Promise.resolve(), deadlineMs, "late browser context containment"),
-    boundedCleanup(lateBrowserCleanup ?? Promise.resolve(), deadlineMs, "late browser process containment"),
+    boundedCleanup(lateBrowserCleanup ?? Promise.resolve(), Math.max(deadlineMs, 10_100), "late browser process containment"),
   ]);
   const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-  if (browser?.isConnected()) failures.push({ status: "rejected", reason: new Error("partial browser remains connected") });
+  if (browser && !ownedBrowserQuiescent(browser)) failures.push({ status: "rejected", reason: new Error("partial browser process disappearance is unconfirmed") });
   if (!broker.isQuiescent()) failures.push({ status: "rejected", reason: new Error("partial broker is not quiescent") });
   if (failures.length > 0) throw new AggregateError(failures.map((failure) => failure.reason), "partial BrowserOpen teardown failed");
 }
@@ -3767,6 +3978,60 @@ function unconfirmedOpenCleanupError(): BrowserRecoveryError {
   );
 }
 
+/** Fixed owned text plus structured fields; the original stays in the cause. */
+function browserFailure(cause: Error, phase: BrowserFailurePhase, category: BrowserFailureCategory): BrowserFailureError {
+  return new BrowserFailureError(bounded(cause.message, 500), phase, category, { cause });
+}
+
+const DEADLINE_ERROR_PATTERN = /exceeded its \d{1,8}ms total deadline/;
+
+/** Classify one failed BrowserOpen startup stage; the outcome is unchanged. */
+function classifySetupFailure(error: Error, stage: BrowserFailurePhase): BrowserFailureError {
+  if (error instanceof BrowserFailureError) return error;
+  let category: BrowserFailureCategory;
+  // Site-assigned typed categories are authoritative and cannot be shadowed
+  // by caller-controlled text in the message.
+  if (error instanceof PublicUrlValidationError) category = error.category;
+  else if (DEADLINE_ERROR_PATTERN.test(error.message)) category = "timeout";
+  else if (stage === "url_validation") category = classifyPublicUrlError(error);
+  else category = "internal_error";
+  return browserFailure(error, stage, category);
+}
+
+/**
+ * Classify manager-owned session-fatal errors from their fixed strings. These
+ * messages are owned constants, not page or network content; the original
+ * error remains internally attributable through the cause chain.
+ */
+function classifyFatalSessionError(error: Error): Error {
+  if (error instanceof BrowserFailureError || error instanceof BrowserRecoveryError) return error;
+  let category: BrowserFailureCategory = "internal_error";
+  if (/disconnected unexpectedly|tab crashed|Last browser tab closed unexpectedly/i.test(error.message)) {
+    category = "browser_process_failure";
+  } else if (/redirect hops|main-document request limit/i.test(error.message)) {
+    category = "budget_exhausted";
+  }
+  return browserFailure(error, "navigation", category);
+}
+
+/** Safe category for one failed Chromium navigation (fixed net tokens only).
+ * The leading Chromium token is checked first: it precedes any URL in the
+ * message, so caller-controlled text cannot shadow it. */
+function classifyNavigationError(error: Error): BrowserFailureCategory {
+  const token = /\bnet::ERR_[A-Z0-9_]{1,64}\b/u.exec(error.message)?.[0];
+  switch (token) {
+    case "net::ERR_NAME_NOT_RESOLVED":
+    case "net::ERR_NAME_RESOLUTION_FAILED":
+      return "dns_resolution_failed";
+    case "net::ERR_TIMED_OUT":
+      return "timeout";
+    default:
+      break;
+  }
+  if (DEADLINE_ERROR_PATTERN.test(error.message)) return "timeout";
+  return "browser_network_failure";
+}
+
 function operationCancellationError(cancellation: BrowserCancellationKind, phase: "not_started" | "dispatched" | "unknown"): BrowserRecoveryError {
   const by = cancellation === "close"
     ? " by BrowserClose"
@@ -4057,6 +4322,7 @@ function normalizedInteractionFailure(
   name: "BrowserHover" | "BrowserClick" | "BrowserFill" | "BrowserType" | "BrowserSelect" | "BrowserPress",
   error: unknown,
 ): Error {
+  if (error instanceof BrowserSessionClosedError) return error;
   const message = error instanceof Error ? error.message : "";
   if (/\b(?:not_started|effect status is (?:started|completed|unknown))\b/i.test(message)) return asError(error);
   if (/Invalid or stale browser session handle|Browser session is closed/.test(message)) {

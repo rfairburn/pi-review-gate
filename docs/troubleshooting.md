@@ -62,6 +62,25 @@ underlying behavior.
   intentionally omitted by the route policy; this never fails the render and bounded
   omission diagnostics are disclosed. See
   [Security model](security-model.md#egress-broker-containment).
+- **Older `BrowserOpen` builds fail on content-rich pages with `category=budget_exhausted`.**
+  Interactive mode no longer inherits extraction's cumulative 16-host, connection,
+  request or byte quotas. Check the loaded extension version rather than adding site
+  exceptions or bypassing SSRF checks. Extraction retains its separate limits.
+  Current interactive capacity refusals affect only excess connections and appear as
+  session-wide `brokerCapacityRefusals` in diagnostic results. Genuine security denials
+  remain fatal. See [Security model](security-model.md#egress-broker-containment) and
+  [Web tools](web-tools.md).
+- **Browser handles report tool-inactivity expiry.** Reopen with `BrowserOpen`; prior
+  page state is lost. Configure the positive minute value under `/review-settings` →
+  Web → Browser idle expiry. Background page traffic cannot keep the session alive.
+- **A dynamic site's capture fails with `phase=capture; category=document_changed`.**
+  A main or child-frame navigation changes the capability generation; stale evidence
+  is rejected and the session is closed, not returned or automatically replayed.
+  Reopen explicitly and observe bounded page settling before a fresh capture. Public CNN QA reproduced advertising child-frame navigation during initial
+  capture; a fixed post-open observation window allowed capture, but its ad/video tiles
+  still showed site errors. Successful opening is not proof every third-party widget
+  works. Use bounded console/network observations without disabling generation, CSP,
+  CORS, TLS or egress guards.
 - **DDGS provisioning fails during install or launch.** `scripts/ensure-ddgs.sh`
   requires the pinned `ddgs==9.15.0`, binary distributions, and a clean `pip check`; the
   configured PyPI/index source and local pip configuration are part of the trusted setup

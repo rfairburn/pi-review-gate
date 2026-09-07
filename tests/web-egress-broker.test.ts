@@ -44,6 +44,124 @@ import type { HostResolver, NetworkOptions, ValidatedUrl } from "../src/web/netw
 const publicAnswer = "203.0.114.1"; // adjacent to TEST-NET-3, not blocked
 const secondPublicAnswer = "198.20.0.5";
 
+test("interactive broker streams beyond lifetime quotas and bounds history", async () => {
+  const chunk = Buffer.alloc(1024 * 1024, 97);
+  const origin = countingServer(async (req, res) => {
+    const count = req.url === "/large" ? 9 : 0;
+    for (let i = 0; i < count; i++) {
+      if (!res.write(chunk)) await once(res, "drain");
+    }
+    res.end();
+  });
+  const originPort = await listen(origin);
+  const harness = await startBroker(async () => [publicAnswer], { mode: "interactive", maxTotalMs: 0 });
+  try {
+    for (let i = 0; i < 270; i++) {
+      const result = await proxyGet(harness.port, `http://host-${i}.test:${originPort}/${i < 4 ? "large" : "small"}`);
+      assert.equal(result.status, 200);
+      assert.equal(result.body.length, i < 4 ? 9 * 1024 * 1024 : 0);
+    }
+    const summary = await harness.broker.close();
+    assert.equal(summary.budgetAborts, 0);
+    assert.equal(summary.refusals, 0);
+    assert.equal(summary.ledger.length, 256);
+    assert.equal(summary.ledgerDropped, 14);
+    assert.equal(harness.dials.length, 270);
+  } finally { await harness.stop(); await close(origin); }
+});
+
+test("interactive established HTTP and CONNECT survive extraction idle deadline", async () => {
+  const origin = countingServer((_req, res) => {
+    res.writeHead(200);
+    res.write("first");
+    setTimeout(() => res.end("last"), 100);
+  });
+  const originPort = await listen(origin);
+  const echo = net.createServer((socket) => socket.pipe(socket));
+  const echoPort = await listen(echo);
+  const harness = await startBroker(async () => [publicAnswer], { mode: "interactive", idleSocketMs: 10 });
+  try {
+    assert.equal((await proxyGet(harness.port, `http://stream.test:${originPort}/`)).body, "firstlast");
+    const tunnel = await proxyConnect(harness.port, `quiet.test:${echoPort}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(tunnel.socket.destroyed, false);
+    tunnel.socket.write("awake");
+    const [data] = await once(tunnel.socket, "data");
+    assert.equal(data.toString(), "awake");
+    tunnel.socket.destroy();
+    assert.equal(harness.broker.summary().budgetAborts, 0);
+  } finally { await harness.stop(); await close(origin); await close(echo); }
+});
+
+test("interactive client capacity is 64 and returns only on close", async () => {
+  let capacity = 0;
+  const harness = await startBroker(async () => [publicAnswer], { mode: "interactive", preAuthSocketMs: 60_000 }, {
+    capacityRefusal() { capacity++; },
+    policyFailure() { assert.fail("capacity is not a security denial"); },
+  });
+  const clients: net.Socket[] = [];
+  const connect = async () => {
+    const socket = net.connect(harness.port, "127.0.0.1");
+    socket.on("error", () => undefined);
+    clients.push(socket);
+    await once(socket, "connect");
+    return socket;
+  };
+  try {
+    for (let i = 0; i < 64; i++) await connect();
+    const excess = await connect();
+    await once(excess, "close");
+    assert.equal(capacity, 1);
+    clients[0]!.destroy();
+    await once(clients[0]!, "close");
+    // A round-trip on an existing peer ensures the broker processed closure.
+    clients[1]!.end();
+    await once(clients[1]!, "close");
+    const recovered = await connect();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(recovered.destroyed, false);
+    recovered.destroy();
+    assert.equal(capacity, 1);
+  } finally { for (const socket of clients) socket.destroy(); await harness.stop(); }
+});
+
+test("interactive overlapping DNS admission caps upstream reservations and recovers", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let resolving = 0;
+  let capacity = 0;
+  let security = 0;
+  const origin = countingServer();
+  const originPort = await listen(origin);
+  const harness = await startBroker(async (host) => {
+    resolving++;
+    await gate;
+    return [host === "private.test" ? "127.0.0.1" : publicAnswer];
+  }, { mode: "interactive" }, {
+    capacityRefusal(context) { assert.equal(context.category, "capacity_exhausted"); capacity++; },
+    policyFailure() { security++; },
+  });
+  // Pipeline 65 requests on one client: the upstream limit cannot be bypassed
+  // merely because the independent client limit has not been reached.
+  const socket = net.connect(harness.port, "127.0.0.1");
+  socket.on("error", () => undefined);
+  socket.resume();
+  try {
+    await once(socket, "connect");
+    socket.write(Array.from({ length: 65 }, (_, i) => `GET http://h${i}.test:${originPort}/ HTTP/1.1\r\nHost: h${i}.test\r\n\r\n`).join(""));
+    for (let i = 0; i < 100 && capacity === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(resolving, 64);
+    assert.equal(capacity, 1);
+    assert.equal(security, 0);
+    release();
+    await once(socket, "close");
+    const recovered = await proxyGet(harness.port, `http://recovered.test:${originPort}/`);
+    assert.equal(recovered.status, 200);
+    assert.equal((await proxyGet(harness.port, `http://private.test:${originPort}/`)).status, 403);
+    assert.equal(security, 1);
+  } finally { release(); socket.destroy(); await harness.stop(); await close(origin); }
+});
+
 function testOptions(overrides: Partial<NetworkOptions> = {}): NetworkOptions {
   return { timeoutMs: 15_000, maxBytes: 65_536, userAgent: "pi-review-gate-test", ...overrides };
 }
@@ -674,6 +792,51 @@ test("broker enforces distinct-host and connection budgets", async () => {
     assert.ok(summary.omissions.some((omission) => omission.includes("connection budget")));
   } finally {
     await harness.stop();
+    await close(target);
+  }
+});
+
+test("policy refusal observer receives bounded destination and category context", async () => {
+  const target = countingServer();
+  const targetPort = await listen(target);
+  const dnsError = Object.assign(new Error("getaddrinfo ENOTFOUND missing.test"), { code: "ENOTFOUND" });
+  type Refusal = { reason: string; diagnostic: string; context?: { destination?: { kind: string; hostname: string; port: number }; category?: string } };
+  const dnsFailures: Refusal[] = [];
+  const budgetFailures: Refusal[] = [];
+  const dnsHarness = await startBroker(
+    async (hostname) => {
+      if (hostname === "missing.test") throw dnsError;
+      return [publicAnswer];
+    },
+    undefined,
+    { policyFailure: (reason, diagnostic, context) => dnsFailures.push({ reason, diagnostic, context }) },
+  );
+  const budgetHarness = await startBroker(
+    () => Promise.resolve([publicAnswer]),
+    { maxDistinctHosts: 1 },
+    { policyFailure: (reason, diagnostic, context) => budgetFailures.push({ reason, diagnostic, context }) },
+  );
+  try {
+    const dnsRefused = await proxyGet(dnsHarness.port, `http://missing.test:${targetPort}/`);
+    assert.equal(dnsRefused.status, 403, "DNS failure at admission must refuse the request");
+    assert.equal(dnsFailures.length, 1);
+    assert.equal(dnsFailures[0]?.reason, "refusal");
+    assert.ok(dnsFailures[0] && dnsFailures[0].diagnostic.length > 0 && dnsFailures[0].diagnostic.length <= 500);
+    assert.deepEqual(dnsFailures[0]?.context, {
+      destination: { kind: "http", hostname: "missing.test", port: targetPort },
+      category: "dns_resolution_failed",
+    }, "the DNS refusal must carry its destination and safe category");
+
+    assert.equal((await proxyGet(budgetHarness.port, `http://a.test:${targetPort}/`)).status, 200);
+    const budgetRefused = await proxyGet(budgetHarness.port, `http://b.test:${targetPort}/`);
+    assert.equal(budgetRefused.status, 403, "the second distinct host must still be refused");
+    assert.deepEqual(budgetFailures.at(-1)?.context, {
+      destination: { kind: "http", hostname: "b.test", port: targetPort },
+      category: "budget_exhausted",
+    }, "the budget refusal must carry its destination and safe category");
+  } finally {
+    await dnsHarness.stop();
+    await budgetHarness.stop();
     await close(target);
   }
 });

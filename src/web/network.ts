@@ -417,20 +417,31 @@ export interface ValidatedUrl {
  * `createPinnedLookup` / `createPinnedAgent`); re-resolving later would reopen
  * the DNS rebinding window.
  */
+/** A failed public-URL validation whose safe category is assigned at the
+ * failure site. The message may embed caller-controlled input; the category
+ * must never be derived by searching it. */
+export class PublicUrlValidationError extends Error {
+  constructor(message: string, readonly category: PublicUrlErrorCategory) {
+    super(message);
+    this.name = "PublicUrlValidationError";
+  }
+}
+
 export async function validatePublicUrl(value: string, resolve: HostResolver = defaultHostResolver): Promise<ValidatedUrl> {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    throw new Error(`Invalid URL: ${value}`);
+    throw new PublicUrlValidationError(`Invalid URL: ${value}`, "invalid_url");
   }
-  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Only http and https URLs are supported.");
-  if (url.username || url.password) throw new Error("URLs containing credentials are not allowed.");
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new PublicUrlValidationError("Only http and https URLs are supported.", "invalid_url");
+  if (url.username || url.password) throw new PublicUrlValidationError("URLs containing credentials are not allowed.", "invalid_url");
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  // Resolver errors propagate unchanged (structured Node codes preserved).
   const addresses = await resolve(hostname);
-  if (addresses.length === 0) throw new Error(`Hostname did not resolve: ${hostname}`);
+  if (addresses.length === 0) throw new PublicUrlValidationError(`Hostname did not resolve: ${hostname}`, "dns_resolution_failed");
   for (const address of addresses) {
-    if (isBlockedAddress(address)) throw new Error(`URL resolves to a non-public address: ${address}`);
+    if (isBlockedAddress(address)) throw new PublicUrlValidationError(`URL resolves to a non-public address: ${address}`, "non_public_address_denied");
   }
   url.hash = "";
   return { href: url.href, hostname, addresses: [...addresses] };
@@ -439,6 +450,24 @@ export async function validatePublicUrl(value: string, resolve: HostResolver = d
 /** Backwards-compatible convenience wrapper returning only the canonical href. */
 export async function validatedPublicUrl(value: string, resolve?: HostResolver): Promise<string> {
   return (await validatePublicUrl(value, resolve)).href;
+}
+
+/** Safe bounded category for one failed public-URL validation. */
+export type PublicUrlErrorCategory = "dns_resolution_failed" | "non_public_address_denied" | "invalid_url";
+
+/**
+ * Classify a failed public-URL validation into a safe category. Site-assigned
+ * typed categories are authoritative; resolver failures are classified by
+ * structured Node error codes only. No error message text — which may embed
+ * caller-controlled URLs — is ever searched.
+ */
+export function classifyPublicUrlError(error: unknown): PublicUrlErrorCategory {
+  if (error instanceof PublicUrlValidationError) return error.category;
+  const code = isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+  if (code !== undefined && ["ENOTFOUND", "EAI_AGAIN", "ENODATA", "ETIMEDOUT"].includes(code)) {
+    return "dns_resolution_failed";
+  }
+  return "invalid_url";
 }
 
 /**

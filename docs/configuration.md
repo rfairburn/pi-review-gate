@@ -154,6 +154,7 @@ defaults to `true`. The default retry policy is
   "web": {
     "enabled": true,
     "browserInteractionApproval": "ask",
+    "browserIdleExpiryMinutes": 15,
     "search": { "provider": "ddgs", "timeoutMs": 20000, "maxResults": 10 },
     "fetch": {
       "timeoutMs": 30000,
@@ -166,6 +167,15 @@ defaults to `true`. The default retry policy is
   }
 }
 ```
+
+`web.browserIdleExpiryMinutes` is a positive safe integer number of minutes
+(default **15**). Edit it through `/review-settings` → **Web** → **Browser idle
+expiry**, then **Save changes**. Zero, fractions, and nonfinite values are rejected;
+there is no disabled option. The browser lifecycle contract is renewed by browser-tool
+activity, not background page requests, scripts, or WebSockets, and does not expire
+during an active browser operation. Both initial tool registration and live settings
+updates apply this persisted value to the managed browser. Expired handles explicitly
+require `BrowserOpen`; no lost state is silently recreated.
 
 `web.browserInteractionApproval` accepts exactly `"ask"` (default),
 `"automatically-accept"`, or `"automatically-deny"`. Omission uses Ask; invalid values

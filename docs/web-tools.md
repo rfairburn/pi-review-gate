@@ -264,7 +264,8 @@ and semantic:
 
 Each Pi session owns at most **one live, non-suspended browser**, with multiple owned
 tabs. Its session/tab handles remain usable across completed turns, model thinking,
-ordinary idle, and automatic/manual/ask-reviewer reviews until `BrowserClose`.
+ordinary idle, and automatic/manual/ask-reviewer reviews until `BrowserClose` or
+configured tool-inactivity expiry (15 minutes by default).
 Duplicate or concurrent `BrowserOpen` never creates or replaces an instance: it gives
 instructions for the existing session (`BrowserTabs`/`BrowserNavigate`/`BrowserClose`),
 or asks you to await the already-running open.
@@ -283,11 +284,13 @@ resolve only extension-issued semantic refs internally. Navigation, popup, dialo
 observers are armed before dispatch. Popup tabs stay in the same ownership/broker bound
 and are never auto-switched; overflow popups are closed. Unexpected downloads are
 canceled, and confirm/prompt/beforeunload dialogs are default-dismissed so they cannot
-hang an action. Service workers, external protocols, media, permissions,
-direct QUIC/WebRTC, and proxy bypass are disabled. This initial observational implementation also disables images and
-custom/downloadable fonts in Chromium itself and blocks image/font requests at routing;
-no visual resource is allowed to bypass broker accounting through a generated `data:`
-or `blob:` URL.
+hang an action. Service workers, external protocols, permissions, direct QUIC/WebRTC,
+and proxy bypass remain disabled. Interactive images, downloaded fonts, media, SSE,
+and HTTP beacons use protected broker networking. Local `data:`/`blob:` rendering is
+allowed; those URLs do not themselves open network connections. Dedicated and shared
+workers retain broker-only egress. Site CSP, CORS, TLS checks and user-gesture media
+playback policy remain in force. This is a headless QA browser, not unrestricted
+computer use; visibility and password/upload overrides are separate future work.
 
 Everything returned from a page — snapshot text, accessible names, title, URL, and
 pixels — is labeled **untrusted evidence**. It must never be treated as an instruction
@@ -305,10 +308,11 @@ are process-local capabilities scoped to one session, tab, current document gene
 and latest successful snapshot.
 
 Console and network rings are also process-local and memory-only. They are allocated per
-owned tab, bounded when each event is captured, never written to caches or review-gate
+owned tab with shared session-wide count/byte quotas, bounded when each event is captured,
+never written to caches or review-gate
 evidence stores beyond the bounded tool result itself, and cleared on tab close, session
 teardown, or extension shutdown. Diagnostic reads are serialized with existing browser
-actions, consume the existing operation budget, honor cancellation and deadlines, and
+actions, renew tool activity, honor cancellation and deadlines, and
 do not navigate, mutate the document generation/page state, create requests, or widen
 broker permissions. Ring overflow and result pagination are never silent: dropped and
 truncated counts accompany every read.
@@ -326,10 +330,16 @@ Pi/provider input/conversation retention. It must not be presented as credential
 browsing or as guaranteed erasure. The registry ends when its owning manager is discarded,
 not at a turn/review boundary.
 
-Resource and action limits remain hard and finite: one browser per Pi session, 4 tabs, 12
-explicit navigations/history traversals, 64 operations, 32 retained history entries per
-tab, 32 main-document requests, 16 destination hosts,
-96 connections, 256 broker requests, 8 MiB per connection, and 32 MiB aggregate bytes.
+Active resource limits remain hard and finite: one browser per Pi session, 4 tabs,
+32 retained history entries per tab, 64 simultaneous broker client connections and
+64 simultaneous upstream connections. Interactive browsing has no cumulative host,
+connection, request, navigation, action, main-document-request, or transferred-byte
+quota. `navigationsRemaining` and disabled lifetime limit fields are `null`.
+Capacity returns on close; an excess connection is refused locally without retiring a
+healthy session. Diagnostic results expose a bounded scalar `brokerCapacityRefusals`
+(session-wide, not attributed to the queried tab). Streaming retains backpressure,
+not whole responses; this does not bound Chromium page memory. Extraction limits are
+unchanged.
 Each open/navigation and confirmation-capable interaction has one 30-second end-to-end
 deadline; each other action or snapshot has one 10-second end-to-end deadline. All
 phases share that one absolute timer and never receive fresh timers. A deadline race
@@ -341,27 +351,30 @@ Cleanup can therefore extend the caller's elapsed time
 beyond the action deadline. Unsettled work reports unknown effects, never rollback.
 Ordinary invalid/stale capability validation and harmless screenshot mode/ref argument
 mistakes do not themselves retire a healthy session.
-There is no browser idle or elapsed-lifetime expiry. Interactive CONNECT tunnels are
-retained through ordinary idle because the broker cannot distinguish encrypted HTTPS
-from live WSS traffic. Ordinary plain-HTTP destination sockets still have a 20-second
-idle eviction without closing the browser or cancelling a pending permission prompt.
-Hard resource budgets and terminal cleanup still apply to all transports, and new
+Browser tool inactivity expires the session after `web.browserIdleExpiryMinutes`
+(default 15, configurable under `/review-settings` → Web). Background scripts,
+requests and WebSockets do not renew expiry, and active operations/approval waits are
+protected. Expired handles explicitly require `BrowserOpen`; state is not recreated.
+There is no elapsed browser-lifetime deadline or established-stream idle eviction.
+Pre-authentication connection deadlines and concurrent capacity still apply, and new
 connections undergo fresh DNS validation and pinned dialing. No page action is
 automatically replayed. Redirect chains are capped at 10 hops and semantic output at
 24,000 characters and depth 16. Console and network rings retain at most
-128 and 256 events per tab respectively; each read returns at most 64. Console/error text
+256 events and 1 MiB of sanitized UTF-8 serialized data per channel across the whole
+session, with tab-isolated reads; each read returns at most 64. Oldest captures are
+evicted by count or bytes with truthful dropped cursors. Broker closed history retains
+256 entries plus at most 64 active entries, disclosing pruned history separately. Console/error text
 is captured at 1,000 characters, source origins at 300, inspect names/descriptions/text at
 256/512/512, and every cap has explicit truncation accounting. A screenshot is capped at 2,000×2,000,
 4,000,000 decoded pixels, 4 MiB of final encoded PNG data, and a conservative 32 MiB
 allocation charge covering decoded RGBA, encoded bytes, and the Pi base64 image-content
 string. Both viewport/element bounds and the decoded final PNG are checked; an oversized
 or malformed final result is discarded and fails the session closed before image
-content is created. Budgets are cumulative for the whole session, not reset by
-navigation.
+content is created. Individual output limits are not relaxed by sustained sessions.
 
 Action cancellation, terminal session shutdown, browser crashes, and hard broker
-policy/budget failures immediately begin deadline-bounded teardown. Ordinary socket
-idle eviction is not a fatal budget notification. Interaction failures distinguish
+security-policy failures immediately begin deadline-bounded teardown. Capacity-only
+refusals are nonfatal. Interaction failures distinguish
 `not_started`, `started`, `completed`, and `unknown` effect states where available and
 never claim that cancellation rolled back a page or external effect. Successful results
 use a bounded post-dispatch accounting window, drain containment work added during that
@@ -370,14 +383,28 @@ that a later page effect cannot occur. Shutdown also aborts and awaits
 any `BrowserOpen` still in startup, permanently rejects new opens, and preserves any
 unconfirmed startup teardown as a shutdown error. If any close step times out or
 quiescence cannot be proven, the tool returns an error saying closure is unconfirmed; it
-never turns an attempted close into a false closed claim. Screenshot cancellation also
+never turns an attempted close into a false closed claim. Local Chromium gets 5 seconds
+for graceful close, then the retained verified-owned Playwright process handle is used
+for forced termination, with up to 5 additional seconds for verification (plus 100 ms
+outer scheduling allowance). This retains the local isolated-selector transport; no
+process-name scanning or arbitrary PID termination is used. OS process disappearance,
+not just connection state, is checked. Unsupported ownership bridges fail closed.
+Screenshot cancellation also
 fails closed and completes this teardown before returning. Call `BrowserClose` as soon
 as the evidence is collected; on success it deterministically confirms browser and
 broker cleanup, and it is safe to repeat.
 
 Interactive Browser failures throw bounded, sanitized errors so Pi's native outer
 `toolResult.isError` is true. They contain text only, never screenshots or raw page/
-Playwright exceptions. `BrowserExtract` and `WebFetch` keep their existing result contract.
+Playwright exceptions. Manager-owned failures carry a structured failure phase
+(`url_validation`, `broker_admission`, `chromium_startup`, `context_creation`, or
+`navigation`) and a safe category such as `dns_resolution_failed`,
+`non_public_address_denied`, `budget_exhausted`, or `browser_process_failure`; browser
+tool errors report them as fixed text like `phase=...; category=...` with bounded
+per-category guidance. This keeps a distinct-host budget exhaustion on a content-rich
+page distinguishable from an ambiguous network error, and unstructured failure text never
+claims a proven authorization denial. `BrowserExtract` and `WebFetch` keep their existing
+result contract.
 The real-runtime regression in `tests/browser-native-error.test.ts` accepts
 `PI_BROWSER_AGENT_RUNTIME` pointing to an installed Pi agent-core `dist/index.js`
 (tested with 0.85.0); its model stream is entirely mocked, with no live model calls.

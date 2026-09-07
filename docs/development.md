@@ -145,4 +145,8 @@ to limit the orchestrator, pass Pi's native allowlist through the wrapper, for e
 - The `ApplyPatch` V4A diff engine and its compatibility tests are adapted from the
   OpenAI Agents JS apply-patch implementation and are used under the MIT License. See
   [NOTICE](../NOTICE) and
-  [LICENSES/MIT-openai-agents-js.txt](../LICENSES/MIT-openai-agents-js.txt).
+  [LICENSES/MIT-openai-agents-js.txt](../LICENSES/MIT-openai-agents-js.txt). The canonical
+  envelope parser (`src/apply-patch/envelope.ts`) implements the publicly documented
+  OpenAI/Codex apply_patch grammar so patches authored by OpenAI models apply unchanged;
+  it is an independent implementation of the public format — no Codex source code is
+  copied.

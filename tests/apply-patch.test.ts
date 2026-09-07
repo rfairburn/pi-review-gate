@@ -3,8 +3,8 @@ import { chmod, lstat, mkdir, readdir, readFile, rm, symlink, writeFile, mkdtemp
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
-import { APPLY_PATCH_TOOL_NAME, applyPatchToolSchema, parseApplyPatchOperation, performApplyPatchOperation, registerApplyPatchTool, renderApplyPatchCall, renderApplyPatchResult } from "../src/apply-patch/tool";
-import { extractCandidatePaths, recordToolCallEvidence, createEvidenceState, shouldRecordToolCallEvidence, shouldRecordToolResultEvidence } from "../src/evidence";
+import { APPLY_PATCH_TOOL_NAME, applyPatchToolSchema, parseApplyPatchOperation, registerApplyPatchTool, renderApplyPatchCall, renderApplyPatchResult } from "../src/apply-patch/tool";
+import { collectEvidenceChanges, createEvidenceState, extractCandidatePaths, recordToolCallEvidence, recordToolResultEvidence, shouldRecordToolCallEvidence, shouldRecordToolResultEvidence } from "../src/evidence";
 import { activate } from "../src/index";
 import { ExecutionToolManager } from "../src/execution/tool";
 import { normalizeConfig } from "../src/config";
@@ -61,21 +61,32 @@ function updateOperation(path: string, diff: string, moveTo?: string): Record<st
 // Registration, schema, and visibility
 // ---------------------------------------------------------------------------
 
-test("ApplyPatch registers with a strict structured schema and sequential execution", () => {
+test("ApplyPatch registers with a canonical-envelope-first strict schema and sequential execution", () => {
   const { tools } = harness();
   const tool = tools.find((candidate) => candidate.name === APPLY_PATCH_TOOL_NAME)!;
   assert.equal(tool.label, APPLY_PATCH_TOOL_NAME);
   assert.equal(tool.executionMode, "sequential");
-  assert.ok(tool.description.includes("create_file"));
+  assert.ok(tool.description.includes("*** Begin Patch"));
+  assert.ok(tool.description.includes("applied sequentially"));
+  assert.ok(!tool.description.includes("rollback"), "the model-facing contract must not promise rollback");
   assert.ok(Array.isArray(tool.promptGuidelines) && tool.promptGuidelines.length > 0);
   assert.ok(typeof tool.renderCall === "function");
   assert.ok(typeof tool.renderResult === "function");
 
-  const schema = applyPatchToolSchema() as { additionalProperties: boolean; required: string[]; properties: Record<string, any> };
+  const schema = applyPatchToolSchema() as { additionalProperties: boolean; properties: Record<string, any>; oneOf: Array<Record<string, any>> };
   assert.equal(schema.additionalProperties, false);
-  assert.deepEqual(schema.required, ["operation"]);
-  // The operation argument is a discriminated oneOf with operation-specific
-  // required and forbidden fields.
+  // Exactly one of the canonical patch envelope or the legacy structured
+  // operation object may be present.
+  assert.deepEqual(
+    schema.oneOf.map((branch) => branch.required),
+    [["patch"], ["operation"]],
+  );
+  const patch = schema.properties.patch as { type: string; description: string };
+  assert.equal(patch.type, "string");
+  assert.ok(patch.description.includes("*** Begin Patch"));
+  assert.ok(patch.description.includes("applied sequentially"));
+  // The legacy operation argument is a discriminated oneOf with
+  // operation-specific required and forbidden fields.
   const operation = schema.properties.operation as { description: string; oneOf: Array<Record<string, any>> };
   assert.ok(operation.description.length > 0);
   assert.deepEqual(
@@ -889,6 +900,468 @@ test("ApplyPatch aborts before mutating when the signal is already aborted", asy
       (error: Error) => /cancel|abort/i.test(error.message),
     );
     await assert.rejects(lstat(join(dir, "never.txt")));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Canonical envelope: sequential application and partial-failure reporting
+// ---------------------------------------------------------------------------
+
+function envelope(...lines: string[]): string {
+  return ["*** Begin Patch", ...lines, "*** End Patch"].join("\n");
+}
+
+test("a mixed multi-file envelope applies create/update/rename/delete in order", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await writeFile(join(dir, "keep.txt"), "one\ntwo\n", "utf8");
+    await writeFile(join(dir, "old.txt"), "one\ntwo\n", "utf8");
+    await writeFile(join(dir, "drop.txt"), "bye\n", "utf8");
+
+    const patch = envelope(
+      "*** Add File: src/new.txt",
+      "+hello",
+      "+world",
+      "*** Update File: keep.txt",
+      "@@ one",
+      "-two",
+      "+TWO",
+      "*** Update File: old.txt",
+      "*** Move to: moved/old.txt",
+      "-one",
+      "+FIRST",
+      "*** Delete File: drop.txt",
+    );
+    const result = await execute({ patch }, { cwd: dir });
+    // The model-facing success text follows the upstream Codex print_summary
+    // format exactly (grouped A/M/D lines, patch path spelling).
+    assert.equal(
+      result.content[0].text,
+      ["Success. Updated the following files:", "A src/new.txt", "M keep.txt", "M old.txt", "D drop.txt"].join("\n"),
+    );
+
+    // Codex newline semantics: every Add File line contributes line + "\n".
+    assert.equal(await readFile(join(dir, "src/new.txt"), "utf8"), "hello\nworld\n");
+    assert.equal(await readFile(join(dir, "keep.txt"), "utf8"), "one\nTWO\n");
+    assert.equal(await readFile(join(dir, "moved/old.txt"), "utf8"), "FIRST\ntwo\n");
+    await assert.rejects(lstat(join(dir, "old.txt")));
+    await assert.rejects(lstat(join(dir, "drop.txt")));
+
+    const operations = result.details.operations as Array<Record<string, any>>;
+    assert.equal(operations.length, 4);
+    assert.deepEqual(
+      operations.map((op) => op.operation),
+      ["create_file", "update_file", "update_file", "delete_file"],
+    );
+    assert.equal(operations[2]!.moveTo, "moved/old.txt");
+    // The combined final diff carries the accumulated delta of every applied
+    // operation.
+    const finalDiff = result.details.finalDiff as string;
+    assert.match(finalDiff, /diff --git a\/src\/new\.txt/);
+    assert.match(finalDiff, /rename from old\.txt/);
+    assert.match(finalDiff, /\+\+\+ \/dev\/null/);
+    assert.equal(result.details.mutated, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failing later operation stops the request and preserves earlier successes (7-of-8 style)", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await writeFile(join(dir, "keep.txt"), "one\ntwo\n", "utf8");
+    await writeFile(join(dir, "never.txt"), "keep-me\n", "utf8");
+    await writeFile(join(dir, "drop.txt"), "bye\n", "utf8");
+    // bad.txt exists but does not contain the line the hunk wants to remove,
+    // so operation 5 fails with an anchor mismatch.
+    await writeFile(join(dir, "bad.txt"), "unrelated\n", "utf8");
+
+    const patch = envelope(
+      "*** Add File: a1.txt",
+      "+one",
+      "*** Add File: a2.txt",
+      "+two",
+      "*** Update File: keep.txt",
+      "@@ one",
+      "-two",
+      "+TWO",
+      "*** Delete File: drop.txt",
+      "*** Update File: bad.txt",
+      "@@ unrelated",
+      "-missing",
+      "+replacement",
+      "*** Add File: a6.txt",
+      "+six",
+      "*** Add File: a7.txt",
+      "+seven",
+      "*** Delete File: never.txt",
+    );
+
+    await assert.rejects(
+      execute({ patch }, { cwd: dir }),
+      (error: Error) => {
+        assert.match(error.message, /failed at operation 5 \(update_file bad\.txt\)/);
+        assert.match(error.message, /4 earlier operation\(s\) still applied/);
+        assert.match(error.message, /Applied: created a1\.txt \(4 bytes\); created a2\.txt \(4 bytes\); updated keep\.txt \(\+1 −1 lines\); deleted drop\.txt/);
+        assert.match(error.message, /Invalid Context/);
+        assert.match(error.message, /Not attempted: create_file a6\.txt, create_file a7\.txt, delete_file never\.txt/);
+        return true;
+      },
+    );
+
+    // Earlier successes remain applied exactly as committed.
+    assert.equal(await readFile(join(dir, "a1.txt"), "utf8"), "one\n");
+    assert.equal(await readFile(join(dir, "a2.txt"), "utf8"), "two\n");
+    assert.equal(await readFile(join(dir, "keep.txt"), "utf8"), "one\nTWO\n");
+    await assert.rejects(lstat(join(dir, "drop.txt")));
+    // The failed operation left its target unchanged; the not-attempted
+    // operations left no trace.
+    assert.equal(await readFile(join(dir, "bad.txt"), "utf8"), "unrelated\n");
+    await assert.rejects(lstat(join(dir, "a6.txt")));
+    await assert.rejects(lstat(join(dir, "a7.txt")));
+    assert.equal(await readFile(join(dir, "never.txt"), "utf8"), "keep-me\n");
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sequential same-path operations apply in order like Codex (no duplicate rejection)", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await writeFile(join(dir, "seq.txt"), "one\ntwo\n", "utf8");
+
+    // The second update targets the state left by the first: its anchor only
+    // matches after the first hunk has been applied.
+    const patch = envelope(
+      "*** Update File: seq.txt",
+      "@@ one",
+      "-two",
+      "+TWO",
+      "*** Update File: seq.txt",
+      "@@ one",
+      "-TWO",
+      "+THREE",
+    );
+    const result = await execute({ patch }, { cwd: dir });
+    assert.equal(
+      result.content[0].text,
+      ["Success. Updated the following files:", "M seq.txt", "M seq.txt"].join("\n"),
+    );
+    assert.equal(await readFile(join(dir, "seq.txt"), "utf8"), "one\nTHREE\n");
+
+    // Create-then-update of the same path is equally valid.
+    const fresh = envelope(
+      "*** Add File: fresh.txt",
+      "+v1",
+      "*** Update File: fresh.txt",
+      "-v1",
+      "+v2",
+    );
+    await execute({ patch: fresh }, { cwd: dir });
+    assert.equal(await readFile(join(dir, "fresh.txt"), "utf8"), "v2\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a malformed envelope is rejected before any mutation", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await assert.rejects(
+      execute({ patch: "*** Add File: a.txt\n+x" }, { cwd: dir }),
+      /first line of the patch must be '\*\*\* Begin Patch'/,
+    );
+    assert.deepEqual(await readdir(dir), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a missing target in a later operation fails only that operation (no all-path preflight)", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    const patch = envelope(
+      "*** Add File: first.txt",
+      "+one",
+      "*** Update File: missing.txt",
+      "-x",
+      "+y",
+    );
+    await assert.rejects(
+      execute({ patch }, { cwd: dir }),
+      (error: Error) => {
+        assert.match(error.message, /failed at operation 2 \(update_file missing\.txt\)/);
+        assert.match(error.message, /does not exist/);
+        assert.match(error.message, /1 earlier operation\(s\) still applied/);
+        return true;
+      },
+    );
+    // The earlier success is preserved: a request-wide preflight would have
+    // rejected the whole envelope for the missing later target.
+    assert.equal(await readFile(join(dir, "first.txt"), "utf8"), "one\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed move exposes its uncertain effects instead of rolling back", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    const sourceAbsolute = join(dir, "src.txt");
+    await writeFile(sourceAbsolute, "one\ntwo\n", "utf8");
+
+    // Force the source removal to fail after the destination commit succeeds.
+    const fsp = require("node:fs/promises") as typeof import("node:fs/promises");
+    const originalUnlink = fsp.unlink;
+    fsp.unlink = async (path: import("node:fs").PathLike) => {
+      if (String(path) === sourceAbsolute) {
+        const error: NodeJS.ErrnoException = new Error("unlink failed (injected)");
+        error.code = "EIO";
+        throw error;
+      }
+      return originalUnlink(path);
+    };
+    try {
+      await assert.rejects(
+        execute({ patch: envelope("*** Update File: src.txt", "*** Move to: dst.txt", "-one", "+FIRST") }, { cwd: dir }),
+        (error: Error) => {
+          assert.match(error.message, /failed at operation 1 \(update_file src\.txt \(moveTo dst\.txt\)\)/);
+          assert.match(error.message, /both files remain in place/);
+          assert.match(error.message, /Uncertain effects of the failed operation: destination 'dst\.txt' was created; source 'src\.txt' was left in place/);
+          return true;
+        },
+      );
+    } finally {
+      fsp.unlink = originalUnlink;
+    }
+    // Both files remain, truthfully reported.
+    assert.equal(await readFile(sourceAbsolute, "utf8"), "one\ntwo\n");
+    assert.equal(await readFile(join(dir, "dst.txt"), "utf8"), "FIRST\ntwo\n");
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("cancellation during a later operation's commit preserves earlier successes", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await writeFile(join(dir, "keep.txt"), "one\ntwo\n", "utf8");
+    const controller = new AbortController();
+
+    // Cancellation arrives while the second operation's replacement is being
+    // committed (rename is the update commit step) and the commit fails.
+    const fsp = require("node:fs/promises") as typeof import("node:fs/promises");
+    const originalRename = fsp.rename;
+    fsp.rename = async () => {
+      controller.abort(new Error("cancelled mid-commit"));
+      const error: NodeJS.ErrnoException = new Error("cancelled mid-commit");
+      error.code = "EIO";
+      throw error;
+    };
+    try {
+      await assert.rejects(
+        execute({ patch: envelope("*** Add File: a1.txt", "+one", "*** Update File: keep.txt", "@@ one", "-two", "+TWO") }, { cwd: dir, signal: controller.signal }),
+        (error: Error) => {
+          assert.match(error.message, /failed at operation 2 \(update_file keep\.txt\)/);
+          assert.match(error.message, /cancelled mid-commit/);
+          assert.match(error.message, /1 earlier operation\(s\) still applied/);
+          return true;
+        },
+      );
+    } finally {
+      fsp.rename = originalRename;
+    }
+    assert.equal(await readFile(join(dir, "a1.txt"), "utf8"), "one\n", "the earlier success stays applied");
+    assert.equal(await readFile(join(dir, "keep.txt"), "utf8"), "one\ntwo\n", "the cancelled operation left its target unchanged");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an external edit landing during the staging window is not overwritten by an update", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    const sourceAbsolute = join(dir, "race.txt");
+    await writeFile(sourceAbsolute, "one\ntwo\n", "utf8");
+
+    // Simulate a concurrent external edit landing while the replacement is
+    // being staged: after the temporary file is written (stageFile chmods it
+    // for updates) but before the rename commits.
+    const fsp = require("node:fs/promises") as typeof import("node:fs/promises");
+    const originalChmod = fsp.chmod;
+    fsp.chmod = async (path: import("node:fs").PathLike, mode: import("node:fs").Mode) => {
+      if (String(path).endsWith(".tmp")) {
+        await writeFile(sourceAbsolute, "external edit\n", "utf8");
+      }
+      return originalChmod(path, mode);
+    };
+    try {
+      await assert.rejects(
+        execute({ operation: { type: "update_file", path: "race.txt", diff: "-two\n+TWO\n" } }, { cwd: dir }),
+        /changed after validation; refusing to overwrite concurrent edits/,
+      );
+    } finally {
+      fsp.chmod = originalChmod;
+    }
+    assert.equal(await readFile(sourceAbsolute, "utf8"), "external edit\n", "the external content must survive");
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a directory-cleanup failure is reported without discarding the partial-failure accounting", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+
+    // Operation 2 creates a directory chain, then fails at the commit; the
+    // subsequent empty-directory cleanup also fails (EACCES). The accumulated
+    // applied / failed / not-attempted accounting must still be reported.
+    const fsp = require("node:fs/promises") as typeof import("node:fs/promises");
+    const originalLink = fsp.link;
+    const originalRmdir = fsp.rmdir;
+    let failingCommitAttempted = false;
+    fsp.link = async (source: import("node:fs").PathLike, destination: import("node:fs").PathLike) => {
+      if (String(destination).endsWith("fail.txt")) {
+        failingCommitAttempted = true;
+        const error: NodeJS.ErrnoException = new Error("link failed (injected)");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalLink(source, destination);
+    };
+    fsp.rmdir = async () => {
+      const error: NodeJS.ErrnoException = new Error("rmdir failed (injected)");
+      error.code = "EACCES";
+      throw error;
+    };
+    try {
+      await assert.rejects(
+        execute({ patch: envelope("*** Add File: ok.txt", "+one", "*** Add File: sub/dir/fail.txt", "+x") }, { cwd: dir }),
+        (error: Error) => {
+          assert.match(error.message, /failed at operation 2 \(create_file sub\/dir\/fail\.txt\)/);
+          assert.match(error.message, /1 earlier operation\(s\) still applied/);
+          assert.match(error.message, /Applied: created ok\.txt \(4 bytes\)/);
+          assert.match(error.message, /Uncertain effects of the failed operation:/);
+          assert.match(error.message, /directory '.*sub\/dir' could not be removed: rmdir failed \(injected\)/);
+          return true;
+        },
+      );
+    } finally {
+      fsp.link = originalLink;
+      fsp.rmdir = originalRmdir;
+    }
+    assert.ok(failingCommitAttempted, "the failing commit was attempted");
+    // The earlier success remains applied; the failed create left no file.
+    assert.equal(await readFile(join(dir, "ok.txt"), "utf8"), "one\n");
+    await assert.rejects(lstat(join(dir, "sub/dir/fail.txt")));
+    // Cleanup failed: the created directories remain and were reported.
+    assert.ok((await lstat(join(dir, "sub/dir"))).isDirectory());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a canonical Add File with NUL content is rejected before creating the target", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await assert.rejects(
+      execute({ patch: envelope("*** Add File: bin.txt", "+a\u0000b") }, { cwd: dir }),
+      /refusing to write binary content \(NUL byte\)/,
+    );
+    await assert.rejects(lstat(join(dir, "bin.txt")));
+    assert.deepEqual(await readdir(dir), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a no-change update with moveTo still performs the rename truthfully", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await writeFile(join(dir, "old.txt"), "same\n", "utf8");
+    // A context-only hunk (no anchor) matches the whole file without
+    // changing it; the move still happens and is reported truthfully.
+    const result = await execute(
+      { patch: envelope("*** Update File: old.txt", "*** Move to: new.txt", " same") },
+      { cwd: dir },
+    );
+    // Upstream reports a moved file under its source path as modified.
+    assert.equal(result.content[0].text, ["Success. Updated the following files:", "M old.txt"].join("\n"));
+    assert.equal(await readFile(join(dir, "new.txt"), "utf8"), "same\n");
+    await assert.rejects(lstat(join(dir, "old.txt")));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("review capture retains successful changed paths when a multi-file request partially fails", async () => {
+  const dir = await tempWorkspace();
+  try {
+    await writeFile(join(dir, "keep.txt"), "one\ntwo\n", "utf8");
+    const patch = envelope(
+      "*** Add File: ok1.txt",
+      "+one",
+      "*** Update File: keep.txt",
+      "@@ one",
+      "-two",
+      "+TWO",
+      "*** Update File: missing.txt",
+      "-x",
+      "+y",
+    );
+    const state = createEvidenceState();
+    const toolInput = { patch };
+    await recordToolCallEvidence({
+      state,
+      cwd: dir,
+      toolName: "ApplyPatch",
+      toolInput,
+      snapshotOptions: { maxFileBytes: 100_000, maxSnapshotBytes: 1_000_000 },
+      exchangeSequence: 1,
+    });
+
+    // The call errors overall, but the successful changes must survive in the
+    // review evidence.
+    let thrown: Error | undefined;
+    try {
+      await harness().execute(toolInput, { cwd: dir });
+    } catch (error) {
+      thrown = error as Error;
+    }
+    assert.ok(thrown, "the partial failure must surface as an error");
+    assert.match(thrown!.message, /failed at operation 3/);
+
+    recordToolResultEvidence({
+      state,
+      toolName: "ApplyPatch",
+      toolInput,
+      result: { content: [{ type: "text", text: thrown!.message }], isError: true },
+      isError: true,
+      exchangeSequence: 1,
+    });
+
+    const changes = await collectEvidenceChanges(state, dir, { maxFileBytes: 100_000, maxSnapshotBytes: 1_000_000 }, 1);
+    assert.deepEqual(
+      changes.map((change) => change.path).sort(),
+      ["keep.txt", "ok1.txt"],
+      "successful changes are captured even though the tool call errored",
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

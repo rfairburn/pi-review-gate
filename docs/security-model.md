@@ -177,33 +177,76 @@ not by kernel-level containment.
 
 ## ApplyPatch confinement and safety
 
-The `ApplyPatch` tool performs one structured OpenAI apply_patch operation per call —
-`create_file`, `update_file`, or `delete_file` — against a single file inside the
-current workspace, following the V4A diff contract at
-https://developers.openai.com/api/docs/guides/tools-apply-patch.
+The `ApplyPatch` tool accepts the canonical OpenAI/Codex apply_patch envelope —
+`*** Begin Patch` ... `*** End Patch` with `*** Add File:`, `*** Update File:` (optional
+`*** Move to:`), and `*** Delete File:` operations — in a single `patch` string argument,
+and may mix multiple file operations per call. It follows the public apply_patch grammar
+used by OpenAI Codex (the V4A diff contract at
+https://developers.openai.com/api/docs/guides/tools-apply-patch); Pi's JSON tool
+transport carries one argument value, so the whole envelope travels as that string — the
+minimal transport difference from Codex's stdin/heredoc delivery. A legacy single-file
+structured `operation` object remains accepted for compatibility with earlier sessions
+but is deliberately not part of the model-facing guidance.
 
 ### Input contract
 
-`ApplyPatch` takes exactly one argument, `operation`, which is a discriminated V4A file
-operation. Each variant has its own required and forbidden fields, enforced both by the
-JSON schema (`oneOf` with `additionalProperties: false`) and at runtime, so a field that
-belongs to another operation (for example `moveTo` on `create_file`, or `diff` on
-`delete_file`) is rejected with an informative error rather than silently ignored:
+`ApplyPatch` takes exactly one argument: either the canonical `patch` envelope or the
+legacy `operation` object, enforced both by the JSON schema (`oneOf` with
+`additionalProperties: false`) and at runtime.
 
-- `create_file` — requires `type`, `path`, and `diff`; every diff line starts with `+`.
-- `update_file` — requires `type`, `path`, and `diff`; optionally accepts a non-empty
-  `moveTo` (a new workspace-relative path that must not already exist) to patch-and-rename.
-- `delete_file` — accepts only `type` and `path`; there is no `diff` or `moveTo`.
+The canonical envelope follows the public Codex grammar:
 
-`path` is a non-empty, workspace-relative string; a single leading `@` convention marker
-is stripped before use. `diff` is a non-empty **headerless** V4A body (no
-`*** Begin/Update/Add/Delete` markers and no path header), because the operation type and
-paths are structured fields. The tool is registered in both the top-level orchestrator and
-the Pi-native executor runtimes; it is active by default under Pi's normal registered-tool
-policy and is never force-enabled through `setActiveTools`, so an explicit Pi launch
-`--tools` allowlist remains authoritative.
+- `*** Begin Patch` / `*** End Patch` boundary markers (surrounding blank lines are
+  trimmed; a shell-style heredoc wrapper `<<EOF` ... `EOF` is unwrapped before parsing,
+  matching Codex's lenient default).
+- `*** Add File: <path>` — each following line starts with `+`; every line contributes
+  `<line>\n` to the file content (Codex newline semantics).
+- `*** Update File: <path>` — an optional `*** Move to: <path>` rename before the change
+  lines, then one or more `@@ [anchor]` chunks of ` ` context / `-` removed / `+` added
+  lines. The first chunk may omit its `@@` marker, a bare empty line is an empty context
+  line, and `*** End of File` anchors a chunk at end-of-file.
+- `*** Delete File: <path>` — no content lines.
 
-Behavior and safety properties:
+The complete envelope is parsed before any filesystem mutation, so malformed requests
+fail cleanly with no side effects. Update-hunk bodies are handed to the existing V4A
+engine unmodified, so anchor/context/EOF application semantics are identical to
+single-file operations. Deliberate deviations from upstream: `*** Environment ID:` lines
+are rejected (this tool patches the local workspace only), and an update hunk without any
+change line is rejected with a Codex-style diagnostic.
+
+Legacy structured calls keep their earlier contract: a discriminated V4A file operation
+(`create_file`, `update_file`, or `delete_file`) whose variants have their own required
+and forbidden fields, a non-empty **headerless** diff body (no `*** Begin/Update/Add`
+/Delete` markers and no path header), and the same path normalization. In both forms,
+every path is a non-empty workspace-relative string; a single leading `@` convention
+marker is stripped before use.
+
+The tool is registered in both the top-level orchestrator and the Pi-native executor
+runtimes; it is active by default under Pi's normal registered-tool policy and is never
+force-enabled through `setActiveTools`, so an explicit Pi launch `--tools` allowlist
+remains authoritative.
+
+### Execution semantics
+
+File operations are applied sequentially in envelope order, exactly like Codex's
+`apply_hunks_to_files` loop: the first failing operation stops the request, earlier
+successful operations remain applied, and later operations are not attempted. A later
+operation may legitimately target a file an earlier one just created or modified (the
+sequential state is what it reads). The overall call is an error on partial failure, and
+its diagnostic explicitly reports which operations applied, which failed — including any
+uncertain effects of the failed operation, such as a move whose destination was created
+but whose source removal failed — and which were not attempted, so review capture and
+the model both see the accumulated delta. There is deliberately no cross-file rollback:
+POSIX provides no multi-file atomicity, so the tool reports partial state truthfully
+instead of claiming atomicity it cannot provide; a process crash mid-request can leave a
+partial set, and ordinary failures report exactly what was applied.
+
+Successful canonical calls return the upstream Codex `print_summary` text (`Success.
+Updated the following files:` followed by git-style `A`/`M`/`D` lines grouped by status,
+with moved files listed under their source path); Pi's structured details are additive.
+Legacy calls keep the familiar per-operation summaries.
+
+### Per-file safety properties:
 
 - The V4A engine is adapted from the official OpenAI Agents JS `applyDiff.ts`
   implementation (MIT-licensed; see [NOTICE](../NOTICE) and
@@ -217,18 +260,21 @@ Behavior and safety properties:
   with informative diagnostics. V4A file-level header lines inside `operation.diff`
   (e.g. a stray `*** End Patch`) are likewise rejected up front instead of being
   silently treated as section terminators.
-- Validation and parsing complete before any mutation, and each mutation is staged
-  through a same-directory temporary file, so a failed call never exposes a partial
-  write. New files and move destinations are committed through an atomic no-overwrite
-  link, so a target that appears after validation is rejected with `EEXIST` rather than
-  overwritten; on filesystems without hard-link support the commit fails safely instead
-  of risking an overwrite. With `moveTo`, the patched content is committed at the
-  destination before the source is removed, so a failed move leaves the original source
-  bytes in place (and a source-removal failure rolls the destination back).
-  `delete_file` validates that the full source is UTF-8 text before removing it and
-  rechecks cancellation after the validation read. The declared
-  `executionMode: "sequential"` additionally prevents `ApplyPatch` from racing sibling
-  built-in edit/write calls within one parallel tool batch.
+- Each individual file mutation is staged through a same-directory temporary file, so a
+  failed operation never exposes a partial write of its own target. New files and move
+  destinations are committed through an atomic no-overwrite link, so a target that appears
+  after validation is rejected with `EEXIST` rather than overwritten; on filesystems
+  without hard-link support the commit fails safely instead of risking an overwrite.
+  With `moveTo`, the patched content is committed at the destination before the source is
+  removed: a destination-side failure leaves the original source bytes in place, while a
+  source-removal failure leaves both files in place and reports them as uncertain effects
+  rather than hiding the state. `delete_file` validates that the full source is UTF-8
+  text before removing it, and each operation revalidates its source identity immediately
+  before overwriting or deleting so concurrent external edits are not destroyed.
+  Cancellation is honored before every mutation step (an atomic commit that already
+  completed cannot be undone). The declared `executionMode: "sequential"` additionally
+  prevents `ApplyPatch` from racing sibling built-in edit/write calls within one parallel
+  tool batch.
 - Like Pi's built-in `edit` and `write`, foreground `ApplyPatch` calls do not wait for
   background landing leases or conflict gates. This allows conflict resolution without
   deadlocking behind the gate it must repair. Editing does not clear that gate:
@@ -236,15 +282,17 @@ Behavior and safety properties:
 - Updates preserve the original file's exact permission bits (independent of the process
   umask), byte-order mark, and line-ending style (LF or CRLF) where feasible;
   trailing-newline state is preserved by the upstream engine. An update whose patch
-  changes nothing succeeds as a true no-op: the file is not rewritten, so its inode,
-  timestamps, hard links, and extended metadata are preserved.
+  changes nothing and has no rename succeeds as a true no-op: the file is not rewritten,
+  so its inode, timestamps, hard links, and extended metadata are preserved. A no-change
+  update that does carry `moveTo` performs the rename and reports it as such.
 - Failures throw with an informative message so Pi marks the tool result as an error and
-  the model can correct the diff or path and retry. Each call mutates at most one file;
-  there is deliberately no cross-call or multi-file rollback — retry the individual
-  failed operation.
-- Review evidence pre-captures `operation.path` and `operation.moveTo` as mutation
-  candidates before execution (applying the same leading-`@` normalization the tool
-  uses) and successful and failed calls both remain review evidence. Results expose
+  the model can correct the envelope and resubmit only the remaining operations.
+- Review evidence pre-captures every envelope path (including move destinations) — or
+  `operation.path`/`operation.moveTo` for legacy calls — as mutation candidates before
+  execution, applying the same leading-`@` normalization the tool uses. Because change
+  detection compares baseline snapshots against disk state, successful changes remain in
+  the review capture even when the overall call errors after a partial failure.
+  Successful and failed calls both remain review evidence. Results expose
   bounded structured details including the requested diff and a unified final diff —
   with `rename from`/`rename to` headers for moves and the removed content for
   deletions — rendered compactly by the tool's custom call/result renderers.

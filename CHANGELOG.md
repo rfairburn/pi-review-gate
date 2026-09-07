@@ -15,6 +15,33 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.7]
+
+### Added
+
+- `ApplyPatch` now accepts the canonical OpenAI/Codex apply_patch envelope in a single
+  `patch` argument: `*** Begin Patch` ... `*** End Patch` with mixed multi-file
+  `*** Add File:` / `*** Update File:` (optional `*** Move to:`) / `*** Delete File:`
+  operations, following the public Codex grammar (boundary trimming, shell-heredoc
+  leniency, per-line add newlines, `@@ [anchor]` hunks whose first chunk may omit the
+  marker, and `*** End of File` anchors). The complete envelope is parsed before any
+  filesystem mutation; `*** Environment ID:` lines are rejected because the tool patches
+  the local workspace only. The legacy single-file structured `operation` argument
+  remains accepted for compatibility with earlier sessions (Refs #18).
+
+### Changed
+
+- Multi-file `ApplyPatch` requests apply file operations sequentially in envelope order,
+  like Codex: the first failing operation stops the request, earlier successes remain
+  applied, later operations are not attempted, and the call errors with an explicit
+  applied / failed / not-attempted report including any uncertain effects of the failed
+  operation (for example a move whose destination was created but whose source removal
+  failed). There is no cross-file rollback: partial state is reported truthfully instead
+  of claiming atomicity POSIX does not provide. Successful canonical calls return the
+  upstream `print_summary` text (`Success. Updated the following files:` with git-style
+  A/M/D lines); review evidence pre-captures every envelope path and retains successful
+  changes even when the overall call errors (Refs #18).
+
 ## [0.1.0-dev.6]
 
 ### Changed

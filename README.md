@@ -38,9 +38,10 @@ receipts of exactly what the model was told.
 - **Durable evidence and recovery** — stable evidence bundles, integrity-checked
   execution manifests, landing-manifest crash recovery, and exact-session restart
   restoration ([Recovery](docs/recovery.md)).
-- **`ApplyPatch` tool** — one structured OpenAI apply-patch operation per call with
-  workspace confinement, atomic staged writes, and serialized mutation windows
-  ([Security model](docs/security-model.md#applypatch-confinement-and-safety)).
+- **`ApplyPatch` tool** — the canonical OpenAI/Codex apply_patch envelope per call
+  (multi-file create/update/rename/delete with sequential application and explicit
+  partial-failure reporting), workspace confinement, atomic staged writes, and serialized
+  mutation windows ([Security model](docs/security-model.md#applypatch-confinement-and-safety)).
 - **Background shell tools** — `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
   `ShellStop` with detached process groups and lifecycle wakes
   ([Delegated execution](docs/delegated-execution.md#background-shell-tools)).

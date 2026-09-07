@@ -94,7 +94,8 @@ YAML and carry the required user-problem/repro/acceptance/security-privacy field
 the private security-reporting redirect, the PR template carries the linked-issue policy
 and documentation/changelog/compatibility declarations, CODEOWNERS is ordinary public
 default ownership, `SECURITY.md` routes to the private advisory without time promises,
-and `CHANGELOG.md` stays truthful pre-1.0 (Unreleased summary, no fake dated releases).
+and `CHANGELOG.md` stays truthful pre-1.0 (per-build candidate sections, preserved
+aggregate history, no fake dated releases).
 It also re-scans the source-only `.github/**` surface for private artifact references.
 
 ## Launcher behavior

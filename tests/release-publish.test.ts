@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 import { loadReleaseModule, projectRoot } from "./helpers/release-scripts";
-import type { Eligibility, PackagingModule, PublishModule, PublishSummary } from "./helpers/release-scripts";
+import type { ChangelogModule, Eligibility, PackagingModule, PublishModule, PublishSummary } from "./helpers/release-scripts";
 
 const common = loadReleaseModule<{
   REPOSITORY: string;
@@ -17,6 +17,7 @@ const publish = loadReleaseModule<PublishModule & {
   tarballFilenameFor(version: string): string;
   isOwnedDraft(release: unknown, eligibility: Eligibility): boolean;
 }>("publish.cjs");
+const changelog = loadReleaseModule<ChangelogModule>("changelog.cjs");
 
 const TARGET = "c".repeat(40);
 const TOKEN = "test-token";
@@ -38,27 +39,84 @@ function baseEnv(overrides: Partial<Record<string, string>> = {}): Record<string
 interface SyntheticRepo {
   root: string;
   baseline: string;
+  mainChild: string;
+  side: string;
   mergeCommit: string;
 }
 
-function makeRepo(): SyntheticRepo {
+// Pre-adoption changelog shape (aggregate Unreleased, no per-build sections):
+// the default content at every synthetic commit, so existing orchestration
+// tests exercise the legacy body format and verification path.
+const LEGACY_CHANGELOG = [
+  "# Changelog",
+  "",
+  "Intro.",
+  "",
+  "## [Unreleased]",
+  "",
+  "### Added",
+  "",
+  "- Legacy aggregate content.",
+  "",
+].join("\n");
+
+// Post-adoption changelog shape: the candidate/published section for build n
+// above the preserved Previous builds aggregate.
+function newFormatChangelog(n: number, body: string): string {
+  return [
+    "# Changelog",
+    "",
+    "Intro.",
+    "",
+    `## [0.1.0-dev.${n}]`,
+    "",
+    body,
+    "",
+    "## Previous builds",
+    "",
+    "### Added",
+    "",
+    "- Legacy aggregate content.",
+    "",
+  ].join("\n");
+}
+
+function makeRepo(opts: {
+  baselineChangelog?: string;
+  c1Changelog?: string;
+  sideChangelog?: string;
+  mergeChangelog?: string;
+} = {}): SyntheticRepo {
   const root = mkdtempSync(join(tmpdir(), "release-publish-"));
   git(root, "init", "--initial-branch=main");
   git(root, "config", "user.email", "release-test@example.com");
   git(root, "config", "user.name", "release-test");
-  const tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-  const commit = (message: string, parents: string[] = []): string => {
+  // Every commit carries a CHANGELOG.md so the publisher's exact-source notes
+  // derivation (which runs before any remote write) has real content to read.
+  const commit = (message: string, parents: string[], changelogContent: string): string => {
+    const blob = execFileSync("git", ["-C", root, "hash-object", "-w", "--stdin"], {
+      input: changelogContent,
+      encoding: "utf8",
+    }).trim();
+    const tree = execFileSync("git", ["-C", root, "mktree"], {
+      input: `100644 blob ${blob}\tCHANGELOG.md\n`,
+      encoding: "utf8",
+    }).trim();
     const args = ["commit-tree", tree, "-m", message];
     for (const parent of parents) args.push("-p", parent);
     return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
   };
-  const baseline = commit("baseline");
-  const c1 = commit("one", [baseline]);
+  const baseline = commit("baseline", [], opts.baselineChangelog ?? LEGACY_CHANGELOG);
+  const c1 = commit("one", [baseline], opts.c1Changelog ?? LEGACY_CHANGELOG);
   git(root, "update-ref", "refs/heads/main", c1);
-  const side = commit("side", [c1]);
-  const mergeCommit = commit("merge PR #1", [c1, side]);
+  const side = commit("side", [c1], opts.sideChangelog ?? LEGACY_CHANGELOG);
+  const mergeCommit = commit("merge PR #1", [c1, side], opts.mergeChangelog ?? LEGACY_CHANGELOG);
   git(root, "update-ref", "refs/heads/main", mergeCommit);
-  return { root, baseline, mergeCommit };
+  // Materialize the working tree at main's tip: the publisher requires the
+  // checkout HEAD to be the exact event SHA and reads CHANGELOG.md from the
+  // working tree (the exact source checkout).
+  git(root, "reset", "--hard", "main");
+  return { root, baseline, mainChild: c1, side, mergeCommit };
 }
 
 function git(root: string, ...args: string[]): string {
@@ -439,16 +497,21 @@ function publishWith(repo: SyntheticRepo, github: MockGithub, overrides: {
   eligible?: boolean;
   buildRecorder?: { built: boolean };
   buildArtifacts?: (options: { eligibility: Eligibility }) => Promise<ReturnType<typeof fakeBuildArtifacts>>;
+  policyAnchor?: string;
+  detailSha?: string;
 } = {}): Promise<PublishSummary> {
   const eligible = overrides.eligible ?? true;
   // List-shaped association + detailed record, as the real endpoints return.
   github.pullRequests = eligible ? [listItem(7)] : [];
-  github.details = eligible ? { 7: detailPr(7, repo.mergeCommit) } : {};
+  github.details = eligible ? { 7: detailPr(7, overrides.detailSha ?? repo.mergeCommit) } : {};
   return publish.publishRelease({
     env: overrides.env ?? baseEnv({ GITHUB_SHA: repo.mergeCommit }),
     fetchImpl: github.fetch.bind(github),
     projectRoot: repo.root,
     baseline: repo.baseline,
+    // Default: the target IS the adoption anchor, i.e. a legacy build — this
+    // keeps every pre-notes orchestration test on the old body format.
+    policyAnchor: overrides.policyAnchor ?? repo.mergeCommit,
     scratchRoot: mkdtempSync(join(tmpdir(), "release-publish-scratch-")),
     buildArtifacts: overrides.buildArtifacts ?? ((options: { eligibility: Eligibility }) => {
       if (overrides.buildRecorder) overrides.buildRecorder.built = true;
@@ -1211,6 +1274,278 @@ test("direct pushes (no merged PR) are refused before any tag or release write",
     await assert.rejects(publishWith(repo, github, { eligible: false }), /no pull request is associated/);
     assert.equal(github.tags.size, 0);
     assert.equal(github.releases.size, 0);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+// --- Per-build release notes (policy-adopted builds) -------------------------
+// The adoption boundary is an immutable source anchor, not section presence:
+// strict first-parent descendants of the anchor require exact notes; the
+// anchor and its ancestors stay legacy. These tests pin both sides plus the
+// retry verification that keeps published notes bound to the exact source.
+
+test("policy adoption is decided by the immutable anchor, never by section presence", () => {
+  const repo = makeRepo();
+  try {
+    // Strict first-parent descendant of the anchor: adopted.
+    assert.equal(
+      publish.changelogPolicyAdopted({ repoRoot: repo.root, target: repo.mergeCommit, policyAnchor: repo.mainChild }),
+      true,
+    );
+    // The anchor itself is the last legacy build.
+    assert.equal(
+      publish.changelogPolicyAdopted({ repoRoot: repo.root, target: repo.mergeCommit, policyAnchor: repo.mergeCommit }),
+      false,
+    );
+    // An ancestor of the anchor (an earlier pre-adoption build) stays legacy.
+    assert.equal(
+      publish.changelogPolicyAdopted({ repoRoot: repo.root, target: repo.mainChild, policyAnchor: repo.mergeCommit }),
+      false,
+    );
+    // A divergent line that neither contains nor precedes the anchor fails closed.
+    assert.throws(
+      () => publish.changelogPolicyAdopted({ repoRoot: repo.root, target: repo.side, policyAnchor: repo.mergeCommit }),
+      /neither contains nor precedes the adoption anchor/,
+    );
+    // A malformed anchor fails closed too.
+    assert.throws(
+      () => publish.changelogPolicyAdopted({ repoRoot: repo.root, target: repo.mergeCommit, policyAnchor: "nope" }),
+      /40-hex commit SHA/,
+    );
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("new-format publish embeds the exact collapsed notes derived from the source changelog", async () => {
+  const repo = makeRepo({ mergeChangelog: newFormatChangelog(2, "### Changed\n\n- Per-build changelog policy (#36).") });
+  const github = new MockGithub();
+  try {
+    const summary = await publishWith(repo, github, { policyAnchor: repo.mainChild });
+    assert.equal(summary.outcome, "published");
+    const release = github.releaseByTag("b2");
+    assert.ok(release);
+    const expectedBlock = changelog.renderChangesDetails({ tag: "b2", n: 2, content: "### Changed\n\n- Per-build changelog policy (#36)." });
+    assert.ok(release.body.includes(expectedBlock), "the exact derived notes block must be in the published body");
+    // Exactly one collapsed block; identity marker and provenance preserved.
+    assert.equal((release.body.match(/<details>/g) ?? []).length, 1);
+    assert.equal((release.body.match(/<\/details>/g) ?? []).length, 1);
+    assert.ok(release.body.includes(publish.identityMarker(eligibilityFor(repo))));
+    // The provenance fence stays last and parses to the exact published manifest.
+    const embedded = publish.parseProvenanceFromBody(release.body);
+    assert.deepEqual(embedded, fakeBuildArtifacts(eligibilityFor(repo)).provenance);
+    // A retry verifies the published notes against the same exact source.
+    const summary2 = await publishWith(repo, github, { policyAnchor: repo.mainChild });
+    assert.equal(summary2.outcome, "already-published");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("the first adopted build with no changelog section at all fails closed before any remote write", async () => {
+  const repo = makeRepo(); // every commit is legacy-shaped; the target has no numbered section
+  const github = new MockGithub();
+  try {
+    await assert.rejects(
+      publishWith(repo, github, { policyAnchor: repo.mainChild }),
+      /no changelog section for build 0\.1\.0-dev\.2 .*failing closed/,
+    );
+    assert.equal(github.tags.size, 0, "no tag may be created before the notes gate passes");
+    assert.equal(github.releases.size, 0, "no release may be created before the notes gate passes");
+    const writes = github.requests.filter((request) => request.method !== "GET");
+    assert.deepEqual(writes.map((request) => `${request.method} ${new URL(request.url).pathname}`), []);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("a stale candidate number fails closed before any remote write", async () => {
+  const repo = makeRepo({ mergeChangelog: newFormatChangelog(1, "- Stale candidate for the wrong build.") });
+  const github = new MockGithub();
+  try {
+    await assert.rejects(
+      publishWith(repo, github, { policyAnchor: repo.mainChild }),
+      /topmost numbered section is ## \[0\.1\.0-dev\.1\] but this target is build 0\.1\.0-dev\.2; .*failing closed/,
+    );
+    assert.equal(github.tags.size, 0);
+    assert.equal(github.releases.size, 0);
+    const writes = github.requests.filter((request) => request.method !== "GET");
+    assert.deepEqual(writes.map((request) => `${request.method} ${new URL(request.url).pathname}`), []);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("retry of a new-format release whose notes were removed fails closed without mutation", async () => {
+  const repo = makeRepo({ mergeChangelog: newFormatChangelog(2, "- The exact notes for this build.") });
+  const github = new MockGithub();
+  try {
+    await publishWith(repo, github, { policyAnchor: repo.mainChild });
+    const release = github.releaseByTag("b2");
+    assert.ok(release);
+    const expectedBlock = changelog.renderChangesDetails({ tag: "b2", n: 2, content: "- The exact notes for this build." });
+    // Simulate an operator (or bug) stripping the notes from the published body.
+    release.body = release.body.replace(expectedBlock, "");
+    const requestsAfterTamper = github.requests.length;
+    await assert.rejects(publishWith(repo, github, { policyAnchor: repo.mainChild }), /published release notes do not match the exact source changelog/);
+    // Verify-only path: nothing but reads may follow the tamper.
+    const after = github.requests.slice(requestsAfterTamper);
+    assert.ok(after.every((request) => request.method === "GET"), `only reads may follow a failed retry: ${JSON.stringify(after.map((request) => request.method))}`);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("retry of a new-format release with a duplicated details block fails closed", async () => {
+  const repo = makeRepo({ mergeChangelog: newFormatChangelog(2, "- The exact notes for this build.") });
+  const github = new MockGithub();
+  try {
+    await publishWith(repo, github, { policyAnchor: repo.mainChild });
+    const release = github.releaseByTag("b2");
+    assert.ok(release);
+    release.body = `${release.body}\n<details>\n<summary>Injected</summary>\n\nextra notes\n\n</details>\n`;
+    await assert.rejects(publishWith(repo, github, { policyAnchor: repo.mainChild }), /expected exactly one collapsed changes block/);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("notes containing a same-schema provenance example publish and retry successfully", async () => {
+  // The worst-case notes content: a fenced JSON example that CLAIMS the
+  // provenance schema (with a foreign SHA). It must never be interpreted as
+  // a manifest — not at draft ownership, not at publication verification.
+  const example = JSON.stringify(
+    {
+      schema: "pi-review-gate-release-provenance/1",
+      source: { repository: "rfairburn/pi-review-gate", sha: "e".repeat(40) },
+      package: { version: "0.1.0-dev.2" },
+    },
+    null,
+    2,
+  );
+  const tricky = [
+    "### Changed",
+    "",
+    "- Example manifest shape (illustrative only):",
+    "",
+    "```json",
+    example,
+    "```",
+    "",
+    "- HTML-like text: </details> and <!-- comment --> must stay inert.",
+  ].join("\n");
+  const repo = makeRepo({ mergeChangelog: newFormatChangelog(2, tricky) });
+  const github = new MockGithub();
+  try {
+    // The identity write re-checks ownership on the refreshed draft; a
+    // same-schema notes example must not break that (finding regression).
+    const summary = await publishWith(repo, github, { policyAnchor: repo.mainChild });
+    assert.equal(summary.outcome, "published");
+    const release = github.releaseByTag("b2");
+    assert.ok(release);
+    const expectedBlock = changelog.renderChangesDetails({ tag: "b2", n: 2, content: tricky });
+    assert.ok(release.body.includes(expectedBlock));
+    // The contributor's `</details>` and comment are escaped; only the block's
+    // own closing tag is raw HTML in the body.
+    assert.equal((release.body.match(/<\/details>/g) ?? []).length, 1);
+    assert.ok(release.body.includes("&lt;/details>"));
+    assert.ok(release.body.includes("&lt;!-- comment -->"));
+    // The authoritative manifest is the one OUTSIDE the notes region, and it
+    // is exactly this run's provenance — the notes example cannot stand in.
+    const authoritative = publish.parseProvenanceFromBody(publish.bodyWithoutNotes(release.body));
+    assert.deepEqual(authoritative, fakeBuildArtifacts(eligibilityFor(repo)).provenance);
+    const summary2 = await publishWith(repo, github, { policyAnchor: repo.mainChild });
+    assert.equal(summary2.outcome, "already-published");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("a draft whose authoritative provenance has an incompatible schema is not owned and stays untouched", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    const eligibility = eligibilityFor(repo);
+    // A marker-bearing draft whose only manifest (outside any notes region)
+    // claims a different provenance schema: foreign, never resumable.
+    const body = [
+      publish.identityMarker(eligibility),
+      "",
+      "Prerelease `b2` of `pi-review-gate@0.1.0-dev.2`.",
+      "",
+      `- Source: rfairburn/pi-review-gate@${repo.mergeCommit}`,
+      "",
+      "```json",
+      JSON.stringify(
+        {
+          schema: "pi-review-gate-release-provenance/9",
+          source: { repository: "rfairburn/pi-review-gate", sha: repo.mergeCommit },
+          package: { version: "0.1.0-dev.2" },
+        },
+        null,
+        2,
+      ),
+      "```",
+    ].join("\n") + "\n";
+    github.tags.set("refs/tags/b2", repo.mergeCommit);
+    github.releases.set(42, {
+      id: 42,
+      tag_name: "b2",
+      target_commitish: repo.mergeCommit,
+      name: "b2",
+      body,
+      draft: true,
+      prerelease: true,
+      make_latest: "false",
+      assets: [],
+      html_url: "https://example.com/draft",
+      upload_url: `${UPLOADS_BASE}/releases/42/assets?name={name}&label={label}`,
+    });
+    await assert.rejects(publishWith(repo, github), /not owned by this builder/);
+    // Untouched: no writes at all, body byte-identical.
+    const writes = github.requests.filter((request) => request.method !== "GET");
+    assert.deepEqual(writes.map((request) => `${request.method} ${new URL(request.url).pathname}`), []);
+    assert.equal(github.releases.get(42)?.body, body);
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("a legacy target keeps the exact pre-notes body shape byte for byte", async () => {
+  const repo = makeRepo(); // all commits legacy-shaped; anchor == target
+  const github = new MockGithub();
+  try {
+    const summary = await publishWith(repo, github);
+    assert.equal(summary.outcome, "published");
+    const release = github.releaseByTag("b2");
+    assert.ok(release);
+    const expectedLegacyBody = publish.releaseBody(eligibilityFor(repo), fakeBuildArtifacts(eligibilityFor(repo)).provenance);
+    assert.equal(release.body, expectedLegacyBody, "the legacy body must stay byte-identical to the pre-notes format");
+    assert.ok(!release.body.includes("<details>"));
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("a target that is an ancestor of the adoption anchor stays on the legacy path", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    // The publisher requires the checkout HEAD to be the exact event SHA.
+    git(repo.root, "checkout", "--detach", repo.mainChild);
+    // Publish b1 (the main child) while the anchor sits at the later merge
+    // commit: the target precedes the anchor, so it is pre-adoption.
+    const summary = await publishWith(
+      repo,
+      github,
+      { env: baseEnv({ GITHUB_SHA: repo.mainChild }), detailSha: repo.mainChild, policyAnchor: repo.mergeCommit },
+    );
+    assert.equal(summary.outcome, "published");
+    assert.equal(summary.tag, "b1");
+    const release = github.releaseByTag("b1");
+    assert.ok(release);
+    assert.ok(!release.body.includes("<details>"), "pre-adoption builds carry no notes block");
   } finally {
     rmSync(repo.root, { recursive: true, force: true });
   }

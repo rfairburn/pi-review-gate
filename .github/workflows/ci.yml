@@ -44,6 +44,11 @@ jobs:
       PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history is required for the PR changelog candidate check below,
+          # which counts the pull request base's first-parent distance from the
+          # immutable baseline. The default shallow checkout cannot count it.
+          fetch-depth: 0
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ matrix.node-version }}
@@ -52,6 +57,13 @@ jobs:
         run: npm ci
       - name: Static checks
         run: npm run check:static
+      - name: PR changelog candidate check (next-build numbering)
+        # Event/history-aware and read-only: on pull_request events it validates
+        # that the candidate build section in CHANGELOG.md is numbered from this
+        # pull request's current base (first-parent distance + 1). It no-ops for
+        # push/dispatch events; the publisher re-validates the exact merged
+        # commit before any remote write.
+        run: node scripts/release/pr-candidate.cjs
       - name: Fast tests
         run: npm run test:fast
       - name: CI workflow contract tests

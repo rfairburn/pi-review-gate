@@ -75,8 +75,10 @@ job then:
    pull request, and the tarball digest; no run timestamps) — verifying each uploaded
    asset's bytes by downloading it again and comparing SHA-256 digests.
 5. Publishes the draft with `draft: false`, `prerelease: true`, `make_latest: "false"`,
-   and re-verifies the published release. No npm publish step exists and no milestone
-   tags are created.
+   and re-verifies the published release. For policy-adopted builds the body also
+   carries that build's collapsed change notes derived from the exact source changelog
+   (see [Release notes](#release-notes-per-build-changes) below). No npm publish step
+   exists and no milestone tags are created.
 
 An incomplete run resumes: a draft carrying the matching ownership marker may be
 completed by uploading only its missing assets, and mismatched assets of such a verified
@@ -86,7 +88,55 @@ never touched.
 Published releases are immutable: retries verify the published assets against the
 published `provenance.json` and `SHA256SUMS` (the tarball bytes themselves are only
 re-built for a draft, because tar packing is not byte-reproducible across runs) and
-otherwise do nothing. Any mismatch fails closed; nothing is replaced or clobbered.
+otherwise do nothing. For policy-adopted builds they additionally verify that the
+published body still carries exactly the collapsed change notes derived from the exact
+source changelog. Any mismatch fails closed; nothing is replaced or clobbered.
+
+## Release notes (per-build changes)
+
+From the build that adopted per-build changelog attribution onward, every release body
+carries that build's human-readable changes in a collapsed-by-default block:
+
+```html
+<details>
+<summary>Changes in bN</summary>
+
+...the exact content of the build's changelog section...
+
+</details>
+```
+
+- **Source of truth:** the notes are derived deterministically from the
+  `## [0.1.0-dev.N]` section of the `CHANGELOG.md` checked out at the exact released
+  commit — never from a moving branch, never independently maintained, and never
+  duplicated across releases. The staged tarball carries that same changelog, so the
+  repository, the shipped package, and the release body agree by construction.
+- **Candidate policy:** while a pull request is open, its topmost numbered section is a
+  candidate for the next build. CI (the verify job, full-history checkout) predicts that
+  number as the first-parent distance of the pull request's current base from the
+  immutable baseline plus one — the squash merge lands exactly one first-parent step
+  above that base. This is a provisional prediction: if main advances while the pull
+  request is open, the contributor updates the section number against the new base and
+  strict CI re-validates it. The publisher then re-checks the exact merged commit's own
+  distance before any remote write; a stale, missing, duplicate, or empty candidate
+  fails closed instead of publishing a wrong or absent history.
+- **Policy-adoption boundary:** whether a build requires notes is derived from an
+  immutable source anchor, not from section presence and not from mutable "latest
+  release" state: the anchor is the main commit at the moment per-build attribution was
+  adopted (pinned in the builder next to the numbering baseline). Every strict
+  first-parent descendant of the anchor is a policy-adopted build whose publication
+  requires exact notes — including the first adopted build itself, which cannot omit its
+  own section and be reclassified as legacy. The anchor and its ancestors (the old-format
+  immutable releases) verify read-only through the original marker, provenance, and asset
+  checks without demanding retroactive mutation; a target whose history neither contains
+  nor precedes the anchor fails closed. Removing notes from a new-format release
+  therefore cannot masquerade as legacy — retries re-derive the expected block from the
+  exact source and fail closed on any omission, mismatch, or duplication.
+- **Body integrity:** the notes sit between the identity/provenance lines and the
+  provenance fence. Contributor content is escaped so it can never terminate the details
+  block early, open an HTML comment, or inject markup; a release body must carry exactly
+  one details block, and the manifest embedded in the body must equal the published
+  `provenance.json` asset.
 
 ## Costs and limits
 

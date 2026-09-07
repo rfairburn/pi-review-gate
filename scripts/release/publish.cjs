@@ -21,6 +21,8 @@ const os = require("node:os");
 const path = require("node:path");
 const {
   BASELINE_SHA,
+  HEX40,
+  POLICY_ADOPTION_ANCHOR,
   REPOSITORY,
   ReleaseError,
   assertReleaseEventContext,
@@ -32,6 +34,7 @@ const { resolveEligibility, summarizeGITHUBOutput } = require("./eligibility.cjs
 // Module-object reference (not destructured) so the install-smoke call is
 // resolved at invocation time; tests stub the boundary through this object.
 const packagingModule = require("./packaging.cjs");
+const changelog = require("./changelog.cjs");
 const {
   PROVENANCE_SCHEMA,
   buildProvenance,
@@ -62,21 +65,51 @@ function identityMarker(eligibility) {
   })} -->`;
 }
 
+// The provenance fence is always the LAST fenced JSON block of a body this
+// builder writes (releaseBody appends it after any release notes), so the
+// authoritative embedded manifest is the last parseable ```json fence. Notes
+// content may itself contain fenced JSON; those fences are not manifests.
 function parseProvenanceFromBody(body) {
-  const match = body.match(/```json\n([\s\S]*?)\n```/);
-  if (!match) return null;
-  try {
-    return JSON.parse(match[1]);
-  } catch {
-    return null;
+  const fences = [...body.matchAll(/```json\n([\s\S]*?)\n```/g)];
+  for (let i = fences.length - 1; i >= 0; i -= 1) {
+    try {
+      return JSON.parse(fences[i][1]);
+    } catch {
+      // Not JSON: notes content, keep scanning earlier fences.
+    }
   }
+  return null;
 }
 
+// Contributor notes content is confined to the single collapsed details
+// block this builder renders (its `<` characters are escaped, so no raw
+// details tag can appear inside it). Removing that region isolates the
+// authoritative part of the body: identity lines and the provenance fence.
+// Notes examples — including fenced JSON that happens to claim the
+// provenance schema — are never interpreted as manifests. When the details
+// structure is ambiguous (not exactly one balanced pair) nothing is removed:
+// scanning everything then fails closed on any mismatch instead of guessing.
+function bodyWithoutNotes(body) {
+  const openCount = (body.match(/<details>/g) ?? []).length;
+  const closeCount = (body.match(/<\/details>/g) ?? []).length;
+  if (openCount !== 1 || closeCount !== 1) return body;
+  const start = body.indexOf("<details>");
+  const end = body.indexOf("</details>", start);
+  if (end === -1) return body;
+  return body.slice(0, start) + body.slice(end + "</details>".length);
+}
+
+// Ownership of a draft: the exact identity marker plus an authoritative
+// provenance manifest OUTSIDE the notes region. A freshly created draft has
+// no manifest yet (the identity write appends it after the notes block), so
+// an absent manifest is owned; a present one must carry the provenance
+// schema and this run's exact repository/SHA/version — an incompatible or
+// foreign authoritative manifest is never owned.
 function isOwnedDraft(release, eligibility) {
   if (!release || release.draft !== true || release.tag_name !== eligibility.tag) return false;
   const body = typeof release.body === "string" ? release.body : "";
   if (!body.includes(identityMarker(eligibility))) return false;
-  const provenance = parseProvenanceFromBody(body);
+  const provenance = parseProvenanceFromBody(bodyWithoutNotes(body));
   if (provenance) {
     if (provenance?.schema !== PROVENANCE_SCHEMA) return false;
     if (provenance?.source?.repository !== REPOSITORY) return false;
@@ -86,7 +119,12 @@ function isOwnedDraft(release, eligibility) {
   return true;
 }
 
-function releaseBody(eligibility, provenance) {
+// Deterministic release body. `notesBlock` (the collapsed per-build changes
+// derived from the exact source changelog) is inserted between the identity/
+// provenance lines and the provenance fence; when omitted the output is
+// byte-identical to the pre-notes legacy shape, so old-format drafts and
+// published releases keep verifying unchanged.
+function releaseBody(eligibility, provenance, notesBlock) {
   const lines = [
     identityMarker(eligibility),
     "",
@@ -96,6 +134,9 @@ function releaseBody(eligibility, provenance) {
     `- Baseline: ${eligibility.baseline} (first-parent distance ${eligibility.n})`,
     `- Merged pull request: #${eligibility.prNumber} (merge commit ${eligibility.prMergeCommitSha})`,
   ];
+  if (notesBlock !== undefined && notesBlock !== null) {
+    lines.push("", notesBlock);
+  }
   if (provenance) {
     lines.push("", "```json", JSON.stringify(provenance, null, 2), "```");
   }
@@ -180,7 +221,7 @@ async function findReleaseByTag({ api, tag }) {
   return drafts[0] ?? null;
 }
 
-async function resolveOrCreateDraftRelease({ api, eligibility }) {
+async function resolveOrCreateDraftRelease({ api, eligibility, notesBlock }) {
   const created = await api.createRelease({
     tag_name: eligibility.tag,
     // Explicit source binding. GitHub's documented default for
@@ -190,7 +231,7 @@ async function resolveOrCreateDraftRelease({ api, eligibility }) {
     // possible tag-creation path on the exact validated source.
     target_commitish: eligibility.target,
     name: `${eligibility.tag} (${PACKAGE_NAME} ${eligibility.version})`,
-    body: releaseBody(eligibility, undefined),
+    body: releaseBody(eligibility, undefined, notesBlock),
     draft: true,
     prerelease: true,
     make_latest: "false",
@@ -312,13 +353,28 @@ async function syncDraftAssets({ api, release, assets }) {
 // Rebuilt local bytes are deliberately NOT compared: tar mtimes make packing
 // non-deterministic between runs, so published verification relies on the
 // validated manifest rather than on re-packing different bytes.
-async function verifyPublishedRelease({ api, release, eligibility, tarballFilename }) {
+//
+// For policy-adopted builds (`expectedNotesBlock` set), the published body
+// must additionally carry EXACTLY the collapsed changes block derived from
+// the exact source changelog — removing, editing, or duplicating notes on a
+// published release fails closed instead of masquerading as legacy.
+async function verifyPublishedRelease({ api, release, eligibility, tarballFilename, expectedNotesBlock }) {
   const problems = [];
   if (release.draft !== false) problems.push("release is not published");
   if (release.prerelease !== true) problems.push("release is not marked prerelease");
   if (release.tag_name !== eligibility.tag) problems.push("tag name mismatch");
   const body = typeof release.body === "string" ? release.body : "";
   if (!body.includes(identityMarker(eligibility))) problems.push("release body does not carry the release identity marker");
+  if (expectedNotesBlock !== undefined && expectedNotesBlock !== null) {
+    const openCount = (body.match(/<details>/g) ?? []).length;
+    const closeCount = (body.match(/<\/details>/g) ?? []).length;
+    if (openCount !== 1 || closeCount !== 1) {
+      problems.push(`expected exactly one collapsed changes block in the published body, found ${openCount} opening / ${closeCount} closing details tag(s)`);
+    }
+    if (!body.includes(expectedNotesBlock)) {
+      problems.push("published release notes do not match the exact source changelog for this build");
+    }
+  }
   const assets = release.assets ?? [];
   const names = new Set(assets.map((asset) => asset.name));
   for (const expected of expectedAssetNames(tarballFilename)) {
@@ -357,6 +413,19 @@ async function verifyPublishedRelease({ api, release, eligibility, tarballFilena
   }
   if (provenanceArtifact?.size !== tarballAsset.buffer.length) {
     throw new ReleaseError("published tarball size does not match published provenance");
+  }
+  // Policy-adopted builds additionally bind the body to the asset: the
+  // authoritative manifest OUTSIDE the notes region must equal the published
+  // provenance asset, so a body edited after publication cannot be certified
+  // on retry (notes examples are not manifests and cannot stand in for it).
+  if (expectedNotesBlock !== undefined && expectedNotesBlock !== null) {
+    const embedded = parseProvenanceFromBody(bodyWithoutNotes(body));
+    if (embedded === null) {
+      throw new ReleaseError("published release body does not carry a parseable provenance fence outside the notes block");
+    }
+    if (JSON.stringify(embedded) !== JSON.stringify(provenance)) {
+      throw new ReleaseError("provenance embedded in the published release body differs from the published provenance asset");
+    }
   }
   return { verified: true, tarballSha256: tarballSha };
 }
@@ -433,10 +502,99 @@ async function buildReleaseArtifacts({ eligibility, projectRoot, scratch }) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-build release notes (exact source changelog)
+// ---------------------------------------------------------------------------
+
+const CHANGELOG_RELATIVE_PATH = "CHANGELOG.md";
+
+function readTargetChangelog({ projectRoot }) {
+  const changelogPath = path.join(projectRoot, CHANGELOG_RELATIVE_PATH);
+  if (!fs.existsSync(changelogPath)) {
+    throw new ReleaseError(`source checkout is missing ${CHANGELOG_RELATIVE_PATH}; cannot derive or verify per-build release notes; failing closed`);
+  }
+  try {
+    return fs.readFileSync(changelogPath, "utf8");
+  } catch (error) {
+    throw new ReleaseError(`unable to read ${CHANGELOG_RELATIVE_PATH}: ${String((error && error.message) || error).slice(0, 300)}`);
+  }
+}
+
+// Policy-adoption boundary, derived from the immutable source anchor rather
+// than from section presence: a target is adopted when it is a STRICT
+// first-parent descendant of the anchor (the main commit at adoption time). A
+// section-presence scan would let the first adopted build omit its own notes
+// and be reclassified as legacy; an anchor cannot. The anchor itself and its
+// ancestors are pre-adoption builds and stay legacy. A target whose line
+// neither contains nor precedes the anchor (a rewritten or divergent history)
+// fails closed instead of guessing.
+function changelogPolicyAdopted({ repoRoot, target, policyAnchor }) {
+  if (!HEX40.test(policyAnchor ?? "")) {
+    throw new ReleaseError(`policy adoption anchor must be a 40-hex commit SHA, got ${JSON.stringify(policyAnchor ?? null)}`);
+  }
+  const chain = git(["rev-list", "--first-parent", target], { repoRoot }).split("\n");
+  const anchorIndex = chain.indexOf(policyAnchor);
+  if (anchorIndex > 0) return true; // strict first-parent descendant: adopted
+  if (anchorIndex === 0) return false; // the target IS the last legacy build
+  let anchorChain;
+  try {
+    anchorChain = git(["rev-list", "--first-parent", policyAnchor], { repoRoot }).split("\n");
+  } catch (error) {
+    throw new ReleaseError(`cannot resolve the policy adoption anchor ${policyAnchor}: ${String((error && error.message) || error).slice(0, 300)}`);
+  }
+  if (anchorChain.includes(target)) return false; // pre-adoption ancestor of the anchor
+  throw new ReleaseError(
+    `cannot determine changelog policy adoption: target ${target} neither contains nor precedes the adoption anchor ${policyAnchor}; failing closed`,
+  );
+}
+
+// Derive the exact collapsible release notes for this target from the changelog
+// of the EXACT source checkout (never a moving branch). Runs before any remote
+// write in publishRelease. Returns { notesBlock: string | null }:
+//   - topmost numbered section is this build's: new format; the block is
+//     derived and required to be well-formed and non-empty;
+//   - no numbered sections at all: legacy unless the target is policy-adopted
+//     per the immutable source anchor (then a missing section fails closed
+//     instead of silently taking the legacy path);
+//   - topmost numbered section is any other build: stale or mismatched
+//     candidate; fails closed before publication.
+function deriveReleaseNotes({ projectRoot, repoRoot, eligibility, policyAnchor }) {
+  const text = readTargetChangelog({ projectRoot });
+  let parsed;
+  try {
+    parsed = changelog.parseChangelog(text);
+  } catch (error) {
+    throw new ReleaseError(`changelog structure rejected: ${String((error && error.message) || error).slice(0, 300)}`);
+  }
+  const topmost = parsed.numbered.length > 0 ? parsed.numbered[0].n : null;
+  if (topmost === null) {
+    const adopted = changelogPolicyAdopted({ repoRoot, target: eligibility.target, policyAnchor });
+    if (adopted) {
+      throw new ReleaseError(
+        `no changelog section for build ${changelog.devVersionFor(eligibility.n)} although per-build attribution is already adopted in this target's history; missing notes never publish silently; failing closed`,
+      );
+    }
+    return { notesBlock: null };
+  }
+  if (topmost !== eligibility.n) {
+    throw new ReleaseError(
+      `changelog topmost numbered section is ${changelog.buildHeadingFor(topmost)} but this target is build ${changelog.devVersionFor(eligibility.n)}; the candidate number is stale or mismatched — update it against the current base and re-run strict CI; failing closed before any remote write`,
+    );
+  }
+  let derived;
+  try {
+    derived = changelog.deriveReleaseNotes({ text, n: eligibility.n, tag: eligibility.tag });
+  } catch (error) {
+    throw new ReleaseError(`release notes derivation failed for ${changelog.devVersionFor(eligibility.n)}: ${String((error && error.message) || error).slice(0, 300)}`);
+  }
+  return { notesBlock: derived.notesBlock };
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
-async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildArtifacts, baseline }) {
+async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildArtifacts, baseline, policyAnchor }) {
+  const anchor = policyAnchor ?? POLICY_ADOPTION_ANCHOR;
   const context = assertReleaseEventContext(env);
   const eligibility = await resolveEligibility({ env, fetchImpl, repoRoot: projectRoot, baseline });
   if (eligibility.target !== context.target) {
@@ -448,6 +606,10 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
     throw new ReleaseError(`checkout HEAD ${head} does not match the event SHA ${context.target}`);
   }
   const tarballFilename = tarballFilenameFor(eligibility.version);
+  // Per-build notes are derived from the exact source checkout BEFORE any
+  // remote write: a stale, missing, duplicate, or empty candidate fails
+  // closed here, and the same block is what retries must find published.
+  const { notesBlock } = deriveReleaseNotes({ projectRoot, repoRoot: projectRoot, eligibility, policyAnchor: anchor });
   const api = createApi({ fetchImpl, token: env.GITHUB_TOKEN, repository: REPOSITORY });
 
   const tag = await ensureTag({ api, tag: eligibility.tag, target: eligibility.target });
@@ -456,7 +618,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
 
   if (existing && existing.draft === false) {
     // Immutable boundary: published releases are verified only, never touched.
-    const verification = await verifyPublishedRelease({ api, release: existing, eligibility, tarballFilename });
+    const verification = await verifyPublishedRelease({ api, release: existing, eligibility, tarballFilename, expectedNotesBlock: notesBlock });
     // Read-only identity cross-check: the published release must still be
     // bound to a tag ref at the exact source SHA. Failing closed here mutates
     // nothing; it only refuses to certify a compromised identity.
@@ -497,14 +659,14 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
     release = existing;
     mode = "resume-draft";
   } else {
-    const resolved = await resolveOrCreateDraftRelease({ api, eligibility });
+    const resolved = await resolveOrCreateDraftRelease({ api, eligibility, notesBlock });
     release = resolved.release;
     mode = resolved.mode;
     if (mode === "published") {
       // A concurrent run published between our discovery and creation: the
       // immutable boundary applies immediately — verify only. No artifact
       // build, no PATCH, no upload, no delete may touch a published release.
-      const verification = await verifyPublishedRelease({ api, release, eligibility, tarballFilename });
+      const verification = await verifyPublishedRelease({ api, release, eligibility, tarballFilename, expectedNotesBlock: notesBlock });
       return {
         outcome: "already-published",
         tag: eligibility.tag,
@@ -536,7 +698,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       target_commitish: eligibility.target,
       draft: true,
       prerelease: true,
-      body: releaseBody(eligibility, build.provenance),
+      body: releaseBody(eligibility, build.provenance, notesBlock),
     });
     const refreshed = await api.getRelease(release.id);
     if (!refreshed) throw new ReleaseError("draft release became unreadable after identity write");
@@ -554,7 +716,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       draft: false,
       prerelease: true,
       make_latest: "false",
-      body: releaseBody(eligibility, build.provenance),
+      body: releaseBody(eligibility, build.provenance, notesBlock),
     });
     const published = await api.getRelease(release.id);
     if (!published) throw new ReleaseError("release became unreadable after publication");
@@ -564,6 +726,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       release: published,
       eligibility,
       tarballFilename: build.tarballFilename,
+      expectedNotesBlock: notesBlock,
     });
     return {
       outcome: "published",
@@ -584,6 +747,9 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
 
 module.exports = {
   assertTagRefMatches,
+  bodyWithoutNotes,
+  changelogPolicyAdopted,
+  deriveReleaseNotes,
   ensureTag,
   expectedAssetNames,
   findOrphanedOwnedDraft,

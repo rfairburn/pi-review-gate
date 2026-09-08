@@ -15,6 +15,24 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.14]
+
+### Fixed
+
+- Switching a worker resource to a different model in `/review-settings` no longer
+  leaves stale reasoning levels behind: selecting a model that does not support the
+  level stored on the execution or research route displayed a supported fallback while
+  the saved and effective values kept the higher level, blocking the save with
+  `… priority reasoning is unsupported for …` and requiring manual reconfiguration
+  before workers could launch. Route entries for the switched resource are now
+  re-derived from the model's actual capability metadata: a prior level the new model
+  supports is preserved, otherwise a model-supported fallback is selected and persisted
+  (the single valid level for single-level models, `off` for models without
+  configurable reasoning), and switching to an external agent drops the Pi reasoning
+  override since the agent owns its configuration. Unrelated resources' valid route
+  overrides are untouched, and the normalized choice survives save/reopen/restart so
+  execution succeeds under the new model without additional configuration (Closes #24).
+
 ## [0.1.0-dev.13]
 
 ### Fixed

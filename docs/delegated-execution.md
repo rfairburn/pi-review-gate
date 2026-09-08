@@ -212,7 +212,11 @@ which never implies verification) from reviewer verdicts (`reviewer_verdict`). T
 and results are paired by real call ids; a call without an observed result stays
 `in_flight`, which is never evidence of success. Private model reasoning (Pi thinking
 blocks, Codex reasoning items) is excluded from every view, and all retained content is
-redacted before search or display.
+redacted before search or display. Entry previews stay compact (whitespace-collapsed
+and bounded); deep reads are distinct from previews and preserve the retained text's
+own whitespace — newlines, indentation, tabs, and blank lines — so multiline YAML,
+source code, diffs, and command output arrive readable, with continued chunks
+reconstructing the retained content exactly and truncation/continuation explicit.
 
 Completed review cycles are persisted as official records under the task's artifact
 directory (`reviews/<waveId>/cycle-NNNN.json`, one per cycle, numbered to match the
@@ -283,7 +287,9 @@ field, because each operation has its own exact-schema tool:
 { "executionId": "exec-…", "taskId": "task-…",
   "evidence": { "cursor": "ev1.…" } }
 
-// Deep-read one large entry in bounded chunks
+// Deep-read one large entry in bounded chunks; the chunk text preserves the
+// retained content's own newlines, indentation, tabs, and blank lines (redaction
+// and retention caps excepted), and continued chunks reconstruct it exactly.
 { "executionId": "exec-…", "taskId": "task-…",
   "evidence": { "entryId": "turn:0001/line:12", "chunkIndex": 0 } }
 

@@ -15,6 +15,12 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.17]
+
+### Fixed
+
+- `SubtasksInspect` evidence deep reads now preserve the retained text faithfully: the model-visible chunk renders the retained original indentation, newlines, tabs, and blank lines (deliberate existing redaction and disclosed retention limits excepted), so multiline indented YAML, source code, diffs, and multiline tool/command output arrive as multiline text instead of a whitespace-collapsed single line. Continued chunks reconstruct the retained redacted content exactly — no silent whitespace loss, normalization, or duplication — chunk boundaries no longer split UTF-16 surrogate pairs (a lone surrogate in either half would corrupt both chunks' text), and continuation and truncation remain explicit. Compact entry previews stay compact and distinct from deep content. Two parser paths that unnecessarily JSON-escaped safe structured text fields now retain them verbatim: a plain-string `tool_execution_end` result in the Pi RPC stdout fallback, and the query of a completed Codex `web_search` item, whose remaining fields (status, error, id, results) stay retained in their compact JSON representation alongside the verbatim query so a failed search still carries its diagnostic and metadata (structured `mcp_tool_call` items keep their full compact JSON representation). Redaction before retention/search/display, private-reasoning exclusion, confinement, resource bounds, the explicit-`taskId` inspection contract (#53), and the scoped read-only selector error semantics (#61) are all unchanged (Closes #54).
+
 ## [0.1.0-dev.16]
 
 ### Fixed

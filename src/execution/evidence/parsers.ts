@@ -289,6 +289,9 @@ export function parsePiStdoutLines(lines: Array<{ text: string }>): ParsedLines 
       }
       case "tool_execution_end": {
         const result = isRecord(parsed.result) ? parsed.result : undefined;
+        // #54: a plain-string result is already faithful text; rendering it
+        // through JSON.stringify would quote and escape its newlines.
+        const resultText = typeof parsed.result === "string" ? parsed.result : undefined;
         const record: RawEvidenceRecord = {
           recordKey: `L${ordinal + 1}`,
           at,
@@ -297,7 +300,7 @@ export function parsePiStdoutLines(lines: Array<{ text: string }>): ParsedLines 
           toolName: str(parsed.toolName),
           status: parsed.isError === true ? "failed" : result !== undefined || parsed.isError === false ? "succeeded" : "unknown",
           provenance: "executor_observed",
-          ...capped(result ? formatContentBlocks(result.content) : compactJson(parsed.result ?? null)),
+          ...capped(result ? formatContentBlocks(result.content) : resultText ?? compactJson(parsed.result ?? null)),
         };
         if (!record.callId && inFlightCalls.length === 1) {
           const call = inFlightCalls.shift()!;
@@ -559,13 +562,30 @@ export function parseCodexStreamLines(lines: Array<{ text: string }>): ParsedLin
       } else {
         const pending = inFlight.get(name) ?? [];
         const failed = item.status === "failed" || (item.error !== undefined && item.error !== null);
+        // #54: the web search query is the item's safe text field; retain it
+        // verbatim instead of JSON-escaping its newlines. The remaining fields
+        // (status, error, id, results) keep their previously retained compact
+        // JSON representation so a failed search still carries its diagnostic
+        // and metadata. Structured mcp_tool_call items keep their full compact
+        // JSON representation (no established text field to render faithfully).
+        const query = itemType === "web_search" ? str(item.query) : undefined;
+        let content: string;
+        if (query !== undefined) {
+          const retained: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(item)) {
+            if (key !== "type" && key !== "query") retained[key] = value;
+          }
+          content = [query, `web search ${failed ? "failed" : "completed"}`, compactJson(retained)].join("\n");
+        } else {
+          content = compactJson(item);
+        }
         const record: RawEvidenceRecord = {
           recordKey: `L${notification.lineOrdinal + 1}`,
           kind: "tool_result",
           toolName: name,
           status: failed ? "failed" : "succeeded",
           provenance: "executor_observed",
-          ...capped(compactJson(item)),
+          ...capped(content),
         };
         if (pending.length === 1) {
           record.callId = pending[0]!.callId;

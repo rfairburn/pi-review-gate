@@ -70,9 +70,17 @@ function readEntry(bundle: SubtaskEvidenceBundle, selector: SubtaskEvidenceSelec
     throw new EvidenceNavigationError("entry_not_found", `No evidence entry "${entryId}" exists in this task's current snapshot.`);
   }
   const content = snapshot.contentByEntryId.get(entryId) ?? "";
-  const start = chunkIndex * EVIDENCE_DEEP_CHUNK_CHARS;
-  const chunk = content.slice(start, start + EVIDENCE_DEEP_CHUNK_CHARS);
-  const hasMore = start + EVIDENCE_DEEP_CHUNK_CHARS < content.length;
+  // #54: chunk boundaries follow the fixed grid, except a boundary that would
+  // split a UTF-16 surrogate pair is pushed past it — a lone surrogate in
+  // either half would corrupt both chunks' text even though concatenation
+  // still reconstructs the retained content. A chunk starts exactly at the
+  // (capped) boundary after the previous one, so every chunkIndex resolves in
+  // constant time as a pure function of the snapshot and continued chunks
+  // remain lossless.
+  const start = chunkIndex === 0 ? 0 : Math.min(chunkBoundary(content, chunkIndex - 1), content.length);
+  const end = Math.min(chunkBoundary(content, chunkIndex), content.length);
+  const chunk = content.slice(start, end);
+  const hasMore = end < content.length;
   return {
     taskId: snapshot.taskId,
     mode: "entry",
@@ -93,6 +101,14 @@ function readEntry(bundle: SubtaskEvidenceBundle, selector: SubtaskEvidenceSelec
           : undefined,
     },
   };
+}
+
+/** Grid boundary after chunk `chunkIndex`, pushed past a split surrogate pair. */
+function chunkBoundary(content: string, chunkIndex: number): number {
+  const candidate = (chunkIndex + 1) * EVIDENCE_DEEP_CHUNK_CHARS;
+  const high = content.charCodeAt(candidate - 1);
+  const low = content.charCodeAt(candidate);
+  return high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff ? candidate + 1 : candidate;
 }
 
 function readCall(bundle: SubtaskEvidenceBundle, selector: SubtaskEvidenceSelector): SubtaskEvidenceRead {

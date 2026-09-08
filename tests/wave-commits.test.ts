@@ -18,6 +18,7 @@ import {
   candidateRefName,
   buildCandidateReviewPatch,
   createCommitWithParent,
+  collectGitDiffBounded,
   CandidateCommit,
 } from "../src/execution/wave-commits";
 
@@ -1034,25 +1035,32 @@ function makeScriptedChild(): {
   child: ChildProcessByStdio<Writable, Readable, Readable>;
   stdout: EventEmitter;
   stderr: EventEmitter;
+  /** Scripted stdin surface; an EventEmitter so tests can emit "error" (e.g. EPIPE). */
+  stdin: EventEmitter;
   stdinText: () => string;
 } {
   const stdout = new EventEmitter();
   const stderr = new EventEmitter();
   let stdinText = "";
-  const child = Object.assign(new EventEmitter(), {
-    stdout,
-    stderr,
-    stdin: {
-      write: (chunk: unknown) => { stdinText += String(chunk); return true; },
-      end: () => undefined,
-    },
+  const stdin = Object.assign(new EventEmitter(), {
+    write: (chunk: unknown) => { stdinText += String(chunk); return true; },
+    end: () => undefined,
   });
+  const child = Object.assign(new EventEmitter(), { stdout, stderr, stdin });
   return {
     child: child as unknown as ChildProcessByStdio<Writable, Readable, Readable>,
     stdout,
     stderr,
+    stdin,
     stdinText: () => stdinText,
   };
+}
+
+/** Build a realistic EPIPE error for stdin failure regressions. */
+function epipeError(): NodeJS.ErrnoException {
+  const error = new Error("write EPIPE") as NodeJS.ErrnoException;
+  error.code = "EPIPE";
+  return error;
 }
 
 test("wave-commits — commit-tree capture waits for close and keeps the final SHA chunk", async () => {
@@ -1105,6 +1113,150 @@ test("wave-commits — commit-tree failure still reports exit code and stderr", 
   assert.ok(rejected instanceof Error);
   assert.match(rejected.message, /exited with code 128/);
   assert.match(rejected.message, /fatal: bad tree/);
+});
+
+// ── createCommitWithParent: stdin failure handling ──────────────────────────
+
+test("wave-commits — commit-tree stdin EPIPE with a zero exit fails closed", async () => {
+  const fullSha = "9c8a5f1e2d3b4c6a7e8f90a1b2c3d4e5f6071829";
+  const { child, stdout, stdin } = makeScriptedChild();
+  let resolved: string | undefined;
+  let rejected: unknown;
+  const settled = createCommitWithParent("/tmp", "tree-sha", "parent-sha", "candidate\n", () => child)
+    .then((sha) => { resolved = sha; }, (error) => { rejected = error; });
+
+  // The child closed stdin before the message was fully delivered (early exit
+  // or a write/end race), yet still produced a plausible object name and
+  // reports success. A valid SHA plus zero exit must not override the failed
+  // message write: this must reject with a bounded diagnostic instead of
+  // resolving a checkpoint whose identity is unproven — and it must never
+  // surface as an unhandled "error" event on child.stdin.
+  stdin.emit("error", epipeError());
+  stdout.emit("data", Buffer.from(fullSha + "\n"));
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+
+  await settled;
+  assert.equal(resolved, undefined, "must not resolve a checkpoint when the message write failed");
+  assert.ok(rejected instanceof Error, "must reject with a diagnostic");
+  assert.match(rejected.message, /EPIPE/);
+  assert.match(rejected.message, /stdin/);
+});
+
+test("wave-commits — commit-tree early exit reports the exit code and tolerates the follow-up EPIPE", async () => {
+  const { child, stderr, stdin } = makeScriptedChild();
+  let rejected: unknown;
+  const settled = createCommitWithParent("/tmp", "tree-sha", "parent-sha", "candidate\n", () => child)
+    .catch((error) => { rejected = error; });
+
+  // git commit-tree fails before consuming stdin (e.g. an invalid tree): it
+  // exits non-zero, and the pending message write then fails with EPIPE. The
+  // exit diagnostic must win, and the later stdin error must not crash the
+  // parent as an unhandled "error" event.
+  stderr.emit("data", Buffer.from("fatal: invalid tree object\n"));
+  child.emit("exit", 128, null);
+  child.emit("close", 128, null);
+  stdin.emit("error", epipeError());
+
+  await settled;
+  assert.ok(rejected instanceof Error);
+  assert.match(rejected.message, /exited with code 128/);
+  assert.match(rejected.message, /fatal: invalid tree object/);
+});
+
+test("wave-commits — commit-tree spawn error settles once and tolerates a stdin error", async () => {
+  const { child, stdin } = makeScriptedChild();
+  const spawnError = new Error("spawn git ENOENT") as NodeJS.ErrnoException;
+  spawnError.code = "ENOENT";
+  let rejected: unknown;
+  const settled = createCommitWithParent("/tmp", "tree-sha", "parent-sha", "candidate\n", () => child)
+    .catch((error) => { rejected = error; });
+
+  // A failed spawn reports "error" on the child and can still surface a stdin
+  // error plus a final "close"; settlement must happen exactly once, with the
+  // spawn error.
+  child.emit("error", spawnError);
+  stdin.emit("error", epipeError());
+  child.emit("close", null, null);
+
+  await settled;
+  assert.equal(rejected, spawnError, "must reject with the spawn error");
+});
+
+// ── collectGitDiffBounded: deterministic stdout capture ordering ────────────
+
+test("wave-commits — diff capture waits for close and keeps bytes that arrive after exit", async () => {
+  const { child, stdout } = makeScriptedChild();
+  let resolved: { patch: string; totalBytes: number } | undefined;
+  let rejected: unknown;
+  const settled = collectGitDiffBounded(["diff", "base", "candidate"], "/tmp", 10_000, () => (child as unknown as ChildProcessByStdio<null, Readable, Readable>))
+    .then((result) => { resolved = result; }, (error) => { rejected = error; });
+
+  // Deterministic regression ordering for the CI race: the process reports
+  // "exit" while the final diff chunk is still in flight. Settling on "exit"
+  // resolves a truncated patch and silently drops review content; capture must
+  // wait for "close", which fires only after every stdio stream has drained.
+  stdout.emit("data", Buffer.from("line one\n"));
+  child.emit("exit", 0, null);
+  stdout.emit("data", Buffer.from("final line\n"));
+  child.emit("close", 0, null);
+
+  await settled;
+  assert.equal(rejected, undefined, "must not reject when close delivers the full output");
+  assert.ok(resolved, "must resolve after close");
+  assert.equal(resolved.patch, "line one\nfinal line\n", "patch must include the chunk that arrived after exit");
+  assert.equal(resolved.totalBytes, Buffer.byteLength("line one\nfinal line\n"));
+});
+
+test("wave-commits — diff capture keeps bounded retention across the close boundary", async () => {
+  const { child, stdout } = makeScriptedChild();
+  let resolved: { patch: string; totalBytes: number } | undefined;
+  let rejected: unknown;
+  const settled = collectGitDiffBounded(["diff", "base", "candidate"], "/tmp", 12, () => (child as unknown as ChildProcessByStdio<null, Readable, Readable>))
+    .then((result) => { resolved = result; }, (error) => { rejected = error; });
+
+  // Truncation must keep holding when the second chunk crosses both the
+  // maxBytes boundary and the exit/close boundary: retention stays bounded,
+  // totalBytes still counts every emitted byte.
+  stdout.emit("data", Buffer.from("0123456789ab"));
+  child.emit("exit", 0, null);
+  stdout.emit("data", Buffer.from("cdef"));
+  child.emit("close", 0, null);
+
+  await settled;
+  assert.equal(rejected, undefined);
+  assert.ok(resolved);
+  assert.equal(resolved.patch, "0123456789ab", "retention must stay bounded at maxBytes");
+  assert.equal(resolved.totalBytes, 16, "totalBytes must count every emitted byte");
+});
+
+test("wave-commits — diff capture failure still reports the exit code", async () => {
+  const { child } = makeScriptedChild();
+  let rejected: unknown;
+  const settled = collectGitDiffBounded(["diff", "base", "candidate"], "/tmp", 10_000, () => (child as unknown as ChildProcessByStdio<null, Readable, Readable>))
+    .catch((error) => { rejected = error; });
+  child.emit("exit", 128, null);
+  child.emit("close", 128, null);
+  await settled;
+  assert.ok(rejected instanceof Error);
+  assert.match(rejected.message, /exited with code 128/);
+});
+
+test("wave-commits — diff capture spawn error settles once and does not throw", async () => {
+  const { child } = makeScriptedChild();
+  const spawnError = new Error("spawn git ENOENT") as NodeJS.ErrnoException;
+  spawnError.code = "ENOENT";
+  let rejected: unknown;
+  const settled = collectGitDiffBounded(["diff", "base", "candidate"], "/tmp", 10_000, () => (child as unknown as ChildProcessByStdio<null, Readable, Readable>))
+    .catch((error) => { rejected = error; });
+
+  // A failed spawn reports "error" and may still emit a final "close";
+  // settlement must happen exactly once with the spawn error.
+  child.emit("error", spawnError);
+  child.emit("close", null, null);
+
+  await settled;
+  assert.equal(rejected, spawnError, "must reject with the spawn error");
 });
 
 // Import readFile for the test above

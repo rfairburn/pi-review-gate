@@ -1,4 +1,6 @@
 import { execFile, spawn } from "node:child_process";
+import type { ChildProcessByStdio } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { promises as fs, readlink as fsReadlink, Stats } from "node:fs";
 import { join, sep, isAbsolute, resolve } from "node:path";
@@ -1724,15 +1726,32 @@ export async function executeWaveLanding(
 }
 
 /**
- * Read a blob's raw content from the Git repository.
+ * Minimal child-process factory surface used by gitCatFileBlob.
+ * Production always uses the real spawn; tests may inject a scripted child to
+ * deterministically exercise stdout capture ordering (for example "exit" before
+ * the final data chunk).
  */
-async function gitCatFileBlob(
+export type GitCatFileSpawn = (
+  command: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number; signal?: AbortSignal },
+) => ChildProcessByStdio<Writable, Readable, Readable>;
+
+/**
+ * Read a blob's raw content from the Git repository.
+ *
+ * Exported so tests can inject a scripted child (see GitCatFileSpawn) and
+ * deterministically exercise stdout capture ordering, mirroring the
+ * createCommitWithParent spawn seam.
+ */
+export async function gitCatFileBlob(
   repoPath: string,
   blobId: string,
   abortSignal?: AbortSignal,
+  spawnGit: GitCatFileSpawn = spawn,
 ): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", ["cat-file", "-p", blobId], {
+    const child = spawnGit("git", ["cat-file", "-p", blobId], {
       cwd: repoPath,
       env: { ...process.env, ...GIT_ENV },
       timeout: 30_000,
@@ -1740,10 +1759,22 @@ async function gitCatFileBlob(
     });
 
     const chunks: Buffer[] = [];
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
     child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
     child.stderr.on("data", () => {}); // ignore stderr
-    child.on("error", reject);
-    child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+    child.on("error", fail);
+    // Settle on "close", not "exit": "exit" can fire before the stdio streams
+    // are fully drained, which under load materializes a truncated blob into
+    // the worktree. "close" fires only after the process has exited and every
+    // stdio stream has ended.
+    child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) return;
+      settled = true;
       if (code !== 0 || signal) {
         reject(new Error(`git cat-file failed for blob ${blobId} with code ${code} signal ${signal}`));
       } else {

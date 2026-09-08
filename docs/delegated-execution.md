@@ -66,6 +66,16 @@ capacity. The two priorities are independent subsets: either route can exclude a
 resource, and per-route reasoning lets the same local model use different effort without
 creating a second capacity bucket.
 
+When `/review-settings` switches a resource to a different model, the previous model's
+reasoning is discarded for that resource's retained route entries — the model and its
+reasoning go hand in hand, even when the new model supports the prior level — and each
+entry takes the new model's own configured or pinned reasoning, otherwise that model's
+supported default (the single valid level for single-level models and `off` for models
+without configurable reasoning). Switching to an external agent drops the Pi reasoning
+override because the agent owns its configuration, and other resources' route overrides
+are untouched, so a model switch never leaves an unsupported or stale level behind and
+needs no second manual configuration step.
+
 `config.execution.maxWorkers` controls concurrent workers (1–16, default 4); there is no
 parallelism toggle or per-tool override. Task count is independent, and excess tasks
 queue. The sum of resource capacities may exceed `maxWorkers`; it describes available

@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.15]
+
+### Changed
+
+- `SubtasksInspect` now requires an explicit `taskId` in every mode and for every group
+  size, including single-task executions: the registered schema marks it required,
+  input validation rejects an omitted ID before any execution state is resolved, and
+  both activity and evidence reads fail immediately with one concise actionable
+  diagnostic naming where stable task handles come from, instead of silently inspecting
+  the whole execution group (activity mode) or failing late with a different
+  evidence-only error. Previously advertised omission is no longer supported for
+  inspection, and single-task IDs are never inferred. Valid explicit-ID inspection of
+  active and archived tasks — including unknown-handle failures and integrity-checked
+  archive recovery — is unchanged, as are the optional-`taskId` contracts of the other
+  subtask tools. The execution-wide overview remains available without a task handle
+  through `SubtasksStart`/`SubtasksAdd` results, the complete group diagnostic packet
+  returned by operations that fail after input validation, and the `/subtasks` and
+  `/subtasks-view` user surfaces (Closes #53).
+
 ## [0.1.0-dev.14]
 
 ### Fixed

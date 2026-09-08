@@ -24,6 +24,12 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   unchanged, and finish as `reported` with a durable report path.
 - `SubtasksContinue` accepts either an associated task handle or a verified reattachment
   bundle.
+- `SubtasksInspect` requires an explicit `taskId`, even for single-task executions; it
+  is never inferred from group size, and an omitted ID fails immediately with a concise
+  actionable diagnostic in both activity and evidence modes. The execution-wide overview
+  remains available without a task handle: start and add results list every task handle
+  in the group, operations that fail after input validation return the complete group
+  inspection, and `/subtasks` and `/subtasks-view` show all groups and active tasks.
 - `SubtasksWatch` optionally arms one future checkpoint for an active execution. It
   returns immediately, replaces any prior watch for that execution, and wakes once with
   active-task state, timing, recent activity, executor identity, and available controls

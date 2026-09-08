@@ -15,6 +15,32 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.16]
+
+### Fixed
+
+- `SubtasksInspect` evidence-navigation selector failures are now concise and task-scoped
+  instead of dumping every execution's state: with a valid, authorized `executionId`/
+  `taskId`, a mistyped `evidence.entryId`, an unknown `evidence.callId`, a malformed or
+  expired `evidence.cursor`, or an out-of-range `evidence.index` now returns one short
+  diagnostic naming the requested task plus a bounded navigation hint (list entries with
+  `index`/`limit`, optionally `filter` or `find`, then deep-read by the exact `entryId`
+  or resolve a call by its real `callId`) — in the model-visible response, the
+  human-rendered output, and the details payload alike — rather than the unrelated
+  historical executions' inventory, task IDs, titles, artifact paths, diagnostic markers,
+  or recovery history that the generic failure path appended. The evidence snapshot is
+  assembled exactly once per inspection — before any checkpoint-backfill recovery — and
+  that validated read is returned as-is, so a cursor or selector can never fail only after
+  a recovery write (the surrounding task inspection still reflects any backfilled state),
+  without double-building the bounded artifact index. A correct `entryId` deep read still
+  succeeds, an invalid read mutates neither the task record nor the workspace, and the
+  intentional non-error selector semantics are unchanged (an in-range index with a
+  limit beyond the remaining entries clamps to what exists, and a filtered read with no
+  matches is a valid empty result). Genuine failures — unknown task or execution handles,
+  confinement refusals, and every other non-selector error — keep their complete group
+  diagnostic packet, and authorization, redaction, resource bounds, and the explicit-
+  `taskId` inspection contract are all unchanged (Closes #61).
+
 ## [0.1.0-dev.15]
 
 ### Changed

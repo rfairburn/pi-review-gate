@@ -924,7 +924,15 @@ function formatInspectionForModel(summary: string, inspection: BackgroundInspect
     if (evidence.deepContent) {
       const deep = evidence.deepContent;
       lines.push(`  deep read ${deep.entryId} · chunk ${deep.chunkIndex} · ${deep.contentBytes} retained byte(s)${deep.truncatedContent ? " · source record truncated at retention cap" : ""}:`);
-      for (const contentLine of clipPlain(deep.content, 8_000).split("\n")) lines.push(`    ${contentLine}`);
+      // #54: the model-visible deep read must preserve the retained text's own
+      // whitespace — newlines, indentation, tabs, and blank lines (deliberate
+      // redaction and disclosed retention limits excepted). Navigation already
+      // bounds each chunk (EVIDENCE_DEEP_CHUNK_CHARS plus at most one unit for
+      // a surrogate-pair boundary adjustment), so render it verbatim: any
+      // secondary clipping here could silently drop content that the next
+      // chunk no longer carries, and whitespace collapsing would flatten
+      // multiline YAML, source code, diffs, and command output.
+      for (const contentLine of deep.content.split("\n")) lines.push(`    ${contentLine}`);
       if (deep.note) lines.push(`  note: ${clipPlain(deep.note, 200)}`);
       if (deep.hasMore) lines.push(`  more content: continue with entryId=${deep.entryId} chunkIndex=${deep.nextChunk}.`);
     }

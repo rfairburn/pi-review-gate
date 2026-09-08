@@ -795,6 +795,18 @@ export type CommitTreeSpawn = (
 ) => ChildProcessByStdio<Writable, Readable, Readable>;
 
 /**
+ * Minimal child-process factory surface used by collectGitDiffBounded.
+ * Production always uses the real spawn; tests may inject a scripted child to
+ * deterministically exercise stdout capture ordering (for example "exit" before
+ * the final data chunk).
+ */
+export type GitDiffSpawn = (
+  command: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number; stdio: ["ignore", "pipe", "pipe"] },
+) => ChildProcessByStdio<null, Readable, Readable>;
+
+/**
  * Create a candidate commit with the wave base as its sole parent.
  *
  * `spawnGit` is an internal/test seam (see CommitTreeSpawn); production callers
@@ -826,17 +838,46 @@ export async function createCommitWithParent(
 
     let stdout = "";
     let stderr = "";
+    // A stdin failure means the commit message was not fully delivered. It is
+    // never benign for commit-tree (unlike gitSpawn's empty-input commands), so
+    // retain it and report on close; without a listener an early child exit or
+    // spawn failure would surface as an unhandled "error" event that crashes
+    // the parent.
+    let stdinError: NodeJS.ErrnoException | undefined;
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
     child.stdout.on("data", (chunk: Buffer | string) => { stdout += chunk; });
     child.stderr.on("data", (chunk: Buffer | string) => { stderr += chunk; });
-    child.on("error", reject);
+    child.on("error", fail);
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      if (!stdinError) stdinError = error;
+    });
     // Settle on "close", not "exit": "exit" can fire before the stdio streams
     // are fully drained, which under load loses the final stdout chunk (the
     // commit object name). An empty SHA then reaches update-ref as an empty
     // new value and fails with a misleading "not a valid SHA1". "close" fires
     // only after the process has exited and every stdio stream has ended.
     child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
       if (code !== 0 || signal) {
         reject(new Error(`git commit-tree exited with code ${code} signal ${signal}: ${stderr.trim()}`));
+        return;
+      }
+      // A zero exit after a stdin failure means the child closed stdin before
+      // the message was fully delivered: the resulting commit (if any) cannot
+      // prove its recorded identity, so fail closed instead of pinning a
+      // checkpoint whose message is unproven.
+      if (stdinError) {
+        const detail = String(stdinError.message).slice(0, 200);
+        reject(new Error(
+          `git commit-tree failed while writing the commit message to stdin ` +
+            `(${stdinError.code ?? "unknown"}: ${detail}).`,
+        ));
         return;
       }
       const sha = stdout.trim();
@@ -967,14 +1008,19 @@ function utf8SafePrefix(buf: Buffer, maxBytes: number): Buffer {
  * Stream `git` stdout and retain at most `maxBytes` bytes of the output
  * (UTF-8-safe) while counting the total byte length. This avoids materializing
  * arbitrarily large diffs in memory.
+ *
+ * Exported so tests can inject a scripted child (see GitDiffSpawn) and
+ * deterministically exercise stdout capture ordering, mirroring the
+ * createCommitWithParent spawn seam.
  */
-async function collectGitDiffBounded(
+export async function collectGitDiffBounded(
   args: string[],
   cwd: string,
   maxBytes: number,
+  spawnGit: GitDiffSpawn = spawn,
 ): Promise<{ patch: string; totalBytes: number }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, {
+    const child = spawnGit("git", args, {
       cwd,
       env: { ...process.env, ...GIT_ENV },
       timeout: 30_000,
@@ -985,6 +1031,12 @@ async function collectGitDiffBounded(
     let retainedBytes = 0;
     let totalBytes = 0;
     let done = false;
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
 
     child.stdout.on("data", (chunk: Buffer) => {
       totalBytes += chunk.length;
@@ -1002,8 +1054,14 @@ async function collectGitDiffBounded(
     });
 
     child.stderr.on("data", () => {}); // discard stderr
-    child.on("error", reject);
-    child.on("exit", (code, signal) => {
+    child.on("error", fail);
+    // Settle on "close", not "exit": "exit" can fire before the stdio streams
+    // are fully drained, which under load loses the tail of a large diff and
+    // silently truncates the review patch. "close" fires only after the
+    // process has exited and every stdio stream has ended.
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
       if (code !== 0 || signal) {
         reject(new Error(`git ${args.join(" ")} exited with code ${code} signal ${signal}`));
       } else {

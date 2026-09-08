@@ -15,6 +15,28 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.13]
+
+### Fixed
+
+- Wave execution Git subprocess handling now settles stdout capture only after the
+  child process has exited and every stdio stream has drained, closing a class of
+  latent truncation bugs (the candidate commit object-name capture was already
+  settled this way):
+  - Bounded review patch generation could resolve on process exit while diff bytes
+    were still in flight, silently truncating the review patch under load; it now
+    captures the complete diff before resolving, preserving bounded retention and
+    truncation metadata, actual exit-status reporting, and timeout-kill behavior.
+  - Landing blob materialization had the same exit-settled capture and could write
+    a truncated file into the worktree; it now waits for stream drainage, preserving
+    abort/timeout cleanup and failure diagnostics.
+- Candidate commit creation no longer crashes the parent process or risks pinning an
+  unverified checkpoint when writing the commit message to Git's stdin fails (early
+  child exit, EPIPE, or spawn failure): stdin errors are now handled with a bounded
+  diagnostic, the operation fails closed before any ref is pinned — a zero exit after
+  a failed message write is never treated as success — and settlement happens exactly
+  once even when spawn error, stdin error, and close all fire.
+
 ## [0.1.0-dev.12]
 
 ### Added

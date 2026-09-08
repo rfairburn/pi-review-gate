@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import type { ChildProcessByStdio } from "node:child_process";
+import { EventEmitter } from "node:events";
+import type { Readable, Writable } from "node:stream";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +21,7 @@ import {
 } from "../src/execution/wave-integration";
 import {
   executeWaveLanding,
+  gitCatFileBlob,
   planWaveLanding,
   validatePathSafe,
   type LandingPlan,
@@ -2126,4 +2130,77 @@ test("wave-landing execute — late abort after final path application rolls bac
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
   }
+});
+
+// ── gitCatFileBlob: deterministic stdout capture ordering ───────────────────
+
+/**
+ * Build a scripted fake child process for gitCatFileBlob's spawn seam.
+ * The returned emitters let the test control event ordering exactly (data vs
+ * exit vs close), which real subprocesses cannot guarantee under load.
+ */
+function makeScriptedChild(): {
+  child: ChildProcessByStdio<Writable, Readable, Readable>;
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+} {
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const child = Object.assign(new EventEmitter(), { stdout, stderr });
+  return {
+    child: child as unknown as ChildProcessByStdio<Writable, Readable, Readable>,
+    stdout,
+    stderr,
+  };
+}
+
+test("wave-landing — cat-file capture waits for close and keeps bytes that arrive after exit", async () => {
+  const { child, stdout } = makeScriptedChild();
+  let resolved: Buffer | undefined;
+  let rejected: unknown;
+  const settled = gitCatFileBlob("/tmp", "blob-sha", undefined, () => child)
+    .then((buf) => { resolved = buf; }, (error) => { rejected = error; });
+
+  // Deterministic regression ordering for the CI race: the process reports
+  // "exit" while the final blob chunk is still in flight. Settling on "exit"
+  // materializes a truncated blob into the worktree; capture must wait for
+  // "close", which fires only after every stdio stream has drained.
+  stdout.emit("data", Buffer.from("hel"));
+  child.emit("exit", 0, null);
+  stdout.emit("data", Buffer.from("lo\n"));
+  child.emit("close", 0, null);
+
+  await settled;
+  assert.equal(rejected, undefined, "must not reject when close delivers the full output");
+  assert.ok(resolved, "must resolve after close");
+  assert.equal(resolved.toString("utf8"), "hello\n", "blob must include the chunk that arrived after exit");
+});
+
+test("wave-landing — cat-file failure still reports the exit code", async () => {
+  const { child } = makeScriptedChild();
+  let rejected: unknown;
+  const settled = gitCatFileBlob("/tmp", "bad-blob", undefined, () => child)
+    .catch((error) => { rejected = error; });
+  child.emit("exit", 128, null);
+  child.emit("close", 128, null);
+  await settled;
+  assert.ok(rejected instanceof Error);
+  assert.match(rejected.message, /cat-file failed for blob bad-blob with code 128/);
+});
+
+test("wave-landing — cat-file spawn error settles once and does not throw", async () => {
+  const { child } = makeScriptedChild();
+  const spawnError = new Error("spawn git ENOENT") as NodeJS.ErrnoException;
+  spawnError.code = "ENOENT";
+  let rejected: unknown;
+  const settled = gitCatFileBlob("/tmp", "blob-sha", undefined, () => child)
+    .catch((error) => { rejected = error; });
+
+  // A failed spawn reports "error" and may still emit a final "close";
+  // settlement must happen exactly once with the spawn error.
+  child.emit("error", spawnError);
+  child.emit("close", null, null);
+
+  await settled;
+  assert.equal(rejected, spawnError, "must reject with the spawn error");
 });

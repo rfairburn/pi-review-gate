@@ -20,18 +20,17 @@ dates.
 ### Fixed
 
 - Switching a worker resource to a different model in `/review-settings` no longer
-  leaves stale reasoning levels behind: selecting a model that does not support the
-  level stored on the execution or research route displayed a supported fallback while
-  the saved and effective values kept the higher level, blocking the save with
-  `… priority reasoning is unsupported for …` and requiring manual reconfiguration
-  before workers could launch. Route entries for the switched resource are now
-  re-derived from the model's actual capability metadata: a prior level the new model
-  supports is preserved, otherwise a model-supported fallback is selected and persisted
-  (the single valid level for single-level models, `off` for models without
-  configurable reasoning), and switching to an external agent drops the Pi reasoning
-  override since the agent owns its configuration. Unrelated resources' valid route
-  overrides are untouched, and the normalized choice survives save/reopen/restart so
-  execution succeeds under the new model without additional configuration (Closes #24).
+  leaves stale reasoning levels behind, and never carries the previous model's level
+  over: the model and its reasoning go hand in hand, so every retained execution and
+  research route entry for the switched resource is re-derived from the new model's own
+  capability metadata — its configured or pinned reasoning where set, otherwise its
+  supported default (the single valid level for single-level models, `off` for models
+  without configurable reasoning) — even when the new model also supports the prior
+  level. Switching to an external agent drops the Pi reasoning override since the agent
+  owns its configuration. Unrelated resources' route overrides are untouched, and the
+  paired choice is displayed, persisted, and resolved consistently so it survives
+  save/reopen/restart and execution succeeds under the new model without additional
+  configuration (Closes #24).
 
 ## [0.1.0-dev.13]
 

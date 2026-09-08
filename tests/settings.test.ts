@@ -785,11 +785,11 @@ test("switching a worker model normalizes stale route reasoning to a supported l
   assert.equal(await readFile(configPath, "utf8"), reopenedBefore);
 });
 
-test("switching a worker model preserves supported reasoning and unrelated route overrides", async () => {
+test("switching a worker model discards prior reasoning even when the new model supports it", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-reasoning-preserve-"));
   const configPath = join(dir, "review-gate.json");
   const priorModel = "openai-codex/gpt-5.6-luna";
-  const nextModel = "openai-codex/gpt-5.6-mid";
+  const nextModel = "openai-codex/gpt-5.6-nova";
   const otherModel = "openai-codex/gpt-5.6-sol";
   const resourceId = executorEntryId({ source: "pi", model: priorModel });
   const otherResourceId = executorEntryId({ source: "pi", model: otherModel });
@@ -813,14 +813,19 @@ test("switching a worker model preserves supported reasoning and unrelated route
   const scoped = [
     { model: reasoningModel("openai-codex", "gpt-5.6-luna") },
     { model: reasoningModel("openai-codex", "gpt-5.6-sol") },
-    { model: restrictedReasoningModel("openai-codex", "gpt-5.6-mid", ["off", "minimal", "low", "medium"]) },
+    { model: reasoningModel("openai-codex", "gpt-5.6-nova") },
   ];
 
   await registered.handler("", contextWithSelections([
     rootSettingsRow("Worker resources", "2 models · 3 slots"),
     "1. gpt-5.6-luna [openai-codex] · shared max 1",
     executorEntryRow("Model", "gpt-5.6-luna [openai-codex]"),
-    "gpt-5.6-mid [openai-codex]",
+    "gpt-5.6-nova [openai-codex]",
+    "Back",
+    "Back",
+    // The switched resource displays the new model's own default, not the prior level.
+    rootSettingsRow("Execution priority", "gpt-5.6-nova → gpt-5.6-sol"),
+    "1. gpt-5.6-nova [openai-codex] · High · shared max 1",
     "Back",
     "Back",
     "Save changes",
@@ -831,12 +836,139 @@ test("switching a worker model preserves supported reasoning and unrelated route
     { source: "pi", model: nextModel },
     { source: "pi", model: otherModel },
   ]);
-  // The switched resource keeps its supported override; the inherited research
-  // level falls back to the highest level the new model supports. The other
-  // resource's explicit overrides are untouched.
+  // The previous model's level is never carried over, even though the new model
+  // supports it: both retained entries take the new model's own default. The
+  // unrelated resource's explicit overrides are untouched.
   assert.deepEqual(saved.execution.routes, {
-    execute: [{ resourceId, thinkingLevel: "medium" }, { resourceId: otherResourceId, thinkingLevel: "xhigh" }],
-    research: [{ resourceId, thinkingLevel: "medium" }, { resourceId: otherResourceId, thinkingLevel: "max" }],
+    execute: [{ resourceId, thinkingLevel: "high" }, { resourceId: otherResourceId, thinkingLevel: "xhigh" }],
+    research: [{ resourceId, thinkingLevel: "high" }, { resourceId: otherResourceId, thinkingLevel: "max" }],
+  });
+  for (const kind of ["execute", "research"] as const) {
+    assertEffectiveReasoningSupported(saved, scoped, kind);
+  }
+});
+
+test("switching a worker model selects the new model's pinned reasoning over a supported prior level", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-reasoning-pinned-"));
+  const configPath = join(dir, "review-gate.json");
+  const priorModel = "openai-codex/gpt-5.6-luna";
+  const nextModel = "openai-codex/gpt-5.6-low";
+  const resourceId = executorEntryId({ source: "pi", model: priorModel });
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {
+      workerResources: [{ resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 }],
+      routes: {
+        execute: [{ resourceId, thinkingLevel: "high" }],
+        research: [{ resourceId }],
+      },
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [
+    { model: reasoningModel("openai-codex", "gpt-5.6-luna") },
+    // Pinned to low while still supporting the prior high level.
+    { model: restrictedReasoningModel("openai-codex", "gpt-5.6-low", ["off", "minimal", "low", "medium", "high"]), thinkingLevel: "low" },
+  ];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "1 model · 1 slot"),
+    "1. gpt-5.6-luna [openai-codex] · shared max 1",
+    executorEntryRow("Model", "gpt-5.6-luna [openai-codex]"),
+    "gpt-5.6-low [openai-codex]",
+    "Back",
+    "Back",
+    rootSettingsRow("Execution priority", "gpt-5.6-low"),
+    "1. gpt-5.6-low [openai-codex] · Low · shared max 1",
+    "Back",
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.execution.workerResources, [{
+    resourceId,
+    selection: { source: "pi", model: nextModel },
+    maxConcurrent: 1,
+  }]);
+  // The new model's configured/pinned reasoning governs both routes even though
+  // it also supports the prior level.
+  assert.deepEqual(saved.execution.routes, {
+    execute: [{ resourceId, thinkingLevel: "low" }],
+    research: [{ resourceId, thinkingLevel: "low" }],
+  });
+  for (const kind of ["execute", "research"] as const) {
+    assertEffectiveReasoningSupported(saved, scoped, kind);
+  }
+
+  // Reopen and restart: the paired choice displays consistently and a second
+  // save is idempotent.
+  const reopened = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const reopenedBefore = await readFile(configPath, "utf8");
+  const reopenedRegistered = commandHarness();
+  registerReviewSettings({ pi: reopenedRegistered.pi, config: reopened, configPath });
+  await reopenedRegistered.handler("", contextWithSelections([
+    rootSettingsRow("Execution priority", "gpt-5.6-low"),
+    "1. gpt-5.6-low [openai-codex] · Low · shared max 1",
+    "Back",
+    "Back",
+    rootSettingsRow("Research priority", "gpt-5.6-low"),
+    "1. gpt-5.6-low [openai-codex] · Low · shared max 1",
+    "Back",
+    "Back",
+    "Save changes",
+  ], scoped));
+  assert.equal(await readFile(configPath, "utf8"), reopenedBefore);
+});
+
+test("switching a worker from a minimal-only model selects the new model's own default", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-reasoning-default-"));
+  const configPath = join(dir, "review-gate.json");
+  const priorModel = "openai-codex/gpt-5.6-nano";
+  const nextModel = "openai-codex/gpt-5.6-sol";
+  const resourceId = executorEntryId({ source: "pi", model: priorModel });
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {
+      workerResources: [{ resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 }],
+      routes: {
+        execute: [{ resourceId, thinkingLevel: "minimal" }],
+        research: [{ resourceId }],
+      },
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [
+    { model: restrictedReasoningModel("openai-codex", "gpt-5.6-nano", ["off", "minimal"]) },
+    { model: reasoningModel("openai-codex", "gpt-5.6-sol") },
+  ];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "1 model · 1 slot"),
+    "1. gpt-5.6-nano [openai-codex] · shared max 1",
+    executorEntryRow("Model", "gpt-5.6-nano [openai-codex]"),
+    "gpt-5.6-sol [openai-codex]",
+    "Back",
+    "Back",
+    rootSettingsRow("Execution priority", "gpt-5.6-sol"),
+    "1. gpt-5.6-sol [openai-codex] · High · shared max 1",
+    "Back",
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  // The prior model's minimal level is not carried over: with no pinned value on
+  // the new model, its own supported default governs both routes.
+  assert.deepEqual(saved.execution.routes, {
+    execute: [{ resourceId, thinkingLevel: "high" }],
+    research: [{ resourceId, thinkingLevel: "high" }],
   });
   for (const kind of ["execute", "research"] as const) {
     assertEffectiveReasoningSupported(saved, scoped, kind);

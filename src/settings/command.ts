@@ -129,7 +129,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     if (!choice || choice === "Cancel") return;
     if (choice === resourcesRow) {
       const priorResourceIds = new Set(workerResources.map((entry) => entry.entryId));
-      const priorSelections = new Map(workerResources.map((entry) => [entry.entryId, { ...entry.selection }]));
+      const priorSelectionKeys = new Map(workerResources.map((entry) => [entry.entryId, executorSelectionKey(entry.selection)]));
       workerResources = await selectExecutorPool(input.ui, workerResources, agents, input.scoped);
       executeRoute = reconcileWorkerRoute(executeRoute, workerResources);
       researchRoute = reconcileWorkerRoute(
@@ -137,10 +137,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
         workerResources.filter((entry) => workerResourceSupportsResearch(input.config, entry)),
       );
       for (const resource of workerResources) {
-        const priorSelection = priorSelections.get(resource.entryId);
-        if (!priorSelection || executorSelectionKey(priorSelection) === executorSelectionKey(resource.selection)) continue;
-        executeRoute = normalizeWorkerRouteAfterModelSwitch(executeRoute, resource, priorSelection, input.scoped);
-        researchRoute = normalizeWorkerRouteAfterModelSwitch(researchRoute, resource, priorSelection, input.scoped);
+        const priorKey = priorSelectionKeys.get(resource.entryId);
+        if (priorKey === undefined || priorKey === executorSelectionKey(resource.selection)) continue;
+        executeRoute = normalizeWorkerRouteAfterModelSwitch(executeRoute, resource, input.scoped);
+        researchRoute = normalizeWorkerRouteAfterModelSwitch(researchRoute, resource, input.scoped);
       }
       for (const resource of workerResources) {
         if (priorResourceIds.has(resource.entryId)) continue;
@@ -439,38 +439,30 @@ function reconcileWorkerRoute(route: WorkerRouteEntry[], resources: ExecutorPool
 }
 
 /**
- * After a worker resource's model changes, its stored route reasoning no longer
- * matches the selected model's capabilities. Re-derive every retained entry for
- * that resource from the previously displayed effective level: supported prior
- * levels are preserved, otherwise the model's own capability-based fallback is
- * used, so displayed, persisted, routed, and effective values all agree.
+ * A worker resource's reasoning goes hand in hand with its selected model, so a
+ * manual model replacement discards the previous model's level for every retained
+ * route entry — even when the new model supports it. Each entry takes the new
+ * model's own configured or pinned reasoning, otherwise its supported default,
+ * so displayed, persisted, routed, and effective values all stay paired with the
+ * model. External agents own their configuration; a Pi reasoning override no
+ * longer applies.
  */
 function normalizeWorkerRouteAfterModelSwitch(
   route: WorkerRouteEntry[],
   resource: ExecutorPoolEntry,
-  priorSelection: ExecutorSelection,
   scoped: ScopedModelChoice[],
 ): WorkerRouteEntry[] {
-  const nextSelection = resource.selection;
-  if (nextSelection.source !== "pi") {
-    // External agents own their configuration; a pi reasoning override no longer applies.
+  const selection = resource.selection;
+  if (selection.source !== "pi") {
     return route.map((entry) => entry.resourceId === resource.entryId
       ? { resourceId: entry.resourceId }
       : entry);
   }
-  const nextModel = nextSelection.model;
-  const choice = scoped.find((candidate) => candidate.model === nextModel);
+  const choice = scoped.find((candidate) => candidate.model === selection.model);
   if (!choice) return route;
-  const priorPi = priorSelection.source === "pi" ? priorSelection : undefined;
-  const priorChoice = priorPi ? scoped.find((candidate) => candidate.model === priorPi.model) : undefined;
-  const inheritedPriorLevel = priorPi && priorChoice
-    ? effectiveThinkingLevel(priorPi.thinkingLevel, priorChoice)
-    : undefined;
+  const level = effectiveThinkingLevel(undefined, choice);
   return route.map((entry) => entry.resourceId === resource.entryId
-    ? {
-        resourceId: entry.resourceId,
-        thinkingLevel: effectiveThinkingLevel(entry.thinkingLevel ?? inheritedPriorLevel, choice),
-      }
+    ? { resourceId: entry.resourceId, thinkingLevel: level }
     : entry);
 }
 

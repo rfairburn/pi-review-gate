@@ -133,6 +133,17 @@ test("operation-specific execution tools expose exact durable schemas", () => {
   const watch = executionTool(tools, "SubtasksWatch").parameters;
   assert.deepEqual(watch.required, ["executionId", "after"]);
   assert.match(watch.properties.after.description, /one-shot delay/i);
+  // #53: inspection requires an explicit taskId; the other task-targeted tools
+  // keep their optional-ID contract.
+  const inspectParams = executionTool(tools, "SubtasksInspect").parameters;
+  assert.deepEqual(inspectParams.required, ["taskId"]);
+  assert.match(String(inspectParams.properties.taskId.description), /required for inspection/i);
+  for (const name of ["SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge"]) {
+    const params = executionTool(tools, name).parameters;
+    const required = Array.isArray(params.required) ? params.required : [];
+    assert.ok(!required.includes("taskId"), name);
+    assert.match(String(params.properties.taskId.description), /may be omitted only when the execution contains exactly one task/i, name);
+  }
 });
 
 test("runtime synchronization never widens the orchestrator's native --tools allowlist", () => {
@@ -307,8 +318,9 @@ test("saved executor settings govern queued dispatch while existing leases keep 
     }, undefined, undefined, {});
     executionRoot = started.details.root as string;
     const executionId = started.details.executionId as string;
-    const inspect = async () => (await inspectTool("live-settings-inspect", { executionId }, undefined, undefined, {})).details as Record<string, any>;
-    await waitUntil(async () => (await inspect()).tasks[0]?.executorEntryId === "qwen");
+    const [firstTaskId, secondTaskId] = started.details.tasks.map((task: { taskId: string }) => task.taskId) as [string, string];
+    const inspect = (taskId: string) => inspectTool("live-settings-inspect", { executionId, taskId }, undefined, undefined, {}).then((response: Record<string, any>) => response.details as Record<string, any>);
+    await waitUntil(async () => (await inspect(firstTaskId)).tasks[0]?.executorEntryId === "qwen");
 
     config.execution!.executorPool = [
       { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
@@ -317,11 +329,11 @@ test("saved executor settings govern queued dispatch while existing leases keep 
     manager.sync();
 
     const inspection = await waitUntil(async () => {
-      const current = await inspect();
-      return current.tasks[1]?.executorEntryId === "deepseek" ? current : undefined;
+      const current = await inspect(secondTaskId);
+      return current.tasks[0]?.executorEntryId === "deepseek" ? current : undefined;
     });
-    assert.equal(inspection.tasks[0]?.executorEntryId, "qwen");
-    assert.equal(inspection.tasks[1]?.executorEntryId, "deepseek");
+    assert.equal((await inspect(firstTaskId)).tasks[0]?.executorEntryId, "qwen");
+    assert.equal(inspection.tasks[0]?.executorEntryId, "deepseek");
   } finally {
     await manager.shutdown();
     await manager.detach();
@@ -500,7 +512,7 @@ test("SubtasksStart result explains that queued work may have startup delay", as
     landingMs: 0,
     totalMs: result.details.tasks[0].timing.totalMs,
   });
-  const diagnostic = await inspect("start-delay-inspect", { executionId: result.details.executionId }, undefined, undefined, {});
+  const diagnostic = await inspect("start-delay-inspect", { executionId: result.details.executionId, taskId: result.details.tasks[0].taskId }, undefined, undefined, {});
   assert.match(diagnostic.content[0].text, /Execution diagnostics: revision \d+; peak concurrency \d+\./);
   assert.match(diagnostic.content[0].text, /Scheduler: \d+\/4 workers active;/);
   assert.match(diagnostic.content[0].text, /timing \(ms\): total \d+; queued \d+; capture \d+; execution \d+; review \d+; landing \d+/);

@@ -59,7 +59,7 @@ const SHARED_PROMPT_GUIDELINES = [
   "Steering wins over review: a steer received while reviewing interrupts that review, resumes the executor with the changed request, and reviews the replacement result.",
   "If an active adapter cannot steer its current long-running command, keep the steer queued for the next executor handoff; do not treat that transport limitation as rejection.",
   lifecycleWakeGuidanceLine(),
-  "A taskId may be omitted only when the supplied executionId contains exactly one task; otherwise use the returned taskId.",
+  "SubtasksInspect always requires an explicit taskId, even for a single-task execution; for every other operation a taskId may be omitted only when the supplied executionId contains exactly one task, otherwise use the returned taskId.",
   completionNotificationGuidanceLine(),
   "Start/add distinguish tasks already assigned for executor startup from tasks still waiting for capacity. Completion events report durable phase timing, execution revision, peak concurrency on final completion, and estimated post-settlement capacity for SubtasksAdd.",
   "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call SubtasksMarkClean.",
@@ -75,7 +75,7 @@ function toolDescription(action: Action): string {
     case "add":
       return "Add 1–16 durable background subtasks to an existing execution so freed capacity can be topped off.";
     case "inspect":
-      return "Inspect durable execution-subtask state, recent activity, live controls, and artifact locations.";
+      return "Inspect durable execution-subtask state, recent activity, live controls, and artifact locations for an explicitly named task; taskId is required.";
     case "watch":
       return "Request one future one-shot checkpoint if an execution is still active after a specified duration.";
     case "continue":
@@ -538,6 +538,7 @@ function taskSchema(): Record<string, unknown> {
 function toolSchema(action: Action): Record<string, unknown> {
   const executionId = { type: "string", minLength: 1, description: "Stable execution handle returned by SubtasksStart, SubtasksAdd, or SubtasksInspect." };
   const taskId = { type: "string", minLength: 1, description: "Stable task handle. May be omitted only when the execution contains exactly one task." };
+  const inspectTaskId = { type: "string", minLength: 1, description: "Stable task handle. Required for inspection, even for single-task executions; use a handle returned by SubtasksStart/SubtasksAdd or shown in prior results." };
   const tasks = { type: "array", minItems: 1, maxItems: 16, items: taskSchema(), description: "One to sixteen bounded task definitions for the selected group kind." };
   const instructions = { type: "string", minLength: 1, description: "New authoritative direction for this operation." };
   const instructionId = { type: "string", minLength: 1, description: "Optional caller-provided idempotency handle." };
@@ -560,7 +561,7 @@ function toolSchema(action: Action): Record<string, unknown> {
       break;
     case "inspect":
       properties.executionId = executionId;
-      properties.taskId = taskId;
+      properties.taskId = inspectTaskId;
       properties.offset = { type: "integer", minimum: 0, description: "Absolute activity offset for detailed inspection. Mutually exclusive with evidence." };
       properties.lines = { type: "integer", minimum: 1, maximum: 500, description: "Activity lines to return, up to 500. Mutually exclusive with evidence." };
       properties.evidence = {
@@ -578,6 +579,7 @@ function toolSchema(action: Action): Record<string, unknown> {
         },
         description: "Bounded read-only navigation over the task's durable executor evidence. Mutually exclusive with offset/lines. Streams are observed data; worker claims never imply verification.",
       };
+      required.push("taskId");
       break;
     case "watch":
       properties.executionId = executionId;
@@ -695,6 +697,9 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
   }
   if (action === "interrupt" && !normalized.interruptMode) throw new Error("interrupt requires interruptMode");
   if (action === "watch" && (!normalized.executionId || normalized.afterMs === undefined)) throw new Error("watch requires executionId and after");
+  if (action === "inspect" && !normalized.taskId) {
+    throw new Error("inspect requires an explicit taskId; use a stable task handle returned by SubtasksStart/SubtasksAdd or shown in prior inspection results");
+  }
   return normalized;
 }
 

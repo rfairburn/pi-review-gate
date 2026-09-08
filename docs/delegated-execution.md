@@ -29,7 +29,11 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   actionable diagnostic in both activity and evidence modes. The execution-wide overview
   remains available without a task handle: start and add results list every task handle
   in the group, operations that fail after input validation return the complete group
-  inspection, and `/subtasks` and `/subtasks-view` show all groups and active tasks.
+  inspection — except read-only evidence-navigation selector failures (a mistyped
+  `entryId`, unknown `callId`, malformed or expired `cursor`, or out-of-range `index`),
+  which return a concise task-scoped diagnostic with a bounded navigation hint and never
+  other executions' state — and `/subtasks` and `/subtasks-view` show all groups and
+  active tasks.
 - `SubtasksWatch` optionally arms one future checkpoint for an active execution. It
   returns immediately, replaces any prior watch for that execution, and wakes once with
   active-task state, timing, recent activity, executor identity, and available controls
@@ -176,8 +180,13 @@ full recovery story — compaction lifecycle, protected refs, restart behavior, 
 Every failed or non-landed execution-tool operation returns the complete group and task
 inspection: durable handles, current source disposition, commands and acknowledgements,
 incidents, checkpoint/bundle data, artifact paths, conflicts, and concrete recovery
-actions. This state remains inspectable after compaction or an exact-session restart.
-Only `landed` means that worker changes reached the source workspace.
+actions. The one exception is a read-only evidence-navigation selector failure on a
+valid, authorized `taskId` (a mistyped `entryId`, unknown `callId`, malformed or expired
+`cursor`, or out-of-range `index`): that error returns a concise task-scoped diagnostic
+with a bounded navigation hint and never the unrelated executions' inventory, IDs,
+titles, artifact paths, or recovery history. Otherwise this state remains inspectable
+after compaction or an exact-session restart. Only `landed` means that worker changes
+reached the source workspace.
 
 ## Subtask evidence
 
@@ -293,6 +302,20 @@ never followed), and the operation record informs that context only when it is a
 regular file inside that verified directory, fits the bounded context size, belongs to
 this task, and records an artifact directory that verifies as this task's; every other
 case is reported as an explicit unavailable note rather than read unbounded or trusted.
+
+Selector failures are scoped: with a valid, authorized `taskId`, a mistyped `entryId`, an
+unknown `callId`, a malformed or expired `cursor`, or an out-of-range `index` returns one
+concise task-scoped diagnostic with a bounded navigation hint (list entries with
+`index`/`limit`, optionally `filter` or `find`, then deep-read by the exact `entryId` or
+resolve a call by its real `callId`) — never the unrelated executions' inventory, IDs,
+titles, artifact paths, or recovery history. The evidence snapshot is built once per
+inspection, before any checkpoint-backfill recovery, and that validated read is returned
+unchanged — so a selector can never fail only after a recovery write — while the
+surrounding task inspection still reflects any backfilled state; a follow-up evidence read
+picks up post-recovery changes. A correct selector still succeeds, an invalid read mutates
+neither the task record nor the workspace, and an in-range index with a limit beyond the
+remaining entries (or a filtered read with no matches) is a valid clamped/empty result,
+not an error.
 
 Prefer `SubtasksWatch` when you must wait for a state change (it returns immediately
 and arms one deliberate future checkpoint while work remains active; it never waits

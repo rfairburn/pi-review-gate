@@ -13,7 +13,7 @@ import {
   type BackgroundTaskDefinition,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
-import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_MAX, type SubtaskEvidenceSelector } from "./subtask-evidence";
+import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_MAX, EvidenceCursorError, EvidenceNavigationError, type SubtaskEvidenceSelector } from "./subtask-evidence";
 import {
   completionNotificationGuidanceLine,
   lifecycleWakeGuidanceLine,
@@ -454,6 +454,29 @@ export class ExecutionToolManager {
       }
     } catch (error) {
       const diagnostic = messageOf(error);
+      // Issue #61: evidence selector/navigation failures (a mistyped entryId, an
+      // unknown callId, a malformed or expired cursor, an out-of-range index) are
+      // read-only and task-scoped. They must not leak unrelated executions'
+      // inventory, IDs, titles, artifact paths, diagnostic markers, or recovery
+      // history; return one concise, actionable diagnostic with a bounded
+      // navigation hint instead of the full group packet. Genuine failures keep
+      // the full diagnostic below.
+      if (isEvidenceSelectorError(error)) {
+        return result(
+          [
+            `${toolName} failed: ${diagnostic}`,
+            evidenceRecoveryHint(normalized.taskId),
+          ].join("\n"),
+          {
+            action: normalized.action,
+            diagnostic,
+            executionId: normalized.executionId,
+            taskId: normalized.taskId,
+            evidenceSelectorError: true,
+          },
+          true,
+        );
+      }
       const inspections = safeList(this.controller);
       const recovery = recoveryFor(normalized.action, diagnostic);
       const sourceWorkspace = this.controller.criticalPrompt()
@@ -925,6 +948,20 @@ function recoveryFor(action: Action, diagnostic: string): Array<{ action: string
     ...(action === "steer" ? [{ action: "SubtasksContinue", instruction: "If the live turn ended, continue from its verified checkpoint instead of assuming steering was delivered." }] : []),
     ...(diagnostic.includes("conflict") ? [{ action: "resolve_then_SubtasksMarkClean", instruction: "Resolve materialized conflict markers in main immediately, then call SubtasksMarkClean." }] : []),
   ];
+}
+
+/** True for read-only evidence selector/navigation failures: a mistyped entryId,
+ * an unknown callId, a malformed or expired cursor, or an out-of-range index.
+ * These are task-scoped and must not leak unrelated executions' state (#61). */
+function isEvidenceSelectorError(error: unknown): boolean {
+  return error instanceof EvidenceNavigationError || error instanceof EvidenceCursorError;
+}
+
+/** Bounded, task-scoped navigation hint for evidence selector failures. It names
+ * only the authorized task and how to recover — never other executions' data. */
+function evidenceRecoveryHint(taskId: string | undefined): string {
+  const target = taskId ? `task ${taskId}` : "the task";
+  return `Recover with a bounded read on ${target}: list entries (evidence.index/limit, optionally filter or find), then deep-read by the exact entryId or resolve a call by its real callId.`;
 }
 
 function safeList(controller: BackgroundExecutionController): BackgroundInspection[] {

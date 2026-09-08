@@ -669,6 +669,28 @@ export class BackgroundExecutionController {
     evidence?: SubtaskEvidenceSelector,
   ): Promise<BackgroundInspection> {
     const group = this.resolveGroup(executionId);
+    // #61: an evidence read is read-only navigation. Resolve the exact task and
+    // build its ONE coherent evidence read BEFORE any recovery mutation or save,
+    // so a failing selector (mistyped entryId, unknown callId, malformed/expired
+    // cursor, out-of-range index) throws without touching durable state. The
+    // validated read is retained and returned below instead of being rebuilt:
+    // a post-recovery rebuild could observe a different snapshot (source
+    // replacement/retention by an external writer, or a backfilled result
+    // changing the indexed sources) and raise a selector error only AFTER the
+    // recovery writes — and it would double the bounded artifact construction on
+    // every evidence read. Genuine (non-evidence) reads keep the recovery
+    // behavior below unchanged.
+    let evidenceRead: SubtaskEvidenceRead | undefined;
+    if (evidence) {
+      if (!taskId) throw new Error("Evidence inspection requires a known taskId.");
+      const task = group.tasks.find((candidate) => candidate.taskId === taskId)
+        ?? await this.loadArchivedTask(group, taskId);
+      if (!task) throw new Error(`Unknown task ${taskId}.`);
+      // One coherent read: confined artifact scan and selector navigation over
+      // the same snapshot. Confinement and cursor checks are unchanged; any
+      // scoped selector error is thrown before any mutation.
+      evidenceRead = await this.buildEvidenceRead(task, evidence);
+    }
     for (const task of group.tasks.filter((task) => !taskId || task.taskId === taskId)) {
       if (group.kind !== "execute" || !task.waveRoot || isArchivableTaskState(task.state)
         || isActiveTaskState(task.state) || this.runtimes.has(task.taskId) || this.pendingForceMerges.has(task.taskId)) continue;
@@ -692,8 +714,12 @@ export class BackgroundExecutionController {
       task = archived;
     }
     if (evidence) {
-      if (!taskId || !task) throw new Error("Evidence inspection requires a known taskId.");
-      return { ...inspection, evidence: await this.buildEvidenceRead(task, evidence) };
+      if (!taskId || !task || !evidenceRead) throw new Error("Evidence inspection requires a known taskId.");
+      // Return the single pre-recovery read: its snapshot and context are
+      // coherent, and no selector validation runs after the recovery writes
+      // above. The accompanying inspection still reflects any backfilled state;
+      // a follow-up evidence read picks up post-recovery changes.
+      return { ...inspection, evidence: evidenceRead };
     }
     return inspection;
   }

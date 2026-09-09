@@ -172,7 +172,9 @@ test("execute workers inherit ApplyPatch through the active-tool snapshot while 
         args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
       },
     }],
-    execution: { activeExecutor: { source: "external", id: "fake" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+    },
     ui: { subtasksViewExpanded: false },
   });
   const manager = new ExecutionToolManager({
@@ -193,7 +195,8 @@ test("execute workers inherit ApplyPatch through the active-tool snapshot while 
     }],
   }, undefined, undefined, {});
   assert.equal(result.details.kind, "research");
-  const researchTools = result.details.tasks[0].definition.executorAllowedTools;
+  const researchTools = result.details.tasks[0].definition.executorToolCatalog?.allowedToolCatalog ?? [];
+  assert.ok(researchTools.length > 0, "research tasks carry a canonical tool catalog");
   assert.ok(!researchTools.includes(APPLY_PATCH_TOOL_NAME), "research workers must not receive ApplyPatch");
 
   const executeResult = await start.execute("apply-patch-visibility-execute", {
@@ -204,7 +207,8 @@ test("execute workers inherit ApplyPatch through the active-tool snapshot while 
       acceptanceCriteria: ["Change implemented"],
     }],
   }, undefined, undefined, {});
-  const executeTools = executeResult.details.tasks[0].definition.executorAllowedTools;
+  const executeTools = executeResult.details.tasks[0].definition.executorToolCatalog?.allowedToolCatalog ?? [];
+  assert.ok(executeTools.length > 0, "execute tasks carry a canonical tool catalog");
   assert.ok(executeTools.includes(APPLY_PATCH_TOOL_NAME), "execute workers must inherit ApplyPatch");
   await manager.shutdown();
 });

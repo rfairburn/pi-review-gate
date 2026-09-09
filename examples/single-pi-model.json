@@ -6,10 +6,9 @@
   "maxFileBytes": 1048576,
   "maxSnapshotBytes": 52428800,
   "retainBundles": "on-failure",
-  "decider": {
-    "id": "glm-5.2",
-    "adapter": "pi-model",
-    "model": "ollama/glm-5.2",
-    "timeoutMs": 600000
+  "review": {
+    "activeReviewers": [
+      { "source": "pi", "model": "ollama/glm-5.2" }
+    ]
   }
 }

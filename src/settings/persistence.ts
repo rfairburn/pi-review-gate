@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
-  externalAgentCatalog,
   normalizeConfig,
   type ActiveReviewerSelection,
   type BrowserInteractionApproval,
@@ -18,8 +17,6 @@ export interface ReviewSettingsSelection {
   workerResources?: ExecutorPoolEntry[];
   executeRoute?: WorkerRouteEntry[];
   researchRoute?: WorkerRouteEntry[];
-  /** @deprecated Compatibility for direct callers compiled against the former settings shape. */
-  executorPool?: ExecutorPoolEntry[];
   activeReviewers: ActiveReviewerSelection[];
   reviewerTimeoutMs: number;
   executorTimeoutMs: number;
@@ -43,9 +40,8 @@ export async function persistReviewSettings(
   selection: ReviewSettingsSelection,
 ): Promise<ReviewGateConfig> {
   return updateReviewGateConfig(configPath, (parsed) => {
-    const catalog = externalAgentCatalog(normalizeConfig(parsed));
     const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
-    const resources = selection.workerResources ?? selection.executorPool ?? [];
+    const resources = selection.workerResources ?? [];
     const defaultRoute = resources.map((entry) => ({
       resourceId: entry.entryId,
       ...(entry.selection.source === "pi" && entry.selection.thinkingLevel
@@ -61,15 +57,12 @@ export async function persistReviewSettings(
       execute: (selection.executeRoute ?? defaultRoute).map((entry) => ({ ...entry })),
       research: (selection.researchRoute ?? defaultRoute).map((entry) => ({ ...entry })),
     };
-    delete execution.executorPool;
-    delete execution.activeExecutor;
     execution.maxWorkers = selection.maxWorkers;
     execution.retryPolicy = { ...selection.retryPolicy };
     execution.subtaskNotifications = selection.subtaskNotifications;
     execution.deferredPiTools = selection.deferredPiTools
       ?? (typeof execution.deferredPiTools === "boolean" ? execution.deferredPiTools : true);
     delete execution.parallelEnabled;
-    delete execution.externalExecutors;
     parsed.execution = execution;
     const review = isRecord(parsed.review) ? { ...parsed.review } : {};
     review.activeReviewers = selection.activeReviewers.map((reviewer) => ({ ...reviewer }));
@@ -97,10 +90,6 @@ export async function persistReviewSettings(
       }
       parsed.web = web;
     }
-    parsed.externalAgents = catalog;
-    delete parsed.decider;
-    delete parsed.reviewers;
-    delete parsed.enabledReviewerIds;
   });
 }
 

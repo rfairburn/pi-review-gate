@@ -16,7 +16,6 @@ import {
   resolvedWorkerResources,
   resolvedWorkerRoute,
   workerResourceSupportsResearch,
-  resolveReviewers,
   type ActiveReviewerSelection,
   type BrowserInteractionApproval,
   type ExecutorPoolEntry,
@@ -893,12 +892,7 @@ async function validateSelection(
 }
 
 function initialReviewerSelections(config: ReviewGateConfig): ActiveReviewerSelection[] {
-  if (config.review?.activeReviewers !== undefined) {
-    return config.review.activeReviewers.map(cloneReviewerSelection);
-  }
-  return resolveReviewers(config).reviewers.map((reviewer) => reviewer.adapter === "pi-model"
-    ? { source: "pi" as const, model: reviewer.model, thinkingLevel: reviewer.thinkingLevel }
-    : { source: "external" as const, id: reviewer.id });
+  return (config.review?.activeReviewers ?? []).map(cloneReviewerSelection);
 }
 
 function executorPoolSummary(pool: ExecutorPoolEntry[]): string {

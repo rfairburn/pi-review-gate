@@ -11,16 +11,20 @@ export function fakeNeedsChangesConfig(overrides: Partial<ReviewGateConfig> = {}
     maxFileBytes: 1_048_576,
     maxSnapshotBytes: 52_428_800,
     retainBundles: "never",
-    decider: {
+    externalAgents: [{
       id: "fake",
       adapter: "generic-cli",
       command: process.execPath,
-      args: [
-        "-e",
-        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
-      ],
-      timeoutMs: 15000,
-    },
+      args: [],
+      review: {
+        args: [
+          "-e",
+          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
+        ],
+        timeoutMs: 15000,
+      },
+    }],
+    review: { activeReviewers: [{ source: "external", id: "fake" }] },
     ...overrides,
   };
 }

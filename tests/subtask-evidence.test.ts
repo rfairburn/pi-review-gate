@@ -690,7 +690,9 @@ test("end-to-end: registered SubtasksInspect serves bounded evidence navigation"
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: { source: "pi", model: "model-x" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 }],
+    },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
   manager.sync();
@@ -963,7 +965,9 @@ test("controller: operation.json context is confined, bounded, and ownership-val
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: { source: "pi", model: "model-x" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 }],
+    },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
   manager.sync();
@@ -1152,7 +1156,9 @@ test("controller: artifact root escaping the wave root is refused before any con
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: { source: "pi", model: "model-x" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 }],
+    },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
   manager.sync();
@@ -1211,7 +1217,9 @@ test("controller: an operation record naming an unverifiable artifact directory 
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: { source: "pi", model: "model-x" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 }],
+    },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
   manager.sync();
@@ -1245,20 +1253,20 @@ import { createWorkerWorktree, removeWorktree, type WorkerWorktree } from "../sr
 /** One durable completed review cycle record (reviews/<waveId>/cycle-NNNN.json). */
 function reviewCycleFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    version: 1,
-    taskId: "task-1",
-    waveId: "wave-1",
-    cycle: 1,
-    reviewSequence: 1,
-    completedAt: "2025-06-03T10:00:00.000Z",
-    candidate: {
+version: 1,
+taskId: "task-1",
+waveId: "wave-1",
+cycle: 1,
+reviewSequence: 1,
+completedAt: "2025-06-03T10:00:00.000Z",
+candidate: {
       baseCommit: "basecommitsha",
       commitSha: "cand1commitsha",
       treeSha: "tree1sha",
       ref: "refs/pi-review-gate/waves/wave-1/review-candidates/task-1/cycle-000001",
     },
-    aggregate: "needs_changes",
-    summary: "gate: 1 needs_changes",
+aggregate: "needs_changes",
+summary: "gate: 1 needs_changes",
     reviewers: [{
       reviewerId: "reviewer-1",
       displayLabel: "R1",
@@ -1316,17 +1324,17 @@ test("active correction: durable review cycles are indexed with provenance, find
   const { waveRoot, artifactDir } = await makeTaskArtifacts("review-active");
   await writeCycleRecord(artifactDir, reviewCycleFixture());
   await writeCycleRecord(artifactDir, reviewCycleFixture({
-    cycle: 2,
-    reviewSequence: 2,
-    completedAt: "2025-06-03T11:00:00.000Z",
-    candidate: {
+cycle: 2,
+reviewSequence: 2,
+completedAt: "2025-06-03T11:00:00.000Z",
+candidate: {
       baseCommit: "basecommitsha",
       commitSha: "cand2commitsha",
       treeSha: "tree2sha",
       ref: "refs/pi-review-gate/waves/wave-1/review-candidates/task-1/cycle-000002",
     },
-    aggregate: "pass",
-    summary: "gate: 1 pass",
+aggregate: "pass",
+summary: "gate: 1 pass",
     reviewers: [{ reviewerId: "reviewer-1", displayLabel: "R1", verdict: "pass", summary: "all findings resolved", findings: [] }],
   }));
 
@@ -1422,7 +1430,8 @@ test("active correction: missing, invalid, foreign, or refused review records ar
     taskResults: [{
       taskId: "task-1", title: "t", status: "accepted" as const, summary: "ok",
       reviewReport: {
-        aggregate: "pass" as const, summary: "settled", reviewCycles: 3, latestReviewSequence: 3,
+aggregate: "pass" as const,
+summary: "settled", reviewCycles: 3, latestReviewSequence: 3,
         reviewers: [{ reviewerId: "reviewer-9", displayLabel: "R9", verdict: "pass" as const, summary: "settled pass", findings: [] }],
         history: [],
       },
@@ -1440,7 +1449,10 @@ function settledResult(waveRoot: string, latestReviewSequence: number): unknown 
     taskResults: [{
       taskId: "task-1", title: "t", status: "accepted", summary: "ok",
       reviewReport: {
-        aggregate: "pass", summary: "settled pass", reviewCycles: latestReviewSequence, latestReviewSequence,
+aggregate: "pass",
+summary: "settled pass",
+reviewCycles: latestReviewSequence,
+latestReviewSequence,
         reviewers: [{ reviewerId: "reviewer-1", displayLabel: "R1", verdict: "pass", summary: "SETTLED-PASS-MARKER all findings resolved", findings: [] }],
         history: [],
       },
@@ -1469,11 +1481,11 @@ test("active correction: the settled report is reconciled with durable cycles by
   const covered = await makeTaskArtifacts("review-covered");
   await writeCycleRecord(covered.artifactDir, reviewCycleFixture()); // cycle 1, seq 1
   await writeCycleRecord(covered.artifactDir, reviewCycleFixture({
-    cycle: 2,
-    reviewSequence: 2,
-    completedAt: "2025-06-03T11:00:00.000Z",
-    aggregate: "pass",
-    summary: "gate: 1 pass",
+cycle: 2,
+reviewSequence: 2,
+completedAt: "2025-06-03T11:00:00.000Z",
+aggregate: "pass",
+summary: "gate: 1 pass",
     reviewers: [{ reviewerId: "reviewer-1", displayLabel: "R1", verdict: "pass", summary: "all findings resolved", findings: [] }],
   }));
   const bundleCovered = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: covered.waveRoot, artifactDir: covered.artifactDir, result: settledResult(covered.waveRoot, 2) as never });
@@ -1712,7 +1724,9 @@ test("regression #50: registered SubtasksInspect exposes completed needs_changes
     // A reviewer that always blocks with a unique finding marker.
     const config = normalizeConfig({
       enabled: true,
-      execution: { activeExecutor: { source: "external", id: "active-exec" } },
+      execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "active-exec" }, maxConcurrent: 1 }],
+      },
       externalAgents: [{
         id: "active-exec",
         adapter: "run-as-binary",
@@ -1724,16 +1738,23 @@ test("regression #50: registered SubtasksInspect exposes completed needs_changes
         },
       }],
     });
-    config.decider = {
-      id: "blocking",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
-        "-e",
-        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'impl.txt',line:null,issue:'ACTIVE-CORRECTION-FINDING-MARKER must be addressed',recommendation:'add the missing behavior'}]})))",
-      ],
-      timeoutMs: 30_000,
-    };
+    config.externalAgents = [
+      ...(config.externalAgents ?? []),
+      {
+        id: "blocking",
+        adapter: "generic-cli" as const,
+        command: process.execPath,
+        args: [],
+        review: {
+          args: [
+            "-e",
+            "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'impl.txt',line:null,issue:'ACTIVE-CORRECTION-FINDING-MARKER must be addressed',recommendation:'add the missing behavior'}]})))",
+          ],
+          timeoutMs: 30_000,
+        },
+      },
+    ];
+    config.review = { activeReviewers: [{ source: "external", id: "blocking" }] };
     config.maxCorrectionCycles = 1;
 
     let resolveCorrecting: () => void = () => {};

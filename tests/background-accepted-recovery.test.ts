@@ -49,14 +49,25 @@ async function fixture() {
     "process.stdout.write(JSON.stringify({verdict:'pass',summary:'accepted exact candidate',findings:[]}));});",
   ].join("");
   const config = normalizeConfig({
-    enabled: true, retainBundles: "always",
-    reviewers: ["first", "second"].map((id) => ({
-      id, adapter: "generic-cli", command: process.execPath, args: ["-e", reviewer], timeoutMs: 10_000,
-    })),
-    externalAgents: [{ id: "worker", adapter: "run-as-binary", command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script] } }],
-    execution: { activeExecutor: { source: "external", id: "worker" }, maxWorkers: 1,
-      retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 } },
+enabled: true,
+retainBundles: "always",
+externalAgents: [
+      ...["first", "second"].map((id) => ({
+        id, adapter: "generic-cli" as const, command: process.execPath, args: [],
+        review: { args: ["-e", reviewer], timeoutMs: 10_000 },
+      })),
+      { id: "worker", adapter: "run-as-binary" as const, command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: ["-e", script] } },
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "first" },
+      { source: "external", id: "second" },
+    ] },
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "worker" }, maxConcurrent: 1 }],
+      maxWorkers: 1,
+      retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
+    },
   });
   let faults = 0;
   const make = (inject = false) => new BackgroundExecutionController({

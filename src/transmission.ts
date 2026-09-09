@@ -53,9 +53,10 @@ export function buildReviewTransmission(input: {
   action: ReviewTransmissionAction;
 }): ReviewTransmission {
   const reviewerResults = input.reviewerResults.map((result) => ({
-    // Results carry the label of the configuration that ran them; results
-    // without a saved identity (legacy or synthesized) render with their raw
-    // reviewer id rather than an invented current-configuration label.
+    // Results carry the label of the configuration that ran them; synthesized
+    // outcomes that ran no reviewer configuration (unavailable selections,
+    // gate errors) render with their raw reviewer id rather than an invented
+    // current-configuration label.
     displayLabel: result.displayLabel ?? result.reviewerId,
     result,
     findings: result.findings.map((finding, index) => ({

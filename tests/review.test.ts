@@ -3,7 +3,13 @@ import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { reviewerConfigFingerprint, reviewerDisplayLabel, type ReviewGateConfig } from "../src/config";
+import {
+  resolveReviewers,
+  reviewerConfigFingerprint,
+  reviewerDisplayLabel,
+  type ExternalAgentConfig,
+  type ReviewGateConfig,
+} from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { createEvidenceState, recordAcceptedReviewerQuestion, recordToolCallEvidence } from "../src/evidence";
 import { runAskReviewer, runReview } from "../src/review";
@@ -121,12 +127,15 @@ test("runReview uses an OR gate and preserves individual blocking finding identi
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      decider: undefined,
-      reviewers: [
-        blockingReviewer("alpha", markerA, markerB, "alpha finding", "fix alpha"),
-        blockingReviewer("beta", markerB, markerA, "beta finding", "fix beta"),
+...baseConfig,
+externalAgents: [
+blockingReviewer("alpha", markerA, markerB, "alpha finding", "fix alpha"),
+blockingReviewer("beta", markerB, markerA, "beta finding", "fix beta")
       ],
+review: { activeReviewers: [
+        { source: "external", id: "alpha" },
+        { source: "external", id: "beta" }
+      ] },
     };
 
     const output = await runReview({
@@ -157,13 +166,16 @@ test("multi-review aggregation treats pass plus infrastructure error as pass wit
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: undefined,
-      reviewers: [
-        jsonReviewer("passing", "{verdict:'pass',summary:'logic is sound',findings:[]}"),
-        exitReviewer("offline"),
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+jsonReviewer("passing", "{verdict:'pass',summary:'logic is sound',findings:[]}"),
+exitReviewer("offline")
       ],
+review: { activeReviewers: [
+        { source: "external", id: "passing" },
+        { source: "external", id: "offline" }
+      ] },
     };
 
     const output = await runReview({ cwd: dir, request: "change index", before, config });
@@ -192,26 +204,35 @@ test("parallel reviewers cannot inspect in-flight sibling outputs or runtime ses
       id,
       adapter: "generic-cli" as const,
       command: process.execPath,
-      args: ["-e", [
-        "const fs=require('node:fs');const path=require('node:path');",
-        `const id=${JSON.stringify(id)};`,
-        "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
-        "const sibling=path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'reviews','0001','reviewers','fast');",
-        "const exposed=id==='slow'&&fs.existsSync(sibling);",
-        "process.stdout.write(JSON.stringify({verdict:'pass',summary:exposed?'sibling exposed':'reviewer isolated',findings:[]}));",
-        "},id==='slow'?150:0));",
-      ].join("" )],
-      timeoutMs: 15000,
+      args: [],
+      review: {
+        args: ["-e", [
+          "const fs=require('node:fs');const path=require('node:path');",
+          `const id=${JSON.stringify(id)};`,
+          "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
+          "const sibling=path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'reviews','0001','reviewers','fast');",
+          "const exposed=id==='slow'&&fs.existsSync(sibling);",
+          "process.stdout.write(JSON.stringify({verdict:'pass',summary:exposed?'sibling exposed':'reviewer isolated',findings:[]}));",
+          "},id==='slow'?150:0));",
+        ].join("")],
+        timeoutMs: 15000,
+      },
     });
     const output = await runReview({
       cwd: dir,
       request: "change index",
       before,
       config: {
-        ...baseConfig,
-        retainBundles: "always",
-        decider: undefined,
-        reviewers: [reviewer("fast"), reviewer("slow")],
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+reviewer("fast"),
+reviewer("slow")
+        ],
+review: { activeReviewers: [
+          { source: "external", id: "fast" },
+          { source: "external", id: "slow" }
+        ] },
       },
     });
     bundleDir = output.bundleDir;
@@ -237,14 +258,18 @@ test("multi-review aggregation keeps needs_changes authoritative despite pass or
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: undefined,
-      reviewers: [
-        jsonReviewer("passing", "{verdict:'pass',summary:'looks good',findings:[]}"),
-        jsonReviewer("blocking", "{verdict:'needs_changes',summary:'bug remains',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'wrong branch',recommendation:'fix branch'}]}"),
-        exitReviewer("offline"),
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+jsonReviewer("passing", "{verdict:'pass',summary:'looks good',findings:[]}"),
+jsonReviewer("blocking", "{verdict:'needs_changes',summary:'bug remains',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'wrong branch',recommendation:'fix branch'}]}"),
+exitReviewer("offline")
       ],
+review: { activeReviewers: [
+        { source: "external", id: "passing" },
+        { source: "external", id: "blocking" },
+        { source: "external", id: "offline" }
+      ] },
     };
 
     const output = await runReview({ cwd: dir, request: "change index", before, config });
@@ -267,10 +292,16 @@ test("multi-review aggregation returns error when no reviewer completes a usable
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: undefined,
-      reviewers: [exitReviewer("offline-a"), exitReviewer("offline-b")],
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+exitReviewer("offline-a"),
+exitReviewer("offline-b")
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "offline-a" },
+        { source: "external", id: "offline-b" }
+      ] },
     };
 
     const output = await runReview({ cwd: dir, request: "change index", before, config });
@@ -292,11 +323,15 @@ test("a stale enabled reviewer id produces a bounded outcome while resolvable re
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: undefined,
-      reviewers: [jsonReviewer("ok", "{verdict:'pass',summary:'healthy reviewer ran',findings:[]}")],
-      enabledReviewerIds: ["ok", "gone"],
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+jsonReviewer("ok", "{verdict:'pass',summary:'healthy reviewer ran',findings:[]}")
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "ok" },
+        { source: "external", id: "gone" }
+      ] },
     };
 
     const output = await runReview({ cwd: dir, request: "change index", before, config });
@@ -309,7 +344,7 @@ test("a stale enabled reviewer id produces a bounded outcome while resolvable re
       output.reviewerResults?.map((result) => ({ reviewerId: result.reviewerId, verdict: result.verdict })),
       [
         { reviewerId: "ok", verdict: "pass" },
-        { reviewerId: "gone", verdict: "error" },
+        { reviewerId: "external:gone", verdict: "error" },
       ],
     );
     assert.equal(output.reviewerResults?.[1]?.error, "reviewer_unavailable");
@@ -332,17 +367,24 @@ test("same-id reviewer replacement keeps the original configuration fingerprint 
     const secret = "top-secret-value-123";
     const originalScript = "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'healthy reviewer ran',findings:[]})))";
     const configA: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: undefined,
-      reviewers: [{
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: ["-e", originalScript],
-        env: { REVIEW_GATE_TEST_SECRET: secret },
-        timeoutMs: 15000,
-      }],
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+        {
+          id: "one",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: ["-e", originalScript],
+            env: { REVIEW_GATE_TEST_SECRET: secret },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "one" }
+      ] },
     };
 
     const state = createState();
@@ -367,20 +409,28 @@ test("same-id reviewer replacement keeps the original configuration fingerprint 
 
     // The settings are replaced in-session: same id, different command/args.
     const configB: ReviewGateConfig = {
-      ...configA,
-      reviewers: [{
-        id: "one",
-        adapter: "generic-cli",
-        command: "/usr/bin/env",
-        args: ["node", "-e", "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'replacement ran',findings:[]})))"],
-        timeoutMs: 20000,
-      }],
+...configA,
+externalAgents: [
+        {
+          id: "one",
+          adapter: "generic-cli",
+          command: "/usr/bin/env",
+          args: [],
+          review: {
+            args: ["node", "-e", "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'replacement ran',findings:[]})))"],
+            timeoutMs: 20000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "one" }
+      ] },
     };
-    assert.notEqual(reviewerConfigFingerprint(configB.reviewers![0]), ranResult.reviewerConfigFingerprint);
+    assert.notEqual(reviewerConfigFingerprint(resolveReviewers(configB).reviewers[0]), ranResult.reviewerConfigFingerprint);
     assert.equal(reconcileWindowReviewerSelection(state.reviewWindow!, configB), true);
 
     // Record the completed pass in history (as transmitReviewPass does) and
-    // add a pre-migration entry that never carried any identity metadata.
+    // add a superseded-format entry that never carried any identity metadata.
     recordReviewerFeedback(state, {
       result: output.result!,
       reviewerResults: output.reviewerResults,
@@ -412,7 +462,7 @@ test("same-id reviewer replacement keeps the original configuration fingerprint 
     // though the current settings no longer match it.
     assert.equal(stamped?.reviewerAdapter, "generic-cli");
     assert.equal(stamped?.reviewerConfigFingerprint, ranResult.reviewerConfigFingerprint);
-    assert.notEqual(stamped?.reviewerConfigFingerprint, reviewerConfigFingerprint(configB.reviewers![0]));
+    assert.notEqual(stamped?.reviewerConfigFingerprint, reviewerConfigFingerprint(resolveReviewers(configB).reviewers[0]));
     // Legacy entries are not relabeled or backfilled from the current config.
     assert.equal(legacy?.displayLabel, undefined);
     assert.equal(legacy?.reviewerAdapter, undefined);
@@ -439,14 +489,16 @@ test("a review with only unresolvable selections errors without invoking any rev
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: undefined,
-      reviewers: [{
-        id: "ok",
-        adapter: "generic-cli" as const,
-        command: process.execPath,
-        args: [
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+        {
+          id: "ok",
+          adapter: "generic-cli" as const,
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "const fs=require('node:fs');",
@@ -456,9 +508,13 @@ test("a review with only unresolvable selections errors without invoking any rev
             "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'must not run',findings:[]})))",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      }],
-      enabledReviewerIds: ["gone"],
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "gone" }
+      ] },
     };
 
     const output = await runReview({ cwd: dir, request: "change index", before, config });
@@ -467,7 +523,7 @@ test("a review with only unresolvable selections errors without invoking any rev
     assert.equal(output.result?.verdict, "error");
     assert.deepEqual(
       output.reviewerResults?.map((result) => ({ reviewerId: result.reviewerId, verdict: result.verdict })),
-      [{ reviewerId: "gone", verdict: "error" }],
+      [{ reviewerId: "external:gone", verdict: "error" }],
     );
     assert.equal(output.reviewerResults?.[0]?.error, "reviewer_unavailable");
     assert.equal(await readFile(okInvocations, "utf8").catch(() => "absent"), "absent");
@@ -490,20 +546,22 @@ test("a duplicate enabled reviewer id runs once instead of blocking the whole re
     const config: ReviewGateConfig = {
       ...baseConfig,
       retainBundles: "always",
-      decider: undefined,
-      reviewers: [{
+      externalAgents: [{
         ...counting,
-        args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const p=${JSON.stringify(invocations)};`,
-            "fs.writeFileSync(p,String((Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0))+1));",
-            counting.args![1],
-          ].join(""),
-        ],
+        review: {
+          ...counting.review!,
+          args: [
+            "-e",
+            [
+              "const fs=require('node:fs');",
+              `const p=${JSON.stringify(invocations)};`,
+              "fs.writeFileSync(p,String((Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0))+1));",
+              counting.review!.args![1],
+            ].join(""),
+          ],
+        },
       }],
-      enabledReviewerIds: ["codex", "codex"],
+      review: { activeReviewers: [{ source: "external", id: "codex" }, { source: "external", id: "codex" }] },
     };
 
     const output = await runReview({ cwd: dir, request: "change index", before, config });
@@ -526,9 +584,8 @@ test("a review with zero configured reviewers keeps the bounded configuration er
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      decider: undefined,
-      reviewers: [],
+...baseConfig,
+      review: { activeReviewers: [] },
     };
 
     const output = await runReview({ cwd: dir, request: "change index", before, config });
@@ -564,27 +621,36 @@ test("an aborted multi-review is atomic, records a tombstone, and later passes s
       id,
       adapter: "generic-cli" as const,
       command: process.execPath,
-      args: [
-        "-e",
-        [
-          "const fs=require('node:fs');",
-          "const path=require('node:path');",
-          `const id=${JSON.stringify(id)};`,
-          `const fastCompleted=${JSON.stringify(fastCompleted)};`,
-          "const canceled=path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'reviews','0001','CANCELED.md');",
-          "let input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{",
-          "if(fs.existsSync(canceled)){process.stdout.write(JSON.stringify({verdict:'pass',summary:id+' resumed after canceled sequence',findings:[]}));return;}",
-          "if(id==='fast'){fs.writeFileSync(fastCompleted,'done');process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'partial result must be discarded',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'discard me',recommendation:'do not transmit partial results'}]}));return;}",
-          "const wait=setInterval(()=>{if(fs.existsSync(fastCompleted)){clearInterval(wait);setInterval(()=>{},1000);}},5);",
-          "});",
-        ].join(""),
-      ],
-      timeoutMs: 15000,
+      args: [],
+      review: {
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs');",
+            "const path=require('node:path');",
+            `const id=${JSON.stringify(id)};`,
+            `const fastCompleted=${JSON.stringify(fastCompleted)};`,
+            "const canceled=path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'reviews','0001','CANCELED.md');",
+            "let input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{",
+            "if(fs.existsSync(canceled)){process.stdout.write(JSON.stringify({verdict:'pass',summary:id+' resumed after canceled sequence',findings:[]}));return;}",
+            "if(id==='fast'){fs.writeFileSync(fastCompleted,'done');process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'partial result must be discarded',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'discard me',recommendation:'do not transmit partial results'}]}));return;}",
+            "const wait=setInterval(()=>{if(fs.existsSync(fastCompleted)){clearInterval(wait);setInterval(()=>{},1000);}},5);",
+            "});",
+          ].join(""),
+        ],
+        timeoutMs: 15000,
+      },
     });
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      decider: undefined,
-      reviewers: [reviewer("fast"), reviewer("slow")],
+...baseConfig,
+externalAgents: [
+reviewer("fast"),
+reviewer("slow")
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "fast" },
+        { source: "external", id: "slow" }
+      ] },
     };
     const controller = new AbortController();
     const pending = runReview({
@@ -674,13 +740,16 @@ test("runReview retains on any reviewer error even when another reviewer request
       request: "change index",
       before,
       config: {
-        ...baseConfig,
-        retainBundles: "on-failure",
-        decider: undefined,
-        reviewers: [
-          jsonReviewer("blocking", "{verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]}"),
-          jsonReviewer("bad-json", "{verdict:'maybe',summary:'invalid verdict',findings:[]}"),
+...baseConfig,
+retainBundles: "on-failure",
+externalAgents: [
+jsonReviewer("blocking", "{verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]}"),
+jsonReviewer("bad-json", "{verdict:'maybe',summary:'invalid verdict',findings:[]}")
         ],
+review: { activeReviewers: [
+          { source: "external", id: "blocking" },
+          { source: "external", id: "bad-json" }
+        ] },
       },
     });
 
@@ -710,7 +779,8 @@ test("runReview writes changed file artifacts into retained bundles", async () =
       config: {
         ...baseConfig,
         retainBundles: "always",
-        decider: jsonReviewer("passing", "{verdict:'pass',summary:'ok',findings:[]}"),
+        externalAgents: [jsonReviewer("passing", "{verdict:'pass',summary:'ok',findings:[]}")],
+        review: { activeReviewers: [{ source: "external", id: "passing" }] },
       },
     });
 
@@ -739,13 +809,16 @@ test("runAskReviewer passes with a warning and retains evidence when another ans
       question: "do you agree?",
       request: "review the plan",
       config: {
-        ...baseConfig,
-        retainBundles: "on-failure",
-        decider: undefined,
-        reviewers: [
-          jsonReviewer("passing", "{verdict:'pass',summary:'answer ready',findings:[]}"),
-          jsonReviewer("bad-json", "{verdict:'maybe',summary:'invalid verdict',findings:[]}"),
+...baseConfig,
+retainBundles: "on-failure",
+externalAgents: [
+jsonReviewer("passing", "{verdict:'pass',summary:'answer ready',findings:[]}"),
+jsonReviewer("bad-json", "{verdict:'maybe',summary:'invalid verdict',findings:[]}")
         ],
+review: { activeReviewers: [
+          { source: "external", id: "passing" },
+          { source: "external", id: "bad-json" }
+        ] },
       },
     });
 
@@ -770,12 +843,15 @@ test("runReview prompt preserves request context and original baseline across co
     await writeFile(join(dir, "main.tf"), "fleet_image = \"after-geolite2\"\n", "utf8");
 
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      decider: {
-        id: "prompt-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+externalAgents: [
+        {
+          id: "prompt-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -794,8 +870,13 @@ test("runReview prompt preserves request context and original baseline across co
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "prompt-checker" }
+      ] },
     };
 
     const output = await runReview({
@@ -833,12 +914,15 @@ test("runAskReviewer answers with request and evidence even when there is no pat
     evidence.finalAssistantSummaries.push("Plan: update shared docker locals after confirming release branch naming.");
 
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      decider: {
-        id: "prompt-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+externalAgents: [
+        {
+          id: "prompt-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -856,8 +940,13 @@ test("runAskReviewer answers with request and evidence even when there is no pat
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "prompt-checker" }
+      ] },
     };
 
     const output = await runAskReviewer({
@@ -891,12 +980,15 @@ test("accepted reviewer Q&A is visible to later automatic and question reviews",
       acceptedAnswer: "Use:\n\n```diff\n-before\n+after\n```",
     });
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      decider: {
-        id: "prompt-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+externalAgents: [
+        {
+          id: "prompt-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -912,8 +1004,13 @@ test("accepted reviewer Q&A is visible to later automatic and question reviews",
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "prompt-checker" }
+      ] },
     };
 
     const automatic = await runReview({
@@ -949,13 +1046,16 @@ test("correction-attempt escalation reaches automatic and question review prompt
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      implementationGuidanceAfterCorrectionAttempts: 1,
-      decider: {
-        id: "prompt-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+implementationGuidanceAfterCorrectionAttempts: 1,
+externalAgents: [
+        {
+          id: "prompt-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -973,8 +1073,13 @@ test("correction-attempt escalation reaches automatic and question review prompt
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "prompt-checker" }
+      ] },
     };
 
     const automatic = await runReview({
@@ -1010,13 +1115,16 @@ test("concrete-guidance escalation starts at the configured correction-attempt t
     });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      implementationGuidanceAfterCorrectionAttempts: 2,
-      decider: {
-        id: "threshold-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+implementationGuidanceAfterCorrectionAttempts: 2,
+externalAgents: [
+        {
+          id: "threshold-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -1032,8 +1140,13 @@ test("concrete-guidance escalation starts at the configured correction-attempt t
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "threshold-checker" }
+      ] },
     };
 
     const below = await runReview({
@@ -1082,12 +1195,15 @@ test("runReview frames temp-like outside files as captured side effects, not sub
     await writeFile(outside, "console.log('debug')\n", "utf8");
 
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      decider: {
-        id: "prompt-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+externalAgents: [
+        {
+          id: "prompt-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -1114,8 +1230,13 @@ test("runReview frames temp-like outside files as captured side effects, not sub
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "prompt-checker" }
+      ] },
     };
 
     const output = await runReview({
@@ -1139,13 +1260,15 @@ function blockingReviewer(
   otherMarker: string,
   issue: string,
   recommendation: string,
-): NonNullable<ReviewGateConfig["decider"]> {
+): ExternalAgentConfig {
   return {
     id,
     adapter: "generic-cli",
     command: process.execPath,
-    args: [
-      "-e",
+    args: [],
+    review: {
+      args: [
+        "-e",
       [
         "const fs=require('node:fs');",
         `const own=${JSON.stringify(ownMarker)};`,
@@ -1158,33 +1281,40 @@ function blockingReviewer(
         "while(!fs.existsSync(other)&&Date.now()<deadline){}",
         "if(!fs.existsSync(other)){process.stdout.write(JSON.stringify({verdict:'error',summary:'other reviewer did not start',findings:[]}));process.exit(0);}",
         "process.stdin.resume();",
-        "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',guidance,findings:[{severity:'blocking',file:'index.ts',line:null,issue,recommendation}]})));",
-      ].join(""),
-    ],
-    timeoutMs: 15000,
+          "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',guidance,findings:[{severity:'blocking',file:'index.ts',line:null,issue,recommendation}]})));",
+        ].join(""),
+      ],
+      timeoutMs: 15000,
+    },
   };
 }
 
-function jsonReviewer(id: string, objectLiteral: string): NonNullable<ReviewGateConfig["decider"]> {
+function jsonReviewer(id: string, objectLiteral: string): ExternalAgentConfig {
   return {
     id,
     adapter: "generic-cli",
     command: process.execPath,
-    args: [
-      "-e",
-      `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify(${objectLiteral})))`,
-    ],
-    timeoutMs: 15000,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify(${objectLiteral})))`,
+      ],
+      timeoutMs: 15000,
+    },
   };
 }
 
-function exitReviewer(id: string): NonNullable<ReviewGateConfig["decider"]> {
+function exitReviewer(id: string): ExternalAgentConfig {
   return {
     id,
     adapter: "generic-cli",
     command: process.execPath,
-    args: ["-e", "process.exit(1)"],
-    timeoutMs: 15000,
+    args: [],
+    review: {
+      args: ["-e", "process.exit(1)"],
+      timeoutMs: 15000,
+    },
   };
 }
 

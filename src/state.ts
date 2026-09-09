@@ -13,12 +13,13 @@ import type { TokenUsage } from "./usage";
 import {
   automaticReviewEnabled,
   configWithReviewers,
+  frozenReviewerSelection,
   rememberDuplicateReviewerSelections,
   rememberUnresolvedReviewerSelections,
   resolveReviewers,
   type ReviewGateConfig,
 } from "./config";
-import { configDigest, reviewerSelectionDigest } from "./session-state";
+import { reviewerSelectionDigest } from "./session-state";
 
 export type ReviewFeedbackSource = "automatic" | "manual";
 export type ReviewFeedbackDisposition =
@@ -47,7 +48,6 @@ export interface ReviewWindow {
   retainBundleAfterClose: boolean;
   nextExchangeRequestIndex: number;
   reviewConfig?: ReviewGateConfig;
-  reviewConfigurationError?: string;
 }
 
 export interface ActiveReviewExchange {
@@ -220,7 +220,7 @@ function freezeWindowConfig(window: ReviewWindow, config: ReviewGateConfig, scop
   // subset, so the unresolved selections are remembered beside it.
   const frozen = configWithReviewers(
     config,
-    resolution.reviewers,
+    frozenReviewerSelection(config, resolution),
     automaticReviewEnabled(config, scopedModels),
   );
   rememberUnresolvedReviewerSelections(frozen, resolution.unknownIds);
@@ -250,7 +250,7 @@ export function reconcileWindowReviewerSelection(
   const resolution = resolveReviewers(config, scopedModels);
   const reconciled = configWithReviewers(
     window.reviewConfig,
-    resolution.reviewers,
+    frozenReviewerSelection(config, resolution),
     automaticReviewEnabled(config, scopedModels),
   );
   rememberUnresolvedReviewerSelections(reconciled, resolution.unknownIds);
@@ -264,7 +264,7 @@ export interface RestoredReviewConfigReconciliation {
   windows: number;
   /** Number of reviewers the effective reconciled configuration resolves to. */
   reviewers: number;
-  /** True when the persisted state was saved under a different review configuration. */
+  /** True when the persisted state was saved under a different review configuration, or its saved selection is absent and therefore unverifiable (treated as changed). */
   configurationChanged: boolean;
 }
 
@@ -276,35 +276,35 @@ export interface RestoredReviewConfigReconciliation {
  * from the reconciled one, the settings changed between save and restore: the
  * preserved baseline, evidence, and completed history are kept untouched and
  * reviewed with the current configuration instead of being blocked or
- * cleared. Legacy sidecars may carry the blocking reviewConfigurationError
- * flag from versions that hard-blocked mismatches; reconciliation clears it.
- * Genuine corruption never reaches this point: the store rejects it during
- * restore before any state is applied.
+ * cleared. Old-only sidecars whose persisted windows lack a selection digest
+ * never reach this point: the store rejects them during restore before any
+ * state is applied (no upgrade-on-read). If a missing digest does reach the
+ * comparison anyway, it fails closed as changed rather than assuming a
+ * match.
  */
 export function reconcileRestoredReviewWindows(
   state: ReviewGateState,
-  restored: { reviewConfigDigest?: string; reviewerSelectionDigest?: string },
+  restored: { reviewerSelectionDigest?: string },
   config: ReviewGateConfig,
   scopedModels: string[] = [],
 ): RestoredReviewConfigReconciliation {
   let windows = 0;
   for (const window of [state.reviewWindow, state.lastQuestionWindow]) {
     if (!window) continue;
-    window.reviewConfigurationError = undefined;
     freezeWindowConfig(window, config, scopedModels);
     windows += 1;
   }
   const effective = state.reviewWindow?.reviewConfig ?? state.lastQuestionWindow?.reviewConfig;
   let configurationChanged = false;
   if (effective !== undefined) {
-    configurationChanged = restored.reviewerSelectionDigest !== undefined
-      ? restored.reviewerSelectionDigest !== reviewerSelectionDigest(effective)
-      : restored.reviewConfigDigest !== undefined
-        && restored.reviewConfigDigest !== configDigest(effective);
+    // The store rejects restored state whose persisted windows lack a
+    // selection digest, so this comparison is total on every production
+    // path; a missing digest here fails closed as changed.
+    configurationChanged = restored.reviewerSelectionDigest !== reviewerSelectionDigest(effective);
   }
   return {
     windows,
-    reviewers: effective?.reviewers?.length ?? 0,
+    reviewers: effective ? resolveReviewers(effective).reviewers.length : 0,
     configurationChanged,
   };
 }
@@ -511,10 +511,12 @@ export function buildRequestContext(
         lines.push("Complete individual reviewer results delivered to the implementing model:");
         for (const reviewer of feedback.reviewerResults) {
           // Historical entries render with the label snapshotted at record
-          // time, or their raw reviewer id when that identity was never
-          // persisted (pre-migration sidecars). Current configuration labels
-          // are never consulted: a replaced reviewer that kept its id must
-          // not re-label completed results.
+          // time, or their raw reviewer id when no identity was ever run or
+          // persisted: synthesized outcomes (unavailable selections, gate
+          // errors) ran no reviewer configuration, and superseded-format
+          // sidecars never recorded one. Current configuration labels are
+          // never consulted: a replaced reviewer that kept its id must not
+          // re-label completed results.
           const displayLabel = reviewer.displayLabel ?? reviewer.reviewerId;
           lines.push(`- ${displayLabel} (${reviewer.verdict}): ${reviewer.summary}`);
           if (reviewer.guidance) {

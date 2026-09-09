@@ -10,6 +10,8 @@ import {
   defaultExecutorInitialActiveTools,
   normalizeExecutorToolCatalog,
   normalizeToolNames,
+  rejectPreCutoverRequestFields,
+  resolveExecutorToolCatalog,
 } from "../src/execution/tool-catalog";
 import { newTask } from "../src/execution/task-state";
 import { createOperationRecord, operationRecordPath, readOperationRecord } from "../src/execution/operation-record";
@@ -51,16 +53,80 @@ test("Pi worker catalogs remove orchestrator-only delegation controls without mu
   assert.deepEqual(durable.allowedToolCatalog, ["read", "bash", "SubtasksStart", "SubtasksInspect", "WebSearch"]);
 });
 
-test("legacy allowed-only task records restore with every authorized tool active", () => {
-  const legacy = { ...definition(), executorAllowedTools: ["read", "bash", "read"] };
-  const catalog = normalizeExecutorToolCatalog(legacy);
+test("records persist only the canonical catalog without compatibility mirrors", () => {
+  const taskDefinition = definition();
+  assignExecutorToolCatalog(taskDefinition, createExecutorToolCatalog(["read", "bash"], ["read"]));
+  assert.deepEqual(taskDefinition.executorToolCatalog, {
+    allowedToolCatalog: ["read", "bash"],
+    initialActiveTools: ["read"],
+  });
+  assert.equal("executorAllowedTools" in taskDefinition, false);
+  assert.equal("executorInitialActiveTools" in taskDefinition, false);
+});
+
+test("doubled records consume the validated canonical catalog and ignore stale legacy copies", () => {
+  const doubled = definition();
+  assignExecutorToolCatalog(doubled, createExecutorToolCatalog(["read", "bash"], ["read"]));
+  (doubled as unknown as Record<string, unknown>).executorAllowedTools = ["read", "bash", "write"];
+  (doubled as unknown as Record<string, unknown>).executorInitialActiveTools = ["read", "bash"];
+  const catalog = normalizeExecutorToolCatalog(doubled);
   assert.deepEqual(catalog, {
     allowedToolCatalog: ["read", "bash"],
-    initialActiveTools: ["read", "bash"],
+    initialActiveTools: ["read"],
   });
-  assert.deepEqual(legacy.executorAllowedTools, ["read", "bash"]);
-  assert.deepEqual(legacy.executorInitialActiveTools, ["read", "bash"]);
-  assert.deepEqual(legacy.executorToolCatalog, catalog);
+  // The canonical contract is revalidated and rewritten; the stale copies are
+  // ignored, never migrated or compared against it.
+  assert.deepEqual(doubled.executorToolCatalog, catalog);
+});
+
+test("old-only task records fail explicitly instead of restoring full-active behavior", () => {
+  const legacy = definition();
+  (legacy as unknown as Record<string, unknown>).executorAllowedTools = ["read", "bash"];
+  assert.throws(
+    () => normalizeExecutorToolCatalog(legacy),
+    /Unsupported pre-cutover executor tool catalog/,
+  );
+});
+
+test("records without any catalog fields remain legitimate no-catalog contexts", () => {
+  assert.equal(resolveExecutorToolCatalog(definition()), undefined);
+});
+
+test("newTask strips stale legacy mirrors from doubled input definitions", () => {
+  const input = definition();
+  assignExecutorToolCatalog(input, createExecutorToolCatalog(["read", "bash"], ["read"]));
+  (input as unknown as Record<string, unknown>).executorAllowedTools = ["read", "bash", "write"];
+  (input as unknown as Record<string, unknown>).executorInitialActiveTools = "malformed";
+  const task = newTask(input);
+  assert.deepEqual(task.definition.executorToolCatalog, {
+    allowedToolCatalog: ["read", "bash"],
+    initialActiveTools: ["read"],
+  });
+  assert.equal("executorAllowedTools" in task.definition, false);
+  assert.equal("executorInitialActiveTools" in task.definition, false);
+});
+
+test("newTask rejects old-only input definitions explicitly", () => {
+  const input = definition();
+  (input as unknown as Record<string, unknown>).executorAllowedTools = ["read"];
+  assert.throws(() => newTask(input), /Unsupported pre-cutover executor tool catalog/);
+});
+
+test("requests with a valid canonical catalog ignore stale legacy request fields", () => {
+  const request = {
+    executorToolCatalog: createExecutorToolCatalog(["read"], ["read"]),
+    allowedTools: ["read", "write"],
+    initialActiveTools: ["read", "write"],
+  };
+  assert.doesNotThrow(() => rejectPreCutoverRequestFields(request));
+});
+
+test("old-only requests are rejected before adapter launch", () => {
+  const legacy = { allowedTools: ["read"], initialActiveTools: ["read"] } as unknown as Parameters<typeof rejectPreCutoverRequestFields>[0];
+  assert.throws(
+    () => rejectPreCutoverRequestFields(legacy),
+    /Unsupported pre-cutover executor request/,
+  );
 });
 
 test("task and operation records preserve deferred initial intent without narrowing authorization", () => {
@@ -71,7 +137,8 @@ test("task and operation records preserve deferred initial intent without narrow
     allowedToolCatalog: ["read", "bash"],
     initialActiveTools: ["read"],
   });
-  assert.deepEqual(task.definition.executorAllowedTools, ["read", "bash"]);
+  assert.equal("executorAllowedTools" in task.definition, false);
+  assert.equal("executorInitialActiveTools" in task.definition, false);
 
   const operation = createOperationRecord({
     waveId: "wave-1",
@@ -87,8 +154,8 @@ test("task and operation records preserve deferred initial intent without narrow
     allowedToolCatalog: ["read", "bash"],
     initialActiveTools: ["read"],
   });
-  assert.deepEqual(operation.executorAllowedTools, ["read", "bash"]);
-  assert.deepEqual(operation.executorInitialActiveTools, ["read"]);
+  assert.equal("executorAllowedTools" in operation, false);
+  assert.equal("executorInitialActiveTools" in operation, false);
 });
 
 test("task/operation recovery fails closed on divergent durable catalogs", () => {
@@ -110,7 +177,7 @@ test("task/operation recovery fails closed on divergent durable catalogs", () =>
   );
 });
 
-test("older operation records without the canonical field restore full-active", async () => {
+test("old-only operation records fail explicitly at the durable read boundary", async () => {
   const artifactDir = await mkdtemp(join(tmpdir(), "tool-catalog-operation-"));
   try {
     const operation = createOperationRecord({
@@ -122,16 +189,14 @@ test("older operation records without the canonical field restore full-active", 
       artifactDir,
       retryBudget: 1,
     });
-    operation.executorAllowedTools = ["read", "bash", "read"];
+    (operation as unknown as Record<string, unknown>).executorAllowedTools = ["read", "bash"];
     delete operation.executorToolCatalog;
-    delete operation.executorInitialActiveTools;
     await writeFile(operationRecordPath(artifactDir), JSON.stringify(operation), "utf8");
 
-    const restored = await readOperationRecord(operationRecordPath(artifactDir));
-    assert.deepEqual(restored.executorToolCatalog, {
-      allowedToolCatalog: ["read", "bash"],
-      initialActiveTools: ["read", "bash"],
-    });
+    await assert.rejects(
+      readOperationRecord(operationRecordPath(artifactDir)),
+      /Unsupported pre-cutover executor tool catalog/,
+    );
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
   }

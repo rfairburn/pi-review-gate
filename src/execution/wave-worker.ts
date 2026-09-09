@@ -103,8 +103,6 @@ export function rewriteTaskPaths(
       allowedToolCatalog: [...task.executorToolCatalog.allowedToolCatalog],
       initialActiveTools: [...task.executorToolCatalog.initialActiveTools],
     } : undefined,
-    executorAllowedTools: task.executorAllowedTools ? [...task.executorAllowedTools] : undefined,
-    executorInitialActiveTools: task.executorInitialActiveTools ? [...task.executorInitialActiveTools] : undefined,
     authoritativeUpdates: task.authoritativeUpdates?.map((item) => ({
       ...item,
       instruction: rewriteSourcePaths(item.instruction, sourceRoot, workerRoot),
@@ -149,10 +147,6 @@ export interface WaveWorkerTask {
   backgroundKind?: "execute" | "research";
   /** Canonical durable authorization and initial-activation contract. */
   executorToolCatalog?: ExecutorToolCatalog;
-  /** @deprecated Compatibility mirror of executorToolCatalog.allowedToolCatalog. */
-  executorAllowedTools?: string[];
-  /** Compatibility mirror of executorToolCatalog.initialActiveTools. */
-  executorInitialActiveTools?: string[];
   /** Acknowledged steering in delivery order. Later entries supersede conflicting earlier task text. */
   authoritativeUpdates?: Array<{
     instructionId: string;
@@ -164,8 +158,9 @@ export interface WaveWorkerTask {
 
 /**
  * Reconcile the independently durable task and operation copies. A mismatch
- * in a new-format record fails closed; one-sided/legacy records are upgraded
- * to the available contract and retain full-active compatibility.
+ * between two canonical catalogs fails closed, as do unsupported pre-cutover
+ * old-only shapes; a one-sided record without any catalog fields is upgraded
+ * to the available canonical contract.
  */
 export function synchronizeTaskAndOperationToolCatalog(task: WaveWorkerTask, operation: OperationRecord): ExecutorToolCatalog | undefined {
   const taskCatalog = normalizeExecutorToolCatalog(task);
@@ -592,26 +587,6 @@ function configuredAssignment(config: ReviewGateConfig): ExecutorPoolAssignment 
   return entry ? { entry, priority: 0 } : undefined;
 }
 
-function assignmentFromOperation(operation: OperationRecord, config: ReviewGateConfig): ExecutorPoolAssignment | undefined {
-  if (!operation.executorSelection || operation.executorEntryId === undefined || operation.executorPriority === undefined) {
-    return undefined;
-  }
-  const configured = resolvedExecutorPool(config);
-  const configuredPriority = configured.findIndex((entry) =>
-    executorSelectionKey(entry.selection) === executorSelectionKey(operation.executorSelection!));
-  if (configuredPriority >= 0) {
-    return { entry: configured[configuredPriority]!, priority: configuredPriority };
-  }
-  return {
-    entry: {
-      entryId: operation.executorEntryId,
-      selection: operation.executorSelection,
-      maxConcurrent: 1,
-    },
-    priority: operation.executorPriority,
-  };
-}
-
 function beginAssignment(
   operation: OperationRecord,
   assignment: ExecutorPoolAssignment,
@@ -793,8 +768,6 @@ async function runWithPoolFailover(input: {
         artifactDir: input.resolvedArtifactDir,
         workspaceAccess: input.worker.task.backgroundKind === "research" ? "read-only" : "workspace-write",
         executorToolCatalog,
-        allowedTools: executorToolCatalog?.allowedToolCatalog,
-        initialActiveTools: executorToolCatalog?.initialActiveTools,
         signal: input.worker.signal,
         onUpdate: (message) => reportProgress(input.worker, {
           phase: "executing",
@@ -1230,9 +1203,13 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
 
   operation.state = "running";
   const priorExecutorSelection = operation.executorSelection;
-  const assignment = input.executorAssignment ?? (config.execution?.executorPool !== undefined
-    ? assignmentFromOperation(operation, config) ?? configuredAssignment(config)
-    : configuredAssignment(config));
+  // Canonical resume semantics: the caller's capacity lease wins; otherwise
+  // the configured default resource serves the turn. Recorded prior
+  // assignments never steer resume — a recorded selection that differs from
+  // the effective assignment is handled by the changed-assignment
+  // announcement below, which starts a new session from the durable
+  // checkpoint.
+  const assignment = input.executorAssignment ?? configuredAssignment(config);
   if (!assignment) {
     return {
       status: "executor_error",

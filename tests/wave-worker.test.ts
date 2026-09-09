@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +7,7 @@ import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
 import { createWorkerWorktree, removeWorktree } from "../src/execution/wave-worktrees";
 import { createTaskInstructionEvidenceRecorder, runWaveWorker, resumeWaveWorker, buildWaveWorkerPrompt, type WaveWorkerTask, type WaveWorkerResult, type WaveWorkerContinuationInput } from "../src/execution/wave-worker";
-import { normalizeConfig, type ReviewGateConfig } from "../src/config";
+import { normalizeConfig, resolvedWorkerResources, type ReviewGateConfig } from "../src/config";
 import { resolve } from "node:path";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -222,7 +223,7 @@ test("wave-worker runs one executor turn and normalizes to candidate", async () 
     const config = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "pi", model: "test-model" },
+workerResources: [{ resourceId: "default", selection: { source: "pi", model: "test-model" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "fake-exec",
@@ -240,8 +241,8 @@ test("wave-worker runs one executor turn and normalizes to candidate", async () 
     const fakeConfig: ReviewGateConfig = {
       ...config,
       execution: {
-        ...config.execution,
-        activeExecutor: { source: "external", id: "fake-exec" },
+...config.execution,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-exec" }, maxConcurrent: 1 }],
       },
     };
 
@@ -319,7 +320,7 @@ test("wave-worker returns no_changes when executor makes no modifications", asyn
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "noop-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "noop-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "noop-exec",
@@ -365,8 +366,8 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "fail-exec" },
-        retryPolicy: NO_RETRY,
+retryPolicy: NO_RETRY,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "fail-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "fail-exec",
@@ -409,12 +410,12 @@ test("wave-worker checkpoints and pauses when adapter initialization fails", asy
     const config = normalizeConfig({
       enabled: true,
       execution: {
-        executorPool: [{
-          entryId: "missing",
+workerResources: [{
+          resourceId: "missing",
           selection: { source: "external", id: "missing" },
           maxConcurrent: 1,
         }],
-        retryPolicy: NO_RETRY,
+retryPolicy: NO_RETRY,
       },
     });
 
@@ -469,8 +470,8 @@ test("wave-worker checkpoints partial edits and automatically recovers a failed 
     const config = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "retry-exec" },
-        retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 2 },
+retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 2 },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "retry-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "retry-exec",
@@ -539,11 +540,11 @@ test("wave-worker hands a verified checkpoint to the next executor pool entry in
     const config = normalizeConfig({
       enabled: true,
       execution: {
-        executorPool: [
-          { entryId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
-          { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+workerResources: [
+          { resourceId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+          { resourceId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
         ],
-        retryPolicy: NO_RETRY,
+retryPolicy: NO_RETRY,
       },
       externalAgents: [
         {
@@ -560,7 +561,7 @@ test("wave-worker hands a verified checkpoint to the next executor pool entry in
         },
       ],
     });
-    const pool = config.execution!.executorPool!;
+    const pool = resolvedWorkerResources(config);
 
     const result = await runWaveWorker({
       sourceRoot: capture.discovery.captureRoot,
@@ -612,8 +613,8 @@ test("wave-worker returns timeout on executor timeout", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "to-exec" },
-        retryPolicy: NO_RETRY,
+retryPolicy: NO_RETRY,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "to-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "to-exec",
@@ -659,7 +660,7 @@ test("wave-worker returns cancelled on abort signal", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "cancel-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "cancel-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "cancel-exec",
@@ -710,8 +711,8 @@ test("wave-worker returns executor_error on empty response", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "empty-exec" },
-        retryPolicy: NO_RETRY,
+retryPolicy: NO_RETRY,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "empty-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "empty-exec",
@@ -758,7 +759,7 @@ test("wave-worker validates artifact directory is under waveRoot", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "artifact-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "artifact-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "artifact-exec",
@@ -806,7 +807,7 @@ test("wave-worker validates artifact directory is outside worktree", async () =>
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "artifact2-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "artifact2-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "artifact2-exec",
@@ -879,7 +880,7 @@ test("wave-worker executor runs in effectiveCwd, not worktreeRoot", async () => 
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "cwd-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "cwd-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "cwd-exec",
@@ -931,7 +932,7 @@ test("wave-worker does not mutate source repository", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "source-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "source-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "source-exec",
@@ -979,7 +980,7 @@ test("wave-worker result type carries all required fields", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "type-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "type-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "type-exec",
@@ -1030,7 +1031,7 @@ test("wave-worker progress callbacks are invoked", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "progress-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "progress-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "progress-exec",
@@ -1098,7 +1099,7 @@ test("resumeWaveWorker resumes the exact prior session", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume-exec",
@@ -1154,6 +1155,137 @@ test("resumeWaveWorker resumes the exact prior session", async () => {
   }
 });
 
+/**
+ * Canonical resume semantics (issue #67 integration correction): a recorded
+ * prior assignment never steers resume. Without a caller lease the configured
+ * default resource serves the turn; an explicit caller lease always wins.
+ */
+test("resumeWaveWorker uses the configured default without a caller lease and honors an explicit lease", async () => {
+  const root = await mkTmp("pi-ww-resume-canonical-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-resume-canonical");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-resume-canonical");
+    await mkdir(artifactDir, { recursive: true });
+
+    // Two distinct executor scripts so the served resource is observable.
+    const captureA = join(root, "capture-a.json");
+    const captureB = join(root, "capture-b.json");
+    const writeExecutor = async (id: string, capturePath: string, marker: string) => {
+      const command = join(root, `${id}.cjs`);
+      await writeFile(command, [
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        `fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({`,
+        "  sessionId: process.env.PI_REVIEW_EXECUTOR_SESSION_ID,",
+        "  operation: process.env.PI_REVIEW_EXECUTOR_OPERATION,",
+        "}));",
+        `fs.writeFileSync(path.join(process.cwd(), ${JSON.stringify(marker)}), 'done\\n');`,
+        "console.log(JSON.stringify({ type: 'session', sessionId: process.env.PI_REVIEW_EXECUTOR_SESSION_ID }));",
+        "console.log(JSON.stringify({ type: 'assistant', text: 'Applied corrections.' }));",
+      ].join("\n"), "utf8");
+      await chmod(command, 0o755);
+      return command;
+    };
+    const commandA = await writeExecutor("exec-a", captureA, "correction-a.txt");
+    const commandB = await writeExecutor("exec-b", captureB, "correction-b.txt");
+
+    const config: ReviewGateConfig = normalizeConfig({
+      enabled: true,
+      execution: {
+        workerResources: [
+          { resourceId: "resource-a", selection: { source: "external", id: "exec-a" }, maxConcurrent: 1 },
+          { resourceId: "resource-b", selection: { source: "external", id: "exec-b" }, maxConcurrent: 1 },
+        ],
+        retryPolicy: NO_RETRY,
+      },
+      externalAgents: [
+        {
+          id: "exec-a",
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [commandA], timeoutMs: 15000 },
+        },
+        {
+          id: "exec-b",
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [commandB], timeoutMs: 15000 },
+        },
+      ],
+    });
+    const pool = resolvedWorkerResources(config);
+
+    // First turn on the nondefault resource via an explicit lease so the
+    // operation record durably points at resource-b.
+    const firstResult = await runWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-resume-canonical",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      executorAssignment: { entry: pool[1]!, priority: 1 },
+    });
+    assert.equal(firstResult.status, "completed");
+    assert.ok(firstResult.candidate);
+    assert.ok(existsSync(captureB), "first turn should run on resource-b");
+    assert.ok(!existsSync(captureA), "first turn should not touch resource-a");
+
+    // Resume without a caller lease: the configured default (resource-a)
+    // serves the turn even though the record points at the nondefault
+    // resource. No recorded-assignment migration, no failover policy.
+    await rm(captureA, { force: true });
+    await rm(captureB, { force: true });
+    const updates: string[] = [];
+    const defaultResume = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-resume-canonical",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      priorResult: firstResult,
+      feedback: "Please fix the issue.",
+      turn: 2,
+      onUpdate: (update) => updates.push(update.message),
+    });
+    assert.equal(defaultResume.status, "completed");
+    assert.ok(existsSync(captureA), "unleased resume must run on the configured default resource");
+    assert.ok(!existsSync(captureB), "unleased resume must not replay the recorded nondefault resource");
+    assert.ok(
+      updates.some((message) => /current \/review-settings changed the executor assignment/.test(message)),
+      "changed recorded assignment must still announce a new session",
+    );
+
+    // Resume with an explicit caller lease on resource-b: the lease wins.
+    await rm(captureA, { force: true });
+    await rm(captureB, { force: true });
+    const leasedResume = await resumeWaveWorker({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-resume-canonical",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      priorResult: defaultResume,
+      feedback: "Please fix the issue again.",
+      turn: 3,
+      executorAssignment: { entry: pool[1]!, priority: 1 },
+    });
+    assert.equal(leasedResume.status, "completed");
+    assert.ok(existsSync(captureB), "explicit caller lease must win over the configured default");
+    assert.ok(!existsSync(captureA), "explicit caller lease must bypass the configured default");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("resumeWaveWorker correction changes produce replacement sole-base-parent candidate", async () => {
   const root = await mkTmp("pi-ww-resume2-");
   try {
@@ -1176,7 +1308,7 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
     const firstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume2-first" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume2-first" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume2-first",
@@ -1218,7 +1350,7 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
     const resumeConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume2-correction" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume2-correction" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume2-correction",
@@ -1305,7 +1437,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume3-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume3-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume3-exec",
@@ -1333,7 +1465,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     const firstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume3-first" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume3-first" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume3-first",
@@ -1403,7 +1535,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     const revertFirstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume3-revert-first" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume3-revert-first" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume3-revert-first",
@@ -1445,7 +1577,7 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     const revertConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume3-revert" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume3-revert" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume3-revert",
@@ -1505,7 +1637,7 @@ test("resumeWaveWorker failure paths do not pin accepted refs", async () => {
     const firstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume4-first" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume4-first" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume4-first",
@@ -1543,7 +1675,7 @@ test("resumeWaveWorker failure paths do not pin accepted refs", async () => {
     const failConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume4-fail" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume4-fail" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume4-fail",
@@ -1609,7 +1741,7 @@ test("resumeWaveWorker returns cancelled on abort signal", async () => {
     const firstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume5-first" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume5-first" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume5-first",
@@ -1648,7 +1780,7 @@ test("resumeWaveWorker returns cancelled on abort signal", async () => {
     const slowConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "resume5-slow" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume5-slow" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "resume5-slow",
@@ -1714,7 +1846,7 @@ test("resumeWaveWorker rejects turn < 2", async () => {
     const dummyConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "dummy-exec" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "dummy-exec" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "dummy-exec",
@@ -1761,7 +1893,7 @@ test("resumeWaveWorker requires a prior candidate checkpoint", async () => {
     const dummyConfig7: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "dummy-exec7" },
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "dummy-exec7" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "dummy-exec7",
@@ -1830,8 +1962,8 @@ test("resumeWaveWorker recovers candidate-less read-only research from its verif
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        activeExecutor: { source: "external", id: "research-executor" },
-        retryPolicy: NO_RETRY,
+retryPolicy: NO_RETRY,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "research-executor" }, maxConcurrent: 1 }],
       },
       externalAgents: [{
         id: "research-executor",

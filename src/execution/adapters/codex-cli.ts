@@ -9,7 +9,7 @@ import type {
   ExecutorRequest,
   ExecutorTurn,
 } from "../types";
-import { createExecutorToolCatalog } from "../tool-catalog";
+import { createExecutorToolCatalog, rejectPreCutoverRequestFields } from "../tool-catalog";
 
 interface JsonRpcResponse {
   id: number;
@@ -41,6 +41,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    rejectPreCutoverRequestFields(request);
     const startedAt = Date.now();
     const sandbox = request.workspaceAccess === "read-only" ? "read-only" : "workspace-write";
     if (sandbox === "read-only") assertCodexResearchArgsSafe(this.config.args);
@@ -49,9 +50,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
           request.executorToolCatalog.allowedToolCatalog,
           request.executorToolCatalog.initialActiveTools,
         )
-      : request.allowedTools
-        ? createExecutorToolCatalog(request.allowedTools, request.initialActiveTools)
-        : undefined;
+      : undefined;
     // Codex has no adapter-specific deferred activation channel. Until it
     // does, preserve the full role-authorized research catalog.
     const researchConfig = sandbox === "read-only" ? codexResearchThreadConfig(toolCatalog?.allowedToolCatalog) : undefined;

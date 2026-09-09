@@ -61,8 +61,9 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean; rese
     }],
     execution: options.resourceCapacity === undefined
       ? {
-          activeExecutor: { source: "external", id: "fake" },
           deferredPiTools: options.deferredPiTools,
+          // A single external executor at the default shared capacity of four.
+          workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 4 }],
         }
       : {
           workerResources: [{
@@ -287,11 +288,11 @@ test("saved executor settings govern queued dispatch while existing leases keep 
       },
     })),
     execution: {
-      executorPool: [
-        { entryId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
-        { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+workerResources: [
+        { resourceId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+        { resourceId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
       ],
-      maxWorkers: 1,
+maxWorkers: 1,
     },
   });
   const manager = new ExecutionToolManager({
@@ -322,8 +323,8 @@ test("saved executor settings govern queued dispatch while existing leases keep 
     const inspect = (taskId: string) => inspectTool("live-settings-inspect", { executionId, taskId }, undefined, undefined, {}).then((response: Record<string, any>) => response.details as Record<string, any>);
     await waitUntil(async () => (await inspect(firstTaskId)).tasks[0]?.executorEntryId === "qwen");
 
-    config.execution!.executorPool = [
-      { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+    config.execution!.workerResources = [
+      { resourceId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
     ];
     config.execution!.maxWorkers = 2;
     manager.sync();
@@ -498,12 +499,12 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.match(result.content[0].text, /Task handles \(retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect\)/);
   assert.match(result.content[0].text, /executor assigned; startup in progress/);
   const activeCatalog = ["read", "bash", ...executionToolNames];
-  assert.deepEqual(result.details.tasks[0].definition.executorAllowedTools, activeCatalog);
   assert.deepEqual(result.details.tasks[0].definition.executorToolCatalog, {
     allowedToolCatalog: activeCatalog,
     initialActiveTools: ["read", "bash", "SubtasksStart"],
   });
-  assert.deepEqual(result.details.tasks[0].definition.executorInitialActiveTools, ["read", "bash", "SubtasksStart"]);
+  assert.equal("executorAllowedTools" in result.details.tasks[0].definition, false);
+  assert.equal("executorInitialActiveTools" in result.details.tasks[0].definition, false);
   assert.deepEqual(result.details.tasks[0].timing, {
     queueMs: result.details.tasks[0].timing.queueMs,
     captureMs: 0,
@@ -559,14 +560,13 @@ test("SubtasksStart creates immutable research groups without child-local eviden
     "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
     "BrowserScroll", "BrowserHover", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ];
-  assert.deepEqual(started.details.tasks[0].definition.executorAllowedTools, researchCatalog);
-  for (const forbidden of ["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress"]) {
-    assert.equal(started.details.tasks[0].definition.executorAllowedTools.includes(forbidden), false);
-  }
   assert.deepEqual(started.details.tasks[0].definition.executorToolCatalog, {
     allowedToolCatalog: researchCatalog,
     initialActiveTools: ["read"],
   });
+  for (const forbidden of ["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress"]) {
+    assert.equal(started.details.tasks[0].definition.executorToolCatalog?.allowedToolCatalog.includes(forbidden), false);
+  }
   assert.equal(started.details.tasks[0].definition.backgroundKind, "research");
   assert.equal(manager.reviewReadiness()[0]?.kind, "research");
 
@@ -580,7 +580,6 @@ test("SubtasksStart creates immutable research groups without child-local eviden
   }, undefined, undefined, {});
   assert.equal(added.details.kind, "research");
   assert.equal(added.details.tasks[1].definition.backgroundKind, "research");
-  assert.deepEqual(added.details.tasks[1].definition.executorAllowedTools, researchCatalog);
   assert.deepEqual(added.details.tasks[1].definition.executorToolCatalog, {
     allowedToolCatalog: researchCatalog,
     initialActiveTools: ["read"],

@@ -110,7 +110,9 @@ async function managerWithGroups(
       command: process.execPath,
       execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
     }],
-    execution: { activeExecutor: { source: "external", id: "unstarted" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+    },
   });
   // Nothing may ever dispatch in these fixtures: settlement is never needed.
   config.execution!.maxWorkers = 0;

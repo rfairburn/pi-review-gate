@@ -59,8 +59,8 @@ test("background tasks return immediately, land independently, and additions cap
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
       execution: {
-        activeExecutor: { source: "external", id: "fake" },
-        maxWorkers: 2,
+maxWorkers: 2,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 2 }],
       },
       retainBundles: "always",
     });
@@ -171,8 +171,8 @@ test("settled tasks move to bounded archives and restore through stable task han
         execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
       }],
       execution: {
-        activeExecutor: { source: "external", id: "archive" },
-        maxWorkers: 2,
+maxWorkers: 2,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "archive" }, maxConcurrent: 2 }],
       },
       retainBundles: "always",
     });
@@ -357,7 +357,10 @@ test("restored active tasks bound routine history without losing cumulative timi
         command: process.execPath,
         execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", "process.stdin.resume()"] },
       }],
-      execution: { activeExecutor: { source: "external", id: "never-started" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "never-started" }, maxConcurrent: 1 }],
+      },
     });
     config.execution!.maxWorkers = 0;
     const controller = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
@@ -441,8 +444,8 @@ test("parallel independent landings accumulate in the parent review checkpoint",
         execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
       }],
       execution: {
-        activeExecutor: { source: "external", id: "checkpoint" },
-        maxWorkers: 3,
+maxWorkers: 3,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "checkpoint" }, maxConcurrent: 3 }],
       },
     });
     const state = createState();
@@ -550,19 +553,28 @@ test("research tasks report without review or landing and quarantine accidental 
         title: "clean research",
         instructions: "Inspect base.txt and report evidence.",
         acceptanceCriteria: ["Return an evidence-backed report"],
-        executorAllowedTools: ["read"],
+        executorToolCatalog: {
+          allowedToolCatalog: ["read"],
+          initialActiveTools: ["read"],
+        },
       },
       {
         title: "dirty research",
         instructions: "DIRTY_RESEARCH",
         acceptanceCriteria: ["Return an evidence-backed report"],
-        executorAllowedTools: ["read"],
+        executorToolCatalog: {
+          allowedToolCatalog: ["read"],
+          initialActiveTools: ["read"],
+        },
       },
       {
         title: "long research",
         instructions: "LONG_RESEARCH",
         acceptanceCriteria: ["Return a detailed report with a bounded summary"],
-        executorAllowedTools: ["read"],
+        executorToolCatalog: {
+          allowedToolCatalog: ["read"],
+          initialActiveTools: ["read"],
+        },
       },
     ], "research");
     assert.equal(started.kind, "research");
@@ -655,25 +667,31 @@ test("noisy subtask notifications wake the orchestrator when active execution en
       "console.log(JSON.stringify({type:'assistant',text:'done'}));",
     ].join("\n"), "utf8");
     const config = normalizeConfig({
-      enabled: true,
-      decider: {
-        id: "passing",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})),100))"],
-        timeoutMs: 5_000,
-      },
-      externalAgents: [{
+enabled: true,
+externalAgents: [{
         id: "fake",
         adapter: "run-as-binary",
         command: process.execPath,
         execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
-      }],
-      execution: {
-        activeExecutor: { source: "external", id: "fake" },
+      }, {
+          id: "passing",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})),100))"],
+            timeoutMs: 5_000,
+          },
+        }
+      ],
+execution: {
+        workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
         maxWorkers: 1,
         subtaskNotifications: "noisy",
       },
+review: { activeReviewers: [
+        { source: "external", id: "passing" }
+      ] },
     });
     const messages: string[] = [];
     const widgets: unknown[] = [];
@@ -739,7 +757,10 @@ test("steering unsupported by a live turn is applied after it settles even when 
         command: process.execPath,
         execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
       }],
-      execution: { activeExecutor: { source: "external", id: "deferred" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "deferred" }, maxConcurrent: 1 }],
+      },
     });
     controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
     const started = await controller.start([{
@@ -801,9 +822,9 @@ test("queued steering is incorporated before startup and landing events distingu
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
       execution: {
-        activeExecutor: { source: "external", id: "steerable" },
-        maxWorkers: 1,
-        subtaskNotifications: "noisy",
+maxWorkers: 1,
+subtaskNotifications: "noisy",
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "steerable" }, maxConcurrent: 1 }],
       },
       retainBundles: "always",
     });
@@ -893,7 +914,10 @@ test("interrupt quiesces a writer and force-merge lands its verified checkpoint"
         command: executor,
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "slow" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow" }, maxConcurrent: 1 }],
+      },
       retainBundles: "always",
     });
     const controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
@@ -1207,7 +1231,10 @@ test("force-merge save failure after landing preserves the landed outcome", asyn
         command: executor,
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "slow" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow" }, maxConcurrent: 1 }],
+      },
       retainBundles: "always",
     });
     let landedSaveCalls = 0;
@@ -1316,7 +1343,10 @@ test("interrupt before executor startup terminalizes a restored auto-queued cont
         command: executor,
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "restore-fake" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "restore-fake" }, maxConcurrent: 1 }],
+      },
     });
     // Nothing may ever be dispatched in this scenario: every task stays queued.
     config.execution!.maxWorkers = 0;
@@ -1405,7 +1435,10 @@ test("interrupt before executor startup terminalizes an ordinary queued continue
         command: executor,
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "queued-continue-fake" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "queued-continue-fake" }, maxConcurrent: 1 }],
+      },
     });
     config.execution!.maxWorkers = 0;
     const controller = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
@@ -1593,7 +1626,10 @@ test("interrupt during pre-dispatch continuation startup terminalizes the queued
         command: executor,
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "predispatch-fake" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "predispatch-fake" }, maxConcurrent: 1 }],
+      },
     });
     // Keep the restored task queued until the queued steering instruction that
     // deterministically pauses continuation preprocessing has been injected.
@@ -1745,7 +1781,10 @@ test("force-merge publish and wake failures after landing are recorded durably",
         command: executor,
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "slow" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow" }, maxConcurrent: 1 }],
+      },
       retainBundles: "always",
     });
     const controller = new BackgroundExecutionController({
@@ -1834,7 +1873,10 @@ test("settled save tails prune by exact identity and overlapping saves serialize
         command: join(root, "unused-executor.cjs"),
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "tail-fake" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "tail-fake" }, maxConcurrent: 1 }],
+      },
     });
     // Keep every task queued: saves happen without dispatching any executor.
     config.execution!.maxWorkers = 0;
@@ -1886,7 +1928,10 @@ test("a failed save tail propagates to its caller, prunes, and does not wedge la
         command: join(root, "unused-executor.cjs"),
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "tail-fail-fake" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "tail-fail-fake" }, maxConcurrent: 1 }],
+      },
     });
     // Keep every task queued: saves happen without dispatching any executor.
     config.execution!.maxWorkers = 0;
@@ -1948,7 +1993,10 @@ test("repeated group creation and detach/shutdown quiesce save tails before clea
         command: join(root, "unused-executor.cjs"),
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
-      execution: { activeExecutor: { source: "external", id: "tail-detach-fake" }, maxWorkers: 1 },
+      execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "tail-detach-fake" }, maxConcurrent: 1 }],
+      },
     });
     // Keep every task queued: saves happen without dispatching any executor.
     config.execution!.maxWorkers = 0;
@@ -2114,7 +2162,10 @@ async function setupInterruptedMergeTask(unique: string): Promise<{
       command: executor,
       execution: { protocol: "pi-review-executor-jsonl-v1" },
     }],
-    execution: { activeExecutor: { source: "external", id: "slow-merge" }, maxWorkers: 1 },
+    execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow-merge" }, maxConcurrent: 1 }],
+    },
     retainBundles: "always",
   });
   const controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
@@ -2184,7 +2235,10 @@ async function setupFaultScenario(faults: BackgroundFaultHooks): Promise<{
       command: executor,
       execution: { protocol: "pi-review-executor-jsonl-v1" },
     }],
-    execution: { activeExecutor: { source: "external", id: "fault-fake" }, maxWorkers: 1 },
+    execution: {
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "fault-fake" }, maxConcurrent: 1 }],
+    },
     retainBundles: "always",
   });
   const messages: string[] = [];
@@ -2230,8 +2284,8 @@ function boundedScalingConfig() {
       execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
     }],
     execution: {
-      activeExecutor: { source: "external", id: "unstarted" },
-      maxWorkers: 1,
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
     },
     retainBundles: "always",
   });
@@ -3640,9 +3694,9 @@ async function setupBlockingFailureHarness(options: { notifications: "quiet" | "
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
       execution: {
-        activeExecutor: { source: "external", id: "blocking-fake" },
-        maxWorkers: 1,
-        subtaskNotifications: options.notifications,
+maxWorkers: 1,
+subtaskNotifications: options.notifications,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "blocking-fake" }, maxConcurrent: 1 }],
       },
       retainBundles: "always",
     });
@@ -3964,9 +4018,9 @@ const watchConfig = normalizeConfig({
     execution: { protocol: "pi-review-executor-jsonl-v1" as const },
   }],
   execution: {
-    executorPool: [
-      { entryId: "pi-entry", selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1 },
-      { entryId: "external-fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
+workerResources: [
+      { resourceId: "pi-entry", selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1 },
+      { resourceId: "external-fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
     ],
   },
 });
@@ -4082,8 +4136,8 @@ test("widget and watch keep the recorded model-less external identity when the c
         execution: { protocol: "pi-review-executor-jsonl-v1" },
       }],
       execution: {
-        activeExecutor: { source: "external", id: "fake" },
-        maxWorkers: 1,
+maxWorkers: 1,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
       },
     });
     const widgets: unknown[] = [];
@@ -4131,8 +4185,8 @@ test("widget and watch keep the recorded model-less external identity when the c
     const agent = (config.externalAgents ?? []).find((candidate) => candidate.id === "fake");
     assert.ok(agent, "harness must define the fake agent");
     agent.model = "never-ran-7";
-    config.execution!.executorPool = [{
-      entryId: "external-fake",
+    config.execution!.workerResources = [{
+      resourceId: "external-fake",
       selection: { source: "pi", model: "gpt-reassigned" },
       maxConcurrent: 1,
     }];
@@ -4209,7 +4263,10 @@ test("watch checkpoint delivery options come from the shared notification policy
         command: executor,
         execution: { protocol: "pi-review-executor-jsonl-v1" as const },
       }],
-      execution: { activeExecutor: { source: "external", id: "fake" }, maxWorkers: 2 },
+      execution: {
+maxWorkers: 2,
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 2 }],
+      },
     });
     const contents: string[] = [];
     const deliveries: Array<{ deliverAs: string; triggerTurn: boolean } | undefined> = [];
@@ -4292,22 +4349,34 @@ test("active widget and watch labels follow the failover successor during execut
     await chmod(reviewer, 0o755);
 
     const config = normalizeConfig({
-      enabled: true,
-      decider: { id: "gate-reviewer", adapter: "generic-cli", command: process.execPath, args: [reviewer], timeoutMs: 20_000 },
-      externalAgents: [
+enabled: true,
+externalAgents: [
         { id: "exec-a", adapter: "run-as-binary", command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execA], timeoutMs: 30_000 } },
         // The agent-level model is a decoy: the execution-level override is
         // what actually runs and must be what the UI shows.
         { id: "exec-b", adapter: "run-as-binary", command: process.execPath, model: "agent-b-default", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execB], timeoutMs: 30_000, model: "exec-b-effective" } },
+        {
+          id: "gate-reviewer",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [reviewer],
+            timeoutMs: 20_000,
+          },
+        }
       ],
-      execution: {
+execution: {
         workerResources: [
           { resourceId: "res-a", selection: { source: "external" as const, id: "exec-a" }, maxConcurrent: 1 },
           { resourceId: "res-b", selection: { source: "external" as const, id: "exec-b" }, maxConcurrent: 1 },
         ],
         retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
       },
-      retainBundles: "always",
+retainBundles: "always",
+review: { activeReviewers: [
+        { source: "external", id: "gate-reviewer" }
+      ] },
     });
 
     const widgetFrames: string[][] = [];
@@ -4454,20 +4523,32 @@ test("failover to a model-less external executor clears the predecessor's model 
     // models are optional). After failover the task must stop displaying
     // model-a and fall back to the successor's own identity.
     const config = normalizeConfig({
-      enabled: true,
-      decider: { id: "gate-reviewer", adapter: "generic-cli", command: process.execPath, args: [reviewer], timeoutMs: 20_000 },
-      externalAgents: [
+enabled: true,
+externalAgents: [
         { id: "exec-a", adapter: "run-as-binary", command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execA], timeoutMs: 30_000 } },
         { id: "exec-b", adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execB], timeoutMs: 30_000 } },
+        {
+          id: "gate-reviewer",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [reviewer],
+            timeoutMs: 20_000,
+          },
+        }
       ],
-      execution: {
+execution: {
         workerResources: [
           { resourceId: "res-a", selection: { source: "external" as const, id: "exec-a" }, maxConcurrent: 1 },
           { resourceId: "res-b", selection: { source: "external" as const, id: "exec-b" }, maxConcurrent: 1 },
         ],
         retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
       },
-      retainBundles: "always",
+retainBundles: "always",
+review: { activeReviewers: [
+        { source: "external", id: "gate-reviewer" }
+      ] },
     });
 
     const widgetFrames: string[][] = [];

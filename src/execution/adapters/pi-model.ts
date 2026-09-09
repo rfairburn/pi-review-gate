@@ -16,6 +16,7 @@ import {
   EXECUTOR_TOOL_CATALOG_ENV,
   createExecutorToolCatalog,
   createPiWorkerToolCatalog,
+  rejectPreCutoverRequestFields,
   type ExecutorToolCatalog,
 } from "../tool-catalog";
 import {
@@ -55,13 +56,15 @@ export class PiExecutorAdapter implements ExecutorAdapter {
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
     assertNoPiToolPolicyArgs(this.options.args ?? [], "Pi executor arguments");
+    rejectPreCutoverRequestFields(request);
     const thinkingLevel = this.options.thinkingLevel ?? "high";
-    const durableToolCatalog = request.executorToolCatalog
-      ? createExecutorToolCatalog(
-          request.executorToolCatalog.allowedToolCatalog,
-          request.executorToolCatalog.initialActiveTools,
-        )
-      : createExecutorToolCatalog(requireAllowedTools(request.allowedTools), request.initialActiveTools);
+    if (!request.executorToolCatalog) {
+      throw new Error("Pi executor launch requires an authoritative executor tool catalog for native --tools enforcement.");
+    }
+    const durableToolCatalog = createExecutorToolCatalog(
+      request.executorToolCatalog.allowedToolCatalog,
+      request.executorToolCatalog.initialActiveTools,
+    );
     const toolCatalog = createPiWorkerToolCatalog(durableToolCatalog);
     // The native CLI allowlist remains the hard launch boundary. search_tools
     // is the sole control tool added outside the durable capability catalog;
@@ -737,13 +740,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function abortError(signal?: AbortSignal): Error {
   return signal?.reason instanceof Error ? signal.reason : new Error("Executor recovery was cancelled.");
-}
-
-function requireAllowedTools(tools: readonly string[] | undefined): string[] {
-  if (!tools) {
-    throw new Error("Pi executor launch requires an authoritative tool allowlist for native --tools enforcement.");
-  }
-  return [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
 }
 
 function childArgs(args: readonly string[], allowedTools: readonly string[]): string[] {

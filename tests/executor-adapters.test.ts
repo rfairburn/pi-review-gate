@@ -6,9 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CodexExecutorAdapter } from "../src/execution/adapters/codex-cli";
+import { ClaudeExecutorAdapter } from "../src/execution/adapters/claude-cli";
 import { PiExecutorAdapter, PiRpc } from "../src/execution/adapters/pi-model";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
-import type { ExecutorLiveControl } from "../src/execution/types";
+import type { ExecutorLiveControl, ExecutorRequest } from "../src/execution/types";
 
 // Minimal stand-in for the trusted child extension in fake RPC fixtures. Real
 // Pi children publish this only from agent_settled, with a LIVE browser.
@@ -27,9 +28,34 @@ test("Pi executor refuses to launch without an authoritative native --tools allo
       artifactDir: join(tmpdir(), "pi-review-missing-tools"),
       turn: 1,
     }),
-    /requires an authoritative tool allowlist for native --tools enforcement/,
+    /requires an authoritative executor tool catalog for native --tools enforcement/,
   );
 });
+
+for (const [name, runLegacyRequest] of [
+  [
+    "Pi",
+    async () => new PiExecutorAdapter({ model: "provider/model", command: "must-not-launch" })
+      .run({ cwd: process.cwd(), prompt: "task", artifactDir: join(tmpdir(), "pi-review-legacy-request"), turn: 1, allowedTools: ["read"] } as unknown as ExecutorRequest),
+  ],
+  [
+    "Codex",
+    async () => new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command: "must-not-launch", model: "gpt-test" })
+      .run({ cwd: process.cwd(), prompt: "work", artifactDir: join(tmpdir(), "pi-review-codex-legacy-request"), turn: 1, allowedTools: ["read"] } as unknown as ExecutorRequest),
+  ],
+  [
+    "Claude",
+    async () => new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "must-not-launch", model: "sonnet" })
+      .run({ cwd: process.cwd(), prompt: "work", artifactDir: join(tmpdir(), "pi-review-claude-legacy-request"), turn: 1, allowedTools: ["read"], initialActiveTools: ["read"] } as unknown as ExecutorRequest),
+  ],
+] as const) {
+  test(`${name} executor rejects old-only legacy request fields before any launch`, async () => {
+    // A spawn attempt would surface a command-resolution failure instead of
+    // the explicit pre-cutover diagnostic, so the message proves no process
+    // or SDK launch occurred.
+    await assert.rejects(runLegacyRequest(), /Unsupported pre-cutover executor request/);
+  });
+}
 
 test("Pi executor child loads the review-gate extension in executor role without inheriting disablement", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-executor-env-"));
@@ -135,7 +161,10 @@ test("Pi executor fails closed when agent_end and process lifetime provide no tr
       prompt: "finish without acknowledgement",
       artifactDir,
       turn: 1,
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
     });
     assert.equal(result.code, 1);
     assert.equal(result.failure?.category, "protocol");
@@ -172,7 +201,10 @@ test("Pi executor does not turn child termination into successful completion", {
       prompt: "terminate",
       artifactDir,
       turn: 1,
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
     });
     assert.equal(result.code, 1);
     assert.equal(result.failure?.category, "protocol");
@@ -217,7 +249,10 @@ test("Pi executor contains a late RPC write after the child closed its stdin and
       prompt: "terminate after late write",
       artifactDir,
       turn: 1,
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
       onProcessExit: (exit) => {
         exits.push(exit);
       },
@@ -304,7 +339,10 @@ test("Pi executor fails the shutdown/settlement race when the child exits zero b
       prompt: "exit before settling",
       artifactDir,
       turn: 1,
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
       onProcessExit: (exit) => {
         exits.push(exit);
       },
@@ -353,7 +391,10 @@ test("Pi executor fails a final-response/shutdown race when the child exits zero
       prompt: "exit after final response",
       artifactDir,
       turn: 1,
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
       onProcessExit: (exit) => {
         exits.push(exit);
       },
@@ -389,7 +430,11 @@ test("Pi executor does not mask a terminal cleanup hook error behind a valid liv
     ].join("\n"));
     await chmod(command, 0o755);
     const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 2_000 }).run({
-      cwd: root, prompt: "finish", artifactDir: root, turn: 1, allowedTools: ["read"],
+      cwd: root, prompt: "finish", artifactDir: root, turn: 1,
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
     });
     assert.equal(result.code, 1);
     assert.equal(result.failure?.category, "protocol");
@@ -425,7 +470,11 @@ for (const cleanup of ["delayed", "stalled"] as const) {
       ].join("\n"));
       await chmod(command, 0o755);
       const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 2_000 }).run({
-        cwd: root, prompt: "finish", artifactDir: root, turn: 1, allowedTools: ["read"],
+        cwd: root, prompt: "finish", artifactDir: root, turn: 1,
+        executorToolCatalog: {
+          allowedToolCatalog: ["read"],
+          initialActiveTools: ["read"],
+        },
       });
       const outcome = JSON.parse(await readFile(marker, "utf8"));
       if (cleanup === "delayed") {
@@ -471,7 +520,10 @@ test("Pi executor waits from agent_end through delayed child agent_settled ackno
       prompt: "wait for true settlement",
       artifactDir,
       turn: 1,
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
     });
     assert.equal(result.failure, undefined);
     assert.equal(result.text, "settled after cleanup");
@@ -504,7 +556,10 @@ test("Pi executor does not count retry agent_end events as settlement generation
       prompt: "retry before settlement",
       artifactDir,
       turn: 1,
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
     });
     assert.equal(result.failure, undefined);
     assert.equal(result.text, "retry settled once");
@@ -536,7 +591,10 @@ test("Pi executor follows trusted generations across an autonomous settlement", 
       prompt: "allow autonomous completion",
       artifactDir,
       turn: 1,
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
     });
     assert.equal(result.failure, undefined);
     assert.equal(result.text, "autonomous final settlement");
@@ -581,7 +639,10 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
       prompt: "initial task",
       artifactDir,
       turn: 1,
-      allowedTools: ["read", "bash", "SubtasksStart", "SubtasksSteer"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "bash", "SubtasksStart", "SubtasksSteer"],
+        initialActiveTools: ["read", "bash", "SubtasksStart", "SubtasksSteer"],
+      },
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
@@ -607,7 +668,10 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
       prompt: "interrupt this task",
       artifactDir,
       turn: 2,
-      allowedTools: ["read", "bash", "SubtasksStart", "SubtasksSteer"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "bash", "SubtasksStart", "SubtasksSteer"],
+        initialActiveTools: ["read", "bash", "SubtasksStart", "SubtasksSteer"],
+      },
       onLiveControl: (next) => { if (next) resolveInterruptControl(next); },
     });
     const interruptControl = await interruptControlReady;
@@ -655,7 +719,10 @@ test("Pi stays alive for ShellStart work and accepts steering while its agent is
       prompt: "start background work",
       artifactDir,
       turn: 1,
-      allowedTools: ["read", "bash", "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "bash", "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"],
+        initialActiveTools: ["read", "bash", "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"],
+      },
       onUpdate: (message) => updates.push(message),
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
@@ -708,8 +775,10 @@ test("Codex research executor preserves the full allowed catalog with app-server
       artifactDir,
       turn: 1,
       workspaceAccess: "read-only",
-      allowedTools: ["read", "WebSearch"],
-      initialActiveTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "WebSearch"],
+        initialActiveTools: ["read"],
+      },
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
@@ -822,7 +891,10 @@ test("Codex research executor retains safe model reasoning configuration", async
       artifactDir,
       turn: 1,
       workspaceAccess: "read-only",
-      allowedTools: ["read"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read"],
+        initialActiveTools: ["read"],
+      },
     });
     assert.equal(result.text, "done");
   } finally {

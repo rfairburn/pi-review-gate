@@ -108,24 +108,26 @@ async function describeTaskFailures(result: {
  */
 function makeConfigWithFileWriter(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "file-writer" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "file-writer" }, maxConcurrent: 1 }],
+          },
+externalAgents: [
         {
           id: "file-writer",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "let input='';",
@@ -152,10 +154,11 @@ function makeConfigWithFileWriter(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 15000,
-        },
-      ],
-    },
+            timeoutMs: 15000,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -164,24 +167,26 @@ function makeConfigWithFileWriter(): ReviewGateConfig {
  */
 function makeConfigWithPromptTargetWriter(sourceRoot: string): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "prompt-target-writer" },
-      externalExecutors: [{
-        id: "prompt-target-writer",
-        adapter: "run-as-binary",
-        protocol: "pi-review-executor-jsonl-v1",
-        command: process.execPath,
-        env: { TEST_SOURCE_ROOT: sourceRoot },
-        args: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "prompt-target-writer" }, maxConcurrent: 1 }],
+          },
+externalAgents: [
+        {
+          id: "prompt-target-writer",
+          adapter: "run-as-binary",
+          command: process.execPath,
+          args: [],
+          execution: {
+            args: [
           "-e",
           [
             "let input='';",
@@ -201,32 +206,37 @@ function makeConfigWithPromptTargetWriter(sourceRoot: string): ReviewGateConfig 
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      }],
-    },
+            env: { TEST_SOURCE_ROOT: sourceRoot },
+            timeoutMs: 15000,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
 function makeConfigWithNoOp(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "noop" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "noop" }, maxConcurrent: 1 }],
+          },
+externalAgents: [
         {
           id: "noop",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "process.stdin.resume();",
@@ -237,10 +247,11 @@ function makeConfigWithNoOp(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 15000,
-        },
-      ],
-    },
+            timeoutMs: 15000,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -466,16 +477,19 @@ test("regression: ignored HTML paths remain excluded and not reported as landed"
         },
       ],
       config: {
-        ...makeConfigWithFileWriter(),
-        execution: {
+...makeConfigWithFileWriter(),
+execution: {
           ...makeConfigWithFileWriter().execution!,
-          externalExecutors: [
+          workerResources: [{ resourceId: "default", selection: { source: "external", id: "mixed-writer" }, maxConcurrent: 1 }],
+        },
+externalAgents: [
             {
               id: "mixed-writer",
               adapter: "run-as-binary",
-              protocol: "pi-review-executor-jsonl-v1",
               command: process.execPath,
-              args: [
+              args: [],
+              execution: {
+                args: [
                 "-e",
                 [
                   "process.stdin.resume();",
@@ -491,11 +505,11 @@ test("regression: ignored HTML paths remain excluded and not reported as landed"
                   "});",
                 ].join(""),
               ],
-              timeoutMs: 15000,
-            },
-          ],
-          activeExecutor: { source: "external", id: "mixed-writer" },
-        },
+                timeoutMs: 15000,
+                protocol: "pi-review-executor-jsonl-v1",
+              },
+            }
+        ],
       },
       artifactDir,
       waveId: "regression-ignore",
@@ -810,24 +824,26 @@ test("regression: executor subprocess PWD matches actual cwd", async () => {
         },
       ],
       config: {
-        enabled: false,
-        reviewerTimeoutMs: 600_000,
-        executorTimeoutMs: 1_800_000,
-        maxCorrectionCycles: 0,
-        implementationGuidanceAfterCorrectionAttempts: 1,
-        maxPatchBytes: 200_000,
-        maxFileBytes: 1_048_576,
-        maxSnapshotBytes: 52_428_800,
-        retainBundles: "never",
-        execution: {
-          activeExecutor: { source: "external", id: "pwd-checker" },
-          externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+          workerResources: [{ resourceId: "default", selection: { source: "external", id: "pwd-checker" }, maxConcurrent: 1 }],
+                  },
+externalAgents: [
             {
               id: "pwd-checker",
               adapter: "run-as-binary",
-              protocol: "pi-review-executor-jsonl-v1",
               command: process.execPath,
-              args: [
+              args: [],
+              execution: {
+                args: [
                 "-e",
                 [
                   "process.stdin.resume();",
@@ -843,10 +859,11 @@ test("regression: executor subprocess PWD matches actual cwd", async () => {
                   "});",
                 ].join(""),
               ],
-              timeoutMs: 15000,
-            },
-          ],
-        },
+                timeoutMs: 15000,
+                protocol: "pi-review-executor-jsonl-v1",
+              },
+            }
+        ],
       },
       artifactDir,
       waveId: "regression-pwd",

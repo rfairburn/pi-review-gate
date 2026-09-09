@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { assertNoPiToolPolicyArgs } from "./pi-tool-policy";
 
 export type RetainBundles = "never" | "on-failure" | "always";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -199,11 +198,6 @@ export interface ExecutionConfig {
   workerResources?: WorkerResourceEntry[];
   /** Independent ordered resource eligibility for execution and research. */
   routes?: WorkerRoutesConfig;
-  /** Ordered executor priority pool. Earlier entries are preferred. */
-  executorPool?: ExecutorPoolEntry[];
-  /** Legacy single-executor selection, materialized as one pool entry when executorPool is absent. */
-  activeExecutor?: ActiveExecutorSelection;
-  externalExecutors?: ExternalExecutorConfig[];
   maxWorkers?: number;
   retryPolicy?: ExecutionRetryPolicy;
   subtaskNotifications?: SubtaskNotificationMode;
@@ -227,9 +221,6 @@ export interface ReviewGateConfig {
   /** Age after which completed, non-recovery wave roots may be garbage-collected. Zero disables GC. */
   waveArtifactTtlMs?: number;
   retainBundles: RetainBundles;
-  decider?: DeciderConfig;
-  reviewers?: DeciderConfig[];
-  enabledReviewerIds?: string[];
   review?: ReviewSelectionConfig;
   externalAgents?: ExternalAgentConfig[];
   execution?: ExecutionConfig;
@@ -242,6 +233,7 @@ export interface LoadedConfig {
   path?: string;
   disabledReason?: string;
   globallyDisabled?: boolean;
+  warnings?: string[];
 }
 
 export const DEFAULT_CONFIG: ReviewGateConfig = {
@@ -292,12 +284,92 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     };
   }
 
-  const raw = readFileSync(path, "utf8");
-  const parsed = JSON.parse(raw) as unknown;
-  return {
-    config: normalizeConfig(parsed),
-    path,
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    return { ...recoverConfig(parsed), path };
+  } catch {
+    // An unreadable document has no recoverable individual settings. Never
+    // overwrite it, expose its contents in an error, or skip tool registration.
+    return { config: normalizeConfig({}), path, warnings: ["Configuration could not be read or parsed; using built-in defaults."] };
+  }
+}
+
+/** Startup recovery only. Explicit configuration writes still validate strictly. */
+export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "warnings"> {
+  try {
+    return { config: normalizeConfig(value) };
+  } catch {
+    // Reuse the strict validator rather than maintaining a second schema.
+  }
+  const candidate: Record<string, unknown> = Object.create(null);
+  const warnings: string[] = [];
+  // Only these objects contain independently defaultable settings. Selections,
+  // agent definitions and route/resource entries remain atomic: never invent
+  // a model, reasoning pair, command or authorization reference to repair one.
+  const containers = new Set(["web", "web.search", "web.fetch", "ui", "review",
+    "execution", "execution.retryPolicy", "execution.routes"]);
+  const recover = (parent: Record<string, unknown>, key: string, input: unknown, path: string): void => {
+    const attempt = (replacement: unknown): boolean => {
+      const previous = Object.getOwnPropertyDescriptor(parent, key);
+      Object.defineProperty(parent, key, { value: replacement, configurable: true, enumerable: true, writable: true });
+      try {
+        normalizeConfig(candidate);
+        return true;
+      } catch {
+        if (previous) Object.defineProperty(parent, key, previous);
+        else delete parent[key];
+        return false;
+      }
+    };
+    if (attempt(input)) return;
+    if (containers.has(path) && isRecord(input)) {
+      const object: Record<string, unknown> = Object.create(null);
+      if (attempt(object)) {
+        recoverObject(object, input, path);
+        return;
+      }
+    }
+    if (Array.isArray(input)) {
+      const items: unknown[] = [];
+      if (attempt(items)) {
+        for (let i = 0; i < input.length; i++) {
+          items.push(input[i]);
+          try { normalizeConfig(candidate); }
+          catch {
+            items.pop();
+            warnings.push(`${path}[${i}] is invalid; entry omitted.`);
+          }
+        }
+        return;
+      }
+    }
+    warnings.push(`${path} is invalid or unsupported; using its default.`);
   };
+  const recoverObject = (target: Record<string, unknown>, input: Record<string, unknown>, prefix: string): void => {
+    // Resources must precede routes; canonical fields must precede obsolete
+    // copies so a malformed unrelated field does not change their precedence.
+    const last = new Set(["routes", "decider", "reviewers", "enabledReviewerIds", "activeExecutor", "executorPool", "externalExecutors"]);
+    const entries = Object.entries(input).sort(([a], [b]) => Number(last.has(a)) - Number(last.has(b)));
+    if (prefix === "execution.retryPolicy") {
+      // Delay bounds are coupled; testing either against the other's default
+      // could incorrectly discard a valid configured pair.
+      const pair = { baseDelayMs: input.baseDelayMs, maxDelayMs: input.maxDelayMs };
+      Object.assign(target, pair);
+      try { normalizeConfig(candidate); }
+      catch {
+        delete target.baseDelayMs;
+        delete target.maxDelayMs;
+        warnings.push(`${prefix} delay bounds are invalid; using default bounds.`);
+      }
+    }
+    for (const [key, item] of entries) {
+      if (prefix === "execution.retryPolicy" && (key === "baseDelayMs" || key === "maxDelayMs")) continue;
+      recover(target, key, item, prefix ? `${prefix}.${key}` : key);
+    }
+  };
+  if (isRecord(value)) recoverObject(candidate, value, "");
+  else warnings.push("Configuration must be an object; using built-in defaults.");
+  return { config: normalizeConfig(candidate), warnings };
 }
 
 export function normalizeConfig(value: unknown): ReviewGateConfig {
@@ -310,8 +382,9 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
     throw new Error("enabled must be a boolean");
   }
-  if (value.reviewers !== undefined && !Array.isArray(value.reviewers)) {
-    throw new Error("reviewers must be an array");
+  rejectLegacyReviewFields(value);
+  if (isRecord(value.execution)) {
+    rejectLegacyExecutionFields(value.execution);
   }
   const config: ReviewGateConfig = {
     ...DEFAULT_CONFIG,
@@ -333,23 +406,51 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
       "waveArtifactTtlMs",
     ),
     retainBundles: normalizeRetainBundles(value.retainBundles),
-    decider: value.decider === undefined ? undefined : normalizeDecider(value.decider, reviewerTimeoutMs),
-    reviewers: Array.isArray(value.reviewers) ? value.reviewers.map((reviewer) => normalizeDecider(reviewer, reviewerTimeoutMs)) : undefined,
-    enabledReviewerIds: value.enabledReviewerIds === undefined
-      ? undefined
-      : normalizeIdList(value.enabledReviewerIds, "enabledReviewerIds"),
     review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
-    execution: value.execution === undefined ? undefined : normalizeExecution(value.execution, executorTimeoutMs),
+    execution: value.execution === undefined ? undefined : normalizeExecution(value.execution),
     ui: value.ui === undefined ? undefined : normalizeUi(value.ui),
     web: normalizeWeb(value.web),
   };
 
-  if (config.reviewers) {
-    validateUniqueReviewerIds(config.reviewers);
-  }
-
   return config;
+}
+
+/**
+ * The pre-cutover reviewer fields (`decider`, `reviewers`,
+ * `enabledReviewerIds`) are no longer accepted. A record that carries them
+ * alongside the canonical `review.activeReviewers` selection is doubled: the
+ * canonical data alone is authoritative and the obsolete copies are ignored
+ * without rewriting the record. An old-only record is rejected with an
+ * actionable diagnostic instead of being silently read as an empty or
+ * review-disabled configuration.
+ */
+function rejectLegacyReviewFields(value: Record<string, unknown>): void {
+  const legacy = ["decider", "reviewers", "enabledReviewerIds"].filter((field) => value[field] !== undefined);
+  if (legacy.length === 0) return;
+  const canonical = isRecord(value.review) && Array.isArray(value.review.activeReviewers);
+  if (canonical) return; // doubled record: the canonical selection wins
+  throw new Error(
+    `unsupported legacy reviewer configuration: ${legacy.join(", ")} is no longer accepted; ` +
+    "select reviewers with review.activeReviewers and define external harnesses in externalAgents",
+  );
+}
+
+/**
+ * The pre-cutover execution fields (`activeExecutor`, `executorPool`,
+ * `externalExecutors`) are no longer accepted. Doubled records (canonical
+ * `execution.workerResources` present) consume the canonical data alone and
+ * ignore the obsolete copies; old-only records fail with an actionable
+ * diagnostic rather than materializing guessed pool entries.
+ */
+function rejectLegacyExecutionFields(execution: Record<string, unknown>): void {
+  const legacy = ["activeExecutor", "executorPool", "externalExecutors"].filter((field) => execution[field] !== undefined);
+  if (legacy.length === 0) return;
+  if (execution.workerResources !== undefined) return; // doubled record: workerResources wins
+  throw new Error(
+    `unsupported legacy executor configuration: ${legacy.join(", ")} is no longer accepted; ` +
+    "configure execution with execution.workerResources and externalAgents",
+  );
 }
 
 function normalizeWeb(value: unknown): WebConfig {
@@ -433,26 +534,89 @@ export interface ReviewerResolution {
   duplicateEnabledIds: string[];
 }
 
-export function resolveReviewers(config: ReviewGateConfig, scopedModels: string[] = []): ReviewerResolution {
-  if (config.review?.activeReviewers !== undefined) {
-    return resolveSelectedReviewers(config, scopedModels);
-  }
-  const catalog = config.reviewers && config.reviewers.length > 0
-    ? config.reviewers
-    : config.decider
-      ? [config.decider]
-      : [];
-  const selected = config.enabledReviewerIds ?? catalog.map((reviewer) => reviewer.id);
+/**
+ * Resolve the canonical `review.activeReviewers` selection.
+ *
+ * `scopedModels` distinguishes the two resolution domains:
+ * - a live configuration is resolved against the currently scoped Pi models
+ *   (an array, possibly empty before any model is known): an out-of-scope pi
+ *   selection is unresolvable until its model is scoped again;
+ * - a materialized (frozen) configuration is self-contained and is resolved
+ *   without scoping: it carries only selections that were resolvable when it
+ *   was frozen, its pi selections are exact model+reasoning pairs, and its
+ *   external references resolve against the agent definitions frozen beside
+ *   them. Later settings or scope changes never re-resolve a frozen config.
+ */
+export function resolveReviewers(config: ReviewGateConfig, scopedModels?: string[]): ReviewerResolution {
+  const selections = config.review?.activeReviewers ?? [];
+  const scoped = new Set(scopedModels ?? []);
+  const agents = new Map(externalAgentCatalog(config).map((agent) => [agent.id, agent]));
+  const reviewers: DeciderConfig[] = [];
+  const unknownIds: string[] = [];
   const counts = new Map<string, number>();
-  for (const id of selected) {
-    counts.set(id, (counts.get(id) ?? 0) + 1);
+  for (const selection of selections) {
+    const key = reviewerSelectionKey(selection);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (selection.source === "pi") {
+      if (scopedModels !== undefined && !scoped.has(selection.model)) {
+        unknownIds.push(key);
+        continue;
+      }
+      reviewers.push({
+        id: internalReviewerId(selection.model),
+        adapter: "pi-model",
+        model: selection.model,
+        ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
+        command: "pi",
+        args: [],
+        timeoutMs: config.reviewerTimeoutMs,
+      });
+      continue;
+    }
+    const agent = agents.get(selection.id);
+    const reviewer = agent ? reviewerFromExternalAgent(agent, config.reviewerTimeoutMs) : undefined;
+    if (!reviewer) {
+      unknownIds.push(key);
+      continue;
+    }
+    reviewers.push(reviewer);
   }
-  const selectedSet = new Set(selected);
-  const catalogIds = new Set(catalog.map((reviewer) => reviewer.id));
   return {
-    reviewers: catalog.filter((reviewer) => selectedSet.has(reviewer.id)),
-    unknownIds: [...selectedSet].filter((id) => !catalogIds.has(id)),
-    duplicateEnabledIds: [...counts].filter(([, count]) => count > 1).map(([id]) => id),
+    reviewers,
+    unknownIds: [...new Set(unknownIds)],
+    duplicateEnabledIds: [...counts].filter(([, count]) => count > 1).map(([key]) => key),
+  };
+}
+
+export function reviewerSelectionKey(selection: ActiveReviewerSelection): string {
+  return selection.source === "pi" ? `pi:${selection.model}` : `external:${selection.id}`;
+}
+
+/**
+ * The canonical frozen form of a live configuration's reviewer selection:
+ * the resolvable selections (exact pi model+reasoning pairs and external
+ * agent references, duplicates retained so duplicate-only changes stay
+ * digest-visible) plus the canonical agent definitions those references need.
+ * Unresolvable selections are not frozen; they remain reported through the
+ * resolution's unknownIds and the selection bookkeeping beside the config.
+ */
+export function frozenReviewerSelection(
+  config: ReviewGateConfig,
+  resolution: ReviewerResolution,
+): { activeReviewers: ActiveReviewerSelection[]; externalAgents: ExternalAgentConfig[] } {
+  const unknown = new Set(resolution.unknownIds);
+  const activeReviewers = (config.review?.activeReviewers ?? [])
+    .filter((selection) => !unknown.has(reviewerSelectionKey(selection)))
+    .map((selection) => ({ ...selection }));
+  const needed = new Set(
+    activeReviewers.filter((selection): selection is { source: "external"; id: string } => selection.source === "external")
+      .map((selection) => selection.id),
+  );
+  return {
+    activeReviewers,
+    externalAgents: externalAgentCatalog(config)
+      .filter((agent) => needed.has(agent.id))
+      .map(cloneExternalAgent),
   };
 }
 
@@ -462,20 +626,29 @@ export function resolveReviewers(config: ReviewGateConfig, scopedModels: string[
  * gate: they produce explicit bounded outcomes at run time while every
  * resolvable reviewer still runs (issue 15 reconciliation semantics).
  */
-export function automaticReviewEnabled(config: ReviewGateConfig, scopedModels: string[] = []): boolean {
+export function automaticReviewEnabled(config: ReviewGateConfig, scopedModels?: string[]): boolean {
   const resolved = resolveReviewers(config, scopedModels);
   return config.enabled && resolved.reviewers.length > 0;
 }
 
-export function configWithReviewers(config: ReviewGateConfig, reviewers: DeciderConfig[], enabled: boolean): ReviewGateConfig {
+/**
+ * Freeze one canonical configuration representation for a review window:
+ * the base config's evidence-affecting settings plus the canonical reviewer
+ * selection (with the exact external agent definitions it needs). The result
+ * is self-contained: resolving it never consults live settings, so an
+ * in-flight invocation keeps the exact reviewers it started with.
+ */
+export function configWithReviewers(
+  config: ReviewGateConfig,
+  selection: { activeReviewers: readonly ActiveReviewerSelection[]; externalAgents: readonly ExternalAgentConfig[] },
+  enabled: boolean,
+): ReviewGateConfig {
   const { ui: _ui, ...reviewRelevantConfig } = config;
   return {
     ...reviewRelevantConfig,
     enabled,
-    review: undefined,
-    decider: undefined,
-    reviewers: reviewers.map(cloneDecider),
-    enabledReviewerIds: reviewers.map((reviewer) => reviewer.id),
+    review: { activeReviewers: selection.activeReviewers.map((s) => ({ ...s })) },
+    externalAgents: selection.externalAgents.map(cloneExternalAgent),
   };
 }
 
@@ -523,7 +696,7 @@ export function materializeReviewConfig(config: ReviewGateConfig, scopedModels: 
   const resolution = resolveReviewers(config, scopedModels);
   const materialized = configWithReviewers(
     config,
-    resolution.reviewers,
+    frozenReviewerSelection(config, resolution),
     automaticReviewEnabled(config, scopedModels),
   );
   rememberUnresolvedReviewerSelections(materialized, resolution.unknownIds);
@@ -533,11 +706,10 @@ export function materializeReviewConfig(config: ReviewGateConfig, scopedModels: 
 
 export function activeExternalExecutor(
   config: ReviewGateConfig,
-  selection: ExecutorSelection | undefined = config.execution?.activeExecutor ?? undefined,
+  selection: ExecutorSelection | undefined,
 ): ExternalExecutorConfig | undefined {
-  const active = selection;
-  if (active?.source !== "external") return undefined;
-  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === active.id);
+  if (selection?.source !== "external") return undefined;
+  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === selection.id);
   return agent ? executorFromExternalAgent(agent, config.executorTimeoutMs) : undefined;
 }
 
@@ -546,23 +718,12 @@ export function resolvedExecutorPool(config: ReviewGateConfig): ExecutorPoolEntr
 }
 
 export function resolvedWorkerResources(config: ReviewGateConfig): ExecutorPoolEntry[] {
-  if (config.execution?.workerResources !== undefined) {
-    return config.execution.workerResources.map((entry) => ({
-      entryId: entry.resourceId,
-      selection: cloneExecutorSelection(entry.selection),
-      maxConcurrent: entry.maxConcurrent,
-    }));
-  }
-  if (config.execution?.executorPool !== undefined) {
-    return config.execution.executorPool.map(cloneExecutorPoolEntry);
-  }
-  const active = config.execution?.activeExecutor;
-  if (!active) return [];
-  return [{
-    entryId: executorEntryId(active),
-    selection: cloneExecutorSelection(active),
-    maxConcurrent: config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS,
-  }];
+  if (config.execution?.workerResources === undefined) return [];
+  return config.execution.workerResources.map((entry) => ({
+    entryId: entry.resourceId,
+    selection: cloneExecutorSelection(entry.selection),
+    maxConcurrent: entry.maxConcurrent,
+  }));
 }
 
 export function resolvedWorkerRoute(config: ReviewGateConfig, kind: "execute" | "research"): ExecutorPoolEntry[] {
@@ -635,30 +796,7 @@ export function executorAgentFingerprint(config: ReviewGateConfig, selection: Ex
 }
 
 export function externalAgentCatalog(config: ReviewGateConfig): ExternalAgentConfig[] {
-  const agents = (config.externalAgents ?? []).map(cloneExternalAgent);
-  const byId = new Map(agents.map((agent) => [agent.id, agent]));
-  for (const executor of config.execution?.externalExecutors ?? []) {
-    const existing = byId.get(executor.id);
-    if (existing) continue;
-    const agent = externalAgentFromLegacyExecutor(executor);
-    agents.push(agent);
-    byId.set(agent.id, agent);
-  }
-  const legacyReviewers = config.reviewers?.length ? config.reviewers : config.decider ? [config.decider] : [];
-  for (const reviewer of legacyReviewers) {
-    if (reviewer.adapter === "pi-model") continue;
-    const existing = byId.get(reviewer.id);
-    if (existing && existing.adapter === reviewer.adapter) {
-      existing.review ??= roleFromLegacyReviewer(reviewer);
-      continue;
-    }
-    if (!existing) {
-      const agent = externalAgentFromLegacyReviewer(reviewer);
-      agents.push(agent);
-      byId.set(agent.id, agent);
-    }
-  }
-  return agents;
+  return (config.externalAgents ?? []).map(cloneExternalAgent);
 }
 
 export function externalAgentSupportsReview(agent: ExternalAgentConfig): boolean {
@@ -727,76 +865,6 @@ function findConfigPath(env: NodeJS.ProcessEnv): string | undefined {
     join(homedir(), ".config", "pi", "review-gate.json"),
   ];
   return candidates.find((candidate) => existsSync(candidate));
-}
-
-function normalizeDecider(value: unknown, defaultTimeoutMs = DEFAULT_REVIEWER_TIMEOUT_MS): DeciderConfig {
-  if (!isRecord(value)) {
-    throw new Error("decider must be an object");
-  }
-  if (typeof value.id !== "string" || !value.id.trim()) {
-    throw new Error("decider requires id");
-  }
-  if (!REVIEWER_ID_PATTERN.test(value.id) || value.id === "." || value.id === "..") {
-    throw new Error("reviewer id may contain only letters, numbers, underscores, periods, and hyphens");
-  }
-  if (value.adapter === "generic-cli") {
-    if (typeof value.command !== "string" || !value.command.trim()) {
-      throw new Error("generic-cli decider requires command");
-    }
-    const env = normalizeStringRecord(value.env, "generic-cli reviewer env");
-    return {
-      id: value.id,
-      adapter: "generic-cli",
-      command: value.command,
-      args: normalizeStringArray(value.args, "generic-cli reviewer args"),
-      ...(env ? { env } : {}),
-      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "generic-cli reviewer timeoutMs"),
-    };
-  }
-  if (value.adapter === "codex-cli") {
-    const env = normalizeStringRecord(value.env, "codex reviewer env");
-    return {
-      id: value.id,
-      adapter: "codex-cli",
-      command: normalizeOptionalNonEmptyString(value.command, "codex reviewer command") ?? "codex",
-      args: normalizeStringArray(value.args, "codex reviewer args"),
-      ...(env ? { env } : {}),
-      model: normalizeOptionalNonEmptyString(value.model, "codex reviewer model"),
-      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "codex reviewer timeoutMs"),
-    };
-  }
-  if (value.adapter === "claude-cli") {
-    const env = normalizeStringRecord(value.env, "claude reviewer env");
-    return {
-      id: value.id,
-      adapter: "claude-cli",
-      command: normalizeOptionalNonEmptyString(value.command, "claude reviewer command") ?? "claude",
-      args: normalizeStringArray(value.args, "claude reviewer args"),
-      ...(env ? { env } : {}),
-      model: normalizeOptionalNonEmptyString(value.model, "claude reviewer model"),
-      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "claude reviewer timeoutMs"),
-    };
-  }
-  if (value.adapter === "pi-model") {
-    if (typeof value.model !== "string" || !value.model.trim()) {
-      throw new Error("pi-model decider requires model");
-    }
-    const env = normalizeStringRecord(value.env, "pi reviewer env");
-    const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "pi reviewer thinkingLevel");
-    const args = normalizeStringArray(value.args, "pi reviewer args");
-    assertNoPiToolPolicyArgs(args, "pi reviewer args");
-    return {
-      id: value.id,
-      adapter: "pi-model",
-      model: value.model,
-      ...(thinkingLevel ? { thinkingLevel } : {}),
-      command: normalizeOptionalNonEmptyString(value.command, "pi reviewer command") ?? "pi",
-      args,
-      ...(env ? { env } : {}),
-      timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "pi reviewer timeoutMs"),
-    };
-  }
-  throw new Error("unsupported decider adapter");
 }
 
 function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {
@@ -921,25 +989,16 @@ function normalizeExternalAgentRole(value: unknown, role: "review" | "execution"
   };
 }
 
-function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.executorTimeoutMs): ExecutionConfig {
+function normalizeExecution(value: unknown): ExecutionConfig {
   if (!isRecord(value)) {
     throw new Error("execution must be an object");
   }
-  const activeExecutor = value.activeExecutor === undefined
-    ? undefined
-    : normalizeActiveExecutor(value.activeExecutor);
-  const executorPool = value.executorPool === undefined
-    ? undefined
-    : normalizeExecutorPool(value.executorPool);
   const workerResources = value.workerResources === undefined
     ? undefined
     : normalizeWorkerResources(value.workerResources);
   const routes = value.routes === undefined
     ? undefined
-    : normalizeWorkerRoutes(value.routes, workerResources ?? executorPool ?? []);
-  const externalExecutors = value.externalExecutors === undefined
-    ? undefined
-    : normalizeExternalExecutors(value.externalExecutors, defaultTimeoutMs);
+    : normalizeWorkerRoutes(value.routes, workerResources ?? []);
   const maxWorkers = normalizeMaxWorkers(value.maxWorkers);
   const retryPolicy = normalizeExecutionRetryPolicy(value.retryPolicy);
   const subtaskNotifications = normalizeSubtaskNotificationMode(value.subtaskNotifications);
@@ -947,11 +1006,8 @@ function normalizeExecution(value: unknown, defaultTimeoutMs = DEFAULT_CONFIG.ex
     throw new Error("execution.deferredPiTools must be a boolean");
   }
   return {
-    activeExecutor,
-    executorPool,
     workerResources,
     routes,
-    externalExecutors,
     ...(maxWorkers !== undefined ? { maxWorkers } : {}),
     retryPolicy,
     subtaskNotifications,
@@ -1018,32 +1074,6 @@ function normalizeSubtaskNotificationMode(value: unknown): SubtaskNotificationMo
   return value;
 }
 
-function normalizeExecutorPool(value: unknown): ExecutorPoolEntry[] {
-  if (!Array.isArray(value)) throw new Error("execution.executorPool must be an array");
-  const entries = value.map((entry, index) => {
-    if (!isRecord(entry)) throw new Error(`execution.executorPool[${index}] must be an object`);
-    const selection = normalizeActiveExecutor(entry.selection);
-    if (!selection) throw new Error(`execution.executorPool[${index}].selection cannot be null`);
-    const entryId = typeof entry.entryId === "string" && entry.entryId.trim()
-      ? entry.entryId.trim()
-      : executorEntryId(selection);
-    validateConfiguredId(entryId, `execution.executorPool[${index}].entryId`);
-    const maxConcurrent = normalizeRequiredWorkerCount(
-      entry.maxConcurrent,
-      `execution.executorPool[${index}].maxConcurrent`,
-    );
-    return { entryId, selection, maxConcurrent };
-  });
-  validateUniqueConfiguredIds(entries.map((entry) => ({ id: entry.entryId })), "executor pool entry");
-  const selections = new Set<string>();
-  for (const entry of entries) {
-    const key = executorSelectionKey(entry.selection);
-    if (selections.has(key)) throw new Error(`duplicate executor pool selection: ${key}`);
-    selections.add(key);
-  }
-  return entries;
-}
-
 function normalizeExecutionRetryPolicy(value: unknown): ExecutionRetryPolicy {
   if (value === undefined) return { ...DEFAULT_EXECUTION_RETRY_POLICY };
   if (!isRecord(value)) throw new Error("execution.retryPolicy must be an object");
@@ -1086,11 +1116,11 @@ function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
     return null;
   }
   if (!isRecord(value)) {
-    throw new Error("execution.activeExecutor must be an object or null");
+    throw new Error("executor selection must be an object or null");
   }
   if (value.source === "pi") {
     if (typeof value.model !== "string" || !value.model.trim()) {
-      throw new Error("pi active executor requires model");
+      throw new Error("pi executor selection requires model");
     }
     const thinkingLevel = normalizeOptionalThinkingLevel(value.thinkingLevel, "pi executor thinkingLevel");
     return {
@@ -1101,12 +1131,12 @@ function normalizeActiveExecutor(value: unknown): ActiveExecutorSelection {
   }
   if (value.source === "external") {
     if (typeof value.id !== "string" || !value.id.trim()) {
-      throw new Error("external active executor requires id");
+      throw new Error("external executor selection requires id");
     }
     validateConfiguredId(value.id, "external executor");
     return { source: "external", id: value.id };
   }
-  throw new Error("unsupported execution.activeExecutor source");
+  throw new Error("unsupported executor selection source");
 }
 
 function normalizeRequiredWorkerCount(value: unknown, field: string): number {
@@ -1116,103 +1146,6 @@ function normalizeRequiredWorkerCount(value: unknown, field: string): number {
     throw new Error(`${field} must be between 1 and ${MAX_EXECUTION_WORKERS}`);
   }
   return count;
-}
-
-function normalizeExternalExecutors(value: unknown, defaultTimeoutMs: number): ExternalExecutorConfig[] {
-  if (!Array.isArray(value)) {
-    throw new Error("execution.externalExecutors must be an array");
-  }
-  const executors = value.map((executor) => normalizeExternalExecutor(executor, defaultTimeoutMs));
-  validateUniqueConfiguredIds(executors, "external executor");
-  return executors;
-}
-
-function normalizeExternalExecutor(value: unknown, defaultTimeoutMs: number): ExternalExecutorConfig {
-  if (!isRecord(value)) {
-    throw new Error("external executor must be an object");
-  }
-  if (typeof value.id !== "string" || !value.id.trim()) {
-    throw new Error("external executor requires id");
-  }
-  validateConfiguredId(value.id, "external executor");
-  const common = {
-    id: value.id,
-    args: normalizeStringArray(value.args, "external executor args"),
-    env: normalizeStringRecord(value.env, "external executor env"),
-    timeoutMs: positiveIntegerOrDefault(value.timeoutMs, defaultTimeoutMs, "external executor timeoutMs"),
-  };
-  if (value.adapter === "codex-cli") {
-    return {
-      ...common,
-      adapter: "codex-cli",
-      command: normalizeOptionalNonEmptyString(value.command, "codex executor command") ?? "codex",
-      model: normalizeOptionalNonEmptyString(value.model, "codex executor model"),
-    };
-  }
-  if (value.adapter === "claude-cli") {
-    return {
-      ...common,
-      adapter: "claude-cli",
-      command: normalizeOptionalNonEmptyString(value.command, "claude executor command") ?? "claude",
-      model: normalizeOptionalNonEmptyString(value.model, "claude executor model"),
-    };
-  }
-  if (value.adapter === "run-as-binary") {
-    if (value.protocol !== "pi-review-executor-jsonl-v1") {
-      throw new Error("run-as-binary external executor requires protocol pi-review-executor-jsonl-v1");
-    }
-    if (typeof value.command !== "string" || !value.command.trim()) {
-      throw new Error("run-as-binary external executor requires command");
-    }
-    return {
-      ...common,
-      adapter: "run-as-binary",
-      protocol: "pi-review-executor-jsonl-v1",
-      command: value.command,
-    };
-  }
-  throw new Error("unsupported external executor adapter");
-}
-
-function resolveSelectedReviewers(config: ReviewGateConfig, scopedModels: string[]): ReviewerResolution {
-  const selections = config.review?.activeReviewers ?? [];
-  const scoped = new Set(scopedModels);
-  const agents = new Map(externalAgentCatalog(config).map((agent) => [agent.id, agent]));
-  const reviewers: DeciderConfig[] = [];
-  const unknownIds: string[] = [];
-  const counts = new Map<string, number>();
-  for (const selection of selections) {
-    const key = selection.source === "pi" ? `pi:${selection.model}` : `external:${selection.id}`;
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-    if (selection.source === "pi") {
-      if (!scoped.has(selection.model)) {
-        unknownIds.push(key);
-        continue;
-      }
-      reviewers.push({
-        id: internalReviewerId(selection.model),
-        adapter: "pi-model",
-        model: selection.model,
-        ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
-        command: "pi",
-        args: [],
-        timeoutMs: config.reviewerTimeoutMs,
-      });
-      continue;
-    }
-    const agent = agents.get(selection.id);
-    const reviewer = agent ? reviewerFromExternalAgent(agent, config.reviewerTimeoutMs) : undefined;
-    if (!reviewer) {
-      unknownIds.push(key);
-      continue;
-    }
-    reviewers.push(reviewer);
-  }
-  return {
-    reviewers,
-    unknownIds: [...new Set(unknownIds)],
-    duplicateEnabledIds: [...counts].filter(([, count]) => count > 1).map(([key]) => key),
-  };
 }
 
 function reviewerFromExternalAgent(agent: ExternalAgentConfig, defaultTimeoutMs: number): DeciderConfig | undefined {
@@ -1274,45 +1207,6 @@ function mergedAgentRole(agent: ExternalAgentConfig, role: ExternalAgentRoleConf
   };
 }
 
-function externalAgentFromLegacyExecutor(executor: ExternalExecutorConfig): ExternalAgentConfig {
-  return {
-    id: executor.id,
-    adapter: executor.adapter,
-    command: executor.command,
-    model: "model" in executor ? executor.model : undefined,
-    args: [],
-    env: undefined,
-    execution: {
-      args: executor.args ? [...executor.args] : [],
-      env: executor.env ? { ...executor.env } : undefined,
-      timeoutMs: executor.timeoutMs,
-      protocol: executor.adapter === "run-as-binary" ? executor.protocol : undefined,
-    },
-  };
-}
-
-function externalAgentFromLegacyReviewer(reviewer: Exclude<DeciderConfig, PiDeciderConfig>): ExternalAgentConfig {
-  return {
-    id: reviewer.id,
-    adapter: reviewer.adapter,
-    command: reviewer.command,
-    model: "model" in reviewer ? reviewer.model : undefined,
-    args: [],
-    env: undefined,
-    review: roleFromLegacyReviewer(reviewer),
-  };
-}
-
-function roleFromLegacyReviewer(reviewer: DeciderConfig): ExternalAgentRoleConfig {
-  return {
-    args: reviewer.args ? [...reviewer.args] : [],
-    env: reviewer.env ? { ...reviewer.env } : undefined,
-    model: "model" in reviewer ? reviewer.model : undefined,
-    timeoutMs: reviewer.timeoutMs,
-    protocol: reviewer.adapter === "generic-cli" ? "pi-reviewer-json-v1" : undefined,
-  };
-}
-
 function cloneExternalAgent(agent: ExternalAgentConfig): ExternalAgentConfig {
   return {
     ...agent,
@@ -1329,19 +1223,6 @@ function cloneExternalAgent(agent: ExternalAgentConfig): ExternalAgentConfig {
       env: agent.execution.env ? { ...agent.execution.env } : undefined,
     } : undefined,
   };
-}
-
-function normalizeIdList(value: unknown, field: string): string[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`${field} must be an array`);
-  }
-  return value.map((item) => {
-    if (typeof item !== "string" || !item.trim()) {
-      throw new Error(`${field} entries must be non-empty strings`);
-    }
-    validateConfiguredId(item, field);
-    return item;
-  });
 }
 
 function normalizeStringRecord(value: unknown, field: string): Record<string, string> | undefined {
@@ -1391,14 +1272,6 @@ function validateUniqueConfiguredIds(values: Array<{ id: string }>, label: strin
   }
 }
 
-function cloneDecider(decider: DeciderConfig): DeciderConfig {
-  return {
-    ...decider,
-    args: decider.args ? [...decider.args] : undefined,
-    env: decider.env ? { ...decider.env } : undefined,
-  };
-}
-
 function cloneExecutorSelection(selection: ExecutorSelection): ExecutorSelection {
   return selection.source === "external"
     ? { source: "external", id: selection.id }
@@ -1407,14 +1280,6 @@ function cloneExecutorSelection(selection: ExecutorSelection): ExecutorSelection
       model: selection.model,
       ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
     };
-}
-
-function cloneExecutorPoolEntry(entry: ExecutorPoolEntry): ExecutorPoolEntry {
-  return {
-    entryId: entry.entryId,
-    selection: cloneExecutorSelection(entry.selection),
-    maxConcurrent: entry.maxConcurrent,
-  };
 }
 
 function normalizeRetainBundles(value: unknown): RetainBundles {
@@ -1429,16 +1294,6 @@ function normalizeOptionalThinkingLevel(value: unknown, field: string): Thinking
     return value as ThinkingLevel;
   }
   throw new Error(`${field} must be one of: ${THINKING_LEVELS.join(", ")}`);
-}
-
-function validateUniqueReviewerIds(reviewers: DeciderConfig[]): void {
-  const seen = new Set<string>();
-  for (const reviewer of reviewers) {
-    if (seen.has(reviewer.id)) {
-      throw new Error(`reviewer id must be unique: ${reviewer.id}`);
-    }
-    seen.add(reviewer.id);
-  }
 }
 
 function positiveIntegerOrDefault(value: unknown, fallback: number, field: string): number {

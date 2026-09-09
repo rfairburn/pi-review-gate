@@ -155,7 +155,9 @@ async function managerWithEvidenceTask(executionId: string, taskId: string, sess
       command: process.execPath,
       execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
     }],
-    execution: { activeExecutor: { source: "external", id: "unstarted" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+    },
   });
   config.execution!.maxWorkers = 0;
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
@@ -470,7 +472,9 @@ test("pi stdout fallback retains a string tool result verbatim, not JSON-escaped
       command: process.execPath,
       execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
     }],
-    execution: { activeExecutor: { source: "external", id: "unstarted" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+    },
   });
   config.execution!.maxWorkers = 0;
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
@@ -541,7 +545,9 @@ test("codex web search completions retain the query text and previously retained
       command: process.execPath,
       execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
     }],
-    execution: { activeExecutor: { source: "external", id: "unstarted" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+    },
   });
   config.execution!.maxWorkers = 0;
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });

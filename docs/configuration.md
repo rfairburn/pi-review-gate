@@ -19,7 +19,9 @@ described only briefly here is owned by the linked page.
   run — but the extension still loads `WebSearch`, `WebFetch`, `ApplyPatch`, and the
   background shell. Model-facing subtask tools require at least one resolvable configured
   worker resource. Only `PI_REVIEW_GATE_DISABLED` disables the whole extension.
-- The config file must be a JSON object; invalid JSON or shapes fail with an error.
+- The config file must be a JSON object. Startup reports invalid settings and uses
+  defaults for those settings while retaining valid values. An unreadable or
+  unparseable document uses built-in defaults; the file is never overwritten.
 
 ## Kill switches
 
@@ -131,11 +133,29 @@ limits for review and execution. An inactive external definition does not need t
 installed; its command is checked when that definition is selected or run. Pi-scoped
 internal models are never copied into the external catalog.
 
-### Legacy compatibility
+### Pre-cutover configuration fields
 
-The older single `decider` field is still supported, as are `reviewers`,
-`enabledReviewerIds`, and `execution.externalExecutors`. A successful `/review-settings`
-save migrates their definitions into `externalAgents`.
+The pre-cutover fields `decider`, `reviewers`, `enabledReviewerIds`,
+`execution.activeExecutor`, `execution.executorPool`, and
+`execution.externalExecutors` are no longer accepted. A config that carries
+only one of them fails strict validation. Startup warns and omits unsupported fields;
+it does not convert them into reviewer or worker selections. Use `externalAgents`
+plus `review.activeReviewers`, or `execution.workerResources`. There is no migration: a record
+that carries both the old and the new shape uses the canonical fields and ignores the
+old copies, and `/review-settings` saves never rewrite stored records into either
+shape. Reviewer and executor selections that cannot be resolved against the current
+catalog remain reported (as unavailable selections) instead of being dropped or
+silently disabling review.
+
+Startup recovery reports invalid fields and continues normal tool initialization.
+Valid settings, including configured workers and reviewers, survive unrelated errors.
+Nested scalar settings use their existing defaults. Invalid selection, agent, resource,
+or route entries are omitted individually rather than inventing a replacement model,
+command, or authorization reference; valid sibling entries remain. Model/reasoning
+pairs stay together. An unreadable document uses built-in defaults, which contain no
+reviewer or worker selections; this is not a successful review. Explicit configuration
+writes still validate strictly. The environment kill switch and worker tool ceilings
+remain authoritative.
 
 ## Delegated execution fields
 

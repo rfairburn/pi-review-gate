@@ -6,24 +6,24 @@ import test from "node:test";
 import { persistReviewSettings, persistSubtasksViewPreference, updateReviewGateConfig, type ReviewSettingsSelection } from "../src/settings/persistence";
 
 const selection: ReviewSettingsSelection = {
-  executorPool: [],
-  activeReviewers: [],
-  reviewerTimeoutMs: 600_000,
-  executorTimeoutMs: 1_800_000,
-  maxCorrectionCycles: 3,
-  implementationGuidanceAfterCorrectionAttempts: 1,
-  retainBundles: "on-failure",
-  maxWorkers: 2,
-  retryPolicy: {
+workerResources: [],
+activeReviewers: [],
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 3,
+implementationGuidanceAfterCorrectionAttempts: 1,
+retainBundles: "on-failure",
+maxWorkers: 2,
+retryPolicy: {
     maxRetries: 2,
     baseDelayMs: 1_000,
     maxDelayMs: 15_000,
     jitter: true,
     maxSameIncidentRepeats: 2,
   },
-  subtaskNotifications: "quiet",
-  deferredPiTools: true,
-  subtasksViewExpanded: false,
+subtaskNotifications: "quiet",
+deferredPiTools: true,
+subtasksViewExpanded: false,
 };
 
 test("browser approval persistence round-trips every mode and preserves unrelated Web settings", async () => {

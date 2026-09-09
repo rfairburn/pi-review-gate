@@ -36,11 +36,19 @@ The same reconciliation applies in-session: saving new reviewer settings through
 an outdated or empty selection does not wait for a reload; an in-flight review finishes
 under its original selection and later reviews use the new one. Genuine corruption still
 fails closed during restore: integrity, conversation, and cwd validation reject the
-sidecar before any state is applied.
+sidecar before any state is applied. Superseded-format sidecars are likewise never
+guessed at: persisted snapshots predating the omission ledger fail restore with an
+actionable diagnostic while the file is preserved untouched, and sidecars whose
+persisted review window lacks the reviewer-selection digest likewise fail restore with
+an actionable diagnostic while the file is preserved untouched (records without a
+review window remain restorable).
 
 Queued inputs from a review interrupted by restart are not reordered automatically: use
 `/review-now` to finish the review and release them, or `/review-clear` to cancel them
-(see [Review workflow](review-workflow.md#commands)).
+(see [Review workflow](review-workflow.md#commands)). Queued inputs recorded before
+durable delivery tracking have no active delivery record, so they cannot be released
+through `/review-now`; recovery notices identify them separately, and their contents
+stay preserved until cancelled with `/review-clear`.
 
 Manifests outside that exact restored association remain explicit recovery operations
 through `recoverLandingManifest()`. A different conversation, session file, or cwd never

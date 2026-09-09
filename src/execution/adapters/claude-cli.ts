@@ -16,7 +16,7 @@ import { parseClaudeUsage } from "../../usage";
 import { ClaudeStreamJsonParser, ClaudeStreamActivityExtractor } from "../progress";
 import { writeExecutorArtifacts } from "../artifacts";
 import type { ExecutorAdapter, ExecutorInteractionAcknowledgement, ExecutorRequest, ExecutorTurn } from "../types";
-import { createExecutorToolCatalog } from "../tool-catalog";
+import { createExecutorToolCatalog, rejectPreCutoverRequestFields } from "../tool-catalog";
 
 const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<typeof import("@anthropic-ai/claude-agent-sdk")>;
 
@@ -68,15 +68,14 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
   }
 
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
+    rejectPreCutoverRequestFields(request);
     const readOnly = request.workspaceAccess === "read-only";
     const toolCatalog = request.executorToolCatalog
       ? createExecutorToolCatalog(
           request.executorToolCatalog.allowedToolCatalog,
           request.executorToolCatalog.initialActiveTools,
         )
-      : request.allowedTools
-        ? createExecutorToolCatalog(request.allowedTools, request.initialActiveTools)
-        : undefined;
+      : undefined;
     // Claude has no adapter-specific deferred activation channel. Until it
     // does, preserve the full role-authorized research catalog.
     const researchTools = readOnly ? claudeResearchTools(toolCatalog?.allowedToolCatalog) : [];

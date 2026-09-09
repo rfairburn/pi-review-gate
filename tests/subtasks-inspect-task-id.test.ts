@@ -70,7 +70,9 @@ async function managerWithGroup(
       command: process.execPath,
       execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
     }],
-    execution: { activeExecutor: { source: "external", id: "unstarted" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+    },
   });
   // Nothing may ever dispatch in these fixtures: settlement is never needed.
   config.execution!.maxWorkers = 0;
@@ -174,7 +176,9 @@ test("registered shared guidance requires an explicit taskId for inspection only
       command: process.execPath,
       execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
     }],
-    execution: { activeExecutor: { source: "external", id: "unstarted" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+    },
   });
   config.execution!.maxWorkers = 0;
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => process.cwd() });

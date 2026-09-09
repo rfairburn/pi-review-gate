@@ -55,9 +55,16 @@ test("default initial sets keep authorized native discovery active and preserve 
   );
   // Unknown/unauthorized discovery names never widen the subset.
   assert.deepEqual(
-    defaultExecutorInitialActiveTools(["write"]),
+    defaultExecutorInitialActiveTools(["unknown-discovery"]),
     [],
   );
+});
+
+test("new Pi worker defaults activate authorized write without widening research catalogs (#45)", () => {
+  const allowed = ["read", "edit", "write", "ApplyPatch", "SubtasksStart"];
+  const worker = createPiWorkerToolCatalog(createExecutorToolCatalog(allowed, defaultExecutorInitialActiveTools(allowed)));
+  assert.deepEqual(worker.initialActiveTools, ["read", "edit", "write", "ApplyPatch"]);
+  assert.deepEqual(defaultExecutorInitialActiveTools(["read", "grep", "find", "ls"]), ["read", "grep", "find", "ls"]);
 });
 
 test("Pi worker catalogs remove orchestrator-only delegation controls without mutating the durable catalog", () => {

@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.22]
+
+### Fixed
+
+- Authorized `write` is active by default alongside `edit` and `ApplyPatch` in new
+  top-level and delegated Pi coding sessions, without deferred activation. Planning
+  and research restrictions, explicit exclusions, and previously captured worker
+  catalogs remain unchanged (Refs #45).
+
 ## [0.1.0-dev.21]
 
 ### Fixed

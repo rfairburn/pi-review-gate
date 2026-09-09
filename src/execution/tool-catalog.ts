@@ -27,7 +27,7 @@ export const NATIVE_DISCOVERY_TOOLS = ["grep", "find", "ls"] as const;
  * --exclude-tools, or --no-tools keeps those capabilities excluded.
  */
 export const DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER = [
-  "read", ...NATIVE_DISCOVERY_TOOLS, "bash", "edit", "ApplyPatch", "SubtasksStart",
+  "read", ...NATIVE_DISCOVERY_TOOLS, "bash", "edit", "write", "ApplyPatch", "SubtasksStart",
 ] as const;
 
 export interface ExecutorToolCatalog {

@@ -16,6 +16,8 @@ import {
 
 export interface ReviewSettingsSelection {
   operatingMode: OperatingMode;
+  /** Direct operating-mode cycle hotkey (issue #20). */
+  modeCycleShortcut: string;
   workerResources?: ExecutorPoolEntry[];
   executeRoute?: WorkerRouteEntry[];
   researchRoute?: WorkerRouteEntry[];
@@ -70,6 +72,7 @@ export async function persistReviewSettings(
     review.activeReviewers = selection.activeReviewers.map((reviewer) => ({ ...reviewer }));
     parsed.review = review;
     parsed.operatingMode = selection.operatingMode;
+    parsed.modeCycleShortcut = selection.modeCycleShortcut;
     parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
     parsed.executorTimeoutMs = selection.executorTimeoutMs;
     parsed.maxCorrectionCycles = selection.maxCorrectionCycles;

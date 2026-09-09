@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.20]
+
+### Added
+
+- A direct operating-mode cycling hotkey (default `alt+m`, configurable as
+  `modeCycleShortcut` and under **Mode cycle hotkey** in `/review-settings`) advances
+  the canonical persisted mode one step — `execute` → `orchestrate` → `plan-research`
+  → `execute`, wrapping — with no selector or confirmation popup. It reuses the
+  single shared mode transition and persistence path (status indicator, notice,
+  deferred tool reapply), keeps already-running subtask authority untouched, and adds
+  no model-facing mode tool or duplicate mode state. A key that is already a built-in
+  Pi binding is rejected by name in `/review-settings` and, at startup, named in a
+  warning with the hotkey left unregistered rather than overridden, so the built-in
+  action keeps working; conflicts with other extensions are not detectable by the
+  extension (Pi reports those itself at startup). The hotkey binding is captured at
+  extension load, so a changed key applies after `/reload` (Refs #20).
+
 ## [0.1.0-dev.19]
 
 ### Added

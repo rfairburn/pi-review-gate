@@ -41,6 +41,7 @@ described only briefly here is owned by the linked page.
 | --- | --- | --- |
 | `enabled` | `true` | Automatic-review master switch (see kill switches above). |
 | `operatingMode` | `"orchestrate"` | Primary assistant posture: `execute`, `orchestrate`, or `plan-research` (see operating modes below). |
+| `modeCycleShortcut` | `"alt+m"` | Human hotkey that directly cycles the operating modes in the order `execute` → `orchestrate` → `plan-research` → `execute` (see operating modes below). |
 | `reviewerTimeoutMs` | `600000` | Default reviewer timeout (10 minutes). |
 | `executorTimeoutMs` | `1800000` | Default executor timeout (30 minutes). |
 | `maxCorrectionCycles` | `1` | Correction budget before feedback is classified as deferred. |
@@ -75,6 +76,30 @@ Prompt files live in `scripts/orchestrator-system-prompt.md`,
 The extension selects the mode segment rather than the launcher permanently appending
 orchestration instructions. Planning uses existing read-only tools; it does not add
 filesystem discovery or Git-history tools.
+
+### Direct mode-cycle hotkey
+
+Pressing the configured hotkey (default `alt+m`) advances the operating mode one step
+in the canonical order — `execute` → `orchestrate` → `plan-research` → `execute`,
+wrapping at the end — with no selector and no confirmation popup. It uses the same
+persisted `operatingMode` field, the same shared transition, and the same persistence
+path as the **Operating mode** selector, and the existing `operating mode:` status
+indicator updates in place. The hotkey works in every mode, including Plan/research,
+and applies from the next turn like any mode change; already-running subtasks keep
+their captured instructions. There is no model-facing tool for changing modes, and no
+mode state is stored anywhere besides the canonical config field.
+
+The hotkey is editable under **Mode cycle hotkey** in `/review-settings`. Values must
+use a single key, optionally prefixed with modifiers (`ctrl`, `shift`, `alt`,
+`super`) — for example `alt+m`, `ctrl+shift+r`, or `f6`. Avoid binding ordinary
+unmodified typing keys unless you intend to replace their normal input behavior. If the chosen key is already a built-in Pi binding, the
+settings menu rejects it by name and asks for a different key, so the built-in action
+keeps working; at startup a config file that carries an occupied key is named in a
+warning and the hotkey is simply not registered. Conflicts with other extensions are
+not detectable here — Pi reports those itself at startup — and the extension does not
+claim otherwise. The binding itself is captured when the extension loads, so a changed
+hotkey takes effect after `/reload`, just like `keybindings.json`; the persisted mode
+change itself never needs a reload.
 
 ## Reviewers
 

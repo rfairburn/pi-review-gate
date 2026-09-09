@@ -8,7 +8,7 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { OperatingMode } from "./config";
+import { OPERATING_MODES, type OperatingMode } from "./config";
 
 export const OPERATING_MODE_SEGMENT_FILES: Record<OperatingMode, string> = {
   execute: "execution-system-prompt.md",
@@ -29,4 +29,14 @@ export function loadOperatingModeSegments(scriptsDir: string): Record<OperatingM
     segments[mode] = readFileSync(join(scriptsDir, OPERATING_MODE_SEGMENT_FILES[mode]), "utf8");
   }
   return segments;
+}
+
+/**
+ * Direct mode cycling (issue #20): the canonical declaration order wraps
+ * execute → orchestrate → plan-research → execute with no selector or
+ * confirmation popup.
+ */
+export function nextOperatingMode(current: OperatingMode): OperatingMode {
+  const index = OPERATING_MODES.indexOf(current);
+  return OPERATING_MODES[(index + 1) % OPERATING_MODES.length]!;
 }

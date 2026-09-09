@@ -72,6 +72,7 @@ async function waitForFile(path: string, timeoutMs: number): Promise<void> {
 function makeConfigWithReportingWriter(): ReviewGateConfig {
   return {
 enabled: false,
+modeCycleShortcut: "alt+m",
 operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
@@ -129,6 +130,7 @@ externalAgents: [
 function makeConfigWithTargetedWriter(): ReviewGateConfig {
   return {
 enabled: false,
+modeCycleShortcut: "alt+m",
 operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
@@ -184,6 +186,7 @@ function makeConfigWithSyncSlowExecutor(syncFile: string, markerFile: string): R
   const escapedMarkerFile = markerFile.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   return {
 enabled: false,
+modeCycleShortcut: "alt+m",
 operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,

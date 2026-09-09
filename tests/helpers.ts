@@ -4,6 +4,7 @@ export function fakeNeedsChangesConfig(overrides: Partial<ReviewGateConfig> = {}
   return {
     enabled: true,
     operatingMode: "orchestrate",
+    modeCycleShortcut: "alt+m",
     reviewerTimeoutMs: 600_000,
     executorTimeoutMs: 1_800_000,
     maxCorrectionCycles: 3,

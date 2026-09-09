@@ -509,21 +509,27 @@ export class ExecutionToolManager {
     const childTools = kind === "research" ? researchToolIntersection(allowedTools) : allowedTools;
     return tasks.map((task) => {
       // Validate any supplied contract, but preserve only an explicitly named
-      // initial set. The legacy executorAllowedTools field was historically
-      // overwritten by the authoritative parent snapshot and is not an
-      // activation request.
+      // initial set. The authoritative parent snapshot always determines the
+      // allowed ceiling; a supplied catalog is not an activation request.
       resolveExecutorToolCatalog(task);
-      const explicitInitial = task.executorToolCatalog?.initialActiveTools ?? task.executorInitialActiveTools;
+      const explicitInitial = task.executorToolCatalog?.initialActiveTools;
       const catalog = createExecutorToolCatalog(
         childTools,
         explicitInitial ?? (deferredPiToolsEnabled(this.input.config)
           ? defaultExecutorInitialActiveTools(childTools)
           : childTools),
       );
+      // Build the durable definition from known fields only: stale pre-cutover
+      // keys on a supplied input never enter a new record.
       const definition: BackgroundTaskDefinition = {
-        ...task,
-        backgroundKind: kind,
+        title: task.title,
+        instructions: task.instructions,
         acceptanceCriteria: [...task.acceptanceCriteria],
+        ...(task.relevantContext !== undefined ? { relevantContext: task.relevantContext } : {}),
+        backgroundKind: kind,
+        ...(task.authoritativeUpdates
+          ? { authoritativeUpdates: task.authoritativeUpdates.map((item) => ({ ...item })) }
+          : {}),
       };
       assignExecutorToolCatalog(definition, catalog);
       return definition;

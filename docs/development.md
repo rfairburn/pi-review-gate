@@ -138,9 +138,11 @@ to limit the orchestrator, pass Pi's native allowlist through the wrapper, for e
   extension and CLI/RPC surfaces rather than patching or bundling Pi.
 - The `run-as-binary` executor protocol (`pi-review-executor-jsonl-v1`) is documented in
   [Delegated execution](delegated-execution.md#external-harness-protocol).
-- Legacy configuration shapes (`decider`, `reviewers`, `enabledReviewerIds`,
-  `execution.externalExecutors`) remain readable and are migrated into `externalAgents`
-  on `/review-settings` save ([Configuration](configuration.md#legacy-compatibility)).
+- Pre-cutover configuration fields (`decider`, `reviewers`, `enabledReviewerIds`,
+  `execution.activeExecutor`, `execution.executorPool`, `execution.externalExecutors`)
+  are no longer accepted: old-only records fail to load with an actionable diagnostic,
+  and doubled records consume the canonical shape alone without rewriting the stored
+  record ([Configuration](configuration.md#pre-cutover-configuration-fields)).
 
 ## Third-party code
 

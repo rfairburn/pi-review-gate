@@ -18,9 +18,9 @@ const config = normalizeConfig({
     execution: { protocol: "pi-review-executor-jsonl-v1" as const },
   }],
   execution: {
-    executorPool: [
-      { entryId: "pi-entry", selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1 },
-      { entryId: "external-fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
+workerResources: [
+      { resourceId: "pi-entry", selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1 },
+      { resourceId: "external-fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
     ],
   },
 });
@@ -121,8 +121,8 @@ test("executorDisplayLabel keeps the recorded model-less external identity under
       execution: { protocol: "pi-review-executor-jsonl-v1" as const },
     }],
     execution: {
-      executorPool: [
-        { entryId: "external-fake", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 },
+workerResources: [
+        { resourceId: "external-fake", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 },
       ],
     },
   });
@@ -139,8 +139,8 @@ test("executorDisplayLabel keeps the recorded model-less external identity under
       execution: { protocol: "pi-review-executor-jsonl-v1" as const },
     }],
     execution: {
-      executorPool: [
-        { entryId: "external-fake", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 },
+workerResources: [
+        { resourceId: "external-fake", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 },
       ],
     },
   });
@@ -156,8 +156,8 @@ test("executorDisplayLabel keeps the recorded model-less external identity under
       execution: { protocol: "pi-review-executor-jsonl-v1" as const },
     }],
     execution: {
-      executorPool: [
-        { entryId: "external-fake", selection: { source: "pi" as const, model: "gpt-reassigned" }, maxConcurrent: 1 },
+workerResources: [
+        { resourceId: "external-fake", selection: { source: "pi" as const, model: "gpt-reassigned" }, maxConcurrent: 1 },
       ],
     },
   });
@@ -266,7 +266,10 @@ test("renderSubtaskWidget expanded view sorts by recency, bounds the list, and r
     conflictPaths: ["src/a.ts"],
     tasks: [widgetTask({
       state: "reviewing",
-      reviewStatus: { phase: "reviewing", reviewers: [] },
+      reviewStatus: {
+        phase: "reviewing",
+        reviewers: [],
+      },
       latestCommand: { action: "steer", status: "queued" },
     })],
     recent: [],

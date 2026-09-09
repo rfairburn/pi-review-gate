@@ -20,8 +20,8 @@ function noChangeExecutorConfig(): Record<string, unknown> {
       },
     }],
     execution: {
-      executorPool: [{
-        entryId: "fixture-noop",
+workerResources: [{
+        resourceId: "fixture-noop",
         selection: { source: "external", id: "fixture-noop" },
         maxConcurrent: 1,
       }],
@@ -42,27 +42,29 @@ test("settings persistence removes parallelEnabled and stores concurrency and re
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: null, parallelEnabled: true },
+    execution: {
+parallelEnabled: true,
+    },
   }), "utf8");
 
   const next = await persistReviewSettings(configPath, {
-    executorPool: [],
-    activeReviewers: [],
-    reviewerTimeoutMs: 600000,
-    executorTimeoutMs: 1800000,
-    maxCorrectionCycles: 1,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    retainBundles: "on-failure",
-    maxWorkers: 12,
-    retryPolicy: {
+workerResources: [],
+activeReviewers: [],
+reviewerTimeoutMs: 600000,
+executorTimeoutMs: 1800000,
+maxCorrectionCycles: 1,
+implementationGuidanceAfterCorrectionAttempts: 1,
+retainBundles: "on-failure",
+maxWorkers: 12,
+retryPolicy: {
       maxRetries: 3,
       baseDelayMs: 250,
       maxDelayMs: 5_000,
       jitter: false,
       maxSameIncidentRepeats: 4,
     },
-    subtaskNotifications: "quiet",
-    subtasksViewExpanded: false,
+subtaskNotifications: "quiet",
+subtasksViewExpanded: false,
   });
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
@@ -156,23 +158,26 @@ test("landing outcome includes source HEAD drift", async () => {
     // Slow writing executor: writes output.txt after a 2s delay, giving a
     // window to commit to the source repo while the wave is running.
     const config: Record<string, any> = {
-      enabled: false,
-      reviewerTimeoutMs: 600_000,
-      executorTimeoutMs: 1_800_000,
-      maxCorrectionCycles: 0,
-      implementationGuidanceAfterCorrectionAttempts: 1,
-      maxPatchBytes: 200_000,
-      maxFileBytes: 1_048_576,
-      maxSnapshotBytes: 52_428_800,
-      retainBundles: "never",
-      execution: {
-        activeExecutor: { source: "external", id: "fake-slow-writer" },
-        externalExecutors: [{
-          id: "fake-slow-writer",
-          adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
-          command: process.execPath,
-          args: ["-e", [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+        workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-slow-writer" }, maxConcurrent: 4 }],
+      },
+externalAgents: [
+          {
+            id: "fake-slow-writer",
+            adapter: "run-as-binary",
+            command: process.execPath,
+            args: [],
+            execution: {
+              args: ["-e", [
             "process.stdin.resume();",
             "process.stdin.on('data',()=>{});",
             "process.stdin.on('end',()=>{",
@@ -186,9 +191,11 @@ test("landing outcome includes source HEAD drift", async () => {
             "  }, 2000);",
             "});",
           ].join("")],
-          timeoutMs: 10000,
-        }],
-      },
+              timeoutMs: 10000,
+              protocol: "pi-review-executor-jsonl-v1",
+            },
+          }
+      ],
     };
 
     // Wait for a worker progress/start signal after capture, not a fixed sleep.

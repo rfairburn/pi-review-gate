@@ -476,8 +476,8 @@ test("SubtasksStart derives its notification contract prose from the shared poli
         execution: { protocol: "pi-review-executor-jsonl-v1" as const },
       }],
       execution: {
-        activeExecutor: { source: "external" as const, id: "fake" },
-        ...(mode ? { subtaskNotifications: mode } : {}),
+...(mode ? { subtaskNotifications: mode } : {}),
+workerResources: [{ resourceId: "default", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 }],
       },
     });
     const manager = new ExecutionToolManager({

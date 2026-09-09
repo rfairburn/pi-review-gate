@@ -33,10 +33,6 @@ export interface ExecutorRequest {
   workspaceAccess?: "read-only" | "workspace-write";
   /** Canonical durable authorization and initial-activation contract. */
   executorToolCatalog?: ExecutorToolCatalog;
-  /** @deprecated Compatibility mirror for adapters that consume only an allowlist. */
-  allowedTools?: readonly string[];
-  /** Compatibility mirror for the durable Pi startup-active subset. */
-  initialActiveTools?: readonly string[];
   signal?: AbortSignal;
   session?: ExecutorSession;
   recovery?: {

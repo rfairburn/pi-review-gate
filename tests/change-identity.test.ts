@@ -78,13 +78,16 @@ test("runReview includes changeIdentity in reviewer context and invocation metad
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: {
-        id: "ci-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+        {
+          id: "ci-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -104,8 +107,13 @@ test("runReview includes changeIdentity in reviewer context and invocation metad
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "ci-checker" }
+      ] },
     };
 
     const output = await runReview({
@@ -137,13 +145,16 @@ test("runAskReviewer includes changeIdentity in reviewer context and metadata", 
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ci-ask-"));
   try {
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: {
-        id: "ci-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+        {
+          id: "ci-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -162,8 +173,13 @@ test("runAskReviewer includes changeIdentity in reviewer context and metadata", 
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "ci-checker" }
+      ] },
     };
 
     const output = await runAskReviewer({
@@ -241,13 +257,16 @@ test("runReview preserves existing behavior when changeIdentity is omitted", asy
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: {
-        id: "omit-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+        {
+          id: "omit-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -262,8 +281,13 @@ test("runReview preserves existing behavior when changeIdentity is omitted", asy
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "omit-checker" }
+      ] },
     };
 
     const output = await runReview({
@@ -290,13 +314,16 @@ test("runAskReviewer preserves existing behavior when changeIdentity is omitted"
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ci-omit-ask-"));
   try {
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: {
-        id: "omit-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+        {
+          id: "omit-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -310,8 +337,13 @@ test("runAskReviewer preserves existing behavior when changeIdentity is omitted"
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "omit-checker" }
+      ] },
     };
 
     const output = await runAskReviewer({
@@ -348,18 +380,26 @@ test("reused bundle removes stale change-identity.json when identity is omitted"
     state.reviewWindow!.bundleDir = bundleDir;
 
     const config: ReviewGateConfig = {
-      ...baseConfig,
-      retainBundles: "always",
-      decider: {
-        id: "passing",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+retainBundles: "always",
+externalAgents: [
+        {
+          id: "passing",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))",
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "passing" }
+      ] },
     };
 
     // First review with identity

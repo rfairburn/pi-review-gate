@@ -7,6 +7,8 @@ import {
   activeExternalExecutor,
   automaticReviewEnabled,
   deferredPiToolsEnabled,
+  duplicateReviewerSelectionsFor,
+  unresolvedReviewerSelectionsFor,
   loadConfig,
   materializeReviewConfig,
   MAX_WEB_CACHE_BYTES,
@@ -14,6 +16,7 @@ import {
   MAX_WEB_OUTPUT_CHARS,
   MAX_WEB_SEARCH_RESULTS,
   normalizeConfig,
+  internalReviewerId,
   executorAgentFingerprint,
   resolveReviewers,
   reviewerConfigFingerprint,
@@ -30,12 +33,19 @@ test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
     await writeFile(
       path,
       JSON.stringify({
-        enabled: true,
-        decider: {
-          id: "fake",
-          adapter: "generic-cli",
-          command: "node",
-        },
+enabled: true,
+externalAgents: [
+          {
+            id: "fake",
+            adapter: "generic-cli",
+            command: "node",
+            args: [],
+            review: {},
+          }
+        ],
+review: { activeReviewers: [
+          { source: "external", id: "fake" }
+        ] },
       }),
       "utf8",
     );
@@ -46,7 +56,7 @@ test("loadConfig prefers PI_REVIEW_GATE_CONFIG", async () => {
 
     assert.equal(loaded.path, path);
     assert.equal(loaded.config.enabled, true);
-    assert.equal(loaded.config.decider?.id, "fake");
+    assert.deepEqual(resolveReviewers(loaded.config).reviewers.map((reviewer) => reviewer.id), ["fake"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -180,18 +190,26 @@ test("subtask notifications default to quiet and validate the noisy alternative"
 
 test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
   const codex = normalizeConfig({
-    enabled: true,
-    decider: {
-      id: "codex",
-      adapter: "codex-cli",
-    },
+enabled: true,
+externalAgents: [
+      {
+        id: "codex",
+        adapter: "codex-cli",
+        args: [],
+        review: {},
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "codex" }
+    ] },
   });
 
-  assert.deepEqual(codex.decider, {
+  assert.deepEqual(resolveReviewers(codex).reviewers[0], {
     id: "codex",
     adapter: "codex-cli",
     command: "codex",
     args: [],
+    env: {},
     model: undefined,
     timeoutMs: 600000,
   });
@@ -200,18 +218,26 @@ test("normalizeConfig supplies defaults for typed reviewer adapters", () => {
   assert.equal(codex.executorTimeoutMs, 1800000);
 
   const claude = normalizeConfig({
-    enabled: true,
-    decider: {
-      id: "claude",
-      adapter: "claude-cli",
-    },
+enabled: true,
+externalAgents: [
+      {
+        id: "claude",
+        adapter: "claude-cli",
+        args: [],
+        review: {},
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "claude" }
+    ] },
   });
 
-  assert.deepEqual(claude.decider, {
+  assert.deepEqual(resolveReviewers(claude).reviewers[0], {
     id: "claude",
     adapter: "claude-cli",
     command: "claude",
     args: [],
+    env: {},
     model: undefined,
     timeoutMs: 600000,
   });
@@ -228,7 +254,9 @@ test("configured timeouts apply to internal models and unoverridden external rol
         { source: "external", id: "codex" },
       ],
     },
-    execution: { activeExecutor: { source: "external", id: "codex" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "codex" }, maxConcurrent: 1 }],
+    },
     externalAgents: [{
       id: "codex",
       adapter: "codex-cli",
@@ -240,26 +268,38 @@ test("configured timeouts apply to internal models and unoverridden external rol
   const reviewers = resolveReviewers(config, ["openai-codex/gpt-5.6-luna"]).reviewers;
   assert.equal(reviewers[0]?.timeoutMs, 900000);
   assert.equal(reviewers[1]?.timeoutMs, 900000);
-  assert.equal(activeExternalExecutor(config)?.timeoutMs, 3600000);
+  assert.equal(activeExternalExecutor(config, { source: "external", id: "codex" })?.timeoutMs, 3600000);
 });
 
 test("normalizeConfig validates implementation guidance escalation thresholds", () => {
   const configured = normalizeConfig({
-    enabled: true,
-    implementationGuidanceAfterCorrectionAttempts: 0,
-    decider: {
-      id: "codex",
-      adapter: "codex-cli",
-    },
+enabled: true,
+implementationGuidanceAfterCorrectionAttempts: 0,
+externalAgents: [
+      {
+        id: "codex",
+        adapter: "codex-cli",
+        args: [],
+      review: {}}
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "codex" }
+    ] },
   });
   assert.equal(configured.implementationGuidanceAfterCorrectionAttempts, 0);
   assert.throws(() => normalizeConfig({
-    enabled: true,
-    implementationGuidanceAfterCorrectionAttempts: 1.5,
-    decider: {
-      id: "codex",
-      adapter: "codex-cli",
-    },
+enabled: true,
+implementationGuidanceAfterCorrectionAttempts: 1.5,
+externalAgents: [
+      {
+        id: "codex",
+        adapter: "codex-cli",
+        args: [],
+      review: {}}
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "codex" }
+    ] },
   }), /implementationGuidanceAfterCorrectionAttempts/);
 });
 
@@ -269,23 +309,32 @@ test("normalizeConfig rejects coercible booleans and invalid retention values", 
   assert.throws(() => normalizeConfig({ reviewerTimeoutMs: 0 }), /reviewerTimeoutMs/);
   assert.throws(() => normalizeConfig({ waveArtifactTtlMs: -1 }), /waveArtifactTtlMs/);
   assert.throws(() => normalizeConfig({
-    decider: { id: "bad", adapter: "codex-cli", args: ["ok", 1] },
+externalAgents: [
+      {
+        id: "bad",
+        adapter: "codex-cli",
+        args: [],
+        review: {
+          args: ["ok", 1],
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "bad" }
+    ] },
   }), /args must be an array of strings/);
 });
 
 test("normalizeConfig keeps pi model selection generic", () => {
   const loaded = normalizeConfig({
-    enabled: true,
-    decider: {
-      id: "glm",
-      adapter: "pi-model",
-      model: "ollama/glm-5.2",
-      thinkingLevel: "medium",
-    },
+enabled: true,
+review: { activeReviewers: [
+      { source: "pi", model: "ollama/glm-5.2", thinkingLevel: "medium" }
+    ] },
   });
 
-  assert.deepEqual(loaded.decider, {
-    id: "glm",
+  assert.deepEqual(resolveReviewers(loaded).reviewers[0], {
+    id: internalReviewerId("ollama/glm-5.2"),
     adapter: "pi-model",
     command: "pi",
     args: [],
@@ -293,15 +342,6 @@ test("normalizeConfig keeps pi model selection generic", () => {
     thinkingLevel: "medium",
     timeoutMs: 600000,
   });
-});
-
-test("normalizeConfig rejects competing Pi tool-policy arguments", () => {
-  for (const flag of ["--tools", "--tools=read", "-t", "--exclude-tools", "-xt", "--no-tools", "-nt", "--no-builtin-tools", "-nbt"]) {
-    assert.throws(() => normalizeConfig({
-      enabled: true,
-      decider: { id: "pi", adapter: "pi-model", model: "provider/model", args: [flag] },
-    }), /one native --tools allowlist/, flag);
-  }
 });
 
 test("normalizeConfig rejects unsupported internal thinking levels", () => {
@@ -317,140 +357,192 @@ test("normalizeConfig rejects unsupported internal thinking levels", () => {
   }), /thinkingLevel must be one of/);
 });
 
-test("normalizeConfig supports multiple reviewers without legacy decider", () => {
+test("normalizeConfig supports multiple selected reviewers", () => {
   const loaded = normalizeConfig({
-    enabled: true,
-    reviewers: [
+enabled: true,
+externalAgents: [
       {
         id: "codex",
         adapter: "codex-cli",
+        args: [],
+        review: {},
       },
       {
         id: "claude",
         adapter: "claude-cli",
-      },
+        args: [],
+        review: {},
+      }
     ],
+review: { activeReviewers: [
+      { source: "external", id: "codex" },
+      { source: "external", id: "claude" }
+    ] },
   });
 
-  assert.equal(loaded.decider, undefined);
-  assert.deepEqual(loaded.reviewers?.map((reviewer) => reviewer.id), ["codex", "claude"]);
+  assert.deepEqual(resolveReviewers(loaded).reviewers.map((reviewer) => reviewer.id), ["codex", "claude"]);
 });
 
 test("normalizeConfig rejects duplicate reviewer ids", () => {
   assert.throws(
     () => normalizeConfig({
-      enabled: true,
-      reviewers: [
+enabled: true,
+externalAgents: [
         {
           id: "same",
           adapter: "codex-cli",
-        },
+          args: [],
+        review: {}},
         {
           id: "same",
           adapter: "claude-cli",
-        },
+          args: [],
+        review: {}}
       ],
+review: { activeReviewers: [
+        { source: "external", id: "same" },
+        { source: "external", id: "same" }
+      ] },
     }),
-    /reviewer id must be unique: same/,
+    /external agent id must be unique: same/,
   );
 });
 
-test("normalizeConfig rejects reviewer ids that could share an output directory", () => {
+test("normalizeConfig rejects agent ids that could share an output directory", () => {
   for (const id of ["review/a", "review?a"]) {
     assert.throws(
       () => normalizeConfig({
-        enabled: true,
-        reviewers: [
+enabled: true,
+externalAgents: [
           {
             id,
             adapter: "codex-cli",
-          },
+            args: [],
+          review: {}}
         ],
       }),
-      /reviewer id may contain only letters, numbers, underscores, periods, and hyphens/,
+      /external agent id may contain only letters, numbers, underscores, periods, and hyphens/,
     );
   }
 });
 
-test("normalizeConfig rejects path-reserved reviewer ids", () => {
+test("normalizeConfig rejects path-reserved agent ids", () => {
   for (const id of [".", ".."]) {
     assert.throws(
       () => normalizeConfig({
-        enabled: true,
-        decider: {
-          id,
-          adapter: "codex-cli",
-        },
+enabled: true,
+externalAgents: [
+          {
+            id,
+            adapter: "codex-cli",
+            args: [],
+          review: {}}
+        ],
       }),
-      /reviewer id may contain only letters, numbers, underscores, periods, and hyphens/,
+      /external agent id may contain only letters, numbers, underscores, periods, and hyphens/,
     );
   }
 });
 
 test("normalizeConfig permits zero enabled reviewers as an explicit review opt-out", () => {
   const config = normalizeConfig({
-    enabled: true,
-    enabledReviewerIds: [],
-    reviewers: [{ id: "codex", adapter: "codex-cli" }],
+enabled: true,
+externalAgents: [
+      {
+        id: "codex",
+        adapter: "codex-cli",
+        args: [],
+      review: {}}
+    ],
   });
 
   assert.deepEqual(resolveReviewers(config).reviewers, []);
   assert.equal(automaticReviewEnabled(config), false);
 });
 
-test("resolveReviewers filters the catalog in stable config order", () => {
+test("resolveReviewers resolves only selected agents in explicit selection order", () => {
   const config = normalizeConfig({
-    enabled: true,
-    enabledReviewerIds: ["third", "first"],
-    reviewers: [
-      { id: "first", adapter: "codex-cli" },
-      { id: "second", adapter: "claude-cli" },
-      { id: "third", adapter: "generic-cli", command: "review" },
+enabled: true,
+externalAgents: [
+      {
+        id: "first",
+        adapter: "codex-cli",
+        args: [],
+      review: {}},
+      {
+        id: "second",
+        adapter: "claude-cli",
+        args: [],
+      review: {}},
+      {
+        id: "third",
+        adapter: "generic-cli",
+        command: "review",
+        args: [],
+      review: {}}
     ],
+review: { activeReviewers: [
+      { source: "external", id: "third" },
+      { source: "external", id: "first" }
+    ] },
   });
 
-  assert.deepEqual(resolveReviewers(config).reviewers.map((reviewer) => reviewer.id), ["first", "third"]);
+  // Selection order is the stable, explicit run order; unselected catalog
+  // agents ("second") never resolve.
+  assert.deepEqual(resolveReviewers(config).reviewers.map((reviewer) => reviewer.id), ["third", "first"]);
   assert.equal(automaticReviewEnabled(config), true);
 });
 
-test("normalizeConfig preserves internal and external executor selections", () => {
+test("normalizeConfig preserves internal and external worker resource selections", () => {
   const internal = normalizeConfig({
-    enabled: true,
-    enabledReviewerIds: [],
-    execution: {
-      activeExecutor: { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
-      externalExecutors: [
-        { id: "codex", adapter: "codex-cli", command: "codex", model: "gpt-5.6-sol" },
+enabled: true,
+execution: {
+      workerResources: [
+        { resourceId: "pi-primary", selection: { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" }, maxConcurrent: 1 },
+        { resourceId: "codex", selection: { source: "external", id: "codex" }, maxConcurrent: 1 },
+        { resourceId: "fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
+      ],
+    },
+externalAgents: [
+        {
+          id: "codex",
+          adapter: "codex-cli",
+          command: "codex",
+          model: "gpt-5.6-sol",
+          args: [],
+          execution: {},
+        },
         {
           id: "fake",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: "fake-agent",
-        },
-      ],
-    },
+          args: [],
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   });
 
-  assert.deepEqual(internal.execution?.activeExecutor, {
-    source: "pi",
-    model: "openai-codex/gpt-5.6-sol",
-    thinkingLevel: "high",
-  });
-  assert.deepEqual(internal.execution?.externalExecutors?.map((executor) => executor.id), ["codex", "fake"]);
+  assert.deepEqual(internal.execution?.workerResources, [
+    { resourceId: "pi-primary", selection: { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" }, maxConcurrent: 1 },
+    { resourceId: "codex", selection: { source: "external", id: "codex" }, maxConcurrent: 1 },
+    { resourceId: "fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
+  ]);
 });
 
 test("normalizeConfig preserves an ordered executor pool with per-model capacity", () => {
   const config = normalizeConfig({
     enabled: true,
     execution: {
-      executorPool: [
+workerResources: [
         {
-          entryId: "local-primary",
+          resourceId: "local-primary",
           selection: { source: "pi", model: "qwen/local", thinkingLevel: "high" },
           maxConcurrent: 1,
         },
         {
-          entryId: "cloud-overflow",
+          resourceId: "cloud-overflow",
           selection: { source: "external", id: "deepseek" },
           maxConcurrent: 3,
         },
@@ -568,8 +660,8 @@ test("normalizeConfig rejects invalid or duplicate executor pool entries", () =>
   assert.throws(() => normalizeConfig({
     enabled: true,
     execution: {
-      executorPool: [{
-        entryId: "bad-capacity",
+workerResources: [{
+        resourceId: "bad-capacity",
         selection: { source: "external", id: "deepseek" },
         maxConcurrent: 17,
       }],
@@ -578,24 +670,34 @@ test("normalizeConfig rejects invalid or duplicate executor pool entries", () =>
   assert.throws(() => normalizeConfig({
     enabled: true,
     execution: {
-      executorPool: [
-        { entryId: "first", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
-        { entryId: "second", selection: { source: "external", id: "deepseek" }, maxConcurrent: 2 },
+workerResources: [
+        { resourceId: "first", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+        { resourceId: "second", selection: { source: "external", id: "deepseek" }, maxConcurrent: 2 },
       ],
     },
-  }), /duplicate executor pool selection/);
+  }), /duplicate worker resource selection: external:deepseek/);
 });
 
 test("resolveReviewers reports stale and duplicate enabled ids without rejecting config loading", () => {
   const config = normalizeConfig({
-    enabled: true,
-    enabledReviewerIds: ["codex", "missing", "codex"],
-    reviewers: [{ id: "codex", adapter: "codex-cli" }],
+enabled: true,
+externalAgents: [
+      {
+        id: "codex",
+        adapter: "codex-cli",
+        args: [],
+      review: {}}
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "codex" },
+      { source: "external", id: "missing" },
+      { source: "external", id: "codex" }
+    ] },
   });
   const resolution = resolveReviewers(config);
 
-  assert.deepEqual(resolution.unknownIds, ["missing"]);
-  assert.deepEqual(resolution.duplicateEnabledIds, ["codex"]);
+  assert.deepEqual(resolution.unknownIds, ["external:missing"]);
+  assert.deepEqual(resolution.duplicateEnabledIds, ["external:codex"]);
   // Stale or duplicated selections no longer disable the whole gate: the
   // resolvable subset still runs and the unresolved selections produce
   // explicit bounded outcomes at run time.
@@ -604,11 +706,22 @@ test("resolveReviewers reports stale and duplicate enabled ids without rejecting
   // consistent with window-freeze semantics.
   const materialized = materializeReviewConfig(config, []);
   assert.equal(materialized.enabled, true);
-  assert.deepEqual(materialized.reviewers?.map((reviewer) => reviewer.id), ["codex"]);
+  // The frozen selection keeps the explicit (duplicated) resolvable
+  // selections; the duplicate is reported, not silently dropped.
+  assert.deepEqual(resolveReviewers(materialized).reviewers.map((reviewer) => reviewer.id), ["codex", "codex"]);
+  assert.deepEqual(duplicateReviewerSelectionsFor(materialized), ["external:codex"]);
   const onlyStale = normalizeConfig({
-    enabled: true,
-    enabledReviewerIds: ["missing"],
-    reviewers: [{ id: "codex", adapter: "codex-cli" }],
+enabled: true,
+externalAgents: [
+      {
+        id: "codex",
+        adapter: "codex-cli",
+        args: [],
+      review: {}}
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "missing" }
+    ] },
   });
   assert.equal(materializeReviewConfig(onlyStale, []).enabled, false);
 });
@@ -616,17 +729,25 @@ test("resolveReviewers reports stale and duplicate enabled ids without rejecting
 test("reviewerConfigFingerprint distinguishes same-id replacements without exposing raw configuration", () => {
   const secret = "top-secret-value-123";
   const baseRaw = {
-    enabled: true,
-    reviewers: [{
-      id: "one",
-      adapter: "generic-cli" as const,
-      command: process.execPath,
-      args: ["-e", "review-script-marker"],
-      env: { REVIEW_GATE_TEST_SECRET: secret },
-      timeoutMs: 15000,
-    }],
+enabled: true,
+externalAgents: [
+      {
+        id: "one",
+        adapter: "generic-cli" as const,
+        command: process.execPath,
+        args: [],
+        review: {
+          args: ["-e", "review-script-marker"],
+          env: { REVIEW_GATE_TEST_SECRET: secret },
+          timeoutMs: 15000,
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "one" }
+    ] },
   };
-  const original = normalizeConfig(baseRaw).reviewers![0];
+  const original = resolveReviewers(normalizeConfig(baseRaw)).reviewers[0]!;
   const fingerprint = reviewerConfigFingerprint(original);
 
   // Hash-only identity: a 64-character hex digest that never contains raw
@@ -636,7 +757,7 @@ test("reviewerConfigFingerprint distinguishes same-id replacements without expos
   assert.doesNotMatch(fingerprint, /review-script-marker/);
 
   // Deterministic for the same effective configuration, including key order.
-  assert.equal(reviewerConfigFingerprint(normalizeConfig(baseRaw).reviewers![0]), fingerprint);
+  assert.equal(reviewerConfigFingerprint(resolveReviewers(normalizeConfig(baseRaw)).reviewers[0]!), fingerprint);
   const reordered: DeciderConfig = {
     timeoutMs: original.timeoutMs!,
     env: { ...original.env! },
@@ -649,18 +770,68 @@ test("reviewerConfigFingerprint distinguishes same-id replacements without expos
 
   // Every same-id replacement that changes the effective configuration is
   // distinguishable after reload.
-  const varied = normalizeConfig({
-    ...baseRaw,
-    reviewers: [{ ...baseRaw.reviewers![0], command: "/usr/bin/env", args: ["other-script"], env: { OTHER: "value" }, timeoutMs: 20000 }],
-  }).reviewers![0];
+  const varied = resolveReviewers(normalizeConfig({
+...baseRaw,
+externalAgents: [
+      {
+        ...baseRaw.externalAgents![0]!,
+        command: "/usr/bin/env",
+        review: {
+          args: ["other-script"],
+          env: { OTHER: "value" },
+          timeoutMs: 20000,
+        },
+      }
+    ],
+  })).reviewers[0]!;
   assert.notEqual(reviewerConfigFingerprint(varied), fingerprint);
 
   // Model and thinking level participate where applicable.
-  const modelA = normalizeConfig({ enabled: true, reviewers: [{ id: "m", adapter: "codex-cli" as const, model: "model-a" }] }).reviewers![0];
-  const modelB = normalizeConfig({ enabled: true, reviewers: [{ id: "m", adapter: "codex-cli" as const, model: "model-b" }] }).reviewers![0];
+  const modelA = resolveReviewers(normalizeConfig({
+enabled: true,
+externalAgents: [
+      {
+        id: "m",
+        adapter: "codex-cli" as const,
+        args: [],
+        review: {
+          model: "model-a",
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "m" }
+    ] },
+  })).reviewers[0]!;
+  const modelB = resolveReviewers(normalizeConfig({
+enabled: true,
+externalAgents: [
+      {
+        id: "m",
+        adapter: "codex-cli" as const,
+        args: [],
+        review: {
+          model: "model-b",
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "m" }
+    ] },
+  })).reviewers[0]!;
   assert.notEqual(reviewerConfigFingerprint(modelA), reviewerConfigFingerprint(modelB));
-  const thinkingA = normalizeConfig({ enabled: true, reviewers: [{ id: "p", adapter: "pi-model" as const, model: "m1", thinkingLevel: "low" }] }).reviewers![0];
-  const thinkingB = normalizeConfig({ enabled: true, reviewers: [{ id: "p", adapter: "pi-model" as const, model: "m1", thinkingLevel: "high" }] }).reviewers![0];
+  const thinkingA = resolveReviewers(normalizeConfig({
+enabled: true,
+review: { activeReviewers: [
+      { source: "pi", model: "m1", thinkingLevel: "low" }
+    ] },
+  })).reviewers[0]!;
+  const thinkingB = resolveReviewers(normalizeConfig({
+enabled: true,
+review: { activeReviewers: [
+      { source: "pi", model: "m1", thinkingLevel: "high" }
+    ] },
+  })).reviewers[0]!;
   assert.notEqual(reviewerConfigFingerprint(thinkingA), reviewerConfigFingerprint(thinkingB));
 });
 
@@ -713,14 +884,14 @@ test("executorAgentFingerprint covers the fully merged invocation with canonical
   // Inherited (agent-level) args participate even when role args are present.
   const inheritedArgsChanged = normalizeConfig({
     ...baseRaw,
-    externalAgents: [{ ...baseRaw.externalAgents![0], args: ["--other"] }],
+    externalAgents: [{ ...baseRaw.externalAgents![0], args: ["--other"]}],
   });
   assert.notEqual(executorAgentFingerprint(inheritedArgsChanged, selection), fingerprint);
 
   // Inherited (agent-level) env participates even when role env is present.
   const inheritedEnvChanged = normalizeConfig({
     ...baseRaw,
-    externalAgents: [{ ...baseRaw.externalAgents![0], env: { INHERITED: "two", SHARED: "base" } }],
+    externalAgents: [{ ...baseRaw.externalAgents![0], env: { INHERITED: "two", SHARED: "base" }}],
   });
   assert.notEqual(executorAgentFingerprint(inheritedEnvChanged, selection), fingerprint);
 
@@ -728,12 +899,12 @@ test("executorAgentFingerprint covers the fully merged invocation with canonical
   // invocation: changing it must not change the fingerprint.
   const shadowedBaseEnv = normalizeConfig({
     ...baseRaw,
-    externalAgents: [{ ...baseRaw.externalAgents![0], env: { INHERITED: "one", SHARED: "replaced-anyway" } }],
+    externalAgents: [{ ...baseRaw.externalAgents![0], env: { INHERITED: "one", SHARED: "replaced-anyway" }}],
   });
   assert.equal(executorAgentFingerprint(shadowedBaseEnv, selection), fingerprint);
   const shadowedBaseModel = normalizeConfig({
     ...baseRaw,
-    externalAgents: [{ ...baseRaw.externalAgents![0], model: "other-base-model" }],
+    externalAgents: [{ ...baseRaw.externalAgents![0], model: "other-base-model"}],
   });
   assert.equal(executorAgentFingerprint(shadowedBaseModel, selection), fingerprint);
 
@@ -807,7 +978,9 @@ test("shared external agents resolve independently for review and execution", ()
       review: { model: "review-model", timeoutMs: 300000, args: ["--review"] },
       execution: { model: "execution-model", timeoutMs: 1800000, args: ["--execute"] },
     }],
-    execution: { activeExecutor: { source: "external", id: "codex" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "codex" }, maxConcurrent: 1 }],
+    },
   });
 
   assert.deepEqual(resolveReviewers(config).reviewers[0], {
@@ -819,7 +992,7 @@ test("shared external agents resolve independently for review and execution", ()
     model: "review-model",
     timeoutMs: 300000,
   });
-  assert.deepEqual(activeExternalExecutor(config), {
+  assert.deepEqual(activeExternalExecutor(config, { source: "external", id: "codex" }), {
     id: "codex",
     adapter: "codex-cli",
     command: "codex",
@@ -838,14 +1011,23 @@ test("scoped pi models resolve as reviewers only when currently available", () =
     },
   });
 
-  assert.equal(automaticReviewEnabled(config), false);
-  assert.deepEqual(resolveReviewers(config).unknownIds, ["pi:openai-codex/gpt-5.6-sol"]);
+  // Live resolution checks the current scoped model list.
+  const unavailable = resolveReviewers(config, []);
+  assert.equal(unavailable.reviewers.length, 0);
+  assert.deepEqual(unavailable.unknownIds, ["pi:openai-codex/gpt-5.6-sol"]);
+  assert.equal(automaticReviewEnabled(config, []), false);
   const resolved = resolveReviewers(config, ["openai-codex/gpt-5.6-sol"]);
   assert.equal(resolved.unknownIds.length, 0);
   assert.equal(resolved.reviewers[0]?.adapter, "pi-model");
   assert.equal("model" in resolved.reviewers[0]! ? resolved.reviewers[0].model : undefined, "openai-codex/gpt-5.6-sol");
   assert.equal("thinkingLevel" in resolved.reviewers[0]! ? resolved.reviewers[0].thinkingLevel : undefined, "max");
   assert.equal(automaticReviewEnabled(config, ["openai-codex/gpt-5.6-sol"]), true);
+
+  // Frozen/self-contained resolution never consults the live model list, so a
+  // frozen window keeps its exact pi reviewer identity.
+  const frozen = resolveReviewers(config);
+  assert.equal(frozen.unknownIds.length, 0);
+  assert.equal("model" in frozen.reviewers[0]! ? frozen.reviewers[0].model : undefined, "openai-codex/gpt-5.6-sol");
 });
 
 test("normalizeConfig accepts execution.maxWorkers 1..16", () => {
@@ -866,6 +1048,6 @@ test("normalizeConfig rejects invalid execution.maxWorkers", () => {
 });
 
 test("normalizeConfig omits execution.maxWorkers when not provided", () => {
-  const config = normalizeConfig({ enabled: true, execution: { activeExecutor: null } });
+  const config = normalizeConfig({ enabled: true, execution: {} });
   assert.equal(config.execution?.maxWorkers, undefined);
 });

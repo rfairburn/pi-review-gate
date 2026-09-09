@@ -190,6 +190,16 @@ async function buildPoolHarness(
   const agents = [
     { id: "exec-a", adapter: "run-as-binary" as const, command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [scripts.a], timeoutMs: 30_000 } },
     { id: "exec-b", adapter: "run-as-binary" as const, command: process.execPath, model: "model-b", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [scripts.b], timeoutMs: 30_000 } },
+    {
+      id: "gate-reviewer",
+      adapter: "generic-cli" as const,
+      command: process.execPath,
+      args: [],
+      review: {
+        args: ["-e", reviewerSource],
+        timeoutMs: 20_000,
+      },
+    },
   ];
   const base = {
     execution: {
@@ -199,9 +209,11 @@ async function buildPoolHarness(
     externalAgents: agents,
   };
   const config = normalizeConfig({
-    ...base,
-    enabled: true,
-    decider: { id: "gate-reviewer", adapter: "generic-cli" as const, command: process.execPath, args: ["-e", reviewerSource], timeoutMs: 20_000 },
+...base,
+enabled: true,
+review: { activeReviewers: [
+      { source: "external", id: "gate-reviewer" }
+    ] },
   });
   const noReviewConfig = normalizeConfig({ ...base, enabled: false, review: { activeReviewers: [] } });
   return {
@@ -314,13 +326,13 @@ async function runInitialWave(
   assert.ok(initialLease, `${entryId} must be leasable`);
   await mkdir(join(harness.root, "artifacts"), { recursive: true });
   const wave = await executeWave({
-    cwd: sourceDir,
-    tasks: [testTask()],
-    config: harness.noReviewConfig,
-    maxWorkers: 1,
-    artifactDir: join(harness.root, "artifacts"),
-    executorPool: pool,
-    initialExecutorLeases: [initialLease],
+cwd: sourceDir,
+tasks: [testTask()],
+config: harness.noReviewConfig,
+maxWorkers: 1,
+artifactDir: join(harness.root, "artifacts"),
+executorPool: pool,
+initialExecutorLeases: [initialLease],
   });
   assert.equal(wave.taskResults[0]?.status, "completed_unreviewed", JSON.stringify(wave.taskResults));
   const bundle = wave.taskResults[0]!.bundle!;
@@ -505,13 +517,13 @@ test("recovery under a changed assignment starts the announced new session on th
     assert.ok(recoveryLease);
     const progress: ContinuationProgressUpdate[] = [];
     const continued = await continueOperation({
-      bundle,
-      instructions: "append the next change",
-      instructionId: "continuation-1",
-      config: harness.config,
-      executorAssignment: recoveryLease,
-      executorPool: pool,
-      onUpdate: (update) => progress.push(update),
+bundle,
+instructions: "append the next change",
+instructionId: "continuation-1",
+config: harness.config,
+executorAssignment: recoveryLease,
+executorPool: pool,
+onUpdate: (update) => progress.push(update),
     });
     // Caller-owned lease: release it now that the continuation has settled.
     recoveryLease.release();
@@ -566,13 +578,13 @@ test("recovery of a legacy operation without recorded assignment starts a new se
     assert.ok(recoveryLease);
     const progress: ContinuationProgressUpdate[] = [];
     const continued = await continueOperation({
-      bundle,
-      instructions: "append the next change",
-      instructionId: "continuation-1",
-      config: harness.config,
-      executorAssignment: recoveryLease,
-      executorPool: pool,
-      onUpdate: (update) => progress.push(update),
+bundle,
+instructions: "append the next change",
+instructionId: "continuation-1",
+config: harness.config,
+executorAssignment: recoveryLease,
+executorPool: pool,
+onUpdate: (update) => progress.push(update),
     });
     // Caller-owned lease: release it now that the continuation has settled.
     recoveryLease.release();
@@ -612,13 +624,13 @@ test("recovery on the same recorded assignment resumes the exact prior session",
     assert.ok(recoveryLease);
     const progress: ContinuationProgressUpdate[] = [];
     const continued = await continueOperation({
-      bundle,
-      instructions: "append the next change",
-      instructionId: "continuation-1",
-      config: harness.config,
-      executorAssignment: recoveryLease,
-      executorPool: pool,
-      onUpdate: (update) => progress.push(update),
+bundle,
+instructions: "append the next change",
+instructionId: "continuation-1",
+config: harness.config,
+executorAssignment: recoveryLease,
+executorPool: pool,
+onUpdate: (update) => progress.push(update),
     });
     // Caller-owned lease: release it now that the continuation has settled.
     recoveryLease.release();
@@ -665,13 +677,13 @@ test("recovery failover announces the handoff, follows it durably, and holds one
     let continued: Awaited<ReturnType<typeof continueOperation>> | undefined;
     try {
       continued = await continueOperation({
-        bundle,
-        instructions: "append the next change",
-        instructionId: "continuation-1",
-        config: harness.config,
-        executorAssignment: recoveryLease,
-        executorPool: pool,
-        onUpdate: (update) => progress.push(update),
+bundle,
+instructions: "append the next change",
+instructionId: "continuation-1",
+config: harness.config,
+executorAssignment: recoveryLease,
+executorPool: pool,
+onUpdate: (update) => progress.push(update),
       });
     } finally {
       // Caller-owned lease: release it now that the continuation has settled.
@@ -745,13 +757,13 @@ test("recovery with an unchanged agent id that now resolves to a different model
     assert.ok(recoveryLease);
     const progress: ContinuationProgressUpdate[] = [];
     const continued = await continueOperation({
-      bundle,
-      instructions: "append the next change",
-      instructionId: "continuation-1",
-      config: driftedConfig,
-      executorAssignment: recoveryLease,
-      executorPool: pool,
-      onUpdate: (update) => progress.push(update),
+bundle,
+instructions: "append the next change",
+instructionId: "continuation-1",
+config: driftedConfig,
+executorAssignment: recoveryLease,
+executorPool: pool,
+onUpdate: (update) => progress.push(update),
     });
     // Caller-owned lease: release it now that the continuation has settled.
     recoveryLease.release();
@@ -824,13 +836,13 @@ test("recovery with an unchanged agent id whose inherited env changed starts a n
     assert.ok(recoveryLease);
     const progress: ContinuationProgressUpdate[] = [];
     const continued = await continueOperation({
-      bundle,
-      instructions: "append the next change",
-      instructionId: "continuation-1",
-      config: driftedConfig,
-      executorAssignment: recoveryLease,
-      executorPool: pool,
-      onUpdate: (update) => progress.push(update),
+bundle,
+instructions: "append the next change",
+instructionId: "continuation-1",
+config: driftedConfig,
+executorAssignment: recoveryLease,
+executorPool: pool,
+onUpdate: (update) => progress.push(update),
     });
     // Caller-owned lease: release it now that the continuation has settled.
     recoveryLease.release();
@@ -884,13 +896,13 @@ test("recovery with only a shadowed base env value changed resumes the exact pri
     assert.ok(recoveryLease);
     const progress: ContinuationProgressUpdate[] = [];
     const continued = await continueOperation({
-      bundle,
-      instructions: "append the next change",
-      instructionId: "continuation-1",
-      config: shadowedConfig,
-      executorAssignment: recoveryLease,
-      executorPool: pool,
-      onUpdate: (update) => progress.push(update),
+bundle,
+instructions: "append the next change",
+instructionId: "continuation-1",
+config: shadowedConfig,
+executorAssignment: recoveryLease,
+executorPool: pool,
+onUpdate: (update) => progress.push(update),
     });
     // Caller-owned lease: release it now that the continuation has settled.
     recoveryLease.release();

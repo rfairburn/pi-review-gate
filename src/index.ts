@@ -39,7 +39,7 @@ import { ExecutionToolManager } from "./execution/tool";
 import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
-import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateParseError, SessionStateStore, type PendingDeliverySummary } from "./session-state";
+import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateMissingSelectionDigestError, SessionStateParseError, SessionStateStore, SessionStateUnsupportedFormatError, type PendingDeliverySummary } from "./session-state";
 import { BackgroundProcessReadiness } from "./background-process-readiness";
 import {
   registerBackgroundShell,
@@ -91,12 +91,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       executorSettlementBootstrapError = error instanceof Error ? error : new Error("Pi executor settlement bootstrap failed.");
     }
   }
-  let loaded;
-  try {
-    loaded = loadConfig();
-  } catch (error) {
-    await sendNotice(pi, `review gate: config error: ${error instanceof Error ? error.message : "unknown error"}`);
-    return;
+  const loaded = loadConfig();
+  for (const warning of loaded.warnings ?? []) {
+    await sendNotice(pi, `review gate: config warning: ${warning}`);
   }
 
   const { config } = loaded;
@@ -623,7 +620,6 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       && !runAborted
       && !pausedForReviewerQuestion
       && !state.reviewsPaused
-      && !prospectiveWindow.reviewConfigurationError
       && (prospectiveWindow.reviewConfig?.enabled ?? config.enabled),
     );
     // Reviews settle model work, not the live browser. Page scripts and
@@ -690,18 +686,6 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       return;
     }
     const reviewConfig = window.reviewConfig ?? freezeReviewWindowConfig(state, config, currentScopedModels);
-    if (window.reviewConfigurationError) {
-      // Defensive only: reconciliation clears this flag on restore and the
-      // current configuration no longer sets it. If a legacy flag ever
-      // survives, defer instead of destroying the preserved window.
-      await sendNoticeWhileSessionActive(
-        noticeTarget,
-        `review gate: reviewer selection error: ${window.reviewConfigurationError}; review deferred; use /review-settings`,
-        () => sessionActive,
-      );
-      await persistSessionState();
-      return;
-    }
     if (!reviewConfig.enabled) {
       if (config.enabled) {
         // The gate is enabled but no configured reviewer is currently
@@ -835,19 +819,30 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         await reviewAbort.notifyCancellation();
       }
       state.reviewInProgress = false;
-      // Restored sessions may hold queued-input ledger entries without durable
-      // delivery records; reconcile them before counting so every entry that is
-      // cleared below is also counted. Deliveries already in flight
-      // (dispatching/uncertain) are never counted as definitely dropped.
-      if (backfillLegacyQueuedInputDeliveries(state)) {
-        await persistSessionState();
-      }
       // Count the queued user inputs that are deliberately dropped with this
       // cancellation so the notice below never invents or leaks content. The
-      // count is computed before the deliveries below are cancelled and the
-      // queued-input ledger is cleared.
-      const droppedInputCount = state.pendingModelDeliveries.filter((delivery) =>
-        delivery.kind === "queued_user_input" && delivery.status === "queued").length;
+      // ledger is the source of truth for what is cleared: every reachable
+      // current entry carries its durable delivery record, old-only entries
+      // without one are still counted (never silently dropped), and ledger
+      // occurrences whose only record is an in-flight delivery
+      // (dispatching/uncertain) may still land and are never counted as
+      // definitely dropped. The count is computed before the deliveries below
+      // are cancelled and the queued-input ledger is cleared.
+      const inFlightByMessage = new Map<string, number>();
+      for (const delivery of state.pendingModelDeliveries) {
+        if (delivery.kind === "queued_user_input" && (delivery.status === "dispatching" || delivery.status === "uncertain")) {
+          inFlightByMessage.set(delivery.message, (inFlightByMessage.get(delivery.message) ?? 0) + 1);
+        }
+      }
+      let droppedInputCount = 0;
+      for (const message of state.queuedUserInputsDuringReview) {
+        const inFlight = inFlightByMessage.get(message) ?? 0;
+        if (inFlight > 0) {
+          inFlightByMessage.set(message, inFlight - 1);
+          continue;
+        }
+        droppedInputCount += 1;
+      }
       for (const delivery of state.pendingModelDeliveries) {
         if (delivery.kind === "queued_user_input" && delivery.status === "queued") {
           delivery.status = "cancelled";
@@ -1200,6 +1195,8 @@ function safeRestoreFailureDiagnostic(error: unknown): string {
   if (typeof code === "string" && SAFE_DIAGNOSTIC_ERRNO_PATTERN.test(code)) return `errno ${code}`;
   if (error instanceof SessionStateParseError) return "invalid JSON";
   if (error instanceof SessionStateInvalidStateError) return "invalid persisted state";
+  if (error instanceof SessionStateUnsupportedFormatError) return "unsupported pre-cutover session format (missing snapshot omission ledger)";
+  if (error instanceof SessionStateMissingSelectionDigestError) return "unsupported pre-cutover session format (missing reviewer-selection digest)";
   if (error instanceof SessionStateIntegrityError) return "integrity check failed";
   if (error instanceof SessionStateConversationMismatchError) return "conversation mismatch";
   return "validation failed";
@@ -1395,8 +1392,44 @@ async function recoverPendingModelDeliveries(input: {
     }
   }
   if (input.state.queuedUserInputsDuringReview.length > 0) {
-    await input.notify(`review gate: ${input.state.queuedUserInputsDuringReview.length} user input(s) remain queued from an interrupted review and were not reordered automatically; use /review-now to finish the interrupted review and release them, or /review-clear to cancel them`);
+    // Occurrence-aware split: only ledger occurrences backed by an active
+    // (non-terminal) durable delivery record can be released when the review
+    // finishes; old-only occurrences without one must never be promised a
+    // release — they stay preserved until explicitly cancelled.
+    const total = input.state.queuedUserInputsDuringReview.length;
+    const { releasable, unreleasable } = splitReleasableQueuedInputs(input.state);
+    if (unreleasable === 0) {
+      await input.notify(`review gate: ${total} user input(s) remain queued from an interrupted review and were not reordered automatically; use /review-now to finish the interrupted review and release them, or /review-clear to cancel them`);
+    } else if (releasable === 0) {
+      await input.notify(`review gate: ${total} user input(s) remain queued from an interrupted review and were not reordered automatically; none can be released by /review-now because no active durable delivery record exists for them; they stay preserved until cancelled with /review-clear`);
+    } else {
+      await input.notify(`review gate: ${total} user input(s) remain queued from an interrupted review and were not reordered automatically; ${releasable} of them can be released by finishing the interrupted review with /review-now, but ${unreleasable} cannot be released automatically because no active durable delivery record exists for them; all of them stay preserved until cancelled with /review-clear`);
+    }
   }
+}
+
+/**
+ * Split queued-input ledger occurrences into those backed by an active
+ * (non-terminal) durable delivery record — releasable when the review
+ * finishes — and old-only occurrences without one, which can never be
+ * dispatched. Occurrence-based so repeated texts count correctly.
+ */
+function splitReleasableQueuedInputs(state: ReviewGateState): { releasable: number; unreleasable: number } {
+  const activeByMessage = new Map<string, number>();
+  for (const delivery of state.pendingModelDeliveries) {
+    if (delivery.kind === "queued_user_input" && delivery.status !== "delivered" && delivery.status !== "cancelled") {
+      activeByMessage.set(delivery.message, (activeByMessage.get(delivery.message) ?? 0) + 1);
+    }
+  }
+  let releasable = 0;
+  for (const message of state.queuedUserInputsDuringReview) {
+    const active = activeByMessage.get(message) ?? 0;
+    if (active > 0) {
+      activeByMessage.set(message, active - 1);
+      releasable += 1;
+    }
+  }
+  return { releasable, unreleasable: state.queuedUserInputsDuringReview.length - releasable };
 }
 
 export default activate;
@@ -1422,7 +1455,18 @@ async function releaseQueuedUserInputs(
   persist: () => void | Promise<void>,
 ): Promise<void> {
   state.reviewInProgress = false;
-  if (backfillLegacyQueuedInputDeliveries(state)) await persist();
+  // Old-only ledger occurrences without an active durable delivery record can
+  // never be dispatched; identify them explicitly instead of silently
+  // skipping — their contents stay preserved until the user cancels them.
+  if (isSessionActive()) {
+    const { unreleasable } = splitReleasableQueuedInputs(state);
+    if (unreleasable > 0) {
+      await sendNotice(
+        pi,
+        `review gate: ${unreleasable} queued user input(s) were not released because no active durable delivery record exists for them; they stay preserved and can be cancelled with /review-clear`,
+      );
+    }
+  }
   for (const delivery of state.pendingModelDeliveries.filter((candidate) =>
     candidate.kind === "queued_user_input" && candidate.status !== "delivered" && candidate.status !== "cancelled")) {
     if (!isSessionActive()) return;
@@ -1441,33 +1485,6 @@ async function releaseQueuedUserInputs(
       return;
     }
   }
-}
-
-// Reconcile legacy queued-input ledger entries into durable queued_user_input
-// deliveries (occurrence-aware, matching releaseQueuedUserInputs dispatch
-// semantics). Returns true when any delivery record was backfilled.
-function backfillLegacyQueuedInputDeliveries(state: ReviewGateState): boolean {
-  let backfilled = false;
-  const queuedOccurrences = new Map<string, number>();
-  for (const message of state.queuedUserInputsDuringReview) {
-    const occurrence = (queuedOccurrences.get(message) ?? 0) + 1;
-    queuedOccurrences.set(message, occurrence);
-    const existing = state.pendingModelDeliveries.filter((delivery) =>
-      delivery.kind === "queued_user_input"
-      && delivery.message === message
-      && delivery.status !== "delivered"
-      && delivery.status !== "cancelled").length;
-    if (existing >= occurrence) continue;
-    const sequence = state.pendingModelDeliveries.filter((delivery) => delivery.kind === "queued_user_input").length + 1;
-    queueModelDelivery(state, {
-      deliveryId: `queued-user-input:${state.reviewWindow?.id ?? "window"}:${sequence}`,
-      kind: "queued_user_input",
-      channel: "follow_up",
-      message,
-    });
-    backfilled = true;
-  }
-  return backfilled;
 }
 
 type ReviewAbortReason = "parent" | "escape" | "manual" | "session_shutdown";

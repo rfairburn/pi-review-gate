@@ -97,6 +97,35 @@ export class SessionStateConversationMismatchError extends Error {
 }
 
 /**
+ * Typed restore failure: the sidecar is authentic but predates the canonical
+ * session format — its persisted snapshots lack the omission ledger — which
+ * is no longer supported. The review portion of such a sidecar is explicitly
+ * unrecoverable rather than guessed; never quotes the document's content.
+ */
+export class SessionStateUnsupportedFormatError extends Error {
+  constructor() {
+    super("Persisted review-gate session state predates the canonical snapshot format (missing omission ledger) and is no longer supported.");
+    this.name = "SessionStateUnsupportedFormatError";
+  }
+}
+
+/**
+ * Typed restore failure: the sidecar is authentic but carries a persisted
+ * review window without the reviewer-selection digest that current writers
+ * always record. That shape predates selection tracking and is explicitly
+ * unsupported: accepting it would upgrade it on read (the next save rewrites
+ * the file with a freshly computed digest), so restore fails locally instead
+ * of guessing and the sidecar is preserved untouched. Never quotes the
+ * document's content.
+ */
+export class SessionStateMissingSelectionDigestError extends Error {
+  constructor() {
+    super("Persisted review-gate session state carries a review window without the reviewer-selection digest required by the current format and is no longer supported.");
+    this.name = "SessionStateMissingSelectionDigestError";
+  }
+}
+
+/**
  * Atomically move a session-state sidecar to a unique sibling path without
  * clobbering any existing file. link() fails with EEXIST if the target already
  * exists (no-clobber) and is atomic; unlink() then removes the original so the
@@ -155,11 +184,10 @@ interface PersistedSessionState {
   cwd: string;
   savedAt: string;
   integritySha256: string;
-  reviewConfigDigest?: string;
   /**
    * Digest of the reviewer selection that produced the persisted state. Older
-   * sidecars predate the field; restore falls back to the broad
-   * reviewConfigDigest comparison for them.
+   * sidecars predate the field; reconciliation reports their saved selection
+   * as unverifiable instead of guessing.
    */
   reviewerSelectionDigest?: string;
   state: PersistedReviewGateState;
@@ -204,7 +232,6 @@ interface PersistedReviewWindow {
   reviewerSessions: Array<[string, ReviewerSession]>;
   retainBundleAfterClose: boolean;
   nextExchangeRequestIndex: number;
-  reviewConfigurationError?: string;
 }
 
 interface PersistedWorkspaceSnapshot {
@@ -229,7 +256,6 @@ export interface RestoredSessionState {
   revision: number;
   state: ReviewGateState;
   execution: ExecutionAssociationsSnapshot;
-  reviewConfigDigest?: string;
   reviewerSelectionDigest?: string;
 }
 
@@ -291,7 +317,6 @@ export class SessionStateStore {
       sessionFile: this.identity.sessionFile,
       cwd: resolve(this.identity.cwd),
       savedAt: new Date().toISOString(),
-      reviewConfigDigest: reviewConfig ? configDigest(reviewConfig) : undefined,
       reviewerSelectionDigest: reviewConfig ? reviewerSelectionDigest(reviewConfig) : undefined,
       state: serializeState(state),
       execution: cloneExecutionAssociations(execution),
@@ -358,12 +383,22 @@ export class SessionStateStore {
         pendingDeliveries: summarizePendingDeliveries(parsed.state.pendingModelDeliveries ?? []),
       });
     }
+    // Old-only boundary: current writers always record reviewerSelectionDigest
+    // when a review window is persisted. A window without it predates
+    // selection tracking and is explicitly unsupported — reject before any
+    // restored state is applied, rather than upgrading the file on read (the
+    // next save would rewrite it with a freshly computed digest). Records
+    // without a persisted review window have nothing to verify and remain
+    // restorable.
+    if ((isRecord(parsed.state.reviewWindow) || isRecord(parsed.state.lastQuestionWindow))
+      && parsed.reviewerSelectionDigest === undefined) {
+      throw new SessionStateMissingSelectionDigestError();
+    }
     this.revision = parsed.revision;
     return {
       revision: parsed.revision,
       state: deserializeState(parsed.state),
       execution: cloneExecutionAssociations(parsed.execution),
-      reviewConfigDigest: parsed.reviewConfigDigest,
       reviewerSelectionDigest: parsed.reviewerSelectionDigest,
     };
   }
@@ -500,7 +535,6 @@ function serializeWindow(window: ReviewWindow): PersistedReviewWindow {
     reviewerSessions: [...window.reviewerSessions.entries()].map(([key, value]) => [key, { ...value }]),
     retainBundleAfterClose: window.retainBundleAfterClose,
     nextExchangeRequestIndex: window.nextExchangeRequestIndex,
-    reviewConfigurationError: window.reviewConfigurationError,
   };
 }
 
@@ -541,7 +575,6 @@ function deserializeWindow(window: PersistedReviewWindow): ReviewWindow {
     reviewerSessions: new Map(window.reviewerSessions.map(([key, value]) => [key, { ...value }])),
     retainBundleAfterClose: window.retainBundleAfterClose,
     nextExchangeRequestIndex: window.nextExchangeRequestIndex,
-    reviewConfigurationError: window.reviewConfigurationError,
   };
 }
 
@@ -556,13 +589,18 @@ function serializeSnapshot(snapshot: WorkspaceSnapshot): PersistedWorkspaceSnaps
 }
 
 function deserializeSnapshot(snapshot: PersistedWorkspaceSnapshot): WorkspaceSnapshot {
+  // Sidecars predating the omission ledger are old-only and unsupported:
+  // fail explicitly instead of guessing an empty ledger, so a preserved
+  // baseline can never claim a completeness it was never recorded with.
+  if (!Array.isArray(snapshot.omissions) || typeof snapshot.omissionsTruncated !== "boolean") {
+    throw new SessionStateUnsupportedFormatError();
+  }
   return {
     cwd: snapshot.cwd,
     capturedAt: snapshot.capturedAt,
     files: new Map(snapshot.files.map(([key, value]) => [key, { ...value }])),
-    // Legacy persisted state predates the omission ledger; default to empty.
-    omissions: (snapshot.omissions ?? []).map((omission) => ({ ...omission })),
-    omissionsTruncated: snapshot.omissionsTruncated ?? false,
+    omissions: snapshot.omissions.map((omission) => ({ ...omission })),
+    omissionsTruncated: snapshot.omissionsTruncated,
   };
 }
 

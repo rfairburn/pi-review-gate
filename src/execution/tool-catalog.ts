@@ -17,11 +17,50 @@ export interface ExecutorToolCatalog {
   initialActiveTools: string[];
 }
 
-/** Legacy fields retained on task/operation records during format migration. */
+/** Records that carry the durable catalog contract (task and operation records). */
 export interface ExecutorToolCatalogCarrier {
   executorToolCatalog?: ExecutorToolCatalog;
-  executorAllowedTools?: string[];
-  executorInitialActiveTools?: string[];
+}
+
+/**
+ * Pre-cutover compatibility fields. They are never read, written, compared,
+ * or migrated; their presence without the canonical contract marks an
+ * unsupported old-format record or request.
+ */
+const LEGACY_RECORD_CATALOG_FIELDS = ["executorAllowedTools", "executorInitialActiveTools"] as const;
+const LEGACY_REQUEST_CATALOG_FIELDS = ["allowedTools", "initialActiveTools"] as const;
+
+function hasAnyField(value: object, fields: readonly string[]): boolean {
+  return fields.some((field) => (value as Record<string, unknown>)[field] !== undefined);
+}
+
+function hasLegacyCatalogFields(carrier: object): boolean {
+  return hasAnyField(carrier, LEGACY_RECORD_CATALOG_FIELDS);
+}
+
+/**
+ * Reject executor requests that carry pre-cutover compatibility fields
+ * without the canonical contract. A valid canonical catalog takes precedence
+ * and stale copies are ignored; genuinely catalog-free requests remain
+ * legitimate for adapters without a native allowlist surface.
+ */
+export function rejectPreCutoverRequestFields(request: ExecutorToolCatalogCarrier): void {
+  if (request.executorToolCatalog === undefined && hasAnyField(request, LEGACY_REQUEST_CATALOG_FIELDS)) {
+    throw new Error(
+      "Unsupported pre-cutover executor request: the request carries legacy allowedTools/initialActiveTools fields without the canonical executorToolCatalog contract.",
+    );
+  }
+}
+
+/**
+ * Remove pre-cutover compatibility keys from a newly created record so fresh
+ * durable data never carries mirrors. Restoration paths deliberately do not
+ * call this: existing doubled records are consumed, not rewritten.
+ */
+export function stripLegacyCatalogFields(carrier: object): void {
+  for (const field of LEGACY_RECORD_CATALOG_FIELDS) {
+    delete (carrier as Record<string, unknown>)[field];
+  }
 }
 
 /** Stable first-seen normalization: trim names, reject blanks, and dedupe. */
@@ -61,7 +100,7 @@ export function createPiWorkerToolCatalog(catalog: ExecutorToolCatalog): Executo
   );
 }
 
-/** Build the canonical contract, defaulting to legacy full-active behavior. */
+/** Build the canonical contract, defaulting to full-active when no initial set is given. */
 export function createExecutorToolCatalog(
   allowedToolCatalog: readonly string[],
   initialActiveTools?: readonly string[],
@@ -78,9 +117,14 @@ export function createExecutorToolCatalog(
 }
 
 /**
- * Resolve current and legacy persisted shapes. Older records containing only
- * executorAllowedTools retain the historical behavior where every authorized
- * tool starts active.
+ * Read the canonical catalog from a persisted record.
+ *
+ * Doubled records consume the validated canonical contract and ignore any
+ * stale pre-cutover copies without migration or rewrite-on-read. Records
+ * carrying only pre-cutover fields are unsupported old-format catalogs and
+ * fail explicitly instead of restoring historical full-active behavior;
+ * records with no catalog fields at all remain legitimate no-catalog
+ * contexts for callers that do not require one.
  */
 export function resolveExecutorToolCatalog(carrier: ExecutorToolCatalogCarrier): ExecutorToolCatalog | undefined {
   const canonical = carrier.executorToolCatalog;
@@ -90,30 +134,21 @@ export function resolveExecutorToolCatalog(carrier: ExecutorToolCatalogCarrier):
     }
     return createExecutorToolCatalog(canonical.allowedToolCatalog, canonical.initialActiveTools);
   }
-  if (carrier.executorAllowedTools === undefined) {
-    if (carrier.executorInitialActiveTools !== undefined) {
-      throw new Error("Invalid executor tool catalog: an initial active set requires an allowed tool catalog.");
-    }
-    return undefined;
+  if (hasLegacyCatalogFields(carrier)) {
+    throw new Error(
+      "Unsupported pre-cutover executor tool catalog: the record carries legacy executorAllowedTools/executorInitialActiveTools fields without the canonical executorToolCatalog contract.",
+    );
   }
-  if (!Array.isArray(carrier.executorAllowedTools)) {
-    throw new Error("Invalid executor tool catalog: allowed tools must be an array.");
-  }
-  if (carrier.executorInitialActiveTools !== undefined && !Array.isArray(carrier.executorInitialActiveTools)) {
-    throw new Error("Invalid executor tool catalog: initial active tools must be an array.");
-  }
-  return createExecutorToolCatalog(carrier.executorAllowedTools, carrier.executorInitialActiveTools);
+  return undefined;
 }
 
-/** Persist the canonical contract and compatibility fields together. */
+/** Persist the canonical contract only; records never carry compatibility mirrors. */
 export function assignExecutorToolCatalog(
   carrier: ExecutorToolCatalogCarrier,
   catalog: ExecutorToolCatalog | undefined,
 ): void {
   if (!catalog) {
     delete carrier.executorToolCatalog;
-    delete carrier.executorAllowedTools;
-    delete carrier.executorInitialActiveTools;
     return;
   }
   const normalized = createExecutorToolCatalog(catalog.allowedToolCatalog, catalog.initialActiveTools);
@@ -121,11 +156,9 @@ export function assignExecutorToolCatalog(
     allowedToolCatalog: [...normalized.allowedToolCatalog],
     initialActiveTools: [...normalized.initialActiveTools],
   };
-  carrier.executorAllowedTools = [...normalized.allowedToolCatalog];
-  carrier.executorInitialActiveTools = [...normalized.initialActiveTools];
 }
 
-/** Normalize a record in place after creation or durable restoration. */
+/** Validate a record's canonical catalog in place after creation or durable restoration. */
 export function normalizeExecutorToolCatalog(carrier: ExecutorToolCatalogCarrier): ExecutorToolCatalog | undefined {
   const catalog = resolveExecutorToolCatalog(carrier);
   assignExecutorToolCatalog(carrier, catalog);

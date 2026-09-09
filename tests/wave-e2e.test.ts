@@ -71,24 +71,26 @@ async function waitForFile(path: string, timeoutMs: number): Promise<void> {
  */
 function makeConfigWithReportingWriter(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "reporting-writer" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "reporting-writer" }, maxConcurrent: 1 }],
+          },
+externalAgents: [
         {
           id: "reporting-writer",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "let input='';",
@@ -110,10 +112,11 @@ function makeConfigWithReportingWriter(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 30_000,
-        },
-      ],
-    },
+            timeoutMs: 30_000,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -124,24 +127,26 @@ function makeConfigWithReportingWriter(): ReviewGateConfig {
  */
 function makeConfigWithTargetedWriter(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "targeted-writer" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "targeted-writer" }, maxConcurrent: 1 }],
+          },
+externalAgents: [
         {
           id: "targeted-writer",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "let input='';",
@@ -159,10 +164,11 @@ function makeConfigWithTargetedWriter(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: 30_000,
-        },
-      ],
-    },
+            timeoutMs: 30_000,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -175,24 +181,26 @@ function makeConfigWithSyncSlowExecutor(syncFile: string, markerFile: string): R
   const escapedSyncFile = syncFile.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   const escapedMarkerFile = markerFile.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "sync-slow" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "sync-slow" }, maxConcurrent: 1 }],
+          },
+externalAgents: [
         {
           id: "sync-slow",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "let input='';",
@@ -217,10 +225,11 @@ function makeConfigWithSyncSlowExecutor(syncFile: string, markerFile: string): R
               "});",
             ].join(""),
           ],
-          timeoutMs: 30000,
-        },
-      ],
-    },
+            timeoutMs: 30000,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 

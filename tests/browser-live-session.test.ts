@@ -73,11 +73,25 @@ test("real CONNECT browser stays live through idle, permission wait, Pi turns/re
   let resolutions = 0;
   let dialCount = 0;
   const marker = join(root, "review-started");
-  const config = normalizeConfig({ enabled: true, retainBundles: "never", decider: {
-    id: "fixture", adapter: "generic-cli", command: process.execPath,
-    args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started');process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'fixture reviewed',findings:[]})),800))`],
-    timeoutMs: 15_000,
-  } });
+  const config = normalizeConfig({
+enabled: true,
+retainBundles: "never",
+externalAgents: [
+      {
+        id: "fixture",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+        review: {
+          args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started');process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'fixture reviewed',findings:[]})),800))`],
+          timeoutMs: 15_000,
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "fixture" }
+    ] },
+  });
   const createManager = () => new InteractiveBrowserManager(config.web!.fetch, {
     resolveHostname: async () => { resolutions++; return ["93.184.216.34"]; },
     brokerDial: (_validated, destinationPort) => {

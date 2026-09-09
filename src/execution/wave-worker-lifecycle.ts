@@ -39,6 +39,7 @@ import {
 import { pinCommit } from "./wave-worktrees";
 import {
   configWithReviewers,
+  frozenReviewerSelection,
   resolveReviewers,
   reviewerDisplayLabel,
   type DeciderConfig,
@@ -175,7 +176,8 @@ function reportProgress(
 
 /**
  * Freeze and validate reviewer selection for this worker.
- * Returns a frozen config with materialized reviewers, or throws on blockage.
+ * Returns a frozen canonical config with the exact selection and the
+ * external agent definitions it needs, or throws on blockage.
  */
 export function reviewerProgressLabel(reviewer: DeciderConfig): string {
   if (reviewer.adapter === "pi-model") {
@@ -203,8 +205,9 @@ function freezeReviewers(
     );
   }
   const enabled = config.enabled && resolution.reviewers.length > 0;
-  // Materialize a frozen config so runReview uses the exact resolved reviewers.
-  const frozenConfig = configWithReviewers(config, resolution.reviewers, enabled);
+  // Materialize a frozen canonical config so runReview uses the exact
+  // selected reviewers and their agent definitions.
+  const frozenConfig = configWithReviewers(config, frozenReviewerSelection(config, resolution), enabled);
   return { frozenConfig, enabled };
 }
 
@@ -996,7 +999,7 @@ export async function runWaveWorkerLifecycle(
 
     const reviewCycle = nextReviewCycleNumber;
     nextReviewCycleNumber += 1;
-    const reviewerLabels = frozen.frozenConfig.reviewers?.map(reviewerProgressLabel) ?? [];
+    const reviewerLabels = resolveReviewers(frozen.frozenConfig).reviewers.map(reviewerProgressLabel);
     reportProgress(input, {
       phase: "reviewing",
       message: `review cycle ${reviewCycle}`,

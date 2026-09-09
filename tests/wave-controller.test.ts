@@ -173,24 +173,26 @@ async function waitForManifest(
  */
 function makeConfigWithWritingExecutor(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "fake-writer" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-writer" }, maxConcurrent: 4 }],
+    },
+externalAgents: [
         {
           id: "fake-writer",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "process.stdin.resume();",
@@ -205,10 +207,11 @@ function makeConfigWithWritingExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-        },
-      ],
-    },
+            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -218,24 +221,26 @@ function makeConfigWithWritingExecutor(): ReviewGateConfig {
  */
 function makeConfigWithFailingExecutor(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "fake-fail" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-fail" }, maxConcurrent: 4 }],
+    },
+externalAgents: [
         {
           id: "fake-fail",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "process.stdin.resume();",
@@ -247,10 +252,11 @@ function makeConfigWithFailingExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-        },
-      ],
-    },
+            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -260,24 +266,26 @@ function makeConfigWithFailingExecutor(): ReviewGateConfig {
  */
 function makeConfigWithMixedExecutor(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "fake-mixed" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-mixed" }, maxConcurrent: 4 }],
+    },
+externalAgents: [
         {
           id: "fake-mixed",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "let input='';",
@@ -296,10 +304,11 @@ function makeConfigWithMixedExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-        },
-      ],
-    },
+            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -308,24 +317,26 @@ function makeConfigWithMixedExecutor(): ReviewGateConfig {
  */
 function makeConfigWithSlowExecutor(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "fake-slow" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-slow" }, maxConcurrent: 4 }],
+    },
+externalAgents: [
         {
           id: "fake-slow",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "process.stdin.resume();",
@@ -339,10 +350,11 @@ function makeConfigWithSlowExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-        },
-      ],
-    },
+            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -356,25 +368,26 @@ function makeConfigWithSlowExecutor(): ReviewGateConfig {
  */
 function makeConfigWithGatedExecutor(gateDir: string): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "fake-gated" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-gated" }, maxConcurrent: 4 }],
+    },
+externalAgents: [
         {
           id: "fake-gated",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          env: { PI_GATE_DIR: gateDir },
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "process.stdin.resume();",
@@ -397,10 +410,12 @@ function makeConfigWithGatedExecutor(gateDir: string): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-        },
-      ],
-    },
+            env: { PI_GATE_DIR: gateDir },
+            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -410,24 +425,26 @@ function makeConfigWithGatedExecutor(gateDir: string): ReviewGateConfig {
  */
 function makeConfigWithNoopExecutor(): ReviewGateConfig {
   return {
-    enabled: false,
-    reviewerTimeoutMs: 600_000,
-    executorTimeoutMs: 1_800_000,
-    maxCorrectionCycles: 0,
-    implementationGuidanceAfterCorrectionAttempts: 1,
-    maxPatchBytes: 200_000,
-    maxFileBytes: 1_048_576,
-    maxSnapshotBytes: 52_428_800,
-    retainBundles: "never",
-    execution: {
-      activeExecutor: { source: "external", id: "fake-noop" },
-      externalExecutors: [
+enabled: false,
+reviewerTimeoutMs: 600_000,
+executorTimeoutMs: 1_800_000,
+maxCorrectionCycles: 0,
+implementationGuidanceAfterCorrectionAttempts: 1,
+maxPatchBytes: 200_000,
+maxFileBytes: 1_048_576,
+maxSnapshotBytes: 52_428_800,
+retainBundles: "never",
+execution: {
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-noop" }, maxConcurrent: 4 }],
+    },
+externalAgents: [
         {
           id: "fake-noop",
           adapter: "run-as-binary",
-          protocol: "pi-review-executor-jsonl-v1",
           command: process.execPath,
-          args: [
+          args: [],
+          execution: {
+            args: [
             "-e",
             [
               "process.stdin.resume();",
@@ -439,10 +456,11 @@ function makeConfigWithNoopExecutor(): ReviewGateConfig {
               "});",
             ].join(""),
           ],
-          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-        },
-      ],
-    },
+            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+            protocol: "pi-review-executor-jsonl-v1",
+          },
+        }
+    ],
   };
 }
 
@@ -822,19 +840,27 @@ test("reviewer milestones reach execution activity updates", async () => {
   await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
   await git(["add", "."], sourceDir);
   await git(["commit", "--quiet", "-m", "init"], sourceDir);
+  const baseConfig = makeConfigWithWritingExecutor();
   const config: ReviewGateConfig = {
-    ...makeConfigWithWritingExecutor(),
+    ...baseConfig,
     enabled: true,
-    decider: {
-      id: "passing",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
-        "-e",
-        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
-      ],
-      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-    },
+    externalAgents: [
+      ...(baseConfig.externalAgents ?? []),
+      {
+        id: "passing",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+        review: {
+          args: [
+            "-e",
+            "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
+          ],
+          timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+        },
+      },
+    ],
+    review: { activeReviewers: [{ source: "external", id: "passing" }] },
   };
   const activity: string[] = [];
 
@@ -1020,32 +1046,35 @@ test("fresh workers overflow through the ordered executor pool by per-model capa
   const writer = (id: string) => ({
     id,
     adapter: "run-as-binary" as const,
-    protocol: "pi-review-executor-jsonl-v1" as const,
     command: process.execPath,
-    args: [
-      "-e",
+    args: [],
+    execution: {
+      protocol: "pi-review-executor-jsonl-v1" as const,
+      args: [
+        "-e",
       [
         "process.stdin.resume();",
-        "process.stdin.on('data',()=>{});",
-        "process.stdin.on('end',()=>{",
-        '  const fs=require("fs");',
-        `  fs.writeFileSync(require("path").join(process.cwd(),${JSON.stringify(`${id}.txt`)}),${JSON.stringify(`${id}\n`)});`,
-        `  process.stdout.write(JSON.stringify({type:"session",sessionId:${JSON.stringify(`${id}-session`)}})+"\\n");`,
-        '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-        "});",
-      ].join(""),
-    ],
-    timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          `  fs.writeFileSync(require("path").join(process.cwd(),${JSON.stringify(`${id}.txt`)}),${JSON.stringify(`${id}\n`)});`,
+          `  process.stdout.write(JSON.stringify({type:"session",sessionId:${JSON.stringify(`${id}-session`)}})+"\\n");`,
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "});",
+          ].join(""),
+        ],
+        timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+      },
   });
   const config: ReviewGateConfig = {
     ...makeConfigWithWritingExecutor(),
     execution: {
-      executorPool: [
-        { entryId: "primary", selection: { source: "external", id: "primary" }, maxConcurrent: 1 },
-        { entryId: "overflow", selection: { source: "external", id: "overflow" }, maxConcurrent: 1 },
+      workerResources: [
+        { resourceId: "primary", selection: { source: "external", id: "primary" }, maxConcurrent: 1 },
+        { resourceId: "overflow", selection: { source: "external", id: "overflow" }, maxConcurrent: 1 },
       ],
-      externalExecutors: [writer("primary"), writer("overflow")],
     },
+    externalAgents: [writer("primary"), writer("overflow")],
   };
 
   try {

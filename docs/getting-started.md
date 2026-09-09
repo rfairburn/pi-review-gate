@@ -56,10 +56,16 @@ A minimal example using Codex as the reviewer:
   "reviewerTimeoutMs": 600000,
   "maxCorrectionCycles": 3,
   "retainBundles": "on-failure",
-  "decider": {
-    "id": "codex",
-    "adapter": "codex-cli",
-    "timeoutMs": 600000
+  "externalAgents": [
+    {
+      "id": "codex",
+      "adapter": "codex-cli"
+    }
+  ],
+  "review": {
+    "activeReviewers": [
+      { "source": "external", "id": "codex" }
+    ]
   }
 }
 ```

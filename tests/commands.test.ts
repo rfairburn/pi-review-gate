@@ -24,8 +24,9 @@ test("reviewer command output shows internal model labels instead of encoded rev
   assert.match(answer, /## ollama\/deepseek-v4-flash:0731-cloud — pass/);
   assert.doesNotMatch(answer, /pi-b2xsYW1hL2RlZXBzZWVrLXY0LWZsYXNoOjA3MzEtY2xvdWQ/);
 
-  // A result without a saved identity (pre-migration history) renders with
-  // its raw reviewer id rather than an invented current-configuration label.
+  // A result without a saved identity (synthesized outcome or superseded-format
+  // history) renders with its raw reviewer id rather than an invented
+  // current-configuration label.
   const legacyAnswer = formatReviewerAnswer("is this safe?", [{
     reviewerId: "one",
     verdict: "pass",
@@ -45,13 +46,10 @@ test("reviewer command output shows internal model labels instead of encoded rev
     },
     cwd: () => process.cwd(),
     config: {
-      ...fakeNeedsChangesConfig(),
-      decider: {
-        id: reviewerId,
-        adapter: "pi-model",
-        model: displayLabel,
-        timeoutMs: 15000,
-      },
+...fakeNeedsChangesConfig(),
+review: { activeReviewers: [
+        { source: "pi", model: displayLabel }
+      ] },
     },
     state: createState(),
   });
@@ -307,17 +305,25 @@ test("Escape immediately aborts an active /review-now", async () => {
       pi,
       cwd: () => dir,
       config: {
-        ...reviewConfig(),
-        decider: {
-          id: "slow",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [
+...reviewConfig(),
+externalAgents: [
+          {
+            id: "slow",
+            adapter: "generic-cli",
+            command: process.execPath,
+            args: [],
+            review: {
+              args: [
             "-e",
             `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
           ],
-          timeoutMs: 300_000,
-        },
+              timeoutMs: 300_000,
+            },
+          }
+        ],
+review: { activeReviewers: [
+          { source: "external", id: "slow" }
+        ] },
       },
       state,
     });
@@ -381,17 +387,25 @@ test("/review-cancel stops an active /review-now, reports quiescence, and works 
       cwd: () => dir,
       cancellation: createReviewCancellationCoordinator(),
       config: {
-        ...reviewConfig(),
-        decider: {
-          id: "slow",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [
+...reviewConfig(),
+externalAgents: [
+          {
+            id: "slow",
+            adapter: "generic-cli",
+            command: process.execPath,
+            args: [],
+            review: {
+              args: [
             "-e",
             `require('node:fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`,
           ],
-          timeoutMs: 300_000,
-        },
+              timeoutMs: 300_000,
+            },
+          }
+        ],
+review: { activeReviewers: [
+          { source: "external", id: "slow" }
+        ] },
       },
       state,
     });
@@ -793,17 +807,25 @@ test("Escape immediately aborts an active /ask-reviewer and clears its terminal 
       pi,
       cwd: () => dir,
       config: {
-        ...reviewConfig(),
-        decider: {
-          id: "slow",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [
+...reviewConfig(),
+externalAgents: [
+          {
+            id: "slow",
+            adapter: "generic-cli",
+            command: process.execPath,
+            args: [],
+            review: {
+              args: [
             "-e",
             `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
           ],
-          timeoutMs: 300_000,
-        },
+              timeoutMs: 300_000,
+            },
+          }
+        ],
+review: { activeReviewers: [
+          { source: "external", id: "slow" }
+        ] },
       },
       state: createState(),
     });
@@ -1001,28 +1023,39 @@ function reviewConfig(): ReviewGateConfig {
 
 function passingReviewConfig(): ReviewGateConfig {
   return {
-    ...reviewConfig(),
-    decider: {
-      id: "passing",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
+...reviewConfig(),
+externalAgents: [
+      {
+        id: "passing",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+        review: {
+          args: [
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'approved',findings:[]})))",
       ],
-      timeoutMs: 15000,
-    },
+          timeoutMs: 15000,
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "passing" }
+    ] },
   };
 }
 
 function passingReviewWithQuestionCheckConfig(): ReviewGateConfig {
   return {
-    ...reviewConfig(),
-    decider: {
-      id: "prompt-checker",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
+...reviewConfig(),
+externalAgents: [
+      {
+        id: "prompt-checker",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+        review: {
+          args: [
         "-e",
         [
           "process.stdin.resume();",
@@ -1043,79 +1076,105 @@ function passingReviewWithQuestionCheckConfig(): ReviewGateConfig {
           "});",
         ].join(""),
       ],
-      timeoutMs: 15000,
-    },
+          timeoutMs: 15000,
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "prompt-checker" }
+    ] },
   };
 }
 
 function multiReviewerReviewConfig(): ReviewGateConfig {
   return {
-    ...reviewConfig(),
-    decider: undefined,
-    reviewers: [
+...reviewConfig(),
+externalAgents: [
       {
         id: "blocking",
         adapter: "generic-cli",
         command: process.execPath,
-        args: [
+        args: [],
+        review: {
+          args: [
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
         ],
-        timeoutMs: 15000,
+          timeoutMs: 15000,
+        },
       },
       {
         id: "claude",
         adapter: "generic-cli",
         command: process.execPath,
-        args: [
+        args: [],
+        review: {
+          args: [
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'claude found no blocking issues',findings:[]})))",
         ],
-        timeoutMs: 15000,
-      },
+          timeoutMs: 15000,
+        },
+      }
     ],
+review: { activeReviewers: [
+      { source: "external", id: "blocking" },
+      { source: "external", id: "claude" }
+    ] },
   };
 }
 
 function askReviewerPartialErrorConfig(): ReviewGateConfig {
   return {
-    ...reviewConfig(),
-    decider: undefined,
-    retainBundles: "on-failure",
-    reviewers: [
+...reviewConfig(),
+retainBundles: "on-failure",
+externalAgents: [
       {
         id: "passing",
         adapter: "generic-cli",
         command: process.execPath,
-        args: [
+        args: [],
+        review: {
+          args: [
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewer answer ready',findings:[]})))",
         ],
-        timeoutMs: 15000,
+          timeoutMs: 15000,
+        },
       },
       {
         id: "bad-json",
         adapter: "generic-cli",
         command: process.execPath,
-        args: [
+        args: [],
+        review: {
+          args: [
           "-e",
           "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'maybe',summary:'invalid verdict',findings:[]})))",
         ],
-        timeoutMs: 15000,
-      },
+          timeoutMs: 15000,
+        },
+      }
     ],
+review: { activeReviewers: [
+      { source: "external", id: "passing" },
+      { source: "external", id: "bad-json" }
+    ] },
   };
 }
 
 function cappedWindowAskReviewerConfig(): ReviewGateConfig {
   return {
-    ...reviewConfig(),
-    maxCorrectionCycles: 0,
-    decider: {
-      id: "prompt-checker",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
+...reviewConfig(),
+maxCorrectionCycles: 0,
+externalAgents: [
+      {
+        id: "prompt-checker",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+        review: {
+          args: [
         "-e",
         [
           "process.stdin.resume();",
@@ -1136,19 +1195,27 @@ function cappedWindowAskReviewerConfig(): ReviewGateConfig {
           "});",
         ].join(""),
       ],
-      timeoutMs: 15000,
-    },
+          timeoutMs: 15000,
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "prompt-checker" }
+    ] },
   };
 }
 
 function askReviewerConfig(): ReviewGateConfig {
   return {
-    ...reviewConfig(),
-    decider: {
-      id: "fake",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
+...reviewConfig(),
+externalAgents: [
+      {
+        id: "fake",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+        review: {
+          args: [
         "-e",
         [
           "process.stdin.resume();",
@@ -1162,8 +1229,13 @@ function askReviewerConfig(): ReviewGateConfig {
           "});",
         ].join(""),
       ],
-      timeoutMs: 15000,
-    },
+          timeoutMs: 15000,
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "fake" }
+    ] },
   };
 }
 

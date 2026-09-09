@@ -145,9 +145,6 @@ export interface OperationRecord {
   executorAgentFingerprint?: string;
   /** Canonical durable authorization and initial activation for every attempt. */
   executorToolCatalog?: ExecutorToolCatalog;
-  /** @deprecated Compatibility mirror for older operation consumers. */
-  executorAllowedTools?: string[];
-  executorInitialActiveTools?: string[];
   session?: ExecutorSession;
   generation: number;
   retryBudget: number;

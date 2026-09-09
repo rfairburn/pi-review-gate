@@ -13,20 +13,12 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     customFutureKey: { keep: true },
-    enabledReviewerIds: ["one"],
-    reviewers: [
-      { id: "one", adapter: "generic-cli", command: process.execPath },
-      { id: "two", adapter: "generic-cli", command: process.execPath },
+    externalAgents: [
+      { id: "one", adapter: "generic-cli", command: process.execPath, args: [], review: {} },
+      { id: "two", adapter: "generic-cli", command: process.execPath, args: [], review: {} },
+      { id: "fake", adapter: "run-as-binary", command: process.execPath, args: [], execution: { protocol: "pi-review-executor-jsonl-v1" } },
     ],
-    execution: {
-      activeExecutor: null,
-      externalExecutors: [{
-        id: "fake",
-        adapter: "run-as-binary",
-        protocol: "pi-review-executor-jsonl-v1",
-        command: process.execPath,
-      }],
-    },
+    review: { activeReviewers: [{ source: "external", id: "one" }] },
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -63,7 +55,9 @@ test("/review-settings stages executor and reviewer changes and saves them toget
     { source: "external", id: "one" },
     { source: "external", id: "two" },
   ]);
-  assert.deepEqual(saved.externalAgents.map((agent: { id: string }) => agent.id), ["fake", "one", "two"]);
+  // The canonical catalog keeps the configured agent order; settings saves
+  // never reorder or migrate the shared external agent list.
+  assert.deepEqual(saved.externalAgents.map((agent: { id: string }) => agent.id), ["one", "two", "fake"]);
   assert.equal(saved.reviewers, undefined);
   assert.equal(saved.enabledReviewerIds, undefined);
   assert.deepEqual(saved.customFutureKey, { keep: true });
@@ -86,7 +80,9 @@ test("/review-settings builds and reorders an executor pool with per-model concu
       command: process.execPath,
       execution: { protocol: "pi-review-executor-jsonl-v1" },
     })),
-    execution: { executorPool: [] },
+    execution: {
+workerResources: [],
+    },
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -128,9 +124,9 @@ test("/review-settings independently excludes a shared worker resource from rese
       execution: {},
     })),
     execution: {
-      executorPool: [
-        { entryId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
-        { entryId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 2 },
+workerResources: [
+        { resourceId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+        { resourceId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 2 },
       ],
     },
   }), "utf8");
@@ -156,8 +152,18 @@ test("/review-settings clear-all saves a valid review-disabled configuration", a
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-empty-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
-    enabled: true,
-    reviewers: [{ id: "one", adapter: "generic-cli", command: process.execPath }],
+enabled: true,
+externalAgents: [
+      {
+        id: "one",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+      review: {}}
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "one" }
+    ] },
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -178,8 +184,18 @@ test("root Escape leaves the settings file unchanged", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-cancel-"));
   const configPath = join(dir, "review-gate.json");
   const original = JSON.stringify({
-    enabled: true,
-    reviewers: [{ id: "one", adapter: "generic-cli", command: process.execPath }],
+enabled: true,
+externalAgents: [
+      {
+        id: "one",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+      review: {}}
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "one" }
+    ] },
   });
   await writeFile(configPath, original, "utf8");
   const config: ReviewGateConfig = normalizeConfig(JSON.parse(original));
@@ -202,9 +218,8 @@ test("internal executor uses the exact Pi model label and canonical value", asyn
     // This test exercises model selection and persistence, not executable discovery.
     // Keep the master gate disabled so it does not require a full Pi CLI on PATH.
     enabled: false,
-    enabledReviewerIds: [],
-    reviewers: [],
-    execution: { activeExecutor: null, externalExecutors: [] },
+    review: { activeReviewers: [] },
+    execution: {},
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -234,17 +249,25 @@ test("internal executor uses the exact Pi model label and canonical value", asyn
   });
 });
 
-test("first settings save migrates a legacy decider into the shared external catalog", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-legacy-"));
+test("first settings save persists the normalized shared external catalog", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-catalog-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
-    enabled: true,
-    decider: {
-      id: "legacy",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: ["legacy-reviewer.cjs"],
-    },
+enabled: true,
+externalAgents: [
+      {
+        id: "legacy",
+        adapter: "generic-cli",
+        command: process.execPath,
+        args: [],
+        review: {
+          args: ["legacy-reviewer.cjs"],
+        },
+      }
+    ],
+review: { activeReviewers: [
+      { source: "external", id: "legacy" }
+    ] },
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -253,8 +276,9 @@ test("first settings save migrates a legacy decider into the shared external cat
   await registered.handler("", contextWithSelections(["Save changes"]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.equal(saved.decider, undefined);
   assert.deepEqual(saved.review.activeReviewers, [{ source: "external", id: "legacy" }]);
+  // The canonical config is persisted as configured; review defaults are
+  // applied at resolution time, never rewritten into the stored record.
   assert.deepEqual(saved.externalAgents, [{
     id: "legacy",
     adapter: "generic-cli",
@@ -262,8 +286,6 @@ test("first settings save migrates a legacy decider into the shared external cat
     args: [],
     review: {
       args: ["legacy-reviewer.cjs"],
-      timeoutMs: 600000,
-      protocol: "pi-reviewer-json-v1",
     },
   }]);
 });
@@ -407,7 +429,7 @@ test("subtask notification mode is staged and saved with quiet as the default", 
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: null },
+    execution: {},
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -430,7 +452,7 @@ test("deferred Pi tools toggle is staged, persisted, and labeled for local/new-s
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: null },
+    execution: {},
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -522,7 +544,7 @@ test("internal executor and reviewers persist independent per-model reasoning le
     // pi launcher is not installed on PATH.
     enabled: false,
     execution: {
-      activeExecutor: { source: "pi", model: "openai-codex/gpt-5.6-luna" },
+      workerResources: [{ selection: { source: "pi", model: "openai-codex/gpt-5.6-luna" }, maxConcurrent: 4 }],
     },
     review: {
       activeReviewers: [
@@ -590,7 +612,7 @@ test("executor concurrency is staged and saved atomically", async () => {
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: null },
+    execution: {},
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -613,7 +635,7 @@ test("retry policy is staged and saved atomically", async () => {
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: null },
+    execution: {},
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -662,7 +684,7 @@ test("/review-settings aligns every settings value column from the full label se
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    execution: { activeExecutor: null },
+    execution: {},
   });
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath: "/unused/review-gate.json" });

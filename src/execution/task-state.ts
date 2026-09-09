@@ -12,7 +12,7 @@ import type { ReattachmentBundle } from "./operation-record";
 import type { ContinuationProgressUpdate, SubtaskProgressPhase } from "./types";
 import type { WaveProgressUpdate, WaveResult } from "./wave-controller";
 import type { WaveWorkerResult, WaveWorkerTask } from "./wave-worker";
-import { normalizeExecutorToolCatalog } from "./tool-catalog";
+import { normalizeExecutorToolCatalog, stripLegacyCatalogFields } from "./tool-catalog";
 
 /** Bounded per-task activity history retained durably and in memory. */
 export const MAX_ACTIVITY = 200;
@@ -159,6 +159,9 @@ export function newTask(definition: BackgroundTaskDefinition): BackgroundTaskRec
   const now = new Date().toISOString();
   const normalizedDefinition = JSON.parse(JSON.stringify(definition)) as BackgroundTaskDefinition;
   normalizeExecutorToolCatalog(normalizedDefinition);
+  // New durable records are canonical-only: stale pre-cutover keys on a
+  // supplied input never enter the persisted definition.
+  stripLegacyCatalogFields(normalizedDefinition);
   return {
     taskId: `task-${randomUUID()}`,
     definition: normalizedDefinition,

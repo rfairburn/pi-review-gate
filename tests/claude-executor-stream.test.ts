@@ -72,8 +72,10 @@ test("Claude research executor exposes the full supported parent-authorized cata
       artifactDir,
       turn: 1,
       workspaceAccess: "read-only",
-      allowedTools: ["read", "grep", "find", "WebFetch", "WebSearch", "BrowserExtract", "bash"],
-      initialActiveTools: ["read", "WebFetch"],
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "grep", "find", "WebFetch", "WebSearch", "BrowserExtract", "bash"],
+        initialActiveTools: ["read", "WebFetch"],
+      },
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
@@ -125,7 +127,10 @@ test("Claude research executor rejects configured arguments that could widen its
     artifactDir: join(tmpdir(), "pi-review-claude-policy-override"),
     turn: 1,
     workspaceAccess: "read-only",
-    allowedTools: ["read"],
+    executorToolCatalog: {
+      allowedToolCatalog: ["read"],
+      initialActiveTools: ["read"],
+    },
   }), /rejects tool-policy argument --tools=Bash,Read/);
 });
 

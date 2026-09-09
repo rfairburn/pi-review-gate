@@ -10,7 +10,7 @@ import { PiExecutorAdapter } from "./pi-model";
 import { RunAsBinaryExecutorAdapter } from "./run-as-binary";
 
 export function createExecutorAdapter(config: ReviewGateConfig, selection?: ExecutorSelection): ExecutorAdapter {
-  const active = selection ?? config.execution?.activeExecutor;
+  const active = selection;
   if (!active) {
     throw new Error("delegated execution is disabled; choose an executor with /review-settings");
   }

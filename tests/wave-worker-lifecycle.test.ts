@@ -8,7 +8,7 @@ import { createWorkerWorktree, removeWorktree, workerRefName } from "../src/exec
 import { reviewerProgressLabel, runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "../src/execution/wave-worker-lifecycle";
 import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
 import { buildSubtaskEvidence, readSubtaskEvidence } from "../src/execution/subtask-evidence";
-import { normalizeConfig, type ReviewGateConfig } from "../src/config";
+import { normalizeConfig, type ActiveReviewerSelection, type ExternalAgentConfig, type ReviewGateConfig } from "../src/config";
 import type { WaveWorkerTask } from "../src/execution/wave-worker";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -105,88 +105,91 @@ async function createNoOpExecutor(root: string): Promise<{ command: string }> {
 }
 
 /** Build a config with a fake executor. */
-function buildConfig(command: string, executorId = "fake-exec"): ReviewGateConfig {
+const PASSING_REVIEWER_SCRIPT = "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))";
+const NEEDS_CHANGES_REVIEWER_SCRIPT = "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'x.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))";
+const ERRORING_REVIEWER_SCRIPT = "process.stdin.resume();process.stdin.on('end',()=>{throw new Error('reviewer crash');})";
+
+function cliReviewerAgent(id: string, script: string, timeoutMs = 15_000): ExternalAgentConfig {
+  return {
+    id,
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: { args: ["-e", script], timeoutMs },
+  };
+}
+
+function buildConfig(
+  command: string,
+  executorId = "fake-exec",
+  extraAgents: ExternalAgentConfig[] = [],
+  activeReviewers: ActiveReviewerSelection[] = [],
+): ReviewGateConfig {
   return normalizeConfig({
     enabled: true,
     execution: {
-      activeExecutor: { source: "external", id: executorId },
+      workerResources: [{ resourceId: "default", selection: { source: "external", id: executorId }, maxConcurrent: 1 }],
     },
-    externalAgents: [{
-      id: executorId,
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: {
-        protocol: "pi-review-executor-jsonl-v1",
-        args: [command],
-        timeoutMs: 15000,
+    externalAgents: [
+      {
+        id: executorId,
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1",
+          args: [command],
+          timeoutMs: 15000,
+        },
       },
-    }],
+      ...extraAgents,
+    ],
+    ...(activeReviewers.length > 0 ? { review: { activeReviewers } } : {}),
   });
 }
 
 /** Build a config with a passing reviewer. */
 function buildPassingReviewerConfig(executorCommand: string): ReviewGateConfig {
-  return {
-    ...buildConfig(executorCommand),
-    enabled: true,
-    decider: {
-      id: "passing",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
-        "-e",
-        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
-      ],
-      timeoutMs: 15000,
-    },
-  };
+  return buildConfig(
+    executorCommand,
+    "fake-exec",
+    [cliReviewerAgent("passing", PASSING_REVIEWER_SCRIPT)],
+    [{ source: "external", id: "passing" }],
+  );
 }
 
 /** Build a config with a needs_changes reviewer. */
 function buildNeedsChangesReviewerConfig(executorCommand: string): ReviewGateConfig {
-  return {
-    ...buildConfig(executorCommand),
-    enabled: true,
-    decider: {
-      id: "blocking",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
-        "-e",
-        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'x.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
-      ],
-      timeoutMs: 15000,
-    },
-  };
+  return buildConfig(
+    executorCommand,
+    "fake-exec",
+    [cliReviewerAgent("blocking", NEEDS_CHANGES_REVIEWER_SCRIPT)],
+    [{ source: "external", id: "blocking" }],
+  );
 }
 
 /** Build a config with a reviewer that errors. */
 function buildErrorReviewerConfig(executorCommand: string): ReviewGateConfig {
-  return {
-    ...buildConfig(executorCommand),
-    enabled: true,
-    decider: {
-      id: "erroring",
-      adapter: "generic-cli",
-      command: process.execPath,
-      args: [
-        "-e",
-        "process.stdin.resume();process.stdin.on('end',()=>{throw new Error('reviewer crash');})",
-      ],
-      timeoutMs: 15000,
-    },
-  };
+  return buildConfig(
+    executorCommand,
+    "fake-exec",
+    [cliReviewerAgent("erroring", ERRORING_REVIEWER_SCRIPT)],
+    [{ source: "external", id: "erroring" }],
+  );
 }
 
 function buildPassWithReviewerErrorConfig(executorCommand: string): ReviewGateConfig {
-  const passing = buildPassingReviewerConfig(executorCommand).decider!;
-  const erroring = buildErrorReviewerConfig(executorCommand).decider!;
-  return {
-    ...buildConfig(executorCommand),
-    enabled: true,
-    decider: undefined,
-    reviewers: [passing, erroring],
-  };
+  return buildConfig(
+    executorCommand,
+    "fake-exec",
+    [
+      cliReviewerAgent("passing", PASSING_REVIEWER_SCRIPT),
+      cliReviewerAgent("erroring", ERRORING_REVIEWER_SCRIPT),
+    ],
+    [
+      { source: "external", id: "passing" },
+      { source: "external", id: "erroring" },
+    ],
+  );
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -284,11 +287,16 @@ test("lifecycle resolves current review settings after executor work completes",
       id,
       adapter: "generic-cli" as const,
       command: process.execPath,
-      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'used');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))`],
-      timeoutMs: 15_000,
+      args: [],
+      review: {
+        args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'used');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))`],
+        timeoutMs: 15_000,
+      },
     });
     const config = buildConfig(executor);
-    config.decider = reviewer("old", oldReviewerMarker);
+    const executorAgent = config.externalAgents![0]!;
+    config.externalAgents = [executorAgent, reviewer("old", oldReviewerMarker)];
+    config.review = { activeReviewers: [{ source: "external", id: "old" }] };
 
     const running = runWaveWorkerLifecycle({
       sourceRoot: capture.discovery.captureRoot,
@@ -305,7 +313,8 @@ test("lifecycle resolves current review settings after executor work completes",
       await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
     }
     await access(startedMarker);
-    config.decider = reviewer("new", newReviewerMarker);
+    config.externalAgents = [executorAgent, reviewer("new", newReviewerMarker)];
+    config.review = { activeReviewers: [{ source: "external", id: "new" }] };
 
     const result = await running;
     assert.equal(result.status, "accepted");
@@ -468,14 +477,19 @@ test("lifecycle: steering during review aborts reviewers and resumes the executo
       "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID||'review-steer-session'}));",
       "console.log(JSON.stringify({type:'assistant',text:'turn '+turn+' complete'}));",
     ].join("\n"), "utf8");
+    const baseConfig = buildConfig(executor);
     const config: ReviewGateConfig = {
-      ...buildConfig(executor),
-      enabled: true,
-      decider: {
-        id: "slow-pass",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: ["-e", [
+...baseConfig,
+enabled: true,
+externalAgents: [
+        ...baseConfig.externalAgents!,
+        {
+          id: "slow-pass",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: ["-e", [
           "const fs=require('node:fs');const path=require('node:path');",
           "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
           "const request=fs.readFileSync(path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'request.md'),'utf8');",
@@ -483,8 +497,13 @@ test("lifecycle: steering during review aborts reviewers and resumes the executo
           "process.stdout.write(JSON.stringify(visible?{verdict:'pass',summary:'authoritative steering visible',findings:[]}:{verdict:'needs_changes',summary:'steering missing',findings:[{severity:'blocking',issue:'steering missing',recommendation:'include steering'}]}));",
           "},2000))",
         ].join("")],
-        timeoutMs: 5_000,
-      },
+            timeoutMs: 5_000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "slow-pass" }
+      ] },
     };
     let steered = false;
     const result = await runWaveWorkerLifecycle({
@@ -791,10 +810,9 @@ test("lifecycle: no reviewers configured returns completed_unreviewed", async ()
     await mkdir(artifactDir, { recursive: true });
 
     const { command } = await createFakeExecutor(root);
-    // Config with no decider and no reviewers.
+    // Config with no active reviewers.
     const config = buildConfig(command);
-    delete config.decider;
-    config.reviewers = [];
+    config.review = { activeReviewers: [] };
 
     const result = await runWaveWorkerLifecycle({
       sourceRoot: capture.discovery.captureRoot,
@@ -948,26 +966,25 @@ test("lifecycle: reviewer-blocked does not create artifact directory", async () 
     const artifactDir = join(capture.waveRoot, "artifacts", "task-blocked");
     // Do NOT pre-create the artifact directory.
 
-    // Config with duplicate enabled reviewer ids causes reviewer_blocked.
+    // Config with a duplicated enabled reviewer selection causes reviewer_blocked.
     const config = buildConfig(await createFakeExecutor(root).then((e) => e.command));
     config.enabled = true;
-    config.decider = undefined;
-    config.reviewers = [
+    config.externalAgents = [
+      ...config.externalAgents!,
       {
         id: "dup-reviewer",
         adapter: "generic-cli" as const,
         command: process.execPath,
-        args: ["-e", "process.stdout.write('{}')"],
-        timeoutMs: 15000,
-      },
-      {
-        id: "dup-reviewer",
-        adapter: "generic-cli" as const,
-        command: process.execPath,
-        args: ["-e", "process.stdout.write('{}')"],
-        timeoutMs: 15000,
+        args: [],
+        review: { args: ["-e", "process.stdout.write('{}')"], timeoutMs: 15000 },
       },
     ];
+    config.review = {
+      activeReviewers: [
+        { source: "external", id: "dup-reviewer" },
+        { source: "external", id: "dup-reviewer" },
+      ],
+    };
 
     const result = await runWaveWorkerLifecycle({
       sourceRoot: capture.discovery.captureRoot,
@@ -1004,14 +1021,19 @@ test("lifecycle: reviewer receives task acceptance criteria in evidence", async 
     const { command } = await createFakeExecutor(root);
 
     // Reviewer checks that the prompt contains acceptance criteria.
+    const baseConfig = buildConfig(command);
     const config: ReviewGateConfig = {
-      ...buildConfig(command),
-      enabled: true,
-      decider: {
-        id: "evidence-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+enabled: true,
+externalAgents: [
+        ...baseConfig.externalAgents!,
+        {
+          id: "evidence-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -1031,8 +1053,13 @@ test("lifecycle: reviewer receives task acceptance criteria in evidence", async 
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "evidence-checker" }
+      ] },
     };
 
     const result = await runWaveWorkerLifecycle({
@@ -1084,17 +1111,27 @@ test("lifecycle: an executor completion report resolves review without a tree ch
       ":{verdict:'needs_changes',summary:'completion report missing',guidance:'Report completion.',findings:[{severity:'blocking',file:'session',line:null,issue:'completion report missing',recommendation:'Report completion.'}]}));",
       "});",
     ].join("");
+    const baseConfig = buildConfig(executor);
     const config: ReviewGateConfig = {
-      ...buildConfig(executor),
-      enabled: true,
-      maxCorrectionCycles: 2,
-      decider: {
-        id: "response-evidence-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: ["-e", reviewerScript],
-        timeoutMs: 15_000,
-      },
+...baseConfig,
+enabled: true,
+maxCorrectionCycles: 2,
+externalAgents: [
+        ...baseConfig.externalAgents!,
+        {
+          id: "response-evidence-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: ["-e", reviewerScript],
+            timeoutMs: 15_000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "response-evidence-checker" }
+      ] },
     };
 
     const result = await runWaveWorkerLifecycle({
@@ -1127,14 +1164,19 @@ test("lifecycle: reviewer receives the executor's isolated path mapping", async 
     const { command } = await createFakeExecutor(root, "absolute-output.txt");
     const aliasRoot = sourceDir + "-lexical-alias";
     const expectedWorkerPath = join(worker.worktreeRoot, "absolute-output.txt");
+    const baseConfig = buildConfig(command);
     const config: ReviewGateConfig = {
-      ...buildConfig(command),
-      enabled: true,
-      decider: {
-        id: "path-mapping-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [
+...baseConfig,
+enabled: true,
+externalAgents: [
+        ...baseConfig.externalAgents!,
+        {
+          id: "path-mapping-checker",
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: [
           "-e",
           [
             "process.stdin.resume();",
@@ -1151,8 +1193,13 @@ test("lifecycle: reviewer receives the executor's isolated path mapping", async 
             "});",
           ].join(""),
         ],
-        timeoutMs: 15000,
-      },
+            timeoutMs: 15000,
+          },
+        }
+      ],
+review: { activeReviewers: [
+        { source: "external", id: "path-mapping-checker" }
+      ] },
     };
 
     const result = await runWaveWorkerLifecycle({

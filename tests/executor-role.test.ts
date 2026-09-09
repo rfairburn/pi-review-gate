@@ -268,7 +268,9 @@ async function catalogProducedByExecutionToolManager(): Promise<ExecutorToolCata
         args: ["-e", "process.stdin.resume();setInterval(()=>{},1000)"],
       },
     }],
-    execution: { activeExecutor: { source: "external", id: "fake" } },
+    execution: {
+workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+    },
   });
   const manager = new ExecutionToolManager({
     pi: {

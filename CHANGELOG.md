@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.19]
+
+### Added
+
+- `/review-settings` now selects Prefer execution, Prefer orchestration (default), or
+  Plan/research. The extension replaces the mode-specific system prompt on the next
+  normal run in the same conversation, without restart or layered orchestration
+  instructions. Planning removes write-capable tools from active schemas, the tool
+  inventory, and deferred discovery; writing requires switching modes. Shared safety
+  rules and already-running subtask authority remain unchanged (Refs #19).
+
 ## [0.1.0-dev.18]
 
 ### Changed

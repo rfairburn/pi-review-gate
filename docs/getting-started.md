@@ -106,7 +106,8 @@ config from `~/.config/pi-review-gate/config.json` or `~/.config/pi/review-gate.
 (creating a private zero-model default config at the primary path when neither exists),
 refreshes the discoverable orchestration skill at
 `~/.agents/skills/orchestrator/SKILL.md` (including its recovery runbook), and then
-executes the installed `pi` with the extension and the orchestrator prompt. All remaining
+executes the installed `pi` with the extension. The extension selects the
+[operating-mode prompt](configuration.md#operating-modes); all remaining launcher
 arguments are forwarded unchanged. To limit the orchestrator, pass Pi's native tool
 allowlist through the wrapper, for example
 `./scripts/pi-review-gate.sh --tools read,bash,edit,write`.

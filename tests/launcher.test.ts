@@ -170,9 +170,11 @@ test("persistent launcher uses the Pi fallback config and forwards arguments", a
     await readFile(join(home, ".agents", "skills", "orchestrator", "references", "recovery.md"), "utf8"),
     await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
   );
+  // The launcher no longer bakes the orchestrator prompt in with
+  // --append-system-prompt: the extension owns the operating-mode segment.
   assert.equal(
     await readFile(join(capture, "args"), "utf8"),
-    `--extension\n${resolve("dist/src/index.js")}\n--append-system-prompt\n${resolve("scripts/orchestrator-system-prompt.md")}\n--model\nexample\n--tools\nread,bash\n`,
+    `--extension\n${resolve("dist/src/index.js")}\n--model\nexample\n--tools\nread,bash\n`,
   );
 });
 

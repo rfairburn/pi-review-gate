@@ -1,4 +1,5 @@
-import { deferredPiToolsEnabled, loadConfig, materializeReviewConfig, resolveReviewers } from "./config";
+import { join } from "node:path";
+import { deferredPiToolsEnabled, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode } from "./config";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
@@ -49,6 +50,7 @@ import {
 import { registerApplyPatchTool } from "./apply-patch/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
 import { DeferredToolManager } from "./deferred-tools";
+import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
   createExecutorToolCatalog,
@@ -178,6 +180,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     return;
   }
 
+  // The extension selects one mode segment per run; the launcher no longer
+  // permanently appends orchestration instructions.
+  const operatingModeSegments = loadOperatingModeSegments(join(__dirname, "..", "..", "scripts"));
+
   const backgroundShellController = canRegisterBackgroundShell(pi)
     ? registerBackgroundShell(pi)
     : undefined;
@@ -185,7 +191,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // Register the compact loader before session_start. Authorization capture
   // is deliberately delayed until executionTools.sync() has registered and
   // reconciled every legitimately available top-level execution tool.
-  const deferredTools = new DeferredToolManager(pi);
+  const deferredTools = new DeferredToolManager(pi, () => config.operatingMode);
   deferredTools.register();
 
   const state = createState();
@@ -358,6 +364,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   registerHook(pi, "session_shutdown", async (...args) => {
     sessionActive = false;
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
+    setStatus(extractContext(args) ?? pi, "review-gate-mode", undefined);
     sessionAbortController.abort();
     const reviewSettled = activeReviewSettled;
     activeReviewAbort?.shutdown();
@@ -456,6 +463,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       false,
       deferredPiToolsEnabled(config),
     );
+    setStatus(extractContext(args) ?? pi, "review-gate-mode", operatingModeStatusText(config.operatingMode));
     if (restoredRevision !== undefined) {
       await recoverPendingModelDeliveries({
         pi,
@@ -511,7 +519,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     executionTools.setUiContext(extractContext(args) ?? pi);
     beginAgentRun(state);
     if (activeExchangeHasBaseline(state)) {
-      return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, extractSystemPrompt(args));
+      return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
     }
     const baseline = await createWorkspaceSnapshot(currentCwd, {
       maxFileBytes: config.maxFileBytes,
@@ -520,7 +528,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     setReviewWindowBaseline(state, baseline);
     freezeReviewWindowConfig(state, config, currentScopedModels);
     await persistSessionState();
-    return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, extractSystemPrompt(args));
+    return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
   });
 
   registerHook(pi, "tool_call", async (...args) => {
@@ -1019,10 +1027,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     pi,
     config,
     configPath: loaded.path,
-    onSaved: async () => {
+    onSaved: async (_saved, previousMode, context) => {
       executionTools.sync();
       deferredTools.setDeferredEnabled(deferredPiToolsEnabled(config));
       webTools?.sync(config);
+      await applyOperatingModeTransition(previousMode, context);
       // Reconcile existing review windows to the new reviewer selection
       // immediately. The swap replaces each window's frozen config object
       // without mutating it, so an invocation already running under the old
@@ -1051,6 +1060,42 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     const choices = scopedModelChoices(extractContext(args) ?? args.find((arg) => scopedModelChoices(arg) !== undefined));
     if (choices) currentScopedModels = choices.map((choice) => choice.model);
   }
+
+  /**
+   * Compose this run's system prompt: the base prompt (including any user
+   * --append-system-prompt text and shared instructions) plus the current
+   * operating-mode segment. Each run is built fresh, so a mode switch replaces
+   * the previous mode's segment on the next run without string surgery; the
+   * authorized tool inventory is appended after it by executionPromptInjection.
+   */
+  const operatingModeSystemPrompt = (args: unknown[]): string | undefined => {
+    const base = extractSystemPrompt(args);
+    const segment = operatingModeSegments[config.operatingMode];
+    if (!segment) return base;
+    return base ? `${base}\n\n${segment}` : segment;
+  };
+
+  const operatingModeStatusText = (mode: OperatingMode): string => `operating mode: ${OPERATING_MODE_LABELS[mode]}`;
+
+  /**
+   * The single shared operating-mode transition path (settings save today,
+   * hotkey later). Affects future actions only: the current run and already
+   * running subtasks keep their captured instructions, disclosed counts-only.
+   */
+  const applyOperatingModeTransition = async (previous: OperatingMode, noticeTarget: unknown): Promise<void> => {
+    deferredTools.reapply();
+    const next = config.operatingMode;
+    if (previous === next) return;
+    setStatus(noticeTarget, "review-gate-mode", operatingModeStatusText(next));
+    const capturedWork = executionTools.reviewReadiness().length + currentBackgroundReadiness().running.length;
+    const detail = next === "plan-research"
+      ? "write-capable tools are hidden until you switch to a write-capable mode"
+      : "previously authorized tools are available again";
+    await sendNotice(
+      noticeTarget,
+      `review gate: operating mode is now ${OPERATING_MODE_LABELS[next]}; the mode prompt and tool set apply from the next turn. ${capturedWork > 0 ? `${capturedWork} running work item(s) keep their captured instructions until they finish. ` : ""}${detail}.`,
+    );
+  };
 }
 
 async function cleanupReviewBundles(state: ReviewGateState): Promise<void> {
@@ -1127,7 +1172,10 @@ function executionPromptInjection(
   authorizedToolInventory?: string,
   systemPrompt?: string,
 ): { message?: { customType: string; content: string; display: boolean }; systemPrompt?: string } | undefined {
-  if (!content && !authorizedToolInventory) return undefined;
+  const composedSystemPrompt = authorizedToolInventory
+    ? withAuthorizedToolInventory(systemPrompt, authorizedToolInventory)
+    : systemPrompt;
+  if (!content && composedSystemPrompt === undefined) return undefined;
   return {
     ...(content ? {
       message: {
@@ -1136,9 +1184,7 @@ function executionPromptInjection(
         display: false,
       },
     } : {}),
-    ...(authorizedToolInventory ? {
-      systemPrompt: withAuthorizedToolInventory(systemPrompt, authorizedToolInventory),
-    } : {}),
+    ...(composedSystemPrompt !== undefined ? { systemPrompt: composedSystemPrompt } : {}),
   };
 }
 

@@ -1166,6 +1166,7 @@ function assertEffectiveReasoningSupported(savedConfig: unknown, scopedModels: u
 }
 
 const ROOT_SETTING_LABELS = [
+  "Operating mode",
   "Worker resources",
   "Execution priority",
   "Research priority",

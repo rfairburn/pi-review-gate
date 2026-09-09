@@ -3,6 +3,7 @@ import type { ReviewGateConfig } from "../src/config";
 export function fakeNeedsChangesConfig(overrides: Partial<ReviewGateConfig> = {}): ReviewGateConfig {
   return {
     enabled: true,
+    operatingMode: "orchestrate",
     reviewerTimeoutMs: 600_000,
     executorTimeoutMs: 1_800_000,
     maxCorrectionCycles: 3,

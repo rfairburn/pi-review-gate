@@ -8,12 +8,14 @@ import {
   type ExecutorPoolEntry,
   type WorkerRouteEntry,
   type ExecutionRetryPolicy,
+  type OperatingMode,
   type RetainBundles,
   type ReviewGateConfig,
   type SubtaskNotificationMode,
 } from "../config";
 
 export interface ReviewSettingsSelection {
+  operatingMode: OperatingMode;
   workerResources?: ExecutorPoolEntry[];
   executeRoute?: WorkerRouteEntry[];
   researchRoute?: WorkerRouteEntry[];
@@ -67,6 +69,7 @@ export async function persistReviewSettings(
     const review = isRecord(parsed.review) ? { ...parsed.review } : {};
     review.activeReviewers = selection.activeReviewers.map((reviewer) => ({ ...reviewer }));
     parsed.review = review;
+    parsed.operatingMode = selection.operatingMode;
     parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
     parsed.executorTimeoutMs = selection.executorTimeoutMs;
     parsed.maxCorrectionCycles = selection.maxCorrectionCycles;

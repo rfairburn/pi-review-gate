@@ -6,6 +6,7 @@ import test from "node:test";
 import { persistReviewSettings, persistSubtasksViewPreference, updateReviewGateConfig, type ReviewSettingsSelection } from "../src/settings/persistence";
 
 const selection: ReviewSettingsSelection = {
+operatingMode: "orchestrate",
 workerResources: [],
 activeReviewers: [],
 reviewerTimeoutMs: 600_000,

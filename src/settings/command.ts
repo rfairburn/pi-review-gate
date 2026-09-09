@@ -22,12 +22,15 @@ import {
   type ExecutorSelection,
   type ExternalAgentConfig,
   type ExecutionRetryPolicy,
+  OPERATING_MODES,
+  type OperatingMode,
   type RetainBundles,
   type ReviewGateConfig,
   type SubtaskNotificationMode,
   type ThinkingLevel,
   type WorkerRouteEntry,
 } from "../config";
+import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { sendNotice } from "../pi";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
@@ -36,7 +39,7 @@ interface RegisterSettingsInput {
   pi: unknown;
   config: ReviewGateConfig;
   configPath?: string;
-  onSaved?: (config: ReviewGateConfig) => void | Promise<void>;
+  onSaved?: (config: ReviewGateConfig, previousMode: OperatingMode, context: unknown) => void | Promise<void>;
   onScopedModels?: (models: string[]) => void;
 }
 
@@ -69,6 +72,7 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
 
 async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; scoped: ScopedModelChoice[] }): Promise<void> {
   const agents = externalAgentCatalog(input.config);
+  let operatingMode = input.config.operatingMode;
   let workerResources = materializeExecutorPool(resolvedWorkerResources(input.config), input.scoped);
   let executeRoute = initialWorkerRoute(input.config, "execute", workerResources);
   let researchRoute = initialWorkerRoute(input.config, "research", workerResources);
@@ -93,7 +97,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const [resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, deferredToolsRow, subtasksViewRow, webRow] = alignedSettingsRows([
+    const [modeRow, resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, deferredToolsRow, subtasksViewRow, webRow] = alignedSettingsRows([
+      ["Operating mode", OPERATING_MODE_LABELS[operatingMode]],
       ["Worker resources", executorPoolSummary(workerResources)],
       ["Execution priority", workerRouteSummary(executeRoute, workerResources, agents, input.scoped)],
       ["Research priority", workerRouteSummary(researchRoute, workerResources, agents, input.scoped)],
@@ -109,6 +114,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ["Web", `${formatByteSize(webMaxDownloadBytes)} max download`],
     ]);
     const choice = await input.ui.select("Review settings", [
+      modeRow,
       resourcesRow,
       executeRouteRow,
       researchRouteRow,
@@ -126,6 +132,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       "Cancel",
     ]);
     if (!choice || choice === "Cancel") return;
+    if (choice === modeRow) {
+      operatingMode = await selectOperatingMode(input.ui, operatingMode);
+      continue;
+    }
     if (choice === resourcesRow) {
       const priorResourceIds = new Set(workerResources.map((entry) => entry.entryId));
       const priorSelectionKeys = new Map(workerResources.map((entry) => [entry.entryId, executorSelectionKey(entry.selection)]));
@@ -220,6 +230,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       continue;
     }
     const next = await persistReviewSettings(input.configPath!, {
+      operatingMode,
       workerResources,
       executeRoute,
       researchRoute,
@@ -238,8 +249,9 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       browserInteractionApproval,
       browserIdleExpiryMinutes,
     });
+    const previousMode = input.config.operatingMode;
     replaceConfig(input.config, next);
-    await input.onSaved?.(input.config);
+    await input.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings saved.", "info");
     return;
   }
@@ -312,6 +324,12 @@ async function selectSubtaskNotifications(
   const options = rows.map((row) => `${row.label}${row.value === current ? "  current" : ""}`);
   const selected = await ui.select("Subtask notifications", options);
   return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
+}
+
+async function selectOperatingMode(ui: UiContext, current: OperatingMode): Promise<OperatingMode> {
+  const options = OPERATING_MODES.map((mode) => `${OPERATING_MODE_LABELS[mode]}${mode === current ? "  current" : ""}`);
+  const selected = await ui.select("Operating mode", options);
+  return OPERATING_MODES.find((mode) => selected === `${OPERATING_MODE_LABELS[mode]}${mode === current ? "  current" : ""}`) ?? current;
 }
 
 async function selectBundleRetention(ui: UiContext, current: RetainBundles): Promise<RetainBundles> {

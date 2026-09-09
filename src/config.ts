@@ -4,6 +4,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export type RetainBundles = "never" | "on-failure" | "always";
+/**
+ * Top-level operating posture for the primary assistant. `orchestrate` is the
+ * historical default (the launcher's permanent orchestrator prompt); it keeps
+ * existing behavior for configs that predate the field.
+ */
+export const OPERATING_MODES = ["execute", "orchestrate", "plan-research"] as const;
+export type OperatingMode = typeof OPERATING_MODES[number];
+export const DEFAULT_OPERATING_MODE: OperatingMode = "orchestrate";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = typeof THINKING_LEVELS[number];
 
@@ -211,6 +219,8 @@ export interface ReviewGateUiConfig {
 
 export interface ReviewGateConfig {
   enabled: boolean;
+  /** Top-level operating posture; hot-replaces the mode prompt on the next run. */
+  operatingMode: OperatingMode;
   reviewerTimeoutMs: number;
   executorTimeoutMs: number;
   maxCorrectionCycles: number;
@@ -238,6 +248,7 @@ export interface LoadedConfig {
 
 export const DEFAULT_CONFIG: ReviewGateConfig = {
   enabled: true,
+  operatingMode: DEFAULT_OPERATING_MODE,
   reviewerTimeoutMs: 600_000,
   executorTimeoutMs: 1_800_000,
   maxCorrectionCycles: 1,
@@ -389,6 +400,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
   const config: ReviewGateConfig = {
     ...DEFAULT_CONFIG,
     enabled: value.enabled ?? DEFAULT_CONFIG.enabled,
+    operatingMode: normalizeOperatingMode(value.operatingMode),
     reviewerTimeoutMs,
     executorTimeoutMs,
     maxCorrectionCycles: nonNegativeIntegerOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles, "maxCorrectionCycles"),
@@ -1280,6 +1292,14 @@ function cloneExecutorSelection(selection: ExecutorSelection): ExecutorSelection
       model: selection.model,
       ...(selection.thinkingLevel ? { thinkingLevel: selection.thinkingLevel } : {}),
     };
+}
+
+function normalizeOperatingMode(value: unknown): OperatingMode {
+  if (value === undefined) return DEFAULT_OPERATING_MODE;
+  if (typeof value === "string" && (OPERATING_MODES as readonly string[]).includes(value)) {
+    return value as OperatingMode;
+  }
+  throw new Error(`operatingMode must be one of: ${OPERATING_MODES.join(", ")}`);
 }
 
 function normalizeRetainBundles(value: unknown): RetainBundles {

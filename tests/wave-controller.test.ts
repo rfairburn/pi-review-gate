@@ -174,6 +174,7 @@ async function waitForManifest(
 function makeConfigWithWritingExecutor(): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,
@@ -222,6 +223,7 @@ externalAgents: [
 function makeConfigWithFailingExecutor(): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,
@@ -267,6 +269,7 @@ externalAgents: [
 function makeConfigWithMixedExecutor(): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,
@@ -318,6 +321,7 @@ externalAgents: [
 function makeConfigWithSlowExecutor(): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,
@@ -369,6 +373,7 @@ externalAgents: [
 function makeConfigWithGatedExecutor(gateDir: string): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,
@@ -426,6 +431,7 @@ externalAgents: [
 function makeConfigWithNoopExecutor(): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,

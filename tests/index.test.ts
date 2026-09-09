@@ -492,6 +492,85 @@ review: { activeReviewers: [
   }
 });
 
+test("session_start keeps launch-authorized native discovery active in the conservative active set (#71)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-discovery-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      review: { activeReviewers: [] },
+      externalAgents: [{
+        id: "fake",
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+      }],
+      execution: {
+        workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+      },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    // Pi's default startup registers discovery without initially activating it.
+    let activeTools = ["read", "bash", "edit"];
+    let runtimeInitialized = false;
+    const assertRuntime = () => {
+      if (!runtimeInitialized) throw new Error("Extension runtime not initialized");
+    };
+    const registeredTools: Array<{ name: string; description?: string }> = [];
+    const registeredDiscovery = [
+      { name: "grep", description: "Search file contents." },
+      { name: "find", description: "Find files." },
+      { name: "ls", description: "List directory entries." },
+    ];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand() {},
+      registerTool(tool: { name: string; description?: string }) {
+        registeredTools.push(tool);
+        activeTools.push(tool.name);
+      },
+      getActiveTools() {
+        assertRuntime();
+        return activeTools;
+      },
+      getAllTools() {
+        assertRuntime();
+        return [
+          { name: "read", description: "Read files." },
+          { name: "bash", description: "Run shell commands." },
+          { name: "edit", description: "Edit files." },
+          ...registeredDiscovery,
+          ...registeredTools,
+        ];
+      },
+      setActiveTools(next: string[]) {
+        assertRuntime();
+        activeTools = next;
+      },
+      notify() {},
+    };
+
+    await activate(pi);
+    runtimeInitialized = true;
+    await trigger(hooks, "session_start", { cwd: dir }, { cwd: dir, ui: {}, sessionManager: {} });
+    for (const name of ["grep", "find", "ls"]) {
+      assert.ok(activeTools.includes(name), `${name} is active from the first request`);
+    }
+    // The conservative set keeps the discovery trio alongside the loader and
+    // execution controls; a mode switch retains them (covered role-level).
+    assert.deepEqual(activeTools, [
+      "read", "grep", "find", "ls", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools",
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("session_start captures execution tools before applying the conservative deferred set", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-runtime-start-"));
   try {

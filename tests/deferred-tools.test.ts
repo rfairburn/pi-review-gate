@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { DeferredToolManager } from "../src/deferred-tools";
 import type { OperatingMode } from "../src/config";
@@ -27,7 +30,7 @@ function tool(name: string, description: string): RegisteredTool {
   };
 }
 
-function hostFixture(options: { disabled?: string[] } = {}) {
+function hostFixture(options: { disabled?: string[]; omit?: string[] } = {}) {
   const definitions: RegisteredTool[] = [
     tool("read", "Read file contents."),
     tool("bash", "Execute a shell command."),
@@ -39,8 +42,8 @@ function hostFixture(options: { disabled?: string[] } = {}) {
     tool("SubtasksInspect", "Inspect background execution state."),
     tool("WebSearch", "Search the public web for current sources."),
     tool("disabled_private", "Search a private disabled service."),
-  ];
-  const disabled = new Set(options.disabled ?? ["disabled_private"]);
+  ].filter((definition) => !(options.omit ?? []).includes(definition.name));
+  const disabled = new Set([...(options.omit ?? []), ...((options.disabled ?? ["disabled_private"]))]);
   let active = definitions.map((definition) => definition.name).filter((name) => !disabled.has(name));
   const setCalls: string[][] = [];
   const sessionIdentity = {};
@@ -58,11 +61,18 @@ function hostFixture(options: { disabled?: string[] } = {}) {
       setCalls.push([...names]);
     },
   };
+  /** Register a tool the host lists in getAllTools but left launch-inactive. */
+  const registerInactive = (definition: RegisteredTool) => {
+    const existing = definitions.findIndex((candidate) => candidate.name === definition.name);
+    if (existing >= 0) definitions.splice(existing, 1, definition);
+    else definitions.push(definition);
+  };
   return {
     pi,
     sessionIdentity,
     definitions,
     setCalls,
+    registerInactive,
     active: () => [...active],
     search: () => {
       const registered = definitions.find((definition) => definition.name === "search_tools");
@@ -594,4 +604,193 @@ test("the first-request deferred schema is materially smaller than the authorize
     after.serializedSchemaBytes < before.serializedSchemaBytes * 0.8,
     `expected material schema reduction (${before.serializedSchemaBytes} -> ${after.serializedSchemaBytes})`,
   );
+});
+
+test("launch-authorized native discovery is active from the first request in every operating mode (#71)", () => {
+  // Discovery that is already active stays active too.
+  const fixture = hostFixture();
+  for (const name of ["grep", "find", "ls"]) {
+    fixture.pi.registerTool(tool(name, `Native read-only discovery via ${name}.`));
+  }
+  let mode: OperatingMode = "execute";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  // Active from the first request, with no search_tools activation step.
+  assert.ok(fixture.active().includes("grep"));
+  assert.ok(fixture.active().includes("find"));
+  assert.ok(fixture.active().includes("ls"));
+  // The durable parent authorization keeps them for research inheritance.
+  const authorized = manager.authorizedToolNames()!;
+  for (const name of ["grep", "find", "ls"]) {
+    assert.ok(authorized.includes(name), `${name} stays authorized for delegated research`);
+  }
+  assert.match(manager.startupGuidance() ?? "", /"grep"/);
+
+  // Plan/research keeps read-only discovery while unloading write-capable tools.
+  mode = "plan-research";
+  manager.reapply();
+  for (const name of ["grep", "find", "ls"]) assert.ok(fixture.active().includes(name));
+  for (const name of ["bash", "edit", "write", "ApplyPatch", "SubtasksStart"]) {
+    assert.ok(!fixture.active().includes(name), `${name} stays unloaded in plan-research`);
+  }
+
+  // Mode cycling never deactivates otherwise-authorized discovery.
+  mode = "orchestrate";
+  manager.reapply();
+  for (const name of ["grep", "find", "ls"]) assert.ok(fixture.active().includes(name));
+  mode = "execute";
+  manager.reapply();
+  for (const name of ["grep", "find", "ls"]) assert.ok(fixture.active().includes(name));
+});
+
+test("registered-but-inactive native discovery becomes active by default in every mode (#71)", async () => {
+  // Pi's default startup and --no-builtin-tools both leave discovery registered
+  // but inactive. Registry-authorized discovery is always on in this extension.
+  const fixture = hostFixture({ disabled: ["grep", "find", "ls"] });
+  for (const name of ["grep", "find", "ls"]) {
+    fixture.registerInactive(tool(name, `Native read-only discovery via ${name}.`));
+  }
+  let mode: OperatingMode = "execute";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  for (const name of ["grep", "find", "ls"]) {
+    assert.ok(fixture.active().includes(name), `${name} is active without discovery`);
+    assert.equal(manager.authorizedToolNames()?.includes(name), true);
+    assert.match(manager.startupGuidance() ?? "", new RegExp(`"${name}"`));
+  }
+  for (const next of ["orchestrate", "plan-research", "execute"] as const) {
+    mode = next;
+    manager.reapply();
+    for (const name of ["grep", "find", "ls"]) assert.ok(fixture.active().includes(name));
+  }
+  assert.ok(!fixture.active().includes("disabled_private"), "other inactive tools are not promoted");
+});
+
+test("explicit registry removal keeps discovery tools inactive, unauthorized, and undiscoverable (#71)", async () => {
+  // --tools/--exclude-tools/--no-tools remove names from the host registry;
+  // the extension never re-authorizes an absent name.
+  const fixture = hostFixture({ omit: ["grep", "find", "ls"] });
+  let mode: OperatingMode = "plan-research";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  for (const name of ["grep", "find", "ls"]) {
+    assert.ok(!fixture.active().includes(name), `${name} stays excluded`);
+    assert.equal(manager.authorizedToolNames()?.includes(name), false);
+    assert.doesNotMatch(manager.startupGuidance() ?? "", new RegExp(`"${name}"`));
+  }
+  const result = await fixture.search()( "excluded", { query: "grep" });
+  assert.match(JSON.stringify(result), /No authorized tools matched/);
+
+  // Mode cycling does not widen an explicit exclusion either.
+  mode = "orchestrate";
+  manager.reapply();
+  for (const name of ["grep", "find", "ls"]) assert.ok(!fixture.active().includes(name));
+});
+
+test("configured worker catalogs activate authorized discovery from the first request (#71)", async () => {
+  const fixture = hostFixture();
+  for (const name of ["grep", "find", "ls"]) {
+    fixture.pi.registerTool(tool(name, `Native read-only discovery via ${name}.`));
+  }
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  assert.equal(manager.sessionStart(fixture.sessionIdentity, {
+    allowedToolCatalog: ["read", "grep", "find", "ls", "WebSearch"],
+    initialActiveTools: ["read", "grep", "find", "ls"],
+  }, true), true);
+
+  // The durable initial subset is active at startup; no search_tools call is
+  // needed before the first discovery call.
+  assert.deepEqual(fixture.active(), ["read", "grep", "find", "ls", "search_tools"]);
+  assert.deepEqual(manager.authorizedToolNames(), ["read", "grep", "find", "ls", "WebSearch"]);
+});
+
+test("synthetic nested repository: discovery tools are active and callable without guessed paths (#71/#72)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-discovery-"));
+  try {
+    await mkdir(join(root, "stack", "modules", "vpc"), { recursive: true });
+    await writeFile(join(root, "stack", "main.tf"), "module \"vpc\" {\n  source = \"./modules/vpc\"\n}\n");
+    await writeFile(join(root, "stack", "modules", "vpc", "main.tf"), "resource \"aws_vpc\" \"main\" {\n  cidr_block = \"10.0.0.0/16\"\n}\n");
+    await writeFile(join(root, "stack", "variables.tf"), "variable \"cidr\" {\n  default = \"10.0.0.0/16\"\n}\n");
+
+    const fixture = hostFixture();
+    // Synthetic stand-ins for Pi's native read/grep/find: production code
+    // reuses the host's real implementations; the fixture proves the policy
+    // leaves the native tools callable rather than merely prompt-listed.
+    const walk = async (dir: string): Promise<string[]> => {
+      const entries = await readdir(dir, { withFileTypes: true });
+      const files: string[] = [];
+      for (const entry of entries) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) files.push(...await walk(full));
+        else files.push(full);
+      }
+      return files;
+    };
+    fixture.pi.registerTool({
+      name: "read",
+      description: "Read a file's contents.",
+      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false },
+      execute: async (_id: string, rawParams: unknown) => {
+        const params = rawParams as { path: string };
+        return {
+          content: [{ type: "text", text: await readFile(params.path, "utf8") }],
+          details: {},
+        };
+      },
+    });
+    fixture.pi.registerTool({
+      name: "find",
+      description: "Find files matching a pattern under a path.",
+      parameters: { type: "object", properties: { pattern: { type: "string" }, path: { type: "string" } }, required: ["pattern"], additionalProperties: false },
+      execute: async () => ({
+        content: [{ type: "text", text: (await walk(root)).filter((path) => path.endsWith(".tf")).sort().join("\n") }],
+        details: {},
+      }),
+    });
+    fixture.pi.registerTool({
+      name: "grep",
+      description: "Search file contents for a pattern.",
+      parameters: { type: "object", properties: { pattern: { type: "string" }, path: { type: "string" } }, required: ["pattern"], additionalProperties: false },
+      execute: async (_id: string, rawParams: unknown) => {
+        const params = rawParams as { pattern: string };
+        const matches: string[] = [];
+        for (const path of (await walk(root)).filter((path) => path.endsWith(".tf")).sort()) {
+          if ((await readFile(path, "utf8")).includes(params.pattern)) matches.push(path);
+        }
+        return { content: [{ type: "text", text: matches.join("\n") }], details: {} };
+      },
+    });
+
+    const manager = new DeferredToolManager(fixture.pi);
+    manager.register();
+    manager.sessionStart(fixture.sessionIdentity);
+    for (const name of ["read", "grep", "find"]) {
+      assert.ok(fixture.active().includes(name), `${name} is callable from the first request`);
+    }
+
+    const byName = new Map(fixture.definitions.map((definition) => [definition.name, definition]));
+    const found = await byName.get("find")!.execute!("find-1", { pattern: "**/*.tf" });
+    assert.deepEqual(
+      String((found.content as Array<{ text: string }>)[0].text).split("\n").sort(),
+      [
+        join(root, "stack", "main.tf"),
+        join(root, "stack", "modules", "vpc", "main.tf"),
+        join(root, "stack", "variables.tf"),
+      ].sort(),
+    );
+    const grepped = await byName.get("grep")!.execute!("grep-1", { pattern: "aws_vpc" });
+    const grepText = String((grepped.content as Array<{ text: string }>)[0].text);
+    assert.ok(grepText.includes(join(root, "stack", "modules", "vpc", "main.tf")));
+    const body = await byName.get("read")!.execute!("read-1", { path: join(root, "stack", "modules", "vpc", "main.tf") });
+    assert.match(String((body.content as Array<{ text: string }>)[0].text), /resource "aws_vpc" "main"/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

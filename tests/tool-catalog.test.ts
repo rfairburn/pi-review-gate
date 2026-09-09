@@ -40,6 +40,26 @@ test("tool catalog normalization is stable, deduplicated, and subset validated",
   );
 });
 
+test("default initial sets keep authorized native discovery active and preserve explicit exclusions (#71/#72)", () => {
+  // Authorized native discovery is part of the conservative startup subset in
+  // durable child catalogs.
+  assert.deepEqual(
+    defaultExecutorInitialActiveTools(["ls", "read", "grep", "find", "SubtasksStart"]),
+    ["read", "grep", "find", "ls", "SubtasksStart"],
+  );
+  // A parent launch allowlist that left a discovery tool inactive keeps it out
+  // of the child's initial set: explicit exclusions are never overridden.
+  assert.deepEqual(
+    defaultExecutorInitialActiveTools(["read", "bash", "grep"]),
+    ["read", "grep", "bash"],
+  );
+  // Unknown/unauthorized discovery names never widen the subset.
+  assert.deepEqual(
+    defaultExecutorInitialActiveTools(["write"]),
+    [],
+  );
+});
+
 test("Pi worker catalogs remove orchestrator-only delegation controls without mutating the durable catalog", () => {
   const durable = createExecutorToolCatalog(
     ["read", "bash", "SubtasksStart", "SubtasksInspect", "WebSearch"],

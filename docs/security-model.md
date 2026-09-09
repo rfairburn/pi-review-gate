@@ -153,7 +153,19 @@ For delegated workers and research subtasks:
 - Pi reviewers and Pi workers are always launched with an explicit `--tools` value;
   worker values are captured from the orchestrator's active Pi tools and narrowed
   further for research. Research workers intersect the parent's active tools with a
-  read-only allowlist that excludes `ApplyPatch`.
+  read-only allowlist that excludes `ApplyPatch`. Launch-authorized native read-only
+  discovery (`grep`, `find`, `ls`; mapped to Claude's native `Grep`/`Glob`) is part of
+  the conservative initial-active subset, so it is active from the first request in
+  every operating mode and delegated role with no deferred activation step, and mode
+  switches never deactivate it. Native discovery is included whenever Pi's tool
+  registry permits it, even if initially inactive. `--tools`, `--exclude-tools`,
+  and `--no-tools` remove disallowed names from that registry and remain authoritative.
+  `--no-builtin-tools`, `defaultTools`, and SDK `noTools:'builtin'` only set initial
+  activity; they do not exclude registered tools. Consequently, those settings alone
+  do not keep `grep`, `find`, or `ls` inactive in review-gate. Use `--exclude-tools`
+  or an explicit `--tools` allowlist to withhold them. Other inactive tools are not
+  promoted. Configured worker catalogs are never expanded beyond the inherited
+  durable catalog.
 - Codex uses its read-only sandbox and rejects configuration that could weaken the
   research profile.
 - Claude uses an explicit read-only tool allowlist and permission callback while

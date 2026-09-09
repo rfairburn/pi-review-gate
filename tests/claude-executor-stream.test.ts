@@ -102,6 +102,89 @@ test("Claude research executor exposes the full supported parent-authorized cata
   }
 });
 
+test("Claude research maps authorized discovery onto native Grep/Glob and keeps excluded names absent (#72)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-discovery-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    let capturedOptions: Record<string, any> | undefined;
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage>; options: Record<string, unknown> }) => {
+      capturedOptions = params.options;
+      return createFakeQuery(params.prompt, inputs);
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "research",
+      artifactDir,
+      turn: 1,
+      workspaceAccess: "read-only",
+      executorToolCatalog: {
+        // Authorized native discovery plus read-only web observation.
+        allowedToolCatalog: ["read", "grep", "glob", "find", "ls", "WebFetch", "WebSearch"],
+        initialActiveTools: ["read", "grep", "find", "ls"],
+      },
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    await control.steer("finish", "instruction-1");
+    await run;
+
+    // The native adapter mappings reuse Claude's own Grep/Glob; the durable
+    // initial subset never changes what the read-only role may call.
+    assert.deepEqual(capturedOptions?.tools, ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]);
+    assert.deepEqual(capturedOptions?.allowedTools, ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]);
+    assert.equal((await capturedOptions?.canUseTool("Grep", {}, {})).behavior, "allow");
+    assert.equal((await capturedOptions?.canUseTool("Glob", {}, {})).behavior, "allow");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  // A parent launch that removed discovery from the inherited catalog keeps
+  // Claude's native Grep/Glob out of the read-only profile.
+  const excludedDir = await mkdtemp(join(tmpdir(), "pi-review-claude-excluded-"));
+  try {
+    const artifactDir = join(excludedDir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    let capturedOptions: Record<string, any> | undefined;
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage>; options: Record<string, unknown> }) => {
+      capturedOptions = params.options;
+      return createFakeQuery(params.prompt, inputs);
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "research",
+      artifactDir,
+      turn: 1,
+      workspaceAccess: "read-only",
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "WebFetch", "WebSearch"],
+        initialActiveTools: ["read"],
+      },
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    await control.steer("finish", "instruction-1");
+    await run;
+    assert.deepEqual(capturedOptions?.tools, ["Read", "WebFetch", "WebSearch"]);
+    assert.equal((await capturedOptions?.canUseTool("Grep", {}, {})).behavior, "deny");
+    assert.equal((await capturedOptions?.canUseTool("Glob", {}, {})).behavior, "deny");
+  } finally {
+    await rm(excludedDir, { recursive: true, force: true });
+  }
+});
+
 test("Claude research executor fails closed without a parent tool allowlist", async () => {
   const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" });
   await assert.rejects(adapter.run({

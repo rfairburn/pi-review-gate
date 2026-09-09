@@ -407,13 +407,17 @@ login/configuration; see [Security model](security-model.md#secrets-and-authenti
 
 ## Research-task tool restriction
 
-Pi enforces the read-only tool intersection through `--tools`. Codex uses its read-only
-sandbox and rejects configuration that could weaken the research profile. Claude uses an
-explicit read-only tool allowlist and permission callback while disabling user settings,
-skills, plugins, and MCP. Every adapter also receives a private worktree check that
-quarantines any detected write. Generic binary adapters are ineligible for research
-because their protocol does not acknowledge the restriction. Research subtasks never
-receive `ApplyPatch`. Enforcement details are owned by
+Pi enforces the read-only tool intersection through `--tools`. Launch-authorized native
+read-only discovery (`grep`, `find`, `ls`) is part of the durable initial-active
+subset, so Pi research workers can enumerate paths, search contents, and read matches
+from the first request without a `search_tools` activation step. Codex uses its
+read-only sandbox and rejects configuration that could weaken the research profile.
+Claude maps the same authorized capability names onto its native `Grep`/`Glob` inside
+an explicit read-only tool allowlist and permission callback while disabling user
+settings, skills, plugins, and MCP. Every adapter also receives a private worktree
+check that quarantines any detected write. Generic binary adapters are ineligible for
+research because their protocol does not acknowledge the restriction. Research
+subtasks never receive `ApplyPatch`. Enforcement details are owned by
 [Security model](security-model.md#read-only-enforcement).
 
 ## Artifacts

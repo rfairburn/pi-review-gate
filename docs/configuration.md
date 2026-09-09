@@ -61,8 +61,10 @@ Choose **Operating mode** in `/review-settings`, then **Save changes**:
   remains responsible for integration and verification.
 - **Plan/research**: local read-only investigation and planning. Write-capable tools,
   arbitrary shell, and execution-subtask controls are removed from the active tool
-  schemas, authorized inventory, and `search_tools` results. When changes are needed,
-  the assistant asks you to switch modes; there is no GitHub-writing exception.
+  schemas, authorized inventory, and `search_tools` results. Launch-authorized native
+  read-only discovery (`grep`, `find`, `ls`) stays active in every mode. When changes
+  are needed, the assistant asks you to switch modes; there is no GitHub-writing
+  exception.
 
 The next normal run in the same conversation receives the replacement mode prompt:
 no `/new`, reload, or restart is needed. Shared safety and review instructions and user
@@ -74,8 +76,10 @@ authorization boundary, not tools that were disabled at launch.
 Prompt files live in `scripts/orchestrator-system-prompt.md`,
 `scripts/execution-system-prompt.md`, and `scripts/planning-system-prompt.md`.
 The extension selects the mode segment rather than the launcher permanently appending
-orchestration instructions. Planning uses existing read-only tools; it does not add
-filesystem discovery or Git-history tools.
+orchestration instructions. Native `grep`, `find`, and `ls` stay active in all modes
+whenever Pi's tool registry permits them. `--no-builtin-tools` only changes initial
+activity, so it does not keep this trio inactive; use `--exclude-tools` or an explicit
+`--tools` allowlist to exclude them. Planning gains no shell or Git-history tools.
 
 ### Direct mode-cycle hotkey
 
@@ -295,8 +299,11 @@ boundaries are owned by [Web tools](web-tools.md) and
   [Delegated execution](delegated-execution.md#notifications-and-ui).
 - **Deferred Pi tools** defaults to **On**. Saving **Off** immediately exposes every
   authorized tool in the current top-level Pi session; saving **On** immediately restores
-  the conservative active subset plus `search_tools`. Newly launched Pi subtasks use the
-  saved value, while already-running subtask sessions keep their launch behavior.
+  the conservative active subset plus `search_tools`. The conservative subset always
+  includes launch-authorized native read-only discovery (`grep`, `find`, `ls`), so
+  discovery needs no deferred activation in any mode, including delegated subtasks.
+  Newly launched Pi subtasks use the saved value, while already-running subtask
+  sessions keep their launch behavior.
 - **Subtasks view** stores the expanded/collapsed live-panel preference globally.
 - **Web** includes maximum acquisition size and **Browser interaction approval**:
   **Ask**, **Automatically Accept**, or **Automatically Deny**. Ask prompts when

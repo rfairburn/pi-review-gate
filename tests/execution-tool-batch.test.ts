@@ -670,6 +670,35 @@ test("/subtask-steer reports malformed syntax and unknown targets as immediate f
   await manager.shutdown();
 });
 
+test("research groups inherit authorized native discovery as durable initial-active tools (#71/#72)", async () => {
+  const { tools, manager } = harness({
+    researchCapable: true,
+    activeTools: [
+      "read", "grep", "find", "ls", "WebSearch", "WebFetch", "BrowserExtract", "bash", "write",
+      ...executionToolNames,
+    ],
+  });
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const started = await start("discovery-research", {
+    kind: "research",
+    tasks: [{
+      title: "Discover and report",
+      instructions: "Enumerate Terraform paths and search their contents",
+      acceptanceCriteria: ["Report lists matching paths and content"],
+    }],
+  }, undefined, undefined, {});
+
+  // The read-only research intersection keeps the authorized native discovery
+  // tools, and the durable initial-active subset starts them active so Pi
+  // workers need no search_tools activation step before the first discovery
+  // call. Write-capable tools stay outside the research role.
+  assert.deepEqual(started.details.tasks[0].definition.executorToolCatalog, {
+    allowedToolCatalog: ["read", "grep", "find", "ls", "WebSearch", "WebFetch", "BrowserExtract"],
+    initialActiveTools: ["read", "grep", "find", "ls"],
+  });
+  await manager.shutdown();
+});
+
 function renderWidget(content: unknown, width = 240): string[] {
   assert.equal(typeof content, "function");
   const component = (content as () => { render(width: number): string[] })();

@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.21]
+
+### Fixed
+
+- Pi's native `grep`, `find`, and `ls` are active from the first request in every
+  operating mode and newly delegated Pi execute/research task, without deferred
+  activation. Default-inactive discovery tools are included when Pi's registry
+  permits them; explicit `--tools`, `--exclude-tools`, and `--no-tools` restrictions
+  remain authoritative. `--no-builtin-tools` and other initial-activity settings
+  alone do not withhold these tools. Claude research receives native `Grep`/`Glob`
+  through the existing mapping; Claude execution already includes them. No native
+  tool reimplementation, broader filesystem access, or research shell/write access
+  is added. Captured worker authorization remains unchanged (Refs #71, Refs #72).
+
 ## [0.1.0-dev.20]
 
 ### Added

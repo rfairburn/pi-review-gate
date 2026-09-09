@@ -9,7 +9,6 @@ esac
 
 REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
-ORCHESTRATOR_PROMPT="$REVIEW_GATE_ROOT/scripts/orchestrator-system-prompt.md"
 ORCHESTRATOR_SKILL_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/SKILL.md"
 ORCHESTRATOR_RECOVERY_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/references/recovery.md"
 ORCHESTRATOR_SKILL_DIR="$HOME/.agents/skills/orchestrator"
@@ -209,4 +208,7 @@ echo "pi-review-gate config: $REVIEW_GATE_CONFIG"
 echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"
 echo "pi-review-gate orchestrator skill: $ORCHESTRATOR_SKILL_DIR/SKILL.md"
 
-exec pi --extension "$REVIEW_GATE_EXTENSION" --append-system-prompt "$ORCHESTRATOR_PROMPT" "$@"
+# The extension owns the operating-mode system prompt segment (issue 19); the
+# launcher no longer passes a permanent --append-system-prompt, so mode
+# switches hot-replace it on the next run without string surgery.
+exec pi --extension "$REVIEW_GATE_EXTENSION" "$@"

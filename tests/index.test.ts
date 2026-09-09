@@ -4825,6 +4825,69 @@ function escapeRegExp(value: string): string {
  * Build a minimal Pi host + session context for session_start integration
  * tests, mirroring the runtime helper used by the conversation-restore test.
  */
+test("settings replace the mode prompt on the next run in the same conversation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-operating-mode-"));
+  try {
+    const configPath = join(dir, "config.json");
+    await writeFile(configPath, JSON.stringify(indexTestConfig));
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    let settings: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    const session = createSessionRuntime("mode-session", join(dir, "session.jsonl"), dir, {
+      reviewSettings: (handler) => { settings = handler; },
+    });
+    await activate(session.pi);
+    await trigger(session.hooks, "session_start", { cwd: dir }, session.ctx);
+    const prompt = async () => {
+      const results = await triggerResults(session.hooks, "before_agent_start", {
+        cwd: dir, systemPrompt: "Shared safety and user append instructions.",
+      }, session.ctx);
+      return results.map((result) => (result as { systemPrompt?: string }).systemPrompt ?? "").join("\n");
+    };
+    const initial = await prompt();
+    assert.match(initial, /# Orchestrator role/);
+    assert.ok(settings);
+    let status = "";
+    for (const [label, mode, heading] of [
+      ["Prefer execution", "execute", "# Execution posture"],
+      ["Plan/research", "plan-research", "# Planning and research posture"],
+      ["Prefer orchestration", "orchestrate", "# Orchestrator role"],
+    ]) {
+      let rootVisits = 0;
+      await settings!("", { ...session.ctx, ui: {
+        setStatus: (key: string, value: string) => { if (key === "review-gate-mode") status = value; },
+        select: async (title: string, choices: string[]) => {
+          if (title === "Review settings") return rootVisits++ === 0
+            ? choices.find((choice) => choice.startsWith("Operating mode")) : "Save changes";
+          if (title === "Operating mode") return choices.find((choice) => choice.startsWith(label!));
+          throw new Error(`Unexpected menu: ${title}`);
+        },
+      } });
+      const current = await prompt();
+      assert.equal(status, `operating mode: ${label}`);
+      assert.ok(current.includes(heading!));
+      assert.match(current, /Shared safety and user append instructions/);
+      for (const other of ["# Orchestrator role", "# Execution posture", "# Planning and research posture"]) {
+        if (other !== heading) assert.ok(!current.includes(other));
+      }
+      assert.equal(JSON.parse(await readFile(configPath, "utf8")).operatingMode, mode);
+    }
+    assert.match(initial, /# Orchestrator role/, "previous run's prompt is unchanged");
+    const saved = await readFile(configPath, "utf8");
+    let cancelVisits = 0;
+    await settings!("", { ...session.ctx, ui: {
+      select: async (title: string, choices: string[]) => title === "Operating mode"
+        ? choices.find((choice) => choice.startsWith("Prefer execution"))
+        : cancelVisits++ === 0 ? choices.find((choice) => choice.startsWith("Operating mode")) : "Cancel",
+    } });
+    assert.equal(await prompt(), initial, "cancelling the staged mode preserves the current prompt");
+    assert.equal(await readFile(configPath, "utf8"), saved);
+    await trigger(session.hooks, "session_shutdown", {}, session.ctx);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function createSessionRuntime(
   sessionId: string,
   file: string,

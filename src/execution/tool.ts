@@ -537,7 +537,12 @@ export class ExecutionToolManager {
   }
 }
 
-const RESEARCH_ALLOWED_TOOLS = new Set([
+/**
+ * The research role allow policy. Also the planning-mode visibility policy at
+ * the top level (plus read-only subtask observation controls): anything not on
+ * this list is write-capable or execution control and stays out of plan/research.
+ */
+export const RESEARCH_ALLOWED_TOOLS = new Set([
   "read", "grep", "glob", "find", "ls", "WebFetch", "WebSearch", "BrowserExtract",
   // Research may use bounded diagnostics and observational hover, but
   // consequential click/form authority never enters the read-only role policy.

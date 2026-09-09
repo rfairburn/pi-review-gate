@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { DeferredToolManager } from "../src/deferred-tools";
+import type { OperatingMode } from "../src/config";
 import { measureToolSchemaBaseline } from "./tool-schema-baseline-helper";
 
 interface RegisteredTool {
@@ -70,6 +71,51 @@ function hostFixture(options: { disabled?: string[] } = {}) {
     },
   };
 }
+
+test("planning unloads activated write tools and hides them from discovery and inventory", async () => {
+  const fixture = hostFixture();
+  let mode: OperatingMode = "orchestrate";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  await fixture.search()("load-write", { query: "write" });
+  assert.ok(fixture.active().includes("write"));
+  const before = fixture.active();
+
+  mode = "plan-research";
+  manager.reapply();
+  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  for (const name of ["write", "edit", "bash", "ApplyPatch", "SubtasksStart", "SubtasksAdd"]) {
+    assert.ok(!manager.startupGuidance()?.includes(`"${name}"`));
+    const result = await fixture.search()("try-removed", { query: name });
+    assert.match(JSON.stringify(result), /No authorized tools matched/);
+    assert.ok(!fixture.active().includes(name));
+  }
+  await fixture.search()("load-read-only", { query: "WebSearch" });
+  assert.deepEqual(fixture.active(), ["read", "search_tools", "WebSearch"]);
+  mode = "execute";
+  manager.reapply();
+  assert.deepEqual(fixture.active(), [...before, "WebSearch"]);
+  assert.ok(!fixture.active().includes("disabled_private"));
+});
+
+test("planning filters full-active settings and repeated host reapplication", () => {
+  const fixture = hostFixture();
+  let mode: OperatingMode = "plan-research";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  manager.setDeferredEnabled(false);
+  assert.deepEqual(fixture.active(), ["read", "SubtasksInspect", "WebSearch", "search_tools"]);
+  fixture.pi.setActiveTools(["write"]);
+  manager.reapply();
+  assert.ok(!fixture.active().includes("write"));
+  mode = "orchestrate";
+  manager.reapply();
+  assert.ok(fixture.active().includes("write"));
+  assert.ok(!fixture.active().includes("disabled_private"));
+});
 
 test("first session request is shrunk to the authorized conservative set and loader", () => {
   const fixture = hostFixture();

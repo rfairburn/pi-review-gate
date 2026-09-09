@@ -120,15 +120,15 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
 - Runs `scripts/ensure-ddgs.sh` to provision the pinned web-search dependency.
 - Refreshes the discoverable orchestration skill at
   `~/.agents/skills/orchestrator/SKILL.md` (and its recovery runbook) from the packaged
-  sources, then executes the installed `pi` with the extension and the orchestrator
-  prompt, forwarding all remaining arguments unchanged.
+  sources, then executes the installed `pi` with the extension, forwarding all
+  remaining arguments unchanged.
 
 `scripts/pi-review-web.sh` similarly provisions DDGS, builds when sources are present,
 and executes `dist/src/web/cli.js`.
 
-The always-loaded orchestrator prompt establishes the role and subtask protocol; the
-skill provides deeper guidance for decomposition, supervision, reviewer interpretation,
-integration, and synthesis. The launcher does not impose a separate orchestrator policy;
+The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
+for each new run; the skill provides deeper guidance for decomposition, supervision,
+reviewer interpretation, integration, and synthesis. The launcher does not impose a separate orchestrator policy;
 to limit the orchestrator, pass Pi's native allowlist through the wrapper, for example
 `./scripts/pi-review-gate.sh --tools read,bash,edit,write`.
 

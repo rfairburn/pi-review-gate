@@ -48,6 +48,7 @@ parallelEnabled: true,
   }), "utf8");
 
   const next = await persistReviewSettings(configPath, {
+operatingMode: "orchestrate",
 workerResources: [],
 activeReviewers: [],
 reviewerTimeoutMs: 600000,

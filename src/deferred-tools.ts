@@ -4,6 +4,8 @@ import {
   createExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./execution/tool-catalog";
+import { RESEARCH_ALLOWED_TOOLS } from "./execution/tool";
+import { DEFAULT_OPERATING_MODE, type OperatingMode } from "./config";
 import { renderAuthorizedToolInventory } from "./tool-inventory";
 
 const MAX_QUERY_CHARS = 256;
@@ -31,6 +33,21 @@ interface SearchMatch extends ToolMetadata {
   matchCount: number;
 }
 
+/**
+ * Read-only subtask observation controls retained in plan/research mode. The
+ * planning visibility otherwise reuses the research role allow policy verbatim:
+ * anything not explicitly read-only (write-capable tools, shell execution,
+ * execution start/add/continue/steer/interrupt/force-merge/mark-clean) is
+ * absent from the active set, the inventory, and search results.
+ */
+const PLANNING_OBSERVATION_TOOLS = new Set(["SubtasksInspect", "SubtasksWatch"]);
+
+function planningToolVisible(name: string): boolean {
+  return name === DEFERRED_TOOL_SEARCH_NAME
+    || RESEARCH_ALLOWED_TOOLS.has(name)
+    || PLANNING_OBSERVATION_TOOLS.has(name);
+}
+
 // Pi recreates ExtensionAPI wrappers when extension modules reload, while the
 // sessionManager object remains stable for the AgentSession. Keep the registry
 // itself process-scoped so it survives module cache replacement, but key each
@@ -48,8 +65,10 @@ export class DeferredToolManager {
   private activeSetEstablished = false;
   private sessionDeferred = true;
   private registered = false;
-
-  constructor(private readonly pi: unknown) {}
+  constructor(
+    private readonly pi: unknown,
+    private readonly getOperatingMode: () => OperatingMode = () => DEFAULT_OPERATING_MODE,
+  ) {}
 
   register(): boolean {
     if (this.registered || !isDeferredToolHost(this.pi)) return false;
@@ -114,19 +133,19 @@ export class DeferredToolManager {
     const boundary = retained ?? configured ?? captureAuthorizationBoundary(this.pi);
     if (!retained) registry.set(sessionIdentity, boundary);
     this.boundary = boundary;
-    this.desiredActiveNames = [
-      ...(this.sessionDeferred ? boundary.initialActiveNames : boundary.authorizedNames),
-      DEFERRED_TOOL_SEARCH_NAME,
-    ];
-    this.pi.setActiveTools([...this.desiredActiveNames]);
+    this.desiredActiveNames = this.computeDesiredBase();
     this.activeSetEstablished = true;
+    this.reapply();
     return true;
   }
 
   startupGuidance(): string | undefined {
     if (!this.boundary) return undefined;
+    const authorized = this.getOperatingMode() === "plan-research"
+      ? [...this.boundary.authorizedNames].filter((name) => planningToolVisible(name))
+      : [...this.boundary.authorizedNames];
     return renderAuthorizedToolInventory(
-      [...this.boundary.authorizedNames, DEFERRED_TOOL_SEARCH_NAME],
+      [...authorized, DEFERRED_TOOL_SEARCH_NAME],
       { deferred: this.sessionDeferred },
     );
   }
@@ -139,19 +158,24 @@ export class DeferredToolManager {
       return true;
     }
     this.sessionDeferred = enabled;
-    this.desiredActiveNames = [
-      ...(enabled ? this.boundary.initialActiveNames : this.boundary.authorizedNames),
+    this.desiredActiveNames = this.computeDesiredBase();
+    this.reapply();
+    return true;
+  }
+
+  private computeDesiredBase(): string[] {
+    return [
+      ...(this.sessionDeferred ? this.boundary!.initialActiveNames : [...this.boundary!.authorizedNames]),
       DEFERRED_TOOL_SEARCH_NAME,
     ];
-    this.pi.setActiveTools([...this.desiredActiveNames]);
-    this.activeSetEstablished = true;
-    return true;
   }
 
   /** Reassert the manager-owned active set after another component syncs. */
   reapply(): void {
     if (!this.activeSetEstablished || !isDeferredToolHost(this.pi)) return;
-    this.pi.setActiveTools([...this.desiredActiveNames]);
+    this.pi.setActiveTools(this.getOperatingMode() === "plan-research"
+      ? this.desiredActiveNames.filter(planningToolVisible)
+      : [...this.desiredActiveNames]);
   }
 
   /** Full launch-authorized parent catalog; worker activation remains unchanged. */
@@ -168,8 +192,8 @@ export class DeferredToolManager {
     }
     const activeNames = new Set(normalizedActiveNames(active));
     this.desiredActiveNames = DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER.filter((name) => activeNames.has(name));
-    pi.setActiveTools([...this.desiredActiveNames]);
     this.activeSetEstablished = true;
+    this.reapply();
     return false;
   }
 
@@ -180,7 +204,7 @@ export class DeferredToolManager {
     // Reassert the captured boundary on every loader call. Pi activates newly
     // registered tools by default in some configurations; registration after
     // capture is metadata, never authority.
-    this.pi.setActiveTools([...this.desiredActiveNames]);
+    this.reapply();
     const query = searchQuery(params);
     if (!query) {
       return textResult(`Invalid search_tools request: query must contain 1-${MAX_QUERY_CHARS} characters.`, true);
@@ -190,7 +214,12 @@ export class DeferredToolManager {
       return textResult("Invalid search_tools request: query must contain searchable terms.", true);
     }
 
-    const matches = this.boundary.catalog
+    // Planning mode makes forbidden tools absent from discovery as well: they
+    // cannot be matched, reported, or activated while the mode is applied.
+    const catalog = this.getOperatingMode() === "plan-research"
+      ? this.boundary.catalog.filter((tool) => planningToolVisible(tool.name))
+      : this.boundary.catalog;
+    const matches = catalog
       .map((tool) => matchTool(tool, query, terms))
       .filter((match): match is SearchMatch => match !== undefined)
       .sort((left, right) =>
@@ -224,7 +253,7 @@ export class DeferredToolManager {
       this.desiredActiveNames.push(match.name);
       activated.push(match.name);
     }
-    this.pi.setActiveTools([...this.desiredActiveNames]);
+    this.reapply();
 
     const matchedNames = selected.map((match) => match.name);
     const status = activated.length > 0

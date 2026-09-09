@@ -109,6 +109,7 @@ async function describeTaskFailures(result: {
 function makeConfigWithFileWriter(): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,
@@ -168,6 +169,7 @@ externalAgents: [
 function makeConfigWithPromptTargetWriter(sourceRoot: string): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,
@@ -218,6 +220,7 @@ externalAgents: [
 function makeConfigWithNoOp(): ReviewGateConfig {
   return {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,
@@ -825,6 +828,7 @@ test("regression: executor subprocess PWD matches actual cwd", async () => {
       ],
       config: {
 enabled: false,
+operatingMode: "orchestrate",
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
 maxCorrectionCycles: 0,

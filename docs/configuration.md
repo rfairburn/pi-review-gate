@@ -40,6 +40,7 @@ described only briefly here is owned by the linked page.
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Automatic-review master switch (see kill switches above). |
+| `operatingMode` | `"orchestrate"` | Primary assistant posture: `execute`, `orchestrate`, or `plan-research` (see operating modes below). |
 | `reviewerTimeoutMs` | `600000` | Default reviewer timeout (10 minutes). |
 | `executorTimeoutMs` | `1800000` | Default executor timeout (30 minutes). |
 | `maxCorrectionCycles` | `1` | Correction budget before feedback is classified as deferred. |
@@ -49,6 +50,31 @@ described only briefly here is owned by the linked page.
 | `maxSnapshotBytes` | `52428800` | Bounds the cumulative size of non-ignored untracked files during task capture (50 MiB) and the textual file content retained for ordinary review snapshots. |
 | `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. |
 | `retainBundles` | `"on-failure"` | Review-bundle retention policy: `never`, `on-failure`, or `always`. `always` disables age-based wave GC while the application is running. |
+
+## Operating modes
+
+Choose **Operating mode** in `/review-settings`, then **Save changes**:
+
+- **Prefer execution**: favor focused direct implementation; delegate when useful.
+- **Prefer orchestration** (default): favor bounded delegation; the primary assistant
+  remains responsible for integration and verification.
+- **Plan/research**: local read-only investigation and planning. Write-capable tools,
+  arbitrary shell, and execution-subtask controls are removed from the active tool
+  schemas, authorized inventory, and `search_tools` results. When changes are needed,
+  the assistant asks you to switch modes; there is no GitHub-writing exception.
+
+The next normal run in the same conversation receives the replacement mode prompt:
+no `/new`, reload, or restart is needed. Shared safety and review instructions and user
+append prompts remain. An in-flight run retains its prompt, and already-running subtasks
+retain their captured instructions and authority. Cancelling settings leaves the mode
+unchanged. Returning to a write-capable mode restores tools within the original
+authorization boundary, not tools that were disabled at launch.
+
+Prompt files live in `scripts/orchestrator-system-prompt.md`,
+`scripts/execution-system-prompt.md`, and `scripts/planning-system-prompt.md`.
+The extension selects the mode segment rather than the launcher permanently appending
+orchestration instructions. Planning uses existing read-only tools; it does not add
+filesystem discovery or Git-history tools.
 
 ## Reviewers
 

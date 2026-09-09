@@ -247,6 +247,414 @@ test("Claude interrupt waits for a terminal SDK result and reports interruption"
   }
 });
 
+test("Claude executor delivers turn-interrupt steering to the same session (#63)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-steer-interrupt-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    let interruptCalls = 0;
+    let inputsAtInterrupt: number | undefined;
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage>; options: Record<string, unknown> }) => {
+      const query = createFakeQuery(params.prompt, inputs, true);
+      const originalInterrupt = query.interrupt.bind(query);
+      query.interrupt = async () => { interruptCalls += 1; inputsAtInterrupt = inputs.length; return originalInterrupt(); };
+      return query;
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.deepEqual(control.capabilities, { steer: true, interrupt: true });
+    const acknowledgement = await control.steer("steered", "steer-interrupt-1", { interrupt: true });
+    assert.equal(acknowledgement.status, "acknowledged");
+    assert.match(acknowledgement.message, /turn-interrupt steering/);
+    const result = await run;
+    // The interrupted turn's error result must not end the run; the steered
+    // message's result is the terminal one in the same session.
+    assert.equal(result.failure, undefined);
+    assert.equal(result.aborted, false);
+    assert.equal(result.text, "claude complete");
+    assert.equal(result.session.id, "claude-session");
+    assert.equal(interruptCalls, 1);
+    // Interrupt-before-delivery: the native interrupt fired before the
+    // steered message entered the streaming input.
+    assert.equal(inputsAtInterrupt, 1);
+    assert.equal(inputs.length, 2);
+    assert.equal(inputs[1]?.uuid, acknowledgement.turnId);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor acknowledges turn-interrupt steering before the replacement result and accepts a second steer (#63)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-steer-ack-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const events: string[] = [];
+    let interruptCalls = 0;
+    const inputsAtInterrupt: number[] = [];
+    // A local fake that only settles the final steered message, so earlier
+    // replacement turns stay running after their steering acknowledgement.
+    const output = new AsyncOutputQueue();
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage> }) => {
+      void (async () => {
+        for await (const message of params.prompt) {
+          inputs.push(message);
+          events.push(`enqueue:${message.uuid}`);
+          if (inputs.length === 1) {
+            output.push({ type: "system", subtype: "init", session_id: "claude-session", uuid: "system-1" } as unknown as SDKMessage);
+            output.push({
+              type: "assistant",
+              session_id: "claude-session",
+              uuid: "assistant-1",
+              parent_tool_use_id: null,
+              message: { role: "assistant", content: [{ type: "tool_use", id: "bash-1", name: "Bash", input: { command: "npm test" } }] },
+            } as unknown as SDKMessage);
+          } else if (message.message.content === "second steer") {
+            output.push({
+              type: "result",
+              subtype: "success",
+              is_error: false,
+              result: "claude final",
+              user_message_uuid: message.uuid,
+              session_id: "claude-session",
+              uuid: "result-final",
+              duration_ms: 1,
+              duration_api_ms: 1,
+              num_turns: 1,
+              stop_reason: null,
+              total_cost_usd: 0,
+              usage: { input_tokens: 20, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+              modelUsage: {},
+              permission_denials: [],
+            } as unknown as SDKMessage);
+          }
+        }
+      })();
+      const iterator = output[Symbol.asyncIterator]();
+      return {
+        next: () => iterator.next(),
+        return: async () => ({ value: undefined, done: true }),
+        throw: async (error?: unknown) => { throw error; },
+        [Symbol.asyncIterator]() { return this; },
+        initializationResult: async () => ({ commands: [], agents: [], output_style: "", available_output_styles: [], models: [], account: {} as never }),
+        interrupt: async () => {
+          interruptCalls += 1;
+          inputsAtInterrupt.push(inputs.length);
+          events.push("interrupt");
+          return { still_queued: [] };
+        },
+        close: () => output.close(),
+      } as unknown as Query;
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.deepEqual(control.capabilities, { steer: true, interrupt: true });
+    let settled = false;
+    const done = run.finally(() => { settled = true; });
+    // The first replacement turn deliberately stays running after acceptance.
+    const first = await control.steer("steer one", "claude-steer-1", { interrupt: true });
+    assert.equal(first.status, "acknowledged");
+    assert.match(first.message, /turn-interrupt steering/);
+    // The acknowledgement establishes transport acceptance only: the adapter
+    // run must still be pending while its replacement turn is unfinished.
+    assert.equal(settled, false, "steering ACK must not await replacement turn completion");
+    // A second interrupt-steer retargets again and interrupts the in-flight
+    // replacement, not the original message.
+    const second = await control.steer("second steer", "claude-steer-2", { interrupt: true });
+    assert.equal(second.status, "acknowledged");
+    assert.match(second.message, /turn-interrupt steering/);
+    const result = await done;
+    // The last steered message's result is the terminal one in the same
+    // session; earlier replacement turns never produced a result.
+    assert.equal(result.failure, undefined);
+    assert.equal(result.aborted, false);
+    assert.equal(result.text, "claude final");
+    assert.equal(result.session.id, "claude-session");
+    assert.equal(interruptCalls, 2);
+    // Each native interrupt fired before its own steering delivery.
+    assert.deepEqual(inputsAtInterrupt, [1, 2]);
+    assert.deepEqual(events, [
+      `enqueue:${inputs[0]!.uuid}`,
+      "interrupt",
+      `enqueue:${first.turnId}`,
+      "interrupt",
+      `enqueue:${second.turnId}`,
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor reports a throwing SDK stream as a bounded protocol failure (#63)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-stream-throw-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    let nextCalls = 0;
+    // The SDK stream delivers initialization and the initial prompt's first
+    // activity, then fails on the next read with a transport error.
+    const output = new AsyncOutputQueue();
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage> }) => {
+      void (async () => {
+        for await (const message of params.prompt) {
+          inputs.push(message);
+          if (inputs.length === 1) {
+            output.push({ type: "system", subtype: "init", session_id: "claude-session", uuid: "system-1" } as unknown as SDKMessage);
+            output.push({
+              type: "assistant",
+              session_id: "claude-session",
+              uuid: "assistant-1",
+              parent_tool_use_id: null,
+              message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+            } as unknown as SDKMessage);
+          }
+        }
+      })();
+      const iterator = output[Symbol.asyncIterator]();
+      return {
+        next: () => {
+          nextCalls += 1;
+          if (nextCalls <= 2) return iterator.next();
+          return Promise.reject(new Error("synthetic SDK stream failure"));
+        },
+        return: async () => ({ value: undefined, done: true }),
+        throw: async (error?: unknown) => { throw error; },
+        [Symbol.asyncIterator]() { return this; },
+        initializationResult: async () => ({ commands: [], agents: [], output_style: "", available_output_styles: [], models: [], account: {} as never }),
+        interrupt: async () => ({ still_queued: [] }),
+        close: () => output.close(),
+      } as unknown as Query;
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    // A rejecting SDK iterator must surface as a handled protocol failure,
+    // never as an unhandled rejection.
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const stranded = new Promise<never>((_, rejectPromise) => {
+        const timer = setTimeout(() => rejectPromise(new Error("run stranded after SDK stream failure")), 5000);
+        timer.unref?.();
+      });
+      const result = await Promise.race([adapter.run({ cwd: dir, prompt: "initial", artifactDir, turn: 1 }), stranded]);
+      // Give any (incorrect) unhandled rejection a chance to surface.
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+      assert.equal(nextCalls, 3);
+      assert.deepEqual(unhandled, []);
+      assert.equal(result.code, 1);
+      assert.equal(result.aborted, false);
+      assert.equal(result.failure?.category, "protocol");
+      assert.match(result.failure?.message ?? "", /synthetic SDK stream failure/);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor restores original completion tracking when the native interrupt is rejected (#63)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-interrupt-reject-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    let interruptCalls = 0;
+    // The original turn's terminal result arrives while the native interrupt
+    // request is still pending, and the SDK then rejects the interrupt.
+    const output = new AsyncOutputQueue();
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage> }) => {
+      void (async () => {
+        for await (const message of params.prompt) {
+          inputs.push(message);
+          if (inputs.length === 1) {
+            output.push({ type: "system", subtype: "init", session_id: "claude-session", uuid: "system-1" } as unknown as SDKMessage);
+            output.push({
+              type: "assistant",
+              session_id: "claude-session",
+              uuid: "assistant-1",
+              parent_tool_use_id: null,
+              message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+            } as unknown as SDKMessage);
+          }
+        }
+      })();
+      const iterator = output[Symbol.asyncIterator]();
+      return {
+        next: () => iterator.next(),
+        return: async () => ({ value: undefined, done: true }),
+        throw: async (error?: unknown) => { throw error; },
+        [Symbol.asyncIterator]() { return this; },
+        initializationResult: async () => ({ commands: [], agents: [], output_style: "", available_output_styles: [], models: [], account: {} as never }),
+        interrupt: async () => {
+          interruptCalls += 1;
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
+          output.push({
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            result: "claude complete",
+            user_message_uuid: inputs[0]!.uuid,
+            session_id: "claude-session",
+            uuid: "result-1",
+            duration_ms: 1,
+            duration_api_ms: 1,
+            num_turns: 1,
+            stop_reason: null,
+            total_cost_usd: 0,
+            usage: { input_tokens: 20, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+            modelUsage: {},
+            permission_denials: [],
+          } as unknown as SDKMessage);
+          throw new Error("synthetic interrupt rejection");
+        },
+        close: () => output.close(),
+      } as unknown as Query;
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    const acknowledgement = await control.steer("steered", "steer-reject-1", { interrupt: true });
+    assert.equal(acknowledgement.status, "failed");
+    assert.match(acknowledgement.message, /synthetic interrupt rejection/);
+    // The rejected interruption must not strand completion tracking: the
+    // original turn's result — received while the request was pending —
+    // settles the run promptly and truthfully.
+    const stranded = new Promise<never>((_, rejectPromise) => {
+      const timer = setTimeout(() => rejectPromise(new Error("run stranded after rejected interrupt")), 5000);
+      timer.unref?.();
+    });
+    const result = await Promise.race([run, stranded]);
+    assert.equal(interruptCalls, 1);
+    assert.equal(result.failure, undefined);
+    assert.equal(result.aborted, false);
+    assert.equal(result.text, "claude complete");
+    assert.equal(result.session.id, "claude-session");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor settles with a concrete failure when replacement delivery fails after a verified interrupt (#63)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-delivery-fail-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    let interruptCalls = 0;
+    let releaseClosedGate: (() => void) | undefined;
+    const closedGate = new Promise<void>((resolvePromise) => { releaseClosedGate = resolvePromise; });
+    // The steer-initiated interrupt holds until the query is closed by the
+    // run's own shutdown, so its replacement delivery lands on a closed
+    // streaming input after the interruption was verified.
+    const output = new AsyncOutputQueue();
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage> }) => {
+      void (async () => {
+        for await (const message of params.prompt) {
+          inputs.push(message);
+          if (inputs.length === 1) {
+            output.push({ type: "system", subtype: "init", session_id: "claude-session", uuid: "system-1" } as unknown as SDKMessage);
+            output.push({
+              type: "assistant",
+              session_id: "claude-session",
+              uuid: "assistant-1",
+              parent_tool_use_id: null,
+              message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+            } as unknown as SDKMessage);
+          }
+        }
+      })();
+      const iterator = output[Symbol.asyncIterator]();
+      return {
+        next: () => iterator.next(),
+        return: async () => ({ value: undefined, done: true }),
+        throw: async (error?: unknown) => { throw error; },
+        [Symbol.asyncIterator]() { return this; },
+        initializationResult: async () => ({ commands: [], agents: [], output_style: "", available_output_styles: [], models: [], account: {} as never }),
+        interrupt: async () => {
+          interruptCalls += 1;
+          if (interruptCalls === 1) await closedGate;
+          return { still_queued: [] };
+        },
+        close: () => { output.close(); releaseClosedGate?.(); },
+      } as unknown as Query;
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const runAbort = new AbortController();
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      signal: runAbort.signal,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    const steerPromise = control.steer("steered", "steer-delivery-fail-1", { interrupt: true });
+    // Let the steer's interrupt reach the SDK, then shut the run down so the
+    // streaming input closes before the replacement is delivered.
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    runAbort.abort();
+    const acknowledgement = await steerPromise;
+    assert.equal(acknowledgement.status, "failed");
+    assert.match(acknowledgement.message, /Claude streaming session is closed/);
+    // The verified-but-undelivered steering settles the run with a concrete
+    // failure instead of waiting for an undelivered result.
+    const stranded = new Promise<never>((_, rejectPromise) => {
+      const timer = setTimeout(() => rejectPromise(new Error("run stranded after failed replacement delivery")), 5000);
+      timer.unref?.();
+    });
+    const result = await Promise.race([run, stranded]);
+    assert.equal(interruptCalls, 2);
+    assert.equal(result.aborted, true);
+    assert.equal(result.failure?.category, "protocol");
+    assert.match(result.failure?.message ?? "", /replacement delivery failed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function createFakeQuery(prompt: AsyncIterable<SDKUserMessage>, inputs: SDKUserMessage[], finishOnInterrupt = false): Query {
   const output = new AsyncOutputQueue();
   let closed = false;

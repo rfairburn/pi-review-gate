@@ -1020,6 +1020,10 @@ export async function runWaveWorkerLifecycle(
       adapter: "review-gate",
       generation: nextExecutorTurn,
       protocol: "review-to-executor-handoff-v1",
+      // Steering during review already interrupts the in-flight review and
+      // resumes the executor with the changed request before a fresh review,
+      // so turn-interrupt steering is honored through that same handoff
+      // (issue #63).
       capabilities: { steer: true, interrupt: false },
       steer: async (instruction, instructionId) => {
         reviewSteering.push({ instruction, instructionId });

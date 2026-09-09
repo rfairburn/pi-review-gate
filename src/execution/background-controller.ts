@@ -1159,6 +1159,8 @@ export class BackgroundExecutionController {
     instructions: string;
     instructionId: string;
     actor: "model" | "user";
+    /** Turn-interrupt steering (issue #63): interrupt the active turn before delivery. */
+    interrupt?: boolean;
   }): Promise<BackgroundInspection> {
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
@@ -1167,6 +1169,7 @@ export class BackgroundExecutionController {
       instructionId: input.instructionId,
       action: "steer",
       actor: input.actor,
+      ...(input.interrupt === true ? { interrupt: true } : {}),
       text: input.instructions,
       status: "queued",
       createdAt: new Date().toISOString(),
@@ -2638,12 +2641,17 @@ export class BackgroundExecutionController {
           await this.save(group);
           continue;
         }
+        // Turn-interrupt steering (issue #63): the adapter's acknowledgement
+        // is the truthful capability signal. A transport that cannot interrupt
+        // an in-flight turn reports a concrete failed status here instead of a
+        // pre-checked capability flag, and queued delivery is never relabelled
+        // as an interruption.
         command.status = "delivered";
         command.deliveredAt = new Date().toISOString();
         await this.save(group);
         const generation = task.generation;
         try {
-          const acknowledgement = await control.steer(command.text, command.instructionId);
+          const acknowledgement = await control.steer(command.text, command.instructionId, command.interrupt === true ? { interrupt: true } : undefined);
           if (task.generation !== generation || this.runtimes.get(task.taskId) !== runtime || task.state === "landed") {
             command.status = "failed";
             command.error = "Steering acknowledgement arrived after the targeted task generation ended.";

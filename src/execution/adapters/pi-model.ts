@@ -140,10 +140,35 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     let timedOut = false;
     let aborted = false;
     let interruptedByControl = false;
+    // Turn-interrupt steering handoff (issue #63): held from the start of a
+    // steering delivery until its transport acceptance. During that window an
+    // interrupted session can briefly look idle, so run() must not settle on
+    // pre-steering text in between.
+    const steerHandoff = (() => {
+      let pending = false;
+      let waiter: (() => void) | undefined;
+      return {
+        begin: (): void => { pending = true; },
+        end: (): void => { pending = false; waiter?.(); waiter = undefined; },
+        isPending: (): boolean => pending,
+        wait: async (): Promise<void> => {
+          while (pending) await new Promise<void>((resolvePromise) => { waiter = resolvePromise; });
+        },
+      };
+    })();
+    // Set synchronously with run()'s completion break so a steer starting
+    // after it fails truthfully instead of acknowledging into a finishing
+    // run (issue #63).
+    let completing = false;
     let protocolFailure: string | undefined;
     let finalText = "";
     let timeoutDeadline = Date.now() + timeoutMs;
     let receiptGeneration = 0;
+    // Highest settlement generation run() has authenticated as a clean state.
+    // New waits anchor after it so an already-settled steered replacement is
+    // re-authenticated from its own receipts instead of waiting for a turn
+    // that will not come (issue #63).
+    let authenticatedSettlementGeneration = 0;
     let lastSettlementAcknowledged = false;
     const settlementAcknowledgements = new Map<number, Promise<void>>();
     const waitForAuthenticatedSettlement = async (after: number): Promise<void> => {
@@ -205,21 +230,45 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         generation: request.turn,
         protocol: "pi rpc",
         capabilities: { steer: true, interrupt: true },
-        steer: async (instruction, instructionId) => {
+        steer: async (instruction, instructionId, options) => {
           try {
-            const state = await rpc.request("get_state", {});
-            if (rpcState(state).isStreaming) {
-              await rpc.request("steer", { message: instruction }, instructionId);
-              return { status: "acknowledged", message: "Pi RPC acknowledged live steering." };
+            if (completing) {
+              return { status: "failed", message: "Pi executor completion is already in progress; steering was not delivered." };
             }
-            const beforeSteer = rpc.settledGeneration;
-            await rpc.request("prompt", { message: instruction }, instructionId);
-            lastSettlementAcknowledged = false;
-            await waitForAuthenticatedSettlement(beforeSteer);
-            return {
-              status: "acknowledged",
-              message: "Pi RPC resumed the idle executor with the steering instruction while background work remained active.",
-            };
+            // Hold the handoff from delivery start until transport acceptance
+            // so run() can never settle on pre-steering text while this
+            // delivery is in flight (issue #63). The acknowledgement covers
+            // delivery acceptance only; run() follows the replacement turn's
+            // own settlement before completing.
+            steerHandoff.begin();
+            try {
+              const state = await rpc.request("get_state", {});
+              if (!options?.interrupt && rpcState(state).isStreaming) {
+                // Injected into the active turn; its settlement is already
+                // tracked by run() through the ongoing generation.
+                await rpc.request("steer", { message: instruction }, instructionId);
+                return { status: "acknowledged", message: "Pi RPC acknowledged live steering." };
+              }
+              let interruptedActiveTurn = false;
+              if (options?.interrupt && rpcState(state).isStreaming) {
+                // Pi RPC abort waits for the session to become idle before
+                // responding, so the prompt below starts a clean turn in the
+                // same session and workspace.
+                await rpc.request("abort", {});
+                interruptedActiveTurn = true;
+              }
+              await rpc.request("prompt", { message: instruction }, instructionId);
+              return {
+                status: "acknowledged",
+                message: options?.interrupt
+                  ? (interruptedActiveTurn
+                    ? "Pi RPC interrupted the active turn and delivered steering to the same session."
+                    : "No active Pi RPC turn was streaming; steering was delivered to the idle executor without interruption.")
+                  : "Pi RPC resumed the idle executor with the steering instruction while background work remained active.",
+              };
+            } finally {
+              steerHandoff.end();
+            }
           } catch (error) {
             return { status: "failed", message: messageOf(error) };
           }
@@ -248,6 +297,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       });
       lastSettlementAcknowledged = false;
       await waitForAuthenticatedSettlement(settledGeneration);
+      authenticatedSettlementGeneration = rpc.settledGeneration;
       for (;;) {
         const background = backgroundReadiness.snapshot();
         if (background.unverifiable.length > 0) {
@@ -255,7 +305,37 @@ export class PiExecutorAdapter implements ExecutorAdapter {
             `ShellStart reported background work whose process group could not be verified: ${background.unverifiable.join("; ")}`,
           );
         }
-        if (background.running.length === 0) break;
+        if (background.running.length === 0) {
+          const idleState = rpcState(await rpc.request("get_state", {}));
+          if (idleState.isStreaming || idleState.pendingMessageCount > 0) {
+            request.onUpdate?.("steered turn still active; waiting for its settlement before completion");
+            lastSettlementAcknowledged = false;
+            await waitForAuthenticatedSettlement(authenticatedSettlementGeneration);
+            authenticatedSettlementGeneration = rpc.settledGeneration;
+            continue;
+          }
+          // A steering delivery may sit between decision and transport
+          // acceptance while the session looks idle; wait it out so completion
+          // never uses pre-steering text (issue #63).
+          if (steerHandoff.isPending()) {
+            await steerHandoff.wait();
+            continue;
+          }
+          if (rpc.settledGeneration > authenticatedSettlementGeneration) {
+            // Settlements completed after the last authenticated clean state
+            // - for example a steered replacement turn that finished while
+            // run() was waiting elsewhere. Re-authenticate from the
+            // pre-steering generation so their own receipts evidence
+            // completion, instead of trusting stale evidence or waiting for a
+            // turn that will not come (issue #63).
+            request.onUpdate?.("settled turn(s) completed since the last authenticated settlement; re-authenticating before completion");
+            lastSettlementAcknowledged = false;
+            await waitForAuthenticatedSettlement(authenticatedSettlementGeneration);
+            authenticatedSettlementGeneration = rpc.settledGeneration;
+            continue;
+          }
+          break;
+        }
         request.onUpdate?.(
           `executor waiting for ${background.running.length} background process group(s): ${background.running.map((job) => `${job.id} (${job.label})`).join(", ")}`,
         );
@@ -274,13 +354,16 @@ export class PiExecutorAdapter implements ExecutorAdapter {
           request.onUpdate?.("background process completed; waiting for the executor's automatic completion turn");
           lastSettlementAcknowledged = false;
           await waitForAuthenticatedSettlement(settledGeneration);
+          authenticatedSettlementGeneration = rpc.settledGeneration;
         } else {
           request.onUpdate?.("background process completed; resuming executor for final inspection before review");
           await rpc.request("prompt", { message: backgroundCompletionPrompt });
           lastSettlementAcknowledged = false;
           await waitForAuthenticatedSettlement(settledGeneration);
+          authenticatedSettlementGeneration = rpc.settledGeneration;
         }
       }
+      completing = true;
       const response = await rpc.request("get_last_assistant_text", {});
       finalText = isRecord(response.data) && typeof response.data.text === "string" ? response.data.text : "";
       if (!lastSettlementAcknowledged) {

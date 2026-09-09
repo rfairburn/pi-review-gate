@@ -52,6 +52,17 @@ export interface ExecutorInteractionAcknowledgement {
   turnId?: string;
 }
 
+/** Optional steering delivery modifiers (issue #63). */
+export interface ExecutorSteerOptions {
+  /**
+   * Interrupt the active executor turn before delivering the instruction to
+   * the same session and workspace. Non-terminal: the task, its workspace,
+   * and prior work are preserved. Adapters without this capability must
+   * report a concrete unsupported/failed status instead of claiming it.
+   */
+  interrupt?: boolean;
+}
+
 export interface ExecutorLiveControl {
   adapter: string;
   generation: number;
@@ -61,7 +72,7 @@ export interface ExecutorLiveControl {
     steer: boolean;
     interrupt: boolean;
   };
-  steer(instruction: string, instructionId: string): Promise<ExecutorInteractionAcknowledgement>;
+  steer(instruction: string, instructionId: string, options?: ExecutorSteerOptions): Promise<ExecutorInteractionAcknowledgement>;
   interrupt(): Promise<ExecutorInteractionAcknowledgement>;
 }
 

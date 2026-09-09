@@ -61,7 +61,9 @@ before returning completion for capture/review. After closing stdin, it allows a
 15-second terminal cleanup deadline (covering the browser's 5-second close phase,
 5-second late-containment drain, and exit overhead), independent of the model execution
 deadline. Exceeding that deadline fails completion and escalates process termination.
-Interruption is terminal rather than a claim that a settled turn has no live browser. Executor extension reload or session
+Task interruption through `SubtasksInterrupt` is terminal rather than a claim that a
+settled turn has no live browser. Native turn interruption through
+`SubtasksSteer` with `interrupt: true` keeps the task and browser alive. Executor extension reload or session
 replacement is unsupported: shutdown retires the receipt identity, and the erased
 bootstrap is not reconstructed from environment, session history, or old receipts.
 The replacement runtime blocks tools and cannot acknowledge completion; restart that
@@ -162,6 +164,20 @@ acknowledged transport, and a steer during review cancels that review and resume
 executor with the changed request before a fresh review. If the current adapter cannot
 steer a long-running command, the instruction waits for that next executor handoff
 instead of being reported as rejected.
+
+`SubtasksSteer` accepts an optional `interrupt` boolean (omitted or `false` preserves
+the behavior above). When `true` on a live executor turn, the adapter first aborts the
+active **turn** and then delivers the instructions to the same task, session, and
+workspace; the acknowledgement covers the verified interruption plus transport
+acceptance of the replacement turn — it never awaits the replacement turn's
+completion, so a follow-up steer can target the still-running replacement. The flag
+never cancels, lands, or terminates the task, and `SubtasksInterrupt` keeps its
+separate terminal semantics. Queued or starting tasks retain the instructions for
+startup or the next executor handoff without claiming a native interruption.
+An available idle executor can accept the instructions without interrupting a turn;
+steering during review uses the existing review-to-executor handoff. Adapters that cannot interrupt an in-flight turn report a concrete
+unsupported status as a failed steering acknowledgement instead of acknowledging a
+queued delivery as an interruption.
 
 Stopped tasks retain verified checkpoints and reattachment bundles for
 `SubtasksContinue` or `SubtasksForceMerge`.

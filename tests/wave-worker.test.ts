@@ -23,25 +23,39 @@ test("acknowledged live steering is durable and appears in the effective executo
     const task = testTask();
     await writeFile(join(root, "task.json"), JSON.stringify({ version: 1, taskId: "task-live-steer", task }), "utf8");
     const evidence = createTaskInstructionEvidenceRecorder(task, root);
+    let lastSteerOptions: { interrupt?: boolean } | undefined;
     const control = evidence.wrap({
       adapter: "test",
       generation: 1,
       capabilities: { steer: true, interrupt: true },
-      steer: async () => ({ status: "acknowledged", message: "delivered" }),
+      steer: async (_instruction, _instructionId, options) => {
+        lastSteerOptions = options;
+        return { status: "acknowledged" as const, message: "delivered" };
+      },
       interrupt: async () => ({ status: "acknowledged", message: "stopped" }),
     });
 
     assert.equal((await control!.steer("Write false instead.", "live-steer-1")).status, "acknowledged");
+    assert.equal(lastSteerOptions, undefined);
+    // The turn-interrupt option is forwarded to the underlying transport and
+    // recorded durably like any acknowledged steer (issue #63).
+    assert.equal((await control!.steer("Interrupt and write false.", "live-steer-2", { interrupt: true })).status, "acknowledged");
+    assert.deepEqual(lastSteerOptions, { interrupt: true });
     await evidence.flush();
 
     const persisted = JSON.parse(await readFile(join(root, "task.json"), "utf8"));
-    assert.deepEqual(persisted.task.authoritativeUpdates, [{
+    assert.deepEqual(persisted.task.authoritativeUpdates[0], {
       instructionId: "live-steer-1",
       action: "steer",
       instruction: "Write false instead.",
       acknowledgedAt: persisted.task.authoritativeUpdates[0].acknowledgedAt,
-    }]);
+    });
+    assert.deepEqual(
+      persisted.task.authoritativeUpdates.map((item: { instructionId: string }) => item.instructionId),
+      ["live-steer-1", "live-steer-2"],
+    );
     assert.match(buildWaveWorkerPrompt(task, "/source", "/worker"), /\[steer:live-steer-1\] Write false instead\./);
+    assert.match(buildWaveWorkerPrompt(task, "/source", "/worker"), /\[steer:live-steer-2\] Interrupt and write false\./);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

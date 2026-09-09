@@ -80,11 +80,37 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       }
     });
     let threadId = request.session?.id;
-    let turnId: string | undefined;
+    // The turn run() currently tracks. Turn-interrupt steering republishes it
+    // to the replacement turn, and default steering plus terminal controls
+    // always target this current id, never a frozen launch-time id (issue #63).
+    let activeTurnId: string | undefined;
     let completedTurn: Record<string, unknown> | undefined;
     let timedOut = false;
     let aborted = false;
     let interruptedByControl = false;
+    // Turn-interrupt steering handoff (issue #63): held from the moment a
+    // delivery interrupts the active turn until its replacement turn/start is
+    // accepted and published, so run() cannot settle on the interrupted
+    // turn's terminal status while the replacement id is not yet known.
+    const steerHandoff = (() => {
+      let pending = false;
+      let waiter: (() => void) | undefined;
+      return {
+        begin: (): void => { pending = true; },
+        end: (): void => { pending = false; waiter?.(); waiter = undefined; },
+        isPending: (): boolean => pending,
+        wait: async (): Promise<void> => {
+          while (pending) await new Promise<void>((resolvePromise) => { waiter = resolvePromise; });
+        },
+      };
+    })();
+    // Set synchronously with run()'s completion break so a steer starting
+    // after it fails truthfully instead of acknowledging into a finishing
+    // turn (issue #63).
+    let completing = false;
+    // The turn a steered delivery interrupted when its replacement failed to
+    // start; lets run() report that specific loss instead of a plain stop.
+    let steerInterruptedWithoutReplacement: string | undefined;
     let protocolIdentity: string | undefined;
     let failure: ExecutorTurn["failure"];
     let code: number | null = 0;
@@ -97,8 +123,8 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
     const onAbort = () => {
       aborted = true;
       if (interruptedByControl) return;
-      void (threadId && turnId
-        ? rpc.request("turn/interrupt", { threadId, turnId }).catch(() => undefined)
+      void (threadId && activeTurnId
+        ? rpc.request("turn/interrupt", { threadId, turnId: activeTurnId }).catch(() => undefined)
         : Promise.resolve()).finally(() => rpc.terminate());
     };
     request.signal?.addEventListener("abort", onAbort, { once: true });
@@ -136,66 +162,127 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       threadId = stringAt(threadResponse, "thread", "id") ?? threadId;
       if (!threadId) throw new Error("Codex app-server did not return a thread id.");
 
-      const turnResponse = await rpc.request("turn/start", {
-        threadId,
-        cwd: request.cwd,
-        model: this.config.model,
-        approvalPolicy: "never",
-        ...(researchConfig ? { environments: [] } : {}),
-        input: [{ type: "text", text: request.prompt }],
-      });
-      turnId = stringAt(turnResponse, "turn", "id");
-      if (!turnId) throw new Error("Codex app-server did not return an active turn id.");
+      // One canonical turn-start path so steered replacement turns preserve
+      // the launch turn's model, approval policy, and research configuration
+      // instead of drifting copies (issue #63).
+      const startTurn = async (text: string): Promise<string> => {
+        const response = await rpc.request("turn/start", {
+          threadId,
+          cwd: request.cwd,
+          model: this.config.model,
+          approvalPolicy: "never",
+          ...(researchConfig ? { environments: [] } : {}),
+          input: [{ type: "text", text }],
+        });
+        const started = stringAt(response, "turn", "id");
+        if (!started) throw new Error("Codex app-server did not return an active turn id.");
+        return started;
+      };
+      activeTurnId = await startTurn(request.prompt);
       const activeThreadId = threadId;
-      const activeTurnId = turnId;
 
       request.onLiveControl?.({
         adapter: this.kind,
         generation: request.turn,
         protocol: protocolIdentity,
         capabilities: { steer: true, interrupt: true },
-        steer: async (instruction, instructionId) => {
+        steer: async (instruction, instructionId, options) => {
+          if (completing) {
+            return { status: "failed", message: "Codex turn completion is already in progress; steering was not delivered.", turnId: activeTurnId };
+          }
+          if (!options?.interrupt) {
+            try {
+              const response = await rpc.request("turn/steer", {
+                threadId: activeThreadId,
+                expectedTurnId: activeTurnId,
+                clientUserMessageId: instructionId,
+                input: [{ type: "text", text: instruction }],
+              });
+              return {
+                status: "acknowledged",
+                message: "Codex app-server accepted steering for the active turn.",
+                turnId: stringAt(response, "turnId") ?? activeTurnId,
+              };
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              return {
+                status: message.includes("activeTurnNotSteerable") ? "blocked" : "failed",
+                message,
+                turnId: activeTurnId,
+              };
+            }
+          }
+          // Turn-interrupt steering (issue #63): interrupt the current turn
+          // when one is still running, then start a replacement turn with the
+          // instruction on the same thread. The handoff is held until the
+          // replacement id is published so run() cannot settle on the
+          // interrupted turn's terminal status; the acknowledgement covers
+          // transport acceptance only, and run() follows the replacement
+          // turn's own completion before completing.
+          let interruptedTurnId: string | undefined;
+          steerHandoff.begin();
           try {
-            const response = await rpc.request("turn/steer", {
-              threadId: activeThreadId,
-              expectedTurnId: activeTurnId,
-              clientUserMessageId: instructionId,
-              input: [{ type: "text", text: instruction }],
-            });
+            if (activeTurnId && !rpc.isTurnCompleted(activeThreadId, activeTurnId)) {
+              const current = activeTurnId;
+              await rpc.request("turn/interrupt", { threadId: activeThreadId, turnId: current });
+              const terminal = await rpc.waitForTurn(activeThreadId, current);
+              if (terminal.status !== "interrupted" && terminal.status !== "completed") {
+                return { status: "failed", message: `Codex turn interruption ended in ${String(terminal.status)}.`, turnId: current };
+              }
+              interruptedTurnId = current;
+            }
+            const steeredTurnId = await startTurn(instruction);
+            activeTurnId = steeredTurnId;
             return {
               status: "acknowledged",
-              message: "Codex app-server accepted steering for the active turn.",
-              turnId: stringAt(response, "turnId") ?? activeTurnId,
+              message: interruptedTurnId
+                ? "Codex app-server interrupted the active turn and delivered steering as a new turn on the same thread."
+                : "No active Codex turn was running; steering was delivered as a new turn on the same thread without interruption.",
+              turnId: steeredTurnId,
             };
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            return {
-              status: message.includes("activeTurnNotSteerable") ? "blocked" : "failed",
-              message,
-              turnId: activeTurnId,
-            };
+            if (interruptedTurnId) steerInterruptedWithoutReplacement = interruptedTurnId;
+            return { status: "failed", message: error instanceof Error ? error.message : String(error), turnId: activeTurnId };
+          } finally {
+            steerHandoff.end();
           }
         },
         interrupt: async (): Promise<ExecutorInteractionAcknowledgement> => {
           try {
             interruptedByControl = true;
-            await rpc.request("turn/interrupt", { threadId: activeThreadId, turnId: activeTurnId });
-            const terminal = await rpc.waitForTurn(activeThreadId, activeTurnId);
+            const currentTurnId = activeTurnId;
+            if (!currentTurnId) return { status: "failed", message: "Codex turn has not started; nothing to interrupt." };
+            await rpc.request("turn/interrupt", { threadId: activeThreadId, turnId: currentTurnId });
+            const terminal = await rpc.waitForTurn(activeThreadId, currentTurnId);
             if (terminal.status !== "interrupted" && terminal.status !== "completed") {
-              return { status: "failed", message: `Codex interrupt ended in ${String(terminal.status)}.`, turnId: activeTurnId };
+              return { status: "failed", message: `Codex interrupt ended in ${String(terminal.status)}.`, turnId: currentTurnId };
             }
-            return { status: "acknowledged", message: "Codex app-server acknowledged turn interruption.", turnId: activeTurnId };
+            return { status: "acknowledged", message: "Codex app-server acknowledged turn interruption.", turnId: currentTurnId };
           } catch (error) {
             return { status: "failed", message: error instanceof Error ? error.message : String(error), turnId: activeTurnId };
           }
         },
       });
 
-      const completion = await rpc.waitForTurn(threadId, turnId);
+      let trackedTurnId = activeTurnId!;
+      let completion = await rpc.waitForTurn(activeThreadId, trackedTurnId);
+      // Follow replacement turns published by turn-interrupt steering (issue
+      // #63): a terminal status for the tracked id is only final when no
+      // newer steered turn supersedes it. The handoff ends after publishing
+      // the replacement id, so waiting on it closes the interrupt-to-start gap.
+      for (;;) {
+        if (steerHandoff.isPending()) await steerHandoff.wait();
+        if (activeTurnId === trackedTurnId) break;
+        trackedTurnId = activeTurnId!;
+        completion = await rpc.waitForTurn(activeThreadId, trackedTurnId);
+      }
+      completing = true;
       completedTurn = completion;
       const status = typeof completion.status === "string" ? completion.status : "failed";
       if (status === "interrupted") {
-        failure = { category: "interruption", message: "Codex turn was interrupted." };
+        failure = trackedTurnId === steerInterruptedWithoutReplacement
+          ? { category: "interruption", message: "Codex turn was interrupted for steering, but the replacement turn did not complete." }
+          : { category: "interruption", message: "Codex turn was interrupted." };
       } else if (status !== "completed") {
         failure = { category: "provider", message: stringAt(completion, "error", "message") ?? `Codex turn ended in ${status}.` };
       }
@@ -324,6 +411,11 @@ class AppServerRpc {
 
   notify(method: string, params: unknown): void {
     this.write({ jsonrpc: "2.0", method, params });
+  }
+
+  /** True once the app-server reported a terminal status for this turn. */
+  isTurnCompleted(threadId: string, turnId: string): boolean {
+    return this.completedTurns.has(`${threadId}:${turnId}`);
   }
 
   waitForTurn(threadId: string, turnId: string): Promise<Record<string, unknown>> {

@@ -109,7 +109,7 @@ test("operation-specific execution tools expose exact durable schemas", () => {
     SubtasksInspect: ["executionId", "taskId", "offset", "lines", "evidence"],
     SubtasksWatch: ["executionId", "after"],
     SubtasksContinue: ["executionId", "taskId", "bundle", "instructions", "instructionId"],
-    SubtasksSteer: ["executionId", "taskId", "instructions", "instructionId"],
+    SubtasksSteer: ["executionId", "taskId", "instructions", "instructionId", "interrupt"],
     SubtasksInterrupt: ["executionId", "taskId", "interruptMode", "instructionId"],
     SubtasksForceMerge: ["executionId", "taskId", "mergeAnyhow", "instructionId"],
     SubtasksMarkClean: [],
@@ -127,6 +127,9 @@ test("operation-specific execution tools expose exact durable schemas", () => {
   assert.equal(start.properties.tasks.maxItems, 16);
   assert.equal(start.properties.tasks.items.properties.wakeOn, undefined);
   assert.equal(start.properties.instructions, undefined);
+  const steer = executionTool(tools, "SubtasksSteer").parameters;
+  assert.equal(steer.properties.interrupt.type, "boolean");
+  assert.deepEqual(steer.required, ["instructions"]);
   const forceMerge = executionTool(tools, "SubtasksForceMerge").parameters;
   assert.equal(forceMerge.properties.bundle, undefined);
   assert.match(forceMerge.properties.mergeAnyhow.description, /manual workspace inspection/i);

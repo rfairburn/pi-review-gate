@@ -796,6 +796,210 @@ test("Pi stays alive for ShellStart work and accepts steering while its agent is
   }
 });
 
+test("Pi executor interrupts the active turn and delivers steering to the same session (#63)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-little-steer-interrupt-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "prompts.jsonl");
+    const commands = join(root, "commands.log");
+    const command = join(root, "little-steer-interrupt-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');let input='';let streaming=false;let lastText='';let prompts=0;process.stdin.setEncoding('utf8');",
+      ...fakePiSettlementReceipt,
+      `const capture=${JSON.stringify(capture)};const commands=${JSON.stringify(commands)};`,
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(commands,c.type+'\\n');",
+      "if(c.type==='prompt'){prompts++;streaming=true;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));if(prompts>1){streaming=false;lastText='steered complete';console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:lastText}]}}));console.log(JSON.stringify({type:'turn_end'}));ack();console.log(JSON.stringify({type:'agent_end'}));}}",
+      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:streaming,pendingMessageCount:0}}));",
+      "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:lastText}}));",
+      "else if(c.type==='abort'){streaming=false;console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));ack();console.log(JSON.stringify({type:'agent_end'}));}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new PiExecutorAdapter({
+      model: "provider/model",
+      command,
+    });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "initial task",
+      artifactDir,
+      turn: 1,
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "bash"],
+        initialActiveTools: ["read", "bash"],
+      },
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.deepEqual(control.capabilities, { steer: true, interrupt: true });
+    // The initial turn stays streaming until the interruption below.
+    const acknowledgement = await control.steer("steer the active turn", "steer-interrupt-1", { interrupt: true });
+    assert.equal(acknowledgement.status, "acknowledged");
+    assert.match(acknowledgement.message, /interrupted the active turn/);
+    const result = await run;
+    assert.equal(result.failure, undefined);
+    // The steered turn's settlement is the completion text, not the aborted
+    // turn's partial output.
+    assert.equal(result.text, "steered complete");
+    const prompts = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(prompts, ["initial task", "steer the active turn"]);
+    // Interrupt-before-delivery: the abort precedes the replacement prompt on
+    // the wire, in the same session.
+    const seen = (await readFile(commands, "utf8")).trim().split("\n");
+    const abortAt = seen.indexOf("abort");
+    const promptAt = seen.lastIndexOf("prompt");
+    assert.ok(abortAt > -1 && promptAt > abortAt, "abort must be delivered before the replacement prompt");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor acknowledges interrupt steering before the replacement settles and accepts a second steer (#63)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-little-steer-ack-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "prompts.jsonl");
+    const commands = join(root, "commands.log");
+    const command = join(root, "little-steer-ack-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');let input='';let streaming=false;let lastText='';let prompts=0;process.stdin.setEncoding('utf8');",
+      ...fakePiSettlementReceipt,
+      `const capture=${JSON.stringify(capture)};const commands=${JSON.stringify(commands)};`,
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(commands,c.type+'\\n');",
+      "if(c.type==='prompt'){prompts++;streaming=true;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');console.log(JSON.stringify({type:'response',id:c.id,command:'prompt',success:true}));console.log(JSON.stringify({type:'turn_start'}));if(prompts===3){setTimeout(()=>{streaming=false;lastText='second steer complete';console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:lastText}]}}));console.log(JSON.stringify({type:'turn_end'}));ack();console.log(JSON.stringify({type:'agent_end'}));},50);}}",
+      "else if(c.type==='get_state')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:streaming,pendingMessageCount:0}}));",
+      "else if(c.type==='steer')console.log(JSON.stringify({type:'response',id:c.id,command:'steer',success:true}));",
+      "else if(c.type==='get_last_assistant_text')console.log(JSON.stringify({type:'response',id:c.id,command:c.type,success:true,data:{text:lastText}}));",
+      "else if(c.type==='abort'){streaming=false;console.log(JSON.stringify({type:'response',id:c.id,command:'abort',success:true}));ack();console.log(JSON.stringify({type:'agent_end'}));}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new PiExecutorAdapter({
+      model: "provider/model",
+      command,
+    });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "initial task",
+      artifactDir,
+      turn: 1,
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "bash"],
+        initialActiveTools: ["read", "bash"],
+      },
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.deepEqual(control.capabilities, { steer: true, interrupt: true });
+    let settled = false;
+    const done = run.finally(() => { settled = true; });
+    // The first replacement turn deliberately stays running after acceptance.
+    const first = await control.steer("steer the active turn", "steer-ack-1", { interrupt: true });
+    assert.equal(first.status, "acknowledged");
+    assert.match(first.message, /interrupted the active turn/);
+    // The acknowledgement establishes transport acceptance only: the adapter
+    // run must still be pending while its replacement turn is unfinished.
+    assert.equal(settled, false, "steering ACK must not await replacement turn completion");
+    // A plain steer reaches the still-running replacement without interruption.
+    const second = await control.steer("keep going", "steer-plain-2", { interrupt: false });
+    assert.equal(second.status, "acknowledged");
+    assert.match(second.message, /live steering/);
+    // A second interrupt-steer targets the replacement turn itself.
+    const third = await control.steer("stop and finish differently", "steer-interrupt-3", { interrupt: true });
+    assert.equal(third.status, "acknowledged");
+    assert.match(third.message, /interrupted the active turn/);
+    const result = await done;
+    assert.equal(result.failure, undefined);
+    // run() followed both handoffs; the final text is the second replacement's.
+    assert.equal(result.text, "second steer complete");
+    const prompts = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(prompts, ["initial task", "steer the active turn", "stop and finish differently"]);
+    // Outbound ordering: each interruption precedes its own replacement
+    // prompt, and the plain steer never issues an abort.
+    const seen = (await readFile(commands, "utf8")).trim().split("\n");
+    const aborts = seen.map((line, index) => line === "abort" ? index : -1).filter((index) => index >= 0);
+    const promptAt = seen.map((line, index) => line === "prompt" ? index : -1).filter((index) => index >= 0);
+    assert.equal(aborts.length, 2);
+    assert.equal(promptAt.length, 3);
+    assert.ok(aborts[0]! < promptAt[1]!, "first interruption precedes its replacement prompt");
+    assert.ok(aborts[1]! > promptAt[1]! && aborts[1]! < promptAt[2]!, "second interruption targets the replacement turn and precedes its own replacement prompt");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor interrupt steering without an active turn reports no interruption (#63)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-little-steer-idle-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "prompts.jsonl");
+    const commands = join(root, "commands.log");
+    const command = join(root, "little-steer-idle-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');const {spawn}=require('node:child_process');let input='';let bg;let prompts=0;process.stdin.setEncoding('utf8');",
+      ...fakePiSettlementReceipt,
+      `const capture=${JSON.stringify(capture)};const commands=${JSON.stringify(commands)};`,
+      "const out=(v)=>console.log(JSON.stringify(v));",
+      "const settle=(text)=>{out({type:'message_end',message:{role:'assistant',content:[{type:'text',text}]}});out({type:'turn_end'});ack();out({type:'agent_end'});};",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(commands,c.type+'\\n');",
+      "if(c.type==='prompt'){prompts++;fs.appendFileSync(capture,JSON.stringify(c.message)+'\\n');out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});if(prompts===1){bg=spawn(process.execPath,['-e','setTimeout(()=>{},1500)'],{detached:true,stdio:'ignore'});bg.unref();out({type:'tool_execution_end',toolName:'ShellStart',result:{content:[{type:'text',text:'Started \"idle test\" as job1 (pid '+bg.pid+').\\nWaking you on: exit.'}]},isError:false});settle('background started');}else if(prompts===2){settle('steered complete');}else{if(bg){try{process.kill(-bg.pid,'SIGTERM')}catch{}}settle('final inspection complete');}}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
+      "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'final inspection complete'}});",
+      "else if(c.type==='abort'){out({type:'response',id:c.id,command:'abort',success:true});ack();out({type:'agent_end'});}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const updates: string[] = [];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new PiExecutorAdapter({
+      model: "provider/model",
+      command,
+      timeoutMs: 20_000,
+    });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "start background work",
+      artifactDir,
+      turn: 1,
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "bash", "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"],
+        initialActiveTools: ["read", "bash", "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"],
+      },
+      onUpdate: (message) => updates.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    await waitFor(() => updates.some((message) => message.includes("executor waiting")));
+    // The agent is idle while background work runs, so the honest status must
+    // not claim an interruption.
+    const acknowledgement = await control.steer("replace true with false", "steer-idle-1", { interrupt: true });
+    assert.equal(acknowledgement.status, "acknowledged");
+    assert.match(acknowledgement.message, /without interruption/);
+    const result = await run;
+    assert.equal(result.failure, undefined);
+    assert.equal(result.text, "final inspection complete");
+    const prompts = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(prompts[0], "start background work");
+    assert.equal(prompts[1], "replace true with false");
+    assert.ok(prompts[2].startsWith("ShellStart work that previously blocked"));
+    const seen = (await readFile(commands, "utf8")).trim().split("\n");
+    assert.equal(seen.includes("abort"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex research executor preserves the full allowed catalog with app-server steering", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-codex-app-server-"));
   try {
@@ -890,6 +1094,216 @@ test("Codex interrupt waits for the active turn terminal notification", async ()
     assert.ok(Date.now() - startedAt >= 30, "interrupt acknowledgement must await turn completion");
     const result = await run;
     assert.equal(result.failure?.category, "interruption");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex executor interrupts the active turn and starts a steered turn on the same thread (#63)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-steer-interrupt-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "capture.jsonl");
+    const command = join(root, "codex-steer-interrupt.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');let input='';process.stdin.setEncoding('utf8');",
+      `const capture=${JSON.stringify(capture)};`,
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(capture,raw+'\\n');if(!c.id)continue;",
+      "if(c.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));",
+      "else if(c.method==='thread/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-1'}}}));",
+      "else if(c.method==='turn/start'){const id=c.params.input[0].text==='steer the active turn'?'turn-2':'turn-1';console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turn:{id}}}));if(id==='turn-2'){console.log(JSON.stringify({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text:'codex steered'}}}));console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-2',status:'completed'}}}));}}",
+      "else if(c.method==='turn/interrupt'){console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));setTimeout(()=>console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-1',turn:{id:c.params.turnId,status:'interrupted'}}})),40);}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "work",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.deepEqual(control.capabilities, { steer: true, interrupt: true });
+    // The first turn stays open until the interruption below.
+    const acknowledgement = await control.steer("steer the active turn", "steer-interrupt-1", { interrupt: true });
+    assert.equal(acknowledgement.status, "acknowledged");
+    assert.match(acknowledgement.message, /interrupted the active turn/);
+    const result = await run;
+    assert.equal(result.failure, undefined);
+    // The replacement turn's output is the completion text on the same thread.
+    assert.equal(result.text, "codex steered");
+    assert.equal(result.session.id, "thread-1");
+    const calls = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const interrupts = calls.filter((call) => call.method === "turn/interrupt");
+    assert.equal(interrupts.length, 1);
+    assert.equal(interrupts[0].params.turnId, "turn-1");
+    const starts = calls.filter((call) => call.method === "turn/start");
+    assert.equal(starts.length, 2);
+    assert.deepEqual(starts[1].params.input, [{ type: "text", text: "steer the active turn" }]);
+    // The steered instruction must not also be sent through turn/steer.
+    assert.ok(calls.every((call) => call.method !== "turn/steer"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex executor surfaces a failed steered replacement turn in the task result (#63)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-steer-fail-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "codex-steer-fail.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "let input='';process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);if(!c.id)continue;",
+      "if(c.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));",
+      "else if(c.method==='thread/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-1'}}}));",
+      "else if(c.method==='turn/start'){const id=c.params.input[0].text==='steer the active turn'?'turn-2':'turn-1';console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turn:{id}}}));if(id==='turn-2')console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-2',status:'failed'}}}));}",
+      "else if(c.method==='turn/interrupt'){console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));setTimeout(()=>console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-1',turn:{id:c.params.turnId,status:'interrupted'}}})),40);}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "work",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    const acknowledgement = await control.steer("steer the active turn", "steer-fail-1", { interrupt: true });
+    // Transport acceptance is acknowledged; the replacement turn's own
+    // failure is a task outcome, not a steering delivery failure (#63).
+    assert.equal(acknowledgement.status, "acknowledged");
+    assert.match(acknowledgement.message, /interrupted the active turn/);
+    const result = await run;
+    assert.equal(result.failure?.category, "provider");
+    assert.match(result.failure?.message ?? "", /ended in failed/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex executor acknowledges interrupt steering before the replacement completes and accepts a second steer (#63)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-steer-ack-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "capture.jsonl");
+    const command = join(root, "codex-steer-ack.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');let input='';process.stdin.setEncoding('utf8');let starts=0;",
+      `const capture=${JSON.stringify(capture)};`,
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(capture,raw+'\\n');if(!c.id)continue;",
+      "if(c.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));",
+      "else if(c.method==='thread/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-1'}}}));",
+      "else if(c.method==='turn/start'){const id='turn-'+(++starts);console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turn:{id}}}));if(id==='turn-3'){console.log(JSON.stringify({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text:'codex final'}}}));console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-3',status:'completed'}}}));}}",
+      "else if(c.method==='turn/steer')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turnId:c.params.expectedTurnId}}));",
+      "else if(c.method==='turn/interrupt'){console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));setTimeout(()=>console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-1',turn:{id:c.params.turnId,status:'interrupted'}}})),40);}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "work",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.deepEqual(control.capabilities, { steer: true, interrupt: true });
+    let settled = false;
+    const done = run.finally(() => { settled = true; });
+    // The first replacement turn deliberately stays running after acceptance.
+    const first = await control.steer("steer the active turn", "codex-steer-1", { interrupt: true });
+    assert.equal(first.status, "acknowledged");
+    assert.match(first.message, /interrupted the active turn/);
+    assert.equal(first.turnId, "turn-2");
+    // The acknowledgement establishes transport acceptance only: the adapter
+    // run must still be pending while its replacement turn is unfinished.
+    assert.equal(settled, false, "steering ACK must not await replacement turn completion");
+    // Default steering while the replacement runs targets the CURRENT turn.
+    const second = await control.steer("keep going", "codex-steer-2", { interrupt: false });
+    assert.equal(second.status, "acknowledged");
+    // A second interrupt-steer interrupts the replacement, not the original.
+    const third = await control.steer("stop and finish differently", "codex-steer-3", { interrupt: true });
+    assert.equal(third.status, "acknowledged");
+    assert.match(third.message, /interrupted the active turn/);
+    assert.equal(third.turnId, "turn-3");
+    const result = await done;
+    assert.equal(result.failure, undefined);
+    // run() followed both handoffs; the final text is the last replacement's.
+    assert.equal(result.text, "codex final");
+    assert.equal(result.session.id, "thread-1");
+    const calls = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    // Outbound ordering: each interruption precedes its own replacement
+    // turn/start, and the plain steer never issues an interrupt.
+    assert.deepEqual(
+      calls.map((call) => call.method === "turn/start" ? `start:${call.params.input[0].text}` : call.method === "turn/interrupt" ? `interrupt:${call.params.turnId}` : call.method),
+      ["initialize", "initialized", "thread/start", "start:work", "interrupt:turn-1", "start:steer the active turn", "turn/steer", "interrupt:turn-2", "start:stop and finish differently"],
+    );
+    const steerCall = calls.find((call) => call.method === "turn/steer");
+    assert.equal(steerCall.params.expectedTurnId, "turn-2", "default steering must target the current active turn");
+    // Replacement turns preserve the launch turn's model and approval policy.
+    for (const start of calls.filter((call) => call.method === "turn/start")) {
+      assert.equal(start.params.model, "gpt-test");
+      assert.equal(start.params.approvalPolicy, "never");
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex executor reports a rejected replacement turn start as a failed steering acknowledgement (#63)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-steer-startfail-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "codex-steer-startfail.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "let input='';process.stdin.setEncoding('utf8');let firstStart=true;",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);if(!c.id)continue;",
+      "if(c.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));",
+      "else if(c.method==='thread/start')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-1'}}}));",
+      "else if(c.method==='turn/start'){if(firstStart){firstStart=false;console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turn:{id:'turn-1'}}}));}else{console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,error:{code:-32600,message:'turn/start rejected: synthetic transport failure'}}));}}",
+      "else if(c.method==='turn/interrupt'){console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}}));setTimeout(()=>console.log(JSON.stringify({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-1',turn:{id:c.params.turnId,status:'interrupted'}}})),40);}",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const adapter = new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" });
+    const run = adapter.run({
+      cwd: root,
+      prompt: "work",
+      artifactDir,
+      turn: 1,
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    const acknowledgement = await control.steer("steer the active turn", "codex-start-fail-1", { interrupt: true });
+    // The interruption succeeded but the replacement was never accepted, so
+    // the steering delivery itself failed truthfully (#63).
+    assert.equal(acknowledgement.status, "failed");
+    assert.match(acknowledgement.message, /synthetic transport failure/);
+    const result = await run;
+    assert.equal(result.failure?.category, "interruption");
+    assert.match(result.failure?.message ?? "", /replacement turn did not complete/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

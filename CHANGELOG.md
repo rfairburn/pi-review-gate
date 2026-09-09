@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.23]
+
+### Added
+
+- `SubtasksSteer` accepts an optional `interrupt` boolean (omitted or `false`
+  preserves current behavior). When `true` on a live executor turn, the active
+  **turn** is interrupted and the instructions are delivered to the same task,
+  session, and workspace without cancelling, landing, or terminating the task;
+  the acknowledgement covers the verified interruption plus transport acceptance
+  of the replacement turn and never awaits its completion. During review the flag
+  rides the existing steering-wins-over-review handoff. Without a live turn the
+  request stays durably queued for the next executor handoff exactly like an
+  ordinary steer, and adapters that cannot interrupt an in-flight turn report a
+  concrete unsupported status as a failed steering acknowledgement instead of
+  claiming interruption. `SubtasksInterrupt`
+  terminal semantics are unchanged (Refs #63).
+
 ## [0.1.0-dev.22]
 
 ### Fixed

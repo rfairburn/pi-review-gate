@@ -202,8 +202,8 @@ export function createTaskInstructionEvidenceRecorder(
     if (!control) return undefined;
     return {
       ...control,
-      steer: async (instruction, instructionId) => {
-        const acknowledgement = await control.steer(instruction, instructionId);
+      steer: async (instruction, instructionId, options) => {
+        const acknowledgement = await control.steer(instruction, instructionId, options);
         if (acknowledgement.status === "acknowledged") await record(instruction, instructionId);
         return acknowledgement;
       },

@@ -20,6 +20,13 @@ import { createExecutorToolCatalog, rejectPreCutoverRequestFields } from "../too
 
 const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<typeof import("@anthropic-ai/claude-agent-sdk")>;
 
+// Terminal results that miss the current completion target are buffered
+// briefly so a failed steering attempt can restore tracking for the original
+// turn even when its result arrived while the native interrupt request was
+// still pending (issue #63).
+const UNKEYED_RESULT_KEY = "__unkeyed__";
+const MAX_BUFFERED_RESULTS = 8;
+
 const CLAUDE_RESEARCH_TOOL_MAP = new Map([
   ["read", "Read"],
   ["grep", "Grep"],
@@ -99,6 +106,9 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
     let finalResult: SDKResultMessage | undefined;
     let effectiveSessionId = requestedSessionId;
     let protocolFailure: string | undefined;
+    let steerDeliveryFailure: string | undefined;
+    let sessionClosed = false;
+    const pendingSteerDeliveries = new Set<Promise<void>>();
     let timedOut = false;
     let aborted = false;
     let interruptedByControl = false;
@@ -168,58 +178,142 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
     };
 
     query = sdk.query({ prompt: input, options });
-    const resultPromise = consumeMessages(query, (message, line) => {
-      stdout.append(line);
-      parser.push(line);
-      activity.push(line);
-      if (typeof message.session_id === "string") effectiveSessionId = message.session_id;
-      if (message.type === "result") {
-        const resultUuid = "user_message_uuid" in message && typeof message.user_message_uuid === "string"
-          ? message.user_message_uuid
-          : undefined;
-        if (resultUuid === targetUuid || resultUuid === undefined && targetUuid === initialUuid) {
-          finalResult = message;
-          finished = true;
-          return true;
+    const activeQuery = query;
+    const unmatchedResults = new Map<string, SDKResultMessage>();
+    let settleNow: (() => void) | undefined;
+    const resultPromise = new Promise<void>((resolveSettlement) => {
+      settleNow = resolveSettlement;
+      void (async () => {
+        try {
+          await consumeMessages(activeQuery, (message, line) => {
+            if (finished) return true;
+            stdout.append(line);
+            parser.push(line);
+            activity.push(line);
+            if (typeof message.session_id === "string") effectiveSessionId = message.session_id;
+            if (message.type === "result") {
+              const resultUuid = "user_message_uuid" in message && typeof message.user_message_uuid === "string"
+                ? message.user_message_uuid
+                : undefined;
+              if (resultUuid === targetUuid || resultUuid === undefined && targetUuid === initialUuid) {
+                finalResult = message;
+                finished = true;
+                return true;
+              }
+              const key = resultUuid ?? UNKEYED_RESULT_KEY;
+              unmatchedResults.set(key, message);
+              if (unmatchedResults.size > MAX_BUFFERED_RESULTS) {
+                const oldest = unmatchedResults.keys().next().value;
+                if (oldest !== undefined) unmatchedResults.delete(oldest);
+              }
+            }
+            return false;
+          });
+        } catch (error) {
+          // Preserve protocol-error reporting when the SDK stream itself
+          // fails: record it under the same timeout/abort policy as the main
+          // flow instead of leaving an unhandled rejection behind.
+          if (!timedOut && !aborted) protocolFailure = messageOf(error);
+        } finally {
+          resolveSettlement();
         }
-      }
-      return false;
+      })();
     });
 
+    // Closing the SDK session is authoritative for steering delivery: once
+    // it is closed, a steering acknowledgement must not claim delivery into
+    // a session that can no longer consume input (issue #63).
+    const closeQuerySession = () => {
+      if (!sessionClosed) {
+        sessionClosed = true;
+        query?.close();
+      }
+    };
     const timeout = setTimeout(() => {
       timedOut = true;
-      void query?.interrupt().catch(() => undefined).finally(() => query?.close());
+      void query?.interrupt().catch(() => undefined).finally(() => closeQuerySession());
     }, this.config.timeoutMs ?? 1_800_000);
     timeout.unref?.();
     const onAbort = () => {
       aborted = true;
       if (interruptedByControl) return;
-      void query?.interrupt().catch(() => undefined).finally(() => query?.close());
+      void query?.interrupt().catch(() => undefined).finally(() => closeQuerySession());
     };
     request.signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
       await query.initializationResult();
       await lifecycleStart;
+      // Enqueue the task prompt before publishing live control so steering
+      // can never be delivered ahead of the prompt it steers (issue #63).
+      await input.enqueue(userMessage(request.prompt, initialUuid, "now"));
       request.onUpdate?.("claude streaming session initialized with live steer and interrupt controls");
       request.onLiveControl?.({
         adapter: this.kind,
         generation: request.turn,
         protocol: "Claude Agent SDK streaming Query",
         capabilities: { steer: true, interrupt: true },
-        steer: async (instruction, instructionId) => {
+        steer: async (instruction, instructionId, options) => {
           if (finished) return { status: "blocked", message: "Claude turn already reached a terminal result." };
           const messageUuid = randomUUID();
+          const previousTargetUuid = targetUuid;
+          // Retarget before interrupting so the interrupted turn's result
+          // cannot match and end this run; the steered message's result is
+          // the terminal one (issue #63).
           targetUuid = messageUuid;
+          let interruptionVerified = false;
+          let deliverySettled: (() => void) | undefined;
+          let deliveryPromise: Promise<void> | undefined;
           try {
+            if (options?.interrupt) {
+              await query!.interrupt();
+              interruptionVerified = true;
+              // Track the delivery of a verified interruption so run
+              // settlement can reflect a delivery that fails while shutdown
+              // is in flight.
+              deliveryPromise = new Promise<void>((resolveDelivery) => { deliverySettled = resolveDelivery; });
+              pendingSteerDeliveries.add(deliveryPromise);
+            }
+            if (sessionClosed) throw new Error("Claude streaming session is closed.");
             await input.enqueue(userMessage(instruction, messageUuid, "now"));
             return {
               status: "acknowledged",
-              message: `Claude Agent SDK accepted live steering (${instructionId}).`,
+              message: options?.interrupt
+                ? `Claude Agent SDK delivered turn-interrupt steering to the same session (${instructionId}); any in-flight turn was interrupted.`
+                : `Claude Agent SDK accepted live steering (${instructionId}).`,
               turnId: messageUuid,
             };
           } catch (error) {
-            return { status: "failed", message: messageOf(error), turnId: messageUuid };
+            const failure = messageOf(error);
+            if (!interruptionVerified) {
+              // The native interrupt was rejected (or delivery failed before
+              // any interruption): the original turn was never verified as
+              // interrupted, so restore its completion tracking — including a
+              // terminal result that arrived while the request was pending —
+              // instead of stranding this run on an undelivered UUID.
+              targetUuid = previousTargetUuid;
+              const bufferedKey = previousTargetUuid !== initialUuid || unmatchedResults.has(previousTargetUuid)
+                ? previousTargetUuid
+                : UNKEYED_RESULT_KEY;
+              const buffered = unmatchedResults.get(bufferedKey);
+              if (buffered !== undefined) {
+                unmatchedResults.delete(bufferedKey);
+                finalResult = buffered;
+                finished = true;
+                settleNow?.();
+              }
+            } else {
+              // The interrupt succeeded but the replacement was never
+              // delivered: settle with a concrete failure rather than waiting
+              // for a result whose message will never arrive.
+              steerDeliveryFailure = `Claude turn-interrupt steering verified the interruption, but replacement delivery failed: ${failure}`;
+              finished = true;
+              settleNow?.();
+            }
+            return { status: "failed", message: failure, turnId: messageUuid };
+          } finally {
+            deliverySettled?.();
+            if (deliveryPromise !== undefined) pendingSteerDeliveries.delete(deliveryPromise);
           }
         },
         interrupt: async (): Promise<ExecutorInteractionAcknowledgement> => {
@@ -236,8 +330,12 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
           }
         },
       });
-      await input.enqueue(userMessage(request.prompt, initialUuid, "now"));
       await resultPromise;
+      // Reflect concurrent steering-delivery outcomes before settling the
+      // turn so a verified-but-undelivered interruption is reported.
+      while (pendingSteerDeliveries.size > 0) {
+        await Promise.allSettled([...pendingSteerDeliveries]);
+      }
     } catch (error) {
       if (!timedOut && !aborted) protocolFailure = messageOf(error);
     } finally {
@@ -245,7 +343,7 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       request.signal?.removeEventListener("abort", onAbort);
       request.onLiveControl?.(undefined);
       input.close();
-      query.close();
+      closeQuerySession();
       abortController.abort();
       await lifecycleExit;
     }
@@ -257,10 +355,15 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       ? finalResult.result
       : parsed.text;
     const usage = parseClaudeUsage(resultEnvelope);
-    const resultError = finalResult?.type === "result" && finalResult.subtype !== "success"
-      ? finalResult.errors.join("; ") || finalResult.subtype
+    // The terminal result message is authoritative for this run: an earlier
+    // error result from a superseded (interrupted) turn must not fail a run
+    // whose replacement turn completed successfully (issue #63).
+    const resultError = finalResult?.type === "result"
+      ? finalResult.subtype === "success"
+        ? undefined
+        : finalResult.errors.join("; ") || finalResult.subtype
       : parsed.error;
-    const code = protocolFailure || resultError ? 1 : 0;
+    const code = protocolFailure || resultError || steerDeliveryFailure ? 1 : 0;
     const output: ProcessRunResult = {
       stdout: stdout.value,
       stderr: stderr.value,
@@ -297,6 +400,8 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
         ? { category: "protocol", message: protocolFailure }
         : interruptedByControl
           ? { category: "interruption", message: resultError ?? "Claude query was interrupted." }
+        : steerDeliveryFailure
+          ? { category: "protocol", message: steerDeliveryFailure }
         : resultError
           ? { category: "provider", message: resultError }
           : undefined,

@@ -56,6 +56,7 @@ const SHARED_PROMPT_GUIDELINES = [
   "Use SubtasksInspect for durable state and recent activity; artifact paths permit deeper rg-based investigation.",
   "Use SubtasksWatch only when a future one-shot checkpoint would be decision-relevant. It returns immediately, replaces any prior watch for that execution, cancels when an earlier completion/failure/conflict/recovery event arrives, and must be explicitly rearmed after firing. It is not a polling loop or recurring heartbeat.",
   "Use SubtasksSteer for queued, starting, or live tasks: queued steering is durably incorporated before startup and live steering uses the executor transport.",
+  "SubtasksSteer accepts an optional interrupt boolean: true interrupts the task's active executor turn first and delivers the instructions to the same task and workspace without cancelling, landing, or terminating it; omitted or false preserves normal steering. If the adapter cannot interrupt an in-flight turn, the request reports a concrete unsupported status instead of claiming interruption.",
   "Steering wins over review: a steer received while reviewing interrupts that review, resumes the executor with the changed request, and reviews the replacement result.",
   "If an active adapter cannot steer its current long-running command, keep the steer queued for the next executor handoff; do not treat that transport limitation as rejection.",
   lifecycleWakeGuidanceLine(),
@@ -98,7 +99,7 @@ function toolPromptSnippet(action: Action): string {
     case "inspect": return "Use SubtasksInspect for a decision-relevant diagnostic snapshot, never as a polling loop.";
     case "watch": return "Use SubtasksWatch for one deliberate future checkpoint; it is one-shot and must be explicitly rearmed.";
     case "continue": return "Resume stopped work from a verified checkpoint with SubtasksContinue.";
-    case "steer": return "Change queued or in-flight work with SubtasksSteer; steering supersedes review.";
+    case "steer": return "Change queued or in-flight work with SubtasksSteer, optionally interrupting the active turn first (interrupt: true); steering supersedes review.";
     case "interrupt": return "Stop work with SubtasksInterrupt and choose the requested landing semantics explicitly.";
     case "force_merge": return "Use SubtasksForceMerge only for a stopped verified checkpoint, then inspect main manually.";
     case "mark_clean": return "After resolving materialized conflicts in main, call SubtasksMarkClean.";
@@ -133,6 +134,8 @@ interface NormalizedInput {
   instructions?: string;
   instructionId?: string;
   interruptMode?: "interrupt_as_failure" | "interrupt_with_merge";
+  /** Steer only: interrupt the active executor turn before delivery (issue #63). */
+  interrupt?: boolean;
   mergeAnyhow?: boolean;
   offset?: number;
   lines?: number;
@@ -418,6 +421,7 @@ export class ExecutionToolManager {
             instructions: normalized.instructions!,
             instructionId,
             actor: "model",
+            interrupt: normalized.interrupt,
           });
           return backgroundResult("steer", inspection, false);
         }
@@ -637,6 +641,10 @@ function toolSchema(action: Action): Record<string, unknown> {
       properties.taskId = taskId;
       properties.instructions = instructions;
       properties.instructionId = instructionId;
+      properties.interrupt = {
+        type: "boolean",
+        description: "Optional. When true, interrupt the task's active executor turn before delivering the instructions to the same task and workspace. Omitted or false preserves normal steering. This never cancels, lands, or terminates the task; an adapter that cannot interrupt an in-flight turn reports a concrete unsupported status.",
+      };
       required.push("instructions");
       break;
     case "interrupt":
@@ -716,6 +724,10 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     if (typeof value.mergeAnyhow !== "boolean") throw new Error("mergeAnyhow must be boolean");
     normalized.mergeAnyhow = value.mergeAnyhow;
   }
+  if (value.interrupt !== undefined) {
+    if (typeof value.interrupt !== "boolean") throw new Error("interrupt must be boolean");
+    normalized.interrupt = value.interrupt;
+  }
   if (value.evidence !== undefined) {
     normalized.evidence = normalizeEvidenceSelector(value.evidence);
     if (normalized.offset !== undefined || normalized.lines !== undefined) {
@@ -744,7 +756,7 @@ function allowedKeys(action: Action): Set<string> {
     case "inspect": return new Set(["executionId", "taskId", "offset", "lines", "evidence"]);
     case "watch": return new Set(["executionId", "after"]);
     case "continue": return new Set(["executionId", "taskId", "bundle", "instructions", "instructionId"]);
-    case "steer": return new Set(["executionId", "taskId", "instructions", "instructionId"]);
+    case "steer": return new Set(["executionId", "taskId", "instructions", "instructionId", "interrupt"]);
     case "interrupt": return new Set(["executionId", "taskId", "interruptMode", "instructionId"]);
     case "force_merge": return new Set(["executionId", "taskId", "mergeAnyhow", "instructionId"]);
     case "mark_clean": return new Set();

@@ -67,6 +67,9 @@ export interface BackgroundCommandRecord {
   instructionId: string;
   action: "continue" | "steer" | "interrupt" | "force_merge";
   actor: "model" | "user" | "system";
+  /** Steer only: request turn interruption before delivery (issue #63). Canonical flag for the whole producer/consumer path. */
+  interrupt?: boolean;
+
   text?: string;
   mode?: string;
   status: "queued" | "delivered" | "acknowledged" | "failed";

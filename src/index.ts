@@ -51,6 +51,7 @@ import { registerApplyPatchTool } from "./apply-patch/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
 import { DeferredToolManager } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
+import { registerModeCycleShortcut } from "./mode-cycle";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
   createExecutorToolCatalog,
@@ -1096,6 +1097,19 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       `review gate: operating mode is now ${OPERATING_MODE_LABELS[next]}; the mode prompt and tool set apply from the next turn. ${capturedWork > 0 ? `${capturedWork} running work item(s) keep their captured instructions until they finish. ` : ""}${detail}.`,
     );
   };
+
+  /**
+   * Direct mode-cycling hotkey (issue #20): reuses the same persisted mode
+   * field and the same shared transition as the settings path. Registered
+   * only when Pi exposes the shortcut API; absent hosts simply have no
+   * hotkey while /review-settings keeps working.
+   */
+  registerModeCycleShortcut({
+    pi,
+    config,
+    configPath: loaded.path,
+    applyModeTransition: applyOperatingModeTransition,
+  });
 }
 
 async function cleanupReviewBundles(state: ReviewGateState): Promise<void> {

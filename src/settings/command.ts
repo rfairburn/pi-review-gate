@@ -13,6 +13,7 @@ import {
   externalAgentSupportsReview,
   executorEntryId,
   executorSelectionKey,
+  normalizeModeCycleShortcut,
   resolvedWorkerResources,
   resolvedWorkerRoute,
   workerResourceSupportsResearch,
@@ -32,6 +33,7 @@ import {
 } from "../config";
 import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { sendNotice } from "../pi";
+import { findOccupiedHostBindings } from "../host-keybindings";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
 
@@ -52,7 +54,7 @@ interface UiContext {
 export function registerReviewSettings(input: RegisterSettingsInput): void {
   if (!isRecord(input.pi) || typeof input.pi.registerCommand !== "function") return;
   input.pi.registerCommand("review-settings", {
-    description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, web tools, and retention.",
+    description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, the operating-mode cycle hotkey, web tools, and retention.",
     handler: async (_args: string, ctx: unknown) => {
       const ui = extractUi(ctx);
       if (!ui) {
@@ -73,6 +75,7 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
 async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; scoped: ScopedModelChoice[] }): Promise<void> {
   const agents = externalAgentCatalog(input.config);
   let operatingMode = input.config.operatingMode;
+  let modeCycleShortcut = input.config.modeCycleShortcut;
   let workerResources = materializeExecutorPool(resolvedWorkerResources(input.config), input.scoped);
   let executeRoute = initialWorkerRoute(input.config, "execute", workerResources);
   let researchRoute = initialWorkerRoute(input.config, "research", workerResources);
@@ -97,8 +100,9 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     const reviewStatus = input.config.enabled
       ? activeReviewers.length === 0 ? " — review disabled" : ""
       : " — review disabled by master setting";
-    const [modeRow, resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, deferredToolsRow, subtasksViewRow, webRow] = alignedSettingsRows([
+    const [modeRow, modeCycleRow, resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, deferredToolsRow, subtasksViewRow, webRow] = alignedSettingsRows([
       ["Operating mode", OPERATING_MODE_LABELS[operatingMode]],
+      ["Mode cycle hotkey", modeCycleShortcut],
       ["Worker resources", executorPoolSummary(workerResources)],
       ["Execution priority", workerRouteSummary(executeRoute, workerResources, agents, input.scoped)],
       ["Research priority", workerRouteSummary(researchRoute, workerResources, agents, input.scoped)],
@@ -115,6 +119,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     ]);
     const choice = await input.ui.select("Review settings", [
       modeRow,
+      modeCycleRow,
       resourcesRow,
       executeRouteRow,
       researchRouteRow,
@@ -134,6 +139,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     if (!choice || choice === "Cancel") return;
     if (choice === modeRow) {
       operatingMode = await selectOperatingMode(input.ui, operatingMode);
+      continue;
+    }
+    if (choice === modeCycleRow) {
+      modeCycleShortcut = await selectModeCycleShortcut(input.ui, modeCycleShortcut);
       continue;
     }
     if (choice === resourcesRow) {
@@ -231,6 +240,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     }
     const next = await persistReviewSettings(input.configPath!, {
       operatingMode,
+      modeCycleShortcut,
       workerResources,
       executeRoute,
       researchRoute,
@@ -250,9 +260,16 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       browserIdleExpiryMinutes,
     });
     const previousMode = input.config.operatingMode;
+    const previousModeCycleShortcut = input.config.modeCycleShortcut;
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings saved.", "info");
+    // The hotkey binding itself is captured by Pi at extension load, so a
+    // changed key needs the documented /reload (same as keybindings.json);
+    // the persisted mode change itself never needs a reload.
+    if (modeCycleShortcut !== previousModeCycleShortcut) {
+      await notify(input.ui, "Mode cycle hotkey takes effect after /reload.", "info");
+    }
     return;
   }
 }
@@ -330,6 +347,43 @@ async function selectOperatingMode(ui: UiContext, current: OperatingMode): Promi
   const options = OPERATING_MODES.map((mode) => `${OPERATING_MODE_LABELS[mode]}${mode === current ? "  current" : ""}`);
   const selected = await ui.select("Operating mode", options);
   return OPERATING_MODES.find((mode) => selected === `${OPERATING_MODE_LABELS[mode]}${mode === current ? "  current" : ""}`) ?? current;
+}
+
+async function selectModeCycleShortcut(ui: UiContext, current: string): Promise<string> {
+  if (!ui.input) {
+    await notify(ui, "This UI does not support text input; the mode cycle hotkey cannot be edited here.", "error");
+    return current;
+  }
+  while (true) {
+    const entered = await ui.input("Mode cycle hotkey (modifiers + key, e.g. alt+m)", current);
+    if (entered === undefined) return current;
+    const trimmed = entered.trim();
+    if (trimmed.length === 0) {
+      await notify(ui, "Enter a shortcut such as alt+m, or cancel to keep the current one.", "error");
+      continue;
+    }
+    let normalized: string;
+    try {
+      normalized = normalizeModeCycleShortcut(trimmed);
+    } catch (error) {
+      await notify(ui, error instanceof Error ? error.message : String(error), "error");
+      continue;
+    }
+    // Never steal an occupied host binding: a key that Pi's live resolution
+    // shows as a built-in binding is rejected and re-prompted, so the built-in
+    // action keeps working. Conflicts with other extensions are not detectable
+    // here (Pi reports those itself at startup) and are not claimed to be.
+    const occupancy = findOccupiedHostBindings(normalized);
+    if (occupancy.resolved && occupancy.bindings.length > 0) {
+      await notify(
+        ui,
+        `'${normalized}' is also used by built-in Pi binding(s) (${occupancy.bindings.join(", ")}); pick a different key so the built-in action keeps working.`,
+        "error",
+      );
+      continue;
+    }
+    return normalized;
+  }
 }
 
 async function selectBundleRetention(ui: UiContext, current: RetainBundles): Promise<RetainBundles> {

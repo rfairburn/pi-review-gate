@@ -7,6 +7,7 @@ import { persistReviewSettings, persistSubtasksViewPreference, updateReviewGateC
 
 const selection: ReviewSettingsSelection = {
 operatingMode: "orchestrate",
+modeCycleShortcut: "alt+m",
 workerResources: [],
 activeReviewers: [],
 reviewerTimeoutMs: 600_000,
@@ -64,6 +65,21 @@ test("idle expiry persists safely and omitted or invalid updates preserve existi
       assert.equal(await readFile(configPath, "utf8"), before);
     }
     assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("mode cycle hotkey persists without replacing unrelated settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-mode-cycle-persist-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, '{"enabled":true,"operatingMode":"plan-research","customFutureKey":{"keep":true}}\n', "utf8");
+    await persistReviewSettings(configPath, { ...selection, operatingMode: "plan-research", modeCycleShortcut: "ctrl+shift+r" });
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.operatingMode, "plan-research");
+    assert.equal(saved.modeCycleShortcut, "ctrl+shift+r");
+    assert.deepEqual(saved.customFutureKey, { keep: true });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -12,6 +12,8 @@ export type RetainBundles = "never" | "on-failure" | "always";
 export const OPERATING_MODES = ["execute", "orchestrate", "plan-research"] as const;
 export type OperatingMode = typeof OPERATING_MODES[number];
 export const DEFAULT_OPERATING_MODE: OperatingMode = "orchestrate";
+/** Default direct operating-mode cycle hotkey (execute → orchestrate → plan-research → execute). */
+export const DEFAULT_MODE_CYCLE_SHORTCUT = "alt+m";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = typeof THINKING_LEVELS[number];
 
@@ -221,6 +223,8 @@ export interface ReviewGateConfig {
   enabled: boolean;
   /** Top-level operating posture; hot-replaces the mode prompt on the next run. */
   operatingMode: OperatingMode;
+  /** Human hotkey that directly cycles operating modes in canonical order. */
+  modeCycleShortcut: string;
   reviewerTimeoutMs: number;
   executorTimeoutMs: number;
   maxCorrectionCycles: number;
@@ -249,6 +253,7 @@ export interface LoadedConfig {
 export const DEFAULT_CONFIG: ReviewGateConfig = {
   enabled: true,
   operatingMode: DEFAULT_OPERATING_MODE,
+  modeCycleShortcut: DEFAULT_MODE_CYCLE_SHORTCUT,
   reviewerTimeoutMs: 600_000,
   executorTimeoutMs: 1_800_000,
   maxCorrectionCycles: 1,
@@ -401,6 +406,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     ...DEFAULT_CONFIG,
     enabled: value.enabled ?? DEFAULT_CONFIG.enabled,
     operatingMode: normalizeOperatingMode(value.operatingMode),
+    modeCycleShortcut: normalizeModeCycleShortcut(value.modeCycleShortcut),
     reviewerTimeoutMs,
     executorTimeoutMs,
     maxCorrectionCycles: nonNegativeIntegerOrDefault(value.maxCorrectionCycles, DEFAULT_CONFIG.maxCorrectionCycles, "maxCorrectionCycles"),
@@ -1300,6 +1306,107 @@ function normalizeOperatingMode(value: unknown): OperatingMode {
     return value as OperatingMode;
   }
   throw new Error(`operatingMode must be one of: ${OPERATING_MODES.join(", ")}`);
+}
+
+/** Parsed chord: canonical modifier names (given order) plus canonical key. */
+interface ModeCycleChordParts {
+  modifiers: string[];
+  key: string;
+}
+
+function parseModeCycleChord(value: string): ModeCycleChordParts {
+  const parts = value.split("+").map((part) => part.trim());
+  if (parts.some((part) => part.length === 0)) {
+    throw new Error(
+      "modeCycleShortcut must be a key, optionally preceded by ctrl, shift, alt, or super, e.g. alt+m",
+    );
+  }
+  const modifiers: string[] = [];
+  for (const part of parts.slice(0, -1)) {
+    const modifier = part.toLowerCase();
+    if (!(MODE_CYCLE_MODIFIERS as readonly string[]).includes(modifier) || modifiers.includes(modifier)) {
+      throw new Error(
+        `modeCycleShortcut modifiers must be ctrl, shift, alt, or super (each at most once); got "${part}"`,
+      );
+    }
+    modifiers.push(modifier);
+  }
+  return { modifiers, key: canonicalModeCycleKey(parts[parts.length - 1]!) };
+}
+
+/**
+ * Pi shortcut form: optional modifiers plus one key (letter, digit,
+ * function key, named special, or symbol), e.g. "alt+m" or "f6".
+ * Modifier order is preserved; casing and alias names (esc, return, pageup)
+ * are canonicalized. Invalid values fail strictly at explicit writes and are
+ * defaulted with a warning at startup recovery.
+ */
+export function normalizeModeCycleShortcut(value: unknown): string {
+  if (value === undefined) return DEFAULT_MODE_CYCLE_SHORTCUT;
+  if (typeof value !== "string") {
+    throw new Error(`modeCycleShortcut must be a string like "alt+m"`);
+  }
+  const chord = parseModeCycleChord(value);
+  return `${[...chord.modifiers, chord.key].join("+")}`;
+}
+
+/**
+ * Modifier-order- and alias-insensitive chord identity used for host-binding
+ * occupancy comparisons (issue #20): "shift+ctrl+r" and "ctrl+shift+r" are
+ * the same physical chord and must compare equal. Returns undefined for
+ * strings outside the supported grammar (which then simply cannot collide).
+ */
+export function canonicalModeCycleChord(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    const chord = parseModeCycleChord(value);
+    return [...chord.modifiers.sort(), chord.key].join("+");
+  } catch {
+    return undefined;
+  }
+}
+
+const MODE_CYCLE_MODIFIERS = ["ctrl", "shift", "alt", "super"] as const;
+
+const MODE_CYCLE_SPECIAL_KEYS: Record<string, string> = {
+  escape: "escape",
+  esc: "escape",
+  enter: "enter",
+  return: "enter",
+  tab: "tab",
+  space: "space",
+  backspace: "backspace",
+  delete: "delete",
+  insert: "insert",
+  clear: "clear",
+  home: "home",
+  end: "end",
+  pageup: "pageUp",
+  pagedown: "pageDown",
+  up: "up",
+  down: "down",
+  left: "left",
+  right: "right",
+};
+
+const MODE_CYCLE_SYMBOL_KEYS = new Set([
+  "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/",
+  "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_", "+",
+  "|", "~", "{", "}", ":", "<", ">", "?",
+]);
+
+function canonicalModeCycleKey(raw: string): string {
+  const key = raw.toLowerCase();
+  if (key.length === 1) {
+    if (/[a-z0-9]/.test(key) || MODE_CYCLE_SYMBOL_KEYS.has(key)) return key;
+    throw new Error(`modeCycleShortcut key must be a letter, digit, symbol, or named key; got "${raw}"`);
+  }
+  const special = Object.hasOwn(MODE_CYCLE_SPECIAL_KEYS, key) ? MODE_CYCLE_SPECIAL_KEYS[key] : undefined;
+  if (special) return special;
+  if (/^f([1-9]|1[0-2])$/.test(key)) return key;
+  throw new Error(
+    `modeCycleShortcut key must be a letter, digit, symbol, f1-f12, or a named key (enter, tab, escape, space, backspace, delete, insert, home, end, pageUp, pageDown, up, down, left, right); got "${raw}"`,
+  );
 }
 
 function normalizeRetainBundles(value: unknown): RetainBundles {

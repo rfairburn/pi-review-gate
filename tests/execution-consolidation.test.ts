@@ -49,6 +49,7 @@ parallelEnabled: true,
 
   const next = await persistReviewSettings(configPath, {
 operatingMode: "orchestrate",
+modeCycleShortcut: "alt+m",
 workerResources: [],
 activeReviewers: [],
 reviewerTimeoutMs: 600000,

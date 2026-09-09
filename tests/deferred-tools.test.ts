@@ -82,6 +82,28 @@ function hostFixture(options: { disabled?: string[]; omit?: string[] } = {}) {
   };
 }
 
+test("write starts active only when authorized and not in planning (#45)", () => {
+  for (const mode of ["execute", "orchestrate", "plan-research"] as const) {
+    for (const excluded of [false, true]) {
+      const fixture = hostFixture({ disabled: excluded ? ["write"] : [] });
+      const manager = new DeferredToolManager(fixture.pi, () => mode);
+      manager.register();
+      manager.sessionStart(fixture.sessionIdentity);
+      assert.equal(fixture.active().includes("write"), !excluded && mode !== "plan-research");
+    }
+  }
+});
+
+test("a captured worker catalog does not gain initial write activation on restore (#45)", () => {
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  const catalog = { allowedToolCatalog: ["read", "write"], initialActiveTools: ["read"] };
+  manager.sessionStart(fixture.sessionIdentity, catalog, true);
+  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  assert.deepEqual(catalog.initialActiveTools, ["read"]);
+});
+
 test("planning unloads activated write tools and hides them from discovery and inventory", async () => {
   const fixture = hostFixture();
   let mode: OperatingMode = "orchestrate";
@@ -142,7 +164,7 @@ test("first session request is shrunk to the authorized conservative set and loa
   assert.ok(fixture.active().includes("WebSearch"), "registration alone does not shrink before session_start");
   assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
 
-  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"]);
   assert.deepEqual(manager.authorizedToolNames(), [
     "read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "WebSearch",
   ], "worker authorization remains the complete pre-shrink catalog");
@@ -157,7 +179,7 @@ test("first session request is shrunk to the authorized conservative set and loa
   const reloaded = new DeferredToolManager(recreatedPi);
   reloaded.register();
   reloaded.sessionStart(fixture.sessionIdentity);
-  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"]);
   assert.equal(reloaded.authorizedToolNames()?.includes("post_capture"), false);
 });
 
@@ -231,7 +253,7 @@ test("configured worker boundaries reject unavailable and unauthorized tools", a
 
   const result = await fixture.search()("unauthorized", { query: "private disabled" });
   assert.equal(result.isError, true);
-  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "ApplyPatch", "SubtasksStart"]);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart"]);
 });
 
 test("disabled deferred mode starts full-active and local toggles apply immediately", async () => {
@@ -245,7 +267,7 @@ test("disabled deferred mode starts full-active and local toggles apply immediat
   assert.doesNotMatch(manager.startupGuidance() ?? "", /inactive|next turn/);
 
   assert.equal(manager.setDeferredEnabled(true), true);
-  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"]);
   assert.match(manager.startupGuidance() ?? "", /inactive.*exact name.*next turn/);
 
   await fixture.search()("load-web", { query: "WebSearch" });
@@ -284,7 +306,7 @@ test("search deterministically and additively activates authorized matches only"
   ]);
   assert.deepEqual((result.details as { activated: string[] }).activated, ["SubtasksAdd", "SubtasksInspect"]);
   assert.deepEqual(fixture.active(), [
-    "read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools", "SubtasksAdd", "SubtasksInspect",
+    "read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools", "SubtasksAdd", "SubtasksInspect",
   ]);
   assert.match(String((result.content as Array<{ text: string }>)[0]?.text), /did not perform the operation/);
 });
@@ -317,7 +339,7 @@ test("queries with more than twelve unique terms remain valid and use every term
 
   assert.equal(result.isError, false);
   assert.deepEqual((result.details as { matched: string[] }).matched, ["write"]);
-  assert.deepEqual((result.details as { activated: string[] }).activated, ["write"]);
+  assert.deepEqual((result.details as { activated: string[] }).activated, [], "write was already active");
   assert.ok(fixture.active().includes("write"));
 });
 
@@ -497,7 +519,7 @@ test("session restart and a recreated ExtensionAPI wrapper reuse the session aut
   assert.ok(fixture.active().includes("WebSearch"));
 
   first.sessionStart(fixture.sessionIdentity);
-  const initial = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"];
+  const initial = ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"];
   assert.deepEqual(fixture.active(), initial, "another session_start resets to the same initial set");
 
   fixture.pi.registerTool(tool("reload_private", "A tool registered only after the original authorization capture."));
@@ -577,7 +599,7 @@ test("session startup fails closed without a stable identity", async () => {
 
   assert.equal(manager.sessionStart(undefined), false);
   assert.equal(manager.authorizedToolNames(), undefined);
-  const restrictive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart"];
+  const restrictive = ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart"];
   assert.deepEqual(fixture.active(), restrictive);
   assert.deepEqual(fixture.setCalls, [restrictive]);
 
@@ -591,7 +613,7 @@ test("session startup fails closed without a stable identity", async () => {
   assert.match(String((unavailable.content as Array<{ text: string }>)[0]?.text), /unavailable until session startup completes/);
 });
 
-test("the first-request deferred schema is materially smaller than the authorized catalog", () => {
+test("the first-request deferred schema remains smaller with write initially active", () => {
   const fixture = hostFixture();
   const before = measureToolSchemaBaseline(fixture.active(), fixture.definitions);
   const manager = new DeferredToolManager(fixture.pi);
@@ -599,10 +621,12 @@ test("the first-request deferred schema is materially smaller than the authorize
   manager.sessionStart(fixture.sessionIdentity);
   const after = measureToolSchemaBaseline(fixture.active(), fixture.definitions);
 
+  assert.ok(fixture.active().includes("write"));
+  assert.ok(!fixture.active().includes("WebSearch"));
   assert.ok(after.activeToolCount < before.activeToolCount);
   assert.ok(
-    after.serializedSchemaBytes < before.serializedSchemaBytes * 0.8,
-    `expected material schema reduction (${before.serializedSchemaBytes} -> ${after.serializedSchemaBytes})`,
+    after.serializedSchemaBytes < before.serializedSchemaBytes,
+    `expected schema reduction (${before.serializedSchemaBytes} -> ${after.serializedSchemaBytes})`,
   );
 });
 

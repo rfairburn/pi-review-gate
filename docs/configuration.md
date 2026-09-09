@@ -299,7 +299,10 @@ boundaries are owned by [Web tools](web-tools.md) and
   [Delegated execution](delegated-execution.md#notifications-and-ui).
 - **Deferred Pi tools** defaults to **On**. Saving **Off** immediately exposes every
   authorized tool in the current top-level Pi session; saving **On** immediately restores
-  the conservative active subset plus `search_tools`. The conservative subset always
+  the conservative active subset plus `search_tools`. For new mutation-authorized
+  sessions/tasks, `write` starts active alongside `edit` and `ApplyPatch`; planning
+  still hides it, explicit exclusions still apply, and previously captured worker
+  catalogs retain their recorded initial subsets. The conservative subset always
   includes launch-authorized native read-only discovery (`grep`, `find`, `ls`), so
   discovery needs no deferred activation in any mode, including delegated subtasks.
   Newly launched Pi subtasks use the saved value, while already-running subtask

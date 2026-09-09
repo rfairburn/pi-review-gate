@@ -136,6 +136,56 @@ test("Pi executor child loads the review-gate extension in executor role without
   }
 });
 
+test("Pi executor launches research workers with authorized native discovery active from launch (#71)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-discovery-launch-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const capture = join(root, "capture.json");
+    const environmentCapture = join(root, "environment.json");
+    const command = join(root, "discovery-rpc.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiSettlementReceipt,
+      `fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2)));`,
+      `fs.writeFileSync(${JSON.stringify(environmentCapture)},JSON.stringify({toolCatalog:process.env.PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG}));`,
+      "let input=''; process.stdin.setEncoding('utf8');",
+      "const out=(v)=>console.log(JSON.stringify(v));",
+      "process.stdin.on('data',chunk=>{input+=chunk; for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,command:'prompt',success:true});out({type:'turn_start'});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'research complete'}]}});out({type:'turn_end'});ack();out({type:'agent_end'});}",
+      "else if(c.type==='get_state')out({type:'response',id:c.id,command:c.type,success:true,data:{isStreaming:false,pendingMessageCount:0}});",
+      "else if(c.type==='get_last_assistant_text')out({type:'response',id:c.id,command:c.type,success:true,data:{text:'research complete'}});",
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const adapter = new PiExecutorAdapter({ model: "provider/model", command });
+    const result = await adapter.run({
+      cwd: root,
+      prompt: "research task",
+      artifactDir,
+      turn: 1,
+      executorToolCatalog: {
+        allowedToolCatalog: ["read", "grep", "find", "ls", "WebSearch"],
+        initialActiveTools: ["read", "grep", "find", "ls"],
+      },
+    });
+    assert.equal(result.text, "research complete");
+    const argv: string[] = JSON.parse(await readFile(capture, "utf8"));
+    // The native --tools allowlist carries the full inherited catalog plus the
+    // loader; the durable initial subset starts the discovery trio active so
+    // the worker never needs search_tools before its first discovery call.
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls,WebSearch,search_tools");
+    const environment = JSON.parse(await readFile(environmentCapture, "utf8"));
+    assert.deepEqual(JSON.parse(environment.toolCatalog), {
+      allowedToolCatalog: ["read", "grep", "find", "ls", "WebSearch"],
+      initialActiveTools: ["read", "grep", "find", "ls"],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Pi executor fails closed when agent_end and process lifetime provide no trusted settlement receipt", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-missing-quiescence-"));
   try {

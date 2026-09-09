@@ -8,8 +8,26 @@
  */
 export const EXECUTOR_TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
 export const DEFERRED_TOOL_SEARCH_NAME = "search_tools";
+/**
+ * Canonical native discovery set (issues #71/#72). Pi supplies `grep`,
+ * `find`, and `ls` as built-in read-only tools; Claude's adapter maps the
+ * same capability names onto native `Grep`/`Glob`. This is the single source
+ * for the policy: the conservative initial-active subset keeps them active
+ * from the first request in every operating mode and delegated role whenever
+ * the parent registry authorizes them.
+ */
+export const NATIVE_DISCOVERY_TOOLS = ["grep", "find", "ls"] as const;
+/**
+ * Conservative startup subset for deferred-tool sessions, in every top-level
+ * operating mode and delegated role. Launch-authorized native read-only
+ * discovery belongs to that subset: it is active from the first request — no
+ * `search_tools` activation step — and mode switches never deactivate it
+ * (the planning visibility policy keeps it). Every entry is still filtered
+ * through the captured authorized catalog. Registry removal via --tools,
+ * --exclude-tools, or --no-tools keeps those capabilities excluded.
+ */
 export const DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER = [
-  "read", "bash", "edit", "ApplyPatch", "SubtasksStart",
+  "read", ...NATIVE_DISCOVERY_TOOLS, "bash", "edit", "ApplyPatch", "SubtasksStart",
 ] as const;
 
 export interface ExecutorToolCatalog {

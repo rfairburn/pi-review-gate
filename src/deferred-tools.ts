@@ -1,6 +1,7 @@
 import {
   DEFERRED_TOOL_SEARCH_NAME,
   DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER,
+  NATIVE_DISCOVERY_TOOLS,
   createExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./execution/tool-catalog";
@@ -307,6 +308,11 @@ function captureAuthorizationBoundary(pi: DeferredToolHost): AuthorizationBounda
   const authorizedNames = new Set(active.filter((name) => name !== DEFERRED_TOOL_SEARCH_NAME));
   const metadata = toolMetadata(pi.getAllTools());
   const metadataByName = new Map(metadata.map((tool) => [tool.name, tool]));
+  // Pi registers native discovery even when initially inactive. Its registry
+  // already excludes tools withheld by --tools/--exclude-tools/--no-tools.
+  for (const name of NATIVE_DISCOVERY_TOOLS) {
+    if (metadataByName.has(name)) authorizedNames.add(name);
+  }
   const catalog = [...authorizedNames]
     .map((name) => metadataByName.get(name) ?? { name, description: "" })
     .sort((left, right) => compareNames(left.name, right.name));

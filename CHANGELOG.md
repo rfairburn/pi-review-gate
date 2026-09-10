@@ -15,6 +15,32 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.28]
+
+### Added
+
+- Expanded detail view for the `Subtasks*` tool family: every one of the nine tools'
+  returned results now renders a cohesive expanded detail view under Pi's native
+  expansion binding (Ctrl+O by default), contributed as the shared expansion mechanism's
+  expanded callback and selected by the native `options.expanded` flag. Expansion stays
+  presentation of already-returned data only — no competing key handler, no mirrored
+  expansion state, and no rerun, poll, artifact read, log fetch, or history retrieval; the
+  #56 collapsed cards are passed through unchanged and re-collapse restores them
+  identically. The expanded view is bounded and provenance-separated: what the executor
+  process observed (`executor_observed`), what the worker wrote in its final response
+  (`worker_claim`, never treated as verification), reviewer verdicts
+  (`reviewer_verdict`), and the authoritative task/landing state from durable records
+  render as distinct sections, with the returned snapshot's "as of" freshness and an
+  explicit uncertainty note while any task is still active. Unavailable sources,
+  retention-truncated records, omitted ranges, and capped rendering are disclosed, never
+  cut silently; simple acknowledgements (`SubtasksWatch`, `SubtasksMarkClean`) render
+  only their returned fields, unrecognized result shapes fall back to the returned
+  summary, streaming results render a bounded pending view, evidence selector failures
+  stay task-scoped, and private model reasoning never appears. Deep-read chunks keep the
+  retained text's own whitespace, and all lines are clipped in terminal display cells
+  (CJK and default-presentation emoji measured as two cells) so narrow rows stay readable
+  (Refs #59).
+
 ## [0.1.0-dev.27]
 
 ### Added

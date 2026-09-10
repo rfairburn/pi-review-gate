@@ -165,9 +165,13 @@ shared mechanism in `src/tool-result-expansion.ts`:
   cancelled states stay stable.
 - Tools that define a custom `renderResult` are wired through the helper with their
   existing renderer as the collapsed view: the nine `Subtasks*` tools
-  (`src/execution/tool.ts`) and `ApplyPatch` (`src/apply-patch/tool.ts`). Family detail
-  issues (#58 background shell, #59 subtasks, #60 interactive browser, #82
-  WebFetch/BrowserExtract) contribute expanded callbacks as the only remaining change.
+  (`src/execution/tool.ts`) and `ApplyPatch` (`src/apply-patch/tool.ts`). The `Subtasks*`
+  family contributes its expanded detail callback (#59): expanding any of its results
+  renders one cohesive, provenance-separated detail view of the already-returned data
+  with bounded sections and explicit omission disclosures, and re-collapsing restores the
+  unchanged collapsed card. The remaining family detail issues (#58 background shell, #60
+  interactive browser, #82 WebFetch/BrowserExtract) contribute their expanded callbacks
+  the same way as the only remaining change.
 - Tools that never defined a custom `renderResult` keep Pi's native fallback rendering,
   which already expands and re-collapses the returned text output with a bounded
   preview: the five `Shell*` tools, the web/browser family, and `search_tools`. Those

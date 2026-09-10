@@ -12,9 +12,10 @@
  * `expandableResult()` is the single shared mechanism for extension-owned
  * tools. It wraps an existing result renderer as the collapsed view and
  * optionally accepts an expanded-detail renderer contributed by a family
- * detail issue (#58 background shell, #59 subtasks, #60 interactive browser,
- * #82 WebFetch/BrowserExtract). Until an expanded renderer is contributed the
- * wrapped tool keeps its existing presentation in both states — no fabricated
+ * detail issue (#58 background shell, #60 interactive browser, #82
+ * WebFetch/BrowserExtract; the #59 subtasks callback is contributed). Until an
+ * expanded renderer is contributed the wrapped tool keeps its existing
+ * presentation in both states — no fabricated
  * data, no retrieval, no behavior change; the wiring is ready and the detail
  * callback is the only remaining contribution.
  *

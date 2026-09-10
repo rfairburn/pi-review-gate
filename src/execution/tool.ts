@@ -49,6 +49,7 @@ const EXECUTION_TOOL_NAME_LIST = ACTIONS.map((action) => EXECUTION_TOOL_NAMES[ac
 
 const SHARED_PROMPT_GUIDELINES = [
   "Use SubtasksStart with an array of one or more bounded tasks and kind execute or research; retain the stable execution/task handles returned for every task.",
+  "SubtasksStart accepts an optional top-level workspace string selecting an existing, explicitly authorized development checkout or Git worktree as the group's capture and landing destination; omitted or blank uses the parent session's working directory. The target is resolved once at start: every capture, reviewed landing, restore, continuation, and recovery path uses it, SubtasksAdd inherits the group's target, and steering never retargets it. Each task still gets its own isolated worktree captured from the target; several workers may land into the same target, and separate groups may target different repositories concurrently under the shared global capacity limits.",
   "Use kind research for substantial independent read-only discovery that can proceed in the background. Use concurrent foreground read/web/shell calls for quick, shallow, or tightly coupled investigation, and continue useful foreground work while research runs.",
   "Research groups return reports and never land workspace changes. Execution groups review and land accepted changes.",
   "Use SubtasksAdd to top off a running execution without waiting for slower tasks.",
@@ -72,7 +73,7 @@ const SHARED_PROMPT_GUIDELINES = [
 function toolDescription(action: Action): string {
   switch (action) {
     case "start":
-      return "Start 1–16 durable background execution or read-only research subtasks and return stable execution/task handles immediately.";
+      return "Start 1–16 durable background execution or read-only research subtasks, optionally targeting an existing authorized checkout/worktree via workspace, and return stable execution/task handles immediately.";
     case "add":
       return "Add 1–16 durable background subtasks to an existing execution so freed capacity can be topped off.";
     case "inspect":
@@ -130,6 +131,8 @@ interface NormalizedInput {
   taskId?: string;
   tasks?: BackgroundTaskDefinition[];
   kind?: BackgroundTaskKind;
+  /** Start only (#25): optional explicit execution target; blank normalizes to undefined. */
+  workspace?: string;
   bundle?: ReattachmentBundle;
   instructions?: string;
   instructionId?: string;
@@ -380,7 +383,7 @@ export class ExecutionToolManager {
       switch (normalized.action) {
         case "start": {
           const kind = normalized.kind ?? "execute";
-          const inspection = await this.controller.start(this.withParentTools(normalized.tasks!, kind), kind);
+          const inspection = await this.controller.start(this.withParentTools(normalized.tasks!, kind), kind, normalized.workspace);
           return backgroundResult("start", inspection, false, this.input.config);
         }
         case "add": {
@@ -589,6 +592,12 @@ function toolSchema(action: Action): Record<string, unknown> {
         enum: ["execute", "research"],
         description: "execute produces reviewed workspace changes that land; research is read-only and returns a report. Defaults to execute.",
       };
+      // #25: no minLength — an empty or whitespace-only string is a valid
+      // input that normalizes to "omitted" (parent session's working directory).
+      properties.workspace = {
+        type: "string",
+        description: "Optional existing directory (an explicitly authorized development checkout or Git worktree) that the group captures from and lands into. Omitted or blank uses the parent session's working directory. Resolved once at start; SubtasksAdd inherits it and steering never changes it.",
+      };
       properties.tasks = tasks;
       required.push("tasks");
       break;
@@ -714,6 +723,13 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     if (value.kind !== "execute" && value.kind !== "research") throw new Error("kind must be execute or research");
     normalized.kind = value.kind;
   }
+  if (value.workspace !== undefined) {
+    // #25: start-only explicit execution target; a blank string is the same
+    // as omitting it (parent session working directory).
+    if (typeof value.workspace !== "string") throw new Error("workspace must be a string");
+    const workspace = value.workspace.trim();
+    if (workspace !== "") normalized.workspace = workspace;
+  }
   if (value.bundle !== undefined) normalized.bundle = normalizeBundle(value.bundle);
   if (value.tasks !== undefined) normalized.tasks = normalizeTasks(value.tasks);
   if (value.interruptMode !== undefined) {
@@ -751,7 +767,7 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
 
 function allowedKeys(action: Action): Set<string> {
   switch (action) {
-    case "start": return new Set(["kind", "tasks"]);
+    case "start": return new Set(["kind", "tasks", "workspace"]);
     case "add": return new Set(["executionId", "tasks"]);
     case "inspect": return new Set(["executionId", "taskId", "offset", "lines", "evidence"]);
     case "watch": return new Set(["executionId", "after"]);
@@ -1006,7 +1022,12 @@ interface ThemeLike {
 
 function renderCall(toolName: string, action: Action, args: unknown, theme: ThemeLike): unknown {
   const taskCount = isRecord(args) && Array.isArray(args.tasks) ? ` · ${args.tasks.length} task${args.tasks.length === 1 ? "" : "s"}` : "";
-  return textComponent((width) => [clip(theme.fg("toolTitle", theme.bold(toolName)) + theme.fg("accent", taskCount || ` · ${action}`), width)]);
+  // #25: surface the explicit execution target at dispatch so the rendered
+  // call shows which checkout/worktree the group will capture and land into.
+  const workspace = isRecord(args) && typeof args.workspace === "string" && args.workspace.trim() !== ""
+    ? ` · ${args.workspace.trim()}`
+    : "";
+  return textComponent((width) => [clip(theme.fg("toolTitle", theme.bold(toolName)) + theme.fg("accent", taskCount || ` · ${action}`) + workspace, width)]);
 }
 
 function renderResult(value: unknown, _options: unknown, theme: ThemeLike): unknown {

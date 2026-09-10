@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExecutorSelection, ReviewGateConfig } from "../config";
@@ -284,8 +284,14 @@ export class BackgroundExecutionController {
   private pumping = false;
   private pumpRequested = false;
   private scopedModels: string[] = [];
-  private conflictGate?: BackgroundConflictGate;
-  private releaseConflictBlock?: () => void;
+  /**
+   * #25 multi-target: one outstanding conflict gate per resolved source root.
+   * Different targets keep independent gates and lease blocks, so concurrent
+   * conflicts on separate repositories cannot overwrite, early-release, or
+   * leak each other's block; landings into an already-gated root serialize
+   * behind that root's block in the coordinator instead.
+   */
+  private readonly conflictGates = new Map<string, { gate: BackgroundConflictGate; release: () => void }>();
   private uiContext: unknown;
   private expandedView = false;
   private readonly watches = new Map<string, { timer: ReturnType<typeof setTimeout>; subscription: BackgroundWatchSubscription }>();
@@ -346,11 +352,17 @@ export class BackgroundExecutionController {
         if (task.bundle) bundles.push({ ...task.bundle });
       }
     }
+    // #25 multi-target: every outstanding gate is persisted per source root.
+    // The legacy singular field is no longer written (restored readers recover
+    // it from conflictGates) and conflictGates stays absent when no gate is
+    // active so the zero-gate snapshot keeps its exact prior shape.
+    const gates = [...this.conflictGates.values()].map(({ gate }) => ({ ...gate, paths: [...gate.paths] }));
     return {
       waveRoots: [...new Set(waveRoots)],
       bundles,
       groupRoots: [...this.groups.values()].map((group) => group.root),
-      conflictGate: this.conflictGate ? { ...this.conflictGate, paths: [...this.conflictGate.paths] } : undefined,
+      conflictGate: undefined,
+      ...(gates.length > 0 ? { conflictGates: gates } : {}),
     };
   }
 
@@ -369,8 +381,10 @@ export class BackgroundExecutionController {
         const restored = await readGroup(root);
         if (!restoreIsCurrent()) return;
         const group = restored.group;
-        if (resolve(group.cwd) !== resolve(this.input.cwd())) {
-          throw new Error(`execution cwd ${group.cwd} does not match ${resolve(this.input.cwd())}`);
+        // #25: session identity is anchored to the parent session's directory
+        // at creation time, independently of the selected execution target.
+        if (resolve(this.sessionCwdOf(group)) !== resolve(this.input.cwd())) {
+          throw new Error(`execution session cwd ${this.sessionCwdOf(group)} does not match ${resolve(this.input.cwd())}`);
         }
         // Finding 15: seed archive-reuse metadata only for tasks that restored
         // inline (the bounded recent settled window); evicted settled tasks
@@ -483,16 +497,13 @@ export class BackgroundExecutionController {
       }
     }
     if (!restoreIsCurrent()) return;
-    if (associations.conflictGate) {
-      const gate: BackgroundConflictGate = {
-        ...associations.conflictGate,
-        paths: [...associations.conflictGate.paths],
-      };
-      this.conflictGate = gate;
-      this.releaseConflictBlock = sourceMutationCoordinator.block(
-        gate.sourceRoot,
-        gate.reason,
-      );
+    // #25 multi-target: recover every persisted outstanding gate — new
+    // snapshots carry conflictGates (one per source root); legacy single-gate
+    // snapshots fall back to conflictGate. Each gate re-blocks its own root.
+    const persistedGates = associations.conflictGates
+      ?? (associations.conflictGate ? [associations.conflictGate] : []);
+    for (const persisted of persistedGates) {
+      this.setConflictGate({ ...persisted, paths: [...persisted.paths] });
     }
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(this.input.config));
     this.rebuildRecentActivity();
@@ -500,9 +511,16 @@ export class BackgroundExecutionController {
     void this.pump();
   }
 
-  async start(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind = "execute"): Promise<BackgroundInspection> {
+  async start(
+    tasks: BackgroundTaskDefinition[],
+    kind: BackgroundTaskKind = "execute",
+    workspace?: string,
+  ): Promise<BackgroundInspection> {
     const detachEpoch = this.detachEpoch;
     if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
+    // #25: resolve the execution target exactly once, before any durable
+    // group state exists; a rejected workspace never leaves a group behind.
+    const cwd = await this.resolveExecutionTarget(workspace);
     if (resolvedWorkerRoute(this.input.config, kind).length === 0) {
       throw new Error(`No ${kind} worker route is configured. Add at least one eligible resource in /review-settings.`);
     }
@@ -531,7 +549,8 @@ export class BackgroundExecutionController {
       executionId,
       kind,
       root,
-      cwd: resolve(this.input.cwd()),
+      cwd,
+      sessionCwd: resolve(this.input.cwd()),
       createdAt: now,
       updatedAt: now,
       peakConcurrency: 0,
@@ -546,6 +565,47 @@ export class BackgroundExecutionController {
     await this.publishAssociations();
     void this.pump();
     return this.inspect(executionId);
+  }
+
+  /**
+   * #25: resolve the group's execution target once at creation. An omitted or
+   * blank workspace defaults to the parent session's working directory,
+   * preserving current behavior. A supplied workspace must be an existing,
+   * accessible directory (an explicitly authorized development checkout or Git
+   * worktree); relative paths resolve against the parent session's working
+   * directory like every other session-relative path in this feature. The
+   * target is canonicalized through realpath so the persisted target is a
+   * stable identity that later symlink redirection cannot move. The target
+   * is the capture/landing destination, never worker scratch: every task still
+   * receives its own isolated worktree captured from it. No directory creation,
+   * cloning, or worktree management happens here.
+   */
+  private async resolveExecutionTarget(workspace?: string): Promise<string> {
+    const parentCwd = resolve(this.input.cwd());
+    if (workspace === undefined || workspace.trim() === "") return parentCwd;
+    // #25: session-relative, never anchored at the process cwd, which can
+    // diverge from the session's working directory.
+    const candidate = resolve(parentCwd, workspace);
+    let stats;
+    try {
+      stats = await stat(candidate);
+    } catch {
+      throw new Error(`Execution workspace ${workspace} does not exist or is not accessible.`);
+    }
+    if (!stats.isDirectory()) {
+      throw new Error(`Execution workspace ${workspace} must be an existing directory (an authorized development checkout or Git worktree).`);
+    }
+    return realpath(candidate);
+  }
+
+  /**
+   * #25: the parent session's working directory a group was created from.
+   * Session-scoped identity checks compare against this value independently of
+   * the selected target; legacy groups fall back to `cwd`, which always held
+   * the parent session's directory before explicit workspaces existed.
+   */
+  private sessionCwdOf(group: BackgroundExecutionGroup): string {
+    return group.sessionCwd ?? group.cwd;
   }
 
   /** Composite archive-handle key: archive metadata is scoped per execution. */
@@ -636,7 +696,9 @@ export class BackgroundExecutionController {
 
   async add(executionId: string | undefined, tasks: BackgroundTaskDefinition[]): Promise<BackgroundInspection> {
     const group = this.resolveGroup(executionId);
-    if (resolve(group.cwd) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
+    // #25: SubtasksAdd inherits the group's selected target; only the parent
+    // session identity is checked here.
+    if (resolve(this.sessionCwdOf(group)) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
     this.assertUnsettledAdmissionCapacity(group, tasks.length);
     group.tasks.push(...tasks.map((definition) => newTask(definition)));
     group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - tasks.length) + tasks.length;
@@ -774,6 +836,9 @@ export class BackgroundExecutionController {
   ): BackgroundInspection {
     const from = Math.max(0, offset ?? 0);
     const count = Math.max(1, Math.min(lines ?? MAX_ACTIVITY, 500));
+    // #25 multi-target: at most one gate per group (same-root landings
+    // serialize behind the coordinator), so a single optional field suffices.
+    const conflictGate = this.gateForGroup(group);
     return {
       executionId: group.executionId,
       kind: group.kind,
@@ -789,8 +854,8 @@ export class BackgroundExecutionController {
       historicalCount: group.totalTaskCount ?? group.tasks.length,
       archivedCount: group.settledArchivedCount ?? 0,
       scheduling: this.schedulingSnapshot(group),
-      conflictGate: this.conflictGate && this.conflictGate.executionId === group.executionId
-        ? { ...this.conflictGate, paths: [...this.conflictGate.paths] }
+      conflictGate: conflictGate
+        ? { ...conflictGate, paths: [...conflictGate.paths] }
         : undefined,
       tasks: selected.map((task) => ({
         ...cloneTask(task),
@@ -818,7 +883,8 @@ export class BackgroundExecutionController {
 
   watch(executionId: string | undefined, afterMs: number): BackgroundWatchSubscription {
     const group = this.resolveGroup(executionId);
-    if (resolve(group.cwd) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
+    // #25: session identity only; the selected target may differ from it.
+    if (resolve(this.sessionCwdOf(group)) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
     if (!group.tasks.some((task) => isActiveTaskState(task.state))) {
       throw new Error(`Execution ${group.executionId} has no active tasks to watch.`);
     }
@@ -959,7 +1025,11 @@ export class BackgroundExecutionController {
     }
     const inspection = await inspectOperation(bundle);
     const capture = await readWaveCaptureRecord(ownedRoot);
-    if (await realpath(group.cwd) !== await realpath(this.input.cwd())
+    // #25: the first clause is the parent-session identity check (the group's
+    // creation-time session directory); the second keeps the target-identity
+    // check — this wave must have been captured from the group's selected
+    // target, which may be a different repository than the session's.
+    if (await realpath(this.sessionCwdOf(group)) !== await realpath(this.input.cwd())
       || await realpath(capture.discovery.requestedCwd) !== await realpath(group.cwd)
       || await realpath(inspection.manifest.sourceRoot) !== await realpath(capture.discovery.captureRoot)
       || inspection.bundle.waveId !== capture.waveId
@@ -1023,7 +1093,9 @@ export class BackgroundExecutionController {
       || await realpath(record.artifactDir) !== artifactDir
       || await realpath(record.worktreeRoot) !== await realpath(worktree.worktreeRoot)
       || await realpath(record.effectiveCwd) !== await realpath(worktree.effectiveCwd)
-      || await realpath(group.cwd) !== await realpath(this.input.cwd())
+      // #25: parent-session identity (creation-time session directory), kept
+      // independent of the selected target checked in the next clause.
+      || await realpath(this.sessionCwdOf(group)) !== await realpath(this.input.cwd())
       || await realpath(capture.discovery.requestedCwd) !== await realpath(group.cwd)) {
       throw new Error("Research bundle source/task ownership does not match this execution.");
     }
@@ -1092,9 +1164,6 @@ export class BackgroundExecutionController {
       if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== adoptionEpoch) {
         throw new Error("Application shutdown or controller detach began while the execution bundle was being adopted.");
       }
-      if (resolve(inspection.manifest.sourceRoot) !== resolve(this.input.cwd())) {
-        throw new Error(`Recovery bundle belongs to ${inspection.manifest.sourceRoot}, not ${resolve(this.input.cwd())}.`);
-      }
       if (inspection.record.state === "landed" && await this.settledArchiveOwner(inspection.bundle.taskId)) {
         // Finding 15 (narrowed in review pass 2): settled work owned by one of
         // this controller's executions must never resurrect as recoverable
@@ -1108,10 +1177,30 @@ export class BackgroundExecutionController {
       let group: BackgroundExecutionGroup;
       if (executionId) {
         group = this.resolveGroup(executionId);
+        // #25: parent-session identity is checked against the group's creation-
+        // time session directory, independently of its selected target.
+        if (resolve(this.sessionCwdOf(group)) !== resolve(this.input.cwd())) {
+          throw new Error("Execution group belongs to a different workspace.");
+        }
+        // #25: the bundle must have been captured from this group's persisted
+        // target — the same target-identity clause recoverTaskAssociation
+        // enforces — so a foreign-target group never adopts a parent-source
+        // bundle (or vice versa) before its task is admitted.
+        const capture = await readWaveCaptureRecord(inspection.bundle.waveRoot);
+        if (await realpath(capture.discovery.requestedCwd) !== await realpath(group.cwd)) {
+          throw new Error(
+            `Recovery bundle was captured from ${capture.discovery.requestedCwd}, not execution ${group.executionId}'s workspace ${group.cwd}.`,
+          );
+        }
         // Adoption into an existing execution adds to its unsettled
         // population: the shared admission cap applies here too.
         this.assertUnsettledAdmissionCapacity(group, 1);
       } else {
+        // #25: fresh adoption (no surviving group) keeps the fail-closed legacy
+        // gate — the bundle's source must be the current session's workspace.
+        if (resolve(inspection.manifest.sourceRoot) !== resolve(this.input.cwd())) {
+          throw new Error(`Recovery bundle belongs to ${inspection.manifest.sourceRoot}, not ${resolve(this.input.cwd())}.`);
+        }
         const root = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
         if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== adoptionEpoch) {
           await rm(root, { recursive: true, force: true });
@@ -1126,6 +1215,7 @@ export class BackgroundExecutionController {
           kind: definition.backgroundKind === "research" ? "research" : "execute",
           root,
           cwd: resolve(this.input.cwd()),
+          sessionCwd: resolve(this.input.cwd()),
           createdAt: now,
           updatedAt: now,
           peakConcurrency: 0,
@@ -1431,7 +1521,7 @@ export class BackgroundExecutionController {
         await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
         const materialized = await materializeLandingConflicts(capture, plan, `forced subtask ${task.taskId}`);
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
-        this.conflictGate = {
+        const conflictGate: BackgroundConflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
           sourceRoot: group.cwd,
@@ -1440,14 +1530,14 @@ export class BackgroundExecutionController {
           manifestPath: materialized.manifestPath,
           reason: `Forced task ${task.taskId} materialized conflicts that require immediate resolution.`,
         };
-        this.releaseConflictBlock = sourceMutationCoordinator.block(group.cwd, this.conflictGate.reason);
+        this.setConflictGate(conflictGate);
         transitionTaskState(task, "conflicted");
         task.summary = `Force-merge materialized conflict markers in ${materialized.paths.join(", ")}. Resolve them and manually inspect the complete workspace; force-merge does not verify the requested result.`;
         command.status = "acknowledged";
         command.acknowledgedAt = new Date().toISOString();
         await this.save(group);
         await this.publishAssociations();
-        await this.wake(task, "failure", this.criticalPrompt()!);
+        await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
         return this.inspect(group.executionId, task.taskId);
       }
       transitionTaskState(task, "landing");
@@ -1506,51 +1596,82 @@ export class BackgroundExecutionController {
   }
 
   async markClean(): Promise<{ cleared: boolean; paths: string[] }> {
-    const gate = this.conflictGate;
-    if (!gate) return { cleared: false, paths: [] };
-    const unresolved = await unresolvedConflictMarkers(gate.sourceRoot, gate.paths);
-    if (unresolved.length > 0) {
-      throw new Error(`Conflict markers remain in: ${unresolved.join(", ")}`);
+    const entries = [...this.conflictGates.entries()];
+    if (entries.length === 0) return { cleared: false, paths: [] };
+    // #25 multi-target: validate every outstanding gate before releasing any —
+    // one unresolved target must never clear another target's block. The
+    // single-gate message and behavior are unchanged; with several gates each
+    // dirty root is named so the remaining work stays actionable.
+    const dirty: string[] = [];
+    for (const [, { gate }] of entries) {
+      const unresolved = await unresolvedConflictMarkers(gate.sourceRoot, gate.paths);
+      if (unresolved.length > 0) {
+        dirty.push(entries.length === 1 ? unresolved.join(", ") : `${gate.sourceRoot}: ${unresolved.join(", ")}`);
+      }
     }
-    const group = this.groups.get(gate.executionId);
-    const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
-    if (task) {
-      transitionTaskState(task, "landed");
-      task.summary = "Conflict resolution was validated and marked landed.";
-      task.updatedAt = new Date().toISOString();
-      await this.save(group!);
+    if (dirty.length > 0) {
+      throw new Error(`Conflict markers remain in: ${dirty.join("; ")}`);
     }
     const baseline = activeExchangeBaseline(this.input.state);
-    if (baseline && gate.paths.length > 0) {
-      const resolved = await createWorkspaceSnapshot(gate.sourceRoot, {
-        maxFileBytes: this.input.config.maxFileBytes,
-        maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-        reuseUnchangedFrom: baseline,
-      });
-      checkpointReviewWindow(this.input.state, selectiveCheckpoint(baseline, baseline, baseline, resolved, gate.paths, gate.sourceRoot));
+    const clearedPaths: string[] = [];
+    for (const [key, { gate, release }] of entries) {
+      const group = this.groups.get(gate.executionId);
+      const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
+      if (task) {
+        transitionTaskState(task, "landed");
+        task.summary = "Conflict resolution was validated and marked landed.";
+        task.updatedAt = new Date().toISOString();
+        await this.save(group!);
+      }
+      // #25: same-directory identity guard as checkpointParent — a conflict
+      // gate on a foreign target must not merge that repository's files into
+      // the parent review baseline.
+      if (baseline && gate.paths.length > 0 && await realpath(gate.sourceRoot) === await realpath(this.input.cwd())) {
+        const resolved = await createWorkspaceSnapshot(gate.sourceRoot, {
+          maxFileBytes: this.input.config.maxFileBytes,
+          maxSnapshotBytes: this.input.config.maxSnapshotBytes,
+          reuseUnchangedFrom: baseline,
+        });
+        checkpointReviewWindow(this.input.state, selectiveCheckpoint(baseline, baseline, baseline, resolved, gate.paths, gate.sourceRoot));
+      }
+      this.conflictGates.delete(key);
+      release();
+      clearedPaths.push(...gate.paths);
     }
-    this.conflictGate = undefined;
-    this.releaseConflictBlock?.();
-    this.releaseConflictBlock = undefined;
     await this.publishAssociations();
-    if (task) {
-      this.addActivity(task, "landed", "Conflict resolution validated; queued landing attempts released.");
-      await this.save(group!);
-      await this.wake(task, "completion", `Task ${task.taskId} conflict resolution was validated and landed.`);
+    for (const [, { gate }] of entries) {
+      const group = this.groups.get(gate.executionId);
+      const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
+      if (task) {
+        this.addActivity(task, "landed", "Conflict resolution validated; queued landing attempts released.");
+        await this.save(group!);
+        await this.wake(task, "completion", `Task ${task.taskId} conflict resolution was validated and landed.`);
+      }
     }
     this.updateIndicator();
-    return { cleared: true, paths: [...gate.paths] };
+    return { cleared: true, paths: clearedPaths };
   }
 
-  criticalPrompt(): string | undefined {
-    const gate = this.conflictGate;
-    if (!gate) return undefined;
+  /**
+   * Builds the mandatory priority instruction for outstanding conflict gates.
+   * Without an explicit gate it aggregates every active gate — one block per
+   * source root naming its execution/task identity and conflicted paths — so
+   * simultaneous conflicts on separate targets keep the recurring warning on
+   * every turn and after restore; only a gate-free controller returns
+   * undefined. Callers that just activated one gate pass it to wake exactly
+   * that task's target, which names its own source root.
+   */
+  criticalPrompt(gate?: BackgroundConflictGate): string | undefined {
+    const gates = gate ? [gate] : [...this.conflictGates.values()].map(({ gate }) => gate);
+    if (gates.length === 0) return undefined;
     return [
       "CRITICAL REVIEW-GATE WORKSPACE CONFLICT:",
-      `Execution ${gate.executionId}, task ${gate.taskId} materialized merge-conflict markers in the main workspace.`,
-      `Conflicted paths: ${gate.paths.join(", ")}.`,
-      "Automatic task landings are blocked. Resolve these files now, verify the workspace, then call SubtasksMarkClean.",
-      "Do not claim the workspace is clean or continue unrelated source mutations while this gate remains active.",
+      ...gates.flatMap((target) => [
+        `Execution ${target.executionId}, task ${target.taskId} materialized merge-conflict markers in the source workspace ${target.sourceRoot}.`,
+        `Conflicted paths: ${target.paths.join(", ")}.`,
+      ]),
+      "Automatic task landings into these targets are blocked. Resolve these files now, verify each workspace, then call SubtasksMarkClean.",
+      "Do not claim any of these workspaces is clean or continue unrelated source mutations while a gate remains active.",
     ].join("\n");
   }
 
@@ -1685,9 +1806,10 @@ export class BackgroundExecutionController {
         this.active = 0;
         this.shuttingDown = false;
         this.pumpRequested = false;
-        this.conflictGate = undefined;
-        this.releaseConflictBlock?.();
-        this.releaseConflictBlock = undefined;
+        // #25 multi-target: release every outstanding root's block; the
+        // persisted snapshot re-blocks each gate on restore.
+        for (const { release } of this.conflictGates.values()) release();
+        this.conflictGates.clear();
         this.updateIndicator();
       });
     } finally {
@@ -2148,7 +2270,7 @@ export class BackgroundExecutionController {
         await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
         const materialized = await materializeLandingConflicts(capture, plan, `subtask ${task.taskId}`);
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
-        this.conflictGate = {
+        const conflictGate: BackgroundConflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
           sourceRoot: group.cwd,
@@ -2157,12 +2279,12 @@ export class BackgroundExecutionController {
           manifestPath: materialized.manifestPath,
           reason: `Task ${task.taskId} requires immediate conflict resolution.`,
         };
-        this.releaseConflictBlock = sourceMutationCoordinator.block(group.cwd, this.conflictGate.reason);
+        this.setConflictGate(conflictGate);
         transitionTaskState(task, "conflicted");
         this.addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
         await this.save(group);
         await this.publishAssociations();
-        await this.wake(task, "failure", this.criticalPrompt()!);
+        await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
       },
     });
     task.result = result;
@@ -2170,7 +2292,10 @@ export class BackgroundExecutionController {
     const undeliveredSteering = this.failUndeliveredSteering(task, "The executor turn ended before the queued steering instruction reached a verified transport.");
     const worker = result.taskResults[0];
     task.bundle = worker?.bundle;
-    task.summary = worker?.summary;
+    // #25 settlement race: markClean may have already landed this task while
+    // executeWave settled; keep its validated-resolution summary instead of
+    // letting the executor's own turn summary overwrite it.
+    if (task.state !== "landed") task.summary = worker?.summary;
     task.error = worker?.error;
     if (isStoppedForExit(task) && result.landing?.status !== "landed") {
       task.summary = "Executor stopped for application shutdown; the durable checkpoint must be verified before resume.";
@@ -2208,10 +2333,18 @@ export class BackgroundExecutionController {
           completionSnapshot,
         ));
     } else if (result.landing?.status === "conflicted") {
-      transitionTaskState(task, "conflicted");
-      task.summary = this.conflictGate
-        ? `Merge conflict requires immediate resolution: ${this.conflictGate.paths.join(", ")}.`
-        : "Landing conflict could not be materialized automatically; inspect full diagnostics before modifying main.";
+      // #25 settlement race: markClean may have validated the materialized
+      // conflict and landed this task while executeWave was still settling;
+      // its gate is then already removed. Never regress that resolved landing
+      // back to conflicted — the durable landed outcome stays authoritative.
+      if (task.state !== "landed") {
+        transitionTaskState(task, "conflicted");
+        // #25 multi-target: this task's own gate, never another target's.
+        const conflictGate = this.gateForTask(group.executionId, task.taskId);
+        task.summary = conflictGate
+          ? `Merge conflict requires immediate resolution: ${conflictGate.paths.join(", ")}.`
+          : "Landing conflict could not be materialized automatically; inspect full diagnostics before modifying main.";
+      }
     } else if (result.phase === "aborted") {
       transitionTaskState(task, task.interruptionMode ? "interrupted" : "paused_recoverable");
       task.summary = task.interruptionMode
@@ -2302,7 +2435,7 @@ export class BackgroundExecutionController {
               incidents: lifecycle.incidents, attempts: lifecycle.attempts,
             }],
           };
-          task.summary = lifecycle.summary;
+          if (task.state !== "landed") task.summary = lifecycle.summary;
           await this.applySettledExecutorIdentity(task);
           await this.save(group);
           await this.publishAssociations();
@@ -2311,11 +2444,11 @@ export class BackgroundExecutionController {
           await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
           const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
           await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
-          this.activateConflictGate(group, task, materialized.paths, materialized.manifestPath, `Continued task ${task.taskId} requires immediate conflict resolution.`);
+          const conflictGate = this.activateConflictGate(group, task, materialized.paths, materialized.manifestPath, `Continued task ${task.taskId} requires immediate conflict resolution.`);
           this.addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
           await this.save(group);
           await this.publishAssociations();
-          await this.wake(task, "failure", this.criticalPrompt()!);
+          await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
         },
         onUpdate: (update) => this.continuationProgress(group, task, update),
       });
@@ -2356,10 +2489,16 @@ export class BackgroundExecutionController {
             completionSnapshot,
           ));
       } else if (result.landing?.status === "conflicted") {
-        transitionTaskState(task, "conflicted");
-        task.summary = this.conflictGate
-          ? `Merge conflict requires immediate resolution: ${this.conflictGate.paths.join(", ")}.`
-          : "Continuation landing conflict could not be materialized automatically; inspect full diagnostics.";
+        // Same settlement race as runFresh: never regress a task that markClean
+        // already landed while the continuation was still settling.
+        if (task.state !== "landed") {
+          transitionTaskState(task, "conflicted");
+          // #25 multi-target: this task's own gate, never another target's.
+          const conflictGate = this.gateForTask(group.executionId, task.taskId);
+          task.summary = conflictGate
+            ? `Merge conflict requires immediate resolution: ${conflictGate.paths.join(", ")}.`
+            : "Continuation landing conflict could not be materialized automatically; inspect full diagnostics.";
+        }
       } else {
         transitionTaskState(task, result.lifecycle?.status === "cancelled" ? "interrupted" : "paused_recoverable");
         task.summary = result.lifecycle?.summary ?? result.inspection.record.state;
@@ -2391,9 +2530,8 @@ export class BackgroundExecutionController {
     paths: string[],
     manifestPath: string,
     reason: string,
-  ): void {
-    this.releaseConflictBlock?.();
-    this.conflictGate = {
+  ): BackgroundConflictGate {
+    const gate: BackgroundConflictGate = {
       executionId: group.executionId,
       taskId: task.taskId,
       sourceRoot: group.cwd,
@@ -2402,8 +2540,39 @@ export class BackgroundExecutionController {
       manifestPath,
       reason,
     };
-    this.releaseConflictBlock = sourceMutationCoordinator.block(group.cwd, reason);
+    this.setConflictGate(gate);
     transitionTaskState(task, "conflicted");
+    return gate;
+  }
+
+  /**
+   * #25 multi-target: install one target's conflict gate and its lease block,
+   * keyed by resolved source root. A same-root successor releases only that
+   * root's prior block — a different target's gate and block stay untouched.
+   */
+  private setConflictGate(gate: BackgroundConflictGate): void {
+    const key = resolve(gate.sourceRoot);
+    this.conflictGates.get(key)?.release();
+    this.conflictGates.set(key, {
+      gate,
+      release: sourceMutationCoordinator.block(gate.sourceRoot, gate.reason),
+    });
+  }
+
+  /** The outstanding gate for one execution group, if any (at most one per group). */
+  private gateForGroup(group: BackgroundExecutionGroup): BackgroundConflictGate | undefined {
+    for (const { gate } of this.conflictGates.values()) {
+      if (gate.executionId === group.executionId) return gate;
+    }
+    return undefined;
+  }
+
+  /** The outstanding gate for one exact task, if any. */
+  private gateForTask(executionId: string, taskId: string): BackgroundConflictGate | undefined {
+    for (const { gate } of this.conflictGates.values()) {
+      if (gate.executionId === executionId && gate.taskId === taskId) return gate;
+    }
+    return undefined;
   }
 
   /**
@@ -2506,6 +2675,13 @@ export class BackgroundExecutionController {
   ): Promise<void> {
     await this.input.faults?.checkpointParent?.(faultContext);
     if (!taskBaseline || !before || reviewWindowId === undefined || this.input.state.reviewWindow?.id !== reviewWindowId || landedPaths.length === 0) return;
+    // #25: the parent review baseline only covers the parent session's own
+    // workspace. Snapshot file keys are relative to each snapshot's root, so
+    // merging a different target repository's files into this baseline would
+    // surface them as phantom parent changes (or corrupt colliding paths).
+    // A landing into an explicitly selected foreign target therefore never
+    // checkpoints the parent; same-directory targets keep current behavior.
+    if (await realpath(sourceRoot) !== await realpath(this.input.cwd())) return;
     const after = await createWorkspaceSnapshot(sourceRoot, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
@@ -2713,11 +2889,8 @@ export class BackgroundExecutionController {
         group: owner,
         task: eventTask,
         content,
-        conflictGate: this.conflictGate
-          && this.conflictGate.executionId === owner.executionId
-          && this.conflictGate.taskId === eventTask.taskId
-          ? this.conflictGate
-          : undefined,
+        // #25 multi-target: only this exact task's own gate.
+        conflictGate: this.gateForTask(owner.executionId, eventTask.taskId),
       })
       : undefined;
     const deliveredContent = diagnostic
@@ -3081,7 +3254,11 @@ export class BackgroundExecutionController {
     try {
       const rendered = renderSubtaskWidget({
         expanded: this.expandedView,
-        conflictPaths: this.conflictGate ? [...this.conflictGate.paths] : undefined,
+        // #25 multi-target: the indicator flattens every active gate's paths;
+        // per-target ownership stays in inspect and the persisted snapshot.
+        conflictPaths: this.conflictGates.size > 0
+          ? [...this.conflictGates.values()].flatMap(({ gate }) => [...gate.paths])
+          : undefined,
         tasks,
         recent: this.recentActivity.map((entry) => ({ title: entry.title, event: entry.event })),
       }, this.input.config);

@@ -67,7 +67,21 @@ export interface BackgroundExecutionGroup {
   executionId: string;
   kind: BackgroundTaskKind;
   root: string;
+  /**
+   * The selected execution target, resolved once at group creation (#25):
+   * the existing checkout/worktree every task captures from and lands into.
+   * Defaults to the parent session's working directory when no explicit
+   * workspace was supplied.
+   */
   cwd: string;
+  /**
+   * The parent session's working directory at group creation (#25). Session-
+   * scoped identity checks (restore, add, watch, recovery association) compare
+   * against this, independently of the selected target. Groups persisted
+   * before explicit workspaces omit it; for them `cwd` was always the parent
+   * session's directory and remains the correct fallback.
+   */
+  sessionCwd?: string;
   createdAt: string;
   updatedAt: string;
   peakConcurrency?: number;

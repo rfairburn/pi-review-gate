@@ -15,6 +15,23 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
 
 - `SubtasksStart` accepts an optional immutable group-level `kind`: `execute` (the
   default) or `research`.
+- `SubtasksStart` also accepts an optional top-level `workspace` string selecting
+  an existing, explicitly authorized development checkout or Git worktree as the
+  group's capture and landing destination. Omitted or blank uses the parent
+  session's working directory, preserving the default behavior; relative paths
+  resolve against that same parent session's working directory. The target is
+  resolved once at start (it must already exist; the extension never creates,
+  clones, checks out, or repurposes directories) and persisted with the group:
+  every capture, reviewed landing, restore, continuation, and recovery path uses
+  that target, `SubtasksAdd` inherits the group's target, and steering never
+  retargets it. The target is a landing destination, not worker scratch: each
+  task still receives its own isolated worktree captured from the target, several
+  workers may independently land reviewed changes into the same target, and
+  separate groups may target different repositories concurrently under the
+  unchanged shared global capacity limits. Parent-session identity checks remain
+  in force independently of the selected target, and a landing into a target
+  other than the parent session's workspace never enters the parent review
+  baseline.
 - Start and add accept 1–16 bounded tasks and return stable execution/task handles
   immediately. Work continues in the background up to the configured global and
   per-model capacities.
@@ -124,10 +141,12 @@ textual diffs, and filename extensions alone never determine classification.
 ## Landing and source preservation
 
 **Independent landing**: As soon as one task is accepted, it acquires the short
-source-mutation lease, replans against current main, and attempts to land. It does not
-wait for, integrate with, or roll back a sibling. A completed landing immediately frees
-capacity, and `SubtasksAdd` can top the execution group back up. The landed changes
-remain uncommitted; source HEAD, index, staging state, and stash are preserved.
+source-mutation lease, replans against current main (the group's selected workspace,
+or the parent session's working directory when no `workspace` was supplied), and
+attempts to land. It does not wait for, integrate with, or roll back a sibling. A
+completed landing immediately frees capacity, and `SubtasksAdd` can top the execution
+group back up. The landed changes remain uncommitted; source HEAD, index, staging
+state, and stash are preserved.
 
 **Source preservation**: Landing never changes source HEAD, index, staging state, or
 stash. Final filesystem mutations are serialized and rollback-protected. Absolute
@@ -141,11 +160,15 @@ and instruction isolation, not an OS sandbox — see
 
 A clean accepted task lands immediately. On a three-way conflict, clean paths are
 applied and ordinary diff3 markers are materialized for the conflicting text paths in
-main. A durable critical gate then blocks every later landing, identifies the owning
-task and paths in `SubtasksInspect`, and injects a priority instruction on every
-matching orchestrator turn. After resolving the files, use `SubtasksMarkClean`; it
-verifies that markers are gone, checkpoints the resolution, clears the gate, and wakes
-queued landings.
+the target workspace. A durable critical gate then blocks every later landing into
+that target, identifies the owning task and paths in `SubtasksInspect`, and injects a
+priority instruction on every matching orchestrator turn. When separate groups target
+different repositories, each target keeps its own independent gate: concurrent
+conflicts retain their own block, inspection entry, and cleanup, and resolving one
+target never releases another target's block. After resolving the files, use
+`SubtasksMarkClean`; it verifies that markers are gone in every outstanding gate
+before clearing any of them, checkpoints each resolution (only for gates on the
+parent session's own workspace), clears the gates, and wakes queued landings.
 
 **Interrupt and force merge**: `SubtasksInterrupt` explicitly chooses failure or merge
 disposition. A normal cancellation uses `interrupt_as_failure`; `interrupt_with_merge`

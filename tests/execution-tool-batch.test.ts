@@ -104,7 +104,9 @@ test("operation-specific execution tools expose exact durable schemas", () => {
     "subtasks-view",
   ]);
   const expectedProperties: Record<string, string[]> = {
-    SubtasksStart: ["kind", "tasks"],
+    // #25: the optional explicit execution workspace target is a Start-only
+    // top-level parameter; every other tool keeps its exact property set.
+    SubtasksStart: ["kind", "workspace", "tasks"],
     SubtasksAdd: ["executionId", "tasks"],
     SubtasksInspect: ["executionId", "taskId", "offset", "lines", "evidence"],
     SubtasksWatch: ["executionId", "after"],

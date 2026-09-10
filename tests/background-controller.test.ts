@@ -12,6 +12,7 @@ import {
   BackgroundExecutionController,
   MAX_UNSETTLED_TASKS_PER_EXECUTION,
   isArchivableTaskState,
+  type BackgroundConflictGate,
   type BackgroundExecutionGroup,
   type BackgroundFaultHooks,
   type BackgroundInspection,
@@ -3899,7 +3900,7 @@ async function setupBlockingFailureHarness(options: { notifications: "quiet" | "
     groups: Map<string, BackgroundExecutionGroup>;
     handleLaunchRejection: (group: BackgroundExecutionGroup, task: BackgroundTaskRecord, error: unknown) => Promise<void>;
     wake: (task: BackgroundTaskRecord, kind: "completion" | "failure" | "state", content: string, eventSnapshot?: unknown) => Promise<void>;
-    conflictGate?: unknown;
+    setConflictGate: (gate: BackgroundConflictGate) => void;
   };
   cleanup: () => Promise<void>;
 }> {
@@ -3975,7 +3976,7 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
       groups: Map<string, BackgroundExecutionGroup>;
       handleLaunchRejection: (group: BackgroundExecutionGroup, task: BackgroundTaskRecord, error: unknown) => Promise<void>;
       wake: (task: BackgroundTaskRecord, kind: "completion" | "failure" | "state", content: string, eventSnapshot?: unknown) => Promise<void>;
-      conflictGate?: unknown;
+      setConflictGate: (gate: BackgroundConflictGate) => void;
     };
     return {
       root,
@@ -3986,11 +3987,15 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
       internals,
       cleanup: async () => {
         await controller?.shutdown().catch(() => undefined);
+        // Release the conflict-gate lease block installed through the real
+        // setConflictGate path so it cannot outlive this fixture's root.
+        await controller?.detach().catch(() => undefined);
         await rm(root, { recursive: true, force: true });
       },
     };
   } catch (error) {
     await controller?.shutdown().catch(() => undefined);
+    await controller?.detach().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
     throw error;
   }
@@ -4040,7 +4045,10 @@ test("wake failure diagnostics are curated, bounded, and exclude secret task and
     const group = internals.groups.get(started.executionId)!;
     const task = group.tasks[0]!;
     injectAdversarialTaskData(scenario.root, group, task);
-    internals.conflictGate = {
+    // Real production gate installation (per-target conflictGates map plus its
+    // source-mutation lease block), so the failure diagnostic reads the gate
+    // back through the same lookup the live landing path uses.
+    internals.setConflictGate({
       executionId: group.executionId,
       taskId: task.taskId,
       sourceRoot: scenario.root,
@@ -4048,7 +4056,7 @@ test("wake failure diagnostics are curated, bounded, and exclude secret task and
       activatedAt: new Date().toISOString(),
       manifestPath: join(scenario.root, "conflict-manifest.json"),
       reason: `Forced task ${task.taskId} materialized conflicts.`,
-    };
+    });
     const jsonEscapeTail = "\u0000".repeat(80_000);
     await internals.handleLaunchRejection(group, task, new Error(`${WAKE_FAILURE_ERROR_SENTINEL} worker exploded: ${jsonEscapeTail}`));
 
@@ -4145,7 +4153,9 @@ test("conflict-gate failure wakes keep SubtasksMarkClean recovery even when the 
       waveRoot: join(scenario.root, "wave-root"),
       expectedRevision: group.revision,
     };
-    internals.conflictGate = {
+    // Real production gate installation so criticalPrompt() and the failure
+    // diagnostic both read the gate from the per-target conflictGates map.
+    internals.setConflictGate({
       executionId: group.executionId,
       taskId: task.taskId,
       sourceRoot: scenario.root,
@@ -4156,7 +4166,7 @@ test("conflict-gate failure wakes keep SubtasksMarkClean recovery even when the 
       activatedAt: new Date().toISOString(),
       manifestPath: join(scenario.root, "conflict-manifest.json"),
       reason: `Forced task ${task.taskId} materialized conflicts.`,
-    };
+    });
     const prompt = controller.criticalPrompt()!;
     assert.ok(prompt.includes("SubtasksMarkClean"), "the raw critical prompt names the recovery action");
     assert.ok(prompt.length > 600, "the critical prompt exceeds the message budget so its tail is truncated");

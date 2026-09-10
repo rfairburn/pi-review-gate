@@ -24,6 +24,7 @@ import {
 } from "./subtask-notifications";
 import { randomUUID } from "node:crypto";
 import { parseDuration } from "../background-shell/jobs";
+import { expandableResult } from "../tool-result-expansion";
 import {
   assignExecutorToolCatalog,
   createExecutorToolCatalog,
@@ -363,7 +364,7 @@ export class ExecutionToolManager {
         execute: async (toolCallId: string, params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: unknown) =>
           this.executeAction(action, name, toolCallId, params, ctx),
         renderCall: (args: unknown, theme: ThemeLike) => renderCall(name, action, args, theme),
-        renderResult: (value: unknown, options: unknown, theme: ThemeLike) => renderResult(value, options, theme),
+        renderResult: expandableResult((value: unknown, options: unknown, theme: ThemeLike) => renderResult(value, options, theme)),
       });
     }
     this.registered = true;

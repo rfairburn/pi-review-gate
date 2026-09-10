@@ -12,6 +12,7 @@
 /// not-attempted operations plus any uncertain effects of the failed one.
 
 import { isAbsolute } from "node:path";
+import { expandableResult } from "../tool-result-expansion";
 import { parseApplyPatchEnvelope, type ApplyPatchFileOp } from "./envelope";
 import { normalizeApplyPatchPath, normalizeApplyPatchPathMarker } from "./paths";
 import { performApplyPatchRequest, type AppliedOperation, type ApplyPatchFailure, type ApplyPatchOperationType } from "./request";
@@ -368,8 +369,8 @@ export function registerApplyPatchTool(pi: unknown, options: ApplyPatchToolOptio
     execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal, _onUpdate?: unknown, ctx?: unknown) =>
       executeApplyPatch(params, signal, ctx, options),
     renderCall: (args: unknown, theme: ApplyPatchRendererTheme) => renderApplyPatchCall(args, theme),
-    renderResult: (value: unknown, renderOptions: unknown, theme: ApplyPatchRendererTheme) =>
-      renderApplyPatchResult(value, renderOptions, theme),
+    renderResult: expandableResult((value: unknown, renderOptions: unknown, theme: ApplyPatchRendererTheme) =>
+      renderApplyPatchResult(value, renderOptions, theme)),
   });
   return true;
 }

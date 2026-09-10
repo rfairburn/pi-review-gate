@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.27]
+
+### Added
+
+- Shared native tool-result expansion foundation: one Pi-native `options.expanded`
+  mechanism in `src/tool-result-expansion.ts` covers every extension-owned tool with
+  potentially expandable returned data. Tools with an existing custom result renderer —
+  the nine `Subtasks*` tools and `ApplyPatch` — are wired through
+  `expandableResult(collapsedRenderer, expandedRenderer?)` with their current renderer
+  preserved as the collapsed view, so family detail issues can contribute expanded
+  callbacks without touching registration; until then their presentation is unchanged in
+  both expansion states. Rendererless tools (the five `Shell*` tools, the web/browser
+  family, and `search_tools`) keep Pi's native fallback rendering, which already expands
+  and re-collapses with a bounded preview. Expansion stays presentation of already
+  returned data only: no competing key handler (the configured binding, Ctrl+O by
+  default, still toggles both directions), no mirrored state, no reruns, network
+  requests, log fetches, artifact reads, or history retrieval, and no change to tool
+  schemas, authority, redaction, model output budgets, or retention limits (Refs #57).
+
 ## [0.1.0-dev.26]
 
 ### Changed

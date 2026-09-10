@@ -155,19 +155,25 @@ export async function quarantineSessionStateSidecar(path: string): Promise<strin
   return target;
 }
 
+/** One durable conflict gate as persisted in the session-state sidecar. */
+export interface PersistedConflictGate {
+  executionId: string;
+  taskId: string;
+  sourceRoot: string;
+  paths: string[];
+  activatedAt: string;
+  manifestPath: string;
+  reason: string;
+}
+
 export interface ExecutionAssociationsSnapshot {
   waveRoots: string[];
   bundles: ReattachmentBundle[];
   groupRoots?: string[];
-  conflictGate?: {
-    executionId: string;
-    taskId: string;
-    sourceRoot: string;
-    paths: string[];
-    activatedAt: string;
-    manifestPath: string;
-    reason: string;
-  };
+  /** Legacy single-gate field; recovered on restore, no longer written. */
+  conflictGate?: PersistedConflictGate;
+  /** #25 multi-target: every outstanding gate (one per source root). */
+  conflictGates?: PersistedConflictGate[];
 }
 
 export interface SessionPersistenceIdentity {
@@ -646,6 +652,7 @@ function cloneExecutionAssociations(value: ExecutionAssociationsSnapshot): Execu
     bundles: value.bundles.map((bundle) => ({ ...bundle })),
     groupRoots: value.groupRoots ? [...new Set(value.groupRoots)] : undefined,
     conflictGate: value.conflictGate ? { ...value.conflictGate, paths: [...value.conflictGate.paths] } : undefined,
+    conflictGates: value.conflictGates?.map((gate) => ({ ...gate, paths: [...gate.paths] })),
   };
 }
 
@@ -683,18 +690,21 @@ function isPersistedSessionState(value: unknown): value is PersistedSessionState
     || (value.state.pendingModelDeliveries !== undefined && !Array.isArray(value.state.pendingModelDeliveries))) return false;
   if (!Array.isArray(value.execution.waveRoots) || !Array.isArray(value.execution.bundles)) return false;
   if (value.execution.groupRoots !== undefined && !Array.isArray(value.execution.groupRoots)) return false;
-  if (value.execution.conflictGate !== undefined) {
-    const gate = value.execution.conflictGate;
-    if (!isRecord(gate)
-      || typeof gate.executionId !== "string"
-      || typeof gate.taskId !== "string"
-      || typeof gate.sourceRoot !== "string"
-      || !Array.isArray(gate.paths)
-      || typeof gate.activatedAt !== "string"
-      || typeof gate.manifestPath !== "string"
-      || typeof gate.reason !== "string") return false;
-  }
+  if (value.execution.conflictGate !== undefined && !isValidConflictGate(value.execution.conflictGate)) return false;
+  if (value.execution.conflictGates !== undefined
+    && (!Array.isArray(value.execution.conflictGates) || value.execution.conflictGates.some((gate) => !isValidConflictGate(gate)))) return false;
   return true;
+}
+
+function isValidConflictGate(value: unknown): value is PersistedConflictGate {
+  return isRecord(value)
+    && typeof value.executionId === "string"
+    && typeof value.taskId === "string"
+    && typeof value.sourceRoot === "string"
+    && Array.isArray(value.paths)
+    && typeof value.activatedAt === "string"
+    && typeof value.manifestPath === "string"
+    && typeof value.reason === "string";
 }
 
 function summarizePendingDeliveries(deliveries: ReadonlyArray<{ status?: unknown; kind?: unknown }>): PendingDeliverySummary {

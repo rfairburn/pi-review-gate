@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.25]
+
+### Added
+
+- `SubtasksStart` accepts an optional top-level `workspace` string selecting an
+  existing, explicitly authorized development checkout or Git worktree as the
+  execution group's capture and landing destination; omitted or blank uses the
+  parent session's working directory, preserving current behavior (relative paths
+  resolve against that same parent session's working directory). The target is
+  resolved once at start (it must already exist; nothing is created, cloned,
+  checked out, or repurposed) and persisted with the group: every capture,
+  reviewed landing, restore, continuation, and recovery path uses that target,
+  `SubtasksAdd` inherits the group's target, and steering never retargets it.
+  Each task still receives its own isolated worktree captured from the target;
+  several workers may independently land into the same target, and separate
+  groups may target different repositories concurrently under the unchanged
+  shared global capacity limits. Parent-session identity checks remain in force
+  independently of the selected target, and a landing into a target other than
+  the parent session's workspace never enters the parent review baseline (Refs
+  #25).
+
 ## [0.1.0-dev.24]
 
 ### Fixed

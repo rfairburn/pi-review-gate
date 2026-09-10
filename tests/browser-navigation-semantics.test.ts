@@ -176,6 +176,15 @@ test("real inspect honors CSP-blocked bases without invoking page getters", asyn
 test("real inspect honors the CSP base policy of a cross-origin owning frame", async () => fixture(async (manager, page, url, requests) => {
   const opened = await manager.open(`${url}/`);
   const frameOrigin = url.replace("navigation.test", "csp-frame.test");
+  // The cross-origin owning frame commits out-of-process, so its
+  // "framenavigated" event can arrive at Node after the in-frame text wait
+  // resolves; it also embeds another "iframe" ("/frame"), whose later child
+  // commit invalidates captures the same way. Registering the waiter before
+  // the frame is appended and awaiting its settled "load" (which by HTML
+  // semantics waits for the nested frame's own load) guarantees every child
+  // commit the manager's guards will observe has settled before any snapshot
+  // capture, without sleeping or retrying.
+  const owningFrameNavigated = page.waitForEvent("framenavigated", frame => frame.url() === `${frameOrigin}/csp`);
   await page.evaluate(src => {
     const frame = document.createElement("iframe");
     frame.src = src;
@@ -183,6 +192,7 @@ test("real inspect honors the CSP base policy of a cross-origin owning frame", a
   }, `${frameOrigin}/csp`);
   const frame = page.frameLocator("iframe").last();
   await frame.getByText("CSP link").waitFor();
+  await (await owningFrameNavigated).waitForLoadState("load");
   const inspected = await manager.inspect(opened.session, opened.tab, await ref(manager, opened.session, opened.tab, "CSP link"));
   assert.equal(inspected.semantic.hrefOrigin, frameOrigin);
   assert.equal(await frame.locator("#effects").innerText(), "No getter effects");

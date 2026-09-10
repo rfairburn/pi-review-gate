@@ -165,24 +165,39 @@ shared mechanism in `src/tool-result-expansion.ts`:
   cancelled states stay stable.
 - Tools that define a custom `renderResult` are wired through the helper with their
   existing renderer as the collapsed view: the nine `Subtasks*` tools
-  (`src/execution/tool.ts`) and `ApplyPatch` (`src/apply-patch/tool.ts`). The `Subtasks*`
-  family contributes its expanded detail callback (#59): expanding any of its results
-  renders one cohesive, provenance-separated detail view of the already-returned data
-  with bounded sections and explicit omission disclosures, and re-collapsing restores the
-  unchanged collapsed card. The remaining family detail issues (#58 background shell, #60
-  interactive browser, #82 WebFetch/BrowserExtract) contribute their expanded callbacks
-  the same way as the only remaining change.
+  (`src/execution/tool.ts`), `ApplyPatch` (`src/apply-patch/tool.ts`), and the eighteen
+  interactive `Browser*` tools from `BrowserOpen` through `BrowserClose`
+  (`src/web/browser-renderer.ts`). The browser family contributes one shared wrapper
+  (`browserRenderResult`) reused by every registration: the collapsed view is a bounded
+  preview of the already-returned model-visible text (the useful native presentation,
+  with an explicit omission marker), and the expanded view renders the family detail
+  callback from `details.response` — semantic snapshots, console/error and network
+  diagnostics with cursor and retention bounds, allowlisted semantic inspection,
+  history/tabs, interaction effect accounting, wait/scroll observations, screenshot
+  capture bounds, and close teardown results. Screenshot image blocks stay native Pi
+  image content in both states; encoded image data is never printed, and expansion
+  reads only already-returned safe content under the existing allowlists and
+  redactions. `WebFetch`, `BrowserExtract` (detail views owned by #82), and `WebSearch`
+  are unchanged.
+  The `Subtasks*` family also contributes its expanded detail callback (#59):
+  expanding a result renders a cohesive, provenance-separated view of already-returned
+  data with bounded sections and omission disclosures; re-collapse restores its
+  unchanged collapsed card. Remaining detail views (#58 and #82) use the same mechanism.
 - Tools that never defined a custom `renderResult` keep Pi's native fallback rendering,
   which already expands and re-collapses the returned text output with a bounded
-  preview: the five `Shell*` tools, the web/browser family, and `search_tools`. Those
-  registrations are deliberately not wrapped, because a custom collapsed renderer would
-  replace the native fallback rather than extend it.
+  preview: the five `Shell*` tools, `WebSearch`, `WebFetch`, `BrowserExtract`, and
+  `search_tools`. Those registrations are deliberately not wrapped, because a custom
+  collapsed renderer would replace the native fallback rather than extend it.
 
 `isExpandableResult()` provides a wiring-audit marker used by
-`tests/tool-result-expansion.test.ts` to prove that every wrapped registration routes
-through the shared helper, that expand and re-collapse render through it, that tools
-awaiting richer details keep their existing presentation in both states, and that the
-rendererless inventory keeps the native fallback untouched.
+`tests/tool-result-expansion.test.ts` and
+`tests/browser-render-registration.test.ts` to prove that every wrapped registration
+routes through the shared helper, that expand and re-collapse render through it, that
+the interactive browser family shares one wrapper instance, and that the rendererless
+inventory keeps the native fallback untouched. The registered browser tests render
+through the real registrations — including image handling, errors, partial and empty
+results, long output bounds, and the redaction boundaries — rather than only the module
+callbacks.
 
 ## Third-party code
 

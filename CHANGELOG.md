@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.29]
+
+### Added
+
+- Native expandable result views for the interactive browser family: all eighteen
+  interactive `Browser*` tools (from `BrowserOpen` through `BrowserClose`) now register
+  one shared `expandableResult` wrapper (`src/web/browser-renderer.ts`) whose collapsed
+  view keeps the previous useful native presentation — a bounded preview of the
+  already-returned model-visible text with an explicit omission marker — and whose
+  expanded view renders family detail from the tool's returned `details.response`:
+  semantic snapshots, console/error and network diagnostics with cursor and retention
+  bounds, allowlisted semantic inspection, history/tabs, interaction effect accounting,
+  wait/scroll observations, screenshot capture bounds, and close teardown results.
+  Screenshots keep native Pi image presentation in both states; encoded image data is
+  never printed. Expansion only re-renders already-returned safe content under the
+  existing allowlists and redactions (no network request, navigation, action, or read
+  on toggle, no competing key handler, and no mirrored expansion state), and
+  `WebSearch`, `WebFetch`, and `BrowserExtract` are unchanged pending their own detail
+  views (Refs #60).
+
 ## [0.1.0-dev.28]
 
 ### Added

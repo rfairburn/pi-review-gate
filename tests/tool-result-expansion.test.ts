@@ -1,11 +1,12 @@
 // Shared native tool-result expansion foundation (#57).
 //
 // These tests exercise the actual shared mechanism in src/tool-result-expansion.ts
-// and the real registered tool renderer wiring (Subtasks* and ApplyPatch wrapped,
-// rendererless tools keeping Pi's native fallback). They do not replicate any
-// rendering algorithm: outputs come from the real renderers. The Subtasks*
-// family contributes its expanded detail callback (#59); ApplyPatch still
-// awaits one and keeps its existing presentation in both expansion states.
+// and the real registered tool renderer wiring (Subtasks*, ApplyPatch, and the
+// interactive Browser* family wrapped, rendererless tools keeping Pi's native
+// fallback). They do not replicate any rendering algorithm: outputs come from
+// the real renderers.
+// Subtasks* and Browser* contribute expanded callbacks; ApplyPatch retains its
+// existing presentation in both expansion states.
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -18,6 +19,7 @@ import { ExecutionToolManager, EXECUTION_TOOL_NAMES } from "../src/execution/too
 import { APPLY_PATCH_TOOL_NAME, registerApplyPatchTool } from "../src/apply-patch/tool";
 import registerBackgroundShell from "../src/background-shell";
 import { WebToolManager } from "../src/web/tools";
+import { INTERACTIVE_BROWSER_TOOL_NAMES } from "../src/web/browser-renderer";
 import { DeferredToolManager } from "../src/deferred-tools";
 import { normalizeConfig } from "../src/config";
 import { createState } from "../src/state";
@@ -240,10 +242,11 @@ test("ApplyPatch's existing renderer is wired as the collapsed view of the mecha
 });
 
 test("rendererless tools retain Pi's native expandable fallback rendering", () => {
-  // Shell*, search_tools, and the web/browser family never defined a custom
-  // renderResult: Pi's native fallback (bounded preview with an expand hint,
-  // full returned text when expanded) is their adequate existing expansion and
-  // must not be replaced by a custom collapsed renderer.
+  // Shell*, search_tools, WebSearch, WebFetch, and BrowserExtract never define
+  // a custom renderResult: Pi's native fallback (bounded preview with an
+  // expand hint, full returned text when expanded) is their adequate existing
+  // expansion and must not be replaced by a custom collapsed renderer. The
+  // WebFetch/BrowserExtract detail views are a separate contribution (#82).
   const shellTools: Record<string, any> = {};
   registerBackgroundShell({
     registerTool: (tool: any) => { shellTools[tool.name] = tool; },
@@ -267,11 +270,7 @@ test("rendererless tools retain Pi's native expandable fallback rendering", () =
   }).register();
   const expectedNative = [
     "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop",
-    "WebSearch", "WebFetch", "BrowserExtract", "BrowserOpen", "BrowserNavigate",
-    "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect",
-    "BrowserScreenshot", "BrowserScroll", "BrowserHover", "BrowserClick",
-    "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserWait",
-    "BrowserHistory", "BrowserTabs", "BrowserClose",
+    "WebSearch", "WebFetch", "BrowserExtract",
     "search_tools",
   ];
   const registered = [...Object.values(shellTools), ...webTools, ...deferredTools] as Array<Record<string, any>>;
@@ -279,17 +278,54 @@ test("rendererless tools retain Pi's native expandable fallback rendering", () =
   for (const name of expectedNative) {
     assert.ok(registeredNames.has(name), `${name} was not registered`);
   }
-  assert.equal(registered.length, expectedNative.length, "unexpected additional rendererless registrations");
+  assert.equal(registered.length, expectedNative.length + INTERACTIVE_BROWSER_TOOL_NAMES.length, "unexpected additional rendererless registrations");
+  const interactiveBrowserNames = new Set<string>(INTERACTIVE_BROWSER_TOOL_NAMES);
   for (const tool of registered) {
+    if (interactiveBrowserNames.has(String(tool.name))) continue;
     assert.equal(tool.renderResult, undefined, `${tool.name} must keep Pi's native fallback expansion`);
     assert.equal(tool.renderCall, undefined, `${tool.name} must keep Pi's native fallback expansion`);
   }
 });
 
+test("every interactive Browser* result renderer is wired through the shared expansion mechanism", () => {
+  const webTools: Array<Record<string, any>> = [];
+  new WebToolManager(
+    { registerTool: (tool) => { webTools.push(tool); } },
+    normalizeConfig({}),
+    undefined,
+    undefined,
+    { shutdown: async () => {}, updateConfig: () => {} } as unknown as any,
+  ).register();
+  const browserTools = webTools.filter((tool) => (INTERACTIVE_BROWSER_TOOL_NAMES as readonly string[]).includes(tool.name));
+  assert.equal(browserTools.length, INTERACTIVE_BROWSER_TOOL_NAMES.length, "the interactive browser family must be registered");
+  for (const tool of browserTools) {
+    assert.equal(isExpandableResult(tool.renderResult), true, `${tool.name} renderResult must be expandableResult-wired`);
+    // No tool in the family registers a competing call renderer or expansion
+    // machinery; the shared wrapper instance is reused by every registration.
+    assert.equal(tool.renderCall, undefined, `${tool.name} must keep the native call fallback`);
+  }
+  // The non-browser web tools stay rendererless (WebFetch/BrowserExtract are
+  // owned by #82).
+  for (const name of ["WebSearch", "WebFetch", "BrowserExtract"]) {
+    const tool = webTools.find((candidate) => candidate.name === name);
+    assert.ok(tool, `${name} was not registered`);
+    assert.equal(tool.renderResult, undefined, `${name} must keep Pi's native fallback expansion`);
+  }
+});
+
 test("the expansion coverage inventory matches the registered tool set", () => {
-  const wrapped = [...executionToolNames, APPLY_PATCH_TOOL_NAME];
+  const wrapped = [...executionToolNames, APPLY_PATCH_TOOL_NAME, ...INTERACTIVE_BROWSER_TOOL_NAMES];
   const tools = [...executionHarness()];
   registerApplyPatchTool({ registerTool: (tool: Record<string, any>) => { tools.push(tool); } });
+  const webTools: Array<Record<string, any>> = [];
+  new WebToolManager(
+    { registerTool: (tool) => { webTools.push(tool); } },
+    normalizeConfig({}),
+    undefined,
+    undefined,
+    { shutdown: async () => {}, updateConfig: () => {} } as unknown as any,
+  ).register();
+  tools.push(...webTools);
   const wrappedRegistered = tools.filter((tool: Record<string, unknown>) => isExpandableResult(tool.renderResult));
   assert.deepEqual(
     wrappedRegistered.map((tool) => tool.name).sort(),

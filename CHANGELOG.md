@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.31]
+
+### Added
+
+- Expanded tool-result detail for the one-shot web acquisition tools: the actual
+  `WebFetch` and `BrowserExtract` registrations are wired through the shared native
+  `expandableResult(collapsedRenderer, expandedRenderer?)` mechanism with the native
+  bounded collapsed preview preserved (output that fits the budget renders unchanged;
+  a large acquisition keeps its first lines behind an explicit omitted-lines notice
+  with an expand hint), and expansion renders the shared web detail view — a
+  compact summary line plus the safe retained response details (document type, source,
+  acquisition, extraction metadata, table/pagination descriptors, index range and
+  continuation, truncation notes, and the untrusted retained content between explicit
+  markers). Pending/partial, error, empty, and cancelled native states keep their
+  existing rendering, raw private fields (raw paths, transport details, private error
+  bodies) never appear, and expansion stays presentation-only: no key handler, no
+  mirrored expansion state, and no re-fetch, cache, browser, or filesystem access when
+  a row expands. Existing interactive browser, shell, and subtask views remain
+  unchanged; WebSearch and discovery keep Pi's native fallback rendering (Refs #82).
+
 ## [0.1.0-dev.30]
 
 ### Added

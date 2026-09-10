@@ -8,11 +8,11 @@
  * expandedRenderer?)` takes a collapsed renderer plus one of these callbacks
  * and returns the native Pi `renderResult` component factory that switches on
  * `options.expanded`, falling back to the collapsed view whenever the detail
- * callback throws or returns a non-component. That module is not part of this
- * snapshot yet, so nothing here imports it — the wiring patch in
- * `src/background-shell/index.ts` is the one pending integration step and is
- * reported to the parent (import from "../tool-result-expansion" plus one
- * `renderResult:` line per Shell tool).
+ * callback throws or returns a non-component. `src/background-shell/index.ts`
+ * wires every Shell* registration through it with this module's preserved
+ * native-fallback collapsed renderer plus the matching per-tool expanded
+ * callback — no other expansion helper, key handler, or state exists in this
+ * family.
  *
  * Expansion is display-only. Every expanded view renders data the tool result
  * already retains — the model-facing `content` text plus the `details`

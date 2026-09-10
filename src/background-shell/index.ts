@@ -4,6 +4,7 @@
  * Modified for pi-review-gate; see NOTICE and LICENSES/Apache-2.0.txt.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
 import { scheduleForceKill } from "./process";
 import { terminalColumns, truncateLineToWidth } from "./width";
 import {
@@ -33,7 +34,16 @@ import {
   type WakeEvent,
   type WakeRules,
 } from "./jobs";
-import { shellResultDetails } from "./result-view";
+import {
+  renderShellListResult,
+  renderShellLogResult,
+  renderShellSendResult,
+  renderShellStartResult,
+  renderShellStopResult,
+  shellCollapsedResultRenderer,
+  shellResultDetails,
+  type ShellResultViewTheme,
+} from "./result-view";
 
 interface BackgroundShellTool {
   name: string;
@@ -47,6 +57,9 @@ interface BackgroundShellTool {
     onUpdate?: unknown,
     ctx?: any,
   ): Promise<Record<string, unknown>>;
+  /** Shared native expansion wiring (#57/#58): the preserved native-fallback
+   *  collapsed view plus this family's per-tool expanded detail renderer. */
+  renderResult?: ToolResultRenderCallback<ShellResultViewTheme>;
 }
 
 export interface BackgroundShellHost {
@@ -681,6 +694,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         }),
       );
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellStartResult),
   });
 
   pi.registerTool({
@@ -714,6 +728,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
       });
       return textResult(rows.join("\n"), false, shellResultDetails("ShellList", { jobs: jobsDetail }));
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellListResult),
   });
 
   pi.registerTool({
@@ -770,6 +785,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         nextOffset,
       });
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellLogResult),
   });
 
   pi.registerTool({
@@ -870,6 +886,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         }),
       );
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellSendResult),
   });
 
   pi.registerTool({
@@ -918,6 +935,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         }),
       );
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellStopResult),
   });
 
   // Track the agent's own lifecycle so nonurgent wakes can be held while the

@@ -385,8 +385,15 @@ pairing, or in flight with no result observed), deep-read chunk size and continu
 or the newer-entry count for cursor reads — plus available continuations (`nextIndex`,
 incremental cursor) and important unavailable notes such as missing tool evidence.
 Retained content, entry previews, and private reasoning never appear in the collapsed
-card; expanded results keep their previous summary-first rendering, and native
-pending, error, and cancelled rendering is unchanged.
+card; expanding the result with Pi's native expansion binding (Ctrl+O by default) renders
+the #59 expanded detail view — the same returned data, never a rerun or retrieval,
+reorganized into bounded, provenance-separated sections (observed evidence, worker
+claims, reviewer verdicts, and the authoritative durable context) with the snapshot's
+"as of" freshness, unavailable ranges, truncated records, and every omitted range
+disclosed — and re-collapsing restores the unchanged collapsed card. Streaming, error,
+and cancelled results stay stable in both states: a still-streaming result renders a
+bounded pending view even when expanded, and evidence selector failures stay task-scoped
+in the expanded view.
 
 Selector failures are scoped: with a valid, authorized `taskId`, a mistyped `entryId`, an
 unknown `callId`, a malformed or expired `cursor`, or an out-of-range `index` returns one

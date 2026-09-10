@@ -390,19 +390,27 @@ test("error results keep native error rendering and skip the evidence summary", 
   assert.ok(ok.split("\n")[0]!.startsWith("[success]"), `expected success styling, got: ${ok.split("\n")[0]}`);
 });
 
-test("expanded evidence results keep the previous summary-first rendering", () => {
-  // #56 is the collapsed-card experience: expansion must retain the original
-  // summary-first output, not the mode-specific collapsed lines.
-  const rendered = renderResult(inspectTool(harness()), inspectResult(evidenceRead("range", {
+test("expanded evidence results render the #59 detail view; re-collapsing restores the collapsed card", () => {
+  const value = inspectResult(evidenceRead("range", {
     entries: [entry(0), entry(1)],
     nextIndex: 2,
     cursor: "ev1.watermark",
-  })), { expanded: true }, identityTheme);
-  assert.match(rendered, /^SubtasksInspect: execute group exec-1, 1 active task\(s\)\./);
-  assert.match(rendered, /task-t running Investigated work/);
-  assert.doesNotMatch(rendered, /entries 0–1 of 43/);
-  assert.doesNotMatch(rendered, /next page at index=2/);
-  assert.doesNotMatch(rendered, /incremental cursor available/);
+  }));
+  // #56 is the collapsed-card experience: without the expansion flag the
+  // registered renderer keeps the mode-specific collapsed lines.
+  const collapsed = renderResult(inspectTool(harness()), value, {}, identityTheme);
+  assert.match(collapsed, /entries 0–1 of 43/);
+  assert.match(collapsed, /next page at index=2/);
+  assert.doesNotMatch(collapsed, /Retained content chunk/);
+  // #59: with the native expansion flag the registered renderer routes to the
+  // contributed expanded detail view, and re-collapsing restores the identical
+  // collapsed card.
+  const expanded = renderResult(inspectTool(harness()), value, { expanded: true }, identityTheme);
+  assert.match(expanded, /SubtasksInspect — expanded result/);
+  assert.match(expanded, /Observed evidence \(executor_observed/);
+  assert.match(expanded, /PREVIEW-TEXT-MARKER/);
+  const recollapsed = renderResult(inspectTool(harness()), value, { expanded: false }, identityTheme);
+  assert.equal(recollapsed, collapsed);
 });
 
 test("partial results keep the native pending rendering", () => {

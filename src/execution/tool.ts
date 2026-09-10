@@ -15,6 +15,7 @@ import {
 import type { ReattachmentBundle } from "./operation-record";
 import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_DEFAULT, EVIDENCE_LIMIT_MAX, EvidenceCursorError, EvidenceNavigationError, type SubtaskEvidenceSelector } from "./subtask-evidence";
 import { redactSensitiveText } from "../redaction";
+import { renderSubtaskResultExpanded } from "./subtask-result-expanded";
 import {
   completionNotificationGuidanceLine,
   lifecycleWakeGuidanceLine,
@@ -364,7 +365,14 @@ export class ExecutionToolManager {
         execute: async (toolCallId: string, params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: unknown) =>
           this.executeAction(action, name, toolCallId, params, ctx),
         renderCall: (args: unknown, theme: ThemeLike) => renderCall(name, action, args, theme),
-        renderResult: expandableResult((value: unknown, options: unknown, theme: ThemeLike) => renderResult(value, options, theme)),
+        // #59: the expanded (Ctrl+O) detail callback is the helper's second
+        // argument; the #56 collapsed renderer above is passed through
+        // unchanged and stays the collapsed view for every expansion state
+        // except an explicit `expanded: true`, which selects the detail view.
+        renderResult: expandableResult(
+          (value: unknown, options: unknown, theme: ThemeLike) => renderResult(value, options, theme),
+          renderSubtaskResultExpanded,
+        ),
       });
     }
     this.registered = true;

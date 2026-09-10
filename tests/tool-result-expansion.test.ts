@@ -3,7 +3,9 @@
 // These tests exercise the actual shared mechanism in src/tool-result-expansion.ts
 // and the real registered tool renderer wiring (Subtasks* and ApplyPatch wrapped,
 // rendererless tools keeping Pi's native fallback). They do not replicate any
-// rendering algorithm: outputs come from the real renderers.
+// rendering algorithm: outputs come from the real renderers. The Subtasks*
+// family contributes its expanded detail callback (#59); ApplyPatch still
+// awaits one and keeps its existing presentation in both expansion states.
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -204,18 +206,22 @@ test("every Subtasks* result renderer is wired through the shared expansion mech
     assert.ok(tool, `${name} was not registered`);
     assert.equal(isExpandableResult(tool.renderResult), true, `${name} renderResult must be expandableResult-wired`);
   }
-  // While no expanded-detail callback is contributed, the registered wrapper
-  // keeps the existing collapsed presentation for both expansion states
-  // (expand then re-collapse renders identically through the real wiring).
+  // #59 contributed the expanded callback for the family: expanding a result
+  // renders the contributed detail view through the real registered wiring,
+  // and re-collapsing the same retained result returns to the identical
+  // existing collapsed presentation.
   const inspect = tools.find((candidate) => candidate.name === "SubtasksInspect")!;
   const value = {
     content: [{ type: "text", text: "inspect: execution exec-1" }],
-    details: { tasks: [{ taskId: "task-a", state: "running", definition: { title: "Work" } }] },
+    details: { action: "inspect", tasks: [{ taskId: "task-a", state: "running", definition: { title: "Work" } }] },
   };
   const collapsed = renderLines(inspect.renderResult(value, {}, theme));
-  assert.deepEqual(renderLines(inspect.renderResult(value, { expanded: true }, theme)), collapsed);
-  assert.deepEqual(renderLines(inspect.renderResult(value, { expanded: false }, theme)), collapsed);
   assert.match(collapsed.join("\n"), /task-a running Work/);
+  const expanded = renderLines(inspect.renderResult(value, { expanded: true }, theme));
+  assert.match(expanded.join("\n"), /SubtasksInspect — expanded result/);
+  assert.match(expanded.join("\n"), /task-a · Work · running/);
+  assert.notDeepEqual(expanded, collapsed);
+  assert.deepEqual(renderLines(inspect.renderResult(value, { expanded: false }, theme)), collapsed);
 });
 
 test("ApplyPatch's existing renderer is wired as the collapsed view of the mechanism", () => {

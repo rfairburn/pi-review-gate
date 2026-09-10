@@ -17,6 +17,7 @@ import {
   INTERACTIVE_BROWSER_TOOL_NAMES,
 } from "../src/web/browser-renderer";
 import { normalizeConfig } from "../src/config";
+import { isExpandableResult } from "../src/tool-result-expansion";
 
 const theme = {
   bold: (value: string) => value,
@@ -133,7 +134,12 @@ test("the real registration installs one shared wrapper on the whole interactive
   for (const name of nonBrowser) {
     const tool = tools.find((candidate) => candidate.name === name);
     assert.ok(tool, `${name} was not registered`);
-    assert.equal(tool.renderResult, undefined, `${name} must not use the browser family wrapper (#82)`);
+    assert.notEqual(tool.renderResult, browserRenderResult, `${name} must not use the interactive browser family wrapper`);
+    if (name === "WebSearch") {
+      assert.equal(tool.renderResult, undefined, "WebSearch retains native fallback");
+    } else {
+      assert.equal(isExpandableResult(tool.renderResult), true, `${name} uses its acquisition detail wrapper (#82)`);
+    }
   }
 });
 

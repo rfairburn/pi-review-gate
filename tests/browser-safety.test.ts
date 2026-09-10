@@ -186,6 +186,18 @@ test("a failed parallel inspection read cannot orphan a pending sibling command"
       const nativeLocator = f.page.locator.bind(f.page);
       let siblingStarted = false;
       let siblingSettled = false;
+      // Inspect's body awaits full session teardown before rethrowing a deadline,
+      // so operate's in-flight classification runs at deadline + real teardown
+      // latency. A wall-clock sibling delay races that: the same fixture reports
+      // "effect status is unknown" when teardown finishes first and the bare
+      // deadline error when the sibling settles first (load-dependent). Anchor
+      // the inspect deadline sibling to the page's real close event instead:
+      // containment closes the page before teardown completes, so the sibling is
+      // in flight at the deadline yet deterministically settled by classification
+      // time. Click keeps the wall-clock delay: its body does not pre-teardown,
+      // so operate classifies with the sibling still pending and drains it.
+      const inspectDeadline = operation === "inspect" && delayMs > 200;
+      const pageClosed = new Promise<void>(resolve => { f.page.once("close", () => resolve()); });
       f.page.locator = ((selector: string) => {
         const locator = nativeLocator(selector);
         if (selector.startsWith("aria-ref=")) {
@@ -195,7 +207,8 @@ test("a failed parallel inspection read cannot orphan a pending sibling command"
             if (name === "href") {
               siblingStarted = true;
               try {
-                await new Promise(resolve => setTimeout(resolve, delayMs));
+                if (inspectDeadline) await pageClosed;
+                else await new Promise(resolve => setTimeout(resolve, delayMs));
                 return await nativeGet(name, options);
               } finally { siblingSettled = true; }
             }
@@ -211,7 +224,14 @@ test("a failed parallel inspection read cannot orphan a pending sibling command"
       assert.equal(siblingSettled, true, `${operation} must drain the sibling before returning`);
       if (delayMs > 200) {
         assert.equal(f.page.isClosed(), true, "deadline contains still-pending engine work");
-        assert.match(failure.message, /effect status is unknown/);
+        if (operation === "click") {
+          assert.match(failure.message, /effect status is unknown/);
+        } else {
+          // Containment settled the anchored sibling before classification, so
+          // the deterministic report is the bare deadline error; containment and
+          // drain are proven by the closed page and settled sibling above.
+          assert.equal(failure.message, "BrowserInspect exceeded its 200ms total deadline.");
+        }
         assert.equal(f.manager.activeSessionCount(), 0);
       } else {
         assert.equal(f.page.isClosed(), false, "settled validation errors need not destroy healthy sessions");

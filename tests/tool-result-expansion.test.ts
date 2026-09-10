@@ -1,8 +1,8 @@
 // Shared native tool-result expansion foundation (#57).
 //
 // These tests exercise the actual shared mechanism in src/tool-result-expansion.ts
-// and the real registered tool renderer wiring (Subtasks*, ApplyPatch, Shell*,
-// and interactive Browser* wrapped; rendererless tools retain native fallback).
+// and real registered tool renderer wiring: Subtasks*, ApplyPatch, Shell*,
+// interactive Browser*, WebFetch and BrowserExtract use the shared helper.
 // Outputs come from production renderers, not copied rendering algorithms.
 // ApplyPatch retains its existing presentation in both expansion states.
 import assert from "node:assert/strict";
@@ -241,8 +241,7 @@ test("ApplyPatch's existing renderer is wired as the collapsed view of the mecha
 });
 
 test("rendererless tools retain Pi's native expandable fallback rendering", () => {
-  // search_tools, WebSearch, WebFetch and BrowserExtract retain native fallback.
-  // WebFetch/BrowserExtract detail views are a separate contribution (#82).
+  // Discovery and WebSearch retain the adequate native expansion fallback.
   const webTools: Array<Record<string, any>> = [];
   new WebToolManager(
     { registerTool: (tool) => { webTools.push(tool); } },
@@ -259,7 +258,7 @@ test("rendererless tools retain Pi's native expandable fallback rendering", () =
     setActiveTools: () => {},
   }).register();
   const expectedNative = [
-    "WebSearch", "WebFetch", "BrowserExtract",
+    "WebSearch",
     "search_tools",
   ];
   const registered = [...webTools, ...deferredTools] as Array<Record<string, any>>;
@@ -267,13 +266,101 @@ test("rendererless tools retain Pi's native expandable fallback rendering", () =
   for (const name of expectedNative) {
     assert.ok(registeredNames.has(name), `${name} was not registered`);
   }
-  assert.equal(registered.length, expectedNative.length + INTERACTIVE_BROWSER_TOOL_NAMES.length, "unexpected additional rendererless registrations");
-  const interactiveBrowserNames = new Set<string>(INTERACTIVE_BROWSER_TOOL_NAMES);
+  assert.equal(registered.length, expectedNative.length + INTERACTIVE_BROWSER_TOOL_NAMES.length + 2, "unexpected additional registrations");
+  const wrappedNames = new Set<string>([...INTERACTIVE_BROWSER_TOOL_NAMES, "WebFetch", "BrowserExtract"]);
   for (const tool of registered) {
-    if (interactiveBrowserNames.has(String(tool.name))) continue;
+    if (wrappedNames.has(String(tool.name))) continue;
     assert.equal(tool.renderResult, undefined, `${tool.name} must keep Pi's native fallback expansion`);
     assert.equal(tool.renderCall, undefined, `${tool.name} must keep Pi's native fallback expansion`);
   }
+  // Acquisition wiring must preserve the interactive browser family's wrapper.
+  for (const name of ["BrowserOpen", "BrowserNavigate", "BrowserClose"]) {
+    const tool = webTools.find((candidate: Record<string, any>) => candidate.name === name);
+    assert.ok(tool, `${name} was not registered`);
+    assert.equal(isExpandableResult(tool.renderResult), true, `${name} must retain shared expansion wiring`);
+  }
+});
+
+// Real registered-tool integration for the two acquisition tools (#82).
+test("registered WebFetch and BrowserExtract expand and re-collapse through the shared mechanism", async () => {
+  const webTools: Array<Record<string, any>> = [];
+  // Long production-shaped retained content: formatPage emits the full content
+  // block in the returned text, so the collapsed view must stay bounded.
+  const longContent = Array.from({ length: 60 }, (_, index) => `retained line ${index + 1} of the acquired document`).join("\n");
+  const retainedResponse = {
+    requestedUrl: "https://example.test/article",
+    finalUrl: "https://example.test/article",
+    fetchedAt: "2026-08-23T00:00:00.000Z",
+    contentType: "text/html; charset=utf-8",
+    downloadedBytes: 123_456,
+    cacheHit: true,
+    title: "Retained article",
+    documentType: "html",
+    dynamicContentSuspected: false,
+    dynamicContentReasons: [],
+    tables: [],
+    pagination: [],
+    startIndex: 0,
+    endIndex: 0,
+    nextIndex: 1,
+    totalBlocks: 2,
+    content: longContent,
+  };
+  const acquisitionCache = {
+    fetch: async () => retainedResponse,
+    cleanupSync() {},
+    updateConfig() {},
+  } as unknown as any;
+  new WebToolManager(
+    { registerTool: (tool) => { webTools.push(tool); } },
+    normalizeConfig({}),
+    acquisitionCache,
+    acquisitionCache,
+    { shutdown: async () => {}, updateConfig: () => {} } as unknown as any,
+  ).register();
+
+  for (const name of ["WebFetch", "BrowserExtract"]) {
+    const tool = webTools.find((candidate) => candidate.name === name);
+    assert.ok(tool, `${name} was not registered`);
+    assert.equal(isExpandableResult(tool.renderResult), true, `${name} renderResult must be expandableResult-wired`);
+
+    // The result value is the real production packet: textResult(formatPage(...)).
+    const value = await tool.execute("call-1", { url: "https://example.test/article" });
+    const returnedText = (value.content as Array<{ text: string }>)[0]!.text;
+    assert.ok(returnedText.includes("retained line 60"), "fixture sanity: the production text includes the full retained content");
+
+    // Native bounded collapsed preview: the returned text is capped with an
+    // explicit omitted-lines notice instead of occupying thousands of lines.
+    const collapsed = renderLines(tool.renderResult(value, { expanded: false, isPartial: false }, theme));
+    assert.ok(collapsed.length <= 25, `${name} collapsed output must stay bounded, got ${collapsed.length} lines`);
+    assert.match(collapsed.join("\n"), /Retained article/);
+    assert.match(collapsed.join("\n"), /more line\(s\) are omitted from this collapsed preview; expand this result for the full retained detail/);
+    assert.doesNotMatch(collapsed.join("\n"), /retained line 60/, "the collapsed preview must omit the unbounded tail");
+
+    // Expansion renders the retained-response detail through the shared
+    // wrapper — same wrapper object, no re-execution or extra retrieval.
+    const expanded = renderLines(tool.renderResult(value, { expanded: true, isPartial: false }, theme));
+    assert.notDeepEqual(expanded, collapsed, `${name} expanded view must render the contributed detail`);
+    assert.match(expanded.join("\n"), /UNTRUSTED RETAINED RESULT DETAILS/);
+    assert.match(expanded.join("\n"), /Retained indexed content/);
+    assert.match(expanded.join("\n"), /# retained heading|retained line 60/, "the expanded detail retains the bounded returned content");
+    assert.match(expanded.join("\n"), /Range: indexes 0-0 of 1/);
+
+    // Re-collapse returns to the same bounded collapsed presentation without
+    // re-running the tool or changing output.
+    assert.deepEqual(renderLines(tool.renderResult(value, { expanded: false, isPartial: false }, theme)), collapsed);
+  }
+
+  // Error results keep the native collapsed diagnostics when expanded.
+  const fetchTool = webTools.find((candidate) => candidate.name === "WebFetch")!;
+  const failedValue = {
+    content: [{ type: "text", text: "WebFetch failed: bounded diagnostic" }],
+    details: { error: "private transport detail" },
+    isError: true,
+  };
+  const failedExpanded = renderLines(fetchTool.renderResult(failedValue, { expanded: true, isPartial: false }, theme)).join("\n");
+  assert.match(failedExpanded, /WebFetch failed: bounded diagnostic/);
+  assert.doesNotMatch(failedExpanded, /private transport detail/);
 });
 
 test("every interactive Browser* result renderer is wired through the shared expansion mechanism", () => {
@@ -293,9 +380,8 @@ test("every interactive Browser* result renderer is wired through the shared exp
     // machinery; the shared wrapper instance is reused by every registration.
     assert.equal(tool.renderCall, undefined, `${tool.name} must keep the native call fallback`);
   }
-  // The non-browser web tools stay rendererless (WebFetch/BrowserExtract are
-  // owned by #82).
-  for (const name of ["WebSearch", "WebFetch", "BrowserExtract"]) {
+  // Search retains native fallback; acquisition tools are covered separately.
+  for (const name of ["WebSearch"]) {
     const tool = webTools.find((candidate) => candidate.name === name);
     assert.ok(tool, `${name} was not registered`);
     assert.equal(tool.renderResult, undefined, `${name} must keep Pi's native fallback expansion`);
@@ -507,7 +593,7 @@ test("Shell* registered renderers never surface unrelated internal details or co
 });
 
 test("the expansion coverage inventory matches the registered tool set", () => {
-  const wrapped = [...executionToolNames, APPLY_PATCH_TOOL_NAME, ...INTERACTIVE_BROWSER_TOOL_NAMES, ...SHELL_TOOL_NAMES];
+  const wrapped = [...executionToolNames, APPLY_PATCH_TOOL_NAME, ...INTERACTIVE_BROWSER_TOOL_NAMES, ...SHELL_TOOL_NAMES, "WebFetch", "BrowserExtract"];
   const tools = [...executionHarness()];
   registerApplyPatchTool({ registerTool: (tool: Record<string, any>) => { tools.push(tool); } });
   const webTools: Array<Record<string, any>> = [];

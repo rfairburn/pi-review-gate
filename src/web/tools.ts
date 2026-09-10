@@ -1,4 +1,5 @@
 import { DEFAULT_CONFIG, type ReviewGateConfig, type WebConfig } from "../config";
+import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
 import { renderWithChromium } from "./browser";
 import {
   BROWSER_FILL_MAX_CHARS,
@@ -35,6 +36,12 @@ import {
   type BrowserWaitRequest,
 } from "./interactive-browser";
 import { WebPageCache, type WebFetchResult } from "./cache";
+import {
+  renderBrowserExtractResult,
+  renderExpandedBrowserExtractResult,
+  renderExpandedWebFetchResult,
+  renderWebFetchResult,
+} from "./result-renderer";
 import { mediaTypeOf } from "./page";
 import { browserRenderResult } from "./browser-renderer";
 import { searchDdgs, type SearchResponse } from "./network";
@@ -56,13 +63,8 @@ interface PiWebTool {
   promptGuidelines?: string[];
   executionMode?: "sequential" | "parallel";
   parameters: Record<string, unknown>;
-  /** Loose native renderResult shape: Pi passes the result, expansion state, theme, and render context. */
-  renderResult?(
-    result: unknown,
-    options: unknown,
-    theme: unknown,
-    context?: unknown,
-  ): unknown;
+  /** Shared native expansion wiring; only tools with custom renderers set it. */
+  renderResult?: ToolResultRenderCallback;
   execute(
     id: string,
     params: Record<string, unknown>,
@@ -174,6 +176,7 @@ export class WebToolManager {
         maxChars: integerSchema(`Maximum content characters, 1000-${this.webConfig.fetch.maxOutputChars}.`),
         refresh: booleanSchema("Force a network refresh instead of using the session cache."),
       }, ["url"]),
+      renderResult: expandableResult(renderWebFetchResult, renderExpandedWebFetchResult),
       execute: async (_id, params, signal) => {
         try {
           const columns = optionalStringArray(params.columns, "columns");
@@ -209,6 +212,7 @@ export class WebToolManager {
       ],
       executionMode: "parallel",
       parameters: pageParameters(this.webConfig.fetch.maxOutputChars),
+      renderResult: expandableResult(renderBrowserExtractResult, renderExpandedBrowserExtractResult),
       execute: async (_id, params, signal) => {
         try {
           const columns = optionalStringArray(params.columns, "columns");

@@ -177,16 +177,14 @@ shared mechanism in `src/tool-result-expansion.ts`:
   capture bounds, and close teardown results. Screenshot image blocks stay native Pi
   image content in both states; encoded image data is never printed, and expansion
   reads only already-returned safe content under the existing allowlists and
-  redactions. `WebFetch`, `BrowserExtract` (detail views owned by #82), and `WebSearch`
-  are unchanged.
+  redactions.
   The `Subtasks*` family also contributes its expanded detail callback (#59):
   expanding a result renders a cohesive, provenance-separated view of already-returned
   data with bounded sections and omission disclosures; re-collapse restores its
-  unchanged collapsed card. Remaining detail views (#82) use the same mechanism.
+  unchanged collapsed card.
 - Tools that never defined a custom `renderResult` keep Pi's native fallback rendering,
   which already expands and re-collapses the returned text output with a bounded
-  preview: `WebSearch`, `WebFetch`, `BrowserExtract`, and
-  `search_tools`. Those registrations are deliberately not wrapped, because a custom
+  preview: `WebSearch` and `search_tools`. Those registrations are deliberately not wrapped, because a custom
   collapsed renderer would replace the native fallback rather than extend it.
 - The five `Shell*` tools (`src/background-shell/index.ts`) previously had no custom
   renderer: they are wired with a collapsed view that preserves Pi's native fallback
@@ -197,6 +195,11 @@ shared mechanism in `src/tool-result-expansion.ts`:
   range and drop counts, stdin delivery state — never re-reading, re-fetching, or
   reconstructing from live job state; restored results without structured details
   degrade to the retained text preview.
+- `WebFetch` and `BrowserExtract` (`src/web/tools.ts`, #82) contribute the shared web
+  expanded detail renderer (`src/web/result-renderer.ts`): collapsed state keeps the
+  native bounded preview of returned text with an omitted-lines notice and expand hint
+  for large acquisitions; expanded state renders safe retained extraction, source,
+  index/range, continuation and truncation details under existing privacy boundaries.
 
 `isExpandableResult()` provides a wiring-audit marker used by
 `tests/tool-result-expansion.test.ts` and
@@ -207,6 +210,8 @@ inventory keeps the native fallback untouched. The registered browser tests rend
 through the real registrations — including image handling, errors, partial and empty
 results, long output bounds, and the redaction boundaries — rather than only the module
 callbacks.
+The shared inventory also exercises registered WebFetch/BrowserExtract tools through
+expansion and re-collapse with their real renderers.
 
 ## Third-party code
 

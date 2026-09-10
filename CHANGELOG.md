@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.32]
+
+### Fixed
+
+- Shell result views now wrap grapheme clusters using terminal-cell widths, including
+  default-presentation emoji such as ⏰ and ✅, and safely substitute a placeholder
+  when a glyph cannot fit the available row. Collapsed previews apply their ten-row
+  budget after wrapping, with an omission count and expansion hint, so long retained
+  log lines no longer produce oversized collapsed cards. The expanded text fallback
+  preserves the retained output; native expansion, redaction, and shell execution
+  behavior remain unchanged (Refs #58).
+
 ## [0.1.0-dev.31]
 
 ### Added

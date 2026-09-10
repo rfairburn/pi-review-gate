@@ -36,6 +36,7 @@ import {
 } from "./interactive-browser";
 import { WebPageCache, type WebFetchResult } from "./cache";
 import { mediaTypeOf } from "./page";
+import { browserRenderResult } from "./browser-renderer";
 import { searchDdgs, type SearchResponse } from "./network";
 import type { BrowserClickButton } from "./browser-interaction-policy";
 
@@ -55,6 +56,13 @@ interface PiWebTool {
   promptGuidelines?: string[];
   executionMode?: "sequential" | "parallel";
   parameters: Record<string, unknown>;
+  /** Loose native renderResult shape: Pi passes the result, expansion state, theme, and render context. */
+  renderResult?(
+    result: unknown,
+    options: unknown,
+    theme: unknown,
+    context?: unknown,
+  ): unknown;
   execute(
     id: string,
     params: Record<string, unknown>,
@@ -229,6 +237,7 @@ export class WebToolManager {
       parameters: objectSchema({
         url: stringSchema("Absolute public http or https URL to open."),
       }, ["url"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           const opened = await this.interactiveBrowser.open(requiredString(params.url, "url"), signal);
@@ -245,6 +254,7 @@ export class WebToolManager {
       promptGuidelines: browserObservationGuidelines(),
       executionMode: "sequential",
       parameters: browserHandleSchema({ url: stringSchema("Absolute public http or https URL to navigate to.") }, ["url"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           const navigated = await this.interactiveBrowser.navigate(
@@ -268,6 +278,7 @@ export class WebToolManager {
       parameters: browserHandleSchema({
         maxChars: integerSchema("Maximum semantic snapshot characters, 1000-24000."),
       }),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           const snapshot = await this.interactiveBrowser.snapshot(
@@ -289,6 +300,7 @@ export class WebToolManager {
       promptGuidelines: browserDiagnosticGuidelines(),
       executionMode: "sequential",
       parameters: browserDiagnosticHandleSchema(),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           rejectUnexpectedFields(params, ["session", "tab", "cursor", "maxEvents"], "BrowserConsole");
@@ -312,6 +324,7 @@ export class WebToolManager {
       promptGuidelines: browserDiagnosticGuidelines(),
       executionMode: "sequential",
       parameters: browserDiagnosticHandleSchema(),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           rejectUnexpectedFields(params, ["session", "tab", "cursor", "maxEvents"], "BrowserNetwork");
@@ -335,6 +348,7 @@ export class WebToolManager {
       promptGuidelines: browserDiagnosticGuidelines(),
       executionMode: "sequential",
       parameters: browserInteractionHandleSchema(),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           rejectUnexpectedFields(params, ["session", "tab", "ref"], "BrowserInspect");
@@ -361,6 +375,7 @@ export class WebToolManager {
         mode: enumSchema(["viewport", "element"], "Capture the current viewport or one element identified by a current BrowserSnapshot ref."),
         ref: stringSchema("Current opaque BrowserSnapshot ref. Required only for element mode and rejected for viewport mode."),
       }, ["mode"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal, _onUpdate, context) => {
         try {
           if (!supportsImageDelivery(context)) {
@@ -402,6 +417,7 @@ export class WebToolManager {
         amount: integerSchema("Viewport fractions to move, 1-3; ref requires 1."),
         ref: stringSchema("Current opaque BrowserSnapshot ref; required for ref and ref_container."),
       }, ["target"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           const scrolled = await this.interactiveBrowser.scroll(
@@ -426,6 +442,7 @@ export class WebToolManager {
       promptGuidelines: browserObservationGuidelines(),
       executionMode: "sequential",
       parameters: browserInteractionHandleSchema(),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           const result = await this.interactiveBrowser.hover(
@@ -449,6 +466,7 @@ export class WebToolManager {
       parameters: browserInteractionHandleSchema({
         button: enumSchema(["left", "right"], "Optional mouse button; defaults to left. Right-click is consequential on every target and does not use controlled link navigation."),
       }),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal, _onUpdate, context) => {
         try {
           const result = await this.interactiveBrowser.click(
@@ -474,6 +492,7 @@ export class WebToolManager {
       parameters: browserInteractionHandleSchema({
         value: { type: "string", maxLength: BROWSER_FILL_MAX_CHARS, description: "Exact replacement value; may be empty to clear the control and is never returned." },
       }, ["value"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal, _onUpdate, context) => {
         try {
           rejectUnexpectedFields(params, ["session", "tab", "ref", "value"], "BrowserFill");
@@ -501,6 +520,7 @@ export class WebToolManager {
         text: { type: "string", minLength: 1, maxLength: BROWSER_TYPE_MAX_CHARS, description: "Exact text to append; never returned." },
         delayMs: { type: "integer", minimum: 0, maximum: BROWSER_TYPE_MAX_DELAY_MS, description: "Optional per-character delay in milliseconds, 0-5; defaults to 0." },
       }, ["text"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal, _onUpdate, context) => {
         try {
           rejectUnexpectedFields(params, ["session", "tab", "ref", "text", "delayMs"], "BrowserType");
@@ -532,6 +552,7 @@ export class WebToolManager {
           description: "Exact option labels or values; each must resolve uniquely and none are returned.",
         },
       }, ["values"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal, _onUpdate, context) => {
         try {
           rejectUnexpectedFields(params, ["session", "tab", "ref", "values"], "BrowserSelect");
@@ -559,6 +580,7 @@ export class WebToolManager {
       parameters: browserInteractionHandleSchema({
         key: { type: "string", minLength: 1, maxLength: BROWSER_PRESS_KEY_MAX_CHARS, description: "One allowlisted named key or short editing chord; no sequences or raw events." },
       }, ["key"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal, _onUpdate, context) => {
         try {
           rejectUnexpectedFields(params, ["session", "tab", "ref", "key"], "BrowserPress");
@@ -593,6 +615,7 @@ export class WebToolManager {
         durationMs: integerSchema("Short duration, 1-2000ms, for duration condition."),
         timeoutMs: integerSchema("One total wait deadline, 1-10000ms; defaults to 10000ms."),
       }, ["condition"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           const waited = await this.interactiveBrowser.wait(
@@ -618,6 +641,7 @@ export class WebToolManager {
         operation: enumSchema(["list", "back", "forward", "reload"], "Bounded history operation."),
         maxEntries: integerSchema("Maximum session-local entries to return, 1-32; defaults to 16."),
       }, ["operation"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           const result = await this.interactiveBrowser.history(
@@ -645,6 +669,7 @@ export class WebToolManager {
         tab: stringSchema("Opaque session-owned tab handle for switch or close."),
         url: stringSchema("Absolute public HTTP(S) URL for open."),
       }, ["session", "operation"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params, signal) => {
         try {
           const result = await this.interactiveBrowser.tabs(
@@ -668,6 +693,7 @@ export class WebToolManager {
       parameters: objectSchema({
         session: stringSchema("Opaque BrowserOpen session handle."),
       }, ["session"]),
+      renderResult: browserRenderResult,
       execute: async (_id, params) => {
         try {
           const closed = await this.interactiveBrowser.close(requiredString(params.session, "session"));

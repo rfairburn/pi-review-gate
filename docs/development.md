@@ -144,6 +144,42 @@ to limit the orchestrator, pass Pi's native allowlist through the wrapper, for e
   and doubled records consume the canonical shape alone without rewriting the stored
   record ([Configuration](configuration.md#pre-cutover-configuration-fields)).
 
+## Shared native tool-result expansion
+
+Tool result expansion is presentation-only and Pi-native: Pi toggles each tool row's
+expanded state through its configured expansion binding (`app.tools.expand`, Ctrl+O by
+default) and passes `{ expanded, isPartial }` to the registered `renderResult`. The
+extension registers no competing key handler, mirrors no expansion state, and expansion
+never reruns a tool, performs a network request, or reads logs, artifacts, or history —
+it renders only data the tool already returned, under the existing authority, redaction,
+and retention boundaries.
+
+All extension-owned tools with potentially expandable returned data are covered by one
+shared mechanism in `src/tool-result-expansion.ts`:
+
+- `expandableResult(collapsedRenderer, expandedRenderer?)` returns a Pi-compatible
+  `renderResult` callback. Collapsed state (or any state before an expanded callback is
+  contributed) renders the existing renderer unchanged; expanded state renders the
+  contributed detail callback. A detail callback that throws or returns a non-component
+  falls back to the collapsed renderer so pending, partial, completed, error, and
+  cancelled states stay stable.
+- Tools that define a custom `renderResult` are wired through the helper with their
+  existing renderer as the collapsed view: the nine `Subtasks*` tools
+  (`src/execution/tool.ts`) and `ApplyPatch` (`src/apply-patch/tool.ts`). Family detail
+  issues (#58 background shell, #59 subtasks, #60 interactive browser, #82
+  WebFetch/BrowserExtract) contribute expanded callbacks as the only remaining change.
+- Tools that never defined a custom `renderResult` keep Pi's native fallback rendering,
+  which already expands and re-collapses the returned text output with a bounded
+  preview: the five `Shell*` tools, the web/browser family, and `search_tools`. Those
+  registrations are deliberately not wrapped, because a custom collapsed renderer would
+  replace the native fallback rather than extend it.
+
+`isExpandableResult()` provides a wiring-audit marker used by
+`tests/tool-result-expansion.test.ts` to prove that every wrapped registration routes
+through the shared helper, that expand and re-collapse render through it, that tools
+awaiting richer details keep their existing presentation in both states, and that the
+rendererless inventory keeps the native fallback untouched.
+
 ## Third-party code
 
 - The background-shell implementation and its tests are modified from Little Coder by

@@ -15,6 +15,28 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.24]
+
+### Fixed
+
+- `SubtasksInspect` evidence now indexes retained Claude/Codex raw streams in the
+  reported readable-stream case instead of reporting no evidence: when a turn's
+  process-result.json does not record its adapter, a readable raw stream is indexed
+  only when the durable operation record's canonical per-turn evidence (the attempt
+  that ran the turn and the assignment that served it) establishes that turn's own
+  adapter — the record's current adapter field describes only its latest assignment
+  and never relabels earlier turns — disclosed with an explicit
+  `adapter_from_operation_record` note; streams whose adapter cannot be established
+  from durable evidence stay explicitly unavailable. Claude entries carry their stream
+  timestamps (display only, without changing source ordering), Codex app-server items
+  pair by their observed item ids where the retained stream carries them (scoped to
+  the source stream; missing or ambiguous ids stay unpaired and legacy id-less streams
+  keep conservative positional pairing), item types and command-result fields are
+  accepted in both observed serializations so real call/result pairing with real
+  statuses works where the stream supports it, parser-level pair references resolve to
+  navigable entry ids, and an empty search over indexed evidence stays distinct from
+  genuinely missing or unsupported sources (Refs #69).
+
 ## [0.1.0-dev.23]
 
 ### Added

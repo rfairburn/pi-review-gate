@@ -352,6 +352,16 @@ export function parsePiStdoutLines(lines: Array<{ text: string }>): ParsedLines 
 // Claude SDK stream-json events (claude-cli adapter raw stream)
 // ---------------------------------------------------------------------------
 
+/**
+ * SDK messages carry an optional ISO `timestamp` ("when this content block
+ * finished on the originating process", omitted by older emitters). It is used
+ * for entry display only — the SDK documents it as display-only and never for
+ * ordering, so source ordering keeps its artifact mtime basis.
+ */
+function claudeAt(parsed: Record<string, unknown>): string | undefined {
+  return isoString(parsed.timestamp);
+}
+
 export function parseClaudeStreamLines(lines: Array<{ text: string }>): ParsedLines {
   const records: RawEvidenceRecord[] = [];
   let skipped = 0;
@@ -364,13 +374,14 @@ export function parseClaudeStreamLines(lines: Array<{ text: string }>): ParsedLi
     switch (parsed.type) {
       case "system":
         if (parsed.subtype === "init") {
-          records.push({ recordKey: `L${ordinal + 1}`, kind: "lifecycle", provenance: "executor_observed", content: `claude session started${str(parsed.model) ? ` (${str(parsed.model)})` : ""}` });
+          records.push({ recordKey: `L${ordinal + 1}`, at: claudeAt(parsed), kind: "lifecycle", provenance: "executor_observed", content: `claude session started${str(parsed.model) ? ` (${str(parsed.model)})` : ""}` });
         } else if (parsed.subtype === "api_retry") {
           const attempt = num(parsed.attempt);
           const maxRetries = num(parsed.max_retries);
           const error = str(parsed.error);
           records.push({
             recordKey: `L${ordinal + 1}`,
+            at: claudeAt(parsed),
             kind: "lifecycle",
             provenance: "executor_observed",
             content: `model retry${attempt !== undefined && maxRetries !== undefined ? ` ${attempt}/${maxRetries}` : ""}${error ? ` · ${singleLine(error)}` : ""}`,
@@ -380,6 +391,7 @@ export function parseClaudeStreamLines(lines: Array<{ text: string }>): ParsedLi
         }
         break;
       case "assistant": {
+        const at = claudeAt(parsed);
         const message = isRecord(parsed.message) ? parsed.message : undefined;
         const content = message && Array.isArray(message.content) ? message.content : [];
         let blockOrdinal = 0;
@@ -389,6 +401,7 @@ export function parseClaudeStreamLines(lines: Array<{ text: string }>): ParsedLi
           if (block.type !== "tool_use") continue;
           records.push({
             recordKey: `L${ordinal + 1}#t${blockOrdinal++}`,
+            at,
             kind: "tool_call",
             callId: str(block.id), // missing ids stay unpaired rather than guessed
             toolName: str(block.name),
@@ -399,6 +412,7 @@ export function parseClaudeStreamLines(lines: Array<{ text: string }>): ParsedLi
         break;
       }
       case "user": {
+        const at = claudeAt(parsed);
         const message = isRecord(parsed.message) ? parsed.message : undefined;
         const content = message && Array.isArray(message.content) ? message.content : [];
         let blockOrdinal = 0;
@@ -407,6 +421,7 @@ export function parseClaudeStreamLines(lines: Array<{ text: string }>): ParsedLi
           if (block.type !== "tool_result") continue;
           records.push({
             recordKey: `L${ordinal + 1}#r${blockOrdinal++}`,
+            at,
             kind: "tool_result",
             callId: str(block.tool_use_id),
             status: block.is_error === true ? "failed" : block.is_error === false ? "succeeded" : "unknown",
@@ -420,9 +435,12 @@ export function parseClaudeStreamLines(lines: Array<{ text: string }>): ParsedLi
         const resultText = str(parsed.result);
         records.push({
           recordKey: `L${ordinal + 1}`,
+          at: claudeAt(parsed),
           kind: "lifecycle",
           provenance: "executor_observed",
-          content: parsed.is_error === true ? `model turn failed${resultText ? ` · ${singleLine(resultText)}` : ""}` : "model turn completed",
+          content: parsed.is_error === true
+            ? `model turn failed${str(parsed.subtype) && str(parsed.subtype) !== "success" ? ` (${str(parsed.subtype)})` : ""}${resultText ? ` · ${singleLine(resultText)}` : ""}`
+            : "model turn completed",
         });
         break;
       }
@@ -446,10 +464,49 @@ interface CodexNotification {
 }
 
 /**
- * Items carry no stable ids in the captured stream, so started/completed pairs
- * are linked positionally only while unambiguous; overlapping in-flight items
- * are left unpaired rather than guessed. `reasoning` items are private model
- * reasoning and never indexed.
+ * Item type spellings observed in retained app-server streams. The executor
+ * adapter itself recognizes camelCase item types (for example `agentMessage`),
+ * while earlier stream captures use snake_case; both spellings of the same
+ * known item are indexed identically. Unknown types stay unknown (skipped).
+ */
+const CODEX_ITEM_TYPE_ALIASES: ReadonlyMap<string, string> = new Map([
+  ["commandExecution", "command_execution"],
+  ["mcpToolCall", "mcp_tool_call"],
+  ["webSearch", "web_search"],
+  ["fileChange", "file_change"],
+  ["agentMessage", "agent_message"],
+]);
+
+/**
+ * Links a completed item to its started counterpart within one bucket of this
+ * source. Modern retained app-server streams carry stable item ids (`item.id`):
+ * such pairs link by observed identity only — scoped to this source, since one
+ * retained stream is one app-server session (one thread), where item ids are
+ * unique. Older id-less captures keep the conservative positional rule: a
+ * missing id pairs only while unambiguous AND only with a pending that itself
+ * carries no observed id — a missing id never matches an observed one, so
+ * unknown, duplicated, or mismatched ids stay honestly unpaired rather than
+ * guessed (#69).
+ */
+function takePairedCodexPending(bucket: RawEvidenceRecord[], itemId: string | undefined): RawEvidenceRecord | undefined {
+  if (itemId !== undefined) {
+    const matches = bucket.filter((pending) => pending.pairingScopedToSource === true && pending.callId === itemId);
+    if (matches.length !== 1) return undefined;
+    bucket.splice(bucket.indexOf(matches[0]!), 1);
+    return matches[0]!;
+  }
+  const only = bucket.length === 1 ? bucket[0] : undefined;
+  if (!only || only.pairingScopedToSource === true) return undefined;
+  bucket.splice(0, 1);
+  return only;
+}
+
+/**
+ * Modern retained app-server streams carry stable item ids (`item.id`); such
+ * started/completed pairs link by that observed identity, scoped to the source
+ * stream. Older id-less captures keep conservative positional pairing only
+ * while unambiguous; overlapping or mismatched items stay unpaired rather than
+ * guessed. `reasoning` items are private model reasoning and never indexed.
  */
 export function parseCodexStreamLines(lines: Array<{ text: string }>): ParsedLines {
   const notifications: CodexNotification[] = [];
@@ -495,7 +552,8 @@ export function parseCodexStreamLines(lines: Array<{ text: string }>): ParsedLin
       skipped += 1;
       continue;
     }
-    const itemType = str(item.type);
+    const rawItemType = str(item.type);
+    const itemType = rawItemType !== undefined ? CODEX_ITEM_TYPE_ALIASES.get(rawItemType) ?? rawItemType : undefined;
     if (itemType === "reasoning") {
       skipped += 1; // private reasoning: never indexed
       continue;
@@ -508,10 +566,16 @@ export function parseCodexStreamLines(lines: Array<{ text: string }>): ParsedLin
     if (itemType === "command_execution") {
       if (started) {
         commandCounter += 1;
+        const itemId = str(item.id);
         const record: RawEvidenceRecord = {
           recordKey: `L${notification.lineOrdinal + 1}`,
           kind: "tool_call",
-          callId: `cmd:${commandCounter}`,
+          // Observed identity wins; the synthetic counter id is only a
+          // positional stand-in for older id-less captures.
+          callId: itemId ?? `cmd:${commandCounter}`,
+          // An observed item id is scoped to this stream: pairing authority
+          // stays with this parser, never the snapshot-wide bare-id pass.
+          ...(itemId !== undefined ? { pairingScopedToSource: true } : {}),
           toolName: "command_execution",
           status: "in_flight",
           provenance: "executor_observed",
@@ -521,29 +585,36 @@ export function parseCodexStreamLines(lines: Array<{ text: string }>): ParsedLin
         inFlight.set("command_execution", [...(inFlight.get("command_execution") ?? []), record]);
       } else {
         const pending = inFlight.get("command_execution") ?? [];
-        const exitCode = num(item.exit_code);
+        // App-server commandExecution items carry camelCase fields (exitCode,
+        // aggregatedOutput); snake_case variants stay supported for older
+        // retained streams.
+        const exitCode = num(item.exit_code) ?? num(item.exitCode);
+        const output = str(item.aggregated_output) ?? str(item.aggregatedOutput);
         const status: SubtaskEvidenceStatus = exitCode !== undefined
           ? (exitCode === 0 ? "succeeded" : "failed")
           : item.status === "failed" ? "failed" : "unknown";
+        const itemId = str(item.id);
         const record: RawEvidenceRecord = {
           recordKey: `L${notification.lineOrdinal + 1}`,
           kind: "tool_result",
+          // The observed id is recorded even when unpaired (honest identity),
+          // and stays scoped to this stream for pairing authority.
+          ...(itemId !== undefined ? { callId: itemId, pairingScopedToSource: true } : {}),
           toolName: "command_execution",
           status,
           provenance: "executor_observed",
           ...capped(
-            [exitCode !== undefined ? `exit code: ${exitCode}` : undefined, str(item.aggregated_output)].filter(Boolean).join("\n"),
+            [exitCode !== undefined ? `exit code: ${exitCode}` : undefined, output].filter(Boolean).join("\n"),
           ),
         };
-        if (pending.length === 1) {
-          const call = pending[0]!;
-          record.callId = call.callId;
-          record.pairedWith = call.recordKey;
-          call.pairedWith = record.recordKey;
-          inFlight.set("command_execution", []);
+        const paired = takePairedCodexPending(pending, itemId);
+        if (paired) {
+          if (itemId === undefined) record.callId = paired.callId; // legacy: inherit the synthetic id
+          record.pairedWith = paired.recordKey;
+          paired.pairedWith = record.recordKey;
         }
-        // Overlapping in-flight commands: the completion is indexed but left
-        // unattributed rather than positionally guessed.
+        // Unknown/duplicated/mismatched ids and overlapping in-flight commands:
+        // the completion is indexed but left unattributed rather than guessed.
         records.push(record);
       }
     } else if (itemType === "mcp_tool_call" || itemType === "web_search") {
@@ -551,9 +622,11 @@ export function parseCodexStreamLines(lines: Array<{ text: string }>): ParsedLin
         ? `${str(item.server) ?? "mcp"}/${str(item.tool) ?? "tool"}`
         : "web_search";
       if (started) {
+        const itemId = str(item.id);
         records.push({
           recordKey: `L${notification.lineOrdinal + 1}`,
           kind: "tool_call",
+          ...(itemId !== undefined ? { callId: itemId, pairingScopedToSource: true } : {}),
           toolName: name,
           provenance: "executor_observed",
           ...capped(itemType === "web_search" ? (str(item.query) ?? "") : compactJson(item)),
@@ -579,19 +652,23 @@ export function parseCodexStreamLines(lines: Array<{ text: string }>): ParsedLin
         } else {
           content = compactJson(item);
         }
+        const itemId = str(item.id);
         const record: RawEvidenceRecord = {
           recordKey: `L${notification.lineOrdinal + 1}`,
           kind: "tool_result",
+          // The observed id is recorded even when unpaired (honest identity),
+          // and stays scoped to this stream for pairing authority.
+          ...(itemId !== undefined ? { callId: itemId, pairingScopedToSource: true } : {}),
           toolName: name,
           status: failed ? "failed" : "succeeded",
           provenance: "executor_observed",
           ...capped(content),
         };
-        if (pending.length === 1) {
-          record.callId = pending[0]!.callId;
-          record.pairedWith = pending[0]!.recordKey;
-          pending[0]!.pairedWith = record.recordKey;
-          inFlight.set(name, []);
+        const paired = takePairedCodexPending(pending, itemId);
+        if (paired) {
+          if (itemId === undefined) record.callId = paired.callId; // legacy: inherit the synthetic id
+          record.pairedWith = paired.recordKey;
+          paired.pairedWith = record.recordKey;
         }
         records.push(record);
       }

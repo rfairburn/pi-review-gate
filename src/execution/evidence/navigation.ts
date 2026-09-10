@@ -114,11 +114,69 @@ function chunkBoundary(content: string, chunkIndex: number): number {
 function readCall(bundle: SubtaskEvidenceBundle, selector: SubtaskEvidenceSelector): SubtaskEvidenceRead {
   const { snapshot } = bundle;
   const callId = selector.callId!;
-  const call = snapshot.entries.find((entry) => entry.kind === "tool_call" && entry.callId === callId);
-  const result = snapshot.entries.find((entry) => entry.kind === "tool_result" && entry.callId === callId);
-  if (!call && !result) {
+  const calls = snapshot.entries.filter((entry) => entry.kind === "tool_call" && entry.callId === callId);
+  const results = snapshot.entries.filter((entry) => entry.kind === "tool_result" && entry.callId === callId);
+  if (calls.length === 0 && results.length === 0) {
     throw new EvidenceNavigationError("call_not_found", `No tool call or result with pairing id "${callId}" exists in this task's current snapshot.`);
   }
+
+  const scoped = [...calls, ...results].some((entry) => entry.pairingScopedToSource === true);
+  if (scoped && (calls.length > 1 || results.length > 1)) {
+    throw new EvidenceNavigationError(
+      "call_ambiguous",
+      `Pairing id "${callId}" identifies multiple source-scoped records; use an entryId to select the intended source.`,
+    );
+  }
+
+  // A validated bidirectional link (set by the source parser or the snapshot
+  // pairing pass) is the only basis for reporting a pair.
+  let linkedCall: SubtaskEvidenceEntryView | undefined;
+  let linkedResult: SubtaskEvidenceEntryView | undefined;
+  for (const candidate of calls) {
+    const sibling = snapshot.entries.find((entry) => entry.entryId === candidate.pairedWith && entry.kind === "tool_result");
+    if (sibling !== undefined && sibling.pairedWith === candidate.entryId) {
+      linkedCall = candidate;
+      linkedResult = sibling;
+      break;
+    }
+  }
+  if (linkedCall && linkedResult) {
+    return {
+      taskId: snapshot.taskId,
+      mode: "call",
+      snapshot: snapshotSummary(snapshot),
+      ...(bundle.context ? { context: bundle.context } : {}),
+      callPair: { call: linkedCall, result: linkedResult, status: "returned" },
+    };
+  }
+
+  // No validated pair. Source-scoped observed identities (e.g. Codex item ids)
+  // must never be guessed: a single unlinked entry is reported honestly, and an
+  // id shared by several unlinked entries is refused explicitly.
+  if (scoped) {
+    if (calls.length + results.length > 1) {
+      throw new EvidenceNavigationError(
+        "call_ambiguous",
+        `Pairing id "${callId}" appears on ${calls.length} tool call(s) and ${results.length} tool result(s) without a validated pair; refusing to guess which records belong together.`,
+      );
+    }
+    const only = calls[0] ?? results[0]!;
+    return {
+      taskId: snapshot.taskId,
+      mode: "call",
+      snapshot: snapshotSummary(snapshot),
+      ...(bundle.context ? { context: bundle.context } : {}),
+      // No validated pair exists in this snapshot: the pair state is
+      // unresolved (never "returned"); the entry's own observed status stays
+      // visible on the entry itself.
+      callPair: only.kind === "tool_call" ? { call: only, status: "in_flight" } : { result: only, status: "in_flight" },
+    };
+  }
+
+  // Global identities (Pi/Claude tool ids): legacy bare-id behavior — the
+  // snapshot pairing pass is their pairing authority.
+  const call = calls[0];
+  const result = results[0];
   return {
     taskId: snapshot.taskId,
     mode: "call",

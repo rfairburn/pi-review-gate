@@ -221,6 +221,30 @@ widen the read boundary (symlinks and path escapes are refused). For a Pi turn w
 session file is missing, that turn falls back explicitly to its own stdout stream and is
 never double-counted from both.
 
+Retained Claude and Codex streams are indexed with adapter-specific honesty. Claude
+tool calls and results pair by the stream's real tool ids (a call without an observed
+result stays `in_flight`), and entries carry the stream's own timestamps for display —
+the SDK marks them display-only, so source ordering keeps its artifact basis. Modern
+retained Codex app-server streams carry stable item ids: started/completed pairs link
+by that observed identity, scoped to the source stream (one retained stream is one
+app-server session) — the pairing decision stays with that stream's parser, so
+snapshot-wide id matching never re-pairs these entries across ambiguous duplicates or
+different sources; older id-less captures keep conservative positional pairing only
+while unambiguous, a missing id never matches an observed one, and overlapping or
+mismatched items stay unpaired rather than guessed. A call read for such an id reports
+only a validated pair: a single unlinked entry stays honestly unpaired, and an id
+shared by several unlinked entries is refused explicitly instead of guessing. Item types and command-result
+fields are accepted in both observed serializations (camelCase and snake_case). When a
+turn's process-result.json does not record its adapter (in-flight or incomplete turns),
+a readable raw stream is indexed only when the durable operation record's canonical
+per-turn evidence — the attempt that ran the turn and the assignment that served it —
+establishes that turn's own adapter; the record's current adapter field describes only
+its latest assignment, so an earlier turn is never relabeled with a later executor, and
+a stream whose adapter cannot be established from durable evidence stays explicitly
+unavailable. Disclosed indexing carries an explicit `adapter_from_operation_record`
+note. An empty search over indexed evidence reports zero matches and remains distinct
+from genuinely missing or unsupported sources.
+
 Each entry carries a stable `entryId`, timestamp, kind, tool name, status, and
 provenance. Provenance separates what an executor process observed
 (`executor_observed`) from what a worker wrote in its final response (`worker_claim`,

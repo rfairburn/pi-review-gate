@@ -58,7 +58,12 @@ export async function buildSubtaskEvidence(input: SubtaskEvidenceBuildInput): Pr
     const artifactRoot = await resolveArtifactRoot(input.waveRoot, input.artifactDir, unavailable);
     if (artifactRoot) {
       try {
-        sources = await discoverAndIndexSources(input.taskId, artifactRoot, unavailable, rawBudget);
+        // Per-turn adapter provenance (#69): turns whose own process-result.json
+        // did not record an adapter are resolved from the durable operation
+        // record's canonical per-turn evidence (the attempt that ran the turn
+        // and the assignment that served it) — never from the record's current
+        // adapter field alone, which later reassignments overwrite.
+        sources = await discoverAndIndexSources(input.taskId, artifactRoot, unavailable, rawBudget, input.operation);
       } catch (error) {
         if (error instanceof EvidenceRefusalError) throw error; // fail closed on confinement violations
         unavailable.push({ reason: "unreadable", detail: `Evidence discovery failed: ${evidenceErrorMessage(error)}` });

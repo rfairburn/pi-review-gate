@@ -21,7 +21,7 @@ import { REVIEW_CYCLE_MARKER_NAME, REVIEW_CYCLE_RECORD_NAME, indexReviewCycleSou
 import { readBoundedTextFile } from "../../bounded-file";
 import { utf8Prefix } from "../../jsonl";
 import { redactSensitiveText } from "../../redaction";
-import { compactJson, parseBinaryStreamLines, parseClaudeStreamLines, parseCodexStreamLines, parsePiSessionLines, parsePiStdoutLines, piSessionRecordOrdinals, streamRecordOrdinals } from "./parsers";
+import { compactJson, isRecord, parseBinaryStreamLines, parseClaudeStreamLines, parseCodexStreamLines, parsePiSessionLines, parsePiStdoutLines, piSessionRecordOrdinals, streamRecordOrdinals } from "./parsers";
 import {
   EVIDENCE_ENTRY_CONTENT_BYTES,
   EVIDENCE_MAX_ENTRIES,
@@ -98,7 +98,90 @@ async function indexSessionSource(artifactRoot: string, fileName: string, mtimeM
   });
 }
 
-async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: number, sessionFileNames: ReadonlySet<string>, budget: RawRetentionBudget): Promise<IndexedSource> {
+/**
+ * Establishes one turn's adapter kind from canonical durable evidence only.
+ *
+ * The record's top-level `adapter` field is CURRENT assignment identity: it is
+ * rewritten whenever a new executor assignment starts, so it describes only the
+ * latest assignment — never an earlier one. This resolver therefore walks the
+ * per-turn chain instead: the attempts list names the generation that ran each
+ * turn number, and the assignments list records which selection served each
+ * window. An adapter kind is returned only when that chain identifies this
+ * turn's own executor:
+ * - a pi selection deterministically resolves to `pi-model`;
+ * - an external agent id is a mutable catalog handle and cannot be resolved
+ *   without reading the current (mutable) agent catalog, so it establishes a
+ *   kind only while its assignment is still the record's latest one — then the
+ *   producer-written top-level `adapter` (set when that assignment started,
+ *   before any of its turns ran) still describes it.
+ * Everything else stays explicitly unavailable rather than guessed (#69).
+ */
+function resolveTurnAdapter(operation: OperationRecord | undefined, turnName: string): { adapter?: string; detail: string } {
+  const turnNumber = Number(turnName);
+  if (!operation || !Number.isInteger(turnNumber) || turnNumber <= 0) return { detail: "" };
+
+  // Canonical per-turn record: the attempt that ran this exact turn number.
+  const attempt = (operation.attempts ?? []).find(
+    (candidate) => candidate.turn === turnNumber && typeof candidate.startedAt === "string",
+  );
+  if (!attempt) {
+    return { detail: "the durable operation record has no attempt for this turn, so its adapter cannot be established from canonical evidence." };
+  }
+
+  // The assignment whose recorded window covers the attempt's start.
+  const assignments = (Array.isArray(operation.assignments) ? operation.assignments : []).filter(
+    (candidate) => typeof candidate.startedAt === "string",
+  );
+  let candidates = assignments.filter(
+    (candidate) =>
+      candidate.startedAt <= attempt.startedAt!
+      && (candidate.endedAt === undefined || candidate.endedAt >= attempt.startedAt!),
+  );
+  if (candidates.length > 1) {
+    // Same-millisecond boundaries: narrow by the attempt's recorded generation
+    // (compaction recovery can advance generations inside one assignment, so
+    // this is a tie-breaker, not a primary key).
+    const byGeneration = candidates.filter((candidate) => candidate.generation === attempt.generation);
+    if (byGeneration.length === 1) candidates = byGeneration;
+  }
+  if (candidates.length !== 1) {
+    return { detail: candidates.length === 0
+      ? "the durable operation record has no assignment covering this turn's attempt, so its adapter cannot be established."
+      : "multiple executor assignments overlap this turn's recorded start, so its adapter cannot be established unambiguously." };
+  }
+  const assignment = candidates[0]!;
+
+  const selection = isRecord(assignment.selection) ? assignment.selection : undefined;
+  if (selection?.source === "pi") {
+    // Established, but not indexable by this raw-stream fallback: pi turns are
+    // indexed from their session file (or its explicit stdout fallback), never
+    // parsed as an external agent stream.
+    return { adapter: "pi-model", detail: "the durable operation record's assignment for this turn was a pi executor, and this fallback indexes only claude-cli/codex-cli raw streams" };
+  }
+  // External selections record only a mutable catalog id. The top-level
+  // producer-written adapter still describes the latest assignment (it is set
+  // when that assignment starts, before any of its turns run), so it may be
+  // used only for turns of that latest assignment.
+  const currentAdapter = typeof operation.adapter === "string" ? operation.adapter : undefined;
+  if (selection?.source === "external"
+    && assignments[assignments.length - 1] === assignment
+    && (currentAdapter === "claude-cli" || currentAdapter === "codex-cli")) {
+    return { adapter: currentAdapter, detail: `the durable operation record's latest assignment ran this turn and recorded adapter "${currentAdapter}"` };
+  }
+  return { detail: selection?.source === "external"
+    ? "this turn's recorded assignment used an external agent id (a mutable catalog handle) that cannot be resolved to an adapter kind from durable evidence alone."
+    : "this turn's recorded assignment has no readable executor selection." };
+}
+
+/**
+ * Indexes one executor turn. A turn whose own process-result.json did not
+ * record an adapter (in-flight or incomplete turn) is resolved from the
+ * durable operation record's canonical per-turn evidence via
+ * resolveTurnAdapter — never from the record's current `adapter` field alone,
+ * which later reassignments and failovers overwrite. It is producer-recorded
+ * identity only; without it the stream stays explicitly unindexed (#69).
+ */
+async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: number, sessionFileNames: ReadonlySet<string>, budget: RawRetentionBudget, operation?: OperationRecord): Promise<IndexedSource> {
   const sourceId = `turn:${turnName}`;
   const dirRel = join("executor", turnName);
   const unavailable: SubtaskEvidenceUnavailable[] = [];
@@ -118,6 +201,7 @@ async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: 
     else throw error;
   }
   const adapter = str(processResult?.adapter);
+  let effectiveAdapter = adapter;
 
   const streamPath = join(artifactRoot, dirRel, "raw-stream.txt");
   let hasStream = false;
@@ -161,7 +245,19 @@ async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: 
       else if (adapter) {
         unavailable.push({ source: sourceId, reason: "unsupported_adapter", detail: `No evidence parser exists for adapter "${adapter}"; the raw stream is not indexed.` });
       } else {
-        unavailable.push({ source: sourceId, reason: "unsupported_adapter", detail: "Cannot determine the turn adapter (process-result.json missing); the raw stream is not indexed." });
+        // process-result.json did not record this turn's adapter (in-flight or
+        // incomplete turn). Resolve it from the durable operation record's
+        // canonical per-turn evidence (attempt -> assignment), never from the
+        // record's current adapter field alone — later reassignments overwrite
+        // that field, and an earlier turn must keep its own identity (#69).
+        const turnAdapter = resolveTurnAdapter(operation, turnName);
+        if ((turnAdapter.adapter === "claude-cli" || turnAdapter.adapter === "codex-cli") && (await resolveReadableArtifact(artifactRoot, streamPath))) {
+          effectiveAdapter = turnAdapter.adapter;
+          unavailable.push({ source: sourceId, reason: "adapter_from_operation_record", detail: `process-result.json did not record the turn adapter; indexed with "${turnAdapter.adapter}" — ${turnAdapter.detail}.` });
+          await indexStream(turnAdapter.adapter === "claude-cli" ? parseClaudeStreamLines : parseCodexStreamLines);
+        } else {
+          unavailable.push({ source: sourceId, reason: "unsupported_adapter", detail: `Cannot determine the turn adapter (process-result.json missing); the raw stream is not indexed.${turnAdapter.detail ? ` ${turnAdapter.detail}` : ""}` });
+        }
       }
     } catch (error) {
       if (error instanceof EvidenceRefusalError) unavailable.push({ source: sourceId, reason: error.reason, detail: evidenceErrorMessage(error) });
@@ -210,10 +306,17 @@ async function indexTurnSource(artifactRoot: string, turnName: string, mtimeMs: 
 
   return finalizeSource({
     sourceId,
-    adapter: adapter ?? "unknown",
+    adapter: effectiveAdapter ?? "unknown",
     stream: "stdout",
     file: `${dirRel}/`,
-    orderKey: firstAtOf(records) ?? new Date(mtimeMs).toISOString(),
+    // Claude stream timestamps are display-only (SDK docs): they must not
+    // change this source's pre-change ordering basis (artifact mtime), or
+    // cross-source ordering and the global retention window would follow a
+    // display clock. Every other adapter keeps the existing record-time-then-
+    // mtime policy untouched (their records carry no `at`).
+    orderKey: effectiveAdapter === "claude-cli"
+      ? new Date(mtimeMs).toISOString()
+      : firstAtOf(records) ?? new Date(mtimeMs).toISOString(),
     records,
     digests,
     unavailable,
@@ -332,7 +435,7 @@ async function enumerateNames(dir: string, dirLabel: string, pattern: (name: str
 }
 
 /** Discovers and indexes every authorized source under the artifact root. */
-export async function discoverAndIndexSources(taskId: string, artifactRoot: string, unavailable: SubtaskEvidenceUnavailable[], budget: RawRetentionBudget): Promise<IndexedSource[]> {
+export async function discoverAndIndexSources(taskId: string, artifactRoot: string, unavailable: SubtaskEvidenceUnavailable[], budget: RawRetentionBudget, operation?: OperationRecord): Promise<IndexedSource[]> {
   const sources: IndexedSource[] = [];
 
   const sessionsDir = await resolveReadableDirectory(artifactRoot, join(artifactRoot, "executor-sessions"));
@@ -368,7 +471,7 @@ export async function discoverAndIndexSources(taskId: string, artifactRoot: stri
     }
     try {
       const mtime = (await stat(join(executorDir!, name))).mtimeMs;
-      sources.push(await indexTurnSource(artifactRoot, name, mtime, sessionSet, budget));
+      sources.push(await indexTurnSource(artifactRoot, name, mtime, sessionSet, budget, operation));
     } catch (error) {
       if (error instanceof EvidenceRefusalError) unavailable.push({ source: `turn:${name}`, reason: error.reason, detail: evidenceErrorMessage(error) });
       else throw error;
@@ -425,8 +528,13 @@ function byteLength(value: string): number {
 /**
  * Assembles the ordered snapshot from indexed sources. Pairing is by real call
  * ids across all sources (synthetic pos:/cmd: ids were already paired within
- * their own source). Every view/snippet/deep read is served from redacted
- * retained content under per-entry and global byte budgets.
+ * their own source). Source-scoped observed item identities (e.g. Codex
+ * app-server item ids, `pairingScopedToSource`) are excluded from that
+ * snapshot-wide pass: their pairing was already decided — or explicitly
+ * refused — by their own parser, and re-pairing them here could manufacture
+ * links across ambiguous duplicates or different sources. Every
+ * view/snippet/deep read is served from redacted retained content under
+ * per-entry and global byte budgets.
  */
 export function assembleSnapshot(taskId: string, sources: IndexedSource[], unavailable: SubtaskEvidenceUnavailable[], rawBudget?: RawRetentionBudget): SubtaskEvidenceSnapshot {
   const ordered = [...sources].sort((a, b) => (a.orderKey === b.orderKey ? a.sourceId.localeCompare(b.sourceId) : a.orderKey < b.orderKey ? -1 : 1));
@@ -460,11 +568,18 @@ export function assembleSnapshot(taskId: string, sources: IndexedSource[], unava
   }
 
   // Parser-level pairing (synthetic pos:/cmd: ids) was resolved within its own
-  // source; reflect it in the call's status here.
+  // source; reflect it in the call's status here and resolve the sibling
+  // reference from a bare recordKey to a full navigable entryId.
+  const entryIdByRecord = new Map<string, string>();
+  for (const meta of metas) entryIdByRecord.set(`${meta.source.sourceId}|${meta.record.recordKey}`, meta.entryId);
   for (const meta of metas) {
     if (!meta.record.pairedWith) continue;
     if (meta.kind === "tool_call" && (meta.record.status === undefined || meta.record.status === "in_flight")) {
       meta.record.status = "returned";
+    }
+    if (!meta.record.pairedWith.includes("/")) {
+      const resolved = entryIdByRecord.get(`${meta.source.sourceId}|${meta.record.pairedWith}`);
+      if (resolved) meta.record.pairedWith = resolved;
     }
   }
 
@@ -472,7 +587,9 @@ export function assembleSnapshot(taskId: string, sources: IndexedSource[], unava
   const callsById = new Map<string, Meta[]>();
   const resultsById = new Map<string, Meta[]>();
   for (const meta of metas) {
-    if (!meta.callId || isSyntheticCallId(meta.callId)) continue;
+    // Source-scoped observed identities keep their parser's pairing decision
+    // (validated link or explicit refusal); this pass must not override it.
+    if (!meta.callId || isSyntheticCallId(meta.callId) || meta.record.pairingScopedToSource === true) continue;
     const map = meta.kind === "tool_call" ? callsById : resultsById;
     const list = map.get(meta.callId) ?? [];
     list.push(meta);
@@ -527,6 +644,7 @@ export function assembleSnapshot(taskId: string, sources: IndexedSource[], unava
       contentBytes: byteLength(retained),
       ...(truncatedContent ? { truncatedContent: true } : {}),
       pairedWith: meta.record.pairedWith,
+      ...(meta.record.pairingScopedToSource === true ? { pairingScopedToSource: true } : {}),
       source: {
         sourceId: meta.source.sourceId,
         adapter: meta.source.adapter,
@@ -549,13 +667,16 @@ export function assembleSnapshot(taskId: string, sources: IndexedSource[], unava
 
   const hasToolEvidence = entries.some((entry) => entry.kind === "tool_call" || entry.kind === "tool_result");
   const binaryOnly = ordered.length > 0 && ordered.every((source) => source.adapter === "run-as-binary");
+  // Name the adapters actually inspected so an empty tool-evidence result is
+  // attributable to a specific retained stream, not to a silent gap.
+  const inspectedAdapters = [...new Set(ordered.map((source) => source.adapter).filter((adapter) => adapter !== "unknown"))];
   const capability: SubtaskEvidenceCapability = hasToolEvidence
     ? { toolEvidence: "available" }
     : binaryOnly
       ? { toolEvidence: "unavailable", reason: "The run-as-binary protocol carries no tool events; only process and claim evidence exists." }
       : ordered.length === 0
         ? { toolEvidence: "unavailable", reason: "No evidence sources were found for this task." }
-        : { toolEvidence: "unavailable", reason: "No tool call/result records were found in the available sources." };
+        : { toolEvidence: "unavailable", reason: `No tool call/result records were found in the available sources${inspectedAdapters.length > 0 ? ` (${inspectedAdapters.join(", ")})` : ""}.` };
 
   const recordsOmitted = ordered.reduce((sum, source) => sum + (source.stats.recordsOmitted ?? 0), 0);
   const diagnostics: SubtaskEvidenceDiagnostics = {

@@ -66,6 +66,7 @@ export type SubtaskEvidenceUnavailableReason =
   | "review_unavailable"
   | "unpublished"
   | "unreadable"
+  | "adapter_from_operation_record"
   | "unsupported_adapter"
   | "missing_stream"
   | "oversized_records"
@@ -127,6 +128,13 @@ export interface SubtaskEvidenceEntryView {
   /** True when the source record exceeded a retention cap. */
   truncatedContent?: boolean;
   pairedWith?: string;
+  /**
+   * True when `callId` is a producer-observed item identity whose pairing was
+   * already decided (or refused) by this entry's own source parser, scoped to
+   * that source. The snapshot-wide bare-id pairing pass must not re-pair such
+   * entries, and call navigation reports only validated links for them.
+   */
+  pairingScopedToSource?: boolean;
   source: SubtaskEvidenceSourceRef;
 }
 
@@ -284,6 +292,14 @@ export interface RawEvidenceRecord {
   provenance: SubtaskEvidenceProvenance;
   content: string;
   pairedWith?: string;
+  /**
+   * True when `callId` is a producer-observed item identity (e.g. a Codex
+   * app-server item id) whose pairing was decided by this record's own source
+   * parser, scoped to that source stream. The snapshot-wide bare-id pairing
+   * pass must not manufacture links for such records; their returned status
+   * derives only from the parser-validated `pairedWith` link.
+   */
+  pairingScopedToSource?: boolean;
 }
 
 /** Shared pre-redaction raw retention budget threaded through discovery. */

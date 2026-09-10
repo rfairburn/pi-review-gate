@@ -372,6 +372,22 @@ regular file inside that verified directory, fits the bounded context size, belo
 this task, and records an artifact directory that verifies as this task's; every other
 case is reported as an explicit unavailable note rather than read unbounded or trusted.
 
+The collapsed tool card summarizes each read at a glance. The call line names the task
+and the effective mode using safe selectors only — `status` for a plain inspection, the
+activity offset for legacy paging, `find "<query>"` with an optional `filter`, the
+requested `entries start..end` window, the entry handle plus chunk for deep reads, the
+call handle for pair resolution, or `cursor continuation` (opaque cursor tokens are never
+displayed) — and query/selector text is redacted before display. The result line reports
+the operation-specific outcome instead of scheduler boilerplate: the returned entry range
+with its provenance mix and retention-truncated entries, match totals with list
+truncation, call/result resolution (`returned`, an observed result with unresolved
+pairing, or in flight with no result observed), deep-read chunk size and continuation,
+or the newer-entry count for cursor reads — plus available continuations (`nextIndex`,
+incremental cursor) and important unavailable notes such as missing tool evidence.
+Retained content, entry previews, and private reasoning never appear in the collapsed
+card; expanded results keep their previous summary-first rendering, and native
+pending, error, and cancelled rendering is unchanged.
+
 Selector failures are scoped: with a valid, authorized `taskId`, a mistyped `entryId`, an
 unknown `callId`, a malformed or expired `cursor`, or an out-of-range `index` returns one
 concise task-scoped diagnostic with a bounded navigation hint (list entries with

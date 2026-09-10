@@ -4,6 +4,7 @@
  * Modified for pi-review-gate; see NOTICE and LICENSES/Apache-2.0.txt.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
 import { scheduleForceKill } from "./process";
 import { terminalColumns, truncateLineToWidth } from "./width";
 import {
@@ -14,9 +15,11 @@ import {
   MAX_LABEL_CHARS,
   MAX_LOG_LINE_CHARS,
   MAX_LOG_RESULT_CHARS,
+  MAX_COMMAND_DISPLAY_CHARS,
   PendingLineBuffer,
   WAKE_CONTEXT_LINES,
   compileMatchers,
+  describeWakeRules,
   evaluateExit,
   evaluateMatch,
   evaluateSilence,
@@ -31,6 +34,16 @@ import {
   type WakeEvent,
   type WakeRules,
 } from "./jobs";
+import {
+  renderShellListResult,
+  renderShellLogResult,
+  renderShellSendResult,
+  renderShellStartResult,
+  renderShellStopResult,
+  shellCollapsedResultRenderer,
+  shellResultDetails,
+  type ShellResultViewTheme,
+} from "./result-view";
 
 interface BackgroundShellTool {
   name: string;
@@ -44,6 +57,9 @@ interface BackgroundShellTool {
     onUpdate?: unknown,
     ctx?: any,
   ): Promise<Record<string, unknown>>;
+  /** Shared native expansion wiring (#57/#58): the preserved native-fallback
+   *  collapsed view plus this family's per-tool expanded detail renderer. */
+  renderResult?: ToolResultRenderCallback<ShellResultViewTheme>;
 }
 
 export interface BackgroundShellHost {
@@ -659,28 +675,26 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
       installExitHooks();
       setIndicator(_ctx);
 
-      const watching = [
-        rules.exit ? "exit" : null,
-        rules.match.length > 0 ? `match ${rules.match.map((m) => JSON.stringify(m)).join(", ")}` : null,
-        rules.silenceMs ? `silence ${formatElapsed(rules.silenceMs)}` : null,
-        rules.everyNMatches ? `every ${rules.everyNMatches} matches` : null,
-      ].filter(Boolean);
+      const watchingSummary = describeWakeRules(rules);
 
       return textResult(
         `Started "${label}" as ${id} (pid ${proc.pid ?? "?"}); currently running.\n` +
-          `Future wake triggers (not current events): ${watching.join(", ") || "nothing"}.\n` +
+          `Future wake triggers (not current events): ${watchingSummary || "nothing"}.\n` +
           `You will be notified automatically; do not poll.`,
         false,
-        {
-          kind: "pi-review-bg-shell",
+        shellResultDetails("ShellStart", {
           event: "started",
           id,
           label,
+          command: truncateText(command, MAX_COMMAND_DISPLAY_CHARS),
           pid: proc.pid,
           processGroupId: process.platform === "win32" ? undefined : proc.pid,
-        },
+          watching: watchingSummary,
+          startedAt: Date.now(),
+        }),
       );
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellStartResult),
   });
 
   pi.registerTool({
@@ -689,15 +703,32 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
     description: "List background jobs with their status, runtime, and what they are watched for.",
     parameters: objectSchema({}),
     async execute() {
-      if (jobs.size === 0) return textResult("No background jobs.");
+      if (jobs.size === 0) {
+        return textResult("No background jobs.", false, shellResultDetails("ShellList", { jobs: [] }));
+      }
       const now = Date.now();
-      const rows = [...jobs.values()].map((j) => {
-        const el = formatElapsed((j.endedAt ?? now) - j.startedAt);
-        const quiet = j.lastOutputAt ? formatElapsed(now - j.lastOutputAt) : "never";
-        return `${j.id}  ${statusOf(j).padEnd(10)}  ${el.padStart(7)}  last output ${quiet} ago  ${j.buffer.total} lines  "${j.label}"`;
+      const jobsDetail = [...jobs.values()].map((j) => ({
+        id: j.id,
+        label: j.label,
+        status: statusOf(j),
+        ...(j.exited ? { exitCode: j.exitCode } : {}),
+        pid: j.proc.pid,
+        processGroupId: process.platform === "win32" ? undefined : j.proc.pid,
+        command: truncateText(j.command, MAX_COMMAND_DISPLAY_CHARS),
+        watching: describeWakeRules(j.rules),
+        totalLines: j.buffer.total,
+        droppedCount: j.buffer.droppedCount,
+        elapsedMs: (j.endedAt ?? now) - j.startedAt,
+        lastOutputAgoMs: j.lastOutputAt === null ? null : Math.max(0, now - j.lastOutputAt),
+      }));
+      const rows = jobsDetail.map((j) => {
+        const el = formatElapsed(j.elapsedMs);
+        const quiet = j.lastOutputAgoMs === null ? "never" : formatElapsed(j.lastOutputAgoMs);
+        return `${j.id}  ${j.status.padEnd(10)}  ${el.padStart(7)}  last output ${quiet} ago  ${j.totalLines} lines  "${j.label}"`;
       });
-      return textResult(rows.join("\n"));
+      return textResult(rows.join("\n"), false, shellResultDetails("ShellList", { jobs: jobsDetail }));
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellListResult),
   });
 
   pi.registerTool({
@@ -724,17 +755,37 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         return truncateText(text, MAX_LOG_RESULT_CHARS);
       };
 
+      const baseDetails = (lines: string[]) =>
+        shellResultDetails("ShellLog", {
+          id: job.id,
+          label: job.label,
+          status: statusOf(job),
+          ...(job.exited ? { exitCode: job.exitCode } : {}),
+          totalLines: job.buffer.total,
+          droppedLines: job.buffer.droppedCount,
+          lines: lines.length,
+        });
+
       if (params.offset === undefined) {
         const lines = job.buffer.tail(want);
         const header = `${job.id} "${job.label}" ${statusOf(job)} · ${job.buffer.total} lines total`;
-        return textResult(render(lines, header));
+        return textResult(render(lines, header), false, {
+          ...baseDetails(lines),
+          from: Math.max(0, job.buffer.total - lines.length),
+          nextOffset: job.buffer.total,
+        });
       }
       const { lines, from, nextOffset } = job.buffer.slice(Number(params.offset), want);
       const header =
         `${job.id} "${job.label}" ${statusOf(job)} · lines ${from}–${nextOffset} of ${job.buffer.total}` +
         (job.buffer.droppedCount > 0 ? ` (${job.buffer.droppedCount} oldest dropped)` : "");
-      return textResult(render(lines, header));
+      return textResult(render(lines, header), false, {
+        ...baseDetails(lines),
+        from,
+        nextOffset,
+      });
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellLogResult),
   });
 
   pi.registerTool({
@@ -763,7 +814,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         return errorResult(
           `Error: stdin for ${job.id} is no longer writable (${reason}) — the job likely exited or ` +
             `closed its input. Check ShellLog/ShellList, and use ShellStop if it needs cleaning up.`,
-          { kind: "pi-review-bg-shell", event: "stdin-closed", id: job.id },
+          { kind: "pi-review-bg-shell", tool: "ShellSend", event: "stdin-closed", id: job.id },
         );
       }
       const text = String(params.text ?? "");
@@ -805,7 +856,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         return errorResult(
           `Error: write to ${job.id} stdin failed (${reason}). The job likely exited mid-write; ` +
             `check ShellLog/ShellList, and use ShellStop if it needs cleaning up.`,
-          { kind: "pi-review-bg-shell", event: "stdin-write-failed", id: job.id },
+          { kind: "pi-review-bg-shell", tool: "ShellSend", event: "stdin-write-failed", id: job.id },
         );
       }
       if (!outcome.flushed) {
@@ -816,11 +867,26 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
             `1.5s (the child may not be reading; the write may be lost if the job exits soon). ` +
             `Check ShellLog, and resend if the data never arrives.`,
           false,
-          { kind: "pi-review-bg-shell", event: "stdin-write-unconfirmed", id: job.id },
+          shellResultDetails("ShellSend", {
+            event: "stdin-write-unconfirmed",
+            id: job.id,
+            bytes: payload.length,
+            delivery: "unconfirmed",
+          }),
         );
       }
-      return textResult(`Wrote ${payload.length} bytes to ${job.id} stdin.`);
+      return textResult(
+        `Wrote ${payload.length} bytes to ${job.id} stdin.`,
+        false,
+        shellResultDetails("ShellSend", {
+          id: job.id,
+          label: job.label,
+          bytes: payload.length,
+          delivery: "confirmed",
+        }),
+      );
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellSendResult),
   });
 
   pi.registerTool({
@@ -835,15 +901,41 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
       if (target === "all") {
         const n = [...jobs.values()].filter((j) => !j.exited).length;
         for (const job of jobs.values()) if (!job.exited) killJob(job);
-        return textResult(`Stopping ${n} job(s).`);
+        return textResult(`Stopping ${n} job(s).`, false, shellResultDetails("ShellStop", {
+          target: "all",
+          count: n,
+          outcome: "stopping",
+        }));
       }
       const resolved = resolveJob(target);
       if (resolved.error) return resolved.error;
       const job = resolved.job!;
-      if (job.exited) return textResult(`Job ${job.id} had already exited (${statusOf(job)}).`);
+      if (job.exited) {
+        return textResult(
+          `Job ${job.id} had already exited (${statusOf(job)}).`,
+          false,
+          shellResultDetails("ShellStop", {
+            target,
+            jobId: job.id,
+            label: job.label,
+            status: statusOf(job),
+            outcome: "already-exited",
+          }),
+        );
+      }
       killJob(job);
-      return textResult(`Stopping ${job.id} ("${job.label}").`);
+      return textResult(
+        `Stopping ${job.id} ("${job.label}").`,
+        false,
+        shellResultDetails("ShellStop", {
+          target,
+          jobId: job.id,
+          label: job.label,
+          outcome: "stopping",
+        }),
+      );
     },
+    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellStopResult),
   });
 
   // Track the agent's own lifecycle so nonurgent wakes can be held while the

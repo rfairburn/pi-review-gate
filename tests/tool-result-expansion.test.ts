@@ -1,12 +1,10 @@
 // Shared native tool-result expansion foundation (#57).
 //
 // These tests exercise the actual shared mechanism in src/tool-result-expansion.ts
-// and the real registered tool renderer wiring (Subtasks*, ApplyPatch, and the
-// interactive Browser* family wrapped, rendererless tools keeping Pi's native
-// fallback). They do not replicate any rendering algorithm: outputs come from
-// the real renderers.
-// Subtasks* and Browser* contribute expanded callbacks; ApplyPatch retains its
-// existing presentation in both expansion states.
+// and the real registered tool renderer wiring (Subtasks*, ApplyPatch, Shell*,
+// and interactive Browser* wrapped; rendererless tools retain native fallback).
+// Outputs come from production renderers, not copied rendering algorithms.
+// ApplyPatch retains its existing presentation in both expansion states.
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -17,7 +15,8 @@ import {
 } from "../src/tool-result-expansion";
 import { ExecutionToolManager, EXECUTION_TOOL_NAMES } from "../src/execution/tool";
 import { APPLY_PATCH_TOOL_NAME, registerApplyPatchTool } from "../src/apply-patch/tool";
-import registerBackgroundShell from "../src/background-shell";
+import registerBackgroundShell, { reapAll } from "../src/background-shell";
+import { shellResultDetails } from "../src/background-shell/result-view";
 import { WebToolManager } from "../src/web/tools";
 import { INTERACTIVE_BROWSER_TOOL_NAMES } from "../src/web/browser-renderer";
 import { DeferredToolManager } from "../src/deferred-tools";
@@ -242,17 +241,8 @@ test("ApplyPatch's existing renderer is wired as the collapsed view of the mecha
 });
 
 test("rendererless tools retain Pi's native expandable fallback rendering", () => {
-  // Shell*, search_tools, WebSearch, WebFetch, and BrowserExtract never define
-  // a custom renderResult: Pi's native fallback (bounded preview with an
-  // expand hint, full returned text when expanded) is their adequate existing
-  // expansion and must not be replaced by a custom collapsed renderer. The
+  // search_tools, WebSearch, WebFetch and BrowserExtract retain native fallback.
   // WebFetch/BrowserExtract detail views are a separate contribution (#82).
-  const shellTools: Record<string, any> = {};
-  registerBackgroundShell({
-    registerTool: (tool: any) => { shellTools[tool.name] = tool; },
-    on: () => {},
-    sendMessage: () => {},
-  });
   const webTools: Array<Record<string, any>> = [];
   new WebToolManager(
     { registerTool: (tool) => { webTools.push(tool); } },
@@ -269,11 +259,10 @@ test("rendererless tools retain Pi's native expandable fallback rendering", () =
     setActiveTools: () => {},
   }).register();
   const expectedNative = [
-    "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop",
     "WebSearch", "WebFetch", "BrowserExtract",
     "search_tools",
   ];
-  const registered = [...Object.values(shellTools), ...webTools, ...deferredTools] as Array<Record<string, any>>;
+  const registered = [...webTools, ...deferredTools] as Array<Record<string, any>>;
   const registeredNames = new Set(registered.map((tool) => String(tool.name)));
   for (const name of expectedNative) {
     assert.ok(registeredNames.has(name), `${name} was not registered`);
@@ -313,8 +302,212 @@ test("every interactive Browser* result renderer is wired through the shared exp
   }
 });
 
+// ---------------------------------------------------------------------------
+// Registered Shell* wiring coverage (#58)
+// ---------------------------------------------------------------------------
+
+const SHELL_TOOL_NAMES = ["ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop"] as const;
+
+function shellHarness(): Record<string, any> {
+  const tools: Record<string, any> = {};
+  registerBackgroundShell({
+    registerTool: (tool: any) => { tools[tool.name] = tool; },
+    on: () => {},
+    sendMessage: () => {},
+  });
+  return tools;
+}
+
+async function until(fn: () => boolean | Promise<boolean>, ms = 8000): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await fn()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return await fn();
+}
+
+test("every Shell* registration is wired through the shared mechanism and expands with real results", async () => {
+  const tools = shellHarness();
+  for (const name of SHELL_TOOL_NAMES) {
+    assert.ok(tools[name], `${name} was not registered`);
+    assert.equal(isExpandableResult(tools[name].renderResult), true, `${name} renderResult must be expandableResult-wired`);
+  }
+
+  const ctx = { hasUI: false, ui: {} };
+  const call = (name: string, params: any) =>
+    tools[name].execute("id", params, undefined, undefined, ctx);
+  try {
+    // Two real jobs: one that exits fast, one with a live stdin.
+    const started = await call("ShellStart", { command: "echo head-line; echo tail-line; exit 3", label: "wiring" });
+    let listed: any;
+    let logged: any;
+    assert.equal(
+      await until(async () => {
+        listed = await call("ShellList", {});
+        logged = await call("ShellLog", { id: started.details.id, lines: 1 });
+        return listed.details.jobs[0]?.status === "failed(3)";
+      }),
+      true,
+      "the wiring job must exit before its results are rendered",
+    );
+    const stoppedExited = await call("ShellStop", { id: started.details.id });
+    const piper = await call("ShellStart", { command: "cat", label: "piper" });
+    const sent = await call("ShellSend", { id: piper.details.id, text: "hello" });
+    assert.equal(sent.details.delivery, "confirmed");
+    const stopped = await call("ShellStop", { id: piper.details.id });
+
+    // From here on any execute call — from a rendering path or otherwise —
+    // fails the test: expansion must never rerun a tool.
+    for (const name of SHELL_TOOL_NAMES) {
+      tools[name].execute = () => { throw new Error(`${name}.execute must not run during expansion`); };
+    }
+
+    // Toggle every real result through its registered renderResult only.
+    const captured: Array<[string, any]> = [
+      ["ShellStart", started],
+      ["ShellList", listed],
+      ["ShellLog", logged],
+      ["ShellSend", sent],
+      ["ShellStop", stopped],
+      ["ShellStop", stoppedExited],
+    ];
+    for (const [name, value] of captured) {
+      const collapsed = renderLines(tools[name].renderResult(value, { expanded: false, isPartial: false }, theme));
+      const expanded = renderLines(tools[name].renderResult(value, { expanded: true, isPartial: false }, theme));
+      const recollapsed = renderLines(tools[name].renderResult(value, { expanded: false, isPartial: false }, theme));
+      assert.deepEqual(recollapsed, collapsed, `${name} re-collapse must restore the collapsed presentation`);
+    }
+
+    // Collapsed keeps the preserved native-fallback presentation, not the
+    // detail framing.
+    const startCollapsed = renderLines(tools.ShellStart.renderResult(started, { expanded: false, isPartial: false }, theme));
+    assert.match(startCollapsed.join("\n"), /Started "wiring" as job\d+/);
+    assert.doesNotMatch(startCollapsed.join("\n"), /ShellStart ·/);
+
+    // Expanded shows the retained snapshot's provenance from the result alone.
+    const startExpanded = renderLines(tools.ShellStart.renderResult(started, { expanded: true, isPartial: false }, theme));
+    assert.match(startExpanded.join("\n"), new RegExp(`ShellStart · ${started.details.id} "wiring"`));
+    assert.match(startExpanded.join("\n"), /command: echo head-line; echo tail-line; exit 3/);
+    assert.match(startExpanded.join("\n"), new RegExp(`pid ${started.details.pid}\\b`));
+
+    // The expanded ShellLog view renders exactly the retained slice — the one
+    // line the call delivered, with its range — never the rest of the live
+    // buffer, which only a re-fetch could show.
+    const logExpanded = renderLines(tools.ShellLog.renderResult(logged, { expanded: true, isPartial: false }, theme));
+    const logJoined = logExpanded.join("\n");
+    assert.match(logJoined, /lines 1–2 of 2 line\(s\)/);
+    assert.match(logJoined, /tail-line/);
+    assert.doesNotMatch(logJoined, /head-line/);
+
+    // Expansion is presentation only: the throwing spies above prove no toggle
+    // re-executed a tool, and the retained result is neither mutated nor
+    // re-derived from live job state.
+    const loggedSnapshot = JSON.stringify(logged);
+    reapAll();
+    assert.deepEqual(renderLines(tools.ShellLog.renderResult(logged, { expanded: true, isPartial: false }, theme)), logExpanded);
+    assert.equal(JSON.stringify(logged), loggedSnapshot, "expansion must not mutate the retained result");
+  } finally {
+    reapAll();
+  }
+});
+
+test("Shell* registered renderers stay stable across error, partial, and no-data results", async () => {
+  const tools = shellHarness();
+  const ctx = { hasUI: false, ui: {} };
+  try {
+    // Real error result through the real registration. Error results carry no
+    // structured details, so expansion degrades to the bounded preview of the
+    // retained error text — nothing fabricated.
+    const missing = await tools.ShellLog.execute("id", { id: "nope" }, undefined, undefined, ctx);
+    assert.equal(missing.isError, true);
+    const expandedMissing = renderLines(tools.ShellLog.renderResult(missing, { expanded: true, isPartial: false }, theme)).join("\n");
+    assert.match(expandedMissing, /no structured details were recorded/);
+    assert.match(expandedMissing, /no such job "nope"/);
+    // Collapsed renders the retained error text through the preserved fallback.
+    assert.match(
+      renderLines(tools.ShellLog.renderResult(missing, { expanded: false, isPartial: false }, theme)).join("\n"),
+      /no such job "nope"/,
+    );
+
+    // A tagged error result renders the bounded error view through the wiring.
+    const taggedError = {
+      content: [{ type: "text", text: `Error: ${"x".repeat(400)}` }],
+      isError: true,
+      details: shellResultDetails("ShellLog"),
+    };
+    assert.match(
+      renderLines(tools.ShellLog.renderResult(taggedError, { expanded: true, isPartial: false }, theme)).join("\n"),
+      /ShellLog · error/,
+    );
+
+    // Partial (streaming) renders one bounded pending line per tool.
+    for (const name of SHELL_TOOL_NAMES) {
+      assert.deepEqual(
+        renderLines(tools[name].renderResult(missing, { expanded: true, isPartial: true }, theme)),
+        [`${name} … (running)`],
+      );
+    }
+
+    // No structured details (restored pre-details result): bounded preview of
+    // the retained text, nothing fabricated.
+    const legacy = { content: [{ type: "text", text: 'Started "old" as job1 (pid 1); currently running.' }], isError: false };
+    const legacyJoined = renderLines(tools.ShellStart.renderResult(legacy, { expanded: true, isPartial: false }, theme)).join("\n");
+    assert.match(legacyJoined, /no structured details were recorded/);
+    assert.match(legacyJoined, /Started "old" as job1/);
+
+    // Empty content renders nothing in the collapsed fallback, as native does.
+    const empty = { content: [{ type: "text", text: "" }], isError: false };
+    assert.deepEqual(renderLines(tools.ShellList.renderResult(empty, { expanded: false, isPartial: false }, theme)), []);
+  } finally {
+    reapAll();
+  }
+});
+
+test("Shell* registered renderers never surface unrelated internal details or context", () => {
+  // Sentinel values in detail fields no renderer reads and in the render
+  // context must never reach a rendered line, in either expansion state.
+  const sentinels = ["SENTINEL-SECRET-TOKEN", "SENTINEL-INTERNAL-PATH", "SENTINEL-CTX-STATE"];
+  const tools = shellHarness();
+  for (const name of SHELL_TOOL_NAMES) {
+    const value = {
+      content: [{ type: "text", text: `Result body for ${name}.` }],
+      isError: false,
+      details: shellResultDetails(name, {
+        id: "job1",
+        label: "sentinel",
+        status: "running",
+        totalLines: 0,
+        droppedLines: 0,
+        from: 0,
+        nextOffset: 0,
+        bytes: 1,
+        delivery: "confirmed",
+        command: "true",
+        pid: 1,
+        watching: "exit",
+        startedAt: Date.UTC(2026, 0, 1),
+        jobs: [],
+        target: "job1",
+        jobId: "job1",
+        outcome: "stopping",
+        count: 1,
+        secretToken: sentinels[0],
+        internalPath: sentinels[1],
+      }),
+    };
+    const context = { toolCallId: sentinels[2], state: { note: sentinels[2] }, cwd: "/tmp" };
+    for (const options of [{ expanded: false, isPartial: false }, { expanded: true, isPartial: false }]) {
+      const lines = renderLines(tools[name].renderResult(value, options, theme, context)).join("\n");
+      for (const sentinel of sentinels) {
+        assert.doesNotMatch(lines, new RegExp(sentinel), `${name} must not render internal data (${JSON.stringify(options)})`);
+      }
+    }
+  }
+});
+
 test("the expansion coverage inventory matches the registered tool set", () => {
-  const wrapped = [...executionToolNames, APPLY_PATCH_TOOL_NAME, ...INTERACTIVE_BROWSER_TOOL_NAMES];
+  const wrapped = [...executionToolNames, APPLY_PATCH_TOOL_NAME, ...INTERACTIVE_BROWSER_TOOL_NAMES, ...SHELL_TOOL_NAMES];
   const tools = [...executionHarness()];
   registerApplyPatchTool({ registerTool: (tool: Record<string, any>) => { tools.push(tool); } });
   const webTools: Array<Record<string, any>> = [];
@@ -326,6 +519,8 @@ test("the expansion coverage inventory matches the registered tool set", () => {
     { shutdown: async () => {}, updateConfig: () => {} } as unknown as any,
   ).register();
   tools.push(...webTools);
+  const shellTools = shellHarness();
+  for (const name of SHELL_TOOL_NAMES) tools.push(shellTools[name]);
   const wrappedRegistered = tools.filter((tool: Record<string, unknown>) => isExpandableResult(tool.renderResult));
   assert.deepEqual(
     wrappedRegistered.map((tool) => tool.name).sort(),

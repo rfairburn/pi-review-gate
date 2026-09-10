@@ -182,12 +182,21 @@ shared mechanism in `src/tool-result-expansion.ts`:
   The `Subtasks*` family also contributes its expanded detail callback (#59):
   expanding a result renders a cohesive, provenance-separated view of already-returned
   data with bounded sections and omission disclosures; re-collapse restores its
-  unchanged collapsed card. Remaining detail views (#58 and #82) use the same mechanism.
+  unchanged collapsed card. Remaining detail views (#82) use the same mechanism.
 - Tools that never defined a custom `renderResult` keep Pi's native fallback rendering,
   which already expands and re-collapses the returned text output with a bounded
-  preview: the five `Shell*` tools, `WebSearch`, `WebFetch`, `BrowserExtract`, and
+  preview: `WebSearch`, `WebFetch`, `BrowserExtract`, and
   `search_tools`. Those registrations are deliberately not wrapped, because a custom
   collapsed renderer would replace the native fallback rather than extend it.
+- The five `Shell*` tools (`src/background-shell/index.ts`) previously had no custom
+  renderer: they are wired with a collapsed view that preserves Pi's native fallback
+  presentation (bounded preview with the expand hint when collapsed, full returned
+  text when expanded) plus the family's per-tool expanded detail callbacks
+  (`src/background-shell/result-view.ts`). Expansion renders only the bounded
+  retained snapshot each call recorded — command and job lifecycle provenance, log
+  range and drop counts, stdin delivery state — never re-reading, re-fetching, or
+  reconstructing from live job state; restored results without structured details
+  degrade to the retained text preview.
 
 `isExpandableResult()` provides a wiring-audit marker used by
 `tests/tool-result-expansion.test.ts` and

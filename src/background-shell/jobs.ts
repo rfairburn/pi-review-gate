@@ -552,6 +552,20 @@ export function wrapWithParentWatchdog(command: string, parentPid: number, pollS
   ].join("\n");
 }
 
+/** Bounded human summary of a job's wake rules, shared by the ShellStart
+ *  result text and the expanded result views. Empty string when no rule is
+ *  active; the model-facing text appends "nothing" itself. */
+export function describeWakeRules(rules: WakeRules): string {
+  return [
+    rules.exit ? "exit" : null,
+    rules.match.length > 0 ? `match ${rules.match.map((m) => JSON.stringify(m)).join(", ")}` : null,
+    rules.silenceMs ? `silence ${formatElapsed(rules.silenceMs)}` : null,
+    rules.everyNMatches ? `every ${rules.everyNMatches} matches` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
 export function formatElapsed(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 60) return `${s}s`;

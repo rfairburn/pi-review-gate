@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.30]
+
+### Added
+
+- The five background shell tools (`ShellStart`, `ShellList`, `ShellLog`,
+  `ShellSend`, `ShellStop`) now expand through the shared native tool-result expansion
+  mechanism: every registration is wired through
+  `expandableResult(collapsedRenderer, expandedRenderer)` with a collapsed view that
+  preserves Pi's native fallback presentation (bounded preview with the expand hint
+  when collapsed, full returned text when expanded) and a per-tool expanded detail
+  view rendering the bounded retained snapshot the call recorded — command and job
+  lifecycle provenance, log range and drop counts, and stdin delivery state. Expansion
+  is display-only: nothing is re-read, re-fetched, or reconstructed from live job
+  state (restored sessions render exactly what was recorded, and older results without
+  structured details degrade to the retained text preview), pending/partial, error,
+  and empty states stay bounded and stable in both expansion directions, and no
+  competing key handler is registered (the configured binding, Ctrl+O by default,
+  still toggles both directions). No mirrored expansion state, no reruns or network
+  requests, and no change to tool schemas, authority, redaction, model output budgets,
+  or retention limits (Closes #58).
+
 ## [0.1.0-dev.29]
 
 ### Added

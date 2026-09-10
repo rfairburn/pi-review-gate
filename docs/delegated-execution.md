@@ -474,6 +474,17 @@ accepts steering during that interval, and performs a final inspection turn befo
 review. Executor timeouts are suspended while a verified process group remains active;
 external or unparseable `ShellStart` success responses fail closed.
 
+Each Shell tool result carries structured display metadata (command, job lifecycle,
+log range and drop counts, stdin delivery state) in the result's render-only details,
+and Pi's shared tool-result expansion (`expandableResult`, Ctrl+O) shows it: expanding
+a Shell row renders the bounded retained snapshot that call recorded — the log body
+verbatim with its range and truncation markers, plus lifecycle, command, and wake
+configuration provenance. Expansion is display-only: nothing is re-read, re-fetched,
+or reconstructed from live job state, the collapsed presentation is preserved, and
+restored sessions render exactly what was recorded. Structured details are absent on
+older recorded results; expansion then degrades to the retained text preview without
+inventing content.
+
 ## External harness protocol
 
 The `run-as-binary` adapter uses the versioned `pi-review-executor-jsonl-v1` protocol.

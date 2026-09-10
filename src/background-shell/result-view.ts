@@ -25,10 +25,10 @@
  *
  * The collapsed side (`shellCollapsedResultRenderer`) deliberately mirrors
  * Pi's native fallback for tools without a custom `renderResult` — full text
- * when expanded, a 10-line preview with an expand hint when collapsed —
- * because wiring the shared mechanism replaces that native fallback. It also
- * honors the expanded flag itself, so a failed detail render degrades to the
- * familiar native view in both states.
+ * when expanded, a bounded 10-display-row preview with an expand hint when
+ * collapsed — because wiring the shared mechanism replaces that native
+ * fallback. It also honors the expanded flag itself, so a failed detail render
+ * degrades to the familiar native view in both states.
  *
  * Every renderer is defensive about its input (session restore can hand it a
  * result recorded before structured details existed) and about its budget:
@@ -171,75 +171,232 @@ function viewComponent(render: (width: number) => string[]): ShellResultComponen
 // ── Terminal-cell-aware wrapping ────────────────────────────────────────
 
 // Pi (pi-tui) rejects any rendered line wider than the terminal, counting
-// terminal CELLS, not characters: East Asian wide glyphs and most emoji
-// occupy two cells, ANSI/OSC escape sequences none. The shell family renders
-// arbitrary child-process output, so wrapping here is cell-aware rather than
-// trusting the char-count approximation in width.ts (that one is only safe
-// for the widget content it was built for).
+// terminal CELLS with a grapheme-aware walk (its visibleWidth measures each
+// Intl.Segmenter cluster: emoji and East Asian wide glyphs occupy two cells,
+// zero-width clusters none). The shell family renders arbitrary child-process
+// output, so measurement and wrapping here mirror that established host
+// algorithm rather than trusting the char-count approximation in width.ts
+// (that one is only safe for the widget content it was built for).
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Code points pi-tui's width guard counts as two terminal cells: the wide /
+ *  fullwidth ranges of get-east-asian-width (pi-tui's dependency), mirrored
+ *  so wrap decisions agree with the host exactly — including default-emoji
+ *  glyphs like ⏰ U+23F0 and ✅ U+2705 that the review pass 1 table missed.
+ *  The four coarse emoji-block ranges are a superset of the fine-grained
+ *  entries so engines without RGI_Emoji support (see below) still err toward
+ *  counting MORE cells, which wraps earlier and can never emit an over-width
+ *  line. Re-verify against the installed pi host when it upgrades. */
 const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x1100, 0x115f], // Hangul Jamo
+  [0x231a, 0x231b], // ⌚ ⌛
   [0x2329, 0x232a], // angle brackets
-  [0x2e80, 0x303e], [0x3041, 0x33ff], [0x3400, 0x4dbf], // CJK radicals … CJK ext A
-  [0x4e00, 0x9fff], // CJK unified
-  [0xa000, 0xa4cf], [0xa960, 0xa97f], // Yi, Hangul Jamo ext-A
+  [0x23e9, 0x23ec], [0x23f0, 0x23f0], [0x23f3, 0x23f3], // media controls incl. ⏰
+  [0x25fd, 0x25fe], // ◽ ◾
+  [0x2614, 0x2615], [0x2630, 0x2637], [0x2648, 0x2653], [0x267f, 0x267f],
+  [0x268a, 0x268f], [0x2693, 0x2693], [0x26a1, 0x26a1], [0x26aa, 0x26ab],
+  [0x26bd, 0x26be], [0x26c4, 0x26c5], [0x26ce, 0x26ce], [0x26d4, 0x26d4],
+  [0x26ea, 0x26ea], [0x26f2, 0x26f3], [0x26f5, 0x26f5], [0x26fa, 0x26fa],
+  [0x26fd, 0x26fd], // misc symbols
+  [0x2705, 0x2705], [0x270a, 0x270b], [0x2728, 0x2728], [0x274c, 0x274c],
+  [0x274e, 0x274e], [0x2753, 0x2755], [0x2757, 0x2757], [0x2795, 0x2797],
+  [0x27b0, 0x27b0], [0x27bf, 0x27bf], // dingbats incl. ✅
+  [0x2b1b, 0x2b1c], [0x2b50, 0x2b50], [0x2b55, 0x2b55], // ⬛ ⬜ ⭐ ⭕
+  [0x2e80, 0x2e99], [0x2e9b, 0x2ef3], // CJK radicals supplement
+  [0x2f00, 0x2fd5], [0x2ff0, 0x2fff], // Kangxi radicals, ideographic description
+  [0x3000, 0x3000], [0x3001, 0x303e], // fullwidth space, CJK punctuation
+  [0x3041, 0x3096], [0x3099, 0x30ff], // Hiragana, Katakana
+  [0x3105, 0x312f], [0x3131, 0x318e], [0x3190, 0x31e5], // Bopomofo, Hangul compat jamo
+  [0x31ef, 0x321e], [0x3220, 0x3247], // enclosed CJK letters and numbers
+  [0x3250, 0xa48c], // CJK symbols … Yi syllables
+  [0xa490, 0xa4c6], // Yi radicals
+  [0xa960, 0xa97f], // Hangul Jamo extended-A
   [0xac00, 0xd7a3], // Hangul syllables
   [0xf900, 0xfaff], // CJK compatibility ideographs
-  [0xfe10, 0xfe19], [0xfe30, 0xfe6f], // vertical forms, CJK compat forms
-  [0xff00, 0xff60], [0xffe0, 0xffe6], // fullwidth forms
-  [0x1f300, 0x1f64f], [0x1f680, 0x1f6ff], [0x1f900, 0x1f9ff], // emoji blocks
+  [0xfe10, 0xfe19], // vertical forms
+  [0xfe30, 0xfe52], [0xfe54, 0xfe66], [0xfe68, 0xfe6b], // CJK compatibility forms
+  [0xff01, 0xff60], [0xffe0, 0xffe6], // fullwidth forms
+  [0x16fe0, 0x16fe4], [0x16ff0, 0x16ff6], // Canadian Aboriginal syllabics
+  [0x17000, 0x18cd5], [0x18cff, 0x18d1e], [0x18d80, 0x18df2], // Tangut …
+  [0x1aff0, 0x1aff3], [0x1aff5, 0x1affb], [0x1affd, 0x1affe], // Kaktovik numerals
+  [0x1b000, 0x1b122], [0x1b132, 0x1b132], [0x1b150, 0x1b152], [0x1b155, 0x1b155],
+  [0x1b164, 0x1b167], [0x1b170, 0x1b2fb], // Balinese
+  [0x1d300, 0x1d356], [0x1d360, 0x1d376], // musical symbols
+  [0x1f004, 0x1f004], [0x1f0cf, 0x1f0cf], // 🀄 🃏
+  [0x1f18e, 0x1f18e], [0x1f191, 0x1f19a], // enclosed symbols
+  [0x1f200, 0x1f202], [0x1f210, 0x1f23b], [0x1f240, 0x1f248],
+  [0x1f250, 0x1f251], [0x1f260, 0x1f265], // enclosed CJK
+  [0x1f300, 0x1f64f], // Misc Symbols and Pictographs + Emoticons
+  [0x1f680, 0x1f6ff], // Transport and Map Symbols
+  [0x1f7e0, 0x1f7eb], [0x1f7f0, 0x1f7f0], // Geometric Shapes Extended
+  [0x1f900, 0x1f9ff], // Supplemental Symbols and Pictographs
   [0x1fa70, 0x1faff], // Symbols and Pictographs Extended-A (🫠 U+1FAE0 …)
   [0x20000, 0x3fffd], // CJK ext B+ / plane 3
 ];
 
-function codePointCells(cp: number): number {
-  if (WIDE_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi)) return 2;
-  // Zero-width: combining marks, variation selectors, zero-width controls.
-  if ((cp >= 0x0300 && cp <= 0x036f) || (cp >= 0xfe00 && cp <= 0xfe0f) || cp === 0x200b || cp === 0x200d) {
-    return 0;
+// pi-tui measures emoji with the RGI_Emoji Unicode property. Engines without
+// it fall back to sequence markers plus the coarse emoji-block ranges above;
+// both paths err toward counting MORE cells, which wraps earlier and can
+// never emit an over-width line.
+let rgiEmojiRegex: RegExp | null = null;
+try {
+  rgiEmojiRegex = new RegExp("^\\p{RGI_Emoji}$", "v");
+} catch {
+  rgiEmojiRegex = null;
+}
+
+// Per-code-point non-printing classes. (The v-flag property escapes pi-tui
+// uses need an ES2024 target; these u-flag equivalents cover the same sets,
+// with unpaired surrogates handled by explicit range since they are not a
+// standard Unicode property.)
+const ZERO_WIDTH_CP = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Mark}]$/u;
+const NON_PRINTING_CP = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Format}\p{Mark}]$/u;
+
+function isZeroWidthCp(cp: number): boolean {
+  return (cp >= 0xd800 && cp <= 0xdfff) || ZERO_WIDTH_CP.test(String.fromCodePoint(cp));
+}
+
+/** True when every code point of the cluster renders no cell of its own. */
+function isZeroWidthCluster(grapheme: string): boolean {
+  for (const ch of grapheme) {
+    if (!isZeroWidthCp(ch.codePointAt(0)!)) return false;
   }
+  return true;
+}
+
+/** Drop leading non-printing code points to find the cluster's base glyph. */
+function stripLeadingNonPrinting(grapheme: string): string {
+  let i = 0;
+  while (i < grapheme.length) {
+    const cp = grapheme.codePointAt(i)!;
+    if (!(isZeroWidthCp(cp) || NON_PRINTING_CP.test(String.fromCodePoint(cp)))) break;
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return grapheme.slice(i);
+}
+
+function inRanges(cp: number, ranges: ReadonlyArray<readonly [number, number]>): boolean {
+  return ranges.some(([lo, hi]) => cp >= lo && cp <= hi);
+}
+
+/** True for graphemes terminals render as one two-cell emoji: RGI sequences
+ *  (ZWJ families, flags, keycaps, tag sequences) — including default-emoji
+ *  glyphs like ⏰ U+23F0 and ✅ U+2705. Without RGI_Emoji support the
+ *  sequence markers are the conservative stand-in; base-glyph width then
+ *  comes from WIDE_RANGES in graphemeCells. */
+function isEmojiGrapheme(grapheme: string): boolean {
+  if (rgiEmojiRegex !== null) return rgiEmojiRegex.test(grapheme);
+  for (const ch of grapheme) {
+    const cp = ch.codePointAt(0)!;
+    // VS16 forces emoji presentation; ZWJ/keycap/tag sequences are emoji.
+    if (cp === 0xfe0f || cp === 0x200d || cp === 0x20e3 || (cp >= 0xe0020 && cp <= 0xe007f)) return true;
+  }
+  return false;
+}
+
+/** Terminal cells occupied by one grapheme cluster: two for emoji and East
+ *  Asian wide glyphs, zero for combining-only clusters, else one. */
+function graphemeCells(grapheme: string): number {
+  if (grapheme === "\t") return 3; // pi-tui's layout width for tabs
+  if (isZeroWidthCluster(grapheme)) return 0;
+  if (isEmojiGrapheme(grapheme)) return 2;
+  const base = stripLeadingNonPrinting(grapheme);
+  const cp = base.codePointAt(0);
+  if (cp === undefined) return 0;
+  // Regional indicators render two cells in terminals even when isolated.
+  if (cp >= 0x1f1e6 && cp <= 0x1f1ff) return 2;
+  if (inRanges(cp, WIDE_RANGES)) return 2;
   return 1;
 }
 
-/** Visible terminal-cell width of a line: ANSI/OSC escapes are ignored, wide
- *  glyphs count two cells. Exported for width-safe test assertions. */
-export function visibleCells(line: string): number {
-  let cells = 0;
+/** Split a line into zero-width escape tokens and visible graphemes so
+ *  measurement and wrapping walk the same cells pi-tui counts. */
+type WrapToken =
+  | { kind: "sgr"; value: string }
+  | { kind: "escape"; value: string }
+  | { kind: "grapheme"; value: string };
+
+/** Split a line into zero-width escape tokens and visible graphemes so
+ *  measurement and wrapping walk the same cells pi-tui counts. The ESC
+ *  handling mirrors pi-tui's extractAnsiCode exactly — the host width guard
+ *  strips only CSI sequences ending in [mGKHJ] and OSC/APC payloads with a
+ *  BEL or ST (ESC backslash) terminator; anything else (standalone ESC,
+ *  charset designations like ESC(B, DCS, unterminated OSC) is counted by the
+ *  guard as visible text, so consuming more would under-measure and could
+ *  emit over-width lines. Every path advances at least one position, so no
+ *  input can stall the walk. */
+function tokenizeLine(line: string): WrapToken[] {
+  const tokens: WrapToken[] = [];
   let i = 0;
   while (i < line.length) {
-    const ch = line[i]!;
-    if (ch === "\x1b") {
-      const rest = line.slice(i);
-      const csi = rest.match(/^\x1b\[[0-?]*[ -/]*[@-~]/);
-      if (csi) {
-        i += csi[0].length;
-        continue;
-      }
-      if (line[i + 1] === "]") {
-        const end = line.indexOf("\x07", i);
-        if (end >= 0) {
-          i = end + 1;
-          continue;
+    let consumedEscape = false;
+    if (line[i] === "\x1b") {
+      const next = line[i + 1];
+      if (next === "[") {
+        // CSI: consume through the first final byte in [mGKHJ].
+        let j = i + 2;
+        while (j < line.length && !/[mGKHJ]/.test(line[j]!)) j++;
+        if (j < line.length) {
+          tokens.push({ kind: line[j] === "m" ? "sgr" : "escape", value: line.slice(i, j + 1) });
+          i = j + 1;
+          consumedEscape = true;
+        }
+      } else if (next === "]" || next === "_") {
+        // OSC / APC: consume through BEL or ST (ESC backslash).
+        let j = i + 2;
+        while (j < line.length && !(line[j] === "\x07" || (line[j] === "\x1b" && line[j + 1] === "\\"))) j++;
+        if (line[j] === "\x07") {
+          tokens.push({ kind: "escape", value: line.slice(i, j + 1) });
+          i = j + 1;
+          consumedEscape = true;
+        } else if (line[j] === "\x1b" && line[j + 1] === "\\") {
+          tokens.push({ kind: "escape", value: line.slice(i, j + 2) });
+          i = j + 2;
+          consumedEscape = true;
         }
       }
     }
-    const cp = line.codePointAt(i)!;
-    cells += codePointCells(cp);
-    i += cp > 0xffff ? 2 : 1;
+    if (!consumedEscape) {
+      // line[i] may itself be an unmatched ESC — include it in the run (it
+      // measures zero cells as a control character; the bytes after it are
+      // visible text, exactly as the host guard counts them).
+      let end = i + 1;
+      while (end < line.length && line[end] !== "\x1b") end++;
+      for (const { segment } of graphemeSegmenter.segment(line.slice(i, end))) {
+        tokens.push({ kind: "grapheme", value: segment });
+      }
+      i = end;
+    }
+  }
+  return tokens;
+}
+
+/** Visible terminal-cell width of a line: ANSI/OSC escapes are ignored, wide
+ *  glyphs and emoji count two cells each. Exported for width-safe test
+ *  assertions. */
+export function visibleCells(line: string): number {
+  let cells = 0;
+  for (const token of tokenizeLine(line)) {
+    if (token.kind === "grapheme") cells += graphemeCells(token.value);
   }
   return cells;
 }
 
 /** Wrap one line (already-themed or plain) into display lines that never
  *  exceed `width` terminal cells. Formatting is preserved, not cut:
- *  whitespace and embedded ANSI escapes survive the wrap, and styles are
+ *  whitespace and embedded ANSI escapes survive the wrap, styles are
  *  re-applied at the start of every continuation line (Pi resets styling at
- *  each rendered line, so styles would otherwise not carry across).
+ *  each rendered line), and grapheme clusters stay intact — a ZWJ emoji
+ *  sequence is one two-cell unit, never split mid-sequence.
  *
  *  Display-only adjustments, both necessary for honest width math: CR is
  *  stripped (a CRLF stream would otherwise move the cursor) and tabs are
  *  expanded to four spaces (tab stop positions are terminal-dependent, so a
- *  raw tab cannot be measured). The model-visible text is untouched. */
+ *  raw tab cannot be measured). The model-visible text is untouched. A single
+ *  grapheme wider than the whole row (possible only at pathologically narrow
+ *  widths) is substituted with one placeholder cell rather than emitted as an
+ *  over-width line that would trip pi-tui's width guard. */
 export function wrapToWidth(line: string, width: number): string[] {
   if (width <= 0) return [];
   const prepared = line.replace(/\r/g, "").replace(/\t/g, "    ");
@@ -248,45 +405,38 @@ export function wrapToWidth(line: string, width: number): string[] {
   let current = "";
   let cells = 0;
   let activeSgr = "";
-  let i = 0;
-  while (i < prepared.length) {
-    const ch = prepared[i]!;
-    if (ch === "\x1b") {
-      const rest = prepared.slice(i);
-      const sgr = rest.match(/^\x1b\[[0-9;]*m/);
-      if (sgr) {
-        current += sgr[0];
-        activeSgr = sgr[0] === "\x1b[0m" || sgr[0] === "\x1b[m" ? "" : sgr[0];
-        i += sgr[0].length;
-        continue;
-      }
-      const csi = rest.match(/^\x1b\[[0-?]*[ -/]*[@-~]/);
-      if (csi) {
-        current += csi[0];
-        i += csi[0].length;
-        continue;
-      }
-      if (prepared[i + 1] === "]") {
-        const end = prepared.indexOf("\x07", i);
-        if (end >= 0) {
-          current += prepared.slice(i, end + 1);
-          i = end + 1;
-          continue;
-        }
-      }
+  for (const token of tokenizeLine(prepared)) {
+    if (token.kind === "sgr") {
+      current += token.value;
+      activeSgr = token.value === "\x1b[0m" || token.value === "\x1b[m" ? "" : token.value;
+      continue;
     }
-    const cp = prepared.codePointAt(i)!;
-    const cpCells = codePointCells(cp);
-    if (cells > 0 && cells + cpCells > width) {
+    if (token.kind === "escape") {
+      current += token.value;
+      continue;
+    }
+    const gCells = graphemeCells(token.value);
+    if (gCells > width) {
+      // One grapheme wider than the whole row: close the current line and
+      // substitute a bounded placeholder instead of emitting over-width.
+      if (cells > 0) {
+        out.push(activeSgr ? `${current}\x1b[0m` : current);
+        current = activeSgr;
+        cells = 0;
+      }
+      current += "?";
+      cells += 1;
+      continue;
+    }
+    if (cells > 0 && cells + gCells > width) {
       // Break: re-apply the in-flight style at the start of the next line
       // (Pi resets styling at line ends) and close this one.
       out.push(activeSgr ? `${current}\x1b[0m` : current);
       current = activeSgr;
       cells = 0;
     }
-    current += prepared.slice(i, i + (cp > 0xffff ? 2 : 1));
-    cells += cpCells;
-    i += cp > 0xffff ? 2 : 1;
+    current += token.value;
+    cells += gCells;
   }
   if (current.length > 0 || out.length === 0) out.push(current);
   return out;
@@ -320,7 +470,10 @@ function pendingView(tool: ShellToolName, theme: ShellResultViewTheme): ShellRes
 
 /** Pi's fallback preview height for tools without a custom renderResult
  *  (tool-execution.ts createResultFallback). Mirrored, not imported: the
- *  value is part of the presentation this collapsed renderer must preserve. */
+ *  value is part of the presentation this collapsed renderer must preserve.
+ *  It bounds WRAPPED DISPLAY ROWS, not logical lines: shell output carries
+ *  up-to-2048-char lines that each reflow to many display rows, so a logical
+ *  cap applied before wrapping would let the "preview" grow without bound. */
 const NATIVE_PREVIEW_LINES = 10;
 
 /** Pi's `keyHint` helper, resolvable only inside the host. The hint degrades
@@ -343,8 +496,10 @@ function expandHint(): string {
  *  fallback owned both states; this renderer reproduces it so wiring the
  *  shared mechanism extends it instead of replacing it with something weaker:
  *
- *  - collapsed (options.expanded !== true): first NATIVE_PREVIEW_LINES lines
- *    of the model-visible text, then `... (N more lines, <expand hint>)`.
+ *  - collapsed (options.expanded !== true): the model-visible text wrapped
+ *    into display rows first, then capped at NATIVE_PREVIEW_LINES physical
+ *    rows, followed by `... (N more lines, <expand hint>)` where N is the
+ *    number of WRAPPED ROWS omitted — truthful about what expansion reveals.
  *  - expanded (options.expanded === true): the full text — this is also the
  *    graceful path when the detail callback throws or returns a
  *    non-component, because the shared wrapper falls back here unchanged.
@@ -363,13 +518,17 @@ export function shellCollapsedResultRenderer(
     const text = contentText(result);
     if (text.length === 0) return [];
     const lines = text.split("\n");
-    const shown = expanded ? lines : lines.slice(0, NATIVE_PREVIEW_LINES);
-    const out = shown.flatMap((line) => wrap(theme.fg("toolOutput", line), width));
-    const remaining = lines.length - shown.length;
-    if (remaining > 0) {
-      out.push(...wrap(theme.fg("muted", `... (${remaining} more lines, ${expandHint()})`), width));
-    }
-    return out;
+    // Wrap first, then budget: every logical line reflows into width-safe
+    // display rows before the preview height is applied, so a handful of
+    // max-length log lines cannot grow the collapsed view without bound.
+    const all = lines.flatMap((line) => wrap(theme.fg("toolOutput", line), width));
+    if (expanded || all.length <= NATIVE_PREVIEW_LINES) return all;
+    const omitted = all.length - NATIVE_PREVIEW_LINES;
+    const shown = all.slice(0, NATIVE_PREVIEW_LINES);
+    // Truthful omission disclosure: N counts the wrapped display rows that
+    // are hidden, so it matches what expansion reveals — plus the native hint.
+    shown.push(...wrap(theme.fg("muted", `... (${omitted} more lines, ${expandHint()})`), width));
+    return shown;
   });
 }
 

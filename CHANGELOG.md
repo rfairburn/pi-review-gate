@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.26]
+
+### Changed
+
+- Collapsed `SubtasksInspect` tool cards now distinguish each inspection mode at a
+  glance: the call line names the task and effective selector (`status`, activity
+  offset, `find` query with optional filter, requested entry window, entry/chunk deep
+  read, call handle, or cursor continuation — opaque cursor tokens are never displayed),
+  and evidence result lines lead with the operation-specific outcome — returned entry
+  range with provenance mix and retention-truncated entries, match totals with list
+  truncation, call/result resolution (`returned`, an observed result with unresolved
+  pairing, or in flight with no observed result), deep-read chunk size and continuation,
+  or newer-entry count for cursor reads — plus available continuations and important
+  empty/unavailable/truncated outcomes instead of scheduler boilerplate. Query/selector
+  text is redacted before display, retained content and private reasoning never appear in
+  the collapsed card, expanded results keep their previous summary-first rendering, and
+  native pending/error/cancelled rendering, retrieval bounds, and authority are unchanged
+  (Closes #56).
+
 ## [0.1.0-dev.25]
 
 ### Added

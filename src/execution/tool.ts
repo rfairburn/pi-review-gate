@@ -13,7 +13,8 @@ import {
   type BackgroundTaskDefinition,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
-import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_MAX, EvidenceCursorError, EvidenceNavigationError, type SubtaskEvidenceSelector } from "./subtask-evidence";
+import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_DEFAULT, EVIDENCE_LIMIT_MAX, EvidenceCursorError, EvidenceNavigationError, type SubtaskEvidenceSelector } from "./subtask-evidence";
+import { redactSensitiveText } from "../redaction";
 import {
   completionNotificationGuidanceLine,
   lifecycleWakeGuidanceLine,
@@ -1020,7 +1021,183 @@ interface ThemeLike {
   fg(color: string, text: string): string;
 }
 
+/** #56: bounded, redacted display of one free-text evidence selector. Opaque
+ * tokens (cursors, long ids) are clipped so a card never dumps them. */
+function safeSelector(value: string, maxChars = 48): string {
+  const redacted = redactSensitiveText(value).replace(/\s+/g, " ").trim();
+  return redacted.length <= maxChars ? redacted : `${redacted.slice(0, Math.max(1, maxChars - 1))}…`;
+}
+
+/** #56: compact call-line summary for one SubtasksInspect request. It names the
+ * task and the effective navigation mode using safe selectors only — the same
+ * entryId > callId > cursor > find > range precedence the navigation read uses —
+ * and never displays an opaque cursor token. */
+function inspectCallSummary(args: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (typeof args.taskId === "string" && args.taskId.trim() !== "") parts.push(`task ${safeSelector(args.taskId)}`);
+  const evidence = isRecord(args.evidence) ? args.evidence : undefined;
+  if (evidence) {
+    if (typeof evidence.entryId === "string" && evidence.entryId.trim() !== "") {
+      const chunk = typeof evidence.chunkIndex === "number" ? ` chunk ${evidence.chunkIndex}` : "";
+      parts.push(`entry ${safeSelector(evidence.entryId)}${chunk}`);
+    } else if (typeof evidence.callId === "string" && evidence.callId.trim() !== "") {
+      parts.push(`call ${safeSelector(evidence.callId)}`);
+    } else if (typeof evidence.cursor === "string" && evidence.cursor.trim() !== "") {
+      parts.push("cursor continuation");
+    } else if (typeof evidence.find === "string" && evidence.find.trim() !== "") {
+      const filter = typeof evidence.filter === "string" ? ` filter ${evidence.filter}` : "";
+      parts.push(`find "${safeSelector(evidence.find)}"${filter}`);
+    } else {
+      const start = typeof evidence.index === "number" ? evidence.index : 0;
+      const limit = typeof evidence.limit === "number" ? Math.min(Math.max(evidence.limit, 1), EVIDENCE_LIMIT_MAX) : EVIDENCE_LIMIT_DEFAULT;
+      const filter = typeof evidence.filter === "string" ? ` filter ${evidence.filter}` : "";
+      parts.push(`entries ${start}..${start + limit - 1}${filter}`);
+    }
+  } else if (args.offset !== undefined || args.lines !== undefined) {
+    const offset = typeof args.offset === "number" ? args.offset : 0;
+    const lines = typeof args.lines === "number" ? ` lines=${args.lines}` : "";
+    parts.push(`activity offset=${offset}${lines}`);
+  } else {
+    parts.push("status");
+  }
+  return ` · ${parts.join(" · ")}`;
+}
+
+const PROVENANCE_SHORT: Record<string, (count: number) => string> = {
+  executor_observed: () => "observed",
+  worker_claim: (count) => count === 1 ? "claim" : "claims",
+  reviewer_verdict: (count) => count === 1 ? "review verdict" : "review verdicts",
+};
+
+/** Compact provenance/truncation mix for a set of returned entries. Provenance is
+ * shown only when the read mixes kinds, so a uniform read stays undisturbed while
+ * observed-versus-claimed versus reviewer evidence never blurs together. */
+function entryMixSuffix(entries: Array<Record<string, unknown>>): string {
+  const provenance = new Map<string, number>();
+  let truncated = 0;
+  for (const entry of entries) {
+    if (typeof entry.provenance === "string") provenance.set(entry.provenance, (provenance.get(entry.provenance) ?? 0) + 1);
+    if (entry.truncatedContent === true) truncated += 1;
+  }
+  const parts: string[] = [];
+  if (provenance.size > 1) {
+    parts.push([...provenance.entries()].map(([name, count]) => `${count} ${PROVENANCE_SHORT[name]?.(count) ?? name}`).join(", "));
+  }
+  if (truncated > 0) parts.push(`${truncated} truncated at retention`);
+  return parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
+}
+
+/** #56: mode-specific collapsed result summary for one evidence read. Reports the
+ * returned range/count or match total, available continuations, and important
+ * empty/unavailable/truncated outcomes — never scheduler boilerplate, raw content,
+ * cursor tokens, or private reasoning. */
+function evidenceResultLines(evidence: Record<string, unknown>, theme: ThemeLike): string[] {
+  const mode = typeof evidence.mode === "string" ? evidence.mode : "";
+  const lines: string[] = [];
+  const entries = Array.isArray(evidence.entries) ? evidence.entries.filter(isRecord) : [];
+  switch (mode) {
+    case "find": {
+      const summary = isRecord(evidence.matchSummary) ? evidence.matchSummary : undefined;
+      const query = typeof summary?.query === "string" ? safeSelector(summary.query) : "";
+      const total = typeof summary?.totalMatches === "number" ? summary.totalMatches : 0;
+      if (total === 0) {
+        lines.push(theme.fg("warning", `no matches for "${query}"`));
+      } else {
+        const shown = Array.isArray(evidence.matches) ? evidence.matches.length : 0;
+        let line = theme.fg("success", `${total} match${total === 1 ? "" : "es"} for "${query}"`);
+        if (summary?.matchesTruncated === true || shown < total) line += theme.fg("dim", ` (${shown} shown)`);
+        lines.push(line);
+      }
+      break;
+    }
+    case "range": {
+      if (entries.length === 0) {
+        lines.push(theme.fg("warning", "no entries in this read"));
+      } else {
+        const first = entries[0];
+        const last = entries[entries.length - 1];
+        const from = typeof first?.index === "number" ? first.index : 0;
+        const to = typeof last?.index === "number" ? last.index : from;
+        // A cursor is issued only for unfiltered range reads, so its presence
+        // identifies the sequence total as the read's own base length.
+        const snapshot = isRecord(evidence.snapshot) ? evidence.snapshot : undefined;
+        const total = typeof evidence.cursor === "string" && typeof snapshot?.totalEntries === "number"
+          ? ` of ${snapshot.totalEntries}`
+          : "";
+        lines.push(theme.fg("success", `entries ${from}–${to}${total}`) + theme.fg("dim", entryMixSuffix(entries)));
+      }
+      const continuation: string[] = [];
+      if (typeof evidence.nextIndex === "number") continuation.push(`next page at index=${evidence.nextIndex}`);
+      if (typeof evidence.cursor === "string") continuation.push("incremental cursor available");
+      if (continuation.length > 0) lines.push(theme.fg("dim", continuation.join(" · ")));
+      break;
+    }
+    case "cursor": {
+      lines.push(entries.length > 0
+        ? theme.fg("success", `${entries.length} newer entr${entries.length === 1 ? "y" : "ies"}`) + theme.fg("dim", entryMixSuffix(entries))
+        : theme.fg("warning", "no newer entries"));
+      if (typeof evidence.cursor === "string") lines.push(theme.fg("dim", "updated cursor issued for the next continuation"));
+      break;
+    }
+    case "call": {
+      const pair = isRecord(evidence.callPair) ? evidence.callPair : undefined;
+      const callId = typeof pair?.call?.callId === "string" ? (pair.call.callId as string)
+        : typeof pair?.result?.callId === "string" ? (pair.result.callId as string)
+          : "";
+      const label = callId ? `call ${safeSelector(callId)}` : "call";
+      if (pair?.status === "returned") {
+        lines.push(theme.fg("success", `${label} · result returned`));
+      } else if (isRecord(pair?.result)) {
+        // readCall reports an observed source-scoped result without a validated
+        // pair as in_flight: the result record exists, only the pairing is
+        // unresolved — never claim it was absent.
+        lines.push(theme.fg("warning", `${label} · result observed, pairing unresolved`));
+      } else {
+        lines.push(theme.fg("warning", `${label} · in flight, result not observed yet`));
+      }
+      break;
+    }
+    case "entry": {
+      const deep = isRecord(evidence.deepContent) ? evidence.deepContent : undefined;
+      const entryId = typeof deep?.entryId === "string" ? safeSelector(deep.entryId) : "";
+      const chunkIndex = typeof deep?.chunkIndex === "number" ? deep.chunkIndex : 0;
+      const chars = typeof deep?.content === "string" ? deep.content.length : 0;
+      lines.push(theme.fg("success", `entry ${entryId} · chunk ${chunkIndex} · ${chars} char${chars === 1 ? "" : "s"}`));
+      if (deep?.hasMore === true && typeof deep?.nextChunk === "number") {
+        lines.push(theme.fg("dim", `more chunks (next: ${deep.nextChunk})`));
+      }
+      if (deep?.truncatedContent === true) {
+        lines.push(theme.fg("warning", "source record truncated at retention cap"));
+      } else if (typeof deep?.note === "string" && deep.note.trim() !== "") {
+        lines.push(theme.fg("warning", clipPlain(deep.note, 120)));
+      }
+      break;
+    }
+    default:
+      lines.push(theme.fg("success", mode ? `evidence read (${mode})` : "evidence read"));
+  }
+  const snapshot = isRecord(evidence.snapshot) ? evidence.snapshot : undefined;
+  const capability = isRecord(snapshot?.capability) ? snapshot.capability : undefined;
+  if (capability?.toolEvidence === "unavailable") {
+    lines.push(theme.fg("warning", `tool evidence unavailable: ${safeSelector(String(capability.reason ?? "no tool records"))}`));
+  } else if (Array.isArray(snapshot?.unavailable) && snapshot.unavailable.length > 0) {
+    const notes = snapshot.unavailable;
+    const reasons = [...new Set(notes.filter(isRecord).map((item) => (typeof item.reason === "string" ? item.reason : "unknown")))];
+    lines.push(theme.fg("dim", `${notes.length} unavailable source note(s): ${reasons.slice(0, 3).join(", ")}${reasons.length > 3 ? ` +${reasons.length - 3} more` : ""}`));
+  }
+  return lines;
+}
+
 function renderCall(toolName: string, action: Action, args: unknown, theme: ThemeLike): unknown {
+  // #56: inspection cards name the task and effective navigation mode so distinct
+  // searches, ranged reads, deep reads, call resolutions, and cursor continuations
+  // no longer look like repeated identical calls.
+  if (action === "inspect") {
+    return textComponent((width) => [clip(
+      theme.fg("toolTitle", theme.bold(toolName)) + theme.fg("accent", inspectCallSummary(isRecord(args) ? args : {})),
+      width,
+    )]);
+  }
   const taskCount = isRecord(args) && Array.isArray(args.tasks) ? ` · ${args.tasks.length} task${args.tasks.length === 1 ? "" : "s"}` : "";
   // #25: surface the explicit execution target at dispatch so the rendered
   // call shows which checkout/worktree the group will capture and land into.
@@ -1030,13 +1207,31 @@ function renderCall(toolName: string, action: Action, args: unknown, theme: Them
   return textComponent((width) => [clip(theme.fg("toolTitle", theme.bold(toolName)) + theme.fg("accent", taskCount || ` · ${action}`) + workspace, width)]);
 }
 
-function renderResult(value: unknown, _options: unknown, theme: ThemeLike): unknown {
+function renderResult(value: unknown, options: unknown, theme: ThemeLike): unknown {
   const details = isRecord(value) && isRecord(value.details) ? value.details : undefined;
   const summary = isRecord(value) && Array.isArray(value.content) && isRecord(value.content[0]) && typeof value.content[0].text === "string"
     ? value.content[0].text
     : "No execution result.";
+  const isError = isRecord(value) && value.isError === true;
+  const optionsRecord = isRecord(options) ? options : undefined;
+  const isPartial = optionsRecord?.isPartial === true;
+  // #56: the operation-specific summary is the collapsed-card experience. Expanded
+  // results keep their previous summary-first rendering (expansion details are a
+  // separate concern, #57).
+  const isExpanded = optionsRecord?.expanded === true;
   return textComponent((width) => {
-    const lines = [clip(theme.fg(isRecord(value) && value.isError ? "error" : "success", summary), width)];
+    if (isPartial) return [clip(theme.fg("warning", "inspecting…"), width)];
+    const lines: string[] = [];
+    // #56: collapsed evidence navigation reads lead with the operation-specific
+    // outcome instead of the group/scheduler summary line; every other result
+    // (including expanded and error/cancelled outcomes) keeps the native
+    // summary-first rendering.
+    const evidence = details && isRecord(details.evidence) ? details.evidence : undefined;
+    if (!isError && !isExpanded && evidence) {
+      for (const line of evidenceResultLines(evidence, theme)) lines.push(clip(line, width));
+    } else {
+      lines.push(clip(theme.fg(isError ? "error" : "success", summary), width));
+    }
     if (details && Array.isArray(details.tasks)) {
       const renderedTasks = details.tasks.slice(0, 8);
       for (const task of renderedTasks) {

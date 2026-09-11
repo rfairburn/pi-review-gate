@@ -615,6 +615,120 @@ test("persistent launcher fails closed when a directory appears at the config pa
   );
 });
 
+test("persistent launcher publishes skills over a concurrently published destination (#97)", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-skill-race-");
+  // A pre-existing fallback config focuses the test on skill publication.
+  await mkdir(join(fixture.home, ".config", "pi"), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  // Deterministic seam for the CI race: intercept the launcher's renameSync
+  // publication call and plant a stale destination first, exactly as a
+  // concurrent first launch would have published it between this launch's
+  // content check and its publication. The old install-based publication hit
+  // GNU "cannot create regular file ... File exists" in precisely this state.
+  // The shim records every destination it intercepts so the test fails if the
+  // launcher ever stops publishing through this seam (e.g. a revert to a
+  // non-node publisher would bypass the plant and pass silently).
+  const plantedLog = join(fixture.capture, "planted-destinations");
+  const nodeShim = join(fixture.bin, "node");
+  await writeFile(nodeShim, [
+    "#!/usr/bin/env bash",
+    'if [[ "$1" == "-e" && "$2" == *renameSync* ]]; then',
+    "  printf 'stale concurrent publication\\n' > \"$4\"",
+    "  printf '%s\\n' \"$4\" >> \"$CAPTURE_DIR/planted-destinations\"",
+    "fi",
+    `exec "${process.execPath}" "$@"`,
+  ].join("\n"), "utf8");
+  await chmod(nodeShim, 0o755);
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  assert.doesNotMatch(
+    result.stderr,
+    /refusing to|could not (create|write|set)|unexpected failure|File exists/,
+    "publication over an already-published destination must not fail",
+  );
+  assert.match(result.stdout, new RegExp(escapeRegExp(fixture.fallbackConfigPath)));
+  assert.equal(await capturedConfigPath(fixture), fixture.fallbackConfigPath);
+
+  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  // The atomic rename must have replaced the concurrently published (stale)
+  // destination with the complete current content, at the contracted mode.
+  assert.equal(
+    await readFile(join(skillDir, "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+    "the skill must be complete and current, not the stale planted content",
+  );
+  assert.equal(
+    await readFile(join(skillDir, "references", "recovery.md"), "utf8"),
+    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+    "the recovery reference must be complete and current",
+  );
+  for (const file of [join(skillDir, "SKILL.md"), join(skillDir, "references", "recovery.md")]) {
+    assert.equal((await stat(file)).mode & 0o777, 0o644, `${file} must keep the contracted 0644 mode`);
+  }
+  for (const dir of [skillDir, join(skillDir, "references")]) {
+    const entries = await readdir(dir);
+    assert.ok(
+      !entries.some((entry) => entry.startsWith(".skill-publish.")),
+      `temporary skill files left behind in ${dir}: ${entries.join(", ")}`,
+    );
+  }
+  assert.deepEqual(await readdir(join(skillDir, "references")), ["recovery.md"]);
+
+  // The seam must have actually intercepted both publications; without this
+  // the stale-destination precondition would never be in effect.
+  const planted = (await readFile(plantedLog, "utf8")).split("\n").filter((line) => line.length > 0);
+  assert.deepEqual(planted, [
+    join(skillDir, "SKILL.md"),
+    join(skillDir, "references", "recovery.md"),
+  ], "the seam must have planted both skill destinations before publication");
+});
+
+test("persistent launcher fails closed when a directory appears at a skill path before publication (#97)", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-skill-dir-");
+  await mkdir(join(fixture.home, ".config", "pi"), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  // Deterministically race the skill publish step: intercept the launcher's
+  // node invocation and create a directory at the exact destination before
+  // the renameSync call runs. Exact-destination rename semantics must reject
+  // it instead of moving the staged file into the directory.
+  const nodeShim = join(fixture.bin, "node");
+  await writeFile(nodeShim, [
+    "#!/usr/bin/env bash",
+    'if [[ "$1" == "-e" && "$2" == *renameSync* ]]; then',
+    '  mkdir -p "$4" 2>/dev/null || true',
+    "fi",
+    `exec "${process.execPath}" "$@"`,
+  ].join("\n"), "utf8");
+  await chmod(nodeShim, 0o755);
+
+  await assert.rejects(
+    runLauncher([], launcherEnv(fixture)),
+    (error: unknown) => {
+      assert.ok(isExecError(error));
+      assert.equal(error.code, 2);
+      assert.match(error.stderr, /not a replaceable regular file/);
+      return true;
+    },
+  );
+
+  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  assert.ok((await stat(join(skillDir, "SKILL.md"))).isDirectory(), "the racing directory must not be removed");
+  assert.deepEqual(await readdir(join(skillDir, "SKILL.md")), [], "no file may be published into the directory");
+  const entries = await readdir(skillDir);
+  assert.ok(
+    !entries.some((entry) => entry.startsWith(".skill-publish.")),
+    `temporary skill files left behind in ${skillDir}: ${entries.join(", ")}`,
+  );
+  assert.equal(
+    await readFile(join(fixture.capture, "config-env"), "utf8").then(() => true, () => false),
+    false,
+    "the launcher must not start pi when skill publication fails",
+  );
+});
+
 test("concurrent first launches never clobber or expose partial JSON", async () => {
   const fixture = await makeLauncherFixture("pi-review-launcher-race-");
   const racerCount = 8;
@@ -643,6 +757,28 @@ test("concurrent first launches never clobber or expose partial JSON", async () 
   const generated = JSON.parse(await readFile(fixture.primaryConfigPath, "utf8")) as unknown;
   assert.deepEqual(generated, zeroModelDefaultConfig, "the surviving config must be the complete default");
   await assertNoTempLitter(join(fixture.home, ".config", "pi-review-gate"));
+
+  // Issue 97: every racer also publishes the orchestrator skill; all of them
+  // must complete and leave the complete current skill content (the old
+  // install-based publication raced into a GNU EEXIST failure on Linux).
+  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  assert.equal(
+    await readFile(join(skillDir, "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+    "the surviving skill must be complete and current",
+  );
+  assert.equal(
+    await readFile(join(skillDir, "references", "recovery.md"), "utf8"),
+    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+    "the surviving recovery reference must be complete and current",
+  );
+  for (const dir of [skillDir, join(skillDir, "references")]) {
+    const entries = await readdir(dir);
+    assert.ok(
+      !entries.some((entry) => entry.startsWith(".skill-publish.")),
+      `temporary skill files left behind in ${dir}: ${entries.join(", ")}`,
+    );
+  }
 });
 
 test("ensure-ddgs provisions and validates Python in isolated mode", async () => {

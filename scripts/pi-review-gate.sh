@@ -185,12 +185,61 @@ if [[ ! -f "$ORCHESTRATOR_RECOVERY_SOURCE" ]]; then
   exit 2
 fi
 
-mkdir -p "$ORCHESTRATOR_SKILL_DIR/references"
+# Publish one orchestrator skill file atomically (issue 97). The content is
+# staged in a private temporary file inside the destination directory and then
+# moved into place with an atomic rename(2) (Node's fs.renameSync), mirroring
+# the default-config publication above. rename() replaces an existing regular
+# destination in a single step, so concurrent first launches publishing the
+# same skill cannot fail over each other: GNU install overwrites by unlinking
+# the destination and recreating it with O_CREAT|O_EXCL (install's
+# unlink_dest_before_opening), and two interleaved launches race exactly that
+# window into "cannot create regular file ... File exists". Readers likewise
+# never observe a missing or partially written skill file: the final path
+# holds either the old complete file or the new complete one. A destination
+# symlink is replaced atomically as well (the link itself, never followed),
+# but if the destination is a directory rename fails and the launcher refuses
+# to continue instead of publishing somewhere else.
+publish_orchestrator_skill_file() {
+  local skill_source="$1" skill_destination="$2" dir tmp
+  dir="$(dirname "$skill_destination")"
+  if ! command -v node >/dev/null 2>&1; then
+    echo "pi-review-gate: the node runtime is required to publish the orchestrator skill (install Node.js 20 or newer)" >&2
+    return 1
+  fi
+  tmp="$(mktemp "$dir/.skill-publish.XXXXXXXX")" || {
+    echo "pi-review-gate: could not create a temporary file in $dir (permission denied?); the orchestrator skill cannot be published to $skill_destination" >&2
+    return 1
+  }
+  if ! cp -f "$skill_source" "$tmp"; then
+    rm -f "$tmp"
+    echo "pi-review-gate: could not stage $skill_source for publication to $skill_destination (disk full?)" >&2
+    return 1
+  fi
+  # Set the final mode before the rename so the published path never exists in
+  # any other state (mktemp creates 0600; the skill files are 0644).
+  if ! chmod 644 "$tmp"; then
+    rm -f "$tmp"
+    echo "pi-review-gate: could not set permissions on the staged orchestrator skill file in $dir; refusing to continue" >&2
+    return 1
+  fi
+  if node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2]);' "$tmp" "$skill_destination" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp"
+  if [[ -d "$skill_destination" ]]; then
+    echo "pi-review-gate: $skill_destination exists but is not a replaceable regular file (a directory appeared there?); move or rename that path and re-run the launcher" >&2
+  else
+    echo "pi-review-gate: unexpected failure publishing the orchestrator skill to $skill_destination; re-run the launcher" >&2
+  fi
+  return 1
+}
+
+mkdir -p "$ORCHESTRATOR_SKILL_DIR/references" || exit 2
 if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/SKILL.md" ]] || ! cmp -s "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md"; then
-  install -m 0644 "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md"
+  publish_orchestrator_skill_file "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md" || exit 2
 fi
 if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/references/recovery.md" ]] || ! cmp -s "$ORCHESTRATOR_RECOVERY_SOURCE" "$ORCHESTRATOR_SKILL_DIR/references/recovery.md"; then
-  install -m 0644 "$ORCHESTRATOR_RECOVERY_SOURCE" "$ORCHESTRATOR_SKILL_DIR/references/recovery.md"
+  publish_orchestrator_skill_file "$ORCHESTRATOR_RECOVERY_SOURCE" "$ORCHESTRATOR_SKILL_DIR/references/recovery.md" || exit 2
 fi
 
 export PI_REVIEW_GATE_CONFIG="$REVIEW_GATE_CONFIG"

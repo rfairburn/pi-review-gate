@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.34]
+
+### Fixed
+
+- Concurrent launches now publish complete orchestrator skill files with an
+  atomic replacement instead of racing over the destination. Existing file
+  modes, configuration initialization, and fail-closed publication errors are
+  preserved ([#97](https://github.com/rfairburn/pi-review-gate/issues/97)).
+- Dispatch-card lifecycle regressions now retain simulated live row owners and
+  distinguish recoverable interrupted tasks from permanently settled tasks,
+  covering both continued subscriptions and eventual cleanup
+  ([#97](https://github.com/rfairburn/pi-review-gate/issues/97)).
+
 ## [0.1.0-dev.33]
 
 ### Added

@@ -835,7 +835,17 @@ test("an early queued card survives registration of more than 64 further executi
     assert.equal(holder.isError, false);
     const holderId = holder.details.executionId as string;
     const holderTaskId = holder.details.tasks[0].taskId as string;
-    renderCard(start, holder, { state: {} as Record<string, unknown>, invalidate() {} });
+    // Every simulated mounted row owner is retained STRONGLY for the whole
+    // test lifetime: production row identity is the renderer context's
+    // per-row state object, and discarding it would let GC release the
+    // subscription nondeterministically, making hasDispatchCardWatcher
+    // (and this FIFO regression) meaningless. Each render asserts its own
+    // subscription presence so the regression is anchored before any await.
+    const mountedRows: Array<{ state: Record<string, unknown> }> = [];
+    const holderRow = { state: {} as Record<string, unknown>, invalidate() {} };
+    renderCard(start, holder, holderRow);
+    mountedRows.push(holderRow);
+    assert.equal(hasDispatchCardWatcher(holderId), true, "the rendered holder row holds a live subscription");
 
     // The early card: queued behind the holder, rendered (subscribed) second.
     const early = await (start.execute as ExecuteTool)("retention-early", {
@@ -847,16 +857,25 @@ test("an early queued card survives registration of more than 64 further executi
     const invalidateCount = { count: 0 };
     const context = { state: {} as Record<string, unknown>, invalidate: () => { invalidateCount.count += 1; } };
     const queuedCard = renderCard(start, early, context);
+    mountedRows.push(context);
     assert.match(queuedCard, /dispatch: not yet sent/);
+    assert.equal(hasDispatchCardWatcher(earlyId), true, "the rendered early row holds a live subscription");
 
     // Register MORE than the old hard cap of 64 further watched executions:
-    // each filler is a real registered Start with its own rendered row.
+    // each filler is a real registered Start with its own rendered row, and
+    // every filler row owner is retained (and verified) like the others.
+    const fillerIds: string[] = [];
     for (let i = 1; i <= 65; i += 1) {
       const filler = await (start.execute as ExecuteTool)(`retention-filler-${i}`, {
         tasks: [{ title: `Filler ${i}`, instructions: `FILLER_${i}_SENTINEL`, acceptanceCriteria: ["queued"] }],
       }, undefined, undefined, {});
       assert.equal(filler.isError, false);
-      renderCard(start, filler, { state: {} as Record<string, unknown>, invalidate() {} });
+      const fillerRow = { state: {} as Record<string, unknown>, invalidate() {} };
+      renderCard(start, filler, fillerRow);
+      mountedRows.push(fillerRow);
+      const fillerId = filler.details.executionId as string;
+      fillerIds.push(fillerId);
+      assert.equal(hasDispatchCardWatcher(fillerId), true, `filler ${i} row holds its subscription after render`);
     }
 
     // Release the slot: the early task dispatches next in queue order.
@@ -870,6 +889,11 @@ test("an early queued card survives registration of more than 64 further executi
       const entry = controller.liveDispatchView(holderId)?.tasks.find((candidate) => candidate.taskId === holderTaskId);
       return Boolean(entry && !isActiveTaskState(entry.state));
     }, 30_000, "holder settled after interrupt");
+    assert.equal(
+      taskDispatchEntry(controller.liveDispatchView(holderId), holderTaskId).state,
+      "interrupted",
+      "the holder stopped as failure into the recoverable interrupted state",
+    );
 
     await waitFor(
       () => Boolean(taskDispatchEntry(controller.liveDispatchView(earlyId), earlyTaskId).dispatch),
@@ -883,11 +907,98 @@ test("an early queued card survives registration of more than 64 further executi
     const dispatchedCard = renderCard(start, early, context);
     assert.match(dispatchedCard, /dispatch: prompt delivered to transport/);
 
-    // Lifecycle-aware sweep: the settled holder's entry was retired by the
-    // dispatch event, while the still-live early card and queued fillers keep
-    // their subscriptions.
-    assert.equal(hasDispatchCardWatcher(holderId), false, "settled execution's card entry is swept on the next dispatch event");
+    // Recoverable-subscription contract: the interrupted holder is inactive
+    // but NOT archivable — it can be continued and dispatch again — so the
+    // sweep must keep its card subscription (asserting its removal here would
+    // demand a production cleanup defect). The >64 fact is the early card and
+    // every filler row still holding their subscriptions across all later
+    // registrations and the sweep pass itself; genuinely archivable sweep is
+    // covered separately via real controller transitions.
+    assert.equal(hasDispatchCardWatcher(holderId), true, "recoverable interrupted holder keeps its card subscription across sweeps");
     assert.equal(hasDispatchCardWatcher(earlyId), true, "live execution keeps its card subscription");
+    for (const [index, fillerId] of fillerIds.entries()) {
+      assert.equal(hasDispatchCardWatcher(fillerId), true, `filler ${index + 1} keeps its subscription after the sweep`);
+    }
+    assert.ok(mountedRows.length >= 67, "all simulated mounted rows stayed strongly owned for the test lifetime");
+  } finally {
+    if (manager) {
+      await manager.shutdown();
+      await manager.detach();
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a genuinely archivable (landed) execution's card entry is swept by the next dispatch event after real controller transitions", async () => {
+  resetDispatchCardsForTests();
+  const root = await mkRepo("pi-review-dispatch-sweep-");
+  let manager: ExecutionToolManager | undefined;
+  try {
+    // Fast-completing execute executor: the task runs, reviews, and lands
+    // through the actual controller lifecycle, ending in the archivable
+    // "landed" state (no fake empty state, no forced internals).
+    const stdinCapture = join(root, "executor-stdin.json");
+    await writeRecordingExecutor(root, { stdinCapture, delayMs: 100 });
+    const tools: Array<Record<string, any>> = [];
+    const pi: Record<string, any> = {
+      registerTool(tool: Record<string, any>) { tools.push(tool); },
+      registerCommand() {},
+      setToolActive() {},
+      getActiveTools() { return ["read", "bash", "SubtasksStart"]; },
+    };
+    const config = controllerConfig(root, join(root, "dispatch-executor.cjs"), 1);
+    manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => root });
+    manager.sync();
+    const controller = controllerOf(manager);
+    const start = toolOf(tools, "SubtasksStart");
+
+    // First execution: a task whose real lifecycle ends archivable.
+    const first = await (start.execute as ExecuteTool)("sweep-first", {
+      tasks: [{ title: "Landing sweep task", instructions: "LAND_AND_SETTLE_SENTINEL", acceptanceCriteria: ["done"] }],
+    }, undefined, undefined, {});
+    assert.equal(first.isError, false);
+    const firstId = first.details.executionId as string;
+    const firstTaskId = first.details.tasks[0].taskId as string;
+    // The row owner stays strongly referenced for the whole test so the
+    // subscription can only be removed by the production sweep, never by GC.
+    const firstRow = { state: {} as Record<string, unknown>, invalidate() {} };
+    renderCard(start, first, firstRow);
+    assert.equal(hasDispatchCardWatcher(firstId), true, "the archivable-bound row holds its subscription after render");
+
+    // Wait for the REAL controller transition into the archivable state.
+    await waitFor(
+      () => taskDispatchEntry(controller.liveDispatchView(firstId), firstTaskId).state === "landed",
+      45_000,
+      "execute task reaching the archivable landed state",
+    );
+    // Reaching the archivable state alone sweeps nothing: the sweep runs only
+    // on the next actual dispatch event.
+    assert.equal(hasDispatchCardWatcher(firstId), true, "no eviction before the next dispatch event");
+
+    // A second, still-live execution dispatches; its dispatch event runs the
+    // sweep pass over every watched execution.
+    const second = await (start.execute as ExecuteTool)("sweep-second", {
+      tasks: [{ title: "Sweep trigger task", instructions: "SWEEP_TRIGGER_SENTINEL", acceptanceCriteria: ["dispatched"] }],
+    }, undefined, undefined, {});
+    assert.equal(second.isError, false);
+    const secondId = second.details.executionId as string;
+    const secondTaskId = second.details.tasks[0].taskId as string;
+    const secondRow = { state: {} as Record<string, unknown>, invalidate() {} };
+    renderCard(start, second, secondRow);
+    assert.equal(hasDispatchCardWatcher(secondId), true, "the sweep-trigger row holds its subscription");
+    await waitFor(
+      () => Boolean(taskDispatchEntry(controller.liveDispatchView(secondId), secondTaskId).dispatch),
+      30_000,
+      "sweep-trigger dispatch record",
+    );
+
+    assert.equal(hasDispatchCardWatcher(firstId), false, "the archivable execution's card entry is swept by the next dispatch event");
+    assert.equal(hasDispatchCardWatcher(secondId), true, "the live execution keeps its subscription through the sweep");
+    // Keep both row owners observably reachable until after the watcher
+    // assertions (no rerender, which would resubscribe): a collected owner
+    // could otherwise let GC release a subscription and masquerade as a
+    // production sweep.
+    assert.notStrictEqual(firstRow.state, secondRow.state, "both sweep-test row owners stayed reachable through the final watcher assertions");
   } finally {
     if (manager) {
       await manager.shutdown();
@@ -1042,7 +1153,9 @@ test("an interrupted original card keeps its subscription across an unrelated di
       "original dispatch record",
     );
 
-    // Render the original card: subscribes through weak row ownership.
+    // Render the original card. The row owner stays strongly referenced by
+    // this test for its whole lifetime, so the subscription below can only
+    // disappear through real production cleanup, never through GC.
     const invalidateCount = { count: 0 };
     const context = { state: {} as Record<string, unknown>, invalidate: () => { invalidateCount.count += 1; } };
     renderCard(start, original, context);

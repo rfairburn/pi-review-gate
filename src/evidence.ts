@@ -66,7 +66,14 @@ const TRANSIENT_DISCOVERY_TOOLS = new Set([
 ]);
 const PATH_MUTATION_TOOLS = new Set(["write", "edit"]);
 const APPLY_PATCH_TOOL = "applypatch";
-const SHELL_TOOLS = new Set(["bash", "shellstart"]);
+/**
+ * Native command-execution tools whose command text feeds candidate-path and
+ * risk-signal extraction (#94). Pi's native `powershell` tool (Windows-only)
+ * carries the same `command` input shape as `bash`, so it receives the
+ * identical side-effect evidence treatment. ShellStart stays listed: it is
+ * the extension's own background shell tool name.
+ */
+const SHELL_TOOLS = new Set(["bash", "powershell", "shellstart"]);
 
 export function shouldRecordToolCallEvidence(toolName: string): boolean {
   return !TRANSIENT_DISCOVERY_TOOLS.has(normalizedToolName(toolName));

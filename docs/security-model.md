@@ -11,6 +11,9 @@ accept from an untrusted repository, task, or process environment:
 
 - `PI_REVIEW_GATE_CONFIG` — config file selection (the launcher re-resolves it so an
   inherited value from a parent pi session cannot redirect the gate).
+- `PI_CODING_AGENT_DIR` — Pi's native override of the Pi agent directory, which also
+  relocates implicitly discovered review-gate config
+  ([Configuration](configuration.md#config-discovery)).
 - `PI_REVIEW_GATE_DISABLED` — the documented kill switch.
 - `PI_REVIEW_GATE_DDGS_VENV`, `XDG_CACHE_HOME` / `HOME` — venv and cache locations for
   the web search bridge. The default venv lives in a user-writable cache by design.

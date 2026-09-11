@@ -18,6 +18,14 @@ export const DEFERRED_TOOL_SEARCH_NAME = "search_tools";
  */
 export const NATIVE_DISCOVERY_TOOLS = ["grep", "find", "ls"] as const;
 /**
+ * Native shell tools that may start active for execution workers (#94). Pi
+ * ships `bash` on every platform and an optional `powershell` tool on Windows
+ * (docs/windows.md); a host exposes whichever it actually registered, so the
+ * order lists both and the authorized-catalog filter below drops any shell
+ * the host did not authorize. Neither name ever widens a catalog on its own.
+ */
+const EXECUTOR_SHELL_TOOLS = ["bash", "powershell"] as const;
+/**
  * Conservative startup subset for deferred-tool sessions, in every top-level
  * operating mode and delegated role. Launch-authorized native read-only
  * discovery belongs to that subset: it is active from the first request — no
@@ -27,7 +35,7 @@ export const NATIVE_DISCOVERY_TOOLS = ["grep", "find", "ls"] as const;
  * --exclude-tools, or --no-tools keeps those capabilities excluded.
  */
 export const DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER = [
-  "read", ...NATIVE_DISCOVERY_TOOLS, "bash", "edit", "write", "ApplyPatch", "SubtasksStart",
+  "read", ...NATIVE_DISCOVERY_TOOLS, ...EXECUTOR_SHELL_TOOLS, "edit", "write", "ApplyPatch", "SubtasksStart",
 ] as const;
 
 export interface ExecutorToolCatalog {

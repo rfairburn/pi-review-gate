@@ -23,24 +23,184 @@ unset PI_REVIEW_GATE_CONFIG
 # the extension so loadConfig() cleanly refuses to activate. Unsetting it here
 # would silently defeat the kill switch.
 
-# First-launch initialization (issue 32): when neither discovered config exists,
-# create a private zero-model default config at the preferred location and
-# continue normal startup. It never overwrites an existing or malformed config,
-# never exposes partial JSON at the final path, and never clobbers a config that
-# a concurrent launch created in the same window. Only the resolved path is
+# PI_CODING_AGENT_DIR is also deliberately NOT unset: Pi itself honors it for
+# its own agent directory, so the gate must resolve its config against the
+# same directory instead of silently diverging from the running agent.
+
+# Native Pi agent-dir resolution (issue 94), mirroring Pi's getAgentDir() in
+# the installed dist/config.js: a non-empty PI_CODING_AGENT_DIR wins with
+# Pi's native semantics, and the default is the native agent directory
+# <homedir>/.pi/agent. Home resolution mirrors node's os.homedir(): USERPROFILE
+# on Windows (never the Git Bash HOME, which may legitimately differ), HOME on
+# POSIX. Keep this in sync with src/config-path.ts, which mirrors the same
+# semantics for the runtime; the duplication is deliberate because the
+# launcher must resolve paths before the (pre-build/packaged) extension is
+# available.
+launcher_on_windows() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Parity with Pi's normalizeWindowsShellPath (dist/utils/paths.js): lone
+# leading drive paths (/c/x, /mnt/c/x, /cygdrive/c/x) become C:\x; UNC paths,
+# backslash-bearing paths and non-drive POSIX paths are returned unchanged.
+normalize_windows_shell_path() {
+  local path="$1"
+  case "$path" in
+    "//"*|*\\*) printf '%s\n' "$path"; return 0 ;;
+  esac
+  if [[ "$path" =~ ^/(mnt/|cygdrive/)?([A-Za-z])(/(.*))?$ ]]; then
+    local drive="${BASH_REMATCH[2]}"
+    local rest="${BASH_REMATCH[4]}"
+    # tr instead of ${var^^}: the uppercase expansion needs bash 4+, but the
+    # launcher must also run under macOS's stock bash 3.2.
+    drive="$(printf '%s' "$drive" | tr '[:lower:]' '[:upper:]')"
+    if [[ -n "$rest" ]]; then
+      printf '%s\n' "$drive:\\${rest//\//\\}"
+    else
+      printf '%s\n' "$drive:\\"
+    fi
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+# Native Windows path -> POSIX form, for the shell's own filesystem tools
+# (dirname, mkdir, mktemp): MSYS tooling does not treat backslashes as
+# directory separators, so every internal path stays forward-slashed.
+# Prefers cygpath (the canonical Git Bash/MSYS mapping) and falls back to a
+# plain drive-letter mapping when cygpath is unavailable. Identity off Windows.
+windows_native_to_shell_path_fallback() {
+  local p="$1"
+  case "$p" in
+    [A-Za-z]:*)
+      local drive="${p:0:1}"
+      local rest="${p:2}"
+      rest="${rest//\\//}"
+      rest="${rest#/}"
+      drive="$(printf '%s' "$drive" | tr '[:upper:]' '[:lower:]')"
+      if [[ -n "$rest" ]]; then
+        printf '%s\n' "/${drive}/${rest}"
+      else
+        printf '%s\n' "/${drive}"
+      fi
+      ;;
+    *) printf '%s\n' "$p" ;;
+  esac
+}
+
+shell_path_of() {
+  local p="$1"
+  launcher_on_windows || { printf '%s\n' "$p"; return 0; }
+  if command -v cygpath >/dev/null 2>&1; then
+    if cygpath -u "$p" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  windows_native_to_shell_path_fallback "$p"
+}
+
+# POSIX (shell) path -> native Windows form, for anything handed to native
+# processes through the environment: MSYS converts program arguments but never
+# environment variables, and Node cannot open /c/... paths on Windows.
+windows_shell_to_native_path_fallback() {
+  local p="$1"
+  case "$p" in
+    # Already a native drive path (possibly with mixed separators): unify to
+    # backslashes.
+    [A-Za-z]:\\*) printf '%s\n' "${p//\//\\}"; return 0 ;;
+  esac
+  normalize_windows_shell_path "$p"
+}
+
+native_path_of() {
+  local p="$1"
+  launcher_on_windows || { printf '%s\n' "$p"; return 0; }
+  if command -v cygpath >/dev/null 2>&1; then
+    if cygpath -w "$p" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  windows_shell_to_native_path_fallback "$p"
+}
+
+native_home_value() {
+  if launcher_on_windows; then
+    printf '%s\n' "${USERPROFILE:-$HOME}"
+  else
+    printf '%s\n' "${HOME:-}"
+  fi
+}
+
+resolve_pi_agent_dir() {
+  local override="${PI_CODING_AGENT_DIR:-}"
+  if [[ -z "$override" ]]; then
+    printf '%s\n' "$SHELL_HOME/.pi/agent"
+    return 0
+  fi
+  case "$override" in
+    "~") printf '%s\n' "$SHELL_HOME"; return 0 ;;
+    ["~"]/*) printf '%s\n' "$SHELL_HOME/${override#??}"; return 0 ;;
+  esac
+  if launcher_on_windows; then
+    case "$override" in
+      ["~"]\\*) printf '%s\n' "$SHELL_HOME/${override#??}"; return 0 ;;
+    esac
+    # Pi normalizes Git Bash/WSL/Cygwin drive forms (/c, /mnt/c, /cygdrive/c)
+    # to the native path before anything else. Mirror that before cygpath,
+    # which does not interpret /mnt or /cygdrive as drive mounts, so the
+    # launcher and the runtime resolve the same directory.
+    override="$(normalize_windows_shell_path "$override")"
+    override="$(shell_path_of "$override")"
+  fi
+  printf '%s\n' "$override"
+}
+
+# Config locations (issue 94), kept in shell form: all filesystem operations
+# below (dirname, mkdir, mktemp, link publication) operate on forward-slashed
+# paths so they behave identically under MSYS; the path selected for pi is
+# converted to the native Windows form only at the export boundary. The
+# default on all platforms is the native Pi agent directory plus
+# review-gate.json; the sole implicit compatibility fallback is the historical
+# XDG location below. The pre-#94 candidate ~/.config/pi/review-gate.json is
+# no longer discovered or initialized, and there is no automatic migration.
+NATIVE_HOME="$(native_home_value)"
+SHELL_HOME="$(shell_path_of "$NATIVE_HOME")"
+PI_AGENT_DIR="$(resolve_pi_agent_dir)"
+PI_AGENT_DIR="${PI_AGENT_DIR%/}"
+REVIEW_GATE_DEFAULT_CONFIG="$PI_AGENT_DIR/review-gate.json"
+REVIEW_GATE_COMPAT_CONFIG="$SHELL_HOME/.config/pi-review-gate/config.json"
+
+# First-launch initialization (issue 32, re-anchored by issue 94): when
+# neither the Pi-agent default nor the compatibility fallback exists, create a
+# private zero-model default config at the Pi-agent default location and
+# continue normal startup. The compatibility fallback is never created.
+# Initialization never overwrites an existing or malformed config, never
+# exposes partial JSON at the final path, and never clobbers a config that a
+# concurrent launch created in the same window. Only the resolved path is
 # printed to stdout; all notices go to stderr.
 initialize_default_review_gate_config() {
-  local primary="$HOME/.config/pi-review-gate/config.json"
-  local fallback="$HOME/.config/pi/review-gate.json"
+  local primary="$REVIEW_GATE_DEFAULT_CONFIG"
+  local fallback="$REVIEW_GATE_COMPAT_CONFIG"
   local dir probe parent level tmp i prev_umask
   local missing=()
 
   # Re-check discovery: another launch (or the user) may have created a config
-  # between the first pass and now. Preserve the same precedence.
+  # between the first pass and now. Preserve the same precedence and the same
+  # fail-closed validity rule: a present candidate must be a usable regular
+  # file (dangling symlinks and directories included), and an invalid
+  # higher-priority candidate is never bypassed in favor of a lower-priority
+  # one.
   for candidate in "$primary" "$fallback"; do
-    if [[ -f "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
+    if [[ -L "$candidate" || -e "$candidate" ]]; then
+      if [[ -f "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      echo "pi-review-gate: $candidate appeared during initialization but is not a regular file; refusing to continue" >&2
+      return 1
     fi
   done
 
@@ -152,20 +312,37 @@ EOF
   return 1
 }
 
-REVIEW_GATE_CONFIG=""
-for candidate in \
-  "$HOME/.config/pi-review-gate/config.json" \
-  "$HOME/.config/pi/review-gate.json"
-do
-  if [[ -f "$candidate" ]]; then
-    REVIEW_GATE_CONFIG="$candidate"
-    break
-  fi
-done
+# Fail-closed candidate selection (issue 94): candidates are inspected in
+# precedence order for existence — including dangling symlinks — and any
+# present candidate must be a usable regular file. An invalid candidate is
+# never bypassed in favor of a lower-priority path or replaced by
+# initialization. Exit codes: 0 = selected (path on stdout), 3 = no candidate
+# exists, 1 = invalid candidate (diagnostic on stderr).
+select_review_gate_config() {
+  local candidate
+  for candidate in "$REVIEW_GATE_DEFAULT_CONFIG" "$REVIEW_GATE_COMPAT_CONFIG"; do
+    if [[ -L "$candidate" || -e "$candidate" ]]; then
+      if [[ -f "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      echo "pi-review-gate: $candidate exists but is not a regular file; refusing to continue" >&2
+      echo "pi-review-gate: move or rename that path, or create a config manually" >&2
+      return 1
+    fi
+  done
+  return 3
+}
 
-if [[ -z "$REVIEW_GATE_CONFIG" ]]; then
-  REVIEW_GATE_CONFIG="$(initialize_default_review_gate_config)" || exit 2
-fi
+REVIEW_GATE_CONFIG=""
+resolution=""
+resolution_status=0
+resolution="$(select_review_gate_config)" || resolution_status=$?
+case "$resolution_status" in
+  0) REVIEW_GATE_CONFIG="$resolution" ;;
+  3) REVIEW_GATE_CONFIG="$(initialize_default_review_gate_config)" || exit 2 ;;
+  *) exit 2 ;;
+esac
 
 if [[ -f "$REVIEW_GATE_ROOT/src/index.ts" ]]; then
   npm --prefix "$REVIEW_GATE_ROOT" run build
@@ -242,6 +419,10 @@ if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/references/recovery.md" ]] || ! cmp -s "$ORC
   publish_orchestrator_skill_file "$ORCHESTRATOR_RECOVERY_SOURCE" "$ORCHESTRATOR_SKILL_DIR/references/recovery.md" || exit 2
 fi
 
+# The exported path must be in the native Windows form: MSYS never converts
+# environment variables, and Node cannot open /c/... paths on Windows. Off
+# Windows this is an identity mapping.
+REVIEW_GATE_CONFIG="$(native_path_of "$REVIEW_GATE_CONFIG")"
 export PI_REVIEW_GATE_CONFIG="$REVIEW_GATE_CONFIG"
 
 # Same truthy values the extension uses (loadConfig/firstTruthyEnv -> isTruthy

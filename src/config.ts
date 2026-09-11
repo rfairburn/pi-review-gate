@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { lstatSync, readFileSync } from "node:fs";
+import type { ConfigPathResolution } from "./config-path";
+import { reviewGateConfigCandidates, resolveConfigPathResolution } from "./config-path";
 
 export type RetainBundles = "never" | "on-failure" | "always";
 /**
@@ -282,7 +282,21 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
 const DEFAULT_REVIEWER_TIMEOUT_MS = 600_000;
 const REVIEWER_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
+/**
+ * Load the review-gate configuration.
+ *
+ * Path resolution (issue 94): the explicit `PI_REVIEW_GATE_CONFIG` override
+ * always wins; otherwise the first existing of the Pi-agent default
+ * (`PI_CODING_AGENT_DIR`-aware `<agentDir>/review-gate.json`) and the sole
+ * compatibility fallback `~/.config/pi-review-gate/config.json` is loaded.
+ * The removed `~/.config/pi/review-gate.json` location is never discovered.
+ * The optional second parameter is an explicit resolution seam for tests;
+ * production callers use the real home directory and platform.
+ */
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  resolution: Partial<ConfigPathResolution> = {},
+): LoadedConfig {
   const disabledVar = firstTruthyEnv(env, ["PI_REVIEW_GATE_DISABLED"]);
   if (disabledVar) {
     return {
@@ -292,7 +306,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     };
   }
 
-  const path = findConfigPath(env);
+  const path = findConfigPath(env, resolution);
   if (!path) {
     return {
       config: { ...DEFAULT_CONFIG, enabled: false },
@@ -874,15 +888,27 @@ function canonicalStableJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-function findConfigPath(env: NodeJS.ProcessEnv): string | undefined {
+function findConfigPath(
+  env: NodeJS.ProcessEnv,
+  resolution: Partial<ConfigPathResolution>,
+): string | undefined {
   if (env.PI_REVIEW_GATE_CONFIG) {
     return env.PI_REVIEW_GATE_CONFIG;
   }
-  const candidates = [
-    join(homedir(), ".config", "pi-review-gate", "config.json"),
-    join(homedir(), ".config", "pi", "review-gate.json"),
-  ];
-  return candidates.find((candidate) => existsSync(candidate));
+  const candidates = reviewGateConfigCandidates(env, resolveConfigPathResolution(resolution));
+  // Fail-closed precedence: a candidate counts as present when it exists in
+  // any form, including dangling symlinks. A dangling or unreadable primary
+  // is therefore returned for loadConfig to handle (its existing unreadable-
+  // config recovery) instead of being bypassed in favor of a lower-priority
+  // candidate; only true absence selects the next candidate.
+  return candidates.find((candidate) => {
+    try {
+      lstatSync(candidate);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+  });
 }
 
 function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {

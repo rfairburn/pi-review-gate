@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.35]
+
+### Changed
+
+- Configuration now defaults to `review-gate.json` in Pi's agent directory on
+  every platform, honoring `PI_CODING_AGENT_DIR`. The sole compatibility
+  fallback is `~/.config/pi-review-gate/config.json`; existing fallback files
+  are used without automatic migration. Runtime explicit config overrides and
+  persistent-launcher override isolation remain unchanged
+  ([#94](https://github.com/rfairburn/pi-review-gate/issues/94)).
+- Native PowerShell tools now receive the same execution-role catalog,
+  evidence, and progress handling as Bash when available and authorized.
+  Research restrictions remain unchanged. This is basic compatibility work,
+  not a claim of complete native Windows or ShellStart support
+  ([#94](https://github.com/rfairburn/pi-review-gate/issues/94)).
+
 ## [0.1.0-dev.34]
 
 ### Fixed

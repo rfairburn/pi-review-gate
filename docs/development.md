@@ -107,9 +107,11 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
 - Unsets any inherited `PI_REVIEW_GATE_CONFIG` and re-resolves the persistent config so
   a parent pi session cannot silently redirect the gate; it deliberately does **not**
   unset `PI_REVIEW_GATE_DISABLED`, the documented kill switch, and warns when it is set.
-- Selects the first existing config from `~/.config/pi-review-gate/config.json` or
-  `~/.config/pi/review-gate.json`. When neither exists, it initializes a private
-  (directory `0700`, file `0600`) zero-model default config at the primary path —
+- Selects the first existing config from the Pi agent directory's `review-gate.json`
+  (`~/.pi/agent/review-gate.json`, following `PI_CODING_AGENT_DIR`) or the
+  compatibility fallback `~/.config/pi-review-gate/config.json`. When neither exists,
+  it initializes a private
+  (directory `0700`, file `0600`) zero-model default config at the default location —
   explicitly empty reviewer and worker selections, written to a temporary name and
   published atomically so concurrent first launches can never clobber each other or
   expose partial JSON — and continues normal startup. Existing or malformed configs are

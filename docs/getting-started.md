@@ -43,9 +43,11 @@ that command manually when browser extraction is needed. See
 A review-gate config is a single JSON file. Where you place it and how the extension
 finds it depends on your launch path: the persistent launcher reads one of two fixed
 paths, while direct `pi -e` loading uses `PI_REVIEW_GATE_CONFIG` (see [Launching](#launching)).
-On its first launch, the persistent launcher creates the file for you at
-`~/.config/pi-review-gate/config.json` with a valid zero-model default — no reviewers or
-workers selected — so a fresh install starts without any hand-created config. You then
+On its first launch, the persistent launcher creates the file for you at the default
+location — `~/.pi/agent/review-gate.json` (`%USERPROFILE%\.pi\agent\review-gate.json` on
+Windows, following Pi's `PI_CODING_AGENT_DIR` override) — with a valid zero-model
+default — no reviewers or workers selected — so a fresh install starts without any
+hand-created config. You then
 add reviewers and workers through `/review-settings` or by editing the file; until you
 do, automatic review stays off and nothing is invoked.
 A minimal example using Codex as the reviewer:
@@ -102,11 +104,16 @@ For normal use, use the persistent launcher:
 ```
 
 The launcher builds the extension (when sources are present), selects the first existing
-config from `~/.config/pi-review-gate/config.json` or `~/.config/pi/review-gate.json`
-(creating a private zero-model default config at the primary path when neither exists),
+config — `review-gate.json` in the Pi agent directory (`~/.pi/agent/review-gate.json`,
+following Pi's `PI_CODING_AGENT_DIR` override) or the compatibility fallback
+`~/.config/pi-review-gate/config.json` — creating a private zero-model default config
+at the default location when neither exists. A config that exists only at the fallback
+location remains selected unchanged. It then
 refreshes the discoverable orchestration skill at
 `~/.agents/skills/orchestrator/SKILL.md` (including its recovery runbook), and then
-executes the installed `pi` with the extension. The extension selects the
+executes the installed `pi` with the extension. The persistent launcher itself is a
+POSIX-shell script; broader portable launcher support, including Windows, is not
+completed. The extension selects the
 [operating-mode prompt](configuration.md#operating-modes); all remaining launcher
 arguments are forwarded unchanged. To limit the orchestrator, pass Pi's native tool
 allowlist through the wrapper, for example

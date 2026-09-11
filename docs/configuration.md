@@ -7,11 +7,19 @@ described only briefly here is owned by the linked page.
 ## Config discovery
 
 - `PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json` selects the config file explicitly.
-- The persistent launcher (`scripts/pi-review-gate.sh`) selects the first existing file
-  from `~/.config/pi-review-gate/config.json` or `~/.config/pi/review-gate.json` and
-  deliberately re-resolves (and re-exports) the variable so an inherited value from a
-  parent pi session cannot silently redirect the gate elsewhere. When neither exists,
-  it initializes a private zero-model default config at the primary path — explicitly
+- Without an explicit selection, two fixed implicit candidates are checked in order:
+  1. `review-gate.json` in the Pi agent directory — `~/.pi/agent/review-gate.json` by
+     default (`%USERPROFILE%\.pi\agent\review-gate.json` on Windows), following Pi's
+     native `PI_CODING_AGENT_DIR` override when set.
+  2. `~/.config/pi-review-gate/config.json` — an implicit compatibility fallback.
+  There is no third implicit location, and nothing is copied or migrated between the
+  two candidates.
+- The persistent launcher (`scripts/pi-review-gate.sh`) deliberately ignores an
+  inherited `PI_REVIEW_GATE_CONFIG` (it re-resolves and re-exports the variable itself)
+  so an inherited value from a parent pi session cannot silently redirect the gate
+  elsewhere. It selects the first existing candidate above — a config that exists only
+  at the fallback location remains selected unchanged. When neither exists, it
+  initializes a private zero-model default config at the default location — explicitly
   empty reviewer and worker selections, never overwriting or replacing anything that is
   already there — and continues normal startup.
 - With no config file found on a direct `pi -e` load (no `PI_REVIEW_GATE_CONFIG` and

@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.38]
+
+### Added
+
+- A technical SVG diagram in the root README illustrates orchestration,
+  representative executors across workspaces, independent review, and
+  role-scoped tool capabilities
+  ([#105](https://github.com/rfairburn/pi-review-gate/issues/105)).
+
 ## [0.1.0-dev.37]
 
 ### Removed

@@ -141,21 +141,30 @@ test("partial and error states are forwarded unchanged through the shared helper
   assert.deepEqual(renderLines(withDetails(errorResult, { expanded: true, isPartial: false }, theme)), [expandLine("detail")]);
 });
 
-test("a failing or non-rendering expanded callback falls back to the existing renderer", () => {
+test("a failing or non-rendering expanded callback falls back to the existing renderer with a visible notice", () => {
+  // #93: the silent fallback was replaced by a visible failure indication —
+  // the summary stays available but is never presented as a complete-looking
+  // expanded view.
   const throwing = expandableResult(
     () => textComponent([collapseLine("safe")]),
     () => {
       throw new Error("detail renderer failure");
     },
   );
-  assert.deepEqual(renderLines(throwing(sampleResult(), { expanded: true, isPartial: false }, theme)), [collapseLine("safe")]);
+  assert.deepEqual(renderLines(throwing(sampleResult(), { expanded: true, isPartial: false }, theme)), [
+    collapseLine("safe"),
+    "detail view unavailable - showing summary",
+  ]);
   // Pi's custom-renderer slot does not guard against undefined components;
   // the shared helper does, so a bad callback cannot destabilize the TUI.
   const returningUndefined = expandableResult(
     () => textComponent([collapseLine("safe")]),
     () => undefined,
   );
-  assert.deepEqual(renderLines(returningUndefined(sampleResult(), { expanded: true, isPartial: false }, theme)), [collapseLine("safe")]);
+  assert.deepEqual(renderLines(returningUndefined(sampleResult(), { expanded: true, isPartial: false }, theme)), [
+    collapseLine("safe"),
+    "detail view unavailable - showing summary",
+  ]);
 });
 
 test("produced callbacks carry the wiring-audit marker", () => {
@@ -217,15 +226,15 @@ test("every Subtasks* result renderer is wired through the shared expansion mech
     details: { action: "inspect", tasks: [{ taskId: "task-a", state: "running", definition: { title: "Work" } }] },
   };
   const collapsed = renderLines(inspect.renderResult(value, {}, theme));
-  assert.match(collapsed.join("\n"), /task-a running Work/);
+  assert.match(collapsed.join("\n"), /task-a · running · Work/);
   const expanded = renderLines(inspect.renderResult(value, { expanded: true }, theme));
-  assert.match(expanded.join("\n"), /SubtasksInspect — expanded result/);
+  assert.match(expanded.join("\n"), /SubtasksInspect · \? · status/);
   assert.match(expanded.join("\n"), /task-a · Work · running/);
   assert.notDeepEqual(expanded, collapsed);
   assert.deepEqual(renderLines(inspect.renderResult(value, { expanded: false }, theme)), collapsed);
 });
 
-test("ApplyPatch's existing renderer is wired as the collapsed view of the mechanism", () => {
+test("ApplyPatch expands the actual request and retained diff through the shared mechanism", () => {
   const tools: Array<Record<string, any>> = [];
   registerApplyPatchTool({ registerTool: (tool: Record<string, any>) => { tools.push(tool); } });
   const tool = tools.find((candidate) => candidate.name === APPLY_PATCH_TOOL_NAME)!;
@@ -235,13 +244,18 @@ test("ApplyPatch's existing renderer is wired as the collapsed view of the mecha
     content: [{ type: "text", text: "ApplyPatch updated 1 file(s)." }],
     details: { requestedDiff: "", finalDiff: "+ added line\n" },
   };
-  const collapsed = renderLines(tool.renderResult(value, {}, theme));
-  assert.deepEqual(renderLines(tool.renderResult(value, { expanded: true }, theme)), collapsed);
-  assert.match(collapsed.join("\n"), /Final diff:/);
+  const patch = "*** Begin Patch\n*** Add File: sample.txt\n+ added line\n*** End Patch";
+  const context = { args: { patch } };
+  const collapsed = renderLines(tool.renderResult(value, {}, theme, context));
+  const expanded = renderLines(tool.renderResult(value, { expanded: true }, theme, context));
+  assert.notDeepEqual(expanded, collapsed);
+  assert.ok(expanded.join("\n").includes(patch), "expansion preserves the actual submitted envelope");
+  assert.match(expanded.join("\n"), /Final diff:\n\+ added line/);
+  assert.deepEqual(renderLines(tool.renderResult(value, { expanded: false }, theme, context)), collapsed);
 });
 
-test("rendererless tools retain Pi's native expandable fallback rendering", () => {
-  // Discovery and WebSearch retain the adequate native expansion fallback.
+test("web and discovery registrations all use the shared expansion mechanism", () => {
+  // #93 adds genuine request/result views to the formerly rendererless tools.
   const webTools: Array<Record<string, any>> = [];
   new WebToolManager(
     { registerTool: (tool) => { webTools.push(tool); } },
@@ -257,21 +271,15 @@ test("rendererless tools retain Pi's native expandable fallback rendering", () =
     getAllTools: () => [],
     setActiveTools: () => {},
   }).register();
-  const expectedNative = [
-    "WebSearch",
-    "search_tools",
-  ];
+  const expectedNames = [...INTERACTIVE_BROWSER_TOOL_NAMES, "WebFetch", "BrowserExtract", "WebSearch", "search_tools"];
   const registered = [...webTools, ...deferredTools] as Array<Record<string, any>>;
   const registeredNames = new Set(registered.map((tool) => String(tool.name)));
-  for (const name of expectedNative) {
+  for (const name of expectedNames) {
     assert.ok(registeredNames.has(name), `${name} was not registered`);
   }
-  assert.equal(registered.length, expectedNative.length + INTERACTIVE_BROWSER_TOOL_NAMES.length + 2, "unexpected additional registrations");
-  const wrappedNames = new Set<string>([...INTERACTIVE_BROWSER_TOOL_NAMES, "WebFetch", "BrowserExtract"]);
+  assert.equal(registered.length, expectedNames.length, "unexpected additional registrations");
   for (const tool of registered) {
-    if (wrappedNames.has(String(tool.name))) continue;
-    assert.equal(tool.renderResult, undefined, `${tool.name} must keep Pi's native fallback expansion`);
-    assert.equal(tool.renderCall, undefined, `${tool.name} must keep Pi's native fallback expansion`);
+    assert.equal(isExpandableResult(tool.renderResult), true, `${tool.name} must use shared expansion`);
   }
   // Acquisition wiring must preserve the interactive browser family's wrapper.
   for (const name of ["BrowserOpen", "BrowserNavigate", "BrowserClose"]) {
@@ -329,13 +337,12 @@ test("registered WebFetch and BrowserExtract expand and re-collapse through the 
     const returnedText = (value.content as Array<{ text: string }>)[0]!.text;
     assert.ok(returnedText.includes("retained line 60"), "fixture sanity: the production text includes the full retained content");
 
-    // Native bounded collapsed preview: the returned text is capped with an
-    // explicit omitted-lines notice instead of occupying thousands of lines.
+    // The collapsed arm is a concise structured summary, not a second body
+    // preview. The complete retained body is reserved for expansion.
     const collapsed = renderLines(tool.renderResult(value, { expanded: false, isPartial: false }, theme));
-    assert.ok(collapsed.length <= 25, `${name} collapsed output must stay bounded, got ${collapsed.length} lines`);
-    assert.match(collapsed.join("\n"), /Retained article/);
-    assert.match(collapsed.join("\n"), /more line\(s\) are omitted from this collapsed preview; expand this result for the full retained detail/);
-    assert.doesNotMatch(collapsed.join("\n"), /retained line 60/, "the collapsed preview must omit the unbounded tail");
+    assert.ok(collapsed.length <= 6, `${name} collapsed output must stay concise, got ${collapsed.length} lines`);
+    assert.match(collapsed.join("\n"), new RegExp(`${name} · Retained article`));
+    assert.doesNotMatch(collapsed.join("\n"), /retained line 60/, "the collapsed summary must omit the retained tail");
 
     // Expansion renders the retained-response detail through the shared
     // wrapper — same wrapper object, no re-execution or extra retrieval.
@@ -380,12 +387,10 @@ test("every interactive Browser* result renderer is wired through the shared exp
     // machinery; the shared wrapper instance is reused by every registration.
     assert.equal(tool.renderCall, undefined, `${tool.name} must keep the native call fallback`);
   }
-  // Search retains native fallback; acquisition tools are covered separately.
-  for (const name of ["WebSearch"]) {
-    const tool = webTools.find((candidate) => candidate.name === name);
-    assert.ok(tool, `${name} was not registered`);
-    assert.equal(tool.renderResult, undefined, `${name} must keep Pi's native fallback expansion`);
-  }
+  // Search now uses the shared acquisition/search expansion mechanism.
+  const search = webTools.find((candidate) => candidate.name === "WebSearch");
+  assert.ok(search, "WebSearch was not registered");
+  assert.equal(isExpandableResult(search.renderResult), true, "WebSearch must use shared expansion wiring");
 });
 
 // ---------------------------------------------------------------------------
@@ -465,24 +470,24 @@ test("every Shell* registration is wired through the shared mechanism and expand
       assert.deepEqual(recollapsed, collapsed, `${name} re-collapse must restore the collapsed presentation`);
     }
 
-    // Collapsed keeps the preserved native-fallback presentation, not the
-    // detail framing.
+    // Collapsed is the canonical actionable command preview.
     const startCollapsed = renderLines(tools.ShellStart.renderResult(started, { expanded: false, isPartial: false }, theme));
-    assert.match(startCollapsed.join("\n"), /Started "wiring" as job\d+/);
-    assert.doesNotMatch(startCollapsed.join("\n"), /ShellStart ·/);
+    assert.match(startCollapsed.join("\n"), /ShellStart · job\d+ "wiring" · running/);
+    assert.match(startCollapsed.join("\n"), /command:/);
 
     // Expanded shows the retained snapshot's provenance from the result alone.
     const startExpanded = renderLines(tools.ShellStart.renderResult(started, { expanded: true, isPartial: false }, theme));
     assert.match(startExpanded.join("\n"), new RegExp(`ShellStart · ${started.details.id} "wiring"`));
-    assert.match(startExpanded.join("\n"), /command: echo head-line; echo tail-line; exit 3/);
-    assert.match(startExpanded.join("\n"), new RegExp(`pid ${started.details.pid}\\b`));
+    assert.match(startExpanded.join("\n"), /Command:\necho head-line; echo tail-line; exit 3/);
+    assert.match(startExpanded.join("\n"), new RegExp(`PID: ${started.details.pid}\\b`));
 
     // The expanded ShellLog view renders exactly the retained slice — the one
     // line the call delivered, with its range — never the rest of the live
     // buffer, which only a re-fetch could show.
     const logExpanded = renderLines(tools.ShellLog.renderResult(logged, { expanded: true, isPartial: false }, theme));
     const logJoined = logExpanded.join("\n");
-    assert.match(logJoined, /lines 1–2 of 2 line\(s\)/);
+    assert.match(logJoined, /Returned range: \[1, 2\)/);
+    assert.match(logJoined, /Total lines recorded: 2/);
     assert.match(logJoined, /tail-line/);
     assert.doesNotMatch(logJoined, /head-line/);
 
@@ -593,7 +598,7 @@ test("Shell* registered renderers never surface unrelated internal details or co
 });
 
 test("the expansion coverage inventory matches the registered tool set", () => {
-  const wrapped = [...executionToolNames, APPLY_PATCH_TOOL_NAME, ...INTERACTIVE_BROWSER_TOOL_NAMES, ...SHELL_TOOL_NAMES, "WebFetch", "BrowserExtract"];
+  const wrapped = [...executionToolNames, APPLY_PATCH_TOOL_NAME, ...INTERACTIVE_BROWSER_TOOL_NAMES, ...SHELL_TOOL_NAMES, "WebFetch", "BrowserExtract", "WebSearch"];
   const tools = [...executionHarness()];
   registerApplyPatchTool({ registerTool: (tool: Record<string, any>) => { tools.push(tool); } });
   const webTools: Array<Record<string, any>> = [];

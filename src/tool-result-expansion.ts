@@ -24,7 +24,25 @@
  * with a bounded preview. That adequate native expansion is retained as-is:
  * do not wrap those registrations, because a custom collapsed renderer would
  * replace the native fallback rather than extend it.
+ *
+ * Shared native hints (#93): for every tool that has a contributed expanded
+ * renderer, the callback returned here wraps the rendered component so its
+ * header line carries exactly one native-style hint —
+ * `(ctrl+o to expand)` / `(ctrl+o to collapse)` with the host's configured
+ * `app.tools.expand` binding and the native inline casing/styling (see
+ * ./tool-result-hints). Family renderers must NOT emit their own expansion
+ * hints. The wrapper adds no toggle state or key handler: keyboard expansion
+ * is the host's global binding and fullscreen per-card clicking is the
+ * host's own MouseRegion, both of which this mechanism reuses unchanged.
+ * Tools without an expanded renderer keep their exact existing presentation
+ * in both states — a hint there would promise a change that does not exist.
  */
+
+import {
+  visibleLineWidth,
+  withExpansionHint,
+  type ToolResultViewComponent,
+} from "./tool-result-hints";
 
 /** Structural theme subset used by extension tool result renderers. */
 export interface ToolResultTheme {
@@ -90,8 +108,13 @@ export const EXPANDABLE_RESULT_MARKER = "__piReviewGateExpandableResult";
  * - Expanded state with a contributed `expandedRenderer`: renders the detail
  *   view. If the detail renderer throws or returns something that is not a
  *   renderable component (Pi's custom-renderer slot does not guard against
- *   that), the collapsed renderer runs instead so pending, partial, completed,
- *   error, and cancelled states stay stable in the TUI.
+ *   that), the collapsed summary is shown WITH a visible failure notice line
+ *   (`detail view unavailable - showing summary`, progressively shortened at
+ *   narrow widths down to a single-cell marker): the failure is never
+ *   swallowed into a complete-looking expanded summary, and the raw result
+ *   content stays available through the summary. If even the collapsed
+ *   renderer is non-renderable, the value passes through exactly as before so
+ *   Pi's own slot fallback still applies.
  *
  * The raw `result` object is forwarded unchanged, and the native `options`
  * object is forwarded unchanged whenever the host provides one, so delegates
@@ -109,19 +132,34 @@ export function expandableResult<TTheme, TContext>(
     theme: TTheme,
     context?: TContext,
   ): unknown => {
-    if (!expandedRenderer || !isNativelyExpanded(options)) {
-      return collapsedRenderer(result, renderOptionsOf(options), theme, context);
-    }
     let component: unknown;
-    try {
-      component = expandedRenderer(result, renderOptionsOf(options), theme, context);
-    } catch {
-      return collapsedRenderer(result, renderOptionsOf(options), theme, context);
+    if (!expandedRenderer || !isNativelyExpanded(options)) {
+      component = collapsedRenderer(result, renderOptionsOf(options), theme, context);
+    } else {
+      try {
+        component = expandedRenderer(result, renderOptionsOf(options), theme, context);
+      } catch {
+        component = undefined;
+      }
+      if (!isRenderableComponent(component)) {
+        // The detail view failed. Present the collapsed summary with a
+        // visible failure notice — never a silent, complete-looking expanded
+        // summary — while keeping the raw result content available.
+        const base = collapsedRenderer(result, renderOptionsOf(options), theme, context);
+        component = isRenderableComponent(base)
+          ? withDetailViewFailureNotice(base as ToolResultViewComponent, fgOf(theme))
+          : base;
+      }
     }
-    if (!isRenderableComponent(component)) {
-      return collapsedRenderer(result, renderOptionsOf(options), theme, context);
-    }
-    return component;
+    // #93: only a tool with a contributed expanded view carries the shared
+    // native header hint (both states). A non-renderable delegate is passed
+    // through exactly as before so Pi's own slot fallback still applies.
+    if (!expandedRenderer || !isRenderableComponent(component)) return component;
+    return withExpansionHint(
+      component as ToolResultViewComponent,
+      isNativelyExpanded(options),
+      fgOf(theme),
+    );
   };
   (render as unknown as Record<string, unknown>)[EXPANDABLE_RESULT_MARKER] = true;
   return render;
@@ -136,6 +174,65 @@ export function isExpandableResult(value: unknown): boolean {
 /** Native expansion flag: anything but an explicit true stays collapsed. */
 function isNativelyExpanded(options: unknown): boolean {
   return isRecord(options) && options.expanded === true;
+}
+
+/**
+ * The theme's fg() when structurally present (host themes always have it),
+ * wrapped to preserve the receiver. Pi's native `Theme.fg` reads
+ * `this.fgColors`, and the host's theme proxy hands out the raw method, so a
+ * standalone call would throw; the closure below keeps `theme` as `this`.
+ */
+function fgOf(theme: unknown): ((color: string, text: string) => string) | undefined {
+  const record = isRecord(theme) ? theme : undefined;
+  if (!record || typeof (record as { fg?: unknown }).fg !== "function") return undefined;
+  const fg = (record as { fg: (color: string, text: string) => string }).fg;
+  return (color: string, text: string): string => fg.call(record, color, text);
+}
+
+/** Visible notice appended when a contributed detail view fails to render. */
+const DETAIL_VIEW_FAILURE_MESSAGE = "detail view unavailable - showing summary";
+const DETAIL_VIEW_FAILURE_SHORT = "detail view unavailable";
+
+/**
+ * Wraps the collapsed-summary component so an expanded-state detail-view
+ * failure stays visible: one error-styled notice line is appended, chosen
+ * from progressively shorter indicators (full message, shortened message,
+ * `detail failed`, `ERROR`, `!`) so that at least a single-cell marker shows
+ * whenever any terminal cell is available. It is omitted only when the render
+ * width provides no cell at all. The family's lines are never modified.
+ */
+function withDetailViewFailureNotice(
+  inner: ToolResultViewComponent,
+  fg?: (color: string, text: string) => string,
+): ToolResultViewComponent {
+  const style = (text: string): string => {
+    if (typeof fg === "function") {
+      try {
+        return fg("error", text);
+      } catch {
+        // Unknown color or receiver issue: plain text still communicates.
+      }
+    }
+    return text;
+  };
+  // Progressive indicators: as the width shrinks, step down to shorter
+  // markers so a failed detail view never silently looks like a complete
+  // summary. Only when not even one cell is available is nothing appended.
+  const full = style(DETAIL_VIEW_FAILURE_MESSAGE);
+  const short = style(DETAIL_VIEW_FAILURE_SHORT);
+  const indicators = [full, short, style("detail failed"), style("ERROR"), "!"];
+  return {
+    render(width: number): string[] {
+      const lines = inner.render(width).slice();
+      const safeWidth = Math.max(0, width);
+      const message = indicators.find((text) => visibleLineWidth(text) <= safeWidth);
+      if (message !== undefined) lines.push(message);
+      return lines;
+    },
+    invalidate() {
+      inner.invalidate?.();
+    },
+  };
 }
 
 /**

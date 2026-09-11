@@ -15,7 +15,6 @@ import {
   MAX_LABEL_CHARS,
   MAX_LOG_LINE_CHARS,
   MAX_LOG_RESULT_CHARS,
-  MAX_COMMAND_DISPLAY_CHARS,
   PendingLineBuffer,
   WAKE_CONTEXT_LINES,
   compileMatchers,
@@ -40,7 +39,11 @@ import {
   renderShellSendResult,
   renderShellStartResult,
   renderShellStopResult,
-  shellCollapsedResultRenderer,
+  shellListCollapsedView,
+  shellLogCollapsedView,
+  shellSendCollapsedView,
+  shellStartCollapsedView,
+  shellStopCollapsedView,
   shellResultDetails,
   type ShellResultViewTheme,
 } from "./result-view";
@@ -686,7 +689,14 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
           event: "started",
           id,
           label,
-          command: truncateText(command, MAX_COMMAND_DISPLAY_CHARS),
+          // Complete recorded command: the expanded card must show every line
+          // beyond the legacy 512-character / 4-line preview cuts. The render
+          // context's recorded call arguments remain the preferred source;
+          // this is the untruncated fallback snapshot.
+          command,
+          // The job state at the moment this call returned — the card must
+          // not claim any later completion without updated evidence.
+          state: "running",
           pid: proc.pid,
           processGroupId: process.platform === "win32" ? undefined : proc.pid,
           watching: watchingSummary,
@@ -694,7 +704,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         }),
       );
     },
-    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellStartResult),
+    renderResult: expandableResult(shellStartCollapsedView, renderShellStartResult),
   });
 
   pi.registerTool({
@@ -714,7 +724,9 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         ...(j.exited ? { exitCode: j.exitCode } : {}),
         pid: j.proc.pid,
         processGroupId: process.platform === "win32" ? undefined : j.proc.pid,
-        command: truncateText(j.command, MAX_COMMAND_DISPLAY_CHARS),
+        // Complete recorded command, captured with the snapshot: expansion
+        // renders it from this returned snapshot, never via a live lookup.
+        command: j.command,
         watching: describeWakeRules(j.rules),
         totalLines: j.buffer.total,
         droppedCount: j.buffer.droppedCount,
@@ -728,7 +740,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
       });
       return textResult(rows.join("\n"), false, shellResultDetails("ShellList", { jobs: jobsDetail }));
     },
-    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellListResult),
+    renderResult: expandableResult(shellListCollapsedView, renderShellListResult),
   });
 
   pi.registerTool({
@@ -764,6 +776,10 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
           totalLines: job.buffer.total,
           droppedLines: job.buffer.droppedCount,
           lines: lines.length,
+          // Request selectors as actually received, for the expanded view's
+          // Request block: offset null = the tail default was used.
+          requestOffset: params.offset === undefined ? null : Number(params.offset),
+          requestLimit: want,
         });
 
       if (params.offset === undefined) {
@@ -785,7 +801,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         nextOffset,
       });
     },
-    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellLogResult),
+    renderResult: expandableResult(shellLogCollapsedView, renderShellLogResult),
   });
 
   pi.registerTool({
@@ -886,7 +902,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         }),
       );
     },
-    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellSendResult),
+    renderResult: expandableResult(shellSendCollapsedView, renderShellSendResult),
   });
 
   pi.registerTool({
@@ -899,12 +915,23 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
     async execute(_id, params) {
       const target = String(params.id ?? "");
       if (target === "all") {
-        const n = [...jobs.values()].filter((j) => !j.exited).length;
-        for (const job of jobs.values()) if (!job.exited) killJob(job);
+        // Snapshot the affected targets BEFORE signalling, and retain them on
+        // the result: the canonical stop-all card must show the actual jobs
+        // addressed by this call, not a later re-derivation, and "stopping"
+        // must not be reported as confirmed termination.
+        const targets = [...jobs.values()]
+          .filter((j) => !j.exited)
+          .map((j) => ({ id: j.id, label: j.label }));
+        const n = targets.length;
+        for (const { id } of targets) {
+          const job = jobs.get(id);
+          if (job && !job.exited) killJob(job);
+        }
         return textResult(`Stopping ${n} job(s).`, false, shellResultDetails("ShellStop", {
           target: "all",
           count: n,
           outcome: "stopping",
+          targets,
         }));
       }
       const resolved = resolveJob(target);
@@ -935,7 +962,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         }),
       );
     },
-    renderResult: expandableResult(shellCollapsedResultRenderer, renderShellStopResult),
+    renderResult: expandableResult(shellStopCollapsedView, renderShellStopResult),
   });
 
   // Track the agent's own lifecycle so nonurgent wakes can be held while the

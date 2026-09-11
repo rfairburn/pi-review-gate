@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExecutorSelection } from "../config";
 import type { ReattachmentBundle } from "./operation-record";
-import type { ContinuationProgressUpdate, SubtaskProgressPhase } from "./types";
+import type { ContinuationProgressUpdate, SubtaskDispatchRecord, SubtaskProgressPhase } from "./types";
 import type { WaveProgressUpdate, WaveResult } from "./wave-controller";
 import type { WaveWorkerResult, WaveWorkerTask } from "./wave-worker";
 import { normalizeExecutorToolCatalog, stripLegacyCatalogFields } from "./tool-catalog";
@@ -136,6 +136,17 @@ export interface BackgroundTaskRecord {
    */
   executorModel?: string;
   lastRuntimeConfigDigest?: string;
+  /**
+   * First actual dispatch to the executor transport (#93), captured at the
+   * boundary after wrappers, path rewriting, and pre-start steering. Absent
+   * until dispatch; never reconstructed later.
+   */
+  initialDispatch?: SubtaskDispatchRecord;
+  /**
+   * Latest actual dispatch to the executor transport (#93). A re-dispatch
+   * after recovery/failover overwrites this; `initialDispatch` stays.
+   */
+  dispatch?: SubtaskDispatchRecord;
   result?: WaveResult;
   researchResult?: WaveWorkerResult;
   report?: string;

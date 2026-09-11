@@ -1,6 +1,6 @@
 /*
- * Expanded result views for the background shell tool family: ShellStart,
- * ShellList, ShellLog, ShellSend, and ShellStop.
+ * Result views for the background shell tool family: ShellStart, ShellList,
+ * ShellLog, ShellSend, and ShellStop (#58, restructured by #93).
  *
  * Scope by design: this module owns only the Shell family's render callbacks.
  * The shared collapse/expand plumbing is the result-expansion foundation
@@ -9,40 +9,57 @@
  * and returns the native Pi `renderResult` component factory that switches on
  * `options.expanded`, falling back to the collapsed view whenever the detail
  * callback throws or returns a non-component. `src/background-shell/index.ts`
- * wires every Shell* registration through it with this module's preserved
- * native-fallback collapsed renderer plus the matching per-tool expanded
- * callback — no other expansion helper, key handler, or state exists in this
- * family.
+ * wires every Shell* registration through it with this module's per-tool
+ * collapsed view plus the matching expanded detail callback — no other
+ * expansion helper, key handler, or state exists in this family.
  *
- * Expansion is display-only. Every expanded view renders data the tool result
- * already retains — the model-facing `content` text plus the `details`
- * metadata captured at call time (details are a Pi rendering/state channel;
- * they are never sent to the model, so enriching them does not change the
- * model-visible result or any retention budget). Nothing is re-read,
- * re-fetched, or reconstructed from live job state, so a restored session
- * renders exactly the bounded snapshot the call recorded, including its
- * truncation markers, ranges, and drop counts.
+ * #93 contract (#93 canonical Shell examples 1–5):
  *
- * The collapsed side (`shellCollapsedResultRenderer`) deliberately mirrors
- * Pi's native fallback for tools without a custom `renderResult` — full text
- * when expanded, a bounded 10-display-row preview with an expand hint when
- * collapsed — because wiring the shared mechanism replaces that native
- * fallback. It also honors the expanded flag itself, so a failed detail render
- * degrades to the familiar native view in both states.
+ * - Collapsed means a concise, actionable structured summary: job identity,
+ *   state, command preview with a truthful line-omission count, pid/started,
+ *   wake rules; for ShellLog the returned range plus a bounded preview of the
+ *   LAST few already-returned lines; for ShellSend the delivery outcome and
+ *   the recorded input; for ShellStop the affected target list.
+ * - Expanded means the complete actual inputs and the meaningful retained
+ *   result: the full recorded command (never the legacy 512-character or
+ *   4-line preview cuts), every returned log line, the full sent stdin
+ *   payload, the stop-all target list. No preview limit may survive into an
+ *   expanded view.
+ * - The toggle hint itself is NOT rendered here. The shared wrapper adds the
+ *   native `(ctrl+o to expand)` / `(ctrl+o to collapse)` hint centrally, with
+ *   the configured binding; family renderers emit only the desired header and
+ *   body so the hint cannot be duplicated or stale.
+ * - Anything the model received or submitted is shown to the human without an
+ *   additional redaction or truncation layer: the full command (including any
+ *   secret-shaped text) and the full sent stdin input are rendered verbatim —
+ *   on failed and legacy expanded cards too, where the input is labeled as
+ *   submitted (no execution, acceptance, or child-processing claim) and the
+ *   retained error text is rendered completely. Protections applied before
+ *   information reaches the model are unchanged.
+ * - Sources, in preference order: recorded native render `context.args`
+ *   (the original tool-call arguments — the complete command for ShellStart,
+ *   the sent text for ShellSend) over result-detail copies, which are kept
+ *   only as an untruncated fallback for records rendered without a context.
+ *   Data recorded at execution time (pid, ranges, delivery outcomes, the
+ *   stop-all target snapshot) comes from the result details. Fields a legacy
+ *   record genuinely lacks are disclosed as unavailable, never fabricated.
+ * - Expansion is display-only. Every expanded view renders data the tool
+ *   result already retains — the model-facing `content` text plus the
+ *   `details` metadata captured at call time — plus the recorded call
+ *   arguments. Nothing is re-read, re-fetched, or reconstructed from live job
+ *   state, so a restored session renders exactly the bounded snapshot the
+ *   call recorded, including its truncation markers, ranges, and drop counts.
+ *   A stop result says "stopping; process exit is not yet confirmed" and a
+ *   ShellSend acknowledgment never claims child processing.
  *
  * Every renderer is defensive about its input (session restore can hand it a
- * result recorded before structured details existed) and about its budget:
- * all text is wrapped into terminal-cell-safe display lines (wide CJK/emoji
- * glyphs and ANSI escapes handled), the retained-data bounds are unchanged,
- * and any missing detail degrades to a bounded preview of the retained
- * content text rather than a fabricated value.
+ * result recorded before structured details existed — such records fall back
+ * to a bounded preview collapsed and the complete retained text expanded)
+ * and about its budget: all text is wrapped into terminal-cell-safe display
+ * lines (wide CJK/emoji glyphs and ANSI escapes handled) so no rendered line
+ * can exceed the terminal width.
  */
-import {
-  MAX_COMMAND_DISPLAY_CHARS,
-  MAX_ERROR_DISPLAY_CHARS,
-  formatElapsed,
-  truncateText,
-} from "./jobs";
+import { truncateText } from "./jobs";
 
 /** Names of the tools whose results this module renders. */
 export type ShellToolName = "ShellStart" | "ShellList" | "ShellLog" | "ShellSend" | "ShellStop";
@@ -98,10 +115,19 @@ const MAX_EXPANDED_LOG_LINES = 400;
 /** Job rows shown in one expanded ShellList render. The harness caps live
  *  jobs at 8; this is defensive against hand-built or legacy details. */
 const MAX_EXPANDED_JOB_ROWS = 16;
-/** Lines of the model-visible content shown by fallback and summary views. */
-const MAX_EXPANDED_CONTENT_LINES = 8;
-/** Command lines shown for one job (commands may contain newlines). */
-const MAX_EXPANDED_COMMAND_LINES = 4;
+/** Command lines shown in the COLLAPSED ShellStart preview. Expansion shows
+ *  every line — no cap survives into an expanded view. */
+const COLLAPSED_COMMAND_PREVIEW_LINES = 4;
+/** Wrapped display rows of the already-returned log range shown in the
+ *  COLLAPSED ShellLog preview. Per the #93 ShellLog refinement the preview is
+ *  the TAIL of the returned range (native-bash-style), with a truthful
+ *  earlier-lines omission count; expansion shows the complete returned range. */
+const COLLAPSED_LOG_TAIL_ROWS = 6;
+/** Character cap for the input preview in the COLLAPSED ShellSend card; the
+ *  expanded view renders the full recorded input without this cut. */
+const COLLAPSED_INPUT_PREVIEW_CHARS = 200;
+/** Job rows shown in one collapsed ShellList render. */
+const COLLAPSED_JOB_ROWS = 16;
 
 // ── Result-details helpers ──────────────────────────────────────────────
 
@@ -157,6 +183,54 @@ function dTimestamp(details: Record<string, any>, key: string): string | undefin
   } catch {
     return undefined;
   }
+}
+
+/** The recorded tool-call arguments from the native render context
+ *  (documented host contract: `context.args` is the current call's
+ *  arguments). Undefined when absent or not an object. */
+function contextArgsOf(context: unknown): Record<string, any> | undefined {
+  if (!isRecord(context)) return undefined;
+  const args = context.args;
+  return isRecord(args) ? args : undefined;
+}
+
+/** The complete recorded command, preferring the original call arguments over
+ *  the result-details snapshot (which exists only as an untruncated fallback
+ *  for records rendered without a render context). */
+function commandOf(details: Record<string, any> | undefined, context: unknown): string | undefined {
+  const args = contextArgsOf(context);
+  if (args && typeof args.command === "string" && args.command.trim().length > 0) return args.command;
+  return details && typeof details.command === "string" && details.command.length > 0
+    ? details.command
+    : undefined;
+}
+
+/** The actual bytes sent to the job's stdin. The send path appends a newline
+ *  unless the submitted text already ends with one, so the recorded call
+ *  argument yields the exact payload without duplicating it into details. */
+function sentInputOf(details: Record<string, any> | undefined, context: unknown): string | undefined {
+  const args = contextArgsOf(context);
+  if (args && typeof args.text === "string") {
+    return args.text.endsWith("\n") ? args.text : `${args.text}\n`;
+  }
+  return details && typeof details.input === "string" ? details.input : undefined;
+}
+
+/** Truthful unavailable-field wording, used instead of fabricating a value. */
+const UNAVAILABLE = "unavailable in the recorded result";
+
+/** Compact state label for headers and rows: an exit code recorded by the
+ *  call is rendered as `exited N` (the canonical Shell card wording). */
+function stateWithCode(status: string | undefined, exitCode: number | undefined): string {
+  if (exitCode !== undefined) return `exited ${exitCode}`;
+  return status || "unknown";
+}
+
+/** State label for `State:` lines: an exit code recorded by the call means
+ *  the process has exited; the code itself is shown on its own line. */
+function displayState(status: string | undefined, exitCode: number | undefined): string {
+  if (exitCode !== undefined) return "exited";
+  return status || "unknown";
 }
 
 // ── Shared view helpers ─────────────────────────────────────────────────
@@ -447,160 +521,283 @@ function wrap(line: string, width: number): string[] {
   return wrapToWidth(line, width);
 }
 
-/** First non-empty line of a content blob — used as the honest summary of
- *  the model-visible result in summary views. */
-function firstContentLine(result: unknown): string {
-  return contentText(result).split("\n").find((l) => l.trim().length > 0)?.trim() ?? "";
-}
-
-/** Bounded preview of the retained model-visible text, used by fallback and
- *  detail views so nothing important is silently dropped. */
-function contentPreview(result: unknown, maxLines = MAX_EXPANDED_CONTENT_LINES): string[] {
-  const lines = contentText(result).split("\n").slice(0, maxLines);
-  const total = contentText(result).split("\n").length;
-  if (total > lines.length) lines.push(`… ${total - lines.length} more line(s) in the result`);
-  return lines;
-}
-
 function pendingView(tool: ShellToolName, theme: ShellResultViewTheme): ShellResultComponent {
   return viewComponent((width) => [...wrap(theme.fg("muted", `${tool} … (running)`), width)]);
 }
 
-// ── Collapsed fallback (preserves Pi's native presentation) ─────────────
+// ── Legacy-record and degraded views ────────────────────────────────────
 
 /** Pi's fallback preview height for tools without a custom renderResult
  *  (tool-execution.ts createResultFallback). Mirrored, not imported: the
- *  value is part of the presentation this collapsed renderer must preserve.
+ *  value is part of the presentation this legacy preview must preserve.
  *  It bounds WRAPPED DISPLAY ROWS, not logical lines: shell output carries
  *  up-to-2048-char lines that each reflow to many display rows, so a logical
  *  cap applied before wrapping would let the "preview" grow without bound. */
 const NATIVE_PREVIEW_LINES = 10;
 
-/** Pi's `keyHint` helper, resolvable only inside the host. The hint degrades
- *  to plain wording outside Pi (tests, tooling) — never a hard import: the
- *  package is a host-provided peer, not a dependency of this extension. */
-function expandHint(): string {
-  try {
-    const host = require("@earendil-works/pi-coding-agent") as {
-      keyHint?: (keybinding: string, label: string) => string;
-    };
-    if (typeof host.keyHint === "function") return host.keyHint("app.tools.expand", "to expand");
-  } catch {
-    /* outside Pi: fall through to the plain label */
-  }
-  return "to expand";
-}
-
-/** The collapsed view wired into the shared expansion mechanism for the Shell
- *  family. These tools previously had NO custom renderResult, so Pi's native
- *  fallback owned both states; this renderer reproduces it so wiring the
- *  shared mechanism extends it instead of replacing it with something weaker:
- *
- *  - collapsed (options.expanded !== true): the model-visible text wrapped
- *    into display rows first, then capped at NATIVE_PREVIEW_LINES physical
- *    rows, followed by `... (N more lines, <expand hint>)` where N is the
- *    number of WRAPPED ROWS omitted — truthful about what expansion reveals.
- *  - expanded (options.expanded === true): the full text — this is also the
- *    graceful path when the detail callback throws or returns a
- *    non-component, because the shared wrapper falls back here unchanged.
- *
- *  Like Pi's fallback it renders the raw content text only: no details
- *  parsing, no per-tool framing, nothing invented for error or empty
- *  results (an empty result renders as no lines at all, as native does). */
-export function shellCollapsedResultRenderer(
-  result: unknown,
-  options: unknown,
-  theme: ShellResultViewTheme,
-  _context?: unknown,
-): ShellResultComponent {
-  const expanded = isRecord(options) && options.expanded === true;
+/** Collapsed view for results recorded before structured details existed
+ *  (restored sessions): a bounded preview of the retained model-visible text,
+ *  like the native fallback — plus a truthful omission marker WITHOUT any
+ *  toggle hint, which the shared wrapper owns. An empty record renders
+ *  nothing, as the native fallback does. */
+function legacyPreviewView(_tool: ShellToolName, result: unknown, theme: ShellResultViewTheme): ShellResultComponent {
   return viewComponent((width) => {
     const text = contentText(result);
     if (text.length === 0) return [];
-    const lines = text.split("\n");
-    // Wrap first, then budget: every logical line reflows into width-safe
-    // display rows before the preview height is applied, so a handful of
-    // max-length log lines cannot grow the collapsed view without bound.
-    const all = lines.flatMap((line) => wrap(theme.fg("toolOutput", line), width));
-    if (expanded || all.length <= NATIVE_PREVIEW_LINES) return all;
+    const all = text.split("\n").flatMap((line) => wrap(theme.fg("toolOutput", line), width));
+    if (all.length <= NATIVE_PREVIEW_LINES) return all;
     const omitted = all.length - NATIVE_PREVIEW_LINES;
-    const shown = all.slice(0, NATIVE_PREVIEW_LINES);
-    // Truthful omission disclosure: N counts the wrapped display rows that
-    // are hidden, so it matches what expansion reveals — plus the native hint.
-    shown.push(...wrap(theme.fg("muted", `... (${omitted} more lines, ${expandHint()})`), width));
-    return shown;
-  });
-}
-
-function missingDetailsView(tool: ShellToolName, result: unknown, theme: ShellResultViewTheme): ShellResultComponent {
-  return viewComponent((width) => {
-    const lines = [
-      ...wrap(theme.fg("muted", `${tool} — expanded view limited: no structured details were recorded with this result`), width),
-      ...contentPreview(result).flatMap((l) => wrap(theme.fg("dim", `  ${l}`), width)),
-    ];
-    return lines;
-  });
-}
-
-function errorView(tool: ShellToolName, result: unknown, theme: ShellResultViewTheme): ShellResultComponent {
-  return viewComponent((width) => {
-    const text = truncateText(firstContentLine(result), MAX_ERROR_DISPLAY_CHARS);
     return [
-      ...wrap(theme.fg("error", `${tool} · error`), width),
-      ...wrap(theme.fg("error", `  ${text || "(error result carried no text)"}`), width),
+      ...all.slice(0, NATIVE_PREVIEW_LINES),
+      ...wrap(theme.fg("muted", `... (${omitted} more line${omitted === 1 ? "" : "s"})`), width),
     ];
+  });
+}
+
+/** Full retained content, wrapped: the complete model-visible record. Used by
+ *  the expanded legacy view and by the degraded path when a detail callback
+ *  fails (the shared wrapper then re-runs the collapsed renderer with
+ *  expanded=true). No preview cut applies — the recorded text is the complete
+ *  model-visible record, and hiding any of it would misrepresent the call. */
+function fullContentLines(result: unknown, theme: ShellResultViewTheme, width: number): string[] {
+  const text = contentText(result);
+  if (text.length === 0) return [];
+  return text.split("\n").flatMap((line) => wrap(theme.fg("toolOutput", line), width));
+}
+
+/** Collapsed/degraded view of the full retained content (the shared wrapper
+ *  re-runs the collapsed renderer with expanded=true when a detail callback
+ *  fails). */
+function fullContentView(result: unknown, theme: ShellResultViewTheme): ShellResultComponent {
+  return viewComponent((width) => fullContentLines(result, theme, width));
+}
+
+/** A recorded call input rendered on failed or legacy expanded cards. The
+ *  wording ("submitted") makes no execution or delivery claim — the input the
+ *  model supplied is shown in full even when the operation did not start or
+ *  the write was not accepted. */
+interface SubmittedInput {
+  heading: string;
+  text: string;
+}
+
+/** The submitted command for failed/legacy ShellStart cards, when recorded. */
+function submittedCommand(details: Record<string, any> | undefined, context: unknown): SubmittedInput | undefined {
+  const command = commandOf(details, context);
+  return command ? { heading: "Command submitted:", text: command } : undefined;
+}
+
+/** The submitted stdin text for failed/legacy ShellSend cards, when recorded. */
+function submittedInput(details: Record<string, any> | undefined, context: unknown): SubmittedInput | undefined {
+  const input = sentInputOf(details, context);
+  return input ? { heading: "Input submitted:", text: JSON.stringify(input) } : undefined;
+}
+
+/** Render a submitted-input block: the complete recorded text, wrapped, no
+ *  display cut. Every line keeps the input's multiline structure. */
+function submittedLines(submitted: SubmittedInput, theme: ShellResultViewTheme, width: number): string[] {
+  const lines = [...wrap(theme.fg("toolOutput", submitted.heading), width)];
+  for (const line of submitted.text.split("\n")) {
+    lines.push(...wrap(theme.fg("toolOutput", line), width));
+  }
+  return lines;
+}
+
+/** Expanded view for a result without structured details: discloses the
+ *  limitation truthfully, renders the complete recorded call input when one
+ *  is available (labeled as submitted — no execution/delivery claim), then
+ *  the complete retained text so nothing the model received is hidden. */
+function legacyExpandedView(
+  tool: ShellToolName,
+  result: unknown,
+  theme: ShellResultViewTheme,
+  submitted?: SubmittedInput,
+): ShellResultComponent {
+  return viewComponent((width) => [
+    ...wrap(theme.fg("muted", `${tool} — expanded view limited: no structured details were recorded with this result`), width),
+    ...(submitted ? submittedLines(submitted, theme, width) : []),
+    ...fullContentLines(result, theme, width),
+  ]);
+}
+
+function errorView(
+  tool: ShellToolName,
+  result: unknown,
+  theme: ShellResultViewTheme,
+  submitted?: SubmittedInput,
+): ShellResultComponent {
+  return viewComponent((width) => {
+    const lines = [...wrap(theme.fg("error", `${tool} · error`), width)];
+    if (submitted) lines.push(...submittedLines(submitted, theme, width));
+    // Complete retained error text: every line the result carries, with no
+    // presentation cap (the producer already applied its own bounded cut,
+    // visible in the text itself).
+    const text = contentText(result);
+    if (text.length === 0) {
+      lines.push(...wrap(theme.fg("error", "  (error result carried no text)"), width));
+    } else {
+      for (const line of text.split("\n")) {
+        lines.push(...wrap(theme.fg("error", line), width));
+      }
+    }
+    return lines;
   });
 }
 
 // ── ShellStart ──────────────────────────────────────────────────────────
 
-export function renderShellStartResult(
+/** Collapsed #93 canonical example 1: identity, state, a bounded command
+ *  preview with a truthful omission count, pid/started, and the wake rules. */
+export function shellStartCollapsedView(
   result: unknown,
   options: unknown,
   theme: ShellResultViewTheme,
-  _context?: unknown,
+  context?: unknown,
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellStart", theme);
   const details = shellDetails(result, "ShellStart");
-  if (!details) return missingDetailsView("ShellStart", result, theme);
+  const expanded = isRecord(options) && options.expanded === true;
+  if (!details) {
+    return expanded ? legacyExpandedView("ShellStart", result, theme) : legacyPreviewView("ShellStart", result, theme);
+  }
+  if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
   if (isErrorResult(result)) return errorView("ShellStart", result, theme);
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const label = dString(details, "label", 80) ?? id;
+    // State is recorded at call time; a legacy structured record without it
+    // says so instead of claiming "running".
+    const state = dString(details, "state", 32);
     const lines = [
-      ...wrap(theme.fg("toolTitle", `ShellStart · ${id} ${theme.bold(`"${label}"`)}`), width),
+      ...wrap(theme.fg("toolTitle", `ShellStart · ${id} ${theme.bold(`"${label}"`)}${state ? ` · ${state}` : " · state unavailable in the recorded result"}`), width),
     ];
-    const command = dString(details, "command", MAX_COMMAND_DISPLAY_CHARS);
+    const command = commandOf(details, context);
     if (command) {
       const commandLines = command.split("\n");
-      const shown = commandLines.slice(0, MAX_EXPANDED_COMMAND_LINES);
-      lines.push(...shown.flatMap((l) => wrap(theme.fg("dim", `  command: ${l}`), width)));
+      const shown = commandLines.slice(0, COLLAPSED_COMMAND_PREVIEW_LINES);
+      lines.push(...wrap(theme.fg("dim", "  command:"), width));
+      lines.push(...shown.flatMap((l) => wrap(theme.fg("dim", `    ${l}`), width)));
       if (commandLines.length > shown.length) {
-        lines.push(...wrap(theme.fg("dim", `  … ${commandLines.length - shown.length} more command line(s)`), width));
+        lines.push(...wrap(theme.fg("dim", `    … ${commandLines.length - shown.length} more command line(s)`), width));
       }
+    } else {
+      lines.push(...wrap(theme.fg("muted", `  command: ${UNAVAILABLE}`), width));
     }
     const pid = dNumber(details, "pid");
     const pgid = dNumber(details, "processGroupId");
     const startedAt = dTimestamp(details, "startedAt");
     const lifecycle = [
-      pid !== undefined ? `pid ${pid}` : null,
+      pid !== undefined ? `pid ${pid}` : `pid ${UNAVAILABLE}`,
       // Details omit the process-group id on Windows; keep the line honest.
       process.platform !== "win32" && pgid !== undefined && pgid !== pid
         ? `process group ${pgid}`
         : null,
-      startedAt ? `started ${startedAt}` : null,
+      startedAt ? `started ${startedAt}` : `started ${UNAVAILABLE}`,
     ].filter(Boolean);
-    if (lifecycle.length > 0) {
-      lines.push(...wrap(theme.fg("dim", `  ${lifecycle.join(" · ")}`), width));
-    }
+    lines.push(...wrap(theme.fg("dim", `  ${lifecycle.join(" · ")}`), width));
     const watching = dString(details, "watching", 512);
     lines.push(...wrap(theme.fg("dim", `  watching: ${watching || "nothing"}`), width));
     return lines;
   });
 }
 
+/** Expanded #93 canonical example 1: the complete recorded command (beyond
+ *  the legacy 512-character / 4-line preview cuts) plus the returned
+ *  execution details. */
+export function renderShellStartResult(
+  result: unknown,
+  options: unknown,
+  theme: ShellResultViewTheme,
+  context?: unknown,
+): ShellResultComponent {
+  if (isRecord(options) && options.isPartial === true) return pendingView("ShellStart", theme);
+  const details = shellDetails(result, "ShellStart");
+  // Failed and legacy records keep the complete recorded call input visible,
+  // labeled as submitted — a failed start never claims execution.
+  if (!details) return legacyExpandedView("ShellStart", result, theme, submittedCommand(undefined, context));
+  if (isErrorResult(result)) return errorView("ShellStart", result, theme, submittedCommand(details, context));
+  return viewComponent((width) => {
+    const id = dString(details, "id", 64) ?? "?";
+    const label = dString(details, "label", 80) ?? id;
+    const state = dString(details, "state", 32);
+    const lines = [
+      ...wrap(
+        theme.fg("toolTitle", `ShellStart · ${id} ${theme.bold(`"${label}"`)}${state ? ` · ${state}` : ""}`),
+        width,
+      ),
+    ];
+    const command = commandOf(details, context);
+    if (command) {
+      lines.push(...wrap(theme.fg("toolOutput", "Command:"), width));
+      for (const line of command.split("\n")) {
+        // Verbatim, complete: every line of the recorded call command,
+        // wrapped to the terminal width, never cut.
+        lines.push(...wrap(theme.fg("toolOutput", line), width));
+      }
+    } else {
+      lines.push(...wrap(theme.fg("muted", `Command: ${UNAVAILABLE}`), width));
+    }
+    lines.push("");
+    const pid = dNumber(details, "pid");
+    const pgid = dNumber(details, "processGroupId");
+    const startedAt = dTimestamp(details, "startedAt");
+    lines.push(...wrap(theme.fg("dim", `PID: ${pid !== undefined ? pid : UNAVAILABLE}`), width));
+    if (process.platform !== "win32" && pgid !== undefined && pgid !== pid) {
+      lines.push(...wrap(theme.fg("dim", `Process group: ${pgid}`), width));
+    }
+    lines.push(...wrap(theme.fg("dim", `Started: ${startedAt ?? UNAVAILABLE}`), width));
+    const watching = dString(details, "watching", 512);
+    lines.push(...wrap(theme.fg("dim", `Wake rules: ${watching || "nothing"}`), width));
+    lines.push(...wrap(theme.fg("dim", `State: ${state ? `${state} when this call returned` : UNAVAILABLE}`), width));
+    return lines;
+  });
+}
+
 // ── ShellList ───────────────────────────────────────────────────────────
 
+/** Collapsed #93 canonical example 2: count and one actionable row per job. */
+export function shellListCollapsedView(
+  result: unknown,
+  options: unknown,
+  theme: ShellResultViewTheme,
+  _context?: unknown,
+): ShellResultComponent {
+  if (isRecord(options) && options.isPartial === true) return pendingView("ShellList", theme);
+  const details = shellDetails(result, "ShellList");
+  const expanded = isRecord(options) && options.expanded === true;
+  if (!details) {
+    return expanded ? legacyExpandedView("ShellList", result, theme) : legacyPreviewView("ShellList", result, theme);
+  }
+  if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
+  if (isErrorResult(result)) return errorView("ShellList", result, theme);
+  return viewComponent((width) => {
+    const jobs = Array.isArray(details.jobs) ? details.jobs.filter(isRecord) : [];
+    const lines = [
+      ...wrap(theme.fg("toolTitle", `ShellList · ${jobs.length} job${jobs.length === 1 ? "" : "s"}`), width),
+    ];
+    if (jobs.length === 0) {
+      lines.push(...wrap(theme.fg("muted", "  no background jobs"), width));
+      return lines;
+    }
+    const shown = jobs.slice(0, COLLAPSED_JOB_ROWS);
+    for (const job of shown) {
+      const id = typeof job.id === "string" ? job.id : "?";
+      const label = typeof job.label === "string" ? truncateText(job.label, 80) : id;
+      const status = typeof job.status === "string" ? job.status : "unknown";
+      const exitCode = typeof job.exitCode === "number" && Number.isFinite(job.exitCode) ? job.exitCode : undefined;
+      lines.push(
+        ...wrap(theme.fg("dim", `  ${id} ${theme.bold(`"${label}"`)} · ${stateWithCode(status, exitCode)}`), width),
+      );
+    }
+    if (jobs.length > shown.length) {
+      lines.push(...wrap(theme.fg("muted", `  … ${jobs.length - shown.length} more job(s)`), width));
+    }
+    return lines;
+  });
+}
+
+/** Expanded #93 canonical example 2: every job with its complete recorded
+ *  command (the returned snapshot, not a live lookup) and retention counts. */
 export function renderShellListResult(
   result: unknown,
   options: unknown,
@@ -609,15 +806,12 @@ export function renderShellListResult(
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellList", theme);
   const details = shellDetails(result, "ShellList");
-  if (!details) return missingDetailsView("ShellList", result, theme);
+  if (!details) return legacyExpandedView("ShellList", result, theme);
   if (isErrorResult(result)) return errorView("ShellList", result, theme);
   return viewComponent((width) => {
     const jobs = Array.isArray(details.jobs) ? details.jobs.filter(isRecord) : [];
     const lines = [
-      ...wrap(
-        theme.fg("toolTitle", `ShellList · ${jobs.length} job(s) at the time of the call`),
-        width,
-      ),
+      ...wrap(theme.fg("toolTitle", `ShellList · ${jobs.length} job${jobs.length === 1 ? "" : "s"}`), width),
     ];
     if (jobs.length === 0) {
       lines.push(...wrap(theme.fg("muted", "  no background jobs"), width));
@@ -628,39 +822,47 @@ export function renderShellListResult(
       const id = typeof job.id === "string" ? job.id : "?";
       const label = typeof job.label === "string" ? truncateText(job.label, 80) : id;
       const status = typeof job.status === "string" ? job.status : "unknown";
-      const bits: string[] = [status];
-      if (typeof job.exitCode === "number" && Number.isFinite(job.exitCode)) bits.push(`exit ${job.exitCode}`);
-      if (typeof job.pid === "number" && Number.isFinite(job.pid) && process.platform !== "win32") {
-        bits.push(`pid ${job.pid}`);
-      }
-      if (typeof job.elapsedMs === "number" && Number.isFinite(job.elapsedMs) && job.elapsedMs >= 0) {
-        bits.push(`ran ${formatElapsed(job.elapsedMs)}`);
-      }
-      if (typeof job.lastOutputAgoMs === "number" && Number.isFinite(job.lastOutputAgoMs)) {
-        bits.push(`last output ${formatElapsed(job.lastOutputAgoMs)} before the call`);
+      const exitCode = typeof job.exitCode === "number" && Number.isFinite(job.exitCode) ? job.exitCode : undefined;
+      lines.push(...wrap(theme.fg("toolOutput", `${id} ${theme.bold(`"${label}"`)}`), width));
+      const command = typeof job.command === "string" && job.command.length > 0 ? job.command : undefined;
+      if (command) {
+        // Complete recorded command: no display cut. Multiline commands keep
+        // their structure.
+        if (command.includes("\n")) {
+          lines.push(...wrap(theme.fg("dim", "  Command:"), width));
+          for (const line of command.split("\n")) {
+            lines.push(...wrap(theme.fg("dim", `    ${line}`), width));
+          }
+        } else {
+          lines.push(...wrap(theme.fg("dim", `  Command: ${command}`), width));
+        }
       } else {
-        bits.push("no output");
+        lines.push(...wrap(theme.fg("dim", `  Command: ${UNAVAILABLE}`), width));
+      }
+      lines.push(...wrap(theme.fg("dim", `  State: ${displayState(status, exitCode)}`), width));
+      if (exitCode !== undefined) {
+        lines.push(...wrap(theme.fg("dim", `  Exit code: ${exitCode}`), width));
+      }
+      if (typeof job.pid === "number" && Number.isFinite(job.pid) && process.platform !== "win32") {
+        lines.push(...wrap(theme.fg("dim", `  PID: ${job.pid}`), width));
       }
       const total = typeof job.totalLines === "number" && Number.isFinite(job.totalLines) ? job.totalLines : undefined;
       const dropped = typeof job.droppedCount === "number" && Number.isFinite(job.droppedCount) ? job.droppedCount : 0;
       if (total !== undefined) {
-        bits.push(`${total} line(s)${dropped > 0 ? ` (${dropped} oldest dropped)` : ""}`);
+        lines.push(...wrap(theme.fg("dim", `  Retained output: ${Math.max(0, total - dropped)} line(s)`), width));
       }
-      lines.push(...wrap(theme.fg("dim", `  ${id} ${theme.bold(`"${label}"`)} — ${bits.join(" · ")}`), width));
-      const command = typeof job.command === "string" ? truncateText(job.command, MAX_COMMAND_DISPLAY_CHARS) : undefined;
-      if (command) {
-        const commandLines = command.split("\n").slice(0, MAX_EXPANDED_COMMAND_LINES);
-        lines.push(...commandLines.flatMap((l) => wrap(theme.fg("dim", `    command: ${l}`), width)));
-        if (command.split("\n").length > commandLines.length) {
-          lines.push(...wrap(theme.fg("dim", "    … more command line(s)"), width));
-        }
+      if (total !== undefined) {
+        lines.push(...wrap(theme.fg("dim", `  Dropped output: ${dropped} line(s)`), width));
       }
       const watching = typeof job.watching === "string" ? truncateText(job.watching, 512) : "";
-      lines.push(...wrap(theme.fg("dim", `    watching: ${watching || "nothing"}`), width));
+      lines.push(...wrap(theme.fg("dim", `  Wake rules: ${watching || "nothing"}`), width));
+      lines.push("");
     }
     if (jobs.length > shown.length) {
       lines.push(...wrap(theme.fg("muted", `  … ${jobs.length - shown.length} more job(s)`), width));
+      lines.push("");
     }
+    lines.push(...wrap(theme.fg("muted", "Snapshot: state recorded by this list call"), width));
     return lines;
   });
 }
@@ -669,8 +871,8 @@ export function renderShellListResult(
 
 /** The ShellLog body is the retained log text itself, not a second copy of
  *  it: the renderer reads the fenced block back out of the model-visible
- *  content so the expanded view always matches what the call delivered,
- *  including its per-line truncation markers. */
+ *  content so the views always match what the call delivered, including its
+ *  per-line truncation markers. */
 export interface ShellLogBody {
   header: string;
   body: string[];
@@ -695,6 +897,77 @@ export function parseShellLogText(text: string): ShellLogBody | undefined {
   return { header: lines.slice(0, first).join("\n"), body: lines.slice(first + 1), tailCut: true };
 }
 
+/** Tail preview for the collapsed ShellLog card (#93 refinement): the LAST
+ *  few wrapped rows of the ALREADY RETURNED range, with a truthful count of
+ *  the earlier returned lines omitted from the preview. At least the final
+ *  line is always shown. No data is fetched or re-read. */
+function tailPreview(body: string[], width: number): { shown: string[]; omitted: number } {
+  const out: string[] = [];
+  let idx = body.length;
+  let rows = 0;
+  while (idx > 0) {
+    const wrappedLine = wrapToWidth(body[idx - 1]!, width);
+    if (rows > 0 && rows + wrappedLine.length > COLLAPSED_LOG_TAIL_ROWS) break;
+    rows += wrappedLine.length;
+    idx -= 1;
+    out.unshift(...wrappedLine);
+  }
+  return { shown: out, omitted: idx };
+}
+
+/** Collapsed #93 canonical example 3 (with the #93 ShellLog tail refinement):
+ *  identity, state, the returned range with the genuine dropped-lines note,
+ *  then a bounded preview of the LAST lines of the returned range. */
+export function shellLogCollapsedView(
+  result: unknown,
+  options: unknown,
+  theme: ShellResultViewTheme,
+  _context?: unknown,
+): ShellResultComponent {
+  if (isRecord(options) && options.isPartial === true) return pendingView("ShellLog", theme);
+  const details = shellDetails(result, "ShellLog");
+  const expanded = isRecord(options) && options.expanded === true;
+  if (!details) {
+    return expanded ? legacyExpandedView("ShellLog", result, theme) : legacyPreviewView("ShellLog", result, theme);
+  }
+  if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
+  if (isErrorResult(result)) return errorView("ShellLog", result, theme);
+  return viewComponent((width) => {
+    const id = dString(details, "id", 64) ?? "?";
+    const label = dString(details, "label", 80) ?? id;
+    const status = dString(details, "status", 32);
+    const exitCode = dNumber(details, "exitCode");
+    const dropped = dNumber(details, "droppedLines") ?? 0;
+    const from = dNumber(details, "from");
+    const nextOffset = dNumber(details, "nextOffset");
+    const lines = [
+      ...wrap(theme.fg("toolTitle", `ShellLog · ${id} ${theme.bold(`"${label}"`)} · ${stateWithCode(status, exitCode)}`), width),
+    ];
+    if (from !== undefined && nextOffset !== undefined) {
+      lines.push(...wrap(theme.fg("dim", `  Returned lines: ${from}–${nextOffset} · dropped: ${dropped}`), width));
+    }
+    const parsed = parseShellLogText(contentText(result));
+    if (!parsed || parsed.body.length === 0) {
+      lines.push(...wrap(theme.fg("muted", "  (no lines retained in this range)"), width));
+      return lines;
+    }
+    // Genuine upstream retention notices survive into the collapsed card.
+    if (parsed.tailCut) {
+      lines.push(...wrap(theme.fg("muted", "  (result cut by the ShellLog result cap)"), width));
+    }
+    const { shown, omitted } = tailPreview(parsed.body, width);
+    if (omitted > 0) {
+      lines.push(...wrap(theme.fg("muted", `  … ${omitted} earlier returned line${omitted === 1 ? "" : "s"}`), width));
+    }
+    lines.push(...shown);
+    return lines;
+  });
+}
+
+/** Expanded #93 canonical example 3: the request selectors, the returned
+ *  range provenance, and EVERY retained line of the returned range —
+ *  verbatim, with formatting; no re-fetch, and no invented stdout/stderr
+ *  split (capture merged the streams). */
 export function renderShellLogResult(
   result: unknown,
   options: unknown,
@@ -703,53 +976,65 @@ export function renderShellLogResult(
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellLog", theme);
   const details = shellDetails(result, "ShellLog");
-  if (!details) return missingDetailsView("ShellLog", result, theme);
+  if (!details) return legacyExpandedView("ShellLog", result, theme);
   if (isErrorResult(result)) return errorView("ShellLog", result, theme);
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const label = dString(details, "label", 80) ?? id;
-    const status = dString(details, "status", 32) ?? "unknown";
-    const lines = [
-      ...wrap(theme.fg("toolTitle", `ShellLog · ${id} ${theme.bold(`"${label}"`)} · ${status}`), width),
-    ];
+    const status = dString(details, "status", 32);
+    const exitCode = dNumber(details, "exitCode");
     const total = dNumber(details, "totalLines");
-    const dropped = dNumber(details, "droppedLines") ?? 0;
+    const dropped = dNumber(details, "droppedLines");
     const from = dNumber(details, "from");
     const nextOffset = dNumber(details, "nextOffset");
-    const range =
-      from !== undefined && nextOffset !== undefined
-        ? `lines ${from}–${nextOffset}`
-        : total !== undefined
-          ? "last lines"
-          : undefined;
-    if (range && total !== undefined) {
-      lines.push(
-        ...wrap(
-          theme.fg("dim", `  ${range} of ${total} line(s)${dropped > 0 ? ` · ${dropped} oldest dropped from the job buffer` : ""}`),
-          width,
-        ),
-      );
+    const lines = [
+      ...wrap(theme.fg("toolTitle", `ShellLog · ${id} ${theme.bold(`"${label}"`)} · ${stateWithCode(status, exitCode)}`), width),
+    ];
+    // Request selectors as recorded by the call (offset null = the tail
+    // default; absent = a legacy record that did not retain them).
+    lines.push(...wrap(theme.fg("toolOutput", "Request:"), width));
+    lines.push(...wrap(theme.fg("dim", `  Job: ${id}`), width));
+    const requestOffset = details.requestOffset;
+    const offsetLabel =
+      requestOffset === null
+        ? "tail"
+        : typeof requestOffset === "number" && Number.isFinite(requestOffset)
+          ? String(requestOffset)
+          : UNAVAILABLE;
+    lines.push(...wrap(theme.fg("dim", `  Offset: ${offsetLabel}`), width));
+    const requestLimit = dNumber(details, "requestLimit");
+    lines.push(...wrap(theme.fg("dim", `  Limit: ${requestLimit ?? UNAVAILABLE}`), width));
+    lines.push("");
+    if (from !== undefined && nextOffset !== undefined) {
+      lines.push(...wrap(theme.fg("toolOutput", `Returned range: [${from}, ${nextOffset})`), width));
+    }
+    if (nextOffset !== undefined) {
+      lines.push(...wrap(theme.fg("dim", `Next offset: ${nextOffset}`), width));
+    }
+    if (total !== undefined) {
+      lines.push(...wrap(theme.fg("dim", `Total lines recorded: ${total}`), width));
+    }
+    if (dropped !== undefined) {
+      lines.push(...wrap(theme.fg("dim", `Oldest lines dropped: ${dropped}`), width));
     }
     const parsed = parseShellLogText(contentText(result));
     if (!parsed || parsed.body.length === 0) {
-      lines.push(...wrap(theme.fg("muted", "  (no lines retained in this range)"), width));
+      lines.push(...wrap(theme.fg("muted", "(no lines retained in this range)"), width));
       return lines;
     }
+    lines.push(...wrap(theme.fg("toolOutput", "Output:"), width));
+    // Verbatim: the complete retained range, whitespace, and embedded ANSI
+    // escapes survive the wrap; long lines reflow across display lines
+    // instead of being cut.
     const body = parsed.body.slice(0, MAX_EXPANDED_LOG_LINES);
-    lines.push(
-      ...wrap(
-        theme.fg("dim", `  ${body.length} line(s), retained output as delivered to the model${parsed.tailCut ? " (cut by the ShellLog result cap)" : ""}`),
-        width,
-      ),
-    );
     for (const line of body) {
-      // Verbatim: log content, whitespace, and embedded ANSI escapes survive
-      // the wrap; long lines reflow across display lines instead of being
-      // cut, so expanding always reveals the whole retained suffix.
       lines.push(...wrap(line, width));
     }
     if (parsed.body.length > body.length) {
-      lines.push(...wrap(theme.fg("muted", `  … ${parsed.body.length - body.length} more retained line(s)`), width));
+      lines.push(...wrap(theme.fg("muted", `… ${parsed.body.length - body.length} more retained line(s)`), width));
+    }
+    if (parsed.tailCut) {
+      lines.push(...wrap(theme.fg("muted", "(result cut by the ShellLog result cap)"), width));
     }
     return lines;
   });
@@ -757,39 +1042,140 @@ export function renderShellLogResult(
 
 // ── ShellSend ───────────────────────────────────────────────────────────
 
-export function renderShellSendResult(
+/** Collapsed #93 canonical example 4: the delivery outcome and the recorded
+ *  input (bounded preview; the expanded view shows the full input). */
+export function shellSendCollapsedView(
   result: unknown,
   options: unknown,
   theme: ShellResultViewTheme,
-  _context?: unknown,
+  context?: unknown,
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellSend", theme);
   const details = shellDetails(result, "ShellSend");
-  if (!details) return missingDetailsView("ShellSend", result, theme);
+  const expanded = isRecord(options) && options.expanded === true;
+  if (!details) {
+    return expanded ? legacyExpandedView("ShellSend", result, theme) : legacyPreviewView("ShellSend", result, theme);
+  }
+  if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
   if (isErrorResult(result)) return errorView("ShellSend", result, theme);
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const bytes = dNumber(details, "bytes");
     const delivery = dString(details, "delivery", 16);
-    const lines = [
-      ...wrap(
-        theme.fg("toolTitle", `ShellSend · ${id} · ${delivery ?? "unknown delivery"}`),
-        width,
-      ),
-    ];
-    if (bytes !== undefined) {
-      lines.push(...wrap(theme.fg("dim", `  ${bytes} byte(s) ${delivery === "unconfirmed" ? "queued — delivery NOT confirmed within the flush window" : "written to stdin"}`), width));
+    const outcome =
+      delivery === "confirmed"
+        ? `pipe accepted${bytes !== undefined ? ` ${bytes} bytes` : ""}`
+        : delivery === "unconfirmed"
+          ? `queued${bytes !== undefined ? ` ${bytes} bytes` : ""} · delivery unconfirmed`
+          : "unknown delivery";
+    const lines = [...wrap(theme.fg("toolTitle", `ShellSend · ${id} · ${outcome}`), width)];
+    const input = sentInputOf(details, context);
+    const inputPreview =
+      input === undefined ? UNAVAILABLE : truncateText(JSON.stringify(input), COLLAPSED_INPUT_PREVIEW_CHARS);
+    lines.push(...wrap(theme.fg("dim", `  Input: ${inputPreview}`), width));
+    return lines;
+  });
+}
+
+/** Expanded #93 canonical example 4: the full actual sent input (including
+ *  secret-shaped text — no additional human-view redaction or truncation),
+ *  the byte count, and the truthful delivery boundary: pipe acceptance is not
+ *  child processing. */
+export function renderShellSendResult(
+  result: unknown,
+  options: unknown,
+  theme: ShellResultViewTheme,
+  context?: unknown,
+): ShellResultComponent {
+  if (isRecord(options) && options.isPartial === true) return pendingView("ShellSend", theme);
+  const details = shellDetails(result, "ShellSend");
+  // Failed and legacy records keep the complete recorded call input visible,
+  // labeled as submitted — a failed or unacknowledged write never claims
+  // pipe acceptance or child processing.
+  if (!details) return legacyExpandedView("ShellSend", result, theme, submittedInput(undefined, context));
+  if (isErrorResult(result)) return errorView("ShellSend", result, theme, submittedInput(details, context));
+  return viewComponent((width) => {
+    const id = dString(details, "id", 64) ?? "?";
+    const bytes = dNumber(details, "bytes");
+    const delivery = dString(details, "delivery", 16);
+    const lines = [...wrap(theme.fg("toolTitle", `ShellSend · ${id}`), width)];
+    const input = sentInputOf(details, context);
+    if (input === undefined) {
+      lines.push(...wrap(theme.fg("muted", `Input sent: ${UNAVAILABLE}`), width));
+    } else {
+      // Complete and unfiltered: the exact bytes handed to the stdin pipe.
+      lines.push(...wrap(theme.fg("toolOutput", `Input sent: ${JSON.stringify(input)}`), width));
     }
-    const event = dString(details, "event", 64);
-    if (event) lines.push(...wrap(theme.fg("dim", `  event: ${event}`), width));
-    const summary = firstContentLine(result);
-    if (summary) lines.push(...wrap(theme.fg("dim", `  ${summary}`), width));
+    if (bytes !== undefined) {
+      lines.push(...wrap(theme.fg("dim", `Bytes: ${bytes}`), width));
+    }
+    const deliveryLabel =
+      delivery === "confirmed"
+        ? "accepted by the stdin pipe"
+        : delivery === "unconfirmed"
+          ? "queued — delivery NOT confirmed within the flush window"
+          : UNAVAILABLE;
+    lines.push(...wrap(theme.fg("dim", `Delivery: ${deliveryLabel}`), width));
+    lines.push(...wrap(theme.fg("dim", "Child processing: not established by this acknowledgment"), width));
     return lines;
   });
 }
 
 // ── ShellStop ───────────────────────────────────────────────────────────
 
+/** Collapsed #93 canonical example 5: the stop outcome and the actual
+ *  affected target list recorded by the call (stop-all retains its targets). */
+export function shellStopCollapsedView(
+  result: unknown,
+  options: unknown,
+  theme: ShellResultViewTheme,
+  _context?: unknown,
+): ShellResultComponent {
+  if (isRecord(options) && options.isPartial === true) return pendingView("ShellStop", theme);
+  const details = shellDetails(result, "ShellStop");
+  const expanded = isRecord(options) && options.expanded === true;
+  if (!details) {
+    return expanded ? legacyExpandedView("ShellStop", result, theme) : legacyPreviewView("ShellStop", result, theme);
+  }
+  if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
+  if (isErrorResult(result)) return errorView("ShellStop", result, theme);
+  return viewComponent((width) => {
+    const target = dString(details, "target", 80) ?? "?";
+    const outcome = dString(details, "outcome", 32);
+    const targets = Array.isArray(details.targets) ? details.targets.filter(isRecord) : [];
+    const lines: string[] = [];
+    if (target === "all") {
+      const count = dNumber(details, "count");
+      lines.push(...wrap(theme.fg("toolTitle", `ShellStop · all jobs · stopping ${count ?? "?"}`), width));
+      if (targets.length > 0) {
+        const names = targets
+          .slice(0, COLLAPSED_JOB_ROWS)
+          .map((t) => `${typeof t.id === "string" ? t.id : "?"} ${theme.bold(`"${truncateText(String(t.label ?? "?"), 80)}"`)}`);
+        lines.push(...wrap(theme.fg("dim", `  ${names.join(", ")}`), width));
+        if (targets.length > COLLAPSED_JOB_ROWS) {
+          lines.push(...wrap(theme.fg("muted", `  … ${targets.length - COLLAPSED_JOB_ROWS} more target(s)`), width));
+        }
+      } else {
+        lines.push(...wrap(theme.fg("muted", `  targets: ${UNAVAILABLE}`), width));
+      }
+    } else {
+      const jobId = dString(details, "jobId", 64) ?? target;
+      const label = dString(details, "label", 80) ?? jobId;
+      const status = dString(details, "status", 32);
+      const heading =
+        outcome === "already-exited"
+          ? `already exited${status ? ` (${status})` : ""}`
+          : outcome === "stopping"
+            ? "stopping"
+            : outcome ?? "unknown outcome";
+      lines.push(...wrap(theme.fg("toolTitle", `ShellStop · ${jobId} ${theme.bold(`"${label}"`)} · ${heading}`), width));
+    }
+    return lines;
+  });
+}
+
+/** Expanded #93 canonical example 5: the request, the retained target list,
+ *  the signal path, and the truthful outcome — stopping is not termination. */
 export function renderShellStopResult(
   result: unknown,
   options: unknown,
@@ -798,29 +1184,54 @@ export function renderShellStopResult(
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellStop", theme);
   const details = shellDetails(result, "ShellStop");
-  if (!details) return missingDetailsView("ShellStop", result, theme);
+  if (!details) return legacyExpandedView("ShellStop", result, theme);
   if (isErrorResult(result)) return errorView("ShellStop", result, theme);
   return viewComponent((width) => {
     const target = dString(details, "target", 80) ?? "?";
     const outcome = dString(details, "outcome", 32);
     const lines: string[] = [];
     if (target === "all") {
+      const targets = Array.isArray(details.targets) ? details.targets.filter(isRecord) : [];
       const count = dNumber(details, "count");
-      lines.push(...wrap(theme.fg("toolTitle", `ShellStop · all jobs · stopping ${count ?? "?"} job(s)`), width));
+      lines.push(...wrap(theme.fg("toolTitle", "ShellStop · all jobs"), width));
+      lines.push(...wrap(theme.fg("toolOutput", "Request: stop all running jobs"), width));
+      if (targets.length > 0) {
+        lines.push(...wrap(theme.fg("toolOutput", "Targets:"), width));
+        const shown = targets.slice(0, MAX_EXPANDED_JOB_ROWS);
+        for (const t of shown) {
+          const id = typeof t.id === "string" ? t.id : "?";
+          const label = typeof t.label === "string" ? truncateText(t.label, 80) : "?";
+          lines.push(...wrap(theme.fg("toolOutput", `  ${id} ${theme.bold(`"${label}"`)}`), width));
+        }
+        if (targets.length > shown.length) {
+          lines.push(...wrap(theme.fg("muted", `  … ${targets.length - shown.length} more target(s)`), width));
+        }
+      } else {
+        lines.push(...wrap(theme.fg("muted", `Targets: ${UNAVAILABLE}`), width));
+      }
+      lines.push(...wrap(theme.fg("dim", "Action: SIGTERM requested"), width));
+      lines.push(...wrap(theme.fg("dim", "Escalation: existing SIGKILL fallback"), width));
+      lines.push(...wrap(theme.fg("dim", outcome === "stopping"
+        ? "Result: stopping; process exit is not yet confirmed"
+        : `Result: ${outcome ?? UNAVAILABLE}`), width));
+      if (count !== undefined && targets.length === 0) {
+        lines.push(...wrap(theme.fg("dim", `Jobs affected: ${count}`), width));
+      }
     } else {
       const jobId = dString(details, "jobId", 64) ?? target;
       const label = dString(details, "label", 80) ?? jobId;
       const status = dString(details, "status", 32);
-      const heading = outcome === "already-exited"
-        ? `${jobId} ${theme.bold(`"${label}"`)} · already exited${status ? ` (${status})` : ""}`
-        : `${jobId} ${theme.bold(`"${label}"`)} · stopping`;
-      lines.push(...wrap(theme.fg("toolTitle", `ShellStop · ${heading}`), width));
+      lines.push(...wrap(theme.fg("toolTitle", `ShellStop · ${jobId} ${theme.bold(`"${label}"`)}`), width));
+      lines.push(...wrap(theme.fg("toolOutput", `Request: stop ${target}`), width));
+      lines.push(...wrap(theme.fg("toolOutput", `Job: ${jobId} ${theme.bold(`"${label}"`)}`), width));
+      if (outcome === "already-exited") {
+        lines.push(...wrap(theme.fg("dim", `Result: job had already exited${status ? ` (${status})` : ""}; no signal was sent by this call`), width));
+      } else {
+        lines.push(...wrap(theme.fg("dim", "Action: SIGTERM requested"), width));
+        lines.push(...wrap(theme.fg("dim", "Escalation: existing SIGKILL fallback"), width));
+        lines.push(...wrap(theme.fg("dim", "Result: stopping; process exit is not yet confirmed"), width));
+      }
     }
-    if (outcome === "stopping") {
-      lines.push(...wrap(theme.fg("dim", "  SIGTERM sent to the process group; SIGKILL escalation follows if it ignores that"), width));
-    }
-    const summary = firstContentLine(result);
-    if (summary) lines.push(...wrap(theme.fg("dim", `  ${summary}`), width));
     return lines;
   });
 }
@@ -828,7 +1239,7 @@ export function renderShellStopResult(
 // ── Selection ───────────────────────────────────────────────────────────
 
 /** One expanded renderer per Shell tool, keyed by tool name. The shared
- *  foundation (#57) pairs these with the preserved collapsed rendering. */
+ *  foundation (#57) pairs these with the collapsed views above. */
 export const SHELL_EXPANDED_RESULT_RENDERERS: Record<ShellToolName, ShellResultRenderer> = {
   ShellStart: renderShellStartResult,
   ShellList: renderShellListResult,
@@ -837,6 +1248,19 @@ export const SHELL_EXPANDED_RESULT_RENDERERS: Record<ShellToolName, ShellResultR
   ShellStop: renderShellStopResult,
 };
 
+/** One collapsed structured view per Shell tool, keyed by tool name. */
+export const SHELL_COLLAPSED_RESULT_VIEWS: Record<ShellToolName, ShellResultRenderer> = {
+  ShellStart: shellStartCollapsedView,
+  ShellList: shellListCollapsedView,
+  ShellLog: shellLogCollapsedView,
+  ShellSend: shellSendCollapsedView,
+  ShellStop: shellStopCollapsedView,
+};
+
 export function shellExpandedRenderer(tool: ShellToolName): ShellResultRenderer {
   return SHELL_EXPANDED_RESULT_RENDERERS[tool];
+}
+
+export function shellCollapsedRenderer(tool: ShellToolName): ShellResultRenderer {
+  return SHELL_COLLAPSED_RESULT_VIEWS[tool];
 }

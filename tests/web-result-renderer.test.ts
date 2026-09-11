@@ -6,6 +6,7 @@ import {
   visibleDisplayWidth,
   type WebResultRenderOptions,
 } from "../src/web/result-renderer";
+import { visibleTerminalText } from "../src/tool-result-text";
 
 const THEME = {
   bold: (text: string) => text,
@@ -57,18 +58,66 @@ function retainedContentBounds(output: string): { start: number; end: number } {
 function retainedContentRegion(output: string): string {
   const lines = output.split("\n");
   const { start, end } = retainedContentBounds(output);
-  return lines.slice(start + 1, end).join("\n");
+  return lines.slice(start + 2, end).join("\n");
 }
 
-test("web result compact rendering keeps the returned text view", () => {
+/** Reverses visibleTerminalText notation back to the original bytes (tests only). */
+function decodeVisibleTerminal(text: string): string {
+  let out = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index]!;
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = text[index + 1];
+    if (next === "\\") {
+      out += "\\";
+      index += 1;
+      continue;
+    }
+    if (next === "r") {
+      out += "\r";
+      index += 1;
+      continue;
+    }
+    if (next === "u") {
+      const hex = text.slice(index + 2, index + 6);
+      if (/^[0-9a-f]{4}$/u.test(hex)) {
+        out += String.fromCharCode(parseInt(hex, 16));
+        index += 5;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function assertNoRawControlBytes(lines: string[]): void {
+  for (const line of lines) {
+    for (const ch of line) {
+      const code = ch.codePointAt(0) ?? 0;
+      assert.ok(
+        code >= 0x20 && code !== 0x7f && !(code >= 0x80 && code <= 0x9f),
+        `no raw control byte may be rendered: ${JSON.stringify(line)}`,
+      );
+    }
+  }
+}
+
+test("web result compact rendering keeps a concise retained-response summary", () => {
   const value = webResult({
     content: "This retained content must not appear in the compact result renderer.",
     finalUrl: "https://example.test/article",
+    title: "Example article",
+    documentType: "html",
   });
   const lines = rendered(renderWebResult, value, { expanded: false, isPartial: false });
 
-  assert.deepEqual(lines, ["WebFetch summary remains compact."]);
-  assert.doesNotMatch(lines.join("\n"), /retained content|example\.test/);
+  assert.match(lines.join("\n"), /WebFetch · Example article · HTML/);
+  assert.match(lines.join("\n"), /https:\/\/example\.test\/article/);
+  assert.doesNotMatch(lines.join("\n"), /This retained content/);
 });
 
 test("collapsed rendering preserves native multiline WebFetch output and error diagnostics", () => {
@@ -90,7 +139,7 @@ test("collapsed rendering preserves native multiline WebFetch output and error d
   };
   const lines = rendered(renderWebResult, value, { expanded: false, isPartial: false }, 120);
   assert.equal(lines.join("\n"), nativeFormatPage);
-  assert.ok(lines.length > 1, "rendererless native output remains multiline");
+  assert.ok(lines.length > 1, "legacy returned output remains multiline");
   assert.doesNotMatch(lines.join("\n"), /rawPath|private\/raw/);
 
   const errorText = [
@@ -106,7 +155,7 @@ test("collapsed rendering preserves native multiline WebFetch output and error d
   assert.equal(errorLines.join("\n"), errorText);
 });
 
-test("collapsed rendering stays bounded for long acquisitions with an expand notice", () => {
+test("collapsed rendering stays concise while expansion retains long acquisitions", () => {
   // The production formatPage text includes the full retained content block,
   // so a large acquisition must not occupy thousands of collapsed lines.
   const longText = [
@@ -122,14 +171,11 @@ test("collapsed rendering stays bounded for long acquisitions with an expand not
     isError: false,
   }, { expanded: false, isPartial: false }, 120);
 
-  // Bounded preview: capped to 24 lines plus the omitted-lines notice.
-  assert.ok(lines.length <= 30, `collapsed preview must stay bounded, got ${lines.length} lines`);
+  // Structured metadata is concise and does not expose the retained body while collapsed.
+  assert.ok(lines.length <= 24, `collapsed summary must stay bounded, got ${lines.length} lines`);
   const output = lines.join("\n");
-  assert.match(output, /retained line 1/);
-  assert.match(output.replace(/\n/g, ""), /more line\(s\) are omitted from this collapsed preview; expand this result for the full retained detail/);
-  assert.match(output.replace(/\n/g, ""), /No new acquisition is performed\./);
-  assert.doesNotMatch(output, /retained line 100/, "the collapsed preview omits the unbounded tail");
-  assert.doesNotMatch(output, /End of cached document/);
+  assert.match(output, /^WebFetch · result/);
+  assert.doesNotMatch(output, /retained line 1|retained line 100|End of cached document/);
   assertLinesFit(lines, 120);
 
   // The same view re-renders identically on re-collapse (no state, no re-fetch).
@@ -172,8 +218,8 @@ test("expanded WebFetch rendering shows retained text, extraction metadata, rang
   });
 
   const output = rendered(renderExpandedWebResult, value).join("\n");
-  assert.match(output, /Document: Web page · Retained article/);
-  assert.match(output, /Source: https:\/\/example\.test\/article/);
+  assert.match(output, /Document: HTML/);
+  assert.match(output, /Final URL: https:\/\/example\.test\/article/);
   assert.match(output, /Acquisition: 2026-08-23T00:00:00\.000Z · session cache · 321 downloaded bytes/);
   assert.match(output, /Extraction: HTML structural blocks · dynamic_content_suspected: true/);
   assert.match(output, /Byline: Author/);
@@ -209,7 +255,7 @@ test("expanded WebFetch PDF rendering shows page and retained metadata without r
   });
 
   const output = rendered(renderExpandedWebResult, value).join("\n");
-  assert.match(output, /Document: PDF document/);
+  assert.match(output, /Document: PDF/);
   assert.match(output, /Content type: application\/pdf/);
   assert.match(output, /PDF pages: 7/);
   assert.match(output, /Range: indexes 0-2 of 4 · pages 2-3/);
@@ -248,7 +294,7 @@ test("expanded WebFetch find rendering shows retained match indexes without perf
   assert.match(output, /No readable content was returned for this indexed range/);
 });
 
-test("expanded BrowserExtract rendering exposes bounded omissions and extraction truncation without browser actions", () => {
+test("expanded BrowserExtract rendering exposes retained omissions and extraction truncation without browser actions", () => {
   const value = webResult({
     content: "Rendered result\n\nvalue: 42",
     finalUrl: "https://example.test/app",
@@ -284,7 +330,8 @@ test("expanded BrowserExtract rendering exposes bounded omissions and extraction
   });
 
   const output = rendered(renderExpandedWebResult, value).join("\n");
-  assert.match(output, /Browser extraction omissions: 3 subresource\(s\) omitted during render; omission diagnostics were also truncated/);
+  assert.match(output, /Resource omissions: 3/);
+  assert.match(output, /Resource omission diagnostics: the retained diagnostic list is truncated/);
   assert.match(output, /passive resource omitted before any connection/);
   assert.match(output, /--- Extracted tables \(1\) ---/);
   assert.match(output, /Truncation: generated table Markdown capped at 512000 characters; 4 rows omitted/);
@@ -343,7 +390,7 @@ test("expanded rendering handles pending, partial, empty, failed, and cancelled 
   assert.doesNotMatch(cancelled, /private abort reason/);
 });
 
-test("expanded rendering wraps long retained lines and reports the presentation truncation", () => {
+test("expanded rendering wraps long retained lines without a renderer truncation", () => {
   const longContent = `${"x".repeat(100_010)}\ntrailing data must not be fetched or displayed`;
   const lines = rendered(
     renderExpandedWebResult,
@@ -354,9 +401,10 @@ test("expanded rendering wraps long retained lines and reports the presentation 
   const output = lines.join("\n");
 
   assertLinesFit(lines, 120);
-  assert.match(output, /Truncation: retained content exceeded the bounded human-view display; no additional data was fetched/);
-  assert.ok(retainedContentRegion(output).replace(/\n/g, "").includes("x".repeat(100_000)), "the bounded retained prefix is preserved");
-  assert.doesNotMatch(output, /trailing data must not be fetched or displayed/);
+  const contentRegion = retainedContentRegion(output).replace(/\n/g, "");
+  assert.ok(contentRegion.includes("x".repeat(100_010)), "the complete retained content is preserved");
+  assert.match(contentRegion, /trailing data must not be fetched or displayed/);
+  assert.doesNotMatch(output, /retained content exceeded the bounded human-view display/);
 });
 
 test("expanded rendering respects narrow widths, wide Unicode, tabs, and wrapped metadata", () => {
@@ -384,4 +432,62 @@ test("expanded rendering respects narrow widths, wide Unicode, tabs, and wrapped
   assert.ok(contentRegion.includes("界🙂"), "wide Unicode content remains visible");
   assert.ok(contentRegion.replace(/\n/g, "").includes("z".repeat(120)), "wrapped content remains available");
   assert.ok(contentRegion.replace(/\n/g, "").includes("final line"), "blank lines and later content remain available");
+});
+
+test("expanded retained content shows control bytes as visible notation exactly once (no stripping, no double encoding)", () => {
+  const controls = "\u001b[31mred\u001b[0m\u0007\rmid\u0000dle\u007f\u009b\u000bend";
+  const literal = "typed\\r and typed\\u001b[31m and a lone \\ backslash";
+  const secret = "token hunter2 password=correct horse battery staple";
+  const content = [
+    `ANSI and control bytes: ${controls}`,
+    "",
+    `literal backslash text: ${literal}`,
+    secret,
+    "plain final line",
+  ].join("\n");
+  const value = webResult({ content, finalUrl: "https://example.test/controls", documentType: "text" });
+
+  const lines = rendered(renderExpandedWebResult, value);
+  const output = lines.join("\n");
+  const contentRegion = retainedContentRegion(output);
+  const encoded = visibleTerminalText(content);
+
+  // The complete model-visible content survives and decodes back exactly:
+  // controls are visible notation, not executed, deleted, or double-encoded.
+  assert.equal(decodeVisibleTerminal(contentRegion), content, "human view decodes back to the exact returned content");
+  assert.ok(contentRegion.includes(encoded), "retained content is the shared visible encoding applied once");
+  assert.match(contentRegion, /\\u001b\[31mred\\u001b\[0m\\u0007\\rmid\\u0000dle\\u007f\\u009b\\u000bend/);
+  // Literal escape-shaped text stays distinguishable from encoded controls.
+  assert.match(contentRegion, /typed\\\\r and typed\\\\u001b\[31m and a lone \\\\ backslash/);
+  // Secret-shaped model-visible text is not masked.
+  assert.match(output, /hunter2/);
+  assert.match(output, /correct horse battery staple/);
+  // Multiline structure is preserved; no executable control byte is rendered.
+  assert.ok(contentRegion.includes("\n"), "multiline formatting is preserved");
+  assertNoRawControlBytes(lines);
+  // Applied exactly once: encoded notation is never re-escaped, body shown once.
+  assert.doesNotMatch(contentRegion, /\\\\u001b\[31mred/);
+  assert.equal(contentRegion.split("\\u001b[31mred").length - 1, 1, "content is rendered exactly once");
+});
+
+test("collapsed legacy output encodes control bytes visibly and keeps secret-shaped text", () => {
+  const text = [
+    "Web page: Legacy retained result",
+    "\u001b[31mstyled\u001b[0m\rvalue\u0000tail\u007f",
+    "password hunter2",
+  ].join("\n");
+  const value = {
+    content: [{ type: "text", text }],
+    details: { response: { rawPath: "/private/raw" } },
+    isError: false,
+  };
+  const lines = rendered(renderWebResult, value, { expanded: false, isPartial: false }, 200);
+  assert.equal(decodeVisibleTerminal(lines.join("\n")), text, "collapsed legacy output round-trips through the visible encoding");
+  assert.match(lines.join("\n"), /hunter2/, "secret-shaped text stays visible");
+  assertNoRawControlBytes(lines);
+
+  // Expanded no-response fallback (returned tool output) behaves identically.
+  const expanded = rendered(renderExpandedWebResult, value).join("\n");
+  assert.match(expanded, /\\u001b\[31mstyled\\u001b\[0m\\rvalue\\u0000tail\\u007f/);
+  assert.match(expanded, /hunter2/);
 });

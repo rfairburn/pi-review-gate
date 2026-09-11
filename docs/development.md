@@ -147,71 +147,127 @@ to limit the orchestrator, pass Pi's native allowlist through the wrapper, for e
 ## Shared native tool-result expansion
 
 Tool result expansion is presentation-only and Pi-native: Pi toggles each tool row's
-expanded state through its configured expansion binding (`app.tools.expand`, Ctrl+O by
+expanded state through its configured expansion binding (`app.tools.expand`, ctrl+o by
 default) and passes `{ expanded, isPartial }` to the registered `renderResult`. The
 extension registers no competing key handler, mirrors no expansion state, and expansion
-never reruns a tool, performs a network request, or reads logs, artifacts, or history —
-it renders only data the tool already returned, under the existing authority, redaction,
-and retention boundaries.
+never reruns a tool, performs a network request, polls, or reads logs, artifacts, or
+history — it renders only data the tool already returned.
 
-All extension-owned tools with potentially expandable returned data are covered by one
-shared mechanism in `src/tool-result-expansion.ts`:
+All 37 registered extension-owned tools are covered by one shared mechanism in
+`src/tool-result-expansion.ts` — there is no rendererless remainder:
 
 - `expandableResult(collapsedRenderer, expandedRenderer?)` returns a Pi-compatible
   `renderResult` callback. Collapsed state (or any state before an expanded callback is
   contributed) renders the existing renderer unchanged; expanded state renders the
   contributed detail callback. A detail callback that throws or returns a non-component
-  falls back to the collapsed renderer so pending, partial, completed, error, and
-  cancelled states stay stable.
-- Tools that define a custom `renderResult` are wired through the helper with their
-  existing renderer as the collapsed view: the nine `Subtasks*` tools
-  (`src/execution/tool.ts`), `ApplyPatch` (`src/apply-patch/tool.ts`), and the eighteen
-  interactive `Browser*` tools from `BrowserOpen` through `BrowserClose`
-  (`src/web/browser-renderer.ts`). The browser family contributes one shared wrapper
-  (`browserRenderResult`) reused by every registration: the collapsed view is a bounded
-  preview of the already-returned model-visible text (the useful native presentation,
-  with an explicit omission marker), and the expanded view renders the family detail
-  callback from `details.response` — semantic snapshots, console/error and network
-  diagnostics with cursor and retention bounds, allowlisted semantic inspection,
-  history/tabs, interaction effect accounting, wait/scroll observations, screenshot
-  capture bounds, and close teardown results. Screenshot image blocks stay native Pi
-  image content in both states; encoded image data is never printed, and expansion
-  reads only already-returned safe content under the existing allowlists and
-  redactions.
-  The `Subtasks*` family also contributes its expanded detail callback (#59):
-  expanding a result renders a cohesive, provenance-separated view of already-returned
-  data with bounded sections and omission disclosures; re-collapse restores its
+  falls back to the collapsed renderer with a visible failure notice line so pending,
+  partial, completed, error, and cancelled states stay stable and the failure never
+  silently looks like a complete summary.
+- Collapsed cards are actionable operation/outcome summaries; expanded views render the
+  complete original model-visible inputs and results — no additional human-view
+  masking, omission, summarization, or truncation is layered on top of what the model
+  saw. Renderers reuse the native `renderResult` `context.args` (the actual recorded
+  tool-call request) instead of duplicating inputs into truncated result-detail copies.
+  Extra execution provenance is captured at the actual transport boundary only where
+  the original call cannot establish it — for example the worker prompt, captured at
+  dispatch after transformations, is retained rather than reconstructed later and
+  labeled exact. Data genuinely omitted upstream (retention bounds, dropped log lines,
+  uncaptured bodies, genuinely unavailable fields) stays truthfully disclosed; nothing
+  is presented as complete when it cannot be shown.
+- Centralized native hints (`src/tool-result-hints.ts`): the shared wrapper appends
+  exactly one native-style `(ctrl+o to expand)` / `(ctrl+o to collapse)` hint to the
+  header of every tool with a contributed expanded renderer; family renderers emit no
+  expansion hints of their own. The key is never hard-coded: it is resolved at render
+  time from the host's configured `app.tools.expand` binding, lowercase to match the
+  native tool-row hint casing. The hint is width-safe — it rides on the header when the
+  line still fits and otherwise moves to its own wrapped row(s) below the card (oversized
+  tokens hard-wrap) without truncating or dropping any family line, so the affordance
+  stays visible at every width.
+- Interaction stays the host's own: keyboard expansion is the global `app.tools.expand`
+  binding, which flips every row's expansion state together, and in fullscreen mode the
+  host's per-card click region toggles one card without changing its neighbors. Regular
+  mode remains keyboard-only. The mechanism registers no toggle state or handler and
+  forwards any handlers the inner component defines, otherwise leaving events unhandled
+  for the host's region.
+- Start/Add lifecycle: `SubtasksStart` and `SubtasksAdd` return before dispatch. Their
+  queued view truthfully says the prompt is not yet sent and that no captured base
+  commit or worker worktree is available yet — nothing is inferred or fabricated. When
+  an actual dispatch event arrives, the original tool card invalidates automatically
+  through Pi's native renderer context (`context.invalidate()`) and re-renders with the
+  controller's authoritative dispatch view: the prompt captured at the transport
+  boundary (after transformations), the worker worktree, the captured base commit, and
+  the current task state. Rendering and expansion trigger no polling, no fetching, and
+  no dispatch.
+- Control-character display encoding (`src/tool-result-text.ts`): recorded text that
+  contains terminal control bytes renders through `visibleTerminalText` — a reversible
+  visible display encoding (ESC as `\u001b`, CR as `\r`, literal backslashes escaped
+  first, LF and TAB preserved) applied once at the raw-text display boundary. The
+  encoding is not a redaction: nothing is filtered, masked, or truncated, and the
+  upstream retention, redaction, and privacy rules that run before data reaches the
+  model remain unchanged.
+- Native image presentation: screenshot image blocks stay native Pi image content in
+  both states; encoded image data is never printed, and the `[native image]` line
+  denotes the actual native image component, never replacement text.
+- The nine `Subtasks*` tools (`src/execution/tool.ts`) contribute their expanded detail
+  callback: expanding a result renders a cohesive, provenance-separated view of
+  already-returned data — submitted instructions and acceptance criteria, the actual
+  steer instruction and continuation text (with any adapter-delivered variant shown
+  separately when retained), actual dispatch records, and mode-specific evidence reads
+  that are complete (the find query and every returned match, the requested range and
+  every returned entry, the full returned chunk with its whitespace, and the actual
+  call with its paired result or its not-yet-observed state); re-collapse restores the
   unchanged collapsed card.
-- Tools that never defined a custom `renderResult` keep Pi's native fallback rendering,
-  which already expands and re-collapses the returned text output with a bounded
-  preview: `WebSearch` and `search_tools`. Those registrations are deliberately not wrapped, because a custom
-  collapsed renderer would replace the native fallback rather than extend it.
-- The five `Shell*` tools (`src/background-shell/index.ts`) previously had no custom
-  renderer: they are wired with a collapsed view that preserves Pi's native fallback
-  presentation (bounded preview with the expand hint when collapsed, full returned
-  text when expanded) plus the family's per-tool expanded detail callbacks
-  (`src/background-shell/result-view.ts`). Expansion renders only the bounded
-  retained snapshot each call recorded — command and job lifecycle provenance, log
-  range and drop counts, stdin delivery state — never re-reading, re-fetching, or
-  reconstructing from live job state; restored results without structured details
-  degrade to the retained text preview.
-- `WebFetch` and `BrowserExtract` (`src/web/tools.ts`, #82) contribute the shared web
-  expanded detail renderer (`src/web/result-renderer.ts`): collapsed state keeps the
-  native bounded preview of returned text with an omitted-lines notice and expand hint
-  for large acquisitions; expanded state renders safe retained extraction, source,
-  index/range, continuation and truncation details under existing privacy boundaries.
+- The five `Shell*` tools (`src/background-shell/index.ts`, `result-view.ts`) are wired
+  with per-tool collapsed and expanded detail callbacks. The collapsed card shows the
+  actionable job/outcome summary — for `ShellLog` the tail of the returned range with a
+  truthful earlier-lines omission count; expansion renders the complete actual inputs
+  and meaningful retained results: the full recorded command from the original call
+  arguments (never a preview-capped copy), the complete returned log range with its
+  range and drop markers, the actual stdin input, and the retained stop-all target
+  snapshot. Expansion never re-reads, re-fetches, or reconstructs from live job state;
+  restored results without structured details degrade to the retained text preview
+  (bounded collapsed, complete expanded).
+- The eighteen interactive `Browser*` tools from `BrowserOpen` through `BrowserClose`
+  (`src/web/browser-renderer.ts`) share one wrapper (`browserRenderResult`): the
+  collapsed view presents concise, tool-specific operation/outcome summaries rather
+  than previews of returned diagnostic text (opened/navigated titles and URLs, snapshot
+  ref counts and truncation state, console/network event and failure counts with
+  cursor and drop accounting), and the expanded view renders the family detail callback
+  from `details.response` — semantic snapshots, console/error and network diagnostics
+  with cursor and retention bounds, allowlisted semantic inspection, history/tabs,
+  interaction effect accounting, wait/scroll observations, screenshot capture bounds,
+  and close teardown results. Submitted form values (`BrowserFill`, `BrowserType`,
+  `BrowserSelect`) come from the recorded call arguments and are shown in human
+  expansion without a second masking or truncation layer; the result payload itself
+  intentionally does not echo them back to the model.
+- The acquisition and search tools (`src/web/tools.ts`, `src/web/result-renderer.ts`):
+  `WebFetch`, `BrowserExtract`, and `WebSearch` contribute collapsed cards naming the
+  actual request and outcome plus expanded views with the effective request settings
+  and the complete retained content — every returned block or search result once, with
+  source, index/range, continuation and truncation details. Expansion never fetches
+  unreturned blocks or re-runs a search.
+- `ApplyPatch` (`src/apply-patch/tool.ts`, `result-renderer.ts`) contributes a genuine
+  expanded arm: the complete requested patch envelope and the complete retained final
+  diff; on partial failure the view distinguishes applied, failed, and not-attempted
+  operations and shows the complete retained failure detail.
+- `search_tools` (`src/deferred-tools.ts`, `src/deferred-tools-result-renderer.ts`)
+  contributes collapsed and expanded views showing the actual query, matched and
+  newly activated tools, and the real activation outcome, preserving the no-match,
+  unavailable, invalid-query, and already-active distinctions from the operation
+  record.
 
 `isExpandableResult()` provides a wiring-audit marker used by
 `tests/tool-result-expansion.test.ts` and
-`tests/browser-render-registration.test.ts` to prove that every wrapped registration
-routes through the shared helper, that expand and re-collapse render through it, that
-the interactive browser family shares one wrapper instance, and that the rendererless
-inventory keeps the native fallback untouched. The registered browser tests render
-through the real registrations — including image handling, errors, partial and empty
-results, long output bounds, and the redaction boundaries — rather than only the module
-callbacks.
-The shared inventory also exercises registered WebFetch/BrowserExtract tools through
-expansion and re-collapse with their real renderers.
+`tests/browser-render-registration.test.ts` to prove that every one of the 37
+registrations routes through the shared helper, that expand and re-collapse render
+through it, that the interactive browser family shares one wrapper instance, and that
+expanded views carry the actual recorded inputs (including content beyond the legacy
+preview caps and synthetic secret-shaped model-visible input shown unfiltered). The
+registered browser tests render through the real registrations — including image
+handling, errors, partial and empty results, long output bounds, and the redaction
+boundaries — rather than only the module callbacks. The shared inventory also exercises
+registered web, discovery, shell, subtask, and patch tools through expansion and
+re-collapse with their real renderers.
 
 ## Third-party code
 

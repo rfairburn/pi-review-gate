@@ -385,15 +385,18 @@ pairing, or in flight with no result observed), deep-read chunk size and continu
 or the newer-entry count for cursor reads — plus available continuations (`nextIndex`,
 incremental cursor) and important unavailable notes such as missing tool evidence.
 Retained content, entry previews, and private reasoning never appear in the collapsed
-card; expanding the result with Pi's native expansion binding (Ctrl+O by default) renders
+card; expanding the result with Pi's native expansion binding (ctrl+o by default) renders
 the #59 expanded detail view — the same returned data, never a rerun or retrieval,
-reorganized into bounded, provenance-separated sections (observed evidence, worker
-claims, reviewer verdicts, and the authoritative durable context) with the snapshot's
+reorganized into provenance-separated sections (observed evidence, worker claims,
+reviewer verdicts, and the authoritative durable context) with the snapshot's
 "as of" freshness, unavailable ranges, truncated records, and every omitted range
-disclosed — and re-collapsing restores the unchanged collapsed card. Streaming, error,
-and cancelled results stay stable in both states: a still-streaming result renders a
-bounded pending view even when expanded, and evidence selector failures stay task-scoped
-in the expanded view.
+disclosed — and re-collapsing restores the unchanged collapsed card. Evidence reads are
+mode-specific and complete in the expanded view: the find query and every returned
+match, the requested range and every returned entry, the full returned chunk with its
+whitespace, and the actual call with its paired result or its not-yet-observed state.
+Streaming, error, and cancelled results stay stable in both states: a still-streaming
+result renders a bounded pending view even when expanded, and evidence selector
+failures stay task-scoped in the expanded view.
 
 Selector failures are scoped: with a valid, authorized `taskId`, a mistyped `entryId`, an
 unknown `callId`, a malformed or expired `cursor`, or an out-of-range `index` returns one
@@ -476,14 +479,17 @@ external or unparseable `ShellStart` success responses fail closed.
 
 Each Shell tool result carries structured display metadata (command, job lifecycle,
 log range and drop counts, stdin delivery state) in the result's render-only details,
-and Pi's shared tool-result expansion (`expandableResult`, Ctrl+O) shows it: expanding
-a Shell row renders the bounded retained snapshot that call recorded — the log body
-verbatim with its range and truncation markers, plus lifecycle, command, and wake
-configuration provenance. Expansion is display-only: nothing is re-read, re-fetched,
-or reconstructed from live job state, the collapsed presentation is preserved, and
+and Pi's shared tool-result expansion (`expandableResult`, ctrl+o by default) shows it:
+the collapsed card is the actionable job/outcome summary — for `ShellLog` the tail of
+the returned range with an earlier-lines omission count — and expanding the row renders
+the complete actual inputs and meaningful retained results the call recorded: the full
+recorded command from the original call arguments, the complete returned log range with
+its truncation markers, the actual stdin input, and the retained stop-all target
+snapshot, plus job lifecycle and wake configuration provenance. Expansion is
+display-only: nothing is re-read, re-fetched, or reconstructed from live job state, and
 restored sessions render exactly what was recorded. Structured details are absent on
-older recorded results; expansion then degrades to the retained text preview without
-inventing content.
+older recorded results; expansion then degrades to the retained text preview (bounded
+collapsed, complete expanded) without inventing content.
 
 ## External harness protocol
 

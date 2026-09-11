@@ -9,12 +9,13 @@ import {
   isInterruptibleTaskState,
   type BackgroundInspection,
   type BackgroundReviewReadinessTask,
-  type BackgroundTaskKind,
   type BackgroundTaskDefinition,
+  type BackgroundTaskKind,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
 import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_DEFAULT, EVIDENCE_LIMIT_MAX, EvidenceCursorError, EvidenceNavigationError, type SubtaskEvidenceSelector } from "./subtask-evidence";
 import { redactSensitiveText } from "../redaction";
+import { renderSubtaskResultCollapsed } from "./subtask-result-collapsed";
 import { renderSubtaskResultExpanded } from "./subtask-result-expanded";
 import {
   completionNotificationGuidanceLine,
@@ -25,7 +26,8 @@ import {
 } from "./subtask-notifications";
 import { randomUUID } from "node:crypto";
 import { parseDuration } from "../background-shell/jobs";
-import { expandableResult } from "../tool-result-expansion";
+import { expandableResult, EXPANDABLE_RESULT_MARKER, type ToolResultRenderCallback } from "../tool-result-expansion";
+import { hasDispatchCardWatcher, watchDispatchCards } from "./dispatch-cards";
 import {
   assignExecutorToolCatalog,
   createExecutorToolCatalog,
@@ -49,6 +51,37 @@ export const EXECUTION_TOOL_NAMES: Record<Action, string> = {
 };
 
 const EXECUTION_TOOL_NAME_LIST = ACTIONS.map((action) => EXECUTION_TOOL_NAMES[action]);
+
+/** #93: row-local native context.state guard key recording which execution a
+ * rendered Start/Add card already watches for dispatch-driven invalidation. */
+const DISPATCH_WATCH_STATE_KEY = "__piReviewGateDispatchWatchExecutionId";
+
+/**
+ * #93 weak row ownership: the global dispatch registry must never strongly
+ * retain a native renderer callback — such a closure retains the host row, and
+ * the registry outlives rows. These module-level helpers (deliberately outside
+ * any render invocation so no closure can capture a native context) keep only
+ * a WeakRef to the row's per-row state object; the current native invalidate
+ * is looked up on the weak map at event time, and finalization releases the
+ * subscription once a detached row is collected.
+ */
+const rowInvalidators = new WeakMap<object, () => void>();
+const retiredRows = new FinalizationRegistry<() => void>((unsubscribe) => unsubscribe());
+
+function subscribeWeakRow(executionId: string, owner: WeakRef<object>): () => void {
+  const token = {};
+  const unsubscribe = watchDispatchCards(executionId, () => {
+    const row = owner.deref();
+    if (row) rowInvalidators.get(row)?.();
+    else unsubscribe();
+  });
+  const row = owner.deref();
+  if (row) retiredRows.register(row, unsubscribe, token);
+  return () => {
+    retiredRows.unregister(token);
+    unsubscribe();
+  };
+}
 
 const SHARED_PROMPT_GUIDELINES = [
   "Use SubtasksStart with an array of one or more bounded tasks and kind execute or research; retain the stable execution/task handles returned for every task.",
@@ -153,6 +186,12 @@ export class ExecutionToolManager {
   private registered = false;
   private commandsRegistered = false;
   private launchAllowedExecutionTools: Set<string> | undefined;
+  /**
+   * Per-row dispatch subscription ownership, keyed by the renderer context's
+   * per-row `state` object. Registry callbacks reference this owner weakly;
+   * finalization releases subscriptions after detached rows are collected.
+   */
+  private static readonly rowUnsubscribes = new WeakMap<object, () => void>();
   private readonly controller: BackgroundExecutionController;
 
   constructor(private readonly input: ExecutionToolManagerInput) {
@@ -365,17 +404,117 @@ export class ExecutionToolManager {
         execute: async (toolCallId: string, params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: unknown) =>
           this.executeAction(action, name, toolCallId, params, ctx),
         renderCall: (args: unknown, theme: ThemeLike) => renderCall(name, action, args, theme),
-        // #59: the expanded (Ctrl+O) detail callback is the helper's second
-        // argument; the #56 collapsed renderer above is passed through
-        // unchanged and stays the collapsed view for every expansion state
-        // except an explicit `expanded: true`, which selects the detail view.
-        renderResult: expandableResult(
-          (value: unknown, options: unknown, theme: ThemeLike) => renderResult(value, options, theme),
+        // #93: the canonical collapsed callback (subtask-result-collapsed.ts)
+        // is the shared helper's first argument and owns every non-expanded
+        // state; the expanded detail callback (subtask-result-expanded.ts) is
+        // the second. The native `options.expanded` flag selects between them,
+        // the native `context.args` reaches both, and the shared wrapper adds
+        // the single native-style hint to both states.
+        // #93: the dispatch lifecycle preparation (watcher registration via
+        // the native renderer context plus the live dispatch projection) runs
+        // BEFORE routing to either renderer arm, so originally-expanded rows,
+        // rows expanded later, and rows that stay expanded across a dispatch
+        // all observe the refreshed projection identically.
+        renderResult: this.lifecycleRoutedRenderResult(action, expandableResult(
+          renderSubtaskResultCollapsed,
           renderSubtaskResultExpanded,
-        ),
+        )),
       });
     }
     this.registered = true;
+  }
+
+  /**
+   * #93: wraps the shared expandableResult callback so Start/Add dispatch
+   * lifecycle preparation runs before expansion routing:
+   *
+   * - Registers the rendered row once for dispatch-driven invalidation through
+   *   Pi's native renderer context (`context.state` row-local guard plus
+   *   `context.invalidate()`): when an actual dispatch event arrives, the row
+   *   re-renders with the delivered prompt/worktree/base provenance — no extra
+   *   inspection call, no expansion fetch, no polling, and no competing
+   *   expansion state.
+   * - Projects the controller's authoritative in-memory dispatch view into a
+   *   renderer-only copy of the details (never mutating the model result) that
+   *   reaches BOTH the collapsed and the expanded renderer, and refreshes
+   *   `context.state.subtaskDispatchView` on every render so an expanded row
+   *   never keeps a stale projection after invalidation.
+   * - Every other action routes exactly as before.
+   *
+   * The wrapper is marked with the shared wiring marker because the shared
+   * `expandableResult` mechanism remains the only expansion route underneath.
+   */
+  /**
+   * Generic over the shared callback's native context type so the family
+   * renderers' structural context (context.args et al.) flows through the
+   * wrapper unchanged — no widening to `unknown` and no casts at the boundary.
+   */
+  private lifecycleRoutedRenderResult<TContext>(
+    action: Action,
+    expandable: ToolResultRenderCallback<ThemeLike, TContext>,
+  ): ToolResultRenderCallback<ThemeLike, TContext> {
+    const routed = (value: unknown, options: unknown, theme: ThemeLike, context?: TContext): unknown => {
+      const prepared = this.prepareDispatchLifecycle(action, value, context);
+      return expandable(prepared.value, options, theme, prepared.context);
+    };
+    (routed as unknown as Record<string, unknown>)[EXPANDABLE_RESULT_MARKER] = true;
+    return routed;
+  }
+
+  /**
+   * Presentation-only preparation for Start/Add rows. `context` is the native
+   * renderer context of THIS row (Pi's ToolExecutionComponent passes a
+   * per-row `state` object and a per-row `invalidate()` that re-runs this
+   * exact renderResult); it is read structurally, never mutated beyond the
+   * documented row-local keys, and returned as the same reference.
+   */
+  private prepareDispatchLifecycle<TContext>(
+    action: Action,
+    value: unknown,
+    context?: TContext,
+  ): { value: unknown; context?: TContext } {
+    if (action !== "start" && action !== "add") return { value, context };
+    const valueRecord = isRecord(value) ? value : undefined;
+    const details = valueRecord && isRecord(valueRecord.details) ? valueRecord.details : undefined;
+    const executionId = details && typeof details.executionId === "string" ? details.executionId : undefined;
+    if (!executionId) return { value, context };
+    const ctx = isRecord(context) ? context : undefined;
+    const state = ctx && isRecord(ctx.state) ? ctx.state as Record<string, unknown> : undefined;
+    // Subscribe this row to dispatch events for its execution. Row identity
+    // is the renderer context's per-row `state` object (Pi keeps one per tool
+    // row), tracked in a WeakMap of unsubscribe functions so two rows
+    // rendered from the same result envelope never share or double a
+    // listener. If the registry entry for this execution no longer exists
+    // when the row renders again, the row re-subscribes: a card that can
+    // still receive dispatch events always holds a live subscription. No
+    // polling/fetching is introduced — refresh happens only when an actual
+    // dispatch event fires.
+    if (state) {
+      const owned = ExecutionToolManager.rowUnsubscribes.get(state);
+      const entryAlive = hasDispatchCardWatcher(executionId);
+      if (!owned || !entryAlive) {
+        if (owned) {
+          try {
+            owned();
+          } catch {
+            // A stale row subscription must never break rendering.
+          }
+        }
+        state[DISPATCH_WATCH_STATE_KEY] = executionId;
+        const invalidate = typeof ctx?.invalidate === "function" ? ctx.invalidate : undefined;
+        if (invalidate) {
+          rowInvalidators.set(state, invalidate);
+          ExecutionToolManager.rowUnsubscribes.set(
+            state,
+            subscribeWeakRow(executionId, new WeakRef(state)),
+          );
+        }
+      }
+    }
+    const live = this.controller.liveDispatchView(executionId);
+    if (!live) return { value, context };
+    if (state) state.subtaskDispatchView = live;
+    return { value: { ...valueRecord, details: { ...details, dispatchView: live } }, context };
   }
 
   private async executeAction(action: Action, toolName: string, toolCallId: string, params: unknown, ctx: unknown): Promise<Record<string, unknown>> {
@@ -1072,131 +1211,6 @@ function inspectCallSummary(args: Record<string, unknown>): string {
   return ` · ${parts.join(" · ")}`;
 }
 
-const PROVENANCE_SHORT: Record<string, (count: number) => string> = {
-  executor_observed: () => "observed",
-  worker_claim: (count) => count === 1 ? "claim" : "claims",
-  reviewer_verdict: (count) => count === 1 ? "review verdict" : "review verdicts",
-};
-
-/** Compact provenance/truncation mix for a set of returned entries. Provenance is
- * shown only when the read mixes kinds, so a uniform read stays undisturbed while
- * observed-versus-claimed versus reviewer evidence never blurs together. */
-function entryMixSuffix(entries: Array<Record<string, unknown>>): string {
-  const provenance = new Map<string, number>();
-  let truncated = 0;
-  for (const entry of entries) {
-    if (typeof entry.provenance === "string") provenance.set(entry.provenance, (provenance.get(entry.provenance) ?? 0) + 1);
-    if (entry.truncatedContent === true) truncated += 1;
-  }
-  const parts: string[] = [];
-  if (provenance.size > 1) {
-    parts.push([...provenance.entries()].map(([name, count]) => `${count} ${PROVENANCE_SHORT[name]?.(count) ?? name}`).join(", "));
-  }
-  if (truncated > 0) parts.push(`${truncated} truncated at retention`);
-  return parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
-}
-
-/** #56: mode-specific collapsed result summary for one evidence read. Reports the
- * returned range/count or match total, available continuations, and important
- * empty/unavailable/truncated outcomes — never scheduler boilerplate, raw content,
- * cursor tokens, or private reasoning. */
-function evidenceResultLines(evidence: Record<string, unknown>, theme: ThemeLike): string[] {
-  const mode = typeof evidence.mode === "string" ? evidence.mode : "";
-  const lines: string[] = [];
-  const entries = Array.isArray(evidence.entries) ? evidence.entries.filter(isRecord) : [];
-  switch (mode) {
-    case "find": {
-      const summary = isRecord(evidence.matchSummary) ? evidence.matchSummary : undefined;
-      const query = typeof summary?.query === "string" ? safeSelector(summary.query) : "";
-      const total = typeof summary?.totalMatches === "number" ? summary.totalMatches : 0;
-      if (total === 0) {
-        lines.push(theme.fg("warning", `no matches for "${query}"`));
-      } else {
-        const shown = Array.isArray(evidence.matches) ? evidence.matches.length : 0;
-        let line = theme.fg("success", `${total} match${total === 1 ? "" : "es"} for "${query}"`);
-        if (summary?.matchesTruncated === true || shown < total) line += theme.fg("dim", ` (${shown} shown)`);
-        lines.push(line);
-      }
-      break;
-    }
-    case "range": {
-      if (entries.length === 0) {
-        lines.push(theme.fg("warning", "no entries in this read"));
-      } else {
-        const first = entries[0];
-        const last = entries[entries.length - 1];
-        const from = typeof first?.index === "number" ? first.index : 0;
-        const to = typeof last?.index === "number" ? last.index : from;
-        // A cursor is issued only for unfiltered range reads, so its presence
-        // identifies the sequence total as the read's own base length.
-        const snapshot = isRecord(evidence.snapshot) ? evidence.snapshot : undefined;
-        const total = typeof evidence.cursor === "string" && typeof snapshot?.totalEntries === "number"
-          ? ` of ${snapshot.totalEntries}`
-          : "";
-        lines.push(theme.fg("success", `entries ${from}–${to}${total}`) + theme.fg("dim", entryMixSuffix(entries)));
-      }
-      const continuation: string[] = [];
-      if (typeof evidence.nextIndex === "number") continuation.push(`next page at index=${evidence.nextIndex}`);
-      if (typeof evidence.cursor === "string") continuation.push("incremental cursor available");
-      if (continuation.length > 0) lines.push(theme.fg("dim", continuation.join(" · ")));
-      break;
-    }
-    case "cursor": {
-      lines.push(entries.length > 0
-        ? theme.fg("success", `${entries.length} newer entr${entries.length === 1 ? "y" : "ies"}`) + theme.fg("dim", entryMixSuffix(entries))
-        : theme.fg("warning", "no newer entries"));
-      if (typeof evidence.cursor === "string") lines.push(theme.fg("dim", "updated cursor issued for the next continuation"));
-      break;
-    }
-    case "call": {
-      const pair = isRecord(evidence.callPair) ? evidence.callPair : undefined;
-      const callId = typeof pair?.call?.callId === "string" ? (pair.call.callId as string)
-        : typeof pair?.result?.callId === "string" ? (pair.result.callId as string)
-          : "";
-      const label = callId ? `call ${safeSelector(callId)}` : "call";
-      if (pair?.status === "returned") {
-        lines.push(theme.fg("success", `${label} · result returned`));
-      } else if (isRecord(pair?.result)) {
-        // readCall reports an observed source-scoped result without a validated
-        // pair as in_flight: the result record exists, only the pairing is
-        // unresolved — never claim it was absent.
-        lines.push(theme.fg("warning", `${label} · result observed, pairing unresolved`));
-      } else {
-        lines.push(theme.fg("warning", `${label} · in flight, result not observed yet`));
-      }
-      break;
-    }
-    case "entry": {
-      const deep = isRecord(evidence.deepContent) ? evidence.deepContent : undefined;
-      const entryId = typeof deep?.entryId === "string" ? safeSelector(deep.entryId) : "";
-      const chunkIndex = typeof deep?.chunkIndex === "number" ? deep.chunkIndex : 0;
-      const chars = typeof deep?.content === "string" ? deep.content.length : 0;
-      lines.push(theme.fg("success", `entry ${entryId} · chunk ${chunkIndex} · ${chars} char${chars === 1 ? "" : "s"}`));
-      if (deep?.hasMore === true && typeof deep?.nextChunk === "number") {
-        lines.push(theme.fg("dim", `more chunks (next: ${deep.nextChunk})`));
-      }
-      if (deep?.truncatedContent === true) {
-        lines.push(theme.fg("warning", "source record truncated at retention cap"));
-      } else if (typeof deep?.note === "string" && deep.note.trim() !== "") {
-        lines.push(theme.fg("warning", clipPlain(deep.note, 120)));
-      }
-      break;
-    }
-    default:
-      lines.push(theme.fg("success", mode ? `evidence read (${mode})` : "evidence read"));
-  }
-  const snapshot = isRecord(evidence.snapshot) ? evidence.snapshot : undefined;
-  const capability = isRecord(snapshot?.capability) ? snapshot.capability : undefined;
-  if (capability?.toolEvidence === "unavailable") {
-    lines.push(theme.fg("warning", `tool evidence unavailable: ${safeSelector(String(capability.reason ?? "no tool records"))}`));
-  } else if (Array.isArray(snapshot?.unavailable) && snapshot.unavailable.length > 0) {
-    const notes = snapshot.unavailable;
-    const reasons = [...new Set(notes.filter(isRecord).map((item) => (typeof item.reason === "string" ? item.reason : "unknown")))];
-    lines.push(theme.fg("dim", `${notes.length} unavailable source note(s): ${reasons.slice(0, 3).join(", ")}${reasons.length > 3 ? ` +${reasons.length - 3} more` : ""}`));
-  }
-  return lines;
-}
-
 function renderCall(toolName: string, action: Action, args: unknown, theme: ThemeLike): unknown {
   // #56: inspection cards name the task and effective navigation mode so distinct
   // searches, ranged reads, deep reads, call resolutions, and cursor continuations
@@ -1214,58 +1228,6 @@ function renderCall(toolName: string, action: Action, args: unknown, theme: Them
     ? ` · ${args.workspace.trim()}`
     : "";
   return textComponent((width) => [clip(theme.fg("toolTitle", theme.bold(toolName)) + theme.fg("accent", taskCount || ` · ${action}`) + workspace, width)]);
-}
-
-function renderResult(value: unknown, options: unknown, theme: ThemeLike): unknown {
-  const details = isRecord(value) && isRecord(value.details) ? value.details : undefined;
-  const summary = isRecord(value) && Array.isArray(value.content) && isRecord(value.content[0]) && typeof value.content[0].text === "string"
-    ? value.content[0].text
-    : "No execution result.";
-  const isError = isRecord(value) && value.isError === true;
-  const optionsRecord = isRecord(options) ? options : undefined;
-  const isPartial = optionsRecord?.isPartial === true;
-  // #56: the operation-specific summary is the collapsed-card experience. Expanded
-  // results keep their previous summary-first rendering (expansion details are a
-  // separate concern, #57).
-  const isExpanded = optionsRecord?.expanded === true;
-  return textComponent((width) => {
-    if (isPartial) return [clip(theme.fg("warning", "inspecting…"), width)];
-    const lines: string[] = [];
-    // #56: collapsed evidence navigation reads lead with the operation-specific
-    // outcome instead of the group/scheduler summary line; every other result
-    // (including expanded and error/cancelled outcomes) keeps the native
-    // summary-first rendering.
-    const evidence = details && isRecord(details.evidence) ? details.evidence : undefined;
-    if (!isError && !isExpanded && evidence) {
-      for (const line of evidenceResultLines(evidence, theme)) lines.push(clip(line, width));
-    } else {
-      lines.push(clip(theme.fg(isError ? "error" : "success", summary), width));
-    }
-    if (details && Array.isArray(details.tasks)) {
-      const renderedTasks = details.tasks.slice(0, 8);
-      for (const task of renderedTasks) {
-        if (!isRecord(task)) continue;
-        const title = isRecord(task.definition) && typeof task.definition.title === "string" ? task.definition.title : task.taskId;
-        const state = task.state === "queued"
-          ? task.dispatchState === "assigned_starting"
-            ? "queued (executor assigned/startup)"
-            : "queued (executor capacity wait)"
-          : task.state ?? "unknown";
-        lines.push(clip(`  ${String(task.taskId ?? "task")}  ${state}  ${title ?? "task"}`, width));
-      }
-      // Finding 15 (review pass 2): compact rendering is explicitly bounded,
-      // so it must disclose what it omits — both unrendered inline tasks and
-      // archive-only settled history.
-      if (details.tasks.length > renderedTasks.length) {
-        lines.push(clip(`  … ${details.tasks.length - renderedTasks.length} additional inline task(s) omitted from this compact rendering.`, width));
-      }
-      const archivedCount = typeof details.archivedCount === "number" ? details.archivedCount : 0;
-      if (archivedCount > 0) {
-        lines.push(clip(`  … ${archivedCount} earlier settled task(s) are archived; inspect by taskId for exact history.`, width));
-      }
-    }
-    return lines;
-  });
 }
 
 function textComponent(render: (width: number) => string[]) {

@@ -16,10 +16,22 @@ import { expandableResult } from "../tool-result-expansion";
 import { parseApplyPatchEnvelope, type ApplyPatchFileOp } from "./envelope";
 import { normalizeApplyPatchPath, normalizeApplyPatchPathMarker } from "./paths";
 import { performApplyPatchRequest, type AppliedOperation, type ApplyPatchFailure, type ApplyPatchOperationType } from "./request";
+import {
+  renderApplyPatchResult,
+  renderExpandedApplyPatchResult,
+  type ApplyPatchRenderContext,
+  type ApplyPatchRenderOptions,
+  type ApplyPatchRendererTheme,
+} from "./result-renderer";
 
 export const APPLY_PATCH_TOOL_NAME = "ApplyPatch";
 
 export type { AppliedOperation, ApplyPatchFailure, ApplyPatchOperationType };
+export {
+  renderApplyPatchResult,
+  renderExpandedApplyPatchResult,
+};
+export type { ApplyPatchRendererTheme };
 export { normalizeApplyPatchPathMarker };
 
 // ---------------------------------------------------------------------------
@@ -244,21 +256,11 @@ export interface ApplyPatchToolOptions {
 // Rendering
 // ---------------------------------------------------------------------------
 
-type ApplyPatchThemeColor =
-  | "accent"
-  | "error"
-  | "muted"
-  | "success"
-  | "toolDiffAdded"
-  | "toolDiffContext"
-  | "toolDiffRemoved"
-  | "toolTitle";
-
-export interface ApplyPatchRendererTheme {
-  bold(text: string): string;
-  fg(color: ApplyPatchThemeColor, text: string): string;
-}
-
+/**
+ * Compact ApplyPatch call rendering remains owned by the registration module;
+ * result rendering lives in ./result-renderer so the full callback can also be
+ * tested without registering a tool.
+ */
 export function renderApplyPatchCall(args: unknown, theme: ApplyPatchRendererTheme): unknown {
   if (isRecord(args) && typeof args.patch === "string") {
     const suffix = ` · ${summarizeEnvelopeForCall(args.patch)}`;
@@ -292,49 +294,6 @@ function summarizeEnvelopeForCall(patch: string): string {
   return `${paths.length} file operation(s) · ${shown}${more}`;
 }
 
-const MAX_RENDERED_FINAL_DIFF_LINES = 16;
-const MAX_RENDERED_REQUESTED_DIFF_LINES = 8;
-
-export function renderApplyPatchResult(value: unknown, _options: unknown, theme: ApplyPatchRendererTheme): unknown {
-  const isError = isRecord(value) && value.isError === true;
-  const summary = isRecord(value) && Array.isArray(value.content) && isRecord(value.content[0]) && typeof value.content[0].text === "string"
-    ? value.content[0].text
-    : "No ApplyPatch result.";
-  const details = isRecord(value) && isRecord(value.details) ? value.details : undefined;
-  const requestedDiff = details && typeof details.requestedDiff === "string" ? details.requestedDiff : "";
-  const finalDiff = details && typeof details.finalDiff === "string" ? details.finalDiff : "";
-  return textComponent((width) => {
-    const lines = [clip(theme.fg(isError ? "error" : "success", summary), width)];
-    if (!isError) {
-      // The final diff shows what actually landed (including rename from/to
-      // for moves and the full deletion for deletes); the requested diff is
-      // the shorter V4A body or envelope the model sent.
-      lines.push(...renderDiffBlock(finalDiff, MAX_RENDERED_FINAL_DIFF_LINES, "Final diff:", width, theme));
-      lines.push(...renderDiffBlock(requestedDiff, MAX_RENDERED_REQUESTED_DIFF_LINES, "Requested diff:", width, theme));
-    }
-    return lines;
-  });
-}
-
-function renderDiffBlock(diff: string, maxLines: number, label: string, width: number, theme: ApplyPatchRendererTheme): string[] {
-  const diffLines = diff.split("\n").filter((line) => line.length > 0);
-  if (diffLines.length === 0) return [];
-  const lines = [clip(theme.fg("muted", theme.bold(label)), width)];
-  const shown = diffLines.slice(0, maxLines);
-  for (const line of shown) {
-    const color = line.startsWith("+")
-      ? "toolDiffAdded"
-      : line.startsWith("-")
-        ? "toolDiffRemoved"
-        : "toolDiffContext";
-    lines.push(clip(theme.fg(color, line), width));
-  }
-  if (diffLines.length > shown.length) {
-    lines.push(clip(theme.fg("muted", `… ${diffLines.length - shown.length} more diff line(s)`), width));
-  }
-  return lines;
-}
-
 // ---------------------------------------------------------------------------
 // Registration and execution
 // ---------------------------------------------------------------------------
@@ -350,6 +309,28 @@ export interface ApplyPatchHost {
  */
 export function registerApplyPatchTool(pi: unknown, options: ApplyPatchToolOptions = {}): boolean {
   if (!isRecord(pi) || typeof pi.registerTool !== "function") return false;
+
+  // Pi's outer error adapter intentionally normalizes a thrown failure to its
+  // message, so it does not preserve arbitrary properties attached to Error.
+  // Carry the bounded render-only packet by the native tool-call id instead:
+  // execute and renderResult both receive that host-issued id, while the model
+  // still receives the exact original thrown message and error status.
+  const failurePackets = new Map<string, Record<string, unknown>>();
+  const renderResult = expandableResult<ApplyPatchRendererTheme, ApplyPatchRenderContext>(
+    (value: unknown, renderOptions: ApplyPatchRenderOptions, theme: ApplyPatchRendererTheme, context?: ApplyPatchRenderContext) => renderApplyPatchResult(
+      withFailurePacket(value, context, failurePackets),
+      renderOptions,
+      theme,
+      context,
+    ),
+    (value: unknown, renderOptions: ApplyPatchRenderOptions, theme: ApplyPatchRendererTheme, context?: ApplyPatchRenderContext) => renderExpandedApplyPatchResult(
+      withFailurePacket(value, context, failurePackets),
+      renderOptions,
+      theme,
+      context,
+    ),
+  );
+
   pi.registerTool({
     name: APPLY_PATCH_TOOL_NAME,
     label: APPLY_PATCH_TOOL_NAME,
@@ -366,11 +347,16 @@ export function registerApplyPatchTool(pi: unknown, options: ApplyPatchToolOptio
     ],
     executionMode: "sequential",
     parameters: applyPatchToolSchema(),
-    execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal, _onUpdate?: unknown, ctx?: unknown) =>
-      executeApplyPatch(params, signal, ctx, options),
+    execute: async (toolCallId: string, params: unknown, signal?: AbortSignal, _onUpdate?: unknown, ctx?: unknown) => {
+      try {
+        return await executeApplyPatch(params, signal, ctx, options);
+      } catch (error) {
+        if (error instanceof ApplyPatchExecutionError) rememberFailurePacket(failurePackets, toolCallId, error.details);
+        throw error;
+      }
+    },
     renderCall: (args: unknown, theme: ApplyPatchRendererTheme) => renderApplyPatchCall(args, theme),
-    renderResult: expandableResult((value: unknown, renderOptions: unknown, theme: ApplyPatchRendererTheme) =>
-      renderApplyPatchResult(value, renderOptions, theme)),
+    renderResult,
   });
   return true;
 }
@@ -396,7 +382,8 @@ async function executeApplyPatch(
   const result = await performApplyPatchRequest(cwd, request.operations, signal);
   const { applied, failed, notAttempted } = result;
   if (failed !== undefined) {
-    throw new Error(failureMessage(applied, failed, notAttempted));
+    const message = failureMessage(applied, failed, notAttempted);
+    throw new ApplyPatchExecutionError(message, failureDetails(result, request));
   }
   const requestedDiff = clipText(request.patch ?? request.operations[0]!.diff ?? "", MAX_REQUESTED_DIFF_CHARS);
   // Canonical envelope calls get the upstream Codex print_summary text; legacy
@@ -436,6 +423,82 @@ function canonicalSuccessSummary(applied: AppliedOperation[]): string {
 }
 
 const MAX_REQUESTED_DIFF_CHARS = 4_000;
+const MAX_FAILURE_RENDER_PACKETS = 128;
+
+/**
+ * A thrown ApplyPatch failure still carries the render-only result packet for
+ * direct callers. Registered tools additionally copy it into the bounded
+ * native-call-id handoff above, because Pi's normal error adapter preserves
+ * the thrown message and error status but not arbitrary Error properties.
+ */
+export class ApplyPatchExecutionError extends Error {
+  readonly content: Array<{ type: "text"; text: string }>;
+  readonly details: Record<string, unknown>;
+  readonly isError = true;
+
+  constructor(message: string, details: Record<string, unknown>) {
+    super(message);
+    this.name = "ApplyPatchExecutionError";
+    this.content = [{ type: "text", text: message }];
+    this.details = details;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+function rememberFailurePacket(
+  packets: Map<string, Record<string, unknown>>,
+  toolCallId: string,
+  details: Record<string, unknown>,
+): void {
+  if (!toolCallId.trim()) return;
+  packets.delete(toolCallId);
+  packets.set(toolCallId, details);
+  while (packets.size > MAX_FAILURE_RENDER_PACKETS) {
+    const oldest = packets.keys().next().value;
+    if (typeof oldest !== "string") break;
+    packets.delete(oldest);
+  }
+}
+
+function withFailurePacket(
+  value: unknown,
+  context: unknown,
+  packets: ReadonlyMap<string, Record<string, unknown>>,
+): unknown {
+  if (!isRecord(value) || value.isError !== true) return value;
+  if (isRecord(value.details) && Object.keys(value.details).length > 0) return value;
+  if (!isRecord(context) || typeof context.toolCallId !== "string") return value;
+  const details = packets.get(context.toolCallId);
+  return details === undefined ? value : { ...value, details };
+}
+
+function failureDetails(
+  result: { applied: AppliedOperation[]; failed?: ApplyPatchFailure; notAttempted: string[]; finalDiff?: string },
+  request: ParsedApplyPatchRequest,
+): Record<string, unknown> {
+  const operations = result.applied.map(outcomeDetails);
+  return {
+    // `operations` is the same successful-operation inventory returned for a
+    // successful call. `applied` makes the partial-failure wording explicit
+    // for renderers and consumers that do not know the success shape.
+    operations,
+    applied: operations,
+    ...(result.failed ? {
+      failed: {
+        index: result.failed.index,
+        operation: result.failed.operation,
+        path: result.failed.path,
+        ...(result.failed.moveTo ? { moveTo: result.failed.moveTo } : {}),
+        error: result.failed.error,
+        uncertainEffects: [...result.failed.uncertainEffects],
+      },
+    } : {}),
+    notAttempted: [...result.notAttempted],
+    ...(result.finalDiff !== undefined ? { finalDiff: result.finalDiff } : {}),
+    requestedDiff: clipText(request.patch ?? request.operations[0]!.diff ?? "", MAX_REQUESTED_DIFF_CHARS),
+    mutated: result.applied.some((outcome) => outcome.mutated),
+  };
+}
 
 /**
  * Builds the explicit partial-failure diagnostic. The message names every

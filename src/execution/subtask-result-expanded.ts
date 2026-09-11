@@ -1,37 +1,51 @@
 /**
- * Expanded (Ctrl+O) detail view for the Subtasks* tool family (#59).
+ * Expanded (Ctrl+O / configured expansion binding) detail view for the
+ * Subtasks* tool family (#93, canonical examples 6–14).
  *
  * One cohesive human-facing renderer for every operation result the Subtasks*
  * family returns. It is a presentation-only callback with Pi's native
  * `renderResult` signature `(value, options, theme, context?)`; the shared
  * expansion foundation from #57 — `expandableResult(collapsedRenderer,
- * expandedRenderer?)` in `src/tool-result-expansion.ts`, now landed — selects
- * it when the native `options.expanded` flag is set and keeps the collapsed
- * renderer otherwise (falling back to it if this callback throws or returns a
+ * expandedRenderer?)` in `src/tool-result-expansion.ts` — selects it when the
+ * native `options.expanded` flag is set and keeps the collapsed renderer
+ * otherwise (falling back to it if this callback throws or returns a
  * non-component). This module owns no key handlers, no expansion state, and no
  * renderResult wiring of its own; it never duplicates the shared expansion
  * machinery.
  *
- * Pi toggles each tool row's expanded state through its configured expansion
- * binding and passes that state to the registered `renderResult` as
- * `(value, { expanded, isPartial }, theme, context?)`. The Subtasks registration in
- * `src/execution/tool.ts` wires this callback as the helper's second argument —
+ * The expand/collapse key hint is added centrally by the shared
+ * `expandableResult` wrapper: this module emits headers and bodies only and
+ * never renders its own `(ctrl+o …)` hint.
  *
- *   renderResult: expandableResult(collapsedCallback, renderSubtaskResultExpanded),
+ * The native `context.args` carries the actual recorded tool-call request
+ * fields. Per #93 the expanded views reuse those recorded arguments rather
+ * than a duplicated preview: steer/continue instructions, interrupt/force-merge
+ * modes, inspect evidence selectors, and the start workspace are shown exactly
+ * as the model submitted them, without a second human-only redaction layer
+ * (upstream protections applied before content reached the model are separate
+ * and unchanged).
  *
- * The collapsed callback is passed through unchanged, so #56's collapsed-card
- * rendering continues to apply untouched in every state except an explicit
- * `expanded: true`. The helper forwards the native options
- * (`{ expanded, isPartial }`) and the optional context to this
- * callback; this module's structural types mirror the helper's
- * `ToolResultTheme`/`ToolResultRenderer` exactly (they are deliberately not
- * imported here so this module compiles in trees without the #57 merge).
- *
- * Presentation contract (#59):
+ * Presentation contract (#93):
  * - Expansion presents only data the tool already returned. It never reruns an
  *   inspection, polls, fetches artifacts, reads logs, or widens any authority,
  *   retention, or redaction boundary. Private model reasoning is already
- *   excluded and every retained value already redacted upstream.
+ *   excluded upstream; model-visible content is shown in full.
+ * - Evidence reads are mode-specific and complete: the find query and every
+ *   returned match, the requested range and every returned entry, the full
+ *   deep-read chunk with its own whitespace, and the actual call/result pair.
+ *   No presentation-side caps replace returned content, and long lines are
+ *   wrapped into width-safe rows without dropping any character.
+ * - Start/Add expansion shows the submitted task definitions (instructions,
+ *   acceptance criteria, relevant context) and the actual dispatch provenance:
+ *   when the renderer-only live projection (or the returned record itself)
+ *   carries a transport-boundary dispatch record, the full captured sent
+ *   prompt, base commit, and worker worktree are shown with their capture
+ *   provenance; a queued task says "not yet sent"/"not yet available"; a
+ *   record that predates its own dispatch says exactly that. No prompt is ever
+ *   reconstructed from the task definition or labeled exact.
+ * - Steering/continuation acknowledgements are transport facts only: delivery
+ *   status never establishes task compliance, and the submitted instruction is
+ *   never mislabeled as the entire delivered adapter message.
  * - Provenance is visibly separated: what the executor process observed
  *   (`executor_observed`), what the worker wrote in its final response
  *   (`worker_claim` — never treated as verification), reviewer verdicts
@@ -41,12 +55,6 @@
  *   explicit uncertainty note while any task is still active; unavailable
  *   sources, truncated records, and omitted ranges are disclosed, never cut
  *   silently.
- * - Simple acknowledgements (SubtasksWatch, SubtasksMarkClean) render only
- *   their returned fields — no invented detail — and an unrecognized result
- *   shape falls back to the returned summary alone.
- * - Long results stay bounded: every section is capped with an explicit
- *   omission disclosure, and deep-read chunks keep the retained text's own
- *   whitespace (line-level clipping to the render width is presentation only).
  */
 import { isActiveTaskState, type BackgroundTaskState } from "./task-state";
 
@@ -57,18 +65,26 @@ export interface SubtaskExpandedRendererTheme {
   fg(color: string, text: string): string;
 }
 
+/** Native renderResult context subset: the actual recorded tool-call
+ * arguments (`args`) drive the request-field sections of the expanded views. */
+export interface SubtaskExpandedRendererContext {
+  readonly args?: unknown;
+  readonly [key: string]: unknown;
+}
+
 /**
  * Native renderResult callback signature, matching #57's
- * `ToolResultRenderer` delegate contract (optional native context ignored by
- * this renderer). Directly compatible with the collapsed renderer in
- * src/execution/tool.ts, so the landed shared helper selects between them by
- * `options.expanded` without adapters.
+ * `ToolResultRenderer` delegate contract. The optional native context carries
+ * `context.args` (the actual request fields); older hosts and tests may omit
+ * it. Directly compatible with the collapsed renderer in src/execution/tool.ts,
+ * so the landed shared helper selects between them by `options.expanded`
+ * without adapters.
  */
 export type SubtaskExpandedResultRenderer = (
   value: unknown,
   options: { expanded?: boolean; isPartial?: boolean },
   theme: SubtaskExpandedRendererTheme,
-  context?: unknown,
+  context?: SubtaskExpandedRendererContext,
 ) => unknown;
 
 /** Tool names by operation action; kept in step with EXECUTION_TOOL_NAMES in
@@ -86,33 +102,14 @@ const ACTION_TOOL_NAMES: Record<string, string> = {
   mark_clean: "SubtasksMarkClean",
 };
 
-/** Presentation bounds. Everything beyond a cap is disclosed, never invented. */
-const MAX_RENDERED_TASKS = 24;
-const MAX_TASK_COMMANDS = 6;
-const MAX_TASK_ACTIVITY = 6;
-const MAX_ENTRIES_PER_PROVENANCE_SECTION = 10;
-const MAX_MATCH_LINES = 10;
-const MAX_SOURCE_LINES = 12;
-const MAX_UNAVAILABLE_LINES = 8;
-const MAX_ERROR_EXECUTIONS = 4;
-const MAX_TOTAL_LINES = 400;
-
-/** Long-line clip that collapses whitespace (labels, summaries, previews of
- * already-compacted entry views), bounded by terminal display cells. */
-function clipCollapsedWhitespace(value: string, width: number): string {
-  const compact = value.replace(/\s+/g, " ").trim();
-  return clipToDisplayCells(compact, width);
-}
-
-/** Long-line clip that preserves the text's own whitespace (deep-read chunks:
- * newlines, indentation, tabs, and blank lines must survive presentation),
- * bounded by terminal display cells. */
-function clipPreservingWhitespace(value: string, width: number): string {
-  return clipToDisplayCells(value, width);
-}
-
 /**
- * Terminal display width of one code point (cell count, not UTF-16 units):
+ * No presentation-side content cap: expanded rendering is complete. The only
+ * width handling is row wrapping — every character of every returned line
+ * reaches the display, split into width-safe rows without dropping or
+ * compacting any character.
+ */
+
+/** Terminal display width of one code point (cell count, not UTF-16 units):
  * East Asian Wide/Fullwidth characters and default-emoji-presentation
  * characters (Unicode's Emoji_Presentation property, e.g. 🚀) occupy two
  * cells, combining marks and zero-width joiners occupy none, everything else
@@ -161,26 +158,6 @@ function displayWidth(text: string): number {
   return width;
 }
 
-/**
- * Clips a plain (unstyled) line to the supplied terminal cell budget with an
- * explicit ellipsis. Never returns a line wider than `cells` (zero or
- * negative budgets yield an empty line) and never assumes a minimum width.
- */
-function clipToDisplayCells(value: string, cells: number): string {
-  if (cells <= 0) return "";
-  if (displayWidth(value) <= cells) return value;
-  const budget = cells - 1; // reserve one cell for the ellipsis
-  let used = 0;
-  let clipped = "";
-  for (const character of value) {
-    const cells_ = codePointWidth(character.codePointAt(0)!);
-    if (used + cells_ > budget) break;
-    clipped += character;
-    used += cells_;
-  }
-  return `${clipped}…`;
-}
-
 function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -193,28 +170,20 @@ interface ExpandedLine {
   text: string;
   color?: string;
   bold?: boolean;
-  /** True to clip by length only, preserving the text's own whitespace. */
+  /** True to preserve the text's own whitespace when wrapping. */
   preserve?: boolean;
 }
 
 class LineBuilder {
   private readonly lines: ExpandedLine[] = [];
-  private truncatedNotice = false;
 
   add(text: string, color?: string, bold = false): void {
-    if (this.lines.length >= MAX_TOTAL_LINES) {
-      this.discloseTruncation();
-      return;
-    }
     this.lines.push({ text, color, bold });
   }
 
-  /** Adds a line whose whitespace is significant (deep-read chunk content). */
+  /** Adds a line whose whitespace is significant (submitted text, deep-read
+   * chunk content, delivered continuations). */
   addPreserved(text: string, color?: string): void {
-    if (this.lines.length >= MAX_TOTAL_LINES) {
-      this.discloseTruncation();
-      return;
-    }
     this.lines.push({ text, color, preserve: true });
   }
 
@@ -226,17 +195,41 @@ class LineBuilder {
     this.add(text, "toolTitle", true);
   }
 
-  private discloseTruncation(): void {
-    if (!this.truncatedNotice) {
-      this.truncatedNotice = true;
-      // Push past the cap by one so the disclosure itself is visible.
-      this.lines.push({ text: "… expanded view truncated for bounded rendering; the complete returned result stays in the model transcript." });
-    }
-  }
-
   build(): ExpandedLine[] {
     return this.lines;
   }
+}
+
+/** Wraps one plain (unstyled) line into width-safe display rows without
+ * dropping or altering any character: no whitespace compaction, no ellipsis.
+ * Zero or negative budgets yield a single empty row (a narrow row still renders). */
+function wrapByDisplayCells(value: string, cells: number): string[] {
+  if (cells <= 0) return [""];
+  if (displayWidth(value) <= cells) return [value];
+  const rows: string[] = [];
+  let row = "";
+  let used = 0;
+  for (const character of value) {
+    const width = codePointWidth(character.codePointAt(0)!);
+    if (width > cells) {
+      // A single code point wider than the row cannot fit anywhere: emit it
+      // alone rather than dropping it or looping.
+      if (row) rows.push(row);
+      rows.push(character);
+      row = "";
+      used = 0;
+      continue;
+    }
+    if (used + width > cells) {
+      rows.push(row);
+      row = "";
+      used = 0;
+    }
+    row += character;
+    used += width;
+  }
+  if (row || rows.length === 0) rows.push(row);
+  return rows;
 }
 
 /**
@@ -244,12 +237,13 @@ class LineBuilder {
  * `expandableResult`'s expanded renderer in src/execution/tool.ts; the
  * collapsed renderer stays untouched for the collapsed state.
  */
-export const renderSubtaskResultExpanded: SubtaskExpandedResultRenderer = (value, options, theme) => {
+export const renderSubtaskResultExpanded: SubtaskExpandedResultRenderer = (value, options, theme, context) => {
   const lines = new LineBuilder();
   const record = isRecord(value) ? value : undefined;
   const isError = record?.isError === true;
   const summary = summaryText(record);
   const details = record && isRecord(record.details) ? record.details : undefined;
+  const args = argsOf(context);
 
   if (isRecord(options) && options.isPartial === true) {
     // Native lifecycle: a still-streaming result must never be expanded from a
@@ -272,32 +266,42 @@ export const renderSubtaskResultExpanded: SubtaskExpandedResultRenderer = (value
   }
 
   const action = typeof details.action === "string" ? details.action : undefined;
-  const toolName = action ? ACTION_TOOL_NAMES[action] ?? action : "Subtasks";
 
   if (isError) {
-    renderErrorResult(lines, toolName, details);
+    renderErrorResult(lines, action ? ACTION_TOOL_NAMES[action] ?? action : "Subtasks", details);
     return expandedComponent(lines.build(), theme);
   }
 
-  lines.heading(`${toolName} — expanded result`);
-  lines.add(summary, isError ? "error" : undefined);
   if (action === "watch") {
-    renderWatchAcknowledgement(lines, details);
+    renderWatch(lines, details, args);
+  } else if (action === "continue") {
+    renderContinueOperation(lines, details, args);
+  } else if (action === "steer") {
+    renderSteer(lines, details, args);
+  } else if (action === "interrupt") {
+    renderInterrupt(lines, details, args);
+  } else if (action === "force_merge") {
+    renderForceMerge(lines, details, args);
   } else if (typeof details.cleared === "boolean" && Array.isArray(details.paths)) {
-    renderMarkCleanAcknowledgement(lines, details);
-  } else if (isRecord(details.evidence)) {
-    // renderInspection appends the evidence sections itself below.
-    renderInspection(lines, details);
-    renderEvidenceRead(lines, details.evidence, details);
-  } else if (Array.isArray(details.tasks) || typeof details.executionId === "string") {
-    renderInspection(lines, details);
+    // SubtasksMarkClean returns { cleared, paths } with no action tag.
+    renderMarkClean(lines, details);
+  } else if (action === "inspect") {
+    renderInspect(lines, details, args);
+  } else if (action === "start" || action === "add") {
+    renderLifecycle(lines, details, args);
   } else {
     // A returned details record we do not recognize: present only what was
-    // returned, never an inspection-shaped guess.
+    // returned, never an operation-shaped guess.
+    lines.heading(operationLabel(details));
+    lines.add(summary);
     lines.add("No expandable Subtasks details were returned; only the returned summary is shown.", "muted");
   }
   return expandedComponent(lines.build(), theme);
 };
+
+function argsOf(context: unknown): Record<string, any> | undefined {
+  return isRecord(context) && isRecord(context.args) ? context.args : undefined;
+}
 
 function summaryText(record: Record<string, any> | undefined): string {
   const content = record && Array.isArray(record.content) ? record.content[0] : undefined;
@@ -310,73 +314,316 @@ function operationLabel(details: unknown): string {
   return action ? ACTION_TOOL_NAMES[action] ?? action : "Subtasks tool";
 }
 
-/** Text-component contract shared with the other tool renderers. The TUI
- * contract requires every rendered line to fit the supplied width: the
- * component honors the exact width (minus the shell padding) with no minimum
- * floor, so narrow rows never receive over-width lines. */
+/** Text-component contract shared with the other tool renderers. Every line is
+ * rendered losslessly: logical lines are split on their own newlines and each
+ * segment is wrapped into width-safe display rows without compacting,
+ * trimming, or dropping any character — acceptance criteria, queries,
+ * previews, outcomes, and submitted text keep their exact whitespace. Long
+ * lines wrap; nothing is clipped. */
 function expandedComponent(lines: readonly ExpandedLine[], theme: SubtaskExpandedRendererTheme) {
   return {
     render: (width: number): string[] => {
       const bounded = Math.max(0, Math.min(width, width - 2));
-      return lines.map((line) => {
-        const clipped = line.preserve
-          ? clipPreservingWhitespace(line.text, bounded)
-          : clipCollapsedWhitespace(line.text, bounded);
-        if (line.color === undefined && !line.bold) return clipped;
-        return theme.fg(line.color ?? "toolTitle", line.bold ? theme.bold(clipped) : clipped);
-      });
+      const rows: string[] = [];
+      for (const line of lines) {
+        const wrapped = line.text.split("\n").flatMap((text) => wrapByDisplayCells(text, bounded));
+        for (const row of wrapped) {
+          if (line.color === undefined && !line.bold) rows.push(row);
+          else rows.push(theme.fg(line.color ?? "toolTitle", line.bold ? theme.bold(row) : row));
+        }
+      }
+      return rows;
     },
     invalidate() {},
   };
 }
 
 // ---------------------------------------------------------------------------
-// Inspection results (start/add/inspect/continue/steer/interrupt/force_merge)
+// Shared helpers
 // ---------------------------------------------------------------------------
-
-/** Renders a BackgroundInspection spread into the result details. */
-function renderInspection(lines: LineBuilder, details: Record<string, any>): void {
-  const updatedAt = typeof details.updatedAt === "string" ? details.updatedAt : undefined;
-  lines.add(
-    `Snapshot as of ${updatedAt ?? "an unrecorded time"}${anyActiveWarning(details)} — a point-in-time read; live work may have advanced.`,
-    "muted",
-  );
-  lines.add(
-    `execution ${stringOr(details.executionId, "?")} (${stringOr(details.kind, "background")}) · revision ${count(details.revision)} · root ${stringOr(details.root, "(unrecorded)")}`,
-  );
-  const scheduling = isRecord(details.scheduling) ? details.scheduling : undefined;
-  if (scheduling) {
-    lines.add(
-      `Scheduler: ${count(scheduling.activeWorkers)}/${count(scheduling.configuredWorkerLimit)} workers active; `
-      + `${count(scheduling.activePoolLeases)}/${count(scheduling.configuredPoolCapacity)} pool leases active; `
-      + `${count(scheduling.dispatchPending)} task(s) pending dispatch here, ${count(scheduling.globallyDispatchPending)} globally; `
-      + `${count(scheduling.estimatedImmediatelyAvailableSlots)} immediate slot(s) estimated.`,
-      "muted",
-    );
-  }
-  renderConflictGate(lines, details.conflictGate);
-  renderTasks(lines, details);
-}
-
-function anyActiveWarning(details: Record<string, any>): string {
-  const active = Array.isArray(details.tasks)
-    && details.tasks.some((task: unknown) => isRecord(task) && isActiveTaskState(task.state));
-  return active ? " — freshness uncertain: at least one task is still active" : "";
-}
 
 function stringOr(value: unknown, fallback: string): string {
   return typeof value === "string" && value.trim() ? value : fallback;
 }
 
-function renderConflictGate(lines: LineBuilder, gate: unknown): void {
-  if (!isRecord(gate)) return;
-  lines.label("Conflict gate (automatic landings are blocked until markers are resolved and SubtasksMarkClean validates them):");
-  lines.add(`  source ${stringOr(gate.sourceRoot, "?")} · activated ${stringOr(gate.activatedAt, "?")}`);
-  lines.add(`  paths: ${Array.isArray(gate.paths) ? gate.paths.join(", ") : "(none recorded)"}`);
-  if (typeof gate.reason === "string") lines.add(`  reason: ${gate.reason}`);
+/** Human-readable duration ("30 minutes") for requested checkpoints. */
+function durationWords(milliseconds: number): string {
+  if (milliseconds % 3_600_000 === 0 && milliseconds > 0) {
+    const hours = milliseconds / 3_600_000;
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  if (milliseconds % 60_000 === 0 && milliseconds > 0) {
+    const minutes = milliseconds / 60_000;
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  const seconds = Math.round((milliseconds / 1_000) * 10) / 10;
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
 }
 
-/** Task blocks: stable handles, lifecycle/control outcomes, and diagnostics. */
+/** Aggregate state word for a set of task records: the first active task's
+ * merged state (the live projection wins per task), else the first task's. */
+function aggregateStateWord(tasks: Array<Record<string, any>>, dispatchView?: Record<string, any>): string {
+  const states = tasks.map((task) => {
+    const live = dispatchViewEntry(dispatchView, task.taskId);
+    return (live && typeof live.state === "string" ? live.state : task.state) as unknown;
+  });
+  // isActiveTaskState is a Set lookup: unknown strings simply report inactive.
+  const activeIndex = states.findIndex((state) => typeof state === "string" && isActiveTaskState(state as BackgroundTaskState));
+  if (activeIndex >= 0) return stringOr(states[activeIndex], "active");
+  if (states.length > 0) return stringOr(states[0], "settled");
+  return "no tasks";
+}
+
+/** One task's entry in the renderer-only dispatch projection, by exact task
+ * identity — concurrent Start/Add rows for different executions never share a
+ * row-local state key, and a projection entry always belongs to its own task. */
+function dispatchViewEntry(view: Record<string, any> | undefined, taskId: unknown): Record<string, any> | undefined {
+  if (!view || !Array.isArray(view.tasks)) return undefined;
+  const entry = view.tasks.find((candidate) => isRecord(candidate) && candidate.taskId === taskId);
+  return isRecord(entry) ? entry : undefined;
+}
+
+/** The actual dispatch record for one task: the live projection wins, then the
+ * returned record's own snapshot. Absent means not yet sent — never inferred. */
+function dispatchRecordOf(live: Record<string, any> | undefined, task: Record<string, any>): Record<string, any> | undefined {
+  if (live && isRecord(live.dispatch)) return live.dispatch;
+  return isRecord(task.dispatch) ? task.dispatch : undefined;
+}
+
+/** The FIRST actual dispatch record for one task (kept immutable across
+ * recovery re-dispatches), same precedence as {@link dispatchRecordOf}. */
+function initialDispatchRecordOf(live: Record<string, any> | undefined, task: Record<string, any>): Record<string, any> | undefined {
+  if (live && isRecord(live.initialDispatch)) return live.initialDispatch;
+  return isRecord(task.initialDispatch) ? task.initialDispatch : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// SubtasksStart / SubtasksAdd: submitted definitions and dispatch provenance
+// ---------------------------------------------------------------------------
+
+/**
+ * Start/Add expanded view: the actual submitted task definitions and the
+ * truthful dispatch provenance.
+ *
+ * #93 dispatch record integration: the renderer-only `details.dispatchView`
+ * projection — attached by the parent's dispatch lifecycle preparation from
+ * the controller's authoritative in-memory task records and refreshed on every
+ * render after a dispatch event invalidates the row — carries each task's
+ * actual transport-boundary dispatch record (captured sent prompt, base
+ * commit, worker worktree) and current state. The projection wins over the
+ * returned snapshot per task; absent entries fall back to the snapshot and
+ * state honestly what it does and does not carry. No prompt is reconstructed
+ * and expansion fetches nothing.
+ */
+function renderLifecycle(lines: LineBuilder, details: Record<string, any>, args: Record<string, any> | undefined): void {
+  const toolName = ACTION_TOOL_NAMES[details.action] ?? "Subtasks";
+  const allTasks = Array.isArray(details.tasks) ? details.tasks.filter(isRecord) : [];
+  // #93: an Add result carries the whole execution inventory plus the exact
+  // task ids this call created; identify the added tasks by those ids (never
+  // by title or instruction matching), mirroring the collapsed card.
+  const addedIds = Array.isArray(details.addedTaskIds)
+    ? details.addedTaskIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+    : undefined;
+  const tasks = details.action === "add" && addedIds && addedIds.length > 0
+    ? allTasks.filter((task) => addedIds.includes(task.taskId))
+    : allTasks;
+  const dispatchView = isRecord(details.dispatchView) ? details.dispatchView : undefined;
+  lines.heading(`${toolName} · ${stringOr(details.executionId, "?")} · ${aggregateStateWord(tasks, dispatchView)}`);
+  // The target checkout, never the execution's temporary record-storage
+  // directory (details.root): the live projection carries the resolved target,
+  // and details.cwd is the persisted selected target for restored envelopes.
+  lines.add(`Target workspace: ${stringOr(dispatchView?.targetWorkspace, stringOr(details.cwd, stringOr(args?.workspace, "(unrecorded)")))}`);
+
+  for (const task of tasks) {
+    lines.add("");
+    renderSubmittedTask(lines, task, dispatchViewEntry(dispatchView, task.taskId));
+  }
+
+  const scheduling = isRecord(details.scheduling) ? details.scheduling : undefined;
+  if (scheduling && count(scheduling.dispatchPending) > 0) {
+    lines.add("");
+    lines.add(
+      `Dispatch pending: ${count(scheduling.dispatchPending)} task(s) in this execution, ${count(scheduling.globallyDispatchPending)} globally; dispatch events will update the original tool card with the captured prompt.`,
+      "muted",
+    );
+  }
+}
+
+/** The exact model-visible submitted definition — instructions, acceptance
+ * criteria, and relevant context — shared by the Start/Add lifecycle blocks
+ * and every inspect task block (status and activity modes alike). All three
+ * fields are already returned by the tool; expansion shows them in full,
+ * verbatim. */
+function renderSubmittedDefinition(lines: LineBuilder, definition: Record<string, any> | undefined): void {
+  const instructions = typeof definition?.instructions === "string" ? definition.instructions : undefined;
+  lines.label("Submitted instructions:");
+  if (instructions) {
+    for (const line of instructions.split("\n")) lines.addPreserved(line);
+  } else {
+    lines.add("(not returned by this record)", "muted");
+  }
+
+  const criteria = Array.isArray(definition?.acceptanceCriteria) ? definition.acceptanceCriteria.filter((entry: unknown) => typeof entry === "string" && entry.trim()) : [];
+  if (criteria.length > 0) {
+    lines.label("Acceptance criteria:");
+    for (const criterion of criteria) lines.add(`- ${criterion}`);
+  }
+
+  const relevantContext = typeof definition?.relevantContext === "string" && definition.relevantContext.trim()
+    ? definition.relevantContext
+    : undefined;
+  if (relevantContext) {
+    lines.label("Relevant context:");
+    for (const line of relevantContext.split("\n")) lines.addPreserved(line);
+  }
+}
+
+/** One submitted task: the exact model-visible definition plus the truthful
+ * dispatch/worker provenance. `live` is this task's entry in the renderer-only
+ * dispatch projection (undefined when no projection covers it). */
+function renderSubmittedTask(lines: LineBuilder, task: Record<string, any>, live?: Record<string, any>): void {
+  const definition = isRecord(task.definition) ? task.definition : undefined;
+  const title = stringOr(definition?.title, "(untitled)");
+  lines.heading(`Task: ${stringOr(task.taskId, "(unrecorded handle)")} · ${title}`);
+  // The authoritative live state wins when the projection is available, so the
+  // original card reflects dispatch-driven state; otherwise the returned
+  // snapshot stands on its own.
+  const state = stringOr(live?.state ?? task.state, "unknown");
+  lines.add(`State: ${state}`);
+  renderSubmittedDefinition(lines, definition);
+
+  // Durable outcome and lifecycle provenance.
+  if (typeof task.summary === "string" && task.summary.trim()) {
+    lines.add(`Authoritative outcome: ${task.summary.trim()}`);
+  }
+  if (typeof task.error === "string" && task.error.trim()) lines.add(`Error: ${task.error.trim()}`, "error");
+
+  // #93 dispatch provenance: the actual record captured at the executor's
+  // transport boundary. The live projection wins, then the returned record's
+  // own snapshot. Neither is ever reconstructed from the task definition or
+  // later configuration, and nothing here claims turn acknowledgement or task
+  // compliance — those are separate facts recorded elsewhere.
+  const dispatch = dispatchRecordOf(live, task);
+  if (dispatch) {
+    renderDispatchRecord(lines, dispatch, initialDispatchRecordOf(live, task));
+  } else if (state === "queued") {
+    lines.add("Dispatch: not yet started", "muted");
+    lines.add("Captured base commit: not yet available", "muted");
+    lines.add(typeof task.waveRoot === "string" && task.waveRoot ? `Worker worktree: ${task.waveRoot}` : "Worker worktree: not yet created", "muted");
+    lines.add("Prompt sent to worker: not yet sent", "muted");
+  } else {
+    // The task had left the queued state when this record was returned, but
+    // the capture is not part of it: say exactly that. Never claim a prompt
+    // was sent (or not) without the record.
+    lines.add("Dispatch: no capture in this returned record (the task was past queued when it returned)", "muted");
+    lines.add("Captured base commit: not available in this record", "muted");
+    lines.add(typeof task.waveRoot === "string" && task.waveRoot ? `Worker worktree: ${task.waveRoot}` : "Worker worktree: not recorded in this record", "muted");
+    lines.add("Prompt sent to worker: not recorded in this inspection (captured at dispatch; dispatch events update the original card)", "muted");
+  }
+
+  // Returned command history with the full recorded instruction text.
+  const commands = Array.isArray(task.commands) ? task.commands.filter(isRecord) : [];
+  for (const command of commands) {
+    lines.add("");
+    lines.label(`Command record: ${stringOr(command.action, "?")} ${stringOr(command.instructionId, "?")} · ${stringOr(command.status, "?")}`);
+    if (command.interrupt === true) lines.add("  interrupt requested before delivery", "muted");
+    if (typeof command.mode === "string" && command.mode) lines.add(`  mode: ${command.mode}`, "muted");
+    if (typeof command.text === "string" && command.text) {
+      lines.add("  Recorded instruction text:", "muted");
+      for (const line of command.text.split("\n")) lines.addPreserved(`  ${line}`);
+    }
+    if (typeof command.error === "string" && command.error.trim()) lines.add(`  error: ${command.error.trim()}`, "error");
+  }
+  if (typeof task.interruptionMode === "string") {
+    lines.add(`Interruption mode: ${task.interruptionMode}`, "muted");
+  }
+  if (typeof task.reportPath === "string") lines.add(`Research report: ${task.reportPath}`);
+}
+
+/** The full actual dispatch record for one task, rendered without any
+ * presentation cap or human-view filter: the exact prompt text handed to the
+ * executor transport (whitespace preserved), the captured base commit, and the
+ * isolated worker worktree. A recovery re-dispatch is distinguished from the
+ * captured original when both records are available — the latest actual
+ * dispatch is what the task is running on, and the original stays shown, not
+ * replaced silently. */
+function renderDispatchRecord(lines: LineBuilder, dispatch: Record<string, any>, initial: Record<string, any> | undefined): void {
+  const turn = typeof dispatch.executorTurn === "number" ? dispatch.executorTurn : "?";
+  lines.add(`Dispatch: dispatched to executor transport (turn ${turn})`);
+  lines.add(`Captured base commit: ${stringOr(dispatch.baseCommit, "(unrecorded)")}`);
+  lines.add(`Worker worktree: ${stringOr(dispatch.worktreeRoot, "(unrecorded)")}`);
+  lines.add("Prompt provenance: captured at dispatch", "muted");
+  const sentPrompt = typeof dispatch.sentPrompt === "string" ? dispatch.sentPrompt : undefined;
+  const initialSentPrompt = initial && typeof initial.sentPrompt === "string" ? initial.sentPrompt : undefined;
+  const redispatched = Boolean(
+    initialSentPrompt !== undefined
+    && sentPrompt !== undefined
+    && initialSentPrompt !== sentPrompt,
+  );
+  if (redispatched) {
+    const initialTurn = initial && typeof initial.executorTurn === "number" ? initial.executorTurn : "?";
+    lines.add(`Re-dispatched after recovery: the latest actual dispatch is shown below; the captured original was turn ${initialTurn}.`, "muted");
+    lines.add("");
+    lines.label(`Initial dispatch (turn ${initialTurn}) — prompt sent to worker:`);
+    if (initialSentPrompt !== undefined) {
+      for (const line of initialSentPrompt.split("\n")) lines.addPreserved(line);
+    } else {
+      lines.add("(not recorded)", "muted");
+    }
+    lines.add("");
+    lines.label(`Latest actual dispatch (turn ${turn}) — prompt sent to worker:`);
+    if (sentPrompt !== undefined) {
+      for (const line of sentPrompt.split("\n")) lines.addPreserved(line);
+    } else {
+      lines.add("(not recorded)", "muted");
+    }
+  } else {
+    lines.label("Prompt sent to worker:");
+    if (sentPrompt !== undefined) {
+      for (const line of sentPrompt.split("\n")) lines.addPreserved(line);
+    } else {
+      lines.add("(not recorded)", "muted");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SubtasksInspect: mode-specific expansion
+// ---------------------------------------------------------------------------
+
+function renderInspect(lines: LineBuilder, details: Record<string, any>, args: Record<string, any> | undefined): void {
+  const evidence = isRecord(details.evidence) ? details.evidence : undefined;
+  if (evidence) {
+    renderEvidenceRead(lines, evidence, details, args);
+    return;
+  }
+  if (args && (args.offset !== undefined || args.lines !== undefined)) {
+    lines.heading(`SubtasksInspect · ${stringOr(args.taskId, "?")} · activity range`);
+    lines.label("Requested activity range:");
+    lines.add(`  offset: ${typeof args.offset === "number" ? args.offset : 0}`);
+    lines.add(`  lines: ${typeof args.lines === "number" ? args.lines : "(default)"}`);
+  } else {
+    lines.heading(`SubtasksInspect · ${stringOr(args?.taskId, "?")} · status`);
+  }
+  lines.add(
+    `Snapshot as of ${typeof details.updatedAt === "string" ? details.updatedAt : "an unrecorded time"}${anyActiveWarning(details)} — a point-in-time read; live work may have advanced.`,
+    "muted",
+  );
+  lines.add(
+    `execution ${stringOr(details.executionId, "?")} (${stringOr(details.kind, "background")}) · revision ${count(details.revision)}`,
+  );
+  // details.cwd is the persisted selected execution target (details.root is
+  // only the temporary record-storage directory).
+  if (typeof details.cwd === "string" && details.cwd.trim()) {
+    lines.add(`Target workspace: ${details.cwd}`);
+  }
+  renderConflictGate(lines, details.conflictGate);
+  renderTasks(lines, details);
+}
+
+/** Task blocks: stable handles, submitted definitions, lifecycle/control
+ * outcomes, and diagnostics. Everything the tool returned is rendered —
+ * expansion adds no presentation cap on top of the returned page. */
 function renderTasks(lines: LineBuilder, details: Record<string, any>): void {
   const tasks = Array.isArray(details.tasks) ? details.tasks.filter(isRecord) : [];
   if (tasks.length === 0 && count(details.historicalCount) === 0) return;
@@ -387,11 +634,7 @@ function renderTasks(lines: LineBuilder, details: Record<string, any>): void {
       "muted",
     );
   }
-  const shown = tasks.slice(0, MAX_RENDERED_TASKS);
-  for (const task of shown) renderTask(lines, task);
-  if (tasks.length > shown.length) {
-    lines.add(`  … ${tasks.length - shown.length} returned task(s) omitted from this expanded view.`, "muted");
-  }
+  for (const task of tasks) renderTask(lines, task);
 }
 
 function renderTask(lines: LineBuilder, task: Record<string, any>): void {
@@ -402,6 +645,12 @@ function renderTask(lines: LineBuilder, task: Record<string, any>): void {
       "muted",
     );
   }
+  if (typeof task.waveRoot === "string" && task.waveRoot) {
+    lines.add(`  worker worktree: ${task.waveRoot}`);
+  }
+  // The submitted definition is part of every inspect task block: status and
+  // activity modes show what the model actually asked this task to do.
+  renderSubmittedDefinition(lines, isRecord(task.definition) ? task.definition : undefined);
   lines.add(`  executor: ${executorLine(task)}`, "muted");
   const control = task.liveControl;
   if (isRecord(control)) {
@@ -419,14 +668,6 @@ function renderTask(lines: LineBuilder, task: Record<string, any>): void {
       `  checkpoint bundle: operation ${stringOr(task.bundle.operationId, "?")} revision ${count(task.bundle.expectedRevision)} at ${stringOr(task.bundle.waveRoot, "?")} (verified checkpoint; SubtasksContinue may resume from it)`,
     );
   }
-  const timing = isRecord(task.timing) ? task.timing : undefined;
-  if (timing) {
-    lines.add(
-      `  timing (ms): total ${count(timing.totalMs)}; queued ${count(timing.queueMs)}; capture ${count(timing.captureMs)}; execution ${count(timing.executionMs)}; review ${count(timing.reviewMs)}; landing ${count(timing.landingMs)}`,
-      "muted",
-    );
-  }
-  if (typeof task.updatedAt === "string") lines.add(`  updated: ${task.updatedAt}`, "muted");
   if (typeof task.summary === "string" && task.summary.trim()) {
     lines.add(`  current authoritative outcome: ${task.summary.trim()}`);
   }
@@ -436,21 +677,22 @@ function renderTask(lines: LineBuilder, task: Record<string, any>): void {
     lines.add(`  interruption mode: ${task.interruptionMode}`, "muted");
   }
   const commands = Array.isArray(task.commands) ? task.commands.filter(isRecord) : [];
-  if (commands.length > 0) {
-    lines.add(`  commands (returned, newest ${Math.min(commands.length, MAX_TASK_COMMANDS)} of ${commands.length}):`, "muted");
-    for (const command of commands.slice(-MAX_TASK_COMMANDS)) {
-      lines.add(
-        `    ${stringOr(command.action, "?")} ${stringOr(command.instructionId, "?")} · ${stringOr(command.status, "?")}`
-        + `${command.interrupt === true ? " · interrupt requested before delivery" : ""}`
-        + `${typeof command.error === "string" && command.error.trim() ? ` · ${command.error.trim()}` : ""}`,
-      );
+  for (const command of commands) {
+    lines.add(
+      `  command ${stringOr(command.action, "?")} ${stringOr(command.instructionId, "?")} · ${stringOr(command.status, "?")}`
+      + `${command.interrupt === true ? " · interrupt requested before delivery" : ""}`
+      + `${typeof command.mode === "string" && command.mode ? ` · mode ${command.mode}` : ""}`
+      + `${typeof command.error === "string" && command.error.trim() ? ` · ${command.error.trim()}` : ""}`,
+    );
+    if (typeof command.text === "string" && command.text) {
+      for (const line of command.text.split("\n")) lines.addPreserved(`    ${line}`);
     }
   }
   if (typeof task.artifactDir === "string") lines.add(`  artifacts: ${task.artifactDir}`);
   const activity = Array.isArray(task.activity) ? task.activity.filter(isRecord) : [];
   if (activity.length > 0) {
-    lines.add(`  activity (returned tail, newest last; earlier phases may be superseded):`, "muted");
-    for (const event of activity.slice(-MAX_TASK_ACTIVITY)) {
+    lines.add(`  activity (returned for this read, oldest first):`, "muted");
+    for (const event of activity) {
       lines.add(`    - ${count(event.sequence)} · ${stringOr(event.phase, "?")} · ${stringOr(event.message, "")}`);
     }
   }
@@ -474,13 +716,56 @@ function executorLine(task: Record<string, any>): string {
   return "executor pending";
 }
 
+function anyActiveWarning(details: Record<string, any>): string {
+  const active = Array.isArray(details.tasks)
+    && details.tasks.some((task: unknown) => isRecord(task) && isActiveTaskState(task.state));
+  return active ? " — freshness uncertain: at least one task is still active" : "";
+}
+
+function renderConflictGate(lines: LineBuilder, gate: unknown): void {
+  if (!isRecord(gate)) return;
+  lines.label("Conflict gate (automatic landings are blocked until markers are resolved and SubtasksMarkClean validates them):");
+  lines.add(`  source ${stringOr(gate.sourceRoot, "?")} · activated ${stringOr(gate.activatedAt, "?")}`);
+  lines.add(`  paths: ${Array.isArray(gate.paths) ? gate.paths.join(", ") : "(none recorded)"}`);
+  if (typeof gate.reason === "string") lines.add(`  reason: ${gate.reason}`);
+}
+
 // ---------------------------------------------------------------------------
 // Evidence reads (inspect with the evidence selector)
 // ---------------------------------------------------------------------------
 
-function renderEvidenceRead(lines: LineBuilder, evidence: unknown, details: Record<string, any>): void {
+function renderEvidenceRead(lines: LineBuilder, evidence: unknown, details: Record<string, any>, args: Record<string, any> | undefined): void {
   if (!isRecord(evidence)) return;
   const mode = stringOr(evidence.mode, "unknown");
+  const selector = args && isRecord(args.evidence) ? args.evidence : undefined;
+  lines.heading(`SubtasksInspect · ${stringOr(evidence.taskId, "?")} · ${evidenceModeLabel(mode, selector)}`);
+
+  // The actual request selector: the exact model-submitted navigation fields,
+  // shown without a second human-only filter (the model already saw them).
+  lines.label("Request:");
+  lines.add(`  Task: ${stringOr(evidence.taskId, "?")}`);
+  lines.add(`  Evidence selector: ${evidenceSelectorDescription(selector, evidence)}`);
+  if (mode === "range" || mode === "cursor") {
+    lines.add(
+      `  Requested range: index=${typeof selector?.index === "number" ? selector.index : 0}`
+      + ` limit=${typeof selector?.limit === "number" ? selector.limit : "(default)"}`,
+    );
+  }
+  lines.add(
+    `execution ${stringOr(details.executionId, "?")} (${stringOr(details.kind, "background")}) · revision ${count(details.revision)}`,
+  );
+  if (typeof details.updatedAt === "string") {
+    lines.add(
+      `Snapshot as of ${details.updatedAt}${anyActiveWarning(details)} — a point-in-time read; live work may have advanced.`,
+      "muted",
+    );
+  }
+  // details.cwd is the persisted selected execution target (details.root is
+  // only the temporary record-storage directory).
+  if (typeof details.cwd === "string" && details.cwd.trim()) {
+    lines.add(`Target workspace: ${details.cwd}`);
+  }
+
   lines.label(`Evidence read (mode: ${mode}) — bounded, indexed navigation over already-redacted retained artifacts; private model reasoning is excluded:`);
   const snapshot = isRecord(evidence.snapshot) ? evidence.snapshot : undefined;
   if (snapshot) {
@@ -504,21 +789,17 @@ function renderEvidenceRead(lines: LineBuilder, evidence: unknown, details: Reco
       if (diagnostics.rawRetentionExhausted === true) bounds.push("raw retention budget exhausted");
       lines.add(`  indexing diagnostics: ${bounds.join("; ")}`, "muted");
     }
-    const shownSources = sources.slice(0, MAX_SOURCE_LINES);
-    for (const source of shownSources) {
+    for (const source of sources) {
       lines.add(
         `  source ${stringOr(source.sourceId, "?")} · ${stringOr(source.adapter, "?")}/${stringOr(source.stream, "?")} · ${count(source.records)} record(s)`
         + `${typeof source.firstAt === "string" && typeof source.lastAt === "string" ? ` · ${source.firstAt.slice(0, 19)} → ${source.lastAt.slice(0, 19)}` : ""}`
         + `${typeof source.file === "string" ? ` · ${source.file}` : ""}`,
       );
     }
-    if (sources.length > shownSources.length) {
-      lines.add(`  … ${sources.length - shownSources.length} returned source(s) omitted from this expanded view.`, "muted");
-    }
     const unavailable = Array.isArray(snapshot.unavailable) ? snapshot.unavailable.filter(isRecord) : [];
     if (unavailable.length > 0) {
-      lines.add(`  unavailable (disclosed gaps; ${Math.min(unavailable.length, MAX_UNAVAILABLE_LINES)} of ${unavailable.length} shown):`, "warning");
-      for (const item of unavailable.slice(0, MAX_UNAVAILABLE_LINES)) {
+      lines.add(`  unavailable (disclosed gaps; upstream retention, not display clipping):`, "warning");
+      for (const item of unavailable) {
         lines.add(`    ${stringOr(item.source, "task")} · ${stringOr(item.reason, "?")} · ${stringOr(item.detail, "")}`, "warning");
       }
     }
@@ -536,16 +817,12 @@ function renderEvidenceRead(lines: LineBuilder, evidence: unknown, details: Reco
     const sectionEntries = entries.filter((entry) => entry.provenance === section.provenance);
     if (sectionEntries.length === 0) continue;
     lines.label(section.label);
-    const shown = sectionEntries.slice(0, MAX_ENTRIES_PER_PROVENANCE_SECTION);
-    for (const entry of shown) renderEvidenceEntry(lines, entry, section.color);
-    if (sectionEntries.length > shown.length) {
-      lines.add(`  … ${sectionEntries.length - shown.length} ${section.provenance} ${sectionEntries.length - shown.length === 1 ? "entry" : "entries"} in this read omitted from the expanded view (the full page stays in the model result).`, "muted");
-    }
+    for (const entry of sectionEntries) renderEvidenceEntry(lines, entry, section.color);
   }
   const other = entries.filter((entry) => sections.every((section) => section.provenance !== entry.provenance));
   if (other.length > 0) {
     lines.label("Other returned entries (provenance not in the observed/claim/verdict trio):");
-    for (const entry of other.slice(0, MAX_ENTRIES_PER_PROVENANCE_SECTION)) renderEvidenceEntry(lines, entry, undefined);
+    for (const entry of other) renderEvidenceEntry(lines, entry, undefined);
   }
   if (entries.length === 0 && mode !== "find" && mode !== "call" && mode !== "entry") {
     lines.add("  no entries were returned by this read", "muted");
@@ -557,12 +834,8 @@ function renderEvidenceRead(lines: LineBuilder, evidence: unknown, details: Reco
     if (summary) {
       lines.label(`Matches for "${stringOr(summary.query, "?")}": ${count(summary.totalMatches)} total${summary.matchesTruncated === true ? " (list truncated)" : ""}`);
     }
-    const shown = matches.slice(0, MAX_MATCH_LINES);
-    for (const match of shown) {
-      lines.add(`  match [${count(match.index)}] ${stringOr(match.entryId, "?")} (${stringOr(match.kind, "?")}): ${stringOr(match.snippet, "")}`);
-    }
-    if (matches.length > shown.length) {
-      lines.add(`  … ${matches.length - shown.length} returned match(es) omitted from this expanded view.`, "muted");
+    for (const match of matches) {
+      lines.addPreserved(`  match [${count(match.index)}] ${stringOr(match.entryId, "?")} (${stringOr(match.kind, "?")}): ${stringOr(match.snippet, "")}`);
     }
     lines.add("  (matches carry entry kind only; deep-read an entryId for its retained content and provenance.)", "muted");
   }
@@ -571,6 +844,37 @@ function renderEvidenceRead(lines: LineBuilder, evidence: unknown, details: Reco
   renderDeepContent(lines, evidence.deepContent);
   renderContinuation(lines, evidence);
   renderAuthoritativeContext(lines, evidence.context, details);
+}
+
+/** The evidence navigation selector as the model actually requested it, in the
+ * same precedence the navigation read uses. Length-clipped for display only;
+ * content is never re-redacted (the model already saw these fields). */
+function evidenceSelectorDescription(selector: Record<string, any> | undefined, evidence: Record<string, any>): string {
+  if (!selector) {
+    const mode = stringOr(evidence.mode, "");
+    return mode === "find" && isRecord(evidence.matchSummary)
+      ? `find "${stringOr(evidence.matchSummary.query, "?")}"`
+      : `mode ${mode}`;
+  }
+  if (typeof selector.find === "string" && selector.find) return `find "${selector.find}"`;
+  if (typeof selector.entryId === "string" && selector.entryId) {
+    return `entryId ${selector.entryId} · chunkIndex ${typeof selector.chunkIndex === "number" ? selector.chunkIndex : 0}`;
+  }
+  if (typeof selector.callId === "string" && selector.callId) return `callId ${selector.callId}`;
+  if (typeof selector.cursor === "string" && selector.cursor) return `cursor ${selector.cursor}`;
+  const index = typeof selector.index === "number" ? selector.index : 0;
+  const limit = typeof selector.limit === "number" ? selector.limit : "(default)";
+  const filter = typeof selector.filter === "string" ? ` · filter ${selector.filter}` : "";
+  return `index ${index} · limit ${limit}${filter}`;
+}
+
+function evidenceModeLabel(mode: string, selector: Record<string, any> | undefined): string {
+  if (selector && typeof selector.find === "string" && selector.find) return `find "${selector.find}"`;
+  if (selector && typeof selector.callId === "string" && selector.callId) return `call ${selector.callId}`;
+  if (selector && typeof selector.entryId === "string" && selector.entryId) {
+    return `entry ${selector.entryId} · chunk ${typeof selector.chunkIndex === "number" ? selector.chunkIndex : 0}`;
+  }
+  return mode;
 }
 
 function renderEvidenceEntry(lines: LineBuilder, entry: Record<string, any>, color: string | undefined): void {
@@ -611,7 +915,7 @@ function renderCallPair(lines: LineBuilder, pair: unknown): void {
   }
   const result = isRecord(pair.result) ? pair.result : undefined;
   if (result) {
-    lines.add(`    result [${count(result.index)}] ${stringOr(result.entryId, "?")} · ${stringOr(result.status, "unknown")}: ${stringOr(result.preview, "")}`);
+    lines.addPreserved(`    result [${count(result.index)}] ${stringOr(result.entryId, "?")} · ${stringOr(result.status, "unknown")}: ${stringOr(result.preview, "")}`);
   } else {
     lines.add("    result: not observed yet (in flight). A later in-flight status is never evidence of success.", "warning");
   }
@@ -712,11 +1016,240 @@ function renderAuthoritativeContext(lines: LineBuilder, context: unknown, detail
 }
 
 // ---------------------------------------------------------------------------
+// SubtasksSteer / SubtasksContinue: full sent instructions, transport-only acks
+// ---------------------------------------------------------------------------
+
+function renderSteer(lines: LineBuilder, details: Record<string, any>, args: Record<string, any> | undefined): void {
+  const task = taskForRequest(details, args);
+  lines.heading(`SubtasksSteer · ${stringOr(task?.taskId ?? args?.taskId, "?")}`);
+
+  const instructions = firstNonEmpty([
+    typeof args?.instructions === "string" ? args.instructions : undefined,
+    matchingCommand(details, args)?.text,
+  ], "");
+  // The submitted text is labeled by its origin, never as already sent: queued
+  // steering (no live executor to deliver to) has not reached any worker.
+  lines.label("Submitted instructions:");
+  if (instructions) {
+    for (const line of instructions.split("\n")) lines.addPreserved(line);
+  } else {
+    lines.add("(not recorded by this result)", "muted");
+  }
+
+  const command = matchingCommand(details, args);
+  const interruptRequested = args?.interrupt === true || command?.interrupt === true;
+  lines.add(`Interrupt first: ${interruptRequested ? "yes" : "no"}`);
+  lines.add(`Delivery: ${deliveryLine(command)}`);
+  if (!command || command.status === "queued") {
+    lines.add("Instruction sent to the worker: not yet sent (queued for transport)", "muted");
+  }
+  if (command?.status === "acknowledged" || command?.status === "delivered") {
+    lines.add("Instruction sent to the worker: yes (see delivery above)", "muted");
+    lines.add("Task compliance: not established by acknowledgment", "muted");
+  }
+  renderTaskOutcome(lines, task);
+}
+
+function renderContinueOperation(lines: LineBuilder, details: Record<string, any>, args: Record<string, any> | undefined): void {
+  const task = taskForRequest(details, args);
+  lines.heading(`SubtasksContinue · ${stringOr(task?.taskId ?? args?.taskId, "?")}`);
+
+  const submitted = firstNonEmpty([
+    typeof args?.instructions === "string" ? args.instructions : undefined,
+    matchingCommand(details, args)?.text,
+  ], "");
+  lines.label("Submitted continuation:");
+  if (submitted) {
+    for (const line of submitted.split("\n")) lines.addPreserved(line);
+  } else {
+    lines.add("(not recorded by this result)", "muted");
+  }
+
+  const command = matchingCommand(details, args);
+  const delivered = typeof command?.text === "string" && command.text && command.text !== submitted ? command.text : undefined;
+  if (delivered) {
+    // The adapter-delivered message may differ from the submitted text
+    // (appended isolation instructions, rewritten paths). Never mislabel the
+    // submitted text as the entire delivered message.
+    lines.label("Adapter-delivered continuation (recorded at admission):");
+    for (const line of delivered.split("\n")) lines.addPreserved(line);
+  } else {
+    lines.add("Delivered message: not separately recorded by this result (the recorded instruction text matches the submitted continuation).", "muted");
+  }
+  lines.add(`Delivery: ${deliveryLine(command)}`);
+  renderTaskOutcome(lines, task);
+}
+
+/** Truthful lifecycle summary of the targeted task's durable record. */
+function renderTaskOutcome(lines: LineBuilder, task: Record<string, any> | undefined): void {
+  if (!task) {
+    lines.add("Resulting task outcome: not yet available in this record", "muted");
+    return;
+  }
+  const state = stringOr(task.state, "unknown");
+  lines.add(`Resulting task outcome: ${state}${isActiveTaskState(state as BackgroundTaskState) ? " (still in progress)" : ""}`, "muted");
+  if (typeof task.summary === "string" && task.summary.trim()) {
+    lines.add(`Authoritative outcome: ${task.summary.trim()}`);
+  }
+  if (typeof task.error === "string" && task.error.trim()) lines.add(`Error: ${task.error.trim()}`, "error");
+}
+
+/** Resolves the task record the request targeted (explicit args handle, or the
+ * single returned task). Never inferred beyond the returned inventory. */
+function taskForRequest(details: Record<string, any>, args: Record<string, any> | undefined): Record<string, any> | undefined {
+  const tasks = Array.isArray(details.tasks) ? details.tasks.filter(isRecord) : [];
+  const requested = typeof args?.taskId === "string" ? args.taskId : undefined;
+  if (requested) return tasks.find((task) => task.taskId === requested);
+  return tasks.length === 1 ? tasks[0] : undefined;
+}
+
+/** The returned command record for this request, matched by the actual
+ * instructionId (or the most recent matching action as a fallback). */
+function matchingCommand(details: Record<string, any>, args: Record<string, any> | undefined): Record<string, any> | undefined {
+  const task = taskForRequest(details, args);
+  const commands = task && Array.isArray(task.commands) ? task.commands.filter(isRecord) : [];
+  if (commands.length === 0) return undefined;
+  const requestedId = typeof args?.instructionId === "string" ? args.instructionId : undefined;
+  if (requestedId) {
+    const matched = commands.find((command) => command.instructionId === requestedId);
+    if (matched) return matched;
+  }
+  const byAction = commands.filter((command) => ["continue", "steer", "interrupt", "force_merge"].includes(stringOr(command.action, "?")));
+  return byAction.at(-1);
+}
+
+/** Transport status of a steer/continue command record, never overstated. */
+function deliveryLine(command: Record<string, any> | undefined): string {
+  if (!command) return "not recorded by this result";
+  switch (command.status) {
+    case "acknowledged": return "transport acknowledged";
+    case "delivered": return "delivered by transport";
+    case "queued": return "queued for transport (not yet delivered)";
+    case "failed": return `failed: ${stringOr(command.error, "transport rejected the instruction")}`;
+    default: return `status ${stringOr(command.status, "unknown")}`;
+  }
+}
+
+function firstNonEmpty(values: Array<string | undefined>, fallback: string): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return fallback;
+}
+
+// ---------------------------------------------------------------------------
+// SubtasksInterrupt / SubtasksForceMerge: exact request modes, established
+// outcomes only
+// ---------------------------------------------------------------------------
+
+function renderInterrupt(lines: LineBuilder, details: Record<string, any>, args: Record<string, any> | undefined): void {
+  const task = taskForRequest(details, args);
+  const command = matchingCommand(details, args);
+  const mode = firstNonEmpty([
+    typeof args?.interruptMode === "string" ? args.interruptMode : undefined,
+    typeof command?.mode === "string" ? command.mode : undefined,
+    typeof task?.interruptionMode === "string" ? task.interruptionMode : undefined,
+  ], "(not recorded)");
+  lines.heading(`SubtasksInterrupt · ${stringOr(task?.taskId ?? args?.taskId, "?")}`);
+  lines.add(`Requested mode: ${mode}`);
+  const state = task ? stringOr(task.state, "unknown") : undefined;
+  if (state && !isActiveTaskState(state as BackgroundTaskState)) {
+    lines.add("Executor: stopped");
+  } else if (state) {
+    lines.add(`Executor: still active (state ${state}); interruption pending`, "warning");
+  } else {
+    lines.add("Executor: not established by this record", "muted");
+  }
+  if (state === "landed" || state === "reported") {
+    lines.add("Workspace changes: landed");
+  } else if (state === "conflicted") {
+    lines.add("Workspace changes: conflict markers materialized in main", "warning");
+  } else {
+    lines.add("Workspace changes: not landed");
+  }
+  if (isRecord(task?.bundle)) {
+    lines.add(
+      `Recovery: retained checkpoint available (operation ${stringOr(task.bundle.operationId, "?")}, revision ${count(task.bundle.expectedRevision)})`,
+    );
+  } else {
+    lines.add("Recovery: none recorded", "muted");
+  }
+  if (typeof task?.summary === "string" && task.summary.trim()) {
+    lines.add(`Authoritative outcome: ${task.summary.trim()}`);
+  }
+  if (typeof task?.error === "string" && task.error.trim()) lines.add(`Error: ${task.error.trim()}`, "error");
+}
+
+function renderForceMerge(lines: LineBuilder, details: Record<string, any>, args: Record<string, any> | undefined): void {
+  const task = taskForRequest(details, args);
+  lines.heading(`SubtasksForceMerge · ${stringOr(task?.taskId ?? args?.taskId, "?")}`);
+  lines.add("Request: merge the retained checkpoint");
+  const mergeAnyhow = args?.mergeAnyhow === true;
+  lines.add(`mergeAnyhow: ${mergeAnyhow ? "true" : "false"}`);
+  // details.cwd is the persisted selected execution target (details.root is
+  // only the temporary record-storage directory).
+  if (typeof details.cwd === "string" && details.cwd.trim()) {
+    lines.add(`Target: ${details.cwd}`);
+  }
+  const state = task ? stringOr(task.state, "unknown") : undefined;
+  if (state === "conflicted") {
+    lines.add("Result: conflicts materialized", "warning");
+    renderConflictGate(lines, details.conflictGate);
+    lines.add("Required action: resolve and verify the conflict before marking the workspace clean; this does not establish that the task requirements are satisfied.");
+  } else if (state === "landed" || state === "reported") {
+    lines.add("Result: landed");
+    lines.add("Manual workspace inspection is still required; a mechanical landing never proves the requested changes are present or correct.", "muted");
+  } else if (state && !isActiveTaskState(state as BackgroundTaskState)) {
+    lines.add(`Result: ${state} (landing attempt did not complete)`, "warning");
+    lines.add("Manual workspace inspection is still required; a mechanical landing never proves the requested changes are present or correct.", "muted");
+  } else if (state) {
+    lines.add(`Result: in progress (state ${state})`, "warning");
+  } else {
+    lines.add("Result: not established by this record", "muted");
+  }
+  if (typeof task?.summary === "string" && task.summary.trim()) {
+    lines.add(`Authoritative outcome: ${task.summary.trim()}`);
+  }
+  if (typeof task?.error === "string" && task.error.trim()) lines.add(`Error: ${task.error.trim()}`, "error");
+}
+
+// ---------------------------------------------------------------------------
+// Simple acknowledgements: only returned/request fields, nothing invented
+// ---------------------------------------------------------------------------
+
+function renderWatch(lines: LineBuilder, details: Record<string, any>, args: Record<string, any> | undefined): void {
+  lines.heading(`SubtasksWatch · ${stringOr(details.executionId, "?")}`);
+  lines.add(`Requested checkpoint: after ${durationWords(count(details.afterMs))}${typeof args?.after === "string" ? ` (requested as "${args.after}")` : ""}`);
+  lines.add("Watch: armed");
+  lines.add("Kind: one-shot notification");
+  lines.add("Task completion/failure notifications: independent of this watch", "muted");
+  if (typeof details.armedAt === "string") lines.add(`Armed at: ${details.armedAt}`, "muted");
+  if (typeof details.dueAt === "string") lines.add(`Due at: ${details.dueAt}`, "muted");
+  lines.add(`Replaced the prior watch for this execution: ${details.replaced === true ? "yes" : "no"}`);
+}
+
+function renderMarkClean(lines: LineBuilder, details: Record<string, any>): void {
+  lines.heading("SubtasksMarkClean");
+  if (details.cleared === true) {
+    lines.add("Conflict check: passed");
+    lines.add("Conflict gate: cleared");
+  } else {
+    lines.add("Conflict gate: none active");
+  }
+  const paths = Array.isArray(details.paths) ? details.paths.filter((entry: unknown) => typeof entry === "string" && entry.trim()) : [];
+  lines.add(`Validated paths: ${paths.length > 0 ? paths.join(", ") : "(none)"}`);
+  // The acknowledgement does not name the validated workspaces; the actual
+  // operation data (the resolved conflict-marker paths) is exposed instead of
+  // guessing a workspace identity.
+  lines.add("Workspace identity: not named by this acknowledgement; the validated conflict-marker paths above are the returned operation data.", "muted");
+}
+
+// ---------------------------------------------------------------------------
 // Error results
 // ---------------------------------------------------------------------------
 
 function renderErrorResult(lines: LineBuilder, toolName: string, details: Record<string, any>): void {
-  lines.heading(`${toolName} — expanded error result`);
+  lines.heading(`${toolName} · failed`);
   lines.add(`diagnostic: ${stringOr(details.diagnostic, "(no diagnostic returned)")}`, "error");
   if (details.evidenceSelectorError === true) {
     // #61: read-only selector failures are task-scoped by design; the expanded
@@ -738,40 +1271,12 @@ function renderErrorResult(lines: LineBuilder, toolName: string, details: Record
   }
   const executions = Array.isArray(details.executions) ? details.executions.filter(isRecord) : [];
   if (executions.length > 0) {
-    lines.label(`Durable execution state as of the failure (${Math.min(executions.length, MAX_ERROR_EXECUTIONS)} of ${executions.length} shown):`);
-    for (const inspection of executions.slice(0, MAX_ERROR_EXECUTIONS)) {
+    lines.label("Durable execution state as of the failure:");
+    for (const inspection of executions) {
       if (!isRecord(inspection)) continue;
       lines.add(`execution ${stringOr(inspection.executionId, "?")} (${stringOr(inspection.kind, "?")}) · revision ${count(inspection.revision)} · updated ${stringOr(inspection.updatedAt, "?")}`);
       renderTasks(lines, inspection);
       renderConflictGate(lines, inspection.conflictGate);
     }
-    if (executions.length > MAX_ERROR_EXECUTIONS) {
-      lines.add(`  … ${executions.length - MAX_ERROR_EXECUTIONS} returned execution group(s) omitted from this expanded view.`, "muted");
-    }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Simple acknowledgements: only returned fields, nothing invented
-// ---------------------------------------------------------------------------
-
-function renderWatchAcknowledgement(lines: LineBuilder, details: Record<string, any>): void {
-  lines.add("Returned watch acknowledgement (one-shot checkpoint; expansion adds no data beyond what was returned):", "muted");
-  lines.add(`  execution: ${stringOr(details.executionId, "?")}`);
-  lines.add(`  checkpoint after: ${formatDuration(count(details.afterMs))}`);
-  if (typeof details.armedAt === "string") lines.add(`  armed at: ${details.armedAt}`);
-  if (typeof details.dueAt === "string") lines.add(`  due at: ${details.dueAt}`);
-  lines.add(`  replaced the prior watch for this execution: ${details.replaced === true ? "yes" : "no"}`);
-}
-
-function renderMarkCleanAcknowledgement(lines: LineBuilder, details: Record<string, any>): void {
-  lines.add("Returned acknowledgement (expansion adds no data beyond what was returned):", "muted");
-  lines.add(`  conflict gate cleared: ${details.cleared === true ? "yes" : "no"}`);
-  lines.add(`  paths: ${Array.isArray(details.paths) && details.paths.length > 0 ? details.paths.join(", ") : "(none)"}`);
-}
-
-function formatDuration(milliseconds: number): string {
-  if (milliseconds % 3_600_000 === 0 && milliseconds > 0) return `${milliseconds / 3_600_000}h`;
-  if (milliseconds % 60_000 === 0 && milliseconds > 0) return `${milliseconds / 60_000}m`;
-  return `${milliseconds / 1_000}s`;
 }

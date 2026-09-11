@@ -8,6 +8,7 @@ import {
 import { RESEARCH_ALLOWED_TOOLS } from "./execution/tool";
 import { DEFAULT_OPERATING_MODE, type OperatingMode } from "./config";
 import { renderAuthorizedToolInventory } from "./tool-inventory";
+import { deferredToolSearchRenderResult } from "./deferred-tools-result-renderer";
 
 const MAX_QUERY_CHARS = 256;
 
@@ -92,6 +93,7 @@ export class DeferredToolManager {
         required: ["query"],
         additionalProperties: false,
       },
+      renderResult: deferredToolSearchRenderResult,
       execute: async (_toolCallId: string, params: unknown) => this.search(params),
     });
     this.registered = true;
@@ -200,7 +202,9 @@ export class DeferredToolManager {
 
   private search(params: unknown): Record<string, unknown> {
     if (!this.boundary || !isDeferredToolHost(this.pi)) {
-      return textResult("Tool search is unavailable until session startup completes.", true);
+      return textResult("Tool search is unavailable until session startup completes.", true, {
+        outcome: "unavailable",
+      });
     }
     // Reassert the captured boundary on every loader call. Pi activates newly
     // registered tools by default in some configurations; registration after
@@ -208,11 +212,15 @@ export class DeferredToolManager {
     this.reapply();
     const query = searchQuery(params);
     if (!query) {
-      return textResult(`Invalid search_tools request: query must contain 1-${MAX_QUERY_CHARS} characters.`, true);
+      return textResult(`Invalid search_tools request: query must contain 1-${MAX_QUERY_CHARS} characters.`, true, {
+        outcome: "invalid",
+      });
     }
     const terms = searchTerms(query);
     if (terms.length === 0) {
-      return textResult("Invalid search_tools request: query must contain searchable terms.", true);
+      return textResult("Invalid search_tools request: query must contain searchable terms.", true, {
+        outcome: "invalid",
+      });
     }
 
     // Planning mode makes forbidden tools absent from discovery as well: they
@@ -241,15 +249,22 @@ export class DeferredToolManager {
       return textResult("No authorized tools matched. No tools were activated.", false, {
         activated: [],
         matched: [],
+        alreadyActive: [],
+        outcome: "no-match",
       });
     }
 
     const active = new Set(this.desiredActiveNames);
     const activated: string[] = [];
+    const alreadyActive: string[] = [];
     for (const match of selected) {
       // The catalog is already authorization-filtered. Keep this explicit
       // guard so a future catalog refactor cannot turn metadata into authority.
-      if (!this.boundary.authorizedNames.has(match.name) || active.has(match.name)) continue;
+      if (!this.boundary.authorizedNames.has(match.name)) continue;
+      if (active.has(match.name)) {
+        alreadyActive.push(match.name);
+        continue;
+      }
       active.add(match.name);
       this.desiredActiveNames.push(match.name);
       activated.push(match.name);
@@ -265,8 +280,10 @@ export class DeferredToolManager {
       status,
     ].join("\n"), false, {
       activated,
+      alreadyActive,
       matched: matchedNames,
       omitted: 0,
+      outcome: activated.length > 0 ? "activated" : "already-active",
     });
   }
 }

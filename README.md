@@ -93,20 +93,24 @@ Chromium is missing.
 ## Minimal configuration and launch
 
 The persistent launcher reads its config from a fixed location and deliberately ignores
-an exported `PI_REVIEW_GATE_CONFIG`, so a parent pi session cannot redirect it. It uses
-the first path that exists:
+an exported `PI_REVIEW_GATE_CONFIG`, so a parent pi session cannot redirect it. On every
+platform it uses the first path that exists:
 
-- `~/.config/pi-review-gate/config.json`
-- `~/.config/pi/review-gate.json`
+- `review-gate.json` in the Pi agent directory — `~/.pi/agent/review-gate.json` by
+  default (`%USERPROFILE%\.pi\agent\review-gate.json` on Windows), following Pi's
+  native `PI_CODING_AGENT_DIR` override when set
+- `~/.config/pi-review-gate/config.json` — an implicit compatibility fallback
 
 On its first launch, when neither is present, the launcher creates a private zero-model
-default config at the primary path (no reviewers or workers selected) and continues;
-you then configure models through `/review-settings` or by editing the file. To start
-from an existing config instead, place (or copy) it before launching:
+default config at the default location (no reviewers or workers selected) and continues;
+you then configure models through `/review-settings` or by editing the file. A config
+that exists only at the fallback location stays selected unchanged; nothing is copied,
+rewritten, or migrated between the two locations. To start from an existing config
+instead, place (or copy) it before launching:
 
 ```bash
-mkdir -p ~/.config/pi-review-gate
-cp /path/to/review-gate.json ~/.config/pi-review-gate/config.json
+mkdir -p ~/.pi/agent
+cp /path/to/review-gate.json ~/.pi/agent/review-gate.json
 ./scripts/pi-review-gate.sh
 ```
 
@@ -145,6 +149,20 @@ To disable everything, set `PI_REVIEW_GATE_DISABLED=1`. The complete field refer
 multi-reviewer setups, `/review-settings`, and legacy compatibility live in
 [Configuration](docs/configuration.md); ready-to-run examples are in
 [examples/](examples/).
+
+## Platform and shell compatibility
+
+Windows support is basic by design. Pi ships its native `bash` tool on every platform
+and an optional `powershell` tool on Windows; wherever review-gate handles shell
+commands — side-effect evidence and worker shell-tool authorization — `powershell`
+receives the same treatment as `bash`, subject to actual host availability and
+authorization: a tool the host has not registered or authorized is simply not exposed,
+and neither name widens a tool catalog on its own. Plan/research posture removes
+arbitrary shell entirely. Beyond this basic parity, native Windows operation is not
+claimed: `ShellStart` and the background-shell tool family keep their current
+assumptions and are unsupported on Windows, and portable launchers, provisioning,
+process handling, and worktree support are not completed. See
+[Delegated execution](docs/delegated-execution.md#background-shell-tools).
 
 ## How a review turn works
 

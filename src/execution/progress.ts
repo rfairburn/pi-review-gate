@@ -205,11 +205,18 @@ export class CodexJsonlActivityExtractor {
   }
 }
 
+/**
+ * Pi-native shell tools whose start/end activity lines render the command
+ * text (#94). Pi's optional `powershell` tool carries the same `command`
+ * input as `bash`.
+ */
+const SHELL_TOOL_NAMES = new Set(["bash", "powershell"]);
+
 function formatToolStart(toolName: string, args: unknown): string {
   const name = toolName.toLowerCase();
   const values = isRecord(args) ? args : {};
-  if (name === "bash" && typeof values.command === "string") {
-    return `bash · ${singleLine(values.command)}`;
+  if (SHELL_TOOL_NAMES.has(name) && typeof values.command === "string") {
+    return `${name} · ${singleLine(values.command)}`;
   }
   const filePath = typeof values.path === "string"
     ? values.path

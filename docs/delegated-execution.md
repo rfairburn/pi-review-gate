@@ -477,6 +477,15 @@ accepts steering during that interval, and performs a final inspection turn befo
 review. Executor timeouts are suspended while a verified process group remains active;
 external or unparseable `ShellStart` success responses fail closed.
 
+Platform scope is basic: the background-shell family keeps its current process-model
+assumptions and is unsupported on Windows; native Windows operation is not claimed for
+it. For interactive commands, Pi ships its native `bash` tool on every platform and an
+optional `powershell` tool on Windows; review-gate treats `powershell` like `bash`
+wherever it handles shell commands — side-effect evidence and worker shell-tool
+authorization — subject to actual host availability and authorization: a host that has
+not registered or authorized `powershell` never exposes it, and neither name widens a
+tool catalog on its own.
+
 Each Shell tool result carries structured display metadata (command, job lifecycle,
 log range and drop counts, stdin delivery state) in the result's render-only details,
 and Pi's shared tool-result expansion (`expandableResult`, ctrl+o by default) shows it:
@@ -520,7 +529,8 @@ an explicit read-only tool allowlist and permission callback while disabling use
 settings, skills, plugins, and MCP. Every adapter also receives a private worktree
 check that quarantines any detected write. Generic binary adapters are ineligible for
 research because their protocol does not acknowledge the restriction. Research
-subtasks never receive `ApplyPatch`. Enforcement details are owned by
+subtasks never receive `ApplyPatch`, and they never receive an arbitrary shell in
+either native form (`bash` or `powershell`). Enforcement details are owned by
 [Security model](security-model.md#read-only-enforcement).
 
 ## Artifacts

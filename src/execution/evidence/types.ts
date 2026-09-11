@@ -55,6 +55,7 @@ export type SubtaskEvidenceFilter = typeof EVIDENCE_FILTERS[number];
 /** Tool names treated as command executions by the `command` filter. */
 export const EVIDENCE_COMMAND_TOOL_NAMES: ReadonlySet<string> = new Set([
   "bash",
+  "powershell",
   "shell",
   "sh",
   "command_execution",

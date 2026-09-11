@@ -173,9 +173,6 @@ export const renderExpandedApplyPatchResult: ApplyPatchResultRenderer = (value, 
   return renderComponent(lines, theme);
 };
 
-/** Alias for callers that name the tool rather than the family. */
-export const renderApplyPatchExpandedResult = renderExpandedApplyPatchResult;
-
 // ---------------------------------------------------------------------------
 // Shared summary rendering
 // ---------------------------------------------------------------------------

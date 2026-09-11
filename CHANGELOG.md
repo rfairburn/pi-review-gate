@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.37]
+
+### Removed
+
+- Removed six unused renderer aliases: `renderSearchResult`,
+  `renderExpandedSearchResult`, `renderApplyPatchExpandedResult`,
+  `renderSearchToolsResult`, `renderExpandedSearchToolsResult`, and
+  `searchToolsRenderResult`, plus the unused evidence formatter
+  `selectionLabel` and its supporting type import
+  ([#103](https://github.com/rfairburn/pi-review-gate/issues/103)). No repository
+  consumers were found in their history; registered tools and canonical
+  renderers are unchanged. These names were exported from shipped modules:
+  external consumers deep-importing them must update before upgrading.
+
 ## [0.1.0-dev.36]
 
 ### Changed

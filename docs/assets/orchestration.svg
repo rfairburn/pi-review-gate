@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="700" viewBox="0 0 960 700" role="img" aria-labelledby="title description">
+  <title id="title">Pi Review Gate: orchestration, isolated execution, and independent review</title>
+  <desc id="description">A Pi orchestrator delegates work to representative Pi, Claude, and Codex executors. Each worker uses an isolated worktree within its selected target workspace. Captured changes go to independent read-only reviewers. Findings return for correction; approved changes can land in the selected target. Tools and capabilities are available according to role and authorization.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#526779" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="return-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#8494a3" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+      .heading { fill: #243747; font-size: 20px; font-weight: 600; }
+      .body { fill: #526272; font-size: 15px; }
+      .small { fill: #607181; font-size: 13px; }
+      .label { fill: #526779; font-size: 12px; font-weight: 700; letter-spacing: 1.4px; }
+      .wire { fill: none; stroke: #526779; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+      .card { fill: #ffffff; stroke: #b7c4ce; stroke-width: 1.2; }
+    </style>
+  </defs>
+
+  <!-- Fixed neutral canvas keeps contrast stable in either GitHub theme. -->
+  <rect x="0.5" y="0.5" width="959" height="699" rx="12" fill="#fafbfc" stroke="#d9e0e6"/>
+  <text x="32" y="43" fill="#243747" font-size="25" font-weight="600">Parallel execution. Independent review.</text>
+  <text x="32" y="69" class="body">Pi Review Gate · coordinated work, isolated worktrees, reviewed results</text>
+
+  <!-- A review can produce findings, rather than authorizing a landing. -->
+  <path d="M 816 153 V 98 H 136 V 151" fill="none" stroke="#8494a3" stroke-width="1.4" stroke-dasharray="5 5" marker-end="url(#return-arrow)"/>
+  <rect x="358" y="86" width="238" height="23" rx="4" fill="#fafbfc"/>
+  <text x="477" y="102" text-anchor="middle" class="small">Findings return for correction</text>
+
+  <text x="32" y="130" class="label">01 / ORCHESTRATE</text>
+  <text x="288" y="130" class="label">02 / EXECUTE IN ISOLATION</text>
+  <text x="704" y="130" class="label">03 / REVIEW</text>
+
+  <!-- Orchestration -->
+  <rect x="32" y="152" width="208" height="196" rx="9" class="card"/>
+  <rect x="32" y="152" width="208" height="5" rx="2.5" fill="#526f87"/>
+  <text x="50" y="189" class="heading">Pi orchestrator</text>
+  <text x="50" y="218" class="body">Plan bounded tasks</text>
+  <text x="50" y="243" class="body">Delegate and steer</text>
+  <text x="50" y="268" class="body">Coordinate outcomes</text>
+  <line x1="50" y1="286" x2="222" y2="286" stroke="#e0e6eb"/>
+  <text x="50" y="309" class="small">One coordinating session</text>
+  <text x="50" y="329" class="small">Multiple independent tasks</text>
+
+  <!-- Fan-out from one orchestrator; workspaces are illustrative targets. -->
+  <path d="M 240 250 H 264 V 419 H 287" class="wire" marker-end="url(#arrow)"/>
+  <path d="M 264 250 H 287" class="wire" marker-end="url(#arrow)"/>
+  <circle cx="264" cy="250" r="3" fill="#526779"/>
+
+  <!-- Target A: two independent worktrees, not a shared working directory. -->
+  <rect x="288" y="152" width="352" height="154" rx="9" fill="#eef2f5" stroke="#c4cfd8" stroke-width="1.2"/>
+  <path d="M 305 175 h 11 l 4 4 h 12 v 13 h -27 z" fill="none" stroke="#6a7f90" stroke-width="1.3" stroke-linejoin="round"/>
+  <text x="342" y="190" fill="#41596b" font-size="16" font-weight="600">Target workspace A</text>
+  <rect x="304" y="208" width="152" height="80" rx="6" class="card"/>
+  <text x="320" y="238" fill="#243747" font-size="17" font-weight="600">Pi executor</text>
+  <text x="320" y="266" class="small">Isolated worktree</text>
+  <rect x="472" y="208" width="152" height="80" rx="6" class="card"/>
+  <text x="488" y="238" fill="#243747" font-size="17" font-weight="600">Claude executor</text>
+  <text x="488" y="266" class="small">Isolated worktree</text>
+
+  <!-- Target B: another selected workspace, with a separate worker. -->
+  <rect x="288" y="328" width="352" height="154" rx="9" fill="#eef2f5" stroke="#c4cfd8" stroke-width="1.2"/>
+  <path d="M 305 351 h 11 l 4 4 h 12 v 13 h -27 z" fill="none" stroke="#6a7f90" stroke-width="1.3" stroke-linejoin="round"/>
+  <text x="342" y="366" fill="#41596b" font-size="16" font-weight="600">Target workspace B</text>
+  <rect x="304" y="384" width="320" height="80" rx="6" class="card"/>
+  <text x="320" y="414" fill="#243747" font-size="17" font-weight="600">Codex executor</text>
+  <text x="320" y="442" class="small">Isolated worktree</text>
+  <text x="288" y="505" class="small">Example adapters and workspaces; not a required mix.</text>
+
+  <!-- Independent review receives captured work from either target. -->
+  <path d="M 640 250 H 672 V 280 H 703" class="wire" marker-end="url(#arrow)"/>
+  <path d="M 640 419 H 672 V 280" class="wire"/>
+  <circle cx="672" cy="280" r="3" fill="#526779"/>
+
+  <rect x="704" y="152" width="224" height="222" rx="9" class="card"/>
+  <rect x="704" y="152" width="224" height="5" rx="2.5" fill="#526f87"/>
+  <text x="722" y="189" class="heading">Independent review</text>
+  <text x="722" y="216" class="body">Read-only reviewers</text>
+  <line x1="722" y1="234" x2="910" y2="234" stroke="#e0e6eb"/>
+  <text x="722" y="260" class="body">Inspect captured changes</text>
+  <text x="722" y="285" class="body">Return findings + verdict</text>
+  <rect x="722" y="308" width="188" height="45" rx="5" fill="#eef2f5"/>
+  <text x="816" y="336" text-anchor="middle" fill="#41596b" font-size="15" font-weight="600">Review before landing</text>
+
+  <path d="M 816 374 V 427" class="wire" marker-end="url(#arrow)"/>
+  <rect x="785" y="385" width="62" height="23" rx="4" fill="#fafbfc"/>
+  <text x="816" y="401" text-anchor="middle" class="small">Pass</text>
+  <rect x="704" y="430" width="224" height="72" rx="7" fill="#eef3f0" stroke="#adbbb2" stroke-width="1.2"/>
+  <text x="722" y="459" fill="#3d5749" font-size="17" font-weight="600">Reviewed results</text>
+  <text x="722" y="483" fill="#536a5c" font-size="14">Land in the selected target</text>
+
+  <!-- Capability categories are a legend, not unrestricted tool grants. -->
+  <rect x="32" y="538" width="896" height="130" rx="9" fill="#ffffff" stroke="#c4cfd8" stroke-width="1.2"/>
+  <text x="50" y="567" fill="#243747" font-size="17" font-weight="600">Tools &amp; capabilities</text>
+  <text x="910" y="567" text-anchor="end" class="small">Available by role and authorization</text>
+  <line x1="50" y1="580" x2="910" y2="580" stroke="#e0e6eb"/>
+  <g fill="#526f87">
+    <rect x="51" y="598" width="7" height="7" rx="1"/>
+    <rect x="345" y="598" width="7" height="7" rx="1"/>
+    <rect x="639" y="598" width="7" height="7" rx="1"/>
+    <rect x="51" y="635" width="7" height="7" rx="1"/>
+    <rect x="345" y="635" width="7" height="7" rx="1"/>
+    <rect x="639" y="635" width="7" height="7" rx="1"/>
+  </g>
+  <g class="body">
+    <text x="69" y="608">Files &amp; patches</text>
+    <text x="363" y="608">Browser &amp; web</text>
+    <text x="657" y="608">Background shell jobs</text>
+    <text x="69" y="645">Read-only discovery</text>
+    <text x="363" y="645">Task control &amp; steering</text>
+    <text x="657" y="645">Evidence &amp; recovery</text>
+  </g>
+</svg>

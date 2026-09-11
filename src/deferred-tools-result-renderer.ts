@@ -12,6 +12,7 @@
  */
 
 import { expandableResult, type ToolResultRenderCallback } from "./tool-result-expansion";
+import { wrapPreserving } from "./tool-result-wrap";
 
 export interface DeferredToolRendererTheme {
   bold(text: string): string;
@@ -312,48 +313,6 @@ function compactLine(value: string, width: number): string {
   const compact = value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").replace(/\s+/g, " ").trim();
   if (compact.length <= width) return compact;
   return `${compact.slice(0, Math.max(1, width - 1))}…`;
-}
-
-/** Wraps raw returned text without dropping or normalizing its content. */
-function wrapPreserving(value: string, width: number): string[] {
-  if (value.length === 0) return [""];
-  if (width <= 0) return [value];
-  const rows: string[] = [];
-  let current = "";
-  let currentWidth = 0;
-  for (const character of value) {
-    const characterWidth = displayWidth(character);
-    if (current.length > 0 && characterWidth > 0 && currentWidth + characterWidth > width) {
-      rows.push(current);
-      current = "";
-      currentWidth = 0;
-    }
-    current += character;
-    currentWidth += characterWidth;
-  }
-  if (current.length > 0) rows.push(current);
-  return rows.length > 0 ? rows : [""];
-}
-
-function displayWidth(value: string): number {
-  let width = 0;
-  for (const character of value) {
-    const code = character.codePointAt(0) ?? 0;
-    if (code === 0x200b || code === 0x200c || code === 0x200d || code === 0xfeff) continue;
-    if (code >= 0x300 && code <= 0x36f) continue;
-    if ((code >= 0x1100 && code <= 0x115f)
-      || (code >= 0x2e80 && code <= 0xa4cf)
-      || (code >= 0xac00 && code <= 0xd7a3)
-      || (code >= 0xf900 && code <= 0xfaff)
-      || (code >= 0xff00 && code <= 0xffef)
-      || (code >= 0x1f000 && code <= 0x1faff)
-      || (code >= 0x20000 && code <= 0x3fffd)) {
-      width += 2;
-    } else {
-      width += 1;
-    }
-  }
-  return width;
 }
 
 function isRecord(value: unknown): value is RecordValue {

@@ -15,6 +15,14 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.36]
+
+### Changed
+
+- ApplyPatch and tool-discovery result views now share their identical
+  text-wrapping helpers, removing duplicate code without changing rendering
+  behavior ([#101](https://github.com/rfairburn/pi-review-gate/issues/101)).
+
 ## [0.1.0-dev.35]
 
 ### Changed

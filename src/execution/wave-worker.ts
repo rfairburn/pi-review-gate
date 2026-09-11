@@ -795,6 +795,19 @@ async function runWithPoolFailover(input: {
         model: adapter!.model,
         executorTurn,
       }),
+      // #93: forward the delivery-boundary dispatch capture into the
+      // existing progress/event path; parent cards consume `update.dispatch`.
+      onDispatch: (record) => reportProgress(input.worker, {
+        phase: "executing",
+        message: `executor dispatch delivered: turn ${record.executorTurn}`
+          + `${record.adapter ? ` via ${record.adapter}` : ""}`
+          + "; exact sent prompt, isolated worker worktree, and captured base recorded at the transport delivery boundary",
+        artifactDir: input.resolvedArtifactDir,
+        adapter: record.adapter,
+        model: record.model,
+        executorTurn: record.executorTurn,
+        dispatch: record,
+      }),
     });
 
     if (recovered.status === "completed") {

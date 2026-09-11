@@ -16,12 +16,13 @@ function renderLines(
   result: BrowserToolResult,
   width = 240,
   options: { expanded?: boolean; isPartial?: boolean } = {},
+  context: unknown = { showImages: true },
 ): string[] {
   const component = renderBrowserExpandedResult(
     result,
     { expanded: options.expanded ?? true, isPartial: options.isPartial ?? false },
     theme,
-    { showImages: true },
+    context,
   );
   return component.render(width);
 }
@@ -29,8 +30,9 @@ function renderLines(
 function render(
   result: BrowserToolResult,
   options: { expanded?: boolean; isPartial?: boolean } = {},
+  context: unknown = { showImages: true },
 ): string {
-  return renderLines(result, 240, options).join("\n");
+  return renderLines(result, 240, options, context).join("\n");
 }
 
 function testDisplayWidth(value: string): number {
@@ -72,10 +74,12 @@ test("expanded browser snapshots retain semantic formatting and truncation cavea
     },
   });
 
-  assert.match(output, /Browser semantic snapshot/);
+  assert.match(output, /^BrowserSnapshot$/m);
+  assert.doesNotMatch(output, /ctrl\+o/, "family headers carry no hint; the shared wrapper owns it");
+  assert.match(output, /Acquisition truncated: yes/);
+  assert.match(output, /Returned characters: 74\/90 · 1 opaque ref\(s\)/);
   assert.match(output, /- heading "Results"/);
   assert.match(output, /  - link "Next" \[ref=g_ref\]/);
-  assert.match(output, /Snapshot: 74\/90 chars · 1 opaque ref\(s\) · truncated: true/);
   assert.doesNotMatch(output, /collapsed snapshot preview/);
 });
 
@@ -100,7 +104,7 @@ test("wrapped browser values honor narrow terminal columns and physical line bou
       session: "session_safe", tab: "tab_safe", generation: "generation_safe", ref: "ref_safe",
       semantic: {
         role: "button", tag: "button", type: null,
-        accessibleName: "界🙂\nbutton", accessibleDescription: "説明🙂",
+        accessibleName: "界🙂\nbutton", accessibleDescription: "説明🙂", visible: true,
         states: { checked: null, disabled: false, expanded: false, selected: false, focused: false, editable: false },
         hrefOrigin: null,
         visibleText: { text: "界🙂\n表示", returnedChars: 4, truncated: false, suppressed: false },
@@ -176,8 +180,13 @@ test("expanded console and network diagnostics show retained records without hid
       },
     },
   });
-  assert.match(networkOutput, /GET https:\/\/api\.example · document · succeeded · status 200 · 18ms/);
-  assert.doesNotMatch(networkOutput, /headers|body|must-not-render/);
+  assert.match(networkOutput, /#7 · GET · https:\/\/api\.example · document/);
+  assert.match(networkOutput, /Outcome: response/);
+  assert.match(networkOutput, /Disposition: succeeded/);
+  assert.match(networkOutput, /Status: 200/);
+  assert.match(networkOutput, /Duration: 18ms/);
+  assert.match(networkOutput, /Bodies, headers and request queries are not captured/);
+  assert.doesNotMatch(networkOutput, /must-not-render/);
 });
 
 test("expanded semantic inspection keeps allowlisted fields and preserves suppressed values", () => {
@@ -207,6 +216,7 @@ test("expanded semantic inspection keeps allowlisted fields and preserves suppre
   });
 
   assert.match(output, /Accessible name: Password/);
+  assert.match(output, /Visible: \[not returned\]/);
   assert.match(output, /Visible text: \[suppressed by browser privacy\/safety policy\]/);
   assert.doesNotMatch(output, /secret-value|outerHTML/);
 });
@@ -251,8 +261,11 @@ test("expanded history, tabs, and interaction results retain bounded state witho
       ], truncated: true, omittedEntries: 4, navigationsRemaining: null,
     } },
   });
-  assert.match(history, /Entries returned: 2 · truncated: true · omitted: 4/);
-  assert.match(history, /\* 1: https:\/\/example\.test\/new/);
+  assert.match(history, /Requested operation: list/);
+  assert.match(history, /Returned history:/);
+  assert.match(history, /\* 1  https:\/\/example\.test\/new/);
+  assert.match(history, /Current entry: 1/);
+  assert.match(history, /Omitted entries: 4/);
 
   const tabs = render({
     content: [{ type: "text", text: "tabs summary" }],
@@ -263,8 +276,8 @@ test("expanded history, tabs, and interaction results retain bounded state witho
       ], sessionClosed: false, tabsRemaining: 2, maxTabs: 4,
     } },
   });
-  assert.match(tabs, /Tabs: 2\/4/);
-  assert.match(tabs, /\* tab_two · generation generation_two/);
+  assert.match(tabs, /Tabs remaining: 2\/4/);
+  assert.match(tabs, /\* tab_two · https:\/\/two\.example · generation generation_two/);
 
   const interaction = render({
     content: [{ type: "text", text: "interaction summary" }],
@@ -275,7 +288,9 @@ test("expanded history, tabs, and interaction results retain bounded state witho
       url: "https://example.test", privateInput: "must-not-render",
     } },
   });
-  assert.match(interaction, /Consequence: send · effect: completed · approval: human/);
+  assert.match(interaction, /Consequence: send/);
+  assert.match(interaction, /Approval: human/);
+  assert.match(interaction, /Effect: completed/);
   assert.match(interaction, /No rollback is claimed for external effects/);
   assert.doesNotMatch(interaction, /privateInput|must-not-render/);
 });
@@ -286,15 +301,25 @@ test("pending, failed, empty, and generic paths remain bounded and side-effect f
   assert.match(pending, /No retained browser output yet/);
 
   const failed = render({ content: [{ type: "text", text: "BrowserClick failed: not_started; use a fresh snapshot." }], isError: true });
+  assert.match(failed, /^BrowserClick$/m);
+  assert.doesNotMatch(failed, /ctrl\+o/, "family headers carry no hint; the shared wrapper owns it");
   assert.match(failed, /Browser result failed/);
   assert.match(failed, /fresh snapshot/);
+  const hostFailed = render(
+    { content: [{ type: "text", text: "BrowserSnapshot failed: not_started; use a fresh snapshot." }], details: { response: { snapshot: "must-not-render" } } },
+    {},
+    { args: { session: "session_safe", tab: "tab_safe" }, isError: true },
+  );
+  assert.match(hostFailed, /^BrowserSnapshot$/m);
+  assert.doesNotMatch(hostFailed, /must-not-render/);
 
   const empty = render({ content: [] });
-  assert.match(empty, /No retained browser output/);
+  assert.match(empty, /no retained output|No retained browser output/);
 
   const long: BrowserToolResult = { content: [{ type: "text", text: Array.from({ length: 140 }, (_, index) => `line-${index}`).join("\n") }] };
-  const bounded = render(long);
-  assert.match(bounded, /Browser result — retained model-visible output/);
-  assert.match(bounded, /renderer line\(s\) omitted/);
-  assert.doesNotMatch(bounded, /line-139/);
+  const expanded = render(long);
+  assert.match(expanded, /^Browser$/m);
+  assert.match(expanded, /line-0/);
+  assert.match(expanded, /line-139/);
+  assert.doesNotMatch(expanded, /renderer line\(s\) omitted|renderer line truncated/);
 });

@@ -1,23 +1,30 @@
 /*
- * Expanded result views for the background shell tool family (#58).
+ * Result views for the background shell tool family (#58, #93).
  *
  * Every test drives the PRODUCTION renderers in
  * src/background-shell/result-view.ts — no test-local copy of the ideal
  * rendering. The real-process section feeds actual tool results from
- * registerBackgroundShell through the same renderers; the crafted section
- * covers the bounded lifecycle variants (pending, error, empty, truncated,
+ * registerBackgroundShell through the same registered renderers (including
+ * the recorded native render context.args); the crafted section covers the
+ * bounded lifecycle variants (pending, error, empty, truncated,
  * restored-without-details) the real harness cannot easily produce.
+ *
+ * #93 canonical examples 1–5 plus the ShellLog collapsed-tail refinement:
+ * collapsed cards are structured useful summaries WITHOUT any toggle hint
+ * (the shared wrapper owns the configured-key hint centrally); expanded views
+ * show the complete actual inputs and retained results — no 512-character,
+ * 4-line, or 8-line legacy cuts; secret-shaped model-visible input is
+ * rendered verbatim; delivery/stop outcomes stay truthful.
  */
 import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
 import {
-  MAX_COMMAND_DISPLAY_CHARS,
-  MAX_ERROR_DISPLAY_CHARS,
   TRUNCATION_MARKER,
   truncateText,
 } from "../src/background-shell/jobs";
 import {
+  SHELL_COLLAPSED_RESULT_VIEWS,
   SHELL_EXPANDED_RESULT_RENDERERS,
   parseShellLogText,
   renderShellListResult,
@@ -25,8 +32,13 @@ import {
   renderShellSendResult,
   renderShellStartResult,
   renderShellStopResult,
-  shellCollapsedResultRenderer,
+  shellCollapsedRenderer,
   shellExpandedRenderer,
+  shellListCollapsedView,
+  shellLogCollapsedView,
+  shellSendCollapsedView,
+  shellStartCollapsedView,
+  shellStopCollapsedView,
   shellResultDetails,
   visibleCells,
   wrapToWidth,
@@ -39,13 +51,24 @@ const theme: ShellResultViewTheme = {
 };
 
 const renderLines = (
-  renderer: (result: unknown, options: unknown, theme: ShellResultViewTheme) => unknown,
+  renderer: (result: unknown, options: unknown, theme: ShellResultViewTheme, context?: unknown) => unknown,
   result: unknown,
   width = 200,
+  context?: unknown,
 ): string[] =>
-  (renderer(result, { expanded: true }, theme) as { render(w: number): string[] }).render(width) as string[];
+  (renderer(result, { expanded: true }, theme, context) as { render(w: number): string[] }).render(width) as string[];
 
 const textOf = (r: any) => r.content[0].text as string;
+
+/** Drive a collapsed view directly (the registered wrapper routes collapsed
+ *  state to it; renderLines drives the expanded callback). */
+const renderCollapsedLines = (
+  renderer: (result: unknown, options: unknown, theme: ShellResultViewTheme, context?: unknown) => unknown,
+  result: unknown,
+  width = 200,
+  context?: unknown,
+): string[] =>
+  (renderer(result, { expanded: false }, theme, context) as { render(w: number): string[] }).render(width) as string[];
 
 /** Independent ground-truth cell counter for the emoji regression below —
  *  deliberately NOT the production visibleCells. ⏰ U+23F0 and ✅ U+2705
@@ -53,7 +76,7 @@ const textOf = (r: any) => r.content[0].text as string;
  *  terminal cells each, a fact about those code points, not about the
  *  implementation under test. Everything else this fixture can render is
  *  known-narrow; anything unexpected fails loudly instead of miscounting. */
-const NARROW_FIXTURE_CP = new Set([0xb7 /* · */, 0x2013 /* – */]);
+const NARROW_FIXTURE_CP = new Set([0xb7 /* · */, 0x2013 /* – */, 0x2026 /* … */]);
 function measuredCells(line: string): number {
   let cells = 0;
   for (const ch of line) {
@@ -86,6 +109,18 @@ function wire(): Harness {
   };
 }
 
+/** Render through the REGISTERED entrypoint (the expandableResult wrapper),
+ *  optionally passing the native render context (context.args). */
+function renderRegistered(
+  tool: any,
+  result: unknown,
+  options: { expanded?: boolean; isPartial?: boolean },
+  context?: unknown,
+  width = 200,
+): string[] {
+  return (tool.renderResult(result, options, theme, context) as { render(w: number): string[] }).render(width) as string[];
+}
+
 async function until(fn: () => boolean | Promise<boolean>, ms = 8000): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
@@ -99,67 +134,244 @@ afterEach(() => {
   reapAll();
 });
 
-describe("real Shell results through the production expanded renderers", () => {
-  it("ShellStart result details carry the command, pid, and wake summary, and the expanded view shows them", async () => {
-    const { call } = wire();
-    const result = await call("ShellStart", {
-      command: "sleep 60",
+describe("real Shell results through the production registered renderers (#93 canonical)", () => {
+  it("ShellStart: collapsed card is the structured summary, expanded card shows the full command and state", async () => {
+    const h = wire();
+    const result = await h.call("ShellStart", {
+      command: "echo alpha; sleep 60",
       label: "view",
       wake_on: { match: "Traceback", silence: "10m" },
     });
     const details = result.details;
     expect(details.kind).toBe("pi-review-bg-shell");
     expect(details.tool).toBe("ShellStart");
-    expect(details.command).toBe("sleep 60");
+    // The retained detail snapshot carries the COMPLETE command (no 512-char
+    // cut) and the state at the moment the call returned.
+    expect(details.command).toBe("echo alpha; sleep 60");
+    expect(details.state).toBe("running");
     expect(details.label).toBe("view");
     expect(typeof details.pid).toBe("number");
     expect(details.processGroupId).toBe(details.pid);
     expect(details.watching).toContain("exit");
     expect(details.watching).toContain("Traceback");
-    expect(details.watching).toContain("silence 10m00s");
+    expect(details.watching).toContain("silence 10m");
     expect(typeof details.startedAt).toBe("number");
     // The model-visible text is unchanged by details enrichment.
     expect(textOf(result)).toContain('Started "view"');
-    expect(textOf(result)).toContain('match "Traceback", silence 10m');
 
-    const lines = renderLines(renderShellStartResult as any, result);
-    const joined = lines.join("\n");
-    expect(joined).toContain("ShellStart · ");
-    expect(joined).toContain('!b"view"!');
-    expect(joined).toContain("command: sleep 60");
-    expect(joined).toContain(`pid ${details.pid}`);
-    expect(joined).toContain("watching: exit, match \"Traceback\", silence 10m");
-    expect(joined).toContain("started 20");
+    const collapsed = renderRegistered(h.tools.ShellStart, result, { expanded: false });
+    const collapsedJoined = collapsed.join("\n");
+    expect(collapsedJoined).toContain(`ShellStart · ${details.id} !b"view"! · running`);
+    expect(collapsedJoined).toContain("  command:");
+    expect(collapsedJoined).toContain("  echo alpha; sleep 60".replace("  echo", "    echo"));
+    expect(collapsedJoined).toContain(`  pid ${details.pid} · started 20`);
+    expect(collapsedJoined).toContain("  watching: exit, match \"Traceback\", silence 10m");
+    // No family-owned toggle hint anywhere: the shared wrapper owns it.
+    expect(collapsedJoined).not.toContain("to expand");
+    expect(collapsedJoined).not.toContain("ctrl+o");
+
+    const expanded = renderRegistered(h.tools.ShellStart, result, { expanded: true });
+    const joined = expanded.join("\n");
+    expect(joined).toContain(`ShellStart · ${details.id} !b"view"! · running`);
+    expect(joined).toContain("Command:");
+    expect(joined).toContain("echo alpha; sleep 60");
+    expect(joined).toContain(`PID: ${details.pid}`);
+    expect(joined).toContain("Started: 20");
+    expect(joined).toContain('Wake rules: exit, match "Traceback", silence 10m');
+    expect(joined).toContain("State: running when this call returned");
+    expect(joined).not.toContain("to collapse");
+
+    // Expansion is presentation only; re-collapse restores the same card.
+    expect(renderRegistered(h.tools.ShellStart, result, { expanded: false })).toEqual(collapsed);
   });
 
-  it("ShellLog result details carry the range provenance and the expanded view shows the retained lines verbatim", async () => {
-    const { call } = wire();
-    await call("ShellStart", { command: "echo alpha; echo beta; exit 7", label: "logview" });
-    // Wait for the job to exit so the log has its full content, then page it.
+  it("ShellStart expansion shows every command line and every character beyond the legacy 512-char / 4-line cuts", async () => {
+    const h = wire();
+    const longCommand = Array.from({ length: 8 }, (_, i) => `step-${i}: ${"z".repeat(60)}`).join("\n");
+    expect(longCommand.length > 512).toBe(true);
+    const result = await h.call("ShellStart", { command: longCommand, label: "long" });
+    expect(result.details.command).toBe(longCommand);
+    expect(result.details.command.includes(TRUNCATION_MARKER)).toBe(false);
+
+    // Through the registered entrypoint, with the recorded call arguments as
+    // the render context — the production path in the host.
+    const expanded = renderRegistered(
+      h.tools.ShellStart,
+      result,
+      { expanded: true },
+      { args: { command: longCommand, label: "long" } },
+    );
+    const joined = expanded.join("\n");
+    // Every line of the recorded call command survives expansion.
+    for (let i = 0; i < 8; i++) expect(joined).toContain(`step-${i}:`);
+    // Content past the legacy 512-character cap is visible.
+    expect(joined).toContain("step-7:");
+    // The collapsed card keeps the truthful 4-line preview with an omission
+    // count — a collapsed-only bound.
+    const collapsed = renderRegistered(h.tools.ShellStart, result, { expanded: false });
+    const collapsedJoined = collapsed.join("\n");
+    expect(collapsedJoined).toContain("  command:");
+    expect(collapsedJoined).toContain("step-0:");
+    expect(collapsedJoined).not.toContain("step-7:");
+    expect(collapsedJoined).toContain("  … 4 more command line(s)");
+    // Collapse → expand → re-collapse is deterministic.
+    expect(renderRegistered(h.tools.ShellStart, result, { expanded: false })).toEqual(collapsed);
+  });
+
+  it("ShellStart prefers the recorded context.args command over the result-detail command snapshot", () => {
+    const fullCommand = `begin\n${"y".repeat(600)}\nend-marker`;
+    const crafted = {
+      content: [{ type: "text", text: 'Started "pref" as job1 (pid 1); currently running.' }],
+      isError: false,
+      // A legacy detail snapshot that was truncated at 512 characters.
+      details: shellResultDetails("ShellStart", {
+        id: "job1",
+        label: "pref",
+        command: truncateText(fullCommand, 512),
+        pid: 1,
+        watching: "exit",
+        startedAt: Date.UTC(2026, 0, 1),
+        state: "running",
+      }),
+    };
+    const expanded = renderLines(renderShellStartResult as any, crafted, 200, { args: { command: fullCommand } });
+    const joined = expanded.join("\n");
+    // The preferred source is the complete recorded call argument.
+    expect(joined).toContain("end-marker");
+    expect(joined.split("y").length - 1 >= 600).toBe(true);
+    // Without a render context the untruncated detail snapshot is used; a
+    // genuinely truncated legacy snapshot says so with its visible marker.
+    const legacyExpanded = renderLines(renderShellStartResult as any, crafted);
+    expect(legacyExpanded.join("\n")).toContain(TRUNCATION_MARKER);
+  });
+
+  it("ShellStart expansion shows secret-shaped model-visible command text without a human-view filter", async () => {
+    const h = wire();
+    const secretCommand = 'echo "TOKEN=sk-live-abc123 SECRET"; sleep 60';
+    const result = await h.call("ShellStart", { command: secretCommand, label: "secret" });
+    const expanded = renderRegistered(
+      h.tools.ShellStart,
+      result,
+      { expanded: true },
+      { args: { command: secretCommand } },
+    );
+    expect(expanded.join("\n")).toContain("TOKEN=sk-live-abc123 SECRET");
+  });
+
+  it("ShellList: collapsed rows are the structured summary and expansion renders every recorded command completely", async () => {
+    const h = wire();
+    const empty = await h.call("ShellList", {});
+    expect(empty.details.tool).toBe("ShellList");
+    expect(empty.details.jobs).toEqual([]);
+    const emptyCollapsed = renderRegistered(h.tools.ShellList, empty, { expanded: false });
+    expect(emptyCollapsed.join("\n")).toContain("ShellList · 0 jobs");
+    expect(emptyCollapsed.join("\n")).toContain("no background jobs");
+
+    const longCommand = Array.from({ length: 6 }, (_, i) => `suite-${i} --run --filter 'case ${"p".repeat(80)}'`).join("\n");
+    expect(longCommand.length > 512).toBe(true);
+    await h.call("ShellStart", { command: longCommand, label: "tests" });
+    await h.call("ShellStart", { command: "sleep 60", label: "server" });
+    const listed = await h.call("ShellList", {});
+    expect(listed.details.jobs.length).toBe(2);
+    // The snapshot carries the complete recorded commands — expansion reads
+    // them from the returned snapshot, never via a live lookup on toggle.
+    expect(listed.details.jobs[0].command).toBe(longCommand);
+    expect(listed.details.jobs[0].command.includes(TRUNCATION_MARKER)).toBe(false);
+
+    const collapsed = renderRegistered(h.tools.ShellList, listed, { expanded: false });
+    const collapsedJoined = collapsed.join("\n");
+    expect(collapsedJoined).toContain("ShellList · 2 jobs");
+    expect(collapsedJoined).toContain(`  ${listed.details.jobs[0].id} !b"tests"! · running`);
+    expect(collapsedJoined).toContain(`  ${listed.details.jobs[1].id} !b"server"! · running`);
+    expect(collapsedJoined).not.toContain("to expand");
+
+    const expanded = renderRegistered(h.tools.ShellList, listed, { expanded: true });
+    const joined = expanded.join("\n");
+    expect(joined).toContain("ShellList · 2 jobs");
+    expect(joined).toContain('Command:\n    suite-0');
+    expect(joined).toContain("suite-5"); // every command line, beyond any cut
+    expect(joined).toContain("  Command: sleep 60");
+    expect(joined).toContain("  State: running");
+    expect(joined).toContain("  PID: ");
+    expect(joined).toContain("  Retained output: 0 line(s)");
+    expect(joined).toContain("  Dropped output: 0 line(s)");
+    expect(joined).toContain("  Wake rules: exit");
+    expect(joined).toContain("Snapshot: state recorded by this list call");
+    reapAll();
+    const afterReap = await h.call("ShellList", {});
+    // reapAll() empties the job map: the collapsed list resets and a later
+    // expanded view would show the empty snapshot.
+    expect(afterReap.details.jobs.length).toBe(0);
+  });
+
+  it("ShellLog: collapsed previews the LAST returned lines; expansion shows the complete returned range (no fetch)", async () => {
+    const h = wire();
+    await h.call("ShellStart", {
+      command:
+        "for i in 1 2 3 4 5 6; do echo HEAD-$i; done; echo TAIL-A; echo TAIL-B; echo TAIL-C; echo TAIL-D; exit 0",
+      label: "tailview",
+    });
     let logResult: any;
     expect(
       await until(async () => {
-        const list = await call("ShellList", {});
-        logResult = await call("ShellLog", { id: /job\d+/.exec(textOf(list))![0] });
-        return textOf(logResult).includes("beta");
+        const list = await h.call("ShellList", {});
+        logResult = await h.call("ShellLog", { id: /job\d+/.exec(textOf(list))![0] });
+        return textOf(logResult).includes("TAIL-D");
       }),
     ).toBe(true);
     const details = logResult.details;
     expect(details.tool).toBe("ShellLog");
-    expect(details.status).toBe("failed(7)");
-    expect(details.exitCode).toBe(7);
-    expect(details.totalLines).toBe(2);
+    expect(details.status).toBe("done");
+    expect(details.exitCode).toBe(0);
+    expect(details.totalLines).toBe(10);
     expect(details.from).toBe(0);
-    expect(details.nextOffset).toBe(2);
+    expect(details.nextOffset).toBe(10);
+    // The request selectors are retained for the expanded Request block.
+    expect(details.requestOffset).toBeNull(); // tail default
+    expect(details.requestLimit).toBe(60);
 
-    const lines = renderLines(renderShellLogResult as any, logResult);
-    const joined = lines.join("\n");
-    expect(joined).toContain("ShellLog · ");
-    expect(joined).toContain('!b"logview"! · failed(7)');
-    expect(joined).toContain("lines 0–2 of 2 line(s)");
-    expect(joined).toContain("2 line(s), retained output as delivered to the model");
-    expect(joined).toContain("alpha");
-    expect(joined).toContain("beta");
+    // Collapsed: range + the LAST lines of the returned range + truthful
+    // earlier-lines omission count. No toggle hint.
+    const collapsed = renderRegistered(h.tools.ShellLog, logResult, { expanded: false });
+    const collapsedJoined = collapsed.join("\n");
+    expect(collapsedJoined).toContain('ShellLog · ');
+    expect(collapsedJoined).toContain('!b"tailview"! · exited 0');
+    expect(collapsedJoined).toContain("  Returned lines: 0–10 · dropped: 0");
+    expect(collapsedJoined).toContain("TAIL-D");
+    expect(collapsedJoined).toContain("TAIL-B");
+    expect(collapsedJoined).not.toContain("HEAD-1");
+    expect(collapsedJoined).not.toContain("HEAD-4");
+    expect(collapsedJoined).toContain("  … 4 earlier returned lines");
+    expect(collapsedJoined).not.toContain("to expand");
+
+    // Expanded: the COMPLETE returned range, all ten lines, with formatting.
+    const expanded = renderRegistered(h.tools.ShellLog, logResult, { expanded: true });
+    const joined = expanded.join("\n");
+    expect(joined).toContain("Request:");
+    expect(joined).toContain(`  Job: ${details.id}`);
+    expect(joined).toContain("  Offset: tail");
+    expect(joined).toContain("  Limit: 60");
+    expect(joined).toContain("Returned range: [0, 10)");
+    expect(joined).toContain("Next offset: 10");
+    expect(joined).toContain("Total lines recorded: 10");
+    expect(joined).toContain("Oldest lines dropped: 0");
+    expect(joined).toContain("Output:");
+    for (const marker of ["HEAD-1", "HEAD-2", "HEAD-3", "HEAD-4", "HEAD-5", "HEAD-6", "TAIL-A", "TAIL-B", "TAIL-C", "TAIL-D"]) {
+      expect(joined).toContain(marker);
+    }
+    // Capture merged the streams: no invented stdout/stderr provenance.
+    expect(joined.includes("stdout") || joined.includes("stderr")).toBe(false);
+    // Expansion performs no fetch; re-collapse is identical.
+    expect(renderRegistered(h.tools.ShellLog, logResult, { expanded: false })).toEqual(collapsed);
+
+    // An explicit offset request is recorded and rendered exactly.
+    const paged = await h.call("ShellLog", { id: details.id, offset: 0, lines: 3 });
+    expect(paged.details.requestOffset).toBe(0);
+    expect(paged.details.requestLimit).toBe(3);
+    const pagedExpanded = renderRegistered(h.tools.ShellLog, paged, { expanded: true });
+    expect(pagedExpanded.join("\n")).toContain("  Offset: 0");
+    expect(pagedExpanded.join("\n")).toContain("  Limit: 3");
+    expect(pagedExpanded.join("\n")).toContain("Returned range: [0, 3)");
   });
 
   it("registered ShellLog keeps repeated ⏰/✅ within width80 and survives narrow rows", async () => {
@@ -179,7 +391,6 @@ describe("real Shell results through the production expanded renderers", () => {
         return textOf(logResult).split("⏰").length - 1 >= 165;
       }),
     ).toBe(true);
-    // The registered entrypoint is the expandableResult wrapper on the tool.
     const renderRegistered = (options: { expanded: boolean }, width: number): string[] =>
       (h.tools["ShellLog"].renderResult as any)(logResult, options, theme).render(width) as string[];
 
@@ -192,12 +403,14 @@ describe("real Shell results through the production expanded renderers", () => {
     const expanded = renderRegistered({ expanded: true }, 80).join("\n");
     expect(expanded.split("⏰").length - 1).toBe(165);
     expect(expanded.split("✅").length - 1).toBe(120);
-    // Collapsed stays a bounded preview of the wrapped rows: header + fence
-    // + ceil(480/78)=7 + ceil(90/78)=2 + fence = 12 rows → 10 + one hint row.
+    // Collapsed previews the TAIL of the returned range (the 2-row 90-cell
+    // line fits the preview budget; the 7-row 480-cell line is disclosed by
+    // its truthful earlier-lines omission count, with no toggle hint).
     const collapsed = renderRegistered({ expanded: false }, 80);
-    expect(collapsed.length).toBe(11);
-    expect(collapsed[collapsed.length - 1]).toContain("more lines");
-    expect(collapsed[collapsed.length - 1]).toContain("to expand");
+    expect(collapsed.length).toBe(5); // title + range + omission + 2 wrapped rows
+    expect(collapsed[collapsed.length - 3]).toContain("1 earlier returned line");
+    expect(collapsed.join("\n").split("⏰").length - 1).toBe(45);
+    expect(collapsed[collapsed.length - 1]).not.toContain("to expand");
     // Narrow rows: at render width 3 a single emoji is wider than the row —
     // no over-width line may be emitted; at 4 each emoji fills its row
     // exactly and the retained text survives intact.
@@ -238,65 +451,121 @@ describe("real Shell results through the production expanded renderers", () => {
     for (const ch of ["a", "b", "c", "e", "f"]) expect(joined).toContain(ch);
   });
 
-  it("ShellList result details describe every job and the expanded view renders each row bounded", async () => {
-    const { call } = wire();
-    const empty = await call("ShellList", {});
-    expect(empty.details.tool).toBe("ShellList");
-    expect(empty.details.jobs).toEqual([]);
-    expect(renderLines(renderShellListResult as any, empty).join("\n")).toContain("no background jobs");
+  it("ShellStop: stop-all retains the actual target list; stopping is never reported as termination", async () => {
+    const h = wire();
+    await h.call("ShellStart", { command: "sleep 60", label: "t-one" });
+    await h.call("ShellStart", { command: "sleep 60", label: "t-two" });
+    const stopped = await h.call("ShellStop", { id: "all" });
+    expect(stopped.details.tool).toBe("ShellStop");
+    expect(stopped.details.outcome).toBe("stopping");
+    expect(stopped.details.count).toBe(2);
+    // The affected targets are recorded by this call — not re-derived later.
+    expect(stopped.details.targets.length).toBe(2);
+    expect(stopped.details.targets.map((t: any) => t.label).sort()).toEqual(["t-one", "t-two"]);
 
-    const started = await call("ShellStart", { command: "sleep 60", label: "listed" });
-    const listed = await call("ShellList", {});
-    const job = listed.details.jobs[0];
-    expect(listed.details.jobs.length).toBe(1);
-    expect(job.id).toBe(started.details.id);
-    expect(job.status).toBe("running");
-    expect(job.command).toBe("sleep 60");
-    expect(job.totalLines).toBe(0);
-    expect(job.watching).toContain("exit");
+    const collapsed = renderRegistered(h.tools.ShellStop, stopped, { expanded: false });
+    const collapsedJoined = collapsed.join("\n");
+    expect(collapsedJoined).toContain("ShellStop · all jobs · stopping 2");
+    expect(collapsedJoined).toContain('!b"t-one"!');
+    expect(collapsedJoined).toContain('!b"t-two"!');
+    expect(collapsedJoined).toContain(", ");
+    expect(collapsedJoined).not.toContain("to expand");
 
-    const lines = renderLines(renderShellListResult as any, listed);
-    const joined = lines.join("\n");
-    expect(joined).toContain("ShellList · 1 job(s) at the time of the call");
-    expect(joined).toContain(`  ${job.id} `);
-    expect(joined).toContain("— running");
-    expect(joined).toContain("command: sleep 60");
-    expect(joined).toContain("watching: exit");
-    reapAll();
-    const afterReap = await call("ShellList", {});
-    // reapAll() empties the job map: the collapsed list resets and a later
-    // expanded view would show the empty snapshot.
-    expect(afterReap.details.jobs.length).toBe(0);
+    const expanded = renderRegistered(h.tools.ShellStop, stopped, { expanded: true });
+    const joined = expanded.join("\n");
+    expect(joined).toContain("ShellStop · all jobs");
+    expect(joined).toContain("Request: stop all running jobs");
+    expect(joined).toContain("Targets:");
+    expect(joined).toContain("!b\"t-one\"!");
+    expect(joined).toContain("!b\"t-two\"!");
+    expect(joined).toContain("Action: SIGTERM requested");
+    expect(joined).toContain("Escalation: existing SIGKILL fallback");
+    expect(joined).toContain("Result: stopping; process exit is not yet confirmed");
+    expect(joined.includes("terminated")).toBe(false);
+    expect(joined.includes("exited")).toBe(false);
   });
 
-  it("ShellStop results carry the resolved target and the expanded view explains the signal path", async () => {
-    const { call } = wire();
-    const started = await call("ShellStart", { command: "sleep 60", label: "stoppable" });
-    const stopped = await call("ShellStop", { id: started.details.id });
+  it("ShellStop: single-job results carry the resolved target and the truthful stopping result", async () => {
+    const h = wire();
+    const started = await h.call("ShellStart", { command: "sleep 60", label: "stoppable" });
+    const stopped = await h.call("ShellStop", { id: started.details.id });
     expect(stopped.details.tool).toBe("ShellStop");
     expect(stopped.details.outcome).toBe("stopping");
     expect(stopped.details.jobId).toBe(started.details.id);
     expect(stopped.details.label).toBe("stoppable");
 
-    const lines = renderLines(renderShellStopResult as any, stopped);
-    const joined = lines.join("\n");
-    expect(joined).toContain(`ShellStop · ${started.details.id} !b"stoppable"! · stopping`);
-    expect(joined).toContain("SIGTERM sent to the process group; SIGKILL escalation follows if it ignores that");
-    expect(joined).toContain('Stopping ' + started.details.id);
+    const collapsed = renderRegistered(h.tools.ShellStop, stopped, { expanded: false });
+    expect(collapsed.join("\n")).toContain(`ShellStop · ${started.details.id} !b"stoppable"! · stopping`);
+
+    const expanded = renderRegistered(h.tools.ShellStop, stopped, { expanded: true });
+    const joined = expanded.join("\n");
+    expect(joined).toContain(`ShellStop · ${started.details.id} !b"stoppable"!`);
+    expect(joined).toContain(`Request: stop ${started.details.id}`);
+    expect(joined).toContain(`Job: ${started.details.id} !b"stoppable"!`);
+    expect(joined).toContain("Action: SIGTERM requested");
+    expect(joined).toContain("Escalation: existing SIGKILL fallback");
+    expect(joined).toContain("Result: stopping; process exit is not yet confirmed");
+    reapAll();
   });
 
-  it("ShellSend results carry delivery provenance and the expanded view separates confirmed from unconfirmed", async () => {
-    const { call } = wire();
-    const started = await call("ShellStart", { command: "cat", label: "piper" });
-    const sent = await call("ShellSend", { id: started.details.id, text: "hello" });
+  it("ShellSend: pipe acceptance is shown as transport delivery, never as child processing", async () => {
+    const h = wire();
+    const started = await h.call("ShellStart", { command: "cat", label: "piper" });
+    const sent = await h.call("ShellSend", { id: started.details.id, text: "status" });
     expect(sent.details.tool).toBe("ShellSend");
     expect(sent.details.delivery).toBe("confirmed");
-    expect(sent.details.bytes).toBe(6);
-    const lines = renderLines(renderShellSendResult as any, sent);
-    const joined = lines.join("\n");
-    expect(joined).toContain("ShellSend · ");
-    expect(joined).toContain("confirmed");
-    expect(joined).toContain("6 byte(s) written to stdin");
+    expect(sent.details.bytes).toBe(7);
+
+    const collapsed = renderRegistered(h.tools.ShellSend, sent, { expanded: false }, { args: { id: started.details.id, text: "status" } });
+    const collapsedJoined = collapsed.join("\n");
+    expect(collapsedJoined).toContain(`ShellSend · ${started.details.id} · pipe accepted 7 bytes`);
+    expect(collapsedJoined).toContain('  Input: "status\\n"');
+    expect(collapsedJoined).not.toContain("to expand");
+
+    const expanded = renderRegistered(
+      h.tools.ShellSend,
+      sent,
+      { expanded: true },
+      { args: { id: started.details.id, text: "status" } },
+    );
+    const joined = expanded.join("\n");
+    expect(joined).toContain(`ShellSend · ${started.details.id}`);
+    expect(joined).toContain('Input sent: "status\\n"');
+    expect(joined).toContain("Bytes: 7");
+    expect(joined).toContain("Delivery: accepted by the stdin pipe");
+    expect(joined).toContain("Child processing: not established by this acknowledgment");
+    expect(
+      renderRegistered(h.tools.ShellSend, sent, { expanded: false }, { args: { id: started.details.id, text: "status" } }),
+    ).toEqual(collapsed);
+    reapAll();
+  });
+
+  it("ShellSend expansion shows secret-shaped and multiline sent input completely, unfiltered", async () => {
+    const h = wire();
+    const started = await h.call("ShellStart", { command: "cat", label: "vault" });
+    const secret = "TOKEN=sk-live-abc123 password=hunter2";
+    const sent = await h.call("ShellSend", { id: started.details.id, text: secret });
+    expect(sent.details.delivery).toBe("confirmed");
+    const expanded = renderRegistered(
+      h.tools.ShellSend,
+      sent,
+      { expanded: true },
+      { args: { id: started.details.id, text: secret } },
+    );
+    const joined = expanded.join("\n");
+    // The model-visible input reaches the human view verbatim: no additional
+    // masking, redaction, omission, or truncation layer.
+    expect(joined).toContain(`Input sent: ${JSON.stringify(`${secret}\n`)}`);
+    expect(joined).toContain("TOKEN=sk-live-abc123 password=hunter2");
+    expect(joined).not.toContain("…");
+    // The collapsed card bounds only its own preview; the input is visible.
+    const collapsed = renderRegistered(
+      h.tools.ShellSend,
+      sent,
+      { expanded: false },
+      { args: { id: started.details.id, text: secret } },
+    );
+    expect(collapsed.join("\n")).toContain("TOKEN=sk-live-abc123");
     reapAll();
   });
 });
@@ -351,30 +620,154 @@ describe("bounded lifecycle variants of the production renderers", () => {
     }
   });
 
-  it("an untagged result (restored session) falls back to a bounded content preview without fabricating details", () => {
+  it("an untagged result (restored session) discloses the limitation and renders the COMPLETE retained text expanded", () => {
+    // Twenty lines: the legacy 8-line fallback cut is gone — expansion must
+    // show everything the record retains.
+    const body = Array.from({ length: 20 }, (_, i) => `legacy line ${i}`);
     const legacy = {
-      content: [{ type: "text", text: "Started \"old\" as job1 (pid 1); currently running." }],
+      content: [{ type: "text", text: body.join("\n") }],
       isError: false,
     };
     const lines = renderLines(renderShellStartResult as any, legacy) as string[];
     expect(lines[0]).toContain("no structured details were recorded");
-    expect(lines.join("\n")).toContain('Started "old" as job1');
+    for (const line of body) expect(lines.join("\n")).toContain(line);
     // A details blob with the wrong tool tag is equally untrusted.
     const mismatched = { ...logContent(["one"]), details: { kind: "pi-review-bg-shell", tool: "ShellStop" } };
     expect(renderLines(renderShellLogResult as any, mismatched)[0]).toContain("no structured details");
   });
 
-  it("error results render the bounded error text with no invented details", () => {
-    const longError = `Error: ${"x".repeat(400)}`;
-    const result = { content: [{ type: "text", text: truncateText(longError, MAX_ERROR_DISPLAY_CHARS) }], isError: true };
-    const lines = renderLines(renderShellStartResult as any, {
-      ...result,
+  it("legacy ShellStart/ShellSend records surface the recorded context.args inputs as submitted", () => {
+    // A restored record without structured details still carries the original
+    // call arguments in the native render context: expansion must not hide
+    // them, and must not claim they were executed or accepted.
+    const secretCommand = `train --api-key sk-live-restored-9\n${"r".repeat(600)}\nvalidate --strict`;
+    const legacyStart = {
+      content: [{ type: "text", text: 'Started "old" as job1 (pid 1); currently running.' }],
+      isError: false,
+    };
+    const startExpanded = renderLines(
+      renderShellStartResult as any,
+      legacyStart,
+      200,
+      { args: { command: secretCommand } },
+    ) as string[];
+    const startJoined = startExpanded.join("\n");
+    expect(startJoined).toContain("no structured details were recorded");
+    expect(startJoined).toContain("Command submitted:");
+    expect(startJoined).toContain("train --api-key sk-live-restored-9");
+    expect(startJoined).toContain("validate --strict");
+    expect(startJoined.split("r").length - 1 >= 600).toBe(true);
+    expect(startJoined).toContain('Started "old" as job1');
+    // Without a render context there is nothing to surface: no fabrication.
+    const bare = renderLines(renderShellStartResult as any, legacyStart) as string[];
+    expect(bare.join("\n")).not.toContain("Command submitted:");
+
+    const secretInput = "TOKEN=sk-live-restored-1\n" + "s".repeat(600);
+    const legacySend = {
+      content: [{ type: "text", text: "Wrote 21 bytes to job1 stdin." }],
+      isError: false,
+    };
+    const sendExpanded = renderLines(
+      renderShellSendResult as any,
+      legacySend,
+      200,
+      { args: { id: "job1", text: secretInput } },
+    ) as string[];
+    const sendJoined = sendExpanded.join("\n");
+    expect(sendJoined).toContain("no structured details were recorded");
+    expect(sendJoined).toContain("Input submitted:");
+    expect(sendJoined).toContain("TOKEN=sk-live-restored-1");
+    expect(sendJoined.split("s").length - 1 >= 600).toBe(true);
+    expect(sendJoined).toContain("Wrote 21 bytes to job1 stdin.");
+    // The submitted label makes no acceptance claim; the retained result
+    // speaks for itself.
+    expect(sendJoined).not.toContain("accepted by the stdin pipe");
+  });
+
+  it("the collapsed legacy preview stays a bounded native-like preview with no toggle hint", () => {
+    const body = Array.from({ length: 25 }, (_, i) => `output line ${i}`);
+    const legacy = { content: [{ type: "text", text: body.join("\n") }], isError: false };
+    const collapsed = renderCollapsedLines(shellListCollapsedView as any, legacy) as string[];
+    expect(collapsed.length).toBe(11); // 10 wrapped preview rows + the omission marker
+    expect(collapsed[0]).toContain("output line 0");
+    expect(collapsed[9]).toContain("output line 9");
+    expect(collapsed[10]).toContain("... (15 more lines)");
+    expect(collapsed.join("\n")).not.toContain("to expand");
+    // Re-collapse is identical (no I/O, no state).
+    expect(renderCollapsedLines(shellListCollapsedView as any, legacy) as string[]).toEqual(collapsed);
+  });
+
+  it("expanded error results render the complete retained error text and the submitted input", () => {
+    // A producer-bounded multiline retained error: expansion shows every line
+    // of the record with no presentation cap, plus the complete recorded call
+    // input labeled as submitted.
+    const retainedError = [
+      "Error: could not start job: spawn /bin/bash EAGAIN",
+      ...Array.from({ length: 4 }, (_, i) => `  detail line ${i}: ${"d".repeat(60)}`),
+      "  at spawn (node:child_process)",
+    ].join("\n");
+    const secretCommand = `deploy --token sk-live-topsecret-1\n${"c".repeat(600)}\npost-install --verify`;
+    const result = {
+      content: [{ type: "text", text: retainedError }],
+      isError: true,
       details: shellResultDetails("ShellStart"),
-    }) as string[];
-    expect(lines[0]).toContain("ShellStart · error");
+    };
+    const lines = renderLines(
+      renderShellStartResult as any,
+      result,
+      200,
+      { args: { command: secretCommand } },
+    ) as string[];
     const joined = lines.join("\n");
-    expect(joined).toContain("Error: ");
-    expect(joined.includes("x".repeat(240))).toBe(false);
+    expect(lines[0]).toContain("ShellStart · error");
+    // The submitted input is visible in full — including the secret-shaped
+    // text and content beyond 512 characters — without an execution claim.
+    expect(joined).toContain("Command submitted:");
+    expect(joined).toContain("deploy --token sk-live-topsecret-1");
+    expect(joined).toContain("post-install --verify");
+    expect(joined).not.toContain("Command:");
+    expect(joined).not.toContain("State: running");
+    // The complete retained error text survives: every line, no cut.
+    for (const line of retainedError.split("\n")) expect(joined).toContain(line);
+    expect(joined).toContain("at spawn (node:child_process)");
+    // Re-collapse is deterministic (the collapsed card keeps its own
+    // bounded summary; only expansion changes).
+    const collapsed = renderCollapsedLines(shellStartCollapsedView as any, result, 200, { args: { command: secretCommand } }) as string[];
+    expect(renderCollapsedLines(shellStartCollapsedView as any, result, 200, { args: { command: secretCommand } }) as string[]).toEqual(collapsed);
+  });
+
+  it("ShellSend failures keep the full submitted stdin input visible without delivery claims", async () => {
+    const h = wire();
+    const id = textOf(await h.call("ShellStart", { command: "exit 0", label: "gone" })).match(/as (job\d+)/)![1];
+    expect(await until(async () => textOf(await h.call("ShellList", {})).includes("done"))).toBe(true);
+    const secret = "TOKEN=sk-live-abc123\npassword=hunter2\n" + "x".repeat(600);
+    const failed = await h.call("ShellSend", { id, text: secret });
+    expect(failed.isError).toBe(true);
+
+    // Through the registered entrypoint with the recorded call arguments.
+    const expanded = renderRegistered(
+      h.tools.ShellSend,
+      failed,
+      { expanded: true },
+      { args: { id, text: secret } },
+    );
+    const joined = expanded.join("\n");
+    // The real failure result is untagged: the legacy expanded view discloses
+    // the limitation, then shows the submitted input and the error.
+    expect(expanded[0]).toContain("no structured details were recorded");
+    expect(joined).toContain("Input submitted:");
+    // The secret-shaped, multiline, >512-char input is fully visible.
+    expect(joined).toContain("TOKEN=sk-live-abc123");
+    expect(joined).toContain("password=hunter2");
+    expect(joined.split("x").length - 1 >= 600).toBe(true);
+    // The complete retained error text survives, and no delivery is claimed.
+    expect(joined).toContain("has already exited");
+    expect(joined).not.toContain("accepted by the stdin pipe");
+    expect(joined).not.toContain("Child processing:");
+    // Re-collapse is identical.
+    const collapsed = renderRegistered(h.tools.ShellSend, failed, { expanded: false }, { args: { id, text: secret } });
+    expect(renderRegistered(h.tools.ShellSend, failed, { expanded: false }, { args: { id, text: secret } })).toEqual(collapsed);
+    reapAll();
   });
 
   it("ShellLog shows the empty-range note instead of inventing lines", () => {
@@ -388,6 +781,8 @@ describe("bounded lifecycle variants of the production renderers", () => {
         droppedLines: 0,
         from: 0,
         nextOffset: 0,
+        requestOffset: null,
+        requestLimit: 60,
       }),
     };
     const lines = renderLines(renderShellLogResult as any, empty) as string[];
@@ -410,11 +805,14 @@ describe("bounded lifecycle variants of the production renderers", () => {
         droppedLines: 2,
         from: 2,
         nextOffset: 7,
+        requestOffset: 2,
+        requestLimit: 5,
       }),
     };
     const lines = renderLines(renderShellLogResult as any, result, 200) as string[];
     const joined = lines.join("\n");
-    expect(joined).toContain("lines 2–7 of 7 line(s) · 2 oldest dropped from the job buffer");
+    expect(joined).toContain("Returned range: [2, 7)");
+    expect(joined).toContain("Oldest lines dropped: 2");
     expect(joined).toContain("red error line");
     expect(joined).toContain(emoji);
     // At a normal terminal width nothing is cut: the long retained line's
@@ -539,13 +937,15 @@ describe("bounded lifecycle variants of the production renderers", () => {
         droppedLines: 0,
         from: 0,
         nextOffset: 1000,
+        requestOffset: 0,
+        requestLimit: 1000,
       }),
     };
     const lines = renderLines(renderShellLogResult as any, result) as string[];
     expect(lines.join("\n")).toContain("600 more retained line(s)");
   });
 
-  it("ShellLog marks a body cut by the result cap", () => {
+  it("ShellLog marks a body cut by the result cap and discloses it in both states", () => {
     const text = truncateText(
       ['job1 "x" running', "```", "a".repeat(200), "b".repeat(200), "c".repeat(200), "```"].join("\n"),
       120,
@@ -561,10 +961,14 @@ describe("bounded lifecycle variants of the production renderers", () => {
         droppedLines: 0,
         from: 0,
         nextOffset: 3,
+        requestOffset: 0,
+        requestLimit: 3,
       }),
     };
-    const lines = renderLines(renderShellLogResult as any, result) as string[];
-    expect(lines.join("\n")).toContain("cut by the ShellLog result cap");
+    const expandedJoined = renderLines(renderShellLogResult as any, result) as string[];
+    expect(expandedJoined.join("\n")).toContain("cut by the ShellLog result cap");
+    const collapsedJoined = renderCollapsedLines(shellLogCollapsedView as any, result) as string[];
+    expect(collapsedJoined.join("\n")).toContain("cut by the ShellLog result cap");
   });
 
   it("ShellSend distinguishes unconfirmed delivery and keeps the bounded byte count", () => {
@@ -578,22 +982,40 @@ describe("bounded lifecycle variants of the production renderers", () => {
         delivery: "unconfirmed",
       }),
     };
+    const collapsed = renderCollapsedLines(shellSendCollapsedView as any, unconfirmed) as string[];
+    expect(collapsed.join("\n")).toContain("ShellSend · job1 · queued 512 bytes · delivery unconfirmed");
     const lines = renderLines(renderShellSendResult as any, unconfirmed) as string[];
     const joined = lines.join("\n");
-    expect(joined).toContain("ShellSend · job1 · unconfirmed");
-    expect(joined).toContain("512 byte(s) queued — delivery NOT confirmed within the flush window");
+    expect(joined).toContain("ShellSend · job1");
+    expect(joined).toContain("512");
+    expect(joined).toContain("Delivery: queued — delivery NOT confirmed within the flush window");
+    expect(joined).toContain("Child processing: not established by this acknowledgment");
+    // Without the recorded call arguments or a retained input, the field is
+    // disclosed as unavailable, never fabricated.
+    expect(joined).toContain("Input sent: unavailable in the recorded result");
   });
 
   it("ShellStop renders the all-jobs and already-exited variants from details only", () => {
     const all = {
       content: [{ type: "text", text: "Stopping 3 job(s)." }],
       isError: false,
-      details: shellResultDetails("ShellStop", { target: "all", count: 3, outcome: "stopping" }),
+      details: shellResultDetails("ShellStop", {
+        target: "all",
+        count: 3,
+        outcome: "stopping",
+        targets: [{ id: "job1", label: "a" }, { id: "job2", label: "b" }, { id: "job3", label: "c" }],
+      }),
     };
-    expect(renderLines(renderShellStopResult as any, all).join("\n")).toContain("ShellStop · all jobs · stopping 3 job(s)");
+    const allCollapsed = renderCollapsedLines(shellStopCollapsedView as any, all).join("\n");
+    expect(allCollapsed).toContain("ShellStop · all jobs · stopping 3");
+    expect(allCollapsed).toContain('!b"a"!, job2 !b"b"!, job3 !b"c"!');
+    const allExpanded = renderLines(renderShellStopResult as any, all).join("\n");
+    expect(allExpanded).toContain("Request: stop all running jobs");
+    expect(allExpanded).toContain("  job1 !b\"a\"!");
+    expect(allExpanded).toContain("Result: stopping; process exit is not yet confirmed");
 
     const exited = {
-      content: [{ type: "text", text: 'Job job1 had already exited (failed(2)).' }],
+      content: [{ type: "text", text: "Job job1 had already exited (failed(2))." }],
       isError: false,
       details: shellResultDetails("ShellStop", {
         target: "job1",
@@ -604,8 +1026,20 @@ describe("bounded lifecycle variants of the production renderers", () => {
       }),
     };
     const joined = renderLines(renderShellStopResult as any, exited).join("\n");
-    expect(joined).toContain("already exited (failed(2))");
-    expect(joined).not.toContain("SIGTERM sent");
+    expect(joined).toContain("Result: job had already exited (failed(2)); no signal was sent by this call");
+    expect(joined).not.toContain("SIGTERM");
+    const exitedCollapsed = renderCollapsedLines(shellStopCollapsedView as any, exited).join("\n");
+    expect(exitedCollapsed).toContain("already exited (failed(2))");
+  });
+
+  it("ShellStop discloses unavailable stop-all targets instead of re-deriving them", () => {
+    const all = {
+      content: [{ type: "text", text: "Stopping 3 job(s)." }],
+      isError: false,
+      details: shellResultDetails("ShellStop", { target: "all", count: 3, outcome: "stopping" }),
+    };
+    expect(renderCollapsedLines(shellStopCollapsedView as any, all).join("\n")).toContain("targets: unavailable in the recorded result");
+    expect(renderLines(renderShellStopResult as any, all).join("\n")).toContain("Targets: unavailable in the recorded result");
   });
 
   it("ShellList bounds job rows defensively against oversized details", () => {
@@ -627,9 +1061,11 @@ describe("bounded lifecycle variants of the production renderers", () => {
     };
     const lines = renderLines(renderShellListResult as any, result) as string[];
     expect(lines.join("\n")).toContain("… 4 more job(s)");
+    const collapsed = renderCollapsedLines(shellListCollapsedView as any, result) as string[];
+    expect(collapsed.join("\n")).toContain("… 4 more job(s)");
   });
 
-  it("ShellStart bounds multiline commands with a visible note", () => {
+  it("ShellStart keeps the 4-line collapsed command preview with a truthful omission count; expansion shows all lines", () => {
     const command = Array.from({ length: 8 }, (_, i) => `cmd ${i}`).join("\n");
     const result = {
       content: [{ type: "text", text: 'Started "m" as job1 (pid 1); currently running.' }],
@@ -637,23 +1073,33 @@ describe("bounded lifecycle variants of the production renderers", () => {
       details: shellResultDetails("ShellStart", {
         id: "job1",
         label: "m",
-        command: truncateText(command, MAX_COMMAND_DISPLAY_CHARS),
+        command,
         pid: 1,
         watching: "exit",
         startedAt: Date.UTC(2026, 0, 1),
+        state: "running",
       }),
     };
-    const lines = renderLines(renderShellStartResult as any, result) as string[];
-    const joined = lines.join("\n");
-    expect(joined).toContain("command: cmd 0");
-    expect(joined).toContain("4 more command line(s)");
-    expect(joined).toContain("started 2026-01-01T00:00:00.000Z");
+    const collapsed = renderCollapsedLines(shellStartCollapsedView as any, result) as string[];
+    const collapsedJoined = collapsed.join("\n");
+    expect(collapsedJoined).toContain("ShellStart · job1 !b\"m\"! · running");
+    expect(collapsedJoined).toContain("  command:");
+    expect(collapsedJoined).toContain("    cmd 0");
+    expect(collapsedJoined).toContain("  … 4 more command line(s)");
+    expect(collapsedJoined).not.toContain("cmd 7");
+    expect(collapsedJoined).toContain("  pid 1 · started 2026-01-01T00:00:00.000Z");
+
+    const expanded = renderLines(renderShellStartResult as any, result) as string[];
+    const expandedJoined = expanded.join("\n");
+    for (let i = 0; i < 8; i++) expect(expandedJoined).toContain(`cmd ${i}`);
+    expect(expandedJoined).toContain("State: running when this call returned");
   });
 
-  it("shellExpandedRenderer selects the production callback by tool name", () => {
+  it("shellExpandedRenderer and shellCollapsedRenderer select the production callbacks by tool name", () => {
     const renderers = SHELL_EXPANDED_RESULT_RENDERERS as Record<string, (r: unknown, o: unknown, t: ShellResultViewTheme) => unknown>;
     for (const [name, renderer] of Object.entries(renderers)) {
       expect(shellExpandedRenderer(name as any)).toBe(renderer);
+      expect(shellCollapsedRenderer(name as any)).toBe(SHELL_COLLAPSED_RESULT_VIEWS[name as keyof typeof SHELL_COLLAPSED_RESULT_VIEWS]);
     }
   });
 
@@ -663,98 +1109,5 @@ describe("bounded lifecycle variants of the production renderers", () => {
       tool: "ShellLog",
       id: "job1",
     });
-  });
-});
-
-describe("shellCollapsedResultRenderer preserves Pi's native fallback", () => {
-  const themed: ShellResultViewTheme = {
-    bold: (text) => text,
-    fg: (color, text) => `[${color}]${text}`,
-  };
-  const renderCollapsed = (result: unknown, options: unknown, width = 200): string[] =>
-    (shellCollapsedResultRenderer(result, options, themed) as { render(w: number): string[] }).render(width);
-
-  const manyLines = Array.from({ length: 25 }, (_, i) => `output line ${i}`);
-  const result = { content: [{ type: "text", text: manyLines.join("\n") }], isError: false };
-
-  it("collapsed shows the first ten lines plus the expand hint, colored like the native fallback", () => {
-    const lines = renderCollapsed(result, { expanded: false });
-    expect(lines.length).toBe(11);
-    expect(lines[0]).toBe("[toolOutput]output line 0");
-    expect(lines[9]).toBe("[toolOutput]output line 9");
-    expect(lines[10]).toContain("[muted]... (15 more lines, ");
-    expect(lines[10]).toContain("to expand");
-  });
-
-  it("expanded shows the full text, matching the native fallback the wrapper degrades to", () => {
-    const lines = renderCollapsed(result, { expanded: true });
-    expect(lines.length).toBe(25);
-    expect(lines[24]).toBe("[toolOutput]output line 24");
-    expect(lines.join("\n")).not.toContain("more lines,");
-  });
-
-  it("empty content renders nothing, as the native fallback does", () => {
-    expect(renderCollapsed({ content: [{ type: "text", text: "" }] }, {})).toEqual([]);
-    expect(renderCollapsed(undefined, {})).toEqual([]);
-  });
-
-  it("collapsed is a bounded preview of wrapped rows; expansion recovers every character", () => {
-    const wide = { content: [{ type: "text", text: "z".repeat(500) }] };
-    // One 500-char line wraps to 14 display rows at this width — the
-    // collapsed view must stay a bounded preview, not render all of them.
-    const collapsed = renderCollapsed(wide, { expanded: false }, 40);
-    for (const line of collapsed) {
-      expect(visibleCells(line)).toBeLessThanOrEqual(40);
-    }
-    expect(collapsed.length).toBeLessThanOrEqual(12);
-    expect(collapsed[collapsed.length - 1]).toContain("more lines");
-    // Expansion recovers the whole line, wrapped and width-safe.
-    const expanded = renderCollapsed(wide, { expanded: true }, 40);
-    for (const line of expanded) {
-      expect(visibleCells(line)).toBeLessThanOrEqual(40);
-    }
-    expect(expanded.join("").split("z").length - 1).toBe(500);
-    // CJK glyphs count two terminal cells.
-    const cjk = { content: [{ type: "text", text: "漢".repeat(100) }] };
-    for (const line of renderCollapsed(cjk, { expanded: false }, 30)) {
-      expect(visibleCells(line)).toBeLessThanOrEqual(30);
-    }
-    expect(renderCollapsed(cjk, { expanded: false }, 30).join("").split("漢").length - 1).toBe(100);
-  });
-
-  it("collapsed budgets wrapped physical rows for max-length log lines; re-collapse is identical", () => {
-    // Three max-length (2048-char) log lines: ten LOGICAL lines would wrap to
-    // far more than ten display rows, so the budget must count wrapped rows.
-    const body = ["q".repeat(2048), "z".repeat(2048), "r".repeat(2048)];
-    const result = {
-      content: [{ type: "text", text: ['job1 "x" done', "```", ...body, "```"].join("\n") }],
-      isError: false,
-    };
-    const width = 80; // the component renders at width - 2 inside
-    const inner = width - 2;
-    // Independent row arithmetic for this ASCII fixture: each logical line is
-    // themed with a 12-char prefix before wrapping, then fills rows of `inner`.
-    const rowsOf = (s: string) => Math.ceil((`[toolOutput]${s}`.length) / inner);
-    const totalRows =
-      rowsOf('job1 "x" done') + rowsOf("```") + body.reduce((sum, l) => sum + rowsOf(l), 0) + rowsOf("```");
-    expect(totalRows).toBe(84); // 1 + 1 + 27 + 27 + 27 + 1
-
-    const collapsed = renderCollapsed(result, { expanded: false }, width);
-    for (const line of collapsed) {
-      expect(visibleCells(line)).toBeLessThanOrEqual(width);
-    }
-    // Bounded: ten preview rows plus the (wrapped) disclosure, nothing else.
-    const omitted = totalRows - 10;
-    const hint = `[muted]... (${omitted} more lines, to expand)`;
-    expect(collapsed.length).toBe(10 + Math.ceil(hint.length / inner));
-    // Truthful omission disclosure: the count is the wrapped remainder.
-    expect(collapsed[10]).toBe(hint);
-    // Expansion preserves the full retained text.
-    const expandedJoined = renderCollapsed(result, { expanded: true }, width).join("");
-    for (const ch of ["q", "z", "r"] as const) {
-      expect(expandedJoined.split(ch).length - 1).toBe(2048);
-    }
-    // Re-collapse is deterministic and identically bounded (no I/O, no state).
-    expect(renderCollapsed(result, { expanded: false }, width)).toEqual(collapsed);
   });
 });

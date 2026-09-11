@@ -66,7 +66,8 @@ import {
   watchCheckpointDelivery,
   WAKE_FAILURE_NOTIFICATION_CAP,
 } from "./subtask-notifications";
-import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl } from "./types";
+import { notifyDispatchCards } from "./dispatch-cards";
+import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
 import { executeWave, type WaveProgressUpdate } from "./wave-controller";
 import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult } from "./wave-worker";
 import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
@@ -229,6 +230,13 @@ export interface BackgroundInspection {
   scheduling: BackgroundSchedulingSnapshot;
   /** Issue #33: bounded evidence navigation result (only for evidence-mode inspect). */
   evidence?: SubtaskEvidenceRead;
+  /**
+   * #93: the exact task ids created by the add() call that produced this
+   * inspection — `tasks` is the whole execution inventory, so original Add
+   * cards select their own tasks by these ids (never by title or instruction
+   * matching). Absent on start/inspect results.
+   */
+  addedTaskIds?: string[];
   conflictGate?: BackgroundConflictGate;
   tasks: Array<BackgroundTaskRecord & {
     timing: BackgroundTaskTimingSummary;
@@ -236,6 +244,30 @@ export interface BackgroundInspection {
     artifactDir?: string;
     liveControl?: { adapter: string; generation: number; protocol?: string; steer: boolean; interrupt: boolean };
   }>;
+}
+
+/**
+ * In-memory dispatch provenance projection for original SubtasksStart/SubtasksAdd
+ * tool cards (#93). Read directly from the authoritative task records at render
+ * time: no inspection call, no filesystem I/O, no duplicate truth state.
+ * Absent `dispatch`/`initialDispatch` means not yet sent — nothing fabricated.
+ */
+export interface SubtaskCardDispatchViewTask {
+  taskId: string;
+  /** Authoritative current state of the live task record. */
+  state: BackgroundTaskState;
+  /** Queued-only dispatch detail, mirroring inspection's dispatchState. */
+  dispatchState?: "waiting_for_capacity" | "assigned_starting";
+  initialDispatch?: SubtaskDispatchRecord;
+  dispatch?: SubtaskDispatchRecord;
+}
+
+export interface SubtaskCardDispatchView {
+  executionId: string;
+  kind: BackgroundTaskKind;
+  /** Target checkout the group captures from and lands into. */
+  targetWorkspace: string;
+  tasks: SubtaskCardDispatchViewTask[];
 }
 
 export interface BackgroundWatchSubscription {
@@ -700,12 +732,15 @@ export class BackgroundExecutionController {
     // session identity is checked here.
     if (resolve(this.sessionCwdOf(group)) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
     this.assertUnsettledAdmissionCapacity(group, tasks.length);
-    group.tasks.push(...tasks.map((definition) => newTask(definition)));
-    group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - tasks.length) + tasks.length;
+    const created = tasks.map((definition) => newTask(definition));
+    group.tasks.push(...created);
+    group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - created.length) + created.length;
     group.updatedAt = new Date().toISOString();
     await this.save(group);
     void this.pump();
-    return this.inspect(group.executionId);
+    // The inspection carries the whole execution inventory; the exact newly
+    // assigned ids let the original Add card identify its own tasks.
+    return { ...this.inspect(group.executionId), addedTaskIds: created.map((task) => task.taskId) };
   }
 
   inspect(executionId?: string, taskId?: string, offset?: number, lines?: number): BackgroundInspection {
@@ -879,6 +914,66 @@ export class BackgroundExecutionController {
 
   list(): BackgroundInspection[] {
     return [...this.groups.values()].map((group) => this.inspect(group.executionId));
+  }
+
+  /**
+   * #93: in-memory dispatch provenance projection for original SubtasksStart/
+   * SubtasksAdd tool cards. Read directly from the authoritative live task
+   * records: no inspection call, no filesystem I/O, no expansion fetch, and
+   * no duplicated logical state. Unknown execution ids return undefined (the
+   * card keeps its truthful static snapshot).
+   */
+  liveDispatchView(executionId: string): SubtaskCardDispatchView | undefined {
+    const group = this.groups.get(executionId);
+    if (!group) return undefined;
+    return {
+      executionId: group.executionId,
+      kind: group.kind,
+      targetWorkspace: group.cwd,
+      tasks: group.tasks.map((task) => ({
+        taskId: task.taskId,
+        state: task.state,
+        dispatchState: task.state === "queued"
+          ? this.runtimes.has(task.taskId) ? "assigned_starting" : "waiting_for_capacity"
+          : undefined,
+        initialDispatch: task.initialDispatch,
+        dispatch: task.dispatch,
+      })),
+    };
+  }
+
+  /**
+   * #93: record an actual delivery-boundary dispatch capture on the durable
+   * task record and fan the event out to rendered original cards. The first
+   * capture stays in `initialDispatch`; `dispatch` always holds the latest
+   * actual delivery. Records are published only when the adapter's transport
+   * accepted the prompt write; failures before delivery publish nothing. Turn
+   * ACK/compliance remain separate facts recorded elsewhere.
+   */
+  private recordDispatch(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    record: SubtaskDispatchRecord,
+  ): void {
+    task.initialDispatch ??= { ...record };
+    task.dispatch = { ...record };
+    task.updatedAt = new Date().toISOString();
+    // The settling check lets the fan-out sweep retire subscriptions for
+    // executions that can no longer dispatch, while any execution with a live
+    // (e.g. still-queued or paused-recoverable) card is never evicted.
+    notifyDispatchCards(group.executionId, task.taskId, (executionId) => this.allTasksArchivable(executionId));
+  }
+
+  /** #93 card-sweep input: `true` only when this controller knows the
+   * execution and every one of its tasks is ARCHIVABLE (permanently
+   * terminal). Inactive but recoverable states — paused_recoverable, failed,
+   * stopped — can be continued and dispatch again, so their original cards
+   * keep their subscriptions. Unknown executions report `undefined`
+   * (keep watching). */
+  private allTasksArchivable(executionId: string): boolean | undefined {
+    const group = this.groups.get(executionId);
+    if (!group || group.tasks.length === 0) return undefined;
+    return group.tasks.every((task) => isArchivableTaskState(task.state));
   }
 
   watch(executionId: string | undefined, afterMs: number): BackgroundWatchSubscription {
@@ -2129,12 +2224,23 @@ export class BackgroundExecutionController {
     task: BackgroundTaskRecord,
     update: import("./types").SubtaskProgressUpdate,
   ): void {
-    const next = update.phase === "starting" || update.phase === "executing" || update.phase === "correcting"
-      ? "running"
-      : undefined;
+    // #93: dispatch captures are provenance facts; adjacent phases carry state.
+    const isDispatchCapture = Boolean(
+      update.dispatch
+      && (update.subtaskId === undefined || update.subtaskId === task.taskId),
+    );
+    const next = isDispatchCapture
+      ? undefined
+      : update.phase === "starting" || update.phase === "executing" || update.phase === "correcting"
+        ? "running"
+        : undefined;
     const previous = next ? transitionTaskState(task, next) : task.state;
     this.addActivity(task, `research:${update.phase}`, update.message);
     this.applyExecutorIdentity(task, update);
+    // #93: dispatch captures flow through research workers identically.
+    if (isDispatchCapture && update.dispatch) {
+      this.recordDispatch(group, task, update.dispatch);
+    }
     const saved = this.save(group);
     void saved.catch((error) => this.input.notify?.(`review gate: failed to persist research progress: ${messageOf(error)}`));
     const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
@@ -2599,12 +2705,26 @@ export class BackgroundExecutionController {
   }
 
   private progress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: WaveProgressUpdate): void {
-    const next = stateFromWaveProgress(update);
+    // #93: a dispatch capture is a provenance fact, not a lifecycle
+    // transition. Adjacent progress events (starting/executing) already carry
+    // the task state; letting the transport-boundary capture — which is the
+    // LAST event of the dispatch sequence — drive a transition would regress
+    // states set concurrently (for example an injected launch failure).
+    const isDispatchCapture = Boolean(
+      update.subtask?.dispatch
+      && (update.subtask.subtaskId === undefined || update.subtask.subtaskId === task.taskId),
+    );
+    const next = isDispatchCapture ? undefined : stateFromWaveProgress(update);
     const previous = next ? transitionTaskState(task, next) : task.state;
     if (!next) task.updatedAt = new Date().toISOString();
     this.updateReviewStatus(task, update, next);
     for (const message of update.activity ?? [update.message]) this.addActivity(task, update.phase, message);
     if (update.subtask) this.applyExecutorIdentity(task, update.subtask);
+    // #93: actual transport-boundary dispatch capture drives the original
+    // card update through the dispatch event path (no inspection needed).
+    if (isDispatchCapture && update.subtask?.dispatch) {
+      this.recordDispatch(group, task, update.subtask.dispatch);
+    }
     const saved = this.save(group);
     void saved.catch((error) => this.input.notify?.(`review gate: failed to persist task progress: ${messageOf(error)}`));
     const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
@@ -2649,10 +2769,19 @@ export class BackgroundExecutionController {
   }
 
   private continuationProgress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: ContinuationProgressUpdate): void {
-    const next = stateFromContinuationProgress(update);
-    const previous = transitionTaskState(task, next);
+    // #93: dispatch captures are provenance facts; adjacent phases carry state.
+    const isDispatchCapture = Boolean(
+      update.dispatch
+      && (update.subtaskId === undefined || update.subtaskId === task.taskId),
+    );
+    const next = isDispatchCapture ? undefined : stateFromContinuationProgress(update);
+    const previous = next ? transitionTaskState(task, next) : task.state;
     this.addActivity(task, update.phase, update.message);
     this.applyExecutorIdentity(task, update);
+    // #93: dispatch captures flow through continuations identically.
+    if (isDispatchCapture && update.dispatch) {
+      this.recordDispatch(group, task, update.dispatch);
+    }
     task.updatedAt = new Date().toISOString();
     const saved = this.save(group);
     void saved.catch(() => undefined);

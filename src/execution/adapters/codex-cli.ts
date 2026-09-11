@@ -179,6 +179,9 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
         return started;
       };
       activeTurnId = await startTurn(request.prompt);
+      // #93: the app-server accepted the turn carrying the prompt text — the
+      // actual delivery boundary for this prompt.
+      request.onPromptDelivery?.({ prompt: request.prompt });
       const activeThreadId = threadId;
 
       request.onLiveControl?.({

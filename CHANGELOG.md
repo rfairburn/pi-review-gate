@@ -15,6 +15,32 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.33]
+
+### Added
+
+- Every registered extension tool result now expands natively and faithfully (#93). All
+  37 tools — including the previously rendererless `WebSearch` and `search_tools` —
+  share one native expansion mechanism with actionable collapsed cards and expanded
+  views showing the complete original model-visible inputs and results: no additional
+  masking, omission, summarization, or truncation in the human view. Expansion hints
+  (`(ctrl+o to expand)` / `(ctrl+o to collapse)`) follow the configured binding
+  (ctrl+o by default), render width-safely on every card, and interaction stays fully
+  native: the global keyboard binding and per-card clicking in fullscreen mode.
+  Expansion reuses the recorded tool-call arguments instead of truncated copies, so
+  expanded cards show the complete `ShellStart` command, the actual `ShellSend` input,
+  the submitted `BrowserFill`/`BrowserType`/`BrowserSelect` values, the complete
+  `ApplyPatch` envelope and final diff, and every returned search, log, snapshot, and
+  evidence record — the collapsed `ShellLog` preview shows the tail of its returned
+  range with an omission count, and expansion shows the complete returned range.
+  `SubtasksStart` and `SubtasksAdd` cards update automatically when a task dispatches,
+  showing the prompt captured at the transport boundary plus the worker worktree and
+  captured base commit; queued cards truthfully say not yet sent. Control bytes in
+  recorded text render as visible escape notation instead of being executed or
+  deleted, and image payloads stay native images. Expansion remains presentation-only
+  — no fetching, polling, re-execution, or key handlers — and protections applied
+  before data reaches the model are unchanged (Refs #93).
+
 ## [0.1.0-dev.32]
 
 ### Fixed

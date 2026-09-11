@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, readdir, readFile, rm, symlink, writeFile, mkdtemp
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
-import { APPLY_PATCH_TOOL_NAME, applyPatchToolSchema, parseApplyPatchOperation, registerApplyPatchTool, renderApplyPatchCall, renderApplyPatchResult } from "../src/apply-patch/tool";
+import { APPLY_PATCH_TOOL_NAME, applyPatchToolSchema, parseApplyPatchOperation, registerApplyPatchTool, renderApplyPatchCall, renderApplyPatchResult, renderExpandedApplyPatchResult } from "../src/apply-patch/tool";
 import { collectEvidenceChanges, createEvidenceState, extractCandidatePaths, recordToolCallEvidence, recordToolResultEvidence, shouldRecordToolCallEvidence, shouldRecordToolResultEvidence } from "../src/evidence";
 import { activate } from "../src/index";
 import { ExecutionToolManager } from "../src/execution/tool";
@@ -733,20 +733,34 @@ test("ApplyPatch renders compact call and result summaries with supported theme 
   assert.match(callLine, /src\/app\.ts/);
   assert.match(callLine, /src\/main\.ts/);
 
+  // Canonical collapsed card: bounded header plus per-file inventory, with
+  // no raw summary block and no legacy bounded diff previews. Expansion (the
+  // dedicated renderer tests cover the native-context arm) carries the full
+  // retained diffs with diff coloring; this direct call has no native args,
+  // so the retained requestedDiff fallback is exercised in the expanded arm.
   const rendered = renderApplyPatchResult({
     content: [{ type: "text", text: "ApplyPatch updated src/app.ts (+1 −1 lines)." }],
     details: { requestedDiff: "-one\n+uno\n two\n" },
     isError: false,
   }, {}, theme) as { render(width: number): string[] };
   const lines = rendered.render(160);
-  assert.match(lines[0], /updated src\/app\.ts/);
-  assert.match(lines.join("\n"), /Requested diff:/);
-  assert.match(lines.join("\n"), /toolDiffRemoved\)\[-one\]/);
-  assert.match(lines.join("\n"), /toolDiffAdded\)\[\+uno\]/);
-  assert.match(lines.join("\n"), /toolDiffContext\)\[ two\]/);
+  assert.match(lines[0], /ApplyPatch · succeeded/);
+  assert.match(lines.join("\n"), /updated src\/app\.ts/);
+  assert.doesNotMatch(lines.join("\n"), /Final diff:|Requested diff:/);
 
-  // Moves render the bounded final diff with rename from/to headers.
-  const moveRendered = renderApplyPatchResult({
+  const expandedRendered = renderExpandedApplyPatchResult({
+    content: [{ type: "text", text: "ApplyPatch updated src/app.ts (+1 −1 lines)." }],
+    details: { requestedDiff: "-one\n+uno\n two\n" },
+    isError: false,
+  }, {}, theme) as { render(width: number): string[] };
+  const expandedText = expandedRendered.render(200).join("\n");
+  assert.match(expandedText, /Requested patch retained with the result/);
+  assert.match(expandedText, /\[-one\]/);
+  assert.match(expandedText, /\[\+uno\]/);
+  assert.match(expandedText, /\[ two\]/);
+
+  // Moves expand the complete final diff with rename from/to headers.
+  const moveValue = {
     content: [{ type: "text", text: "ApplyPatch updated src/app.ts and moved it to src/main.ts (+1 −1 lines)." }],
     details: {
       requestedDiff: "-one\n+uno\n",
@@ -762,38 +776,41 @@ test("ApplyPatch renders compact call and result summaries with supported theme 
       ].join("\n"),
     },
     isError: false,
-  }, {}, theme) as { render(width: number): string[] };
-  const moveLines = moveRendered.render(200).join("\n");
+  };
+  const moveLines = renderExpandedApplyPatchResult(moveValue, {}, theme).render(200).join("\n");
   assert.match(moveLines, /Final diff:/);
   assert.match(moveLines, /rename from src\/app\.ts/);
   assert.match(moveLines, /rename to src\/main\.ts/);
-  assert.match(moveLines, /Requested diff:/);
 
-  // Deletions render the final deletion diff without a requested-diff block.
-  const deleteRendered = renderApplyPatchResult({
+  // Deletions expand the final deletion diff; there is no requested patch to
+  // fall back to, and the renderer says so instead of inventing one.
+  const deleteValue = {
     content: [{ type: "text", text: "ApplyPatch deleted gone.txt." }],
     details: { finalDiff: "diff --git a/gone.txt b/gone.txt\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye" },
     isError: false,
-  }, {}, theme) as { render(width: number): string[] };
-  const deleteLines = deleteRendered.render(200).join("\n");
+  };
+  const deleteLines = renderExpandedApplyPatchResult(deleteValue, {}, theme).render(200).join("\n");
   assert.match(deleteLines, /Final diff:/);
   assert.match(deleteLines, /toolDiffRemoved\)\[-bye\]/);
-  assert.doesNotMatch(deleteLines, /Requested diff:/);
+  assert.match(deleteLines, /Requested patch was not available in the native render context\./);
 
-  // Long diffs are bounded with a truncation note.
+  // Expanded diffs are never line-capped: every line survives expansion.
   const longDiff = ["@@ -1 +1 @@", ...Array.from({ length: 30 }, (_, index) => `+line ${index}`)].join("\n");
-  const truncatedRendered = renderApplyPatchResult({
+  const longValue = {
     content: [{ type: "text", text: "ApplyPatch updated big.txt (+30 −0 lines)." }],
     details: { requestedDiff: longDiff, finalDiff: longDiff },
     isError: false,
-  }, {}, theme) as { render(width: number): string[] };
-  assert.match(truncatedRendered.render(200).join("\n"), /more diff line\(s\)/);
+  };
+  const longExpanded = renderExpandedApplyPatchResult(longValue, {}, theme).render(200).join("\n");
+  for (let index = 0; index < 30; index += 1) {
+    assert.ok(longExpanded.includes(`+line ${index}`));
+  }
+  assert.doesNotMatch(longExpanded, /more diff line\(s\)/);
 
-  const errorRendered = renderApplyPatchResult({
-    content: [{ type: "text", text: "ApplyPatch failed: boom" }],
-    isError: true,
-  }, {}, theme) as { render(width: number): string[] };
-  assert.match(errorRendered.render(120)[0], /error\)\[ApplyPatch failed: boom\]/);
+  const errorValue = { content: [{ type: "text", text: "ApplyPatch failed: boom" }], isError: true };
+  const errorRendered = renderApplyPatchResult(errorValue, {}, theme) as { render(width: number): string[] };
+  assert.match(errorRendered.render(120)[0], /ApplyPatch · failed/);
+  assert.match(errorRendered.render(120).join("\n"), /error\)\[ApplyPatch failed: boom\]/);
 });
 
 test("ApplyPatch call evidence pre-captures operation.path and operation.moveTo mutation candidates", async () => {

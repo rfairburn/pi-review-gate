@@ -379,15 +379,17 @@ test("error results keep native error rendering and skip the evidence summary", 
     isError: true,
   };
   const rendered = renderResult(tool, failed, {}, identityTheme);
-  assert.match(rendered, /SubtasksInspect failed: No evidence entry/);
-  // The failure line is styled with the error color, not success.
+  // #93 canonical error card: the operation header with the returned diagnostic.
+  assert.match(rendered, /^SubtasksInspect · failed/);
+  assert.match(rendered, /diagnostic: entry_not_found/);
+  // The diagnostic line is styled with the error color, not success.
   const colored = renderResult(tool, failed, {}, colorTheme);
-  assert.ok(colored.split("\n")[0]!.startsWith("[error]"), `expected error styling, got: ${colored.split("\n")[0]}`);
+  assert.ok(colored.split("\n")[1]!.startsWith("[error]"), `expected error styling, got: ${colored.split("\n")[1]}`);
   // No evidence-mode outcome lines are invented for a failed read.
   assert.doesNotMatch(rendered, /entries \d|matches for|newer entr|result returned/);
 
   const ok = renderResult(tool, inspectResult(evidenceRead("range", { entries: [entry(0)], cursor: "ev1.x" })), {}, colorTheme);
-  assert.ok(ok.split("\n")[0]!.startsWith("[success]"), `expected success styling, got: ${ok.split("\n")[0]}`);
+  assert.ok(ok.split("\n")[1]!.startsWith("[success]"), `expected success styling, got: ${ok.split("\n")[1]}`);
 });
 
 test("expanded evidence results render the #59 detail view; re-collapsing restores the collapsed card", () => {
@@ -406,7 +408,7 @@ test("expanded evidence results render the #59 detail view; re-collapsing restor
   // contributed expanded detail view, and re-collapsing restores the identical
   // collapsed card.
   const expanded = renderResult(inspectTool(harness()), value, { expanded: true }, identityTheme);
-  assert.match(expanded, /SubtasksInspect — expanded result/);
+  assert.match(expanded, /SubtasksInspect · task-t · range/);
   assert.match(expanded, /Observed evidence \(executor_observed/);
   assert.match(expanded, /PREVIEW-TEXT-MARKER/);
   const recollapsed = renderResult(inspectTool(harness()), value, { expanded: false }, identityTheme);
@@ -415,15 +417,18 @@ test("expanded evidence results render the #59 detail view; re-collapsing restor
 
 test("partial results keep the native pending rendering", () => {
   const rendered = renderResult(inspectTool(harness()), inspectResult(evidenceRead("range", { entries: [entry(0)] })), { isPartial: true }, identityTheme);
-  assert.match(rendered, /^inspecting…$/);
+  // #93 canonical pending card: the operation label with a warning ellipsis.
+  assert.match(rendered, /^SubtasksInspect …$/);
   assert.doesNotMatch(rendered, /entries 0/);
 });
 
-test("plain status inspection results keep their existing summary-first card", () => {
+test("plain status inspection results render the canonical bounded card", () => {
   const rendered = renderResult(inspectTool(harness()), inspectResult(undefined), {}, identityTheme);
-  assert.match(rendered, /^SubtasksInspect: execute group exec-1, 1 active task\(s\)\./);
-  // clip() collapses whitespace, so the task line renders with single spaces.
-  assert.match(rendered, /task-t running Investigated work/);
+  // #93: the summary-first card was replaced by the canonical header plus the
+  // inspected task line (taskId · state · title).
+  assert.match(rendered, /^SubtasksInspect · task \? · status/);
+  assert.match(rendered, /task-t · running · Investigated work/);
+  assert.doesNotMatch(rendered, /active task\(s\)/);
 });
 
 test("collapsed evidence cards stay within the terminal width for every mode", () => {

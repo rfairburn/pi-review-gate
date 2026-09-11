@@ -37,6 +37,8 @@ export class RunAsBinaryExecutorAdapter implements ExecutorAdapter {
         PI_REVIEW_EXECUTOR_TURN: String(request.turn),
       },
       signal: request.signal,
+      // #93: delivery is reported at the actual stdin boundary, not before.
+      onPromptDelivery: request.onPromptDelivery,
       onProcessStart: request.onProcessStart,
       onProcessExit: request.onProcessExit,
       onStdoutChunk: (chunk) => {

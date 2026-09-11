@@ -65,12 +65,15 @@ function displayWidthOf(value: string): number {
   return width;
 }
 
-/** Renders through the real expanded callback and returns plain text lines. */
-function expandedLines(value: unknown, options: unknown = {}, width = 400): string[] {
+/** Renders through the real expanded callback and returns plain text lines.
+ * `context` is the optional native renderResult context (context.args = the
+ * actual recorded request fields, exactly as the host passes them). */
+function expandedLines(value: unknown, options: unknown = {}, width = 400, context?: unknown): string[] {
   const component = renderSubtaskResultExpanded(
     value,
     options as { expanded?: boolean; isPartial?: boolean },
     THEME,
+    context as { args?: unknown } | undefined,
   ) as { render(w: number): string[] };
   assert.ok(component && typeof component.render === "function", "expanded renderer must return a text component");
   const lines = component.render(width) as string[];
@@ -81,8 +84,8 @@ function expandedLines(value: unknown, options: unknown = {}, width = 400): stri
   return lines;
 }
 
-function joined(value: unknown, options: unknown = {}, width = 400): string {
-  return expandedLines(value, options, width).join("\n");
+function joined(value: unknown, options: unknown = {}, width = 400, context?: unknown): string {
+  return expandedLines(value, options, width, context).join("\n");
 }
 
 /** Mirrors the production result envelope exactly as the tools produce it. */
@@ -248,7 +251,12 @@ before(async () => {
     nextInstructionSequence: 2, createdAt: "2025-06-01T10:00:00.000Z", updatedAt: now,
   }));
 
-  const task = newTask({ title: "expanded evidence", instructions: "run the expanded fixture", acceptanceCriteria: ["fixture passes"] });
+  const task = newTask({
+    title: "expanded evidence",
+    instructions: "run the expanded fixture\nthen verify every line survived",
+    acceptanceCriteria: ["fixture passes", "every instruction line stays visible"],
+    relevantContext: "Context marker: CONTEXT-PROVENANCE-FLAG for the status expansion check.",
+  });
   task.taskId = "task-ev";
   task.state = "failed";
   task.waveRoot = waveRoot;
@@ -326,15 +334,16 @@ test("the registered tool expands natively and re-collapses to the identical col
       tasks: [{ taskId: "task-i", state: "running", definition: { title: "In flight work" } }],
     });
     // Native renderResult callback signature: (value, options, theme, context?)
-    // with 3 counted parameters — directly assignable to the landed helper's
-    // ToolResultRenderer delegate type.
-    assert.equal(renderSubtaskResultExpanded.length, 3);
+    // with 4 counted parameters — the optional 4th carries the native context
+    // (context.args, the actual recorded request fields). Directly assignable
+    // to the landed helper's ToolResultRenderer delegate type.
+    assert.equal(renderSubtaskResultExpanded.length, 4);
     const inspectRenderer = inspectTool.renderResult as (value: unknown, options: unknown, theme: unknown) => { render(w: number): string[] };
     const collapsed = inspectRenderer(value, {}, THEME).render(200).join("\n");
     assert.match(collapsed, /task-i/);
     // The contributed expanded callback is selected by the native flag.
     const expanded = inspectRenderer(value, { expanded: true }, THEME).render(200).join("\n");
-    assert.match(expanded, /SubtasksInspect — expanded result/);
+    assert.match(expanded, /SubtasksInspect · \? · status/);
     assert.match(expanded, /task-i · In flight work · running/);
     assert.notEqual(expanded, collapsed);
     // Re-collapsing the same retained result returns to the identical
@@ -373,7 +382,7 @@ test("expanding then re-collapsing a retained inspect result re-runs nothing", a
 
     // Expand the same retained result object, then re-collapse it.
     const expanded = inspectRenderer(page, { expanded: true }, THEME).render(300).join("\n");
-    assert.match(expanded, /SubtasksInspect — expanded result/);
+    assert.match(expanded, /SubtasksInspect · task-ev · range/);
     assert.match(expanded, /Observed evidence \(executor_observed/);
     const collapsedAfter = inspectRenderer(page, { expanded: false }, THEME).render(300).join("\n");
 
@@ -404,13 +413,39 @@ test("partial results render the bounded pending view and never detail from a ha
 });
 
 test("unrecognized and non-record values fall back to the returned summary only", () => {
+  // A recognized bare acknowledgement (SubtasksMarkClean returns { cleared,
+  // paths } with no action tag) renders its returned operation fields.
   const bare = joined(envelope("mark_clean: nothing to clear", { cleared: false, paths: [] }));
-  assert.match(bare, /mark_clean: nothing to clear/);
+  assert.match(bare, /SubtasksMarkClean/);
+  assert.match(bare, /Conflict gate: none active/);
+  assert.match(bare, /Validated paths: \(none\)/);
   const shapeless = joined(envelope("some tool ran", { unrelated: true }));
   assert.match(shapeless, /some tool ran/);
   assert.match(shapeless, /No expandable Subtasks details were returned/);
   const undefinedValue = expandedLines(undefined);
   assert.ok(undefinedValue.join("\n").includes("No execution result."));
+});
+
+test("the lifecycle card labels the selected target workspace and no parent-session directory", () => {
+  // root is the temporary execution-record storage; cwd is the persisted
+  // selected target checkout; the live projection carries the resolved target.
+  const base = {
+    action: "start",
+    executionId: "exec-target-distinct",
+    kind: "execute",
+    root: "/tmp/pi-review-execution-storage-123",
+    cwd: "/work/target-checkout",
+    tasks: [{ taskId: "task-t1", state: "queued", definition: { title: "Targeted work" } }],
+  };
+  const restored = joined(envelope("SubtasksStart accepted: execution exec-target-distinct (1 task(s)).", { ...base }), { expanded: true });
+  assert.match(restored, /Target workspace: \/work\/target-checkout/);
+  assert.ok(!restored.includes("pi-review-execution-storage-123"), "execution storage must never be labeled as the target");
+  assert.doesNotMatch(restored, /Session directory/, "the removed parent-session label must not return");
+  const live = joined(envelope("SubtasksStart accepted: execution exec-target-distinct (1 task(s)).", {
+    ...base,
+    dispatchView: { executionId: "exec-target-distinct", kind: "execute", targetWorkspace: "/live/target-resolved", tasks: [] },
+  }), { expanded: true });
+  assert.match(live, /Target workspace: \/live\/target-resolved/);
 });
 
 // ---------------------------------------------------------------------------
@@ -475,35 +510,55 @@ test("all nine Subtasks* operations produce envelopes that render through the ex
       expandedLines(familyEnvelope, { expanded: true }, 240);
     }
 
-    // Start envelope expanded: handles, dispatch, scheduler, freshness.
+    // Start envelope expanded: the submitted definitions and the truthful
+    // queued/dispatch provenance (dispatch record integration pending).
     const startText = joined(started, {}, 240);
-    assert.match(startText, /SubtasksStart — expanded result/);
-    assert.match(startText, /Snapshot as of .* — a point-in-time read/);
-    assert.match(startText, /freshness uncertain: at least one task is still active/);
-    assert.match(startText, /Tasks \(stable handles/);
-    assert.match(startText, /task-[0-9a-f-]+ · EXPANDED-FIRST · (queued|capturing|running)/);
-    assert.match(startText, /dispatch: /);
-    assert.match(startText, /Scheduler: \d+\/\d+ workers active/);
+    assert.match(startText, /SubtasksStart · exec\S* · (queued|capturing|running)/);
+    assert.match(startText, /Submitted instructions:/);
+    assert.match(startText, /bounded work/);
+    assert.match(startText, /Acceptance criteria:/);
+    assert.match(startText, /- done/);
+    assert.match(startText, /Dispatch: (not yet started|dispatched to executor transport|no capture in this returned record)/);
+    assert.match(startText, /Captured base commit: (not yet available|not available in this record)/);
+    assert.match(startText, /Worker worktree: (not yet created|\S+)/);
+    assert.match(startText, /Prompt sent to worker: (not yet sent|not recorded in this inspection)/);
 
-    // Steer envelope: the returned command lifecycle is visible.
+    // Steer envelope: the full sent instruction and transport-only delivery.
     const steerText = joined(steered, {}, 240);
-    assert.match(steerText, /SubtasksSteer — expanded result/);
-    assert.match(steerText, /steer instr-expanded-1 · (queued|delivered|acknowledged)/);
+    assert.match(steerText, /SubtasksSteer · /);
+    assert.match(steerText, /Submitted instructions:/);
+    assert.match(steerText, /adjust course/);
+    assert.match(steerText, /Interrupt first: no/);
+    assert.match(steerText, /Delivery: (transport acknowledged|delivered by transport|queued for transport)/);
+    // Transport-only acknowledgment: the compliance disclaimer appears exactly
+    // when a transport acknowledgment/delivery is claimed.
+    if (/transport acknowledged|delivered by transport/.test(steerText)) {
+      assert.match(steerText, /Task compliance: not established by acknowledgment/);
+    } else {
+      assert.doesNotMatch(steerText, /Task compliance:/);
+    }
 
-    // Interrupt envelope: interruption semantics are visible.
+    // Interrupt envelope: exact request mode and established outcomes only.
     const interruptText = joined(interrupted, {}, 240);
-    assert.match(interruptText, /SubtasksInterrupt — expanded result/);
+    assert.match(interruptText, /SubtasksInterrupt · /);
+    assert.match(interruptText, /Requested mode: interrupt_as_failure/);
+    assert.match(interruptText, /Workspace changes: (not landed|conflict markers materialized in main|landed)/);
 
-    // Watch acknowledgement: only returned fields, nothing invented.
+    // Watch acknowledgement: requested checkpoint and one-shot semantics.
     const watchText = joined(watch, {}, 240);
-    assert.match(watchText, /SubtasksWatch — expanded result/);
-    assert.match(watchText, /checkpoint after: 30s/);
-    assert.match(watchText, /replaced the prior watch for this execution: no/);
-    assert.match(watchText, /expansion adds no data beyond what was returned/);
+    assert.match(watchText, /SubtasksWatch · /);
+    assert.match(watchText, /Requested checkpoint: after 30 seconds/);
+    assert.match(watchText, /Watch: armed/);
+    assert.match(watchText, /Kind: one-shot notification/);
+    assert.match(watchText, /Task completion\/failure notifications: independent of this watch/);
+    assert.match(watchText, /Replaced the prior watch for this execution: no/);
 
-    // Mark-clean acknowledgement.
+    // Mark-clean acknowledgement: actual operation data, no guessed workspace.
     const markCleanText = joined(markClean, {}, 240);
-    assert.match(markCleanText, /conflict gate cleared: (yes|no)/);
+    assert.match(markCleanText, /SubtasksMarkClean/);
+    assert.match(markCleanText, /Conflict gate: (none active|cleared)/);
+    assert.match(markCleanText, /Validated paths: /);
+    assert.match(markCleanText, /Workspace identity: not named by this acknowledgement/);
   } finally {
     await manager.shutdown();
     await manager.detach();
@@ -527,7 +582,7 @@ test("genuine failure envelopes expand with diagnostic, source workspace, recove
     }, undefined, undefined, {});
     assert.equal(failed.isError, true);
     const text = joined(failed, {}, 300);
-    assert.match(text, /SubtasksSteer — expanded error result/);
+    assert.match(text, /SubtasksSteer · failed/);
     assert.match(text, /diagnostic: /);
     assert.match(text, /source workspace: /);
     assert.match(text, /Recovery guidance \(returned with the failure\):/);
@@ -558,7 +613,7 @@ test("evidence selector failures stay task-scoped in the expanded view", async (
     }, undefined, undefined, {});
     assert.equal(failed.isError, true);
     const text = joined(failed, {}, 300);
-    assert.match(text, /SubtasksInspect — expanded error result/);
+    assert.match(text, /SubtasksInspect · failed/);
     assert.match(text, /Task-scoped evidence navigation failure: no other execution's state is included by design/);
     // #61: neither the authorized task's own inventory nor any other group's
     // state may appear beyond the returned diagnostic.
@@ -580,9 +635,13 @@ test("evidence inspect expands the retained page with separated provenance, reda
   const text = joined(page, {}, 300);
 
   // Header, identity, and freshness.
-  assert.match(text, /SubtasksInspect — expanded result/);
+  assert.match(text, /SubtasksInspect · task-ev · range/);
+  assert.match(text, /Request:/);
+  assert.match(text, /Evidence selector: /);
   assert.match(text, /Snapshot as of 20\d\d-.+ — a point-in-time read; live work may have advanced\./);
-  assert.match(text, /execution exec-ev \(execute\) · revision \d+ · root /);
+  assert.match(text, /execution exec-ev \(execute\) · revision \d+/);
+  assert.match(text, /Target workspace: /);
+  assert.match(text, /Snapshot as of 20\d\d-.+ — a point-in-time read; live work may have advanced\./);
   assert.match(text, /Evidence read \(mode: range\)/);
   // Freshness uncertainty is scoped to active work; a failed task is settled.
   assert.doesNotMatch(text, /still active/);
@@ -662,15 +721,86 @@ test("unavailable evidence ranges are disclosed instead of silently missing", as
   const restored = await runInspect({ executionId: "exec-ev-empty", taskId: "task-empty", evidence: { index: 0, limit: 10 } });
   assert.equal(restored.isError, false);
   const text = joined(restored, {}, 300);
-  assert.match(text, /unavailable \(disclosed gaps; \d+ of \d+ shown\)/);
+  assert.match(text, /unavailable \(disclosed gaps; upstream retention, not display clipping\):/);
   assert.match(text, /missing_stream/);
+});
+
+// ---------------------------------------------------------------------------
+// Status inspection: the submitted task definition is part of the expansion
+// ---------------------------------------------------------------------------
+
+test("status inspection expands the submitted definitions of the inspected task", async () => {
+  const status = await runInspect({ executionId: "exec-ev", taskId: "task-ev" });
+  assert.equal(status.isError, false);
+  const text = joined(status, {}, 300);
+  // The submitted definition — multiline instructions, every criterion, and
+  // the relevant context — is already returned and must be visible in full.
+  assert.match(text, /Submitted instructions:/);
+  assert.match(text, /run the expanded fixture/);
+  assert.match(text, /then verify every line survived/);
+  assert.match(text, /Acceptance criteria:/);
+  assert.match(text, /- fixture passes/);
+  assert.match(text, /- every instruction line stays visible/);
+  assert.match(text, /Relevant context:/);
+  assert.match(text, /CONTEXT-PROVENANCE-FLAG/);
+});
+
+// ---------------------------------------------------------------------------
+// Steering provenance: queued steering is never labeled as sent
+// ---------------------------------------------------------------------------
+
+test("queued steering without a live executor says not yet sent, not instruction sent", () => {
+  const value = envelope("SubtasksSteer: execute group exec-q, 1 active task(s).", {
+    action: "steer",
+    executionId: "exec-queued",
+    kind: "execute",
+    tasks: [{
+      taskId: "task-queued",
+      state: "queued",
+      definition: { title: "Queued work" },
+      commands: [{
+        instructionId: "steer-queued", action: "steer", actor: "model",
+        text: "Redirect to the focused regression.", status: "queued", createdAt: "2025-06-01T10:00:00.000Z",
+      }],
+    }],
+  });
+  const text = joined(value, { expanded: true }, 300, { args: { taskId: "task-queued", instructions: "Redirect to the focused regression.", instructionId: "steer-queued" } });
+  assert.match(text, /Submitted instructions:/);
+  assert.match(text, /Redirect to the focused regression\./);
+  assert.match(text, /Delivery: queued for transport \(not yet delivered\)/);
+  assert.match(text, /Instruction sent to the worker: not yet sent/);
+  assert.doesNotMatch(text, /Instruction sent:$/);
+  assert.doesNotMatch(text, /Task compliance:/);
+});
+
+test("transport-acknowledged steering keeps the compliance disclaimer", () => {
+  const value = envelope("SubtasksSteer: execute group exec-s, 1 active task(s).", {
+    action: "steer",
+    executionId: "exec-steer",
+    kind: "execute",
+    tasks: [{
+      taskId: "task-steer",
+      state: "running",
+      definition: { title: "Steered work" },
+      commands: [{
+        instructionId: "steer-ack", action: "steer", actor: "model",
+        text: "Stop the stress run.", status: "acknowledged", createdAt: "2025-06-01T10:00:00.000Z",
+        acknowledgedAt: "2025-06-01T10:00:05.000Z",
+      }],
+    }],
+  });
+  const text = joined(value, { expanded: true }, 300, { args: { taskId: "task-steer", instructions: "Stop the stress run.", instructionId: "steer-ack" } });
+  assert.match(text, /Submitted instructions:/);
+  assert.match(text, /Delivery: transport acknowledged/);
+  assert.match(text, /Instruction sent to the worker: yes/);
+  assert.match(text, /Task compliance: not established by acknowledgment/);
 });
 
 // ---------------------------------------------------------------------------
 // Long results: bounded expansion with explicit omissions
 // ---------------------------------------------------------------------------
 
-test("long task lists stay bounded with an explicit omission disclosure", () => {
+test("long task lists render every returned task without an expanded-view cap", () => {
   const tasks = Array.from({ length: 30 }, (_unused, index) => ({
     taskId: `task-b${index}`,
     state: "running",
@@ -681,11 +811,12 @@ test("long task lists stay bounded with an explicit omission disclosure", () => 
     tasks,
   });
   const text = joined(value, {}, 200);
-  assert.match(text, /… 6 returned task\(s\) omitted from this expanded view\./);
-  assert.doesNotMatch(text, /task-b29/);
+  // Expansion adds no presentation cap on top of the returned page.
+  assert.match(text, /task-b29 · Bounded work 29 · running/);
+  assert.doesNotMatch(text, /omitted from this expanded view/);
 });
 
-test("long evidence pages stay bounded with per-section omission disclosures", () => {
+test("long evidence pages render every returned entry, source, and gap note", () => {
   const entries = Array.from({ length: 15 }, (_unused, index) => ({
     index,
     entryId: `entry-b${index}`,
@@ -714,31 +845,35 @@ test("long evidence pages stay bounded with per-section omission disclosures", (
     },
   });
   const text = joined(value, {}, 240);
-  assert.match(text, /… 5 executor_observed entries in this read omitted from the expanded view/);
-  assert.match(text, /… 3 returned source\(s\) omitted from this expanded view\./);
-  assert.match(text, /unavailable \(disclosed gaps; 8 of 12 shown\)/);
+  assert.match(text, /entry-b14/);
+  assert.match(text, /source session:14/);
+  assert.match(text, /turn-11 · missing_stream · gap 11/);
+  assert.doesNotMatch(text, /omitted from this expanded view/);
   assert.match(text, /more entries available: continue the ranged read with index=15/);
 });
 
-test("a very large result discloses the bounded-rendering cap", () => {
-  const tasks = Array.from({ length: 30 }, (_unused, index) => ({
+test("an extreme payload renders completely: the guard is gone and the final sentinel is visible", () => {
+  const tasks = Array.from({ length: 60 }, (_unused, index) => ({
     taskId: `task-c${index}`,
     state: "running",
     definition: { title: `Cap work ${index}` },
-    timing: { totalMs: index, queueMs: index, captureMs: index, executionMs: index, reviewMs: index, landingMs: index },
     summary: `outcome ${index}`,
     commands: Array.from({ length: 6 }, (_u, command) => ({ instructionId: `i-${index}-${command}`, action: "steer", status: "queued", createdAt: "2025-06-01T10:00:00.000Z" })),
-    activity: Array.from({ length: 10 }, (_u, event) => ({ sequence: event, phase: "running", message: `event ${event} for task ${index}` })),
+    activity: Array.from({ length: 100 }, (_u, event) => ({ sequence: event, phase: "running", message: `event ${event} for task ${index}` })),
   }));
   const value = envelope("SubtasksInspect: cap stress result", {
     action: "inspect", kind: "execute", executionId: "exec-c", revision: 9, updatedAt: "2025-06-01T10:00:00.000Z",
     tasks,
   });
   const text = joined(value, {}, 200);
-  assert.match(text, /expanded view truncated for bounded rendering/);
+  // No presentation-side cap: the payload is far beyond the old 5,000-line
+  // budget, and its final sentinel still renders.
+  assert.doesNotMatch(text, /expanded view truncated/);
+  assert.match(text, /task-c59 · Cap work 59 · running/);
+  assert.match(text, /event 99 for task 59/);
 });
 
-test("deep chunks clip over-long retained lines with an explicit ellipsis", () => {
+test("long retained lines wrap into width-safe rows without dropping characters", () => {
   const value = envelope("SubtasksInspect: deep chunk", {
     action: "inspect", kind: "execute", executionId: "exec-b", updatedAt: "2025-06-01T10:00:00.000Z",
     evidence: {
@@ -750,9 +885,97 @@ test("deep chunks clip over-long retained lines with an explicit ellipsis", () =
   const lines = expandedLines(value, {}, 120);
   const plain = lines.map((line) => line.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, ""));
   for (const line of plain) {
-    assert.ok(displayWidthOf(line) <= 120, `deep line exceeds width: ${displayWidthOf(line)} cells`);
+    assert.ok(displayWidthOf(line) <= 120, `rendered row exceeds width: ${displayWidthOf(line)} cells`);
   }
-  assert.ok(plain.some((line) => line.includes("…")), "over-long retained lines clip with an explicit ellipsis");
+  // Wrapping, not clipping: every character survives; the full run is
+  // recoverable from the wrapped rows (4-space indent + 500 y's = 504 cells →
+  // split across rows that concatenate back to the original characters).
+  assert.doesNotMatch(plain.join(""), /…/, "no character may be replaced by an ellipsis");
+  assert.ok(plain.join("").includes("y".repeat(500)), "all 500 characters must survive wrapping contiguously");
+});
+
+test("long submitted instructions and evidence previews wrap at ordinary terminal widths", () => {
+  // A long single-line instruction rendered at an ordinary terminal width:
+  // wrapping must keep the final sentinel visible (no suffix loss).
+  const sentinel = "END-OF-INSTRUCTION-SENTINEL";
+  const longInstruction = `Fix the renderer. ${"Detail sentence. ".repeat(20)}${sentinel}`;
+  const startEnvelope = envelope("SubtasksStart accepted: execution exec-long, 1 active task(s).", {
+    action: "start",
+    executionId: "exec-long",
+    kind: "execute",
+    root: "/work/project",
+    cwd: "/work/project",
+    tasks: [{ taskId: "task-long", state: "queued", definition: { title: "Long work", instructions: longInstruction, acceptanceCriteria: ["done"] } }],
+  });
+  const startText = joined(startEnvelope, { expanded: true }, 80, { args: { tasks: [{ title: "Long work", instructions: longInstruction, acceptanceCriteria: ["done"] }] } });
+  assert.ok(startText.includes(sentinel), "a wrapped long instruction keeps its final sentinel at width 80");
+
+  // A long single-line evidence preview at the same width: same guarantee.
+  const previewSentinel = "END-OF-PREVIEW-SENTINEL";
+  const longPreview = `observed result ${"x".repeat(200)} ${previewSentinel}`;
+  const evidenceEnvelope = envelope("SubtasksInspect: long preview", {
+    action: "inspect", kind: "execute", executionId: "exec-b", updatedAt: "2025-06-01T10:00:00.000Z",
+    tasks: [],
+    evidence: {
+      mode: "range", taskId: "task-b0",
+      snapshot: { totalEntries: 1, sources: [], unavailable: [], capability: { toolEvidence: "available" }, diagnostics: { recordsScanned: 1, oversizedRecords: 0, skippedRecords: 0 } },
+      entries: [{ index: 0, entryId: "entry-b0", kind: "tool_result", status: "returned", provenance: "executor_observed", preview: longPreview, contentBytes: 220, source: { sourceId: "session:1", adapter: "pi-model", stream: "session" } }],
+    },
+  });
+  const evidenceText = joined(evidenceEnvelope, { expanded: true }, 80);
+  // Wrapping is a pure row split: the sentinel may land across a row break,
+  // so reconstruct the rows to prove the complete suffix survived.
+  assert.ok(evidenceText.split("\n").join("").includes(previewSentinel), "a wrapped long evidence preview keeps its final sentinel at width 80");
+});
+
+test("expanded lines are lossless: multiline criteria and repeated-space queries keep their exact whitespace", () => {
+  // A multiline acceptance criterion with internal repeated spaces: the
+  // expanded view must show the exact characters, including the line break
+  // and the space runs, not a whitespace-compacted rewrite.
+  const criterion = "first criterion line\nsecond line with   triple   spaces";
+  const value = envelope("SubtasksStart accepted: execution exec-ws, 1 active task(s).", {
+    action: "start",
+    executionId: "exec-ws",
+    kind: "execute",
+    root: "/work/project",
+    tasks: [{ taskId: "task-ws", state: "queued", definition: { title: "Whitespace work", instructions: "bounded", acceptanceCriteria: [criterion] } }],
+  });
+  const text = joined(value, { expanded: true }, 200);
+  assert.match(text, /- first criterion line\n/, "the criterion's line boundary must survive");
+  assert.match(text, /second line with   triple   spaces/, "repeated internal spaces must survive verbatim");
+  assert.doesNotMatch(text, /first criterion line second line/, "the line break must not be compacted away");
+
+  // A find query containing repeated spaces is a different query after
+  // compaction; the request description and match summary must show it exactly.
+  const query = "marker  with  double spaces";
+  const findEnvelope = envelope("SubtasksInspect: whitespace query", {
+    action: "inspect", kind: "execute", executionId: "exec-ws", updatedAt: "2025-06-01T10:00:00.000Z",
+    tasks: [],
+    evidence: {
+      mode: "find", taskId: "task-ws",
+      snapshot: { totalEntries: 1, sources: [], unavailable: [], capability: { toolEvidence: "available" }, diagnostics: { recordsScanned: 1, oversizedRecords: 0, skippedRecords: 0 } },
+      matches: [{ index: 0, entryId: "entry-ws", kind: "tool_result", snippet: "s" }],
+      matchSummary: { query, totalMatches: 1, matchesTruncated: false },
+    },
+  });
+  const findText = joined(findEnvelope, { expanded: true }, 200, { args: { evidence: { find: query } } });
+  assert.ok(findText.includes(`find "${query}"`), "the request selector must carry the exact query spaces");
+  assert.ok(findText.includes(`Matches for "${query}": 1 total`), "the match summary must carry the exact query spaces");
+});
+
+test("content exceeding 5,000 rendered lines stays complete", () => {
+  const lines = Array.from({ length: 6000 }, (_unused, index) => `chunk-line-${index}`);
+  const value = envelope("SubtasksInspect: oversized deep chunk", {
+    action: "inspect", kind: "execute", executionId: "exec-over", updatedAt: "2025-06-01T10:00:00.000Z",
+    evidence: {
+      mode: "entry", taskId: "task-b0",
+      snapshot: { totalEntries: 1, sources: [], unavailable: [], capability: { toolEvidence: "available" }, diagnostics: { recordsScanned: 1, oversizedRecords: 0, skippedRecords: 0 } },
+      deepContent: { entryId: "entry-b0", chunkIndex: 0, content: lines.join("\n"), hasMore: false, contentBytes: 90_000 },
+    },
+  });
+  const text = joined(value, {}, 200);
+  assert.doesNotMatch(text, /expanded view truncated/);
+  assert.match(text, /chunk-line-5999/);
 });
 
 test("narrow widths are honored: no line exceeds the supplied column count", () => {
@@ -786,25 +1009,32 @@ test("wide Unicode retained content is measured in terminal cells, not UTF-16 un
   });
   // At a width where string length would fit but display cells would not: the
   // CJK line is 480 UTF-16 units but 240 display cells, so a 100-column row
-  // must clip even though a naive length check would call it short.
+  // must wrap by cells even though a naive length check would call it short.
   const lines = expandedLines(value, {}, 100);
   const joinedText = lines.join("\n");
   assert.ok(joinedText.includes("漢字"), "CJK retained content must render");
-  const deepLine = lines.find((line) => line.includes("漢字"))!;
-  assert.ok(deepLine.includes("…"), "the wide retained line clips with an ellipsis");
-  assert.ok(displayWidthOf(deepLine) <= 100, `deep CJK line must fit 100 columns: ${displayWidthOf(deepLine)} cells`);
+  const deepRows = lines.filter((line) => line.includes("漢字"));
+  assert.ok(deepRows.length > 1, "the wide retained line wraps into multiple rows");
+  for (const row of deepRows) {
+    assert.ok(displayWidthOf(row) <= 100, `deep CJK row must fit 100 columns: ${displayWidthOf(row)} cells`);
+  }
+  // Wrapping drops nothing: the wrapped CJK rows concatenate back to the full
+  // original run.
+  assert.ok(lines.join("").includes(cjkLine), "the complete CJK run must survive wrapping");
   // Independent exact-cell assertion for the default-wide-emoji row (🚀 is
   // Emoji_Presentation=Yes, two terminal cells — outside any hand-picked
   // range table): with the 4-space deep-read indent, 50 rockets occupy 104
-  // cells, so the row must clip at this width.
-  const rocketRow = lines.find((line) => line.includes("🚀"));
-  assert.ok(rocketRow, "retained rocket content must render");
-  assert.ok(rocketRow.endsWith("…"), "104-cell rocket row must clip at 100 columns");
-  const rocketCells = [...rocketRow].reduce(
-    (cells, character) => cells + (character === "🚀" ? 2 : 1), 0,
-  );
-  assert.ok(rocketCells <= 100, `rocket row exceeds width: ${rocketCells}`);
-  // A width where a 40-code-unit CJK run is 80 cells: the clip must count 2 cells per char.
+  // cells, so the row must wrap at this width.
+  const rocketRows = lines.filter((line) => line.includes("🚀"));
+  assert.ok(rocketRows.length > 0, "retained rocket content must render");
+  for (const rocketRow of rocketRows) {
+    const rocketCells = [...rocketRow].reduce(
+      (cells, character) => cells + (character === "🚀" ? 2 : 1), 0,
+    );
+    assert.ok(rocketCells <= 100, `rocket row exceeds width: ${rocketCells}`);
+  }
+  assert.equal((lines.join("").match(/🚀/g) ?? []).length, 50, "all 50 rockets must survive wrapping");
+  // A width where a 40-code-unit CJK run is 80 cells: wrapping must count 2 cells per char.
   const shortWide = envelope("SubtasksInspect: short wide chunk", {
     action: "inspect", kind: "execute", executionId: "exec-w", updatedAt: "2025-06-01T10:00:00.000Z",
     evidence: {
@@ -813,8 +1043,9 @@ test("wide Unicode retained content is measured in terminal cells, not UTF-16 un
       deepContent: { entryId: "entry-w0", chunkIndex: 0, content: "漢字".repeat(20), hasMore: false, contentBytes: 96 },
     },
   });
-  const shortLines = expandedLines(shortWide, {}, 60).join("\n");
-  assert.ok(shortLines.includes("…"), "an 80-cell CJK line clips at a 60-column width");
+  const shortLines = expandedLines(shortWide, {}, 60);
+  assert.ok(shortLines.length > 1, "an 80-cell CJK line wraps at a 60-column width");
+  assert.ok(shortLines.join("").includes("漢字".repeat(20)), "the complete short wide run must survive wrapping");
 });
 
 // ---------------------------------------------------------------------------
@@ -834,10 +1065,12 @@ test("collapsed rendering remains the bounded card for the registered tools", as
     });
     const inspectRenderer = inspectTool.renderResult as (value: unknown, options: unknown, theme: unknown) => { render(w: number): string[] };
     const collapsed = inspectRenderer(value, {}, THEME).render(200).join("\n");
-    assert.match(collapsed, /task-p0 running P 0/);
-    assert.doesNotMatch(collapsed, /task-p8 running/);
-    assert.match(collapsed, /… 3 additional inline task\(s\) omitted from this compact rendering\./);
-    assert.match(collapsed, /… 12 earlier settled task\(s\) are archived/);
+    // The canonical bounded card: header plus the inspected task's line
+    // (taskId · state · title), with archive-only history disclosed.
+    assert.match(collapsed, /^SubtasksInspect · task \? · status/);
+    assert.match(collapsed, /task-p0 · running · P 0/);
+    assert.doesNotMatch(collapsed, /task-p8/, "the bounded card shows the inspected task, not a full inventory dump");
+    assert.match(collapsed, /… 12 earlier settled task\(s\) are archived; inspect by taskId for exact history\./);
   } finally {
     await manager.shutdown();
     await manager.detach();

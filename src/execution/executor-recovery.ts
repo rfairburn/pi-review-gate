@@ -1,7 +1,7 @@
 import type { ExecutionRetryPolicy } from "../config";
 import { normalizeCandidate, type PriorCandidate } from "./wave-commits";
 import type { WaveCaptureResult } from "./wave-repository";
-import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorRequest, type ExecutorTurn } from "./types";
+import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorRequest, type ExecutorTurn, type SubtaskDispatchRecord } from "./types";
 import type { WorkerWorktree } from "./wave-worktrees";
 import {
   acquireOperationOwner,
@@ -39,6 +39,15 @@ export async function runExecutorWithRecovery(input: {
   retryPolicy: ExecutionRetryPolicy;
   operation: OperationRecord;
   onRetry?: (message: string, turn: number) => void;
+  /**
+   * #93: invoked when an adapter reports actual prompt delivery at its
+   * transport write/enqueue boundary (see `ExecutorRequest.onPromptDelivery`).
+   * A failure before delivery — validation, adapter initialization, process
+   * startup, or compaction — never publishes a record. Fired on the first
+   * delivery and again whenever a later delivery carries a different prompt;
+   * the caller owns retention.
+   */
+  onDispatch?: (record: SubtaskDispatchRecord) => void;
 }): Promise<RecoveredExecutorRun> {
   const originalPrompt = input.prompt;
   let prompt = input.prompt;
@@ -62,6 +71,9 @@ export async function runExecutorWithRecovery(input: {
   let recovery: ExecutorRequest["recovery"];
   const incidents: ExecutionIncident[] = [];
   const repeated = new Map<string, number>();
+  // #93: last prompt actually delivered to the transport; capture fires only
+  // on real delivery boundaries and when the text genuinely changes.
+  let lastDispatchedPrompt: string | undefined;
 
   acquireOperationOwner(input.operation);
   await writeOperationRecord(input.operation);
@@ -94,6 +106,29 @@ export async function runExecutorWithRecovery(input: {
         turn: turnNumber,
         session,
         recovery,
+        // #93: authoritative dispatch capture at the actual delivery boundary.
+        // The prompt here already contains every wrapper, path rewrite,
+        // pre-start steering incorporation, and recovery composition, but the
+        // record is published only when the adapter's transport accepts the
+        // write — validation, adapter-initialization, startup, and compaction
+        // failures before delivery never publish a sent record or update a
+        // card. Turn ACK and task compliance remain separate facts recorded
+        // elsewhere.
+        onPromptDelivery: (delivery) => {
+          if (delivery.prompt === lastDispatchedPrompt) return;
+          lastDispatchedPrompt = delivery.prompt;
+          input.onDispatch?.({
+            provenance: "captured_at_dispatch",
+            delivery: "written_to_transport",
+            dispatchedAt: new Date().toISOString(),
+            sentPrompt: delivery.prompt,
+            worktreeRoot: input.worktree.worktreeRoot,
+            baseCommit: input.capture.baseCommit,
+            executorTurn: turnNumber,
+            adapter: input.adapter.kind,
+            model: input.adapter.model,
+          });
+        },
         onProcessStart: async (process) => {
           recordOperationChildProcess(input.operation, process.pid, process.processGroupId);
           await writeOperationRecord(input.operation);

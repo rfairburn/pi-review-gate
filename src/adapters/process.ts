@@ -153,6 +153,13 @@ export async function runPromptProcess(input: {
   onStdoutChunk?: (chunk: string) => void;
   onProcessStart?: (process: ProcessLifecycleStart) => void | Promise<void>;
   onProcessExit?: (process: ProcessLifecycleExit) => void | Promise<void>;
+  /**
+   * #93: invoked at the actual prompt transport boundary — once the prompt
+   * write has been flushed to the child's stdin pipe. Never invoked when the
+   * child dies or the pipe errors before accepting the write, so pre-delivery
+   * failures never publish a sent record.
+   */
+  onPromptDelivery?: (delivery: { prompt: string }) => void;
   /** Internal/test override; production adapters use MAX_RETAINED_OUTPUT_BYTES. */
   maxRetainedOutputBytes?: number;
 }): Promise<ProcessRunResult> {
@@ -187,6 +194,16 @@ export async function runPromptProcess(input: {
     let aborted = false;
     let stdinError: string | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    // #93: report delivery only when the stdin write actually flushed to the
+    // transport pipe; an erroring child or pipe never reports delivery.
+    let promptDeliveryReported = false;
+    if (input.onPromptDelivery) {
+      proc.stdin.on("finish", () => {
+        if (promptDeliveryReported) return;
+        promptDeliveryReported = true;
+        input.onPromptDelivery?.({ prompt: input.prompt });
+      });
+    }
 
     const processIdentity = proc.pid === undefined
       ? undefined

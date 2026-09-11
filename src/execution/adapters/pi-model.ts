@@ -225,6 +225,9 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     try {
       let settledGeneration = rpc.settledGeneration;
       await rpc.request("prompt", { message: request.prompt });
+      // #93: the RPC transport accepted the prompt — the actual delivery
+      // boundary for this prompt.
+      request.onPromptDelivery?.({ prompt: request.prompt });
       request.onLiveControl?.({
         adapter: this.kind,
         generation: request.turn,

@@ -423,10 +423,10 @@ test("operation-specific execution tools render operation, task count, and durab
       ],
     },
   }, {}, theme).render(120).join("\n");
-  assert.match(rendered, /task-q queued \(executor capacity wait\) Waiting work/);
-  assert.match(rendered, /task-s queued \(executor assigned\/startup\) Starting work/);
-  assert.match(rendered, /task-a running Fast work/);
-  assert.match(rendered, /task-b conflicted Needs merge/);
+  assert.match(rendered, /task-q · queued \(executor capacity wait\) · Waiting work/);
+  assert.match(rendered, /task-s · queued \(executor assigned\/startup\) · Starting work/);
+  assert.match(rendered, /task-a · running · Fast work/);
+  assert.match(rendered, /task-b · conflicted · Needs merge/);
 });
 
 test("compact task rendering discloses bounded inline omissions and archive-only history", () => {
@@ -443,9 +443,9 @@ test("compact task rendering discloses bounded inline omissions and archive-only
       })),
     },
   }, {}, theme).render(200).join("\n");
-  assert.match(rendered, /task-0 running Task 0/);
-  assert.match(rendered, /task-7 running Task 7/);
-  assert.doesNotMatch(rendered, /task-8 running/);
+  assert.match(rendered, /task-0 · running · Task 0/);
+  assert.match(rendered, /task-7 · running · Task 7/);
+  assert.doesNotMatch(rendered, /task-8 · running/);
   assert.match(rendered, /… 3 additional inline task\(s\) omitted from this compact rendering\./);
   assert.match(rendered, /… 12 earlier settled task\(s\) are archived; inspect by taskId for exact history\./);
 });

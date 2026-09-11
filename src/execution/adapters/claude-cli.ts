@@ -247,6 +247,9 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       // Enqueue the task prompt before publishing live control so steering
       // can never be delivered ahead of the prompt it steers (issue #63).
       await input.enqueue(userMessage(request.prompt, initialUuid, "now"));
+      // #93: the SDK transport accepted the enqueue — the actual delivery
+      // boundary for this prompt (session initialization already succeeded).
+      request.onPromptDelivery?.({ prompt: request.prompt });
       request.onUpdate?.("claude streaming session initialized with live steer and interrupt controls");
       request.onLiveControl?.({
         adapter: this.kind,

@@ -40,7 +40,9 @@ import {
   renderBrowserExtractResult,
   renderExpandedBrowserExtractResult,
   renderExpandedWebFetchResult,
+  renderExpandedWebSearchResult,
   renderWebFetchResult,
+  renderWebSearchResult,
 } from "./result-renderer";
 import { mediaTypeOf } from "./page";
 import { browserRenderResult } from "./browser-renderer";
@@ -134,26 +136,50 @@ export class WebToolManager {
         region: stringSchema("Optional search region such as us-en."),
         freshness: enumSchema(["day", "week", "month", "year"], "Optional freshness window."),
       }, ["query"]),
+      renderResult: expandableResult(renderWebSearchResult, renderExpandedWebSearchResult),
       execute: async (_id, params, signal) => {
+        let requestDetails: Record<string, unknown> | undefined;
         try {
           const query = requiredString(params.query, "query");
           const maxResults = boundedInteger(params.maxResults, 1, this.webConfig.search.maxResults, this.webConfig.search.maxResults, "maxResults");
+          const domain = optionalString(params.domain);
           const excludeDomains = optionalStringArray(params.excludeDomains, "excludeDomains");
+          const region = optionalString(params.region);
+          const selectedFreshness = freshness(params.freshness);
+          requestDetails = {
+            query,
+            maxResults,
+            ...(domain ? { domain } : {}),
+            ...(excludeDomains ? { excludeDomains: [...excludeDomains] } : {}),
+            region: region || "us-en",
+            ...(selectedFreshness ? { freshness: selectedFreshness } : {}),
+            provided: {
+              maxResults: Object.prototype.hasOwnProperty.call(params, "maxResults"),
+              domain: Object.prototype.hasOwnProperty.call(params, "domain"),
+              excludeDomains: Object.prototype.hasOwnProperty.call(params, "excludeDomains"),
+              region: Object.prototype.hasOwnProperty.call(params, "region"),
+              freshness: Object.prototype.hasOwnProperty.call(params, "freshness"),
+            },
+          };
           const response = await searchDdgs({
             query,
             maxResults,
-            ...(optionalString(params.domain) ? { domain: optionalString(params.domain) } : {}),
+            ...(domain ? { domain } : {}),
             ...(excludeDomains ? { excludeDomains } : {}),
-            ...(optionalString(params.region) ? { region: optionalString(params.region) } : {}),
-            ...(freshness(params.freshness) ? { freshness: freshness(params.freshness) } : {}),
+            ...(region ? { region } : {}),
+            ...(selectedFreshness ? { freshness: selectedFreshness } : {}),
             options: {
               timeoutMs: this.webConfig.search.timeoutMs,
               signal,
             },
           });
-          return textResult(formatSearch(response), { response });
+          return textResult(formatSearch(response), { response, request: requestDetails });
         } catch (error) {
-          return textResult(`WebSearch failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          return textResult(
+            `WebSearch failed: ${messageOf(error)}`,
+            { error: messageOf(error), ...(requestDetails ? { request: requestDetails } : {}) },
+            true,
+          );
         }
       },
     });
@@ -178,23 +204,44 @@ export class WebToolManager {
       }, ["url"]),
       renderResult: expandableResult(renderWebFetchResult, renderExpandedWebFetchResult),
       execute: async (_id, params, signal) => {
+        let requestDetails: Record<string, unknown> | undefined;
         try {
+          const url = requiredString(params.url, "url");
+          const index = boundedInteger(params.index, 0, Number.MAX_SAFE_INTEGER, 0, "index");
+          const maxChars = boundedInteger(params.maxChars, 1_000, this.webConfig.fetch.maxOutputChars, this.webConfig.fetch.maxOutputChars, "maxChars");
+          const refresh = optionalBoolean(params.refresh, false, "refresh");
+          const find = optionalString(params.find);
           const columns = optionalStringArray(params.columns, "columns");
+          requestDetails = {
+            url,
+            index,
+            maxChars,
+            refresh,
+            ...(find ? { find } : {}),
+            ...(columns ? { columns: [...columns] } : {}),
+            provided: {
+              index: Object.prototype.hasOwnProperty.call(params, "index"),
+              maxChars: Object.prototype.hasOwnProperty.call(params, "maxChars"),
+              refresh: Object.prototype.hasOwnProperty.call(params, "refresh"),
+              find: Object.prototype.hasOwnProperty.call(params, "find"),
+              columns: Object.prototype.hasOwnProperty.call(params, "columns"),
+            },
+          };
           const fetched = await this.cache.fetch({
-            url: requiredString(params.url, "url"),
-            index: boundedInteger(params.index, 0, Number.MAX_SAFE_INTEGER, 0, "index"),
-            maxChars: boundedInteger(params.maxChars, 1_000, this.webConfig.fetch.maxOutputChars, this.webConfig.fetch.maxOutputChars, "maxChars"),
-            refresh: optionalBoolean(params.refresh, false, "refresh"),
-            ...(optionalString(params.find) ? { find: optionalString(params.find) } : {}),
+            url,
+            index,
+            maxChars,
+            refresh,
+            ...(find ? { find } : {}),
             ...(columns ? { columns } : {}),
             signal,
           });
-          return textResult(formatPage(fetched, "WebFetch", "Fetched"), { response: fetched });
+          return textResult(formatPage(fetched, "WebFetch", "Fetched"), { response: fetched, request: requestDetails });
         } catch (error) {
           return textResult([
             `WebFetch failed: ${messageOf(error)}`,
             "Use BrowserExtract only if this failure plausibly requires rendered JavaScript, browser-managed cookies, or browser-style delivery; otherwise correct the URL or choose another source.",
-          ].join("\n"), { error: messageOf(error) }, true);
+          ].join("\n"), { error: messageOf(error), ...(requestDetails ? { request: requestDetails } : {}) }, true);
         }
       },
     });
@@ -214,20 +261,42 @@ export class WebToolManager {
       parameters: pageParameters(this.webConfig.fetch.maxOutputChars),
       renderResult: expandableResult(renderBrowserExtractResult, renderExpandedBrowserExtractResult),
       execute: async (_id, params, signal) => {
+        let requestDetails: Record<string, unknown> | undefined;
         try {
+          const url = requiredString(params.url, "url");
+          const index = boundedInteger(params.index, 0, Number.MAX_SAFE_INTEGER, 0, "index");
+          const maxChars = boundedInteger(params.maxChars, 1_000, this.webConfig.fetch.maxOutputChars, this.webConfig.fetch.maxOutputChars, "maxChars");
+          const refresh = optionalBoolean(params.refresh, false, "refresh");
+          const find = optionalString(params.find);
           const columns = optionalStringArray(params.columns, "columns");
+          requestDetails = {
+            url,
+            index,
+            maxChars,
+            refresh,
+            acquisition: "rendered browser page",
+            ...(find ? { find } : {}),
+            ...(columns ? { columns: [...columns] } : {}),
+            provided: {
+              index: Object.prototype.hasOwnProperty.call(params, "index"),
+              maxChars: Object.prototype.hasOwnProperty.call(params, "maxChars"),
+              refresh: Object.prototype.hasOwnProperty.call(params, "refresh"),
+              find: Object.prototype.hasOwnProperty.call(params, "find"),
+              columns: Object.prototype.hasOwnProperty.call(params, "columns"),
+            },
+          };
           const rendered = await this.browserCache.fetch({
-            url: requiredString(params.url, "url"),
-            index: boundedInteger(params.index, 0, Number.MAX_SAFE_INTEGER, 0, "index"),
-            maxChars: boundedInteger(params.maxChars, 1_000, this.webConfig.fetch.maxOutputChars, this.webConfig.fetch.maxOutputChars, "maxChars"),
-            refresh: optionalBoolean(params.refresh, false, "refresh"),
-            ...(optionalString(params.find) ? { find: optionalString(params.find) } : {}),
+            url,
+            index,
+            maxChars,
+            refresh,
+            ...(find ? { find } : {}),
             ...(columns ? { columns } : {}),
             signal,
           });
-          return textResult(formatPage(rendered, "BrowserExtract", "Rendered"), { response: rendered });
+          return textResult(formatPage(rendered, "BrowserExtract", "Rendered"), { response: rendered, request: requestDetails });
         } catch (error) {
-          return textResult(`BrowserExtract failed: ${messageOf(error)}`, { error: messageOf(error) }, true);
+          return textResult(`BrowserExtract failed: ${messageOf(error)}`, { error: messageOf(error), ...(requestDetails ? { request: requestDetails } : {}) }, true);
         }
       },
     });

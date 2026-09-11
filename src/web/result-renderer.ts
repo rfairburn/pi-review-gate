@@ -180,10 +180,6 @@ export function renderExpandedWebSearchResult(
   return renderExpandedSearch(value, options, theme, context);
 }
 
-/** Short aliases for callers that name the search family without `Web`. */
-export const renderSearchResult = renderWebSearchResult;
-export const renderExpandedSearchResult = renderExpandedWebSearchResult;
-
 function renderCollapsedAcquisition(
   value: unknown,
   options: WebResultRenderOptions,

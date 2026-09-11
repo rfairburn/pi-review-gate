@@ -182,11 +182,6 @@ export const deferredToolSearchRenderResult = expandableResult(
   renderExpandedDeferredToolResult,
 ) as ToolResultRenderCallback;
 
-/** Descriptive aliases for tests and callers that use the registered name. */
-export const renderSearchToolsResult = renderDeferredToolResult;
-export const renderExpandedSearchToolsResult = renderExpandedDeferredToolResult;
-export const searchToolsRenderResult = deferredToolSearchRenderResult;
-
 function collapsedHeader(outcome: SearchOutcome, suffix?: string): string {
   const parts = ["search_tools"];
   if (outcome.query !== undefined) parts.push(`"${compactWhitespace(outcome.query)}"`);

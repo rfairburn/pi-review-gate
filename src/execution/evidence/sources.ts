@@ -14,7 +14,6 @@
  */
 import { opendir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { ExecutorSelection } from "../../config";
 import type { OperationRecord } from "../operation-record";
 import { EvidenceRefusalError, capped, evidenceErrorMessage, finalizeSource, omittedNote, readBoundedJson, resolveReadableArtifact, resolveReadableDirectory, sha256HexOf, streamJsonlBounded } from "./artifacts";
 import { REVIEW_CYCLE_MARKER_NAME, REVIEW_CYCLE_RECORD_NAME, indexReviewCycleSource, indexReviewCycleUnpublishedSource } from "./review-cycles";
@@ -49,11 +48,6 @@ function str(value: unknown): string | undefined {
 
 function num(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-export function selectionLabel(selection: ExecutorSelection | undefined): string | undefined {
-  if (!selection) return undefined;
-  return selection.source === "pi" ? `pi/${selection.model}` : selection.id;
 }
 
 function firstAtOf(records: RawEvidenceRecord[]): string | undefined {

@@ -294,8 +294,8 @@ function callerReleaseConditions(): void {
 function callerRunsOnlyAfterBothRequiredChecks(): void {
   const source = readWorkflow();
   const release = releaseJobBlock();
-  assert.match(release, /needs: \[verify, full-tests\]/,
-    "the publisher must need both required check jobs");
+  assert.match(release, /needs: \[verify, full-tests, windows-launcher\]/,
+    "the publisher must need Linux verification and native Windows launcher checks");
   assert.match(source, /^  verify:$/m);
   assert.match(source, /^  full-tests:$/m);
   // GitHub evaluates a needed job as failure when it fails OR is skipped; the
@@ -303,7 +303,7 @@ function callerRunsOnlyAfterBothRequiredChecks(): void {
   // only as long as the condition is not overridden.
   assert.doesNotMatch(release, /always\(\)|failure\(\)|cancelled\(\)/,
     "overriding the implicit success() guard would let failed or skipped checks publish");
-  for (const neededJob of ["verify", "full-tests"]) {
+  for (const neededJob of ["verify", "full-tests", "windows-launcher"]) {
     const job = blockOf(source, neededJob, 2);
     assert.doesNotMatch(job, /continue-on-error/,
       `a continue-on-error step or job in ${neededJob} would convert failure into success upstream of the publisher`);

@@ -36,8 +36,9 @@ Behavioral detail lives in the linked pages.
     repository). Review-only use without Git still works; with Git, ignored files are
     excluded from capture by Git's own enumeration.
 
-- **Python 3, for `WebSearch`** — user-installed (`python3` with the standard
-  `venv`/`pip` tooling); the pinned DDGS environment it fills is created and managed
+- **Python 3, for `WebSearch`** — user-installed with the standard `venv`/`pip`
+  tooling (`python3` on macOS/Linux; the Windows launcher probes `python3`, then
+  `python`); the pinned DDGS environment it fills is created and managed
   automatically below. No other runtime feature uses Python.
 - **Bash and standard Unix command-line utilities, for the current `.sh` launchers.**
   These scripts use tools such as `dirname`, `mkdir`, `mktemp`, `chmod`, `cp`, and
@@ -50,8 +51,9 @@ Behavioral detail lives in the linked pages.
 
 On Windows, Git must still be available on `PATH` for delegated execution; Git for
 Windows supplies the executable. Requiring Git does not itself require using its
-bundled Bash as the launch shell. Current `.sh` launcher requirements and ShellStart's
-POSIX requirements are separate limitations, not proof of native Windows support.
+bundled Bash as the launch shell. The native `.cmd` launcher needs no Bash or WSL;
+ShellStart's POSIX requirements remain a separate limitation. Launcher verification
+alone does not establish native Windows worktree/landing/recovery compatibility.
 Minimum Git, Python, and external harness versions are not pinned in the package
 engine declaration; do not interpret that absence as verification of every version.
 
@@ -59,8 +61,10 @@ engine declaration; do not interpret that absence as verification of every versi
 
 - **The `WebSearch` DDGS environment** — the launcher and the `pi-review-web.sh`
   wrapper automatically create, validate, and repair a per-user venv containing the
-  pinned `ddgs==9.15.0` (`~/.cache/pi-review-gate` by default; relocatable via
-  `PI_REVIEW_GATE_DDGS_VENV` and `XDG_CACHE_HOME`). Creating or repairing that venv
+  pinned `ddgs==9.15.0` (the Windows launcher performs equivalent native provisioning
+  with a `Scripts\\python.exe` venv; the `.sh` helpers use `bin/python`). The cache is
+  `~/.cache/pi-review-gate` by default, relocatable via
+  `PI_REVIEW_GATE_DDGS_VENV` and `XDG_CACHE_HOME`. Creating or repairing that venv
   needs package-index access; a valid cached environment is only validated, so
   launches can succeed offline. Management fails closed when the environment cannot
   be established. Each `WebSearch` call then runs Python at search time: the wrappers
@@ -182,14 +186,14 @@ behavior, including its DDGS provisioning (natively, in a `Scripts\python.exe` v
 environment) and the same exit codes; the POSIX launcher remains the macOS/Linux entry.
 Other portable launchers are not completed.
 
-The launcher builds the extension (when sources are present), selects the first existing
+The launcher selects the first existing
 config — `review-gate.json` in the Pi agent directory (`~/.pi/agent/review-gate.json`,
 following Pi's `PI_CODING_AGENT_DIR` override) or the compatibility fallback
 `~/.config/pi-review-gate/config.json` — creating a private zero-model default config
 at the default location when neither exists. A config that exists only at the fallback
 location remains selected unchanged. It builds the extension when sources are present,
 creates and validates the pinned `WebSearch` environment with `scripts/ensure-ddgs.sh`
-(creating or repairing that venv requires `python3` on `PATH`; see
+on macOS/Linux or the native Node helper on Windows (see
 [Prerequisites](#prerequisites)), then
 refreshes the discoverable orchestration skill at
 `~/.agents/skills/orchestrator/SKILL.md` (including its recovery runbook), and then
@@ -201,7 +205,7 @@ the same behavior from cmd.exe or PowerShell without Bash or WSL. The extension 
 arguments are forwarded unchanged. To limit the orchestrator, pass Pi's native tool
 allowlist through the wrapper, for example
 `./scripts/pi-review-gate.sh --tools read,bash,edit,write`
-(or `scripts\pi-review-gate.cmd --tools read,bash,edit,write` on Windows).
+(or `scripts\pi-review-gate.cmd --tools read,powershell,edit,write` on Windows).
 
 For development, load the built extension directly into your pi host:
 

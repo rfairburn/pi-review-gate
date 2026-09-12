@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.40]
+
+### Added
+
+- Add a native Windows `.cmd` launcher and Node helper with configuration discovery,
+  first-launch initialization, development rebuilds, packaged-extension handling,
+  native pinned-DDGS setup, skill refresh, argument forwarding, and exit propagation.
+  Ship the entry point as `pi-review-gate-cmd` and gate publishing on native Windows
+  launcher tests; the macOS/Linux launcher remains unchanged
+  ([#108](https://github.com/rfairburn/pi-review-gate/issues/108)).
+
 ## [0.1.0-dev.39]
 
 ### Documentation

@@ -80,7 +80,7 @@ receipts of exactly what the model was told.
   [Security model](docs/security-model.md#secrets-and-authentication).
 
 Two web-tool dependencies sit outside the npm tree: `WebSearch` needs a user-installed
-`python3` interpreter, and the launcher automatically creates and validates the pinned
+Python 3 interpreter (`python3`, or also `python` on Windows), and the launcher creates and validates the pinned
 DDGS venv for it at launch (creating or repairing that venv needs package-index access;
 a valid cached environment starts offline). `npm install` downloads Playwright's
 Chromium for `BrowserExtract` and the interactive browser tools unless skipped.
@@ -143,7 +143,8 @@ first-launch initialization (deliberately ignoring an inherited `PI_REVIEW_GATE_
 development rebuilds versus the packaged artifact, the pinned DDGS web-search dependency
 (provisioned natively in a `Scripts\python.exe` virtual environment — no `.sh` execution),
 the orchestrator skill refresh, launch diagnostics, argument forwarding, and exit codes.
-It requires Node.js 20+ (and Python 3 for web-search provisioning) on PATH.
+The helper requires Node.js 20+ and Python 3 for web-search provisioning on PATH;
+Pi's own Node.js requirement still applies (see [Prerequisites](#prerequisites)).
 
 The first launch prints a notice when it creates the default config; automatic review
 stays off until at least one reviewer is selected.

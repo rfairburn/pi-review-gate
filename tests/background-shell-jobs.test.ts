@@ -598,6 +598,8 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     expect(idx !== -1, "capture the command status immediately, inside its scope").toBe(true);
     const holder = wrapped.indexOf("$__pi_review_status = @($null, $null)");
     expect(holder !== -1 && holder < idx, "mutable status holder belongs to the outer scope").toBe(true);
+    expect(wrapped.slice(idx + block.length).startsWith("\n$__pi_review_invocation_ok = $?"), "capture invocation status immediately for early return").toBe(true);
+    expect(wrapped).toContain("if ($null -eq $__pi_review_status[0]) { $__pi_review_status[0] = $__pi_review_invocation_ok; $__pi_review_status[1] = $LASTEXITCODE }");
   });
 
   it("preserves the exit status", () => {

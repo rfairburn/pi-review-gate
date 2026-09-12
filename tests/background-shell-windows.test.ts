@@ -15,18 +15,19 @@
  * job; a failure to establish ownership aborts before any unprotected run.
  * The POSIX Bash path (process groups, negative-pid signalling) is covered by
  * background-shell-integration.test.ts on Linux/macOS; nothing in this file
- * mocks a shell — the PATH manipulation below changes what `where` really
- * finds.
+ * mocks a shell — the PATH fixture below changes what `where` really finds,
+ * and every fallback case proves its preconditions (pwsh.exe genuinely
+ * absent, real 5.x powershell.exe retained) before it runs.
  */
 import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
 import { spawn, spawnSync } from "node:child_process";
-import { dirname, join } from "node:path";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
 import { POWERSHELL_ARGS, wrapWithPowerShellWatchdog } from "../src/background-shell/jobs";
-import { resolveWindowsPowerShell, spawnBackgroundJob } from "../src/background-shell/shell";
+import { findWindowsExecutable, resolveWindowsPowerShell, spawnBackgroundJob } from "../src/background-shell/shell";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 
 const IS_WINDOWS = process.platform === "win32";
@@ -72,6 +73,22 @@ async function until(fn: () => boolean | Promise<boolean>, ms = 20_000): Promise
   }
 }
 
+/** Poll ShellLog until `pred` matches, retaining the last observed log so a
+ *  timeout fails with the actual output instead of a bare `false`. */
+async function untilLog(
+  call: (name: string, params: any) => Promise<any>,
+  id: string,
+  pred: (text: string) => boolean,
+  ms = 20_000,
+): Promise<{ ok: boolean; log: string }> {
+  let log = "";
+  const ok = await until(async () => {
+    log = textOf(await call("ShellLog", { id }));
+    return pred(log);
+  }, ms);
+  return { ok, log };
+}
+
 function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -104,12 +121,119 @@ function countShellProcesses(): number {
   return total;
 }
 
-/** The PATH entry that actually contains pwsh.exe (runner-layout independent). */
-function pwshDir(): string | null {
+/** Normalize a Windows PATH entry for comparison: trim, drop trailing
+ *  separators (a root like C:\ keeps its), lowercase. */
+function normalizePathEntry(entry: string): string {
+  let e = entry.trim();
+  while (e.length > 3 && e.endsWith("\\")) e = e.slice(0, -1);
+  return e.toLowerCase();
+}
+
+/** Every directory that can still resolve pwsh.exe under `pathValue`: the
+ *  directories of ALL lines `where pwsh.exe` reports (not just the first — a
+ *  second copy on PATH defeats the fallback just as well) plus any PATH entry
+ *  that actually contains a pwsh.exe file. */
+function pwshResolvingDirs(pathValue: string): Set<string> {
+  const dirs = new Set<string>();
   const result = spawnSync("where", ["pwsh.exe"], { encoding: "utf-8" });
-  if (result.status !== 0 || !result.stdout) return null;
-  const first = result.stdout.trim().split(/\r?\n/)[0];
-  return first ? dirname(first) : null;
+  if (!result.error && result.stdout) {
+    for (const line of result.stdout.trim().split(/\r?\n/)) {
+      const d = dirname(line.trim());
+      if (d) dirs.add(normalizePathEntry(d));
+    }
+  }
+  for (const entry of pathValue.split(";")) {
+    if (!entry.trim()) continue;
+    try {
+      if (existsSync(join(entry, "pwsh.exe"))) dirs.add(normalizePathEntry(entry));
+    } catch {
+      /* unreadable entry: `where` already covered it */
+    }
+  }
+  return dirs;
+}
+
+/** The single fixture every Windows-PowerShell-5.1 case shares: run `fn` with
+ *  a PATH that genuinely resolves NO pwsh.exe while retaining real Windows
+ *  PowerShell 5.1 and the executables this suite needs (where/tasklist for
+ *  the probes, powershell.exe itself, node's own directory). The preconditions
+ *  are PROVEN under the reduced PATH with the production discovery before
+ *  `fn` runs — a missing prerequisite fails with an actionable error, never
+ *  an early-return no-op pass:
+ *   1. findWindowsExecutable("pwsh.exe") is null (what ShellStart itself runs);
+ *   2. resolveWindowsPowerShell() resolves to basename powershell.exe;
+ *   3. that executable reports a 5.x $PSVersionTable.PSVersion (edition probe);
+ *   4. where.exe/tasklist.exe still resolve, and node's directory survives.
+ *  `fn` receives the verified powershell.exe path so identity assertions can
+ *  compare against it. */
+async function withWindowsPowerShell51(fn: (powershellExe: string) => Promise<void>): Promise<void> {
+  const original = process.env.PATH ?? "";
+  const drop = pwshResolvingDirs(original);
+  const kept: string[] = [];
+  for (const entry of original.split(";")) {
+    if (!entry.trim()) continue;
+    if (drop.has(normalizePathEntry(entry))) continue;
+    kept.push(entry);
+  }
+  const reduced = kept.join(";");
+  process.env.PATH = reduced;
+  try {
+    // 1. pwsh.exe is genuinely gone, per the production discovery itself.
+    const leftover = findWindowsExecutable("pwsh.exe");
+    if (leftover !== null) {
+      throw new Error(
+        `5.1 fallback fixture failed: pwsh.exe still resolves after removing ${[...drop].join(", ")} — ` +
+          `found at ${leftover}. Reduced PATH: ${reduced}`,
+      );
+    }
+    // 2. Windows PowerShell itself must still resolve, and be the built-in
+    //    edition by basename (pwsh.exe is excluded by check 1).
+    let powershellExe: string;
+    try {
+      powershellExe = resolveWindowsPowerShell();
+    } catch (err) {
+      throw new Error(
+        `5.1 fallback fixture failed: no PowerShell left on the reduced PATH after removing ${[...drop].join(", ")} — ` +
+          `${(err as Error).message} Reduced PATH: ${reduced}`,
+      );
+    }
+    if (basename(powershellExe).toLowerCase() !== "powershell.exe") {
+      throw new Error(
+        `5.1 fallback fixture failed: expected powershell.exe, resolved ${powershellExe}. Reduced PATH: ${reduced}`,
+      );
+    }
+    // 3. Edition probe: the retained shell must report Windows PowerShell 5.x.
+    const probe = spawnSync(
+      powershellExe,
+      [...POWERSHELL_ARGS, "Write-Output \"$($PSVersionTable.PSVersion)\""],
+      { encoding: "utf-8", timeout: 20_000, windowsHide: true },
+    );
+    const version = (probe.stdout ?? "").trim();
+    if (probe.error || probe.status !== 0 || !/^5\.\d/.test(version)) {
+      throw new Error(
+        `5.1 fallback fixture failed: ${powershellExe} did not report a 5.x PowerShell version ` +
+          `(status ${probe.status}, output ${JSON.stringify(version)}, stderr ${JSON.stringify((probe.stderr ?? "").trim())}).`,
+      );
+    }
+    // 4. The probes and the suite itself still work under the reduced PATH.
+    for (const tool of ["where.exe", "tasklist.exe"]) {
+      if (findWindowsExecutable(tool) === null) {
+        throw new Error(
+          `5.1 fallback fixture failed: ${tool} no longer resolves after removing pwsh directories. Reduced PATH: ${reduced}`,
+        );
+      }
+    }
+    const nodeDir = normalizePathEntry(dirname(process.execPath));
+    const hadNodeDir = original.split(";").some((e) => e.trim() !== "" && normalizePathEntry(e) === nodeDir);
+    if (hadNodeDir && !kept.some((e) => normalizePathEntry(e) === nodeDir)) {
+      throw new Error(
+        `5.1 fallback fixture failed: node's directory (${dirname(process.execPath)}) was removed together with the pwsh directories. Reduced PATH: ${reduced}`,
+      );
+    }
+    await fn(powershellExe);
+  } finally {
+    process.env.PATH = original;
+  }
 }
 
 /** Run `fn` with process.env.PATH replaced, restoring it afterwards. */
@@ -142,17 +266,12 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
     expect(result.details.command, "command").toBe("Write-Output (Get-Process -Id $PID).Path; exit 0");
 
     const id = textOf(result).match(/as (job\d+)/)![1];
-    expect(await until(async () => textOf(await call("ShellLog", { id })).includes("pwsh.exe"))).toBe(true);
+    const { ok, log } = await untilLog(call, id, (t) => t.includes("pwsh.exe"));
+    expect(ok, `expected the launched shell to be pwsh.exe; observed ShellLog:\n${log}`).toBe(true);
   });
 
   it("falls back to powershell.exe when pwsh.exe is absent from PATH", SKIP, async () => {
-    const dir = pwshDir();
-    if (!dir) return; // nothing to strip: pwsh already absent, default path covered above
-    const reduced = (process.env.PATH ?? "")
-      .split(";")
-      .filter((entry) => entry && entry.toLowerCase() !== dir.toLowerCase())
-      .join(";");
-    await withPath(reduced, async () => {
+    await withWindowsPowerShell51(async (powershellExe) => {
       const { call } = wire();
       const result = await call("ShellStart", {
         command: "Write-Output (Get-Process -Id $PID).Path; exit 0",
@@ -160,11 +279,13 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
       });
       expectNoError(result);
       const id = textOf(result).match(/as (job\d+)/)![1];
-      const log = await until(async () => {
-        const text = textOf(await call("ShellLog", { id }));
-        return text.includes("powershell.exe") && !text.includes("pwsh.exe");
-      });
-      expect(log, "resolved to Windows PowerShell").toBe(true);
+      // Identity, not mere absence of the other name: the launched shell's own
+      // reported path must equal the powershell.exe the fixture verified.
+      const { ok, log } = await untilLog(
+        call, id,
+        (t) => t.toLowerCase().includes(powershellExe.toLowerCase()),
+      );
+      expect(ok, `expected the launched shell to be ${powershellExe}; observed ShellLog:\n${log}`).toBe(true);
     });
   });
 
@@ -193,7 +314,8 @@ describe("ShellStart on native Windows: invocation and encoding (#99)", () => {
       command: "Write-Output \"héllo wörld 世界\"; exit 0",
       label: "ps-utf8",
     })).match(/as (job\d+)/)![1];
-    expect(await until(async () => textOf(await call("ShellLog", { id })).includes("héllo wörld 世界"))).toBe(true);
+    const { ok, log } = await untilLog(call, id, (t) => t.includes("héllo wörld 世界"));
+    expect(ok, `expected UTF-8 round-trip; observed ShellLog:\n${log}`).toBe(true);
   });
 
   it("handles spaces and quoting in commands", SKIP, async () => {
@@ -203,44 +325,48 @@ describe("ShellStart on native Windows: invocation and encoding (#99)", () => {
       "Write-Output \"path=$p\"\n" +
       "Write-Output 'a \"quoted\" word'; exit 0";
     const id = textOf(await call("ShellStart", { command, label: "ps-quote" })).match(/as (job\d+)/)![1];
-    expect(await until(async () => {
-      const log = textOf(await call("ShellLog", { id }));
-      return log.includes("path=C:\\Program Files\\PowerShell") && log.includes('a "quoted" word');
-    })).toBe(true);
+    const { ok, log } = await untilLog(
+      call, id,
+      (t) => t.includes("path=C:\\Program Files\\PowerShell") && t.includes('a "quoted" word'),
+    );
+    expect(ok, `expected quoted path output; observed ShellLog:\n${log}`).toBe(true);
   });
 
-  // Exit-status contract, exercised on BOTH PowerShell editions: the default
-  // PATH resolves pwsh (PowerShell 7), the reduced PATH resolves the built-in
-  // Windows PowerShell 5.1 — proven by the discovery tests above.
+  // Exit-status contract, exercised on BOTH explicitly proven editions: the
+  // pwsh case asserts the default PATH resolves pwsh.exe before it runs, and
+  // withWindowsPowerShell51 proves pwsh absence + a real 5.x powershell.exe
+  // for the fallback run — each matrix verifies its own precondition.
   const EXIT_CASES: Array<{ name: string; command: string; code: number }> = [
     { name: "successful cmdlet", command: "Write-Output ok", code: 0 },
     { name: "failed cmdlet (no native status)", command: "Get-ChildItem C:\\definitely\\not\\a\\real\\path-pi-review", code: 1 },
     { name: "nonzero native exit", command: "cmd /c exit 7", code: 7 },
     { name: "explicit exit N", command: "exit 3", code: 3 },
+    // Status edges from the independent review: a plain `return` leaves the
+    // child scope before any tail status capture, so a successful return must
+    // still map to 0 — and a native status set BEFORE the return must survive
+    // it ($LASTEXITCODE propagation), on both editions.
+    { name: "successful return", command: "Write-Output returned; return", code: 0 },
+    { name: "terminating throw", command: "throw 'native-test-failure'", code: 1 },
+    { name: "nonzero native exit then return", command: "cmd /c exit 7; return", code: 7 },
   ];
 
-  async function runExitMatrix(edition: string, pathValue: string | null): Promise<void> {
-    await withPath(pathValue, async () => {
-      for (const testCase of EXIT_CASES) {
-        const { sent, call } = wire();
-        await call("ShellStart", { command: testCase.command, label: `ps-exit-${testCase.code}` });
-        expect(await until(() => sent.length > 0), `${edition}: ${testCase.name} exit wake`).toBe(true);
-        expect(sent[0].content, `${edition}: ${testCase.name}`).toContain(`exited ${testCase.code}`);
-      }
-    });
+  async function runExitMatrix(edition: string): Promise<void> {
+    for (const testCase of EXIT_CASES) {
+      const { sent, call } = wire();
+      await call("ShellStart", { command: testCase.command, label: `ps-exit-${testCase.name.replace(/\s+/g, "-")}` });
+      expect(await until(() => sent.length > 0), `${edition}: ${testCase.name} exit wake`).toBe(true);
+      expect(sent[0].content, `${edition}: ${testCase.name}`).toContain(`exited ${testCase.code}`);
+    }
   }
   it("maps exit status correctly on PowerShell 7 (pwsh)", SKIP, async () => {
-    await runExitMatrix("pwsh", null);
+    // Prove the edition before trusting the label: default PATH resolves pwsh.
+    const exe = resolveWindowsPowerShell();
+    expect(basename(exe).toLowerCase(), "default PATH resolves pwsh.exe").toBe("pwsh.exe");
+    await runExitMatrix("pwsh");
   });
 
   it("maps exit status correctly on Windows PowerShell 5.1 (powershell.exe)", SKIP, async () => {
-    const dir = pwshDir();
-    if (!dir) return; // pwsh already absent: the 5.1 edition IS the default path here
-    const reduced = (process.env.PATH ?? "")
-      .split(";")
-      .filter((entry) => entry && entry.toLowerCase() !== dir.toLowerCase())
-      .join(";");
-    await runExitMatrix("powershell.exe", reduced);
+    await withWindowsPowerShell51(() => runExitMatrix("powershell.exe"));
   });
 
   it("delivers ShellSend text to the job's stdin", SKIP, async () => {
@@ -252,14 +378,16 @@ describe("ShellStart on native Windows: invocation and encoding (#99)", () => {
     await new Promise((r) => setTimeout(r, 800)); // let the shell reach ReadLine
     const sent = await call("ShellSend", { id, text: "hello" });
     expect(sent.isError, "send").toBe(false);
-    expect(await until(async () => textOf(await call("ShellLog", { id })).includes("got:hello"))).toBe(true);
+    const { ok, log } = await untilLog(call, id, (t) => t.includes("got:hello"));
+    expect(ok, `expected stdin delivery; observed ShellLog:\n${log}`).toBe(true);
   });
 });
 
 describe("ShellStart on native Windows: lifecycle and cleanup (#99)", () => {
   // The one that matters most. A grandchild started under the shell must die
-  // with ShellStop — taskkill /F /T walks the tree the way negative-pid group
-  // signalling does on POSIX.
+  // with ShellStop: the stop file makes the surviving watchdog call
+  // TerminateJobObject on the job object — the Windows counterpart of
+  // negative-pid group signalling on POSIX (no taskkill, no pid targeting).
   it("ShellStop kills the whole process tree, not just the shell", SKIP, async () => {
     const { call } = wire();
     const id = textOf(await call("ShellStart", {
@@ -269,8 +397,9 @@ describe("ShellStart on native Windows: lifecycle and cleanup (#99)", () => {
       label: "ps-tree",
     })).match(/as (job\d+)/)![1];
 
-    expect(await until(async () => textOf(await call("ShellLog", { id })).includes("GRANDCHILD="))).toBe(true);
-    const grandchild = Number(textOf(await call("ShellLog", { id })).match(/GRANDCHILD=(\d+)/)![1]);
+    const { ok, log } = await untilLog(call, id, (t) => t.includes("GRANDCHILD="));
+    expect(ok, `expected GRANDCHILD= in ShellLog; observed:\n${log}`).toBe(true);
+    const grandchild = Number(log.match(/GRANDCHILD=(\d+)/)![1]);
     expect(pidAlive(grandchild), "grandchild alive before stop").toBe(true);
 
     await call("ShellStop", { id });
@@ -317,13 +446,7 @@ describe("ShellStart on native Windows: lifecycle and cleanup (#99)", () => {
   });
 
   it("kills the job and its descendants when its parent disappears (Windows PowerShell 5.1)", SKIP, async () => {
-    const dir = pwshDir();
-    if (!dir) return; // pwsh already absent: the 5.1 edition IS the default path here
-    const reduced = (process.env.PATH ?? "")
-      .split(";")
-      .filter((entry) => entry && entry.toLowerCase() !== dir.toLowerCase())
-      .join(";");
-    await withPath(reduced, runParentDeath);
+    await withWindowsPowerShell51(runParentDeath);
   });
 
   // An explicit `exit N` terminates the shell before any trailing cleanup; the
@@ -350,13 +473,7 @@ describe("ShellStart on native Windows: lifecycle and cleanup (#99)", () => {
   });
 
   it("explicit exit N disposes the watchdog and keeps code N (Windows PowerShell 5.1)", SKIP, async () => {
-    const dir = pwshDir();
-    if (!dir) return; // pwsh already absent: the 5.1 edition IS the default path here
-    const reduced = (process.env.PATH ?? "")
-      .split(";")
-      .filter((entry) => entry && entry.toLowerCase() !== dir.toLowerCase())
-      .join(";");
-    await withPath(reduced, runExplicitExitLeakCheck);
+    await withWindowsPowerShell51(runExplicitExitLeakCheck);
   });
 
   it("reapAll leaves nothing running", SKIP, async () => {
@@ -367,8 +484,9 @@ describe("ShellStart on native Windows: lifecycle and cleanup (#99)", () => {
         "Write-Output \"GRANDCHILD=$($p.Id)\"; Wait-Process -Id $p.Id",
       label: "ps-leak",
     })).match(/as (job\d+)/)![1];
-    expect(await until(async () => textOf(await call("ShellLog", { id })).includes("GRANDCHILD="))).toBe(true);
-    const grandchild = Number(textOf(await call("ShellLog", { id })).match(/GRANDCHILD=(\d+)/)![1]);
+    const { ok, log } = await untilLog(call, id, (t) => t.includes("GRANDCHILD="));
+    expect(ok, `expected GRANDCHILD= in ShellLog; observed:\n${log}`).toBe(true);
+    const grandchild = Number(log.match(/GRANDCHILD=(\d+)/)![1]);
 
     reapAll();
     expect(await until(() => !pidAlive(grandchild), 20_000)).toBe(true);
@@ -411,8 +529,9 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       const readiness = new BackgroundProcessReadiness();
       expect(readiness.observeToolResult("ShellStart", result) !== undefined, "tracked").toBe(true);
 
-      expect(await until(async () => textOf(await call("ShellLog", { id })).includes("GRANDCHILD="), 30_000)).toBe(true);
-      const grandchild = Number(textOf(await call("ShellLog", { id })).match(/GRANDCHILD=(\d+)/)![1]);
+      const { ok, log } = await untilLog(call, id, (t) => t.includes("GRANDCHILD="), 30_000);
+      expect(ok, `expected GRANDCHILD= in ShellLog; observed:\n${log}`).toBe(true);
+      const grandchild = Number(log.match(/GRANDCHILD=(\d+)/)![1]);
 
       // The root exits on its own (the wrapper ran `exit 0`)...
       expect(await until(() => !pidAlive(rootPid), 30_000)).toBe(true);
@@ -480,13 +599,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   });
 
   it("terminates descendants when the host dies after the root has exited (Windows PowerShell 5.1)", SKIP, async () => {
-    const dir = pwshDir();
-    if (!dir) return; // pwsh already absent: the 5.1 edition IS the default path here
-    const reduced = (process.env.PATH ?? "")
-      .split(";")
-      .filter((entry) => entry && entry.toLowerCase() !== dir.toLowerCase())
-      .join(";");
-    await withPath(reduced, runHostDeathAfterRootExit);
+    await withWindowsPowerShell51(runHostDeathAfterRootExit);
   });
 
   // Fail-closed ownership establishment: a marker path that is an existing
@@ -579,8 +692,9 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       const id = textOf(result).match(/as (job\d+)/)![1];
       const rootPid = result.details.pid as number;
 
-      expect(await until(async () => textOf(await call("ShellLog", { id })).includes("GRANDCHILD="), 30_000)).toBe(true);
-      const grandchild = Number(textOf(await call("ShellLog", { id })).match(/GRANDCHILD=(\d+)/)![1]);
+      const { ok, log } = await untilLog(call, id, (t) => t.includes("GRANDCHILD="), 30_000);
+      expect(ok, `expected GRANDCHILD= in ShellLog; observed:\n${log}`).toBe(true);
+      const grandchild = Number(log.match(/GRANDCHILD=(\d+)/)![1]);
 
       // The root exits on its own; the owned descendant keeps readiness blocked...
       expect(await until(() => !pidAlive(rootPid), 30_000)).toBe(true);
@@ -607,13 +721,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   });
 
   it("keeps readiness blocked across watchdog polls until a descendant finishes naturally (Windows PowerShell 5.1)", SKIP, async () => {
-    const dir = pwshDir();
-    if (!dir) return; // pwsh already absent: the 5.1 edition IS the default path here
-    const reduced = (process.env.PATH ?? "")
-      .split(";")
-      .filter((entry) => entry && entry.toLowerCase() !== dir.toLowerCase())
-      .join(";");
-    await withPath(reduced, runNaturalCompletion);
+    await withWindowsPowerShell51(runNaturalCompletion);
   });
 });
 

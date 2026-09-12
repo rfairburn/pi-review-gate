@@ -824,6 +824,11 @@ export function wrapWithPowerShellWatchdog(
     `$__pi_review_status[0] = $?`,
     `$__pi_review_status[1] = $LASTEXITCODE`,
     `}`,
+    // An early return skips the block-tail capture. Read invocation status
+    // immediately, before any statement can overwrite it, and use that pair
+    // only when the command did not reach its normal in-scope capture.
+    `$__pi_review_invocation_ok = $?`,
+    `if ($null -eq $__pi_review_status[0]) { $__pi_review_status[0] = $__pi_review_invocation_ok; $__pi_review_status[1] = $LASTEXITCODE }`,
     // Map the captured pair: a failed cmdlet (false success, no native status)
     // becomes 1; a native failure keeps its own code.
     `if ($null -eq $__pi_review_status[1]) { $__pi_review_status[1] = 0 }`,

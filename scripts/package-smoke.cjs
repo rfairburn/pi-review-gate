@@ -74,6 +74,11 @@ try {
   for (const required of [
     "dist/src/index.js",
     "scripts/pi-review-gate.sh",
+    // Native Windows entry point and its Node helper (issue 108): shipped so
+    // the .cmd launcher works from an npm installation without Bash/WSL,
+    // including the in-helper DDGS provisioning (ensure-ddgs parity).
+    "scripts/pi-review-gate.cmd",
+    "scripts/pi-review-gate-launcher.cjs",
     "scripts/ensure-ddgs.sh",
     "scripts/ddgs-search.py",
     "scripts/orchestrator-system-prompt.md",
@@ -117,6 +122,7 @@ try {
     "source-only .github directory must not ship in the package",
   );
   fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate"), fs.constants.X_OK);
+  fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate-cmd"), fs.constants.X_OK);
   process.stdout.write(`package smoke passed: ${packedName}\n`);
 } finally {
   fs.rmSync(scratch, { recursive: true, force: true });

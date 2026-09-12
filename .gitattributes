@@ -1,0 +1,2 @@
+# Batch launchers must keep CRLF line endings in every checkout (cmd.exe).
+*.cmd text eol=crlf

@@ -138,6 +138,9 @@ function verifyTarball({ tarballPath, extractDir }) {
     "README.md",
     "LICENSE",
     "scripts/pi-review-gate.sh",
+    // Native Windows launcher pair (issue 108) ships with the package.
+    "scripts/pi-review-gate.cmd",
+    "scripts/pi-review-gate-launcher.cjs",
     "skills/orchestrator/SKILL.md",
   ]) {
     if (!entries.includes(required)) problems.push(`required tarball entry missing: ${required}`);
@@ -302,14 +305,18 @@ function verifyInstalledTarball({ tarballPath, scratchRoot, projectRoot, package
       }
     }
 
-    // Bin scripts shipped and linked.
-    for (const bin of ["scripts/pi-review-gate.sh", "scripts/pi-review-web.sh"]) {
+    // Bin scripts shipped and linked (the .cmd pair is the native Windows
+    // entry point, issue 108).
+    for (const bin of ["scripts/pi-review-gate.sh", "scripts/pi-review-web.sh", "scripts/pi-review-gate.cmd", "scripts/pi-review-gate-launcher.cjs"]) {
       if (!fs.statSync(path.join(installed, bin), { throwIfNoEntry: false })?.isFile()) {
         problems.push(`bin script missing from the installed package: ${bin}`);
       }
     }
     if (!fs.statSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate"), { throwIfNoEntry: false })?.isFile()) {
       problems.push("npm did not link the pi-review-gate bin into node_modules/.bin");
+    }
+    if (!fs.statSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate-cmd"), { throwIfNoEntry: false })?.isFile()) {
+      problems.push("npm did not link the pi-review-gate-cmd bin into node_modules/.bin");
     }
 
     // Shipped docs validated with the checkout's own deterministic checker

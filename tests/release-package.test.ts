@@ -145,13 +145,20 @@ function packTinyStage(scratch: string, entryPointSource: string): string {
       name: "pi-review-gate",
       version: DEV_VERSION,
       files: ["dist/src", "scripts"],
-      bin: { "pi-review-gate": "scripts/pi-review-gate.sh", "pi-review-web": "scripts/pi-review-web.sh" },
+      bin: {
+        "pi-review-gate": "scripts/pi-review-gate.sh",
+        "pi-review-gate-cmd": "scripts/pi-review-gate.cmd",
+        "pi-review-web": "scripts/pi-review-web.sh",
+      },
     }),
   );
   writeFileSync(join(stage, "dist", "src", "index.js"), entryPointSource);
   for (const bin of ["pi-review-gate.sh", "pi-review-web.sh"]) {
     writeFileSync(join(stage, "scripts", bin), "#!/bin/sh\nexit 0\n");
   }
+  // The native Windows launcher pair ships with the package (issue 108).
+  writeFileSync(join(stage, "scripts", "pi-review-gate.cmd"), "@echo off\r\nexit /b 0\r\n");
+  writeFileSync(join(stage, "scripts", "pi-review-gate-launcher.cjs"), "process.exit(0);\n");
   return packaging.packStage({ stage, packDestination: scratch });
 }
 

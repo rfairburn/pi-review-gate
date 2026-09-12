@@ -115,6 +115,40 @@ jobs:
       - name: Full test suite
         run: npm run test:run
 
+  windows-launcher:
+    # Native Windows coverage for the .cmd entry point and its Node helper
+    # (issue 108). The compiled launcher-cmd tests include win32-only native
+    # cases (cmd.exe + PowerShell invocation, native DDGS provisioning, exit
+    # codes, packaged mode) that no POSIX simulation can exercise; POSIX-only
+    # cases inside the same file skip themselves. This is a disposable runner
+    # checkout, so building production dist here is safe and exercises the
+    # exact npm toolchain the launcher invokes for development rebuilds.
+    name: Windows launcher (Node 20)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 20.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+        env:
+          PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
+      - name: Build test bundle
+        run: npm run build:test
+      - name: Launcher tests (helper pipeline + native .cmd cases)
+        run: node --test dist-test/tests/launcher-cmd.test.js
+      - name: Launcher development-build seam on native Windows
+        # The same npm script the launcher's development branch executes
+        # (npm --prefix <root> run build), validating the toolchain natively.
+        run: npm run build
+      - name: Static docs validation
+        run: node scripts/check-docs.cjs
+
   release:
     # Publishes the numbered prerelease for a validated main push by calling the
     # reusable builder. It runs only after BOTH required check jobs succeeded:

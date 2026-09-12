@@ -103,6 +103,19 @@ For normal use, use the persistent launcher:
 ./scripts/pi-review-gate.sh
 ```
 
+On Windows, use the native entry point instead (from cmd.exe or PowerShell, without
+Bash or WSL):
+
+```bat
+scripts\pi-review-gate.cmd
+```
+
+From an npm installation on Windows, the command is `pi-review-gate-cmd`. The Windows
+entry pairs a thin `.cmd` file with a Node helper that mirrors the POSIX launcher's
+behavior, including its DDGS provisioning (natively, in a `Scripts\python.exe` virtual
+environment) and the same exit codes; the POSIX launcher remains the macOS/Linux entry.
+Other portable launchers are not completed.
+
 The launcher builds the extension (when sources are present), selects the first existing
 config — `review-gate.json` in the Pi agent directory (`~/.pi/agent/review-gate.json`,
 following Pi's `PI_CODING_AGENT_DIR` override) or the compatibility fallback
@@ -111,13 +124,15 @@ at the default location when neither exists. A config that exists only at the fa
 location remains selected unchanged. It then
 refreshes the discoverable orchestration skill at
 `~/.agents/skills/orchestrator/SKILL.md` (including its recovery runbook), and then
-executes the installed `pi` with the extension. The persistent launcher itself is a
-POSIX-shell script; broader portable launcher support, including Windows, is not
-completed. The extension selects the
+executes the installed `pi` with the extension. On macOS/Linux the persistent launcher
+is a POSIX-shell script; on Windows the native entry point
+(`scripts\pi-review-gate.cmd`, or `pi-review-gate-cmd` from an npm installation) mirrors
+the same behavior from cmd.exe or PowerShell without Bash or WSL. The extension selects the
 [operating-mode prompt](configuration.md#operating-modes); all remaining launcher
 arguments are forwarded unchanged. To limit the orchestrator, pass Pi's native tool
 allowlist through the wrapper, for example
-`./scripts/pi-review-gate.sh --tools read,bash,edit,write`.
+`./scripts/pi-review-gate.sh --tools read,bash,edit,write`
+(or `scripts\pi-review-gate.cmd --tools read,bash,edit,write` on Windows).
 
 For development, load the built extension directly into your pi host:
 

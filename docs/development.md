@@ -128,6 +128,29 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
 `scripts/pi-review-web.sh` similarly provisions DDGS, builds when sources are present,
 and executes `dist/src/web/cli.js`.
 
+`scripts/pi-review-gate.cmd` + `scripts/pi-review-gate-launcher.cjs` (issue 108) are the
+native Windows counterparts of the persistent launcher: the thin `.cmd` passes its raw
+arguments to the helper, which forwards Pi management verbs directly to `pi` (with the
+inherited environment and no setup) and runs everything else natively — deleting an
+inherited `PI_REVIEW_GATE_CONFIG`, resolving
+`PI_CODING_AGENT_DIR` with Pi's native semantics (a deliberate mirror of
+`src/config-path.ts`; keep the two in sync), initializing the zero-model default config
+with exact-destination link publication, rebuilding dist or requiring the packaged
+artifact, provisioning the pinned DDGS dependency in a `Scripts\python.exe` venv
+(`python3`, then `python`, probed for isolated-mode usability; the POSIX
+`scripts/ensure-ddgs.sh` stays the macOS/Linux mechanism), publishing the orchestrator
+skill through an atomic rename, exporting `PI_REVIEW_GATE_DDGS_PYTHON`, and executing
+`pi` with the forwarded arguments and exit status. The helper never reparses arguments
+through a shell: publication runs in-process (`fs.linkSync`/`fs.renameSync`), Python is
+spawned with argument arrays, and pi/npm are executed by resolving their npm `.cmd`
+shim's JavaScript entry point and spawning Node directly (POSIX uses plain `execvp`),
+with a fixed-token cmd.exe fallback only for the development build. A literal `%VAR%`
+typed on a cmd.exe command line is expanded by cmd before the batch sees it (PowerShell
+delivers it literally); POSIX permission modes (0700/0600/0644) are requested for parity
+and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest`
+(`.github/workflows/ci.yml`, focused `launcher-cmd` tests); macOS/Linux behavior of the
+POSIX launcher is unchanged.
+
 The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
 for each new run; the skill provides deeper guidance for decomposition, supervision,
 reviewer interpretation, integration, and synthesis. The launcher does not impose a separate orchestrator policy;

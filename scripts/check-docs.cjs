@@ -193,7 +193,7 @@ function main() {
   const docsDir = path.join(ROOT, "docs");
   if (fs.existsSync(docsDir) && fs.statSync(docsDir).isDirectory()) {
     for (const entry of fs.readdirSync(docsDir)) {
-      if (entry.endsWith(".md")) mdFiles.push(path.join("docs", entry));
+      if (entry.endsWith(".md")) mdFiles.push(rel(path.join(docsDir, entry)));
     }
   }
 

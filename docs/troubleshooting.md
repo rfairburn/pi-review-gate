@@ -92,9 +92,19 @@ underlying behavior.
 - **DDGS provisioning fails during install or launch.** `scripts/ensure-ddgs.sh`
   requires the pinned `ddgs==9.15.0`, binary distributions, and a clean `pip check`; the
   configured PyPI/index source and local pip configuration are part of the trusted setup
-  boundary. See [Web tools](web-tools.md#websearch).
+  boundary. The launcher creates and validates the venv at startup and fails closed:
+  creating or repairing it needs a `python3` interpreter (with `venv`/`pip`) and
+  package-index access, but a valid cached environment is only validated, so launches
+  can succeed offline. See [Web tools](web-tools.md#websearch) and
+  [Getting started](getting-started.md#prerequisites).
 
 ## Delegated execution and landing
+
+- **A subtask start fails with `Git discovery failed`.** Delegated execution requires a
+  Git executable on `PATH` (worker worktrees, capture into a private bare repository,
+  landing, recovery, and diff3 conflict materialization). Install Git and retry; see
+  [Getting started](getting-started.md#prerequisites). Ordinary reviews without
+  delegated execution fall back to filesystem capture, so Git is not required for them.
 
 - **A landing is blocked by a conflict gate.** Resolve the materialized diff3 markers in
   main, then run `SubtasksMarkClean` (or `/subtask-mark-clean`) to verify, checkpoint,

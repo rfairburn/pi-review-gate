@@ -38,6 +38,40 @@ npm run test:package     # stage+build in scratch, npm pack, install-into-consum
 ```
 
 The complete suite (`npm run test:run`) executes up to four test files concurrently.
+
+### Development prerequisites
+
+- **Node.js 20 or newer and npm.** CI exercises Node 20 and Node 24; the optional real
+  runtime regression needs Node 22.19 or newer (see below).
+- **TypeScript and type definitions** arrive as ordinary `devDependencies` via
+  `npm install`; the runtime dependencies (including Playwright, undici, and the HTML/PDF
+  parsing stack) are ordinary npm packages.
+- **A Git executable on `PATH`.** The delegated-execution, capture/landing, conflict,
+  and recovery test tiers drive the real `git` binary (worktrees, private bare
+  repositories, plumbing commands, and `git merge-file`), matching what the production
+  code invokes.
+- **`shellcheck` on `PATH`** for `npm run check:static`, which runs
+  `shellcheck scripts/*.sh`.
+- **Bash and Unix utilities** for launcher and background-process tests; some paths
+  require `/bin/bash` and POSIX process-group behavior. These suites are not evidence
+  of native Windows compatibility. **`tar` on `PATH`** is used to extract release
+  packages by `scripts/release/packaging.cjs` and its verification tests.
+- **Playwright's Chromium build** for the browser test tier. Install-time provisioning
+  covers it; after a skipped install, run `npx playwright install chromium`
+  (`--with-deps` adds Linux OS libraries, as the CI full-suite job does). Static checks,
+  packaging smoke, the pure/unit and execution tiers, and the DDGS-mocked web-tool unit
+  tests do not need Chromium — CI's fast job runs them with provisioning skipped
+  entirely.
+- **Optional: `PI_BROWSER_AGENT_RUNTIME`** pointing at an installed Pi agent-core
+  `dist/index.js` enables `tests/browser-native-error.test.ts` (CI uses
+  `@earendil-works/pi-agent-core@0.85.0`, which needs Node >=22.19; the model stream is
+  mocked, with no live model calls). Without it the test skips itself. See
+  [Web tools](web-tools.md#interactive-browser).
+- **`python3` is not needed by the test suite**: DDGS interactions are mocked. In the
+  runtime, Python is used only by `WebSearch` — launch-time venv creation/validation via
+  `scripts/ensure-ddgs.sh` plus one Python process per search
+  (`src/web/network.ts`).
+
 In a working checkout, compile with `npm run build:test` and then run `npm run
 test:run`: that covers the process, Git, filesystem, and end-to-end tiers before
 finalizing a phase without touching the live `dist/`. `npm test` (and
@@ -119,7 +153,9 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
   config location) fail closed with distinct actionable diagnostics.
 - Builds the extension when `src/index.ts` is present, otherwise requires the packaged
   `dist/src/index.js`.
-- Runs `scripts/ensure-ddgs.sh` to provision the pinned web-search dependency.
+- Runs `scripts/ensure-ddgs.sh` to create, validate, and repair the pinned web-search
+  venv (creating or repairing it requires a `python3` interpreter on `PATH`; fails
+  closed when the environment cannot be established).
 - Refreshes the discoverable orchestration skill at
   `~/.agents/skills/orchestrator/SKILL.md` (and its recovery runbook) from the packaged
   sources, then executes the installed `pi` with the extension, forwarding all
@@ -127,6 +163,33 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
 
 `scripts/pi-review-web.sh` similarly provisions DDGS, builds when sources are present,
 and executes `dist/src/web/cli.js`.
+
+`scripts/pi-review-gate.cmd` + `scripts/pi-review-gate-launcher.cjs` (issue 108) are the
+native Windows counterparts of the persistent launcher: the thin `.cmd` passes its raw
+arguments to the helper, which forwards Pi management verbs directly to `pi` (with the
+inherited environment and no setup) and runs everything else natively — deleting an
+inherited `PI_REVIEW_GATE_CONFIG`, resolving
+`PI_CODING_AGENT_DIR` with Pi's native semantics (a deliberate mirror of
+`src/config-path.ts`; keep the two in sync), initializing the zero-model default config
+with exact-destination link publication, rebuilding dist or requiring the packaged
+artifact, provisioning the pinned DDGS dependency in a `Scripts\python.exe` venv
+(`python3`, then `python`, probed for isolated-mode usability; the POSIX
+`scripts/ensure-ddgs.sh` stays the macOS/Linux mechanism), publishing the orchestrator
+skill through an atomic rename, exporting `PI_REVIEW_GATE_DDGS_PYTHON`, and executing
+`pi` with the forwarded arguments and exit status. The helper never reparses arguments
+through a shell: publication runs in-process (`fs.linkSync`/`fs.renameSync`), Python is
+spawned with argument arrays, and pi/npm are executed by resolving their npm `.cmd`
+shim's JavaScript entry point and spawning Node directly (POSIX uses plain `execvp`),
+with a fixed-token cmd.exe fallback only for the development build. Invoking a `.cmd`
+file from PowerShell still crosses cmd.exe parsing: PowerShell string delimiters alone
+do not protect batch metacharacters. For example, pass `--label '\"a&b|c^d\"'` from
+PowerShell so literal double quotes protect the value through batch forwarding.
+Command-shell expansion (including `%VAR%`) can happen before the helper receives an
+argument; the helper does not perform an additional shell expansion. POSIX permission
+modes (0700/0600/0644) are requested for parity
+and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest`
+(`.github/workflows/ci.yml`, focused `launcher-cmd` tests); macOS/Linux behavior of the
+POSIX launcher is unchanged.
 
 The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
 for each new run; the skill provides deeper guidance for decomposition, supervision,

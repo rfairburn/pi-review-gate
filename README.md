@@ -68,12 +68,25 @@ receipts of exactly what the model was told.
 
 ## Prerequisites
 
-- Node.js 20 or newer.
+- Node.js 20 or newer for this extension; your installed Pi version may require a
+  newer Node.js (see [Getting started](docs/getting-started.md#prerequisites)).
 - Pi, installed independently.
+- Git on `PATH` — required for delegated execution (worker worktrees, capture,
+  landing, recovery, and diff3 conflict materialization); ordinary review evidence
+  capture uses Git when available and falls back to a filesystem walk without it.
 - At least one harness installed and authenticated by its own login/configuration
   (Codex CLI, Claude CLI, a Pi-scoped model, or a generic CLI program). Do not put
   OAuth tokens or API keys in the review-gate config file — see
   [Security model](docs/security-model.md#secrets-and-authentication).
+
+Two web-tool dependencies sit outside the npm tree: `WebSearch` needs a user-installed
+Python 3 interpreter (`python3`, or also `python` on Windows), and the launcher creates and validates the pinned
+DDGS venv for it at launch (creating or repairing that venv needs package-index access;
+a valid cached environment starts offline). `npm install` downloads Playwright's
+Chromium for `BrowserExtract` and the interactive browser tools unless skipped.
+`WebFetch` needs neither. The full inventory, including what is user-installed versus
+automatic, lives in [Getting started](docs/getting-started.md#prerequisites), along
+with the current Bash/Unix requirements of the shell launcher and `ShellStart`.
 
 ## Installation
 
@@ -115,6 +128,23 @@ mkdir -p ~/.pi/agent
 cp /path/to/review-gate.json ~/.pi/agent/review-gate.json
 ./scripts/pi-review-gate.sh
 ```
+
+On Windows, the same launcher is available natively for cmd.exe and PowerShell — no
+Bash, WSL, or PowerShell script execution:
+
+```bat
+scripts\pi-review-gate.cmd
+```
+
+From an npm installation, the Windows entry point is `pi-review-gate-cmd`. The native
+entry pairs a thin `.cmd` file with a Node helper (`scripts/pi-review-gate-launcher.cjs`)
+that mirrors the POSIX launcher end to end: the same configuration discovery and
+first-launch initialization (deliberately ignoring an inherited `PI_REVIEW_GATE_CONFIG`),
+development rebuilds versus the packaged artifact, the pinned DDGS web-search dependency
+(provisioned natively in a `Scripts\python.exe` virtual environment — no `.sh` execution),
+the orchestrator skill refresh, launch diagnostics, argument forwarding, and exit codes.
+The helper requires Node.js 20+ and Python 3 for web-search provisioning on PATH;
+Pi's own Node.js requirement still applies (see [Prerequisites](#prerequisites)).
 
 The first launch prints a notice when it creates the default config; automatic review
 stays off until at least one reviewer is selected.
@@ -163,8 +193,9 @@ shell commands — side-effect evidence and worker shell-tool authorization —
 `powershell` receives the same treatment as `bash`, subject to actual host availability
 and authorization: a tool the host has not registered or authorized is simply not
 exposed, and neither name widens a tool catalog on its own. Plan/research posture
-removes arbitrary shell entirely. Beyond this parity, native Windows operation of the
-portable launcher, provisioning, and worktree support remains incomplete. See
+removes arbitrary shell entirely. The persistent launcher has a native Windows entry
+point (`scripts\pi-review-gate.cmd`, or `pi-review-gate-cmd` from an npm installation).
+Broader native Windows worktree/landing/recovery validation remains incomplete. See
 [Delegated execution](docs/delegated-execution.md#background-shell-tools).
 
 ## How a review turn works

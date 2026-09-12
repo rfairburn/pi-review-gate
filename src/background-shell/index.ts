@@ -3,8 +3,14 @@
  * Copyright 2026 Itay Inbar. Licensed under Apache-2.0.
  * Modified for pi-review-gate; see NOTICE and LICENSES/Apache-2.0.txt.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
+import { spawnBackgroundJob } from "./shell";
+import {
+  requestWindowsOwnershipStop,
+  ownershipVerdict,
+  type BackgroundJobOwnership,
+} from "./ownership";
 import { scheduleForceKill } from "./process";
 import { terminalColumns, truncateLineToWidth } from "./width";
 import {
@@ -27,7 +33,6 @@ import {
   laneDelivery,
   normalizeRules,
   truncateText,
-  wrapWithParentWatchdog,
   type JobMatchers,
   type JobWakeState,
   type WakeEvent,
@@ -125,7 +130,14 @@ function integerSchema(description: string): Record<string, unknown> {
 // a box whose whole constraint is 8GB of it — so session_shutdown reaps
 // everything, with the SIGTERM→SIGKILL escalation borrowed from the sub-coder
 // spawner (PR #102 fixed the version that gated on proc.killed and could never
-// actually fire).
+// actually fire). On Windows there is no signal stage: the per-job stop file
+// asks the owning watchdog to terminate the whole job object, and that watchdog
+// also terminates it on its own when the host disappears (see
+// wrapWithPowerShellWatchdog).
+//
+// Shell: a fixed platform contract (#99) — Bash on macOS/Linux, PowerShell on
+// Windows (pwsh first, then powershell.exe; neither => clear error before any
+// job starts). There is no shell selection in arguments or configuration.
 //
 // Guarding: ShellStart hands a string to a shell. It is registered through the
 // same Pi tool surface as the rest of this harness and remains subject to the
@@ -165,6 +177,13 @@ interface Job {
    * agent_settled only while the job is still running; an exit supersedes it.
    */
   heldWake?: { event: WakeEvent; count: number };
+  /** Windows-only per-job ownership identity (job-object record/stop paths);
+   *  keeps descendants accounted for and cleanable after the shell root exits. */
+  ownership?: BackgroundJobOwnership;
+  /** True while a root-exited job's ownership evidence is missing or
+   *  unreadable: the job stays accounted for (blocking) until verified clear.
+   *  Never true on macOS/Linux (process groups already cover descendants). */
+  ownershipUnverifiable?: boolean;
 }
 
 const jobs = new Map<string, Job>();
@@ -174,6 +193,21 @@ let lifecycleRevision = 0;
 const lifecycleListeners = new Set<(event: BackgroundShellLifecycleEvent) => void>();
 /** Kept so the indicator can repaint from process events that carry no ctx. */
 let uiCtx: any = null;
+
+/** Per-job timers that re-check Windows ownership after the shell root has
+ *  exited but owned descendants may remain; cleared on settle and reapAll. */
+const ownershipReleaseTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+/** True when `pid` names a live process (EPERM means alive-but-protected). */
+function processIsAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
 
 const INDICATOR_KEY = "bg-shell";
 const honey = (s: string) => `\x1b[38;2;225;90;31m${s}\x1b[39m`;
@@ -438,6 +472,71 @@ function handleLine(pi: BackgroundShellHost, job: Job, line: string): void {
   (job.pendingWake as any).unref?.();
 }
 
+/** Settle a job as finished: record exit state, flush the pending line, drop
+ *  held wakes, send the exit wake, and publish the lifecycle event. */
+function settleJob(pi: BackgroundShellHost, job: Job, code: number): void {
+  if (job.exited) return;
+  job.exited = true;
+  job.exitCode = code;
+  job.endedAt = Date.now();
+  // A partial line held back by the pending-line buffer is flushed now — the
+  // stream is over, so it can never complete (same rule as Pi).
+  const remaining = job.pending.flush();
+  if (remaining) {
+    handleLine(pi, job, remaining);
+  }
+  // Drop any held match wake: the exit wake below says everything it would
+  // have, and the exit code besides. A nonurgent wake held for the agent's
+  // benefit is stale the instant the job exits — "still running" would be a
+  // lie — so it goes too; if an exit notice is due it replaces it.
+  if (job.pendingWake) {
+    clearTimeout(job.pendingWake);
+    job.pendingWake = undefined;
+  }
+  job.heldWake = undefined;
+  setIndicator();
+  const event = evaluateExit(code, job.rules);
+  const exitWakeScheduled = event ? deliverWake(pi, job, event, Date.now()) : false;
+  // reapAll() removes jobs before their asynchronous close callbacks arrive.
+  // Such callbacks belong to a dead session and must not wake lifecycle
+  // consumers in a newly started one.
+  if (jobs.get(job.id) === job) publishLifecycle("settled", job, exitWakeScheduled);
+}
+
+/** Stop the per-job ownership re-check for a settled (or reaped) job. */
+function clearOwnershipRelease(job: Job): void {
+  const timer = ownershipReleaseTimers.get(job.id);
+  if (timer) clearInterval(timer);
+  ownershipReleaseTimers.delete(job.id);
+}
+
+/** Re-check a root-exited Windows job's ownership until it is verified
+ *  complete, then settle it with the exit code the shell reported. One-second
+ *  ticks only observe the watchdog's record — its own poll (default 5 s) is
+ *  what bounds how long "running" can be over-reported. */
+function scheduleOwnershipRelease(pi: BackgroundShellHost, job: Job, code: number): void {
+  if (ownershipReleaseTimers.has(job.id)) return;
+  const timer = setInterval(() => {
+    if (job.exited) {
+      clearOwnershipRelease(job);
+      return;
+    }
+    const verdict = ownershipVerdict(
+      job.ownership!.markerPath,
+      processIsAlive(job.proc.pid),
+      processIsAlive,
+    );
+    job.ownershipUnverifiable = verdict === "unverifiable";
+    if (verdict === "clear") {
+      clearOwnershipRelease(job);
+      settleJob(pi, job, code);
+    }
+  }, 1_000);
+  // Never hold the process open on our account.
+  (timer as any).unref?.();
+  ownershipReleaseTimers.set(job.id, timer);
+}
+
 function attachStreams(pi: BackgroundShellHost, job: Job): void {
   const onChunk = (buf: Buffer) => {
     // Bound the pending partial line BEFORE accumulation (finding 4): a
@@ -460,29 +559,23 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
 
   const finish = (code: number | null) => {
     if (job.exited) return;
-    job.exited = true;
-    job.exitCode = code;
-    job.endedAt = Date.now();
-    const remaining = job.pending.flush();
-    if (remaining) {
-      handleLine(pi, job, remaining);
+    // Windows ownership: the shell root exiting does NOT end the job while
+    // owned descendants remain. Settle only when ownership is verified
+    // complete; a missing record after the root exited keeps the job
+    // accounted for (blocking) rather than clearing it.
+    if (process.platform === "win32" && job.ownership && job.proc.pid !== undefined) {
+      const verdict = ownershipVerdict(
+        job.ownership.markerPath,
+        processIsAlive(job.proc.pid),
+        processIsAlive,
+      );
+      if (verdict !== "clear") {
+        job.ownershipUnverifiable = verdict === "unverifiable";
+        scheduleOwnershipRelease(pi, job, code ?? 0);
+        return;
+      }
     }
-    // Drop any held match wake: the exit wake below says everything it would
-    // have, and the exit code besides. A nonurgent wake held for the agent's
-    // benefit is stale the instant the job exits — "still running" would be a
-    // lie — so it goes too; if an exit notice is due it replaces it.
-    if (job.pendingWake) {
-      clearTimeout(job.pendingWake);
-      job.pendingWake = undefined;
-    }
-    job.heldWake = undefined;
-    setIndicator();
-    const event = evaluateExit(code, job.rules);
-    const exitWakeScheduled = event ? deliverWake(pi, job, event, Date.now()) : false;
-    // reapAll() removes jobs before their asynchronous close callbacks arrive.
-    // Such callbacks belong to a dead session and must not wake lifecycle
-    // consumers in a newly started one.
-    if (jobs.get(job.id) === job) publishLifecycle("settled", job, exitWakeScheduled);
+    settleJob(pi, job, code ?? 0);
   };
   job.proc.on("close", (code) => finish(code ?? 0));
   job.proc.on("error", (err) => {
@@ -520,6 +613,16 @@ function ensureStallTimer(pi: BackgroundShellHost): void {
 function signalGroup(job: Job, sig: NodeJS.Signals): void {
   const pid = job.proc.pid;
   if (!pid) return;
+  if (process.platform === "win32") {
+    // Windows has no process groups and no portable signals: the stop file is
+    // the request, and the owning watchdog terminates the whole job object on
+    // its next poll — reaching descendants that outlived the shell root. It
+    // never targets a pid: after the root exits that pid may identify an
+    // unrelated process. There is no weaker stage to escalate from, so `sig`
+    // carries no meaning here.
+    requestWindowsOwnershipStop(job.ownership);
+    return;
+  }
   try {
     process.kill(-pid, sig); // negative pid = the group (spawned detached)
   } catch {
@@ -535,7 +638,8 @@ function killJob(job: Job): void {
   signalGroup(job, "SIGTERM");
   // Same escalation as the sub-coder spawner, gated on real exit rather than
   // proc.killed — which Node sets on dispatch, making the old check unreachable
-  // (PR #102).
+  // (PR #102). On Windows each retry just re-asserts the synchronous stop-file
+  // request; the watchdog acts on it within one poll.
   scheduleForceKill(
     { kill: (s?: any) => { signalGroup(job, (s ?? "SIGKILL") as NodeJS.Signals); return true; } } as any,
     () => job.exited,
@@ -548,8 +652,17 @@ export function reapAll(): void {
   for (const job of jobs.values()) {
     if (job.pendingWake) clearTimeout(job.pendingWake);
     job.heldWake = undefined;
-    if (!job.exited) killJob(job);
+    if (!job.exited) {
+      // On Windows the host may re-raise its signal and exit right after this:
+      // the stop-file request is synchronous, and the watchdog's parent-death
+      // check (host pid gone) terminates each job object as the backstop.
+      if (process.platform === "win32") {
+        requestWindowsOwnershipStop(job.ownership);
+      } else killJob(job);
+    }
   }
+  for (const timer of ownershipReleaseTimers.values()) clearInterval(timer);
+  ownershipReleaseTimers.clear();
   jobs.clear();
   if (stallTimer) {
     clearInterval(stallTimer);
@@ -574,8 +687,16 @@ function installExitHooks(): void {
   exitHooksInstalled = true;
 
   process.on("exit", () => {
-    // Synchronous only — no async work is allowed to run at this point.
-    for (const job of jobs.values()) if (!job.exited) signalGroup(job, "SIGTERM");
+    // Synchronous only — no async work is allowed to run at this point. On
+    // Windows that means the synchronous stop-file request; the watchdog's
+    // parent-death check (host pid gone) terminates each job object as the
+    // backstop once the host is actually gone.
+    for (const job of jobs.values()) {
+      if (job.exited) continue;
+      if (process.platform === "win32") {
+        requestWindowsOwnershipStop(job.ownership);
+      } else signalGroup(job, "SIGTERM");
+    }
   });
 
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as NodeJS.Signals[]) {
@@ -594,7 +715,7 @@ function installExitHooks(): void {
 }
 
 function statusOf(job: Job): string {
-  if (!job.exited) return "running";
+  if (!job.exited) return job.ownershipUnverifiable ? "unverifiable" : "running";
   return job.exitCode === 0 ? "done" : `failed(${job.exitCode})`;
 }
 
@@ -603,10 +724,12 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
     name: "ShellStart",
     label: "ShellStart",
     description:
-      "Start a long-running command in the background and return immediately. Use this instead of " +
-      "bash for anything that takes minutes (training, builds, installs, servers, watchers) — bash " +
-      "blocks until the command exits. Declare what is worth interrupting you for in wake_on; you " +
-      "will be told automatically when it happens, so do NOT poll the job in a loop.",
+      "Start a long-running command in the background and return immediately. The command runs in " +
+      "this platform's fixed shell — Bash on macOS/Linux, PowerShell on Windows (pwsh when available, " +
+      "otherwise Windows PowerShell; there is no shell selection) — so write it in that shell's " +
+      "syntax. Use this instead of the foreground shell tool for anything that takes minutes " +
+      "(training, builds, installs, servers, watchers). Declare what is worth interrupting you for " +
+      "in wake_on; you will be told automatically when it happens, so do NOT poll the job in a loop.",
     parameters: objectSchema({
       command: stringSchema("Shell command to run in the background"),
       label: stringSchema("Short name for this job, e.g. 'finetune'"),
@@ -642,17 +765,20 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
       const rules = params.wake_on ? normalizeRules(params.wake_on) : { ...DEFAULT_RULES };
 
       let proc: ChildProcess;
+      let ownership: BackgroundJobOwnership | undefined;
       try {
-        // detached: its own process group, so the in-job watchdog can take the
-        // whole tree down with `kill -TERM 0` without ever signalling
-        // pi-review-gate, and so we can kill the group rather than just the shell
-        // (a `python train.py` under bash is a grandchild — killing only the
-        // shell would orphan the thing actually holding the GPU).
-        proc = spawn(wrapWithParentWatchdog(command, process.pid), {
-          shell: "/bin/bash",
-          detached: true,
-          stdio: ["pipe", "pipe", "pipe"],
-        });
+        // Fixed platform shell (#99): /bin/bash on macOS/Linux in its own
+        // detached process group (the in-job watchdog takes the whole tree down
+        // with `kill -TERM 0`), PowerShell on Windows via pwsh/powershell.exe,
+        // where the wrapper additionally hands the whole tree to a job object
+        // owned by a per-job watchdog that outlives the shell root. A missing
+        // PowerShell fails HERE, before any job is started. A `python train.py`
+        // under the shell is a grandchild — killing only the shell would orphan
+        // the thing actually holding the GPU, which is why stop/shutdown/
+        // watchdog all take the whole tree down.
+        const spawned = spawnBackgroundJob(command, process.pid);
+        proc = spawned.proc;
+        ownership = spawned.ownership;
       } catch (e) {
         return errorResult(`Error: could not start job: ${(e as Error)?.message ?? e}`);
       }
@@ -670,6 +796,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         lastOutputAt: null,
         exited: false,
         pending: new PendingLineBuffer(),
+        ownership,
       };
       jobs.set(id, job);
       publishLifecycle("started", job);
@@ -699,6 +826,10 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
           state: "running",
           pid: proc.pid,
           processGroupId: process.platform === "win32" ? undefined : proc.pid,
+          // Windows ownership record path (job-object watchdog): the harness
+          // readiness tracker keys off it to keep a root-exited job's
+          // descendants accounted for until verified gone.
+          ...(ownership ? { ownershipMarker: ownership.markerPath } : {}),
           watching: watchingSummary,
           startedAt: Date.now(),
         }),
@@ -908,7 +1039,9 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
   pi.registerTool({
     name: "ShellStop",
     label: "ShellStop",
-    description: "Stop a background job by exact job ID or unique label (SIGTERM, then SIGKILL if it ignores that).",
+    description:
+      "Stop a background job by exact job ID or unique label. Terminates the job's whole process tree " +
+      "(SIGTERM, then SIGKILL if it ignores that, on macOS/Linux; forced tree kill on Windows).",
     parameters: objectSchema({
       id: stringSchema("Exact job ID, unique label, or 'all'"),
     }, ["id"]),

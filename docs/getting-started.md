@@ -6,6 +6,10 @@ Behavioral detail lives in the linked pages.
 ## Prerequisites
 
 - **Node.js 20 or newer** (`engines.node: ">=20"` in `package.json`).
+- **PowerShell on Windows** (for `ShellStart`): `pwsh.exe` (PowerShell 7+) or the
+  built-in `powershell.exe` (Windows PowerShell 5.1). If neither resolves on PATH,
+  `ShellStart` fails with a clear error before starting any job. Not required on
+  macOS/Linux — background jobs run in Bash there.
 - **Pi**, installed independently. `pi-review-gate` consumes Pi's public extension and
   CLI/RPC surfaces; it does not patch or bundle Pi, and Pi remains independently
   installed and upgradeable.

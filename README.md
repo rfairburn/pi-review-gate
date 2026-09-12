@@ -154,16 +154,17 @@ multi-reviewer setups, `/review-settings`, and legacy compatibility live in
 
 ## Platform and shell compatibility
 
-Windows support is basic by design. Pi ships its native `bash` tool on every platform
-and an optional `powershell` tool on Windows; wherever review-gate handles shell
-commands — side-effect evidence and worker shell-tool authorization — `powershell`
-receives the same treatment as `bash`, subject to actual host availability and
-authorization: a tool the host has not registered or authorized is simply not exposed,
-and neither name widens a tool catalog on its own. Plan/research posture removes
-arbitrary shell entirely. Beyond this basic parity, native Windows operation is not
-claimed: `ShellStart` and the background-shell tool family keep their current
-assumptions and are unsupported on Windows, and portable launchers, provisioning,
-process handling, and worktree support are not completed. See
+`ShellStart` runs commands in this platform's fixed shell: Bash on macOS/Linux,
+PowerShell on Windows (`pwsh.exe` first, then the built-in `powershell.exe`; there is
+no shell selection). On a Windows host without either executable, `ShellStart` fails
+with a clear error before starting any job. Pi ships its native `bash` tool on every
+platform and an optional `powershell` tool on Windows; wherever review-gate handles
+shell commands — side-effect evidence and worker shell-tool authorization —
+`powershell` receives the same treatment as `bash`, subject to actual host availability
+and authorization: a tool the host has not registered or authorized is simply not
+exposed, and neither name widens a tool catalog on its own. Plan/research posture
+removes arbitrary shell entirely. Beyond this parity, native Windows operation of the
+portable launcher, provisioning, and worktree support remains incomplete. See
 [Delegated execution](docs/delegated-execution.md#background-shell-tools).
 
 ## How a review turn works

@@ -1,8 +1,14 @@
+import { ownershipVerdict } from "./background-shell/ownership";
+
 export interface TrackedBackgroundProcess {
   id: string;
   label: string;
   pid: number;
   processGroupId: number;
+  /** Windows only: the job-object ownership record path (from ShellStart
+   *  details). Present when the extension that started the job uses the
+   *  job-object watchdog; its verdict then bounds the job, not the root pid. */
+  ownershipMarker?: string;
 }
 
 export interface BackgroundReadinessSnapshot {
@@ -14,9 +20,27 @@ export interface BackgroundReadinessSnapshot {
 const SHELL_START_RESULT = /Started\s+"([^"]*)"\s+as\s+(\S+)\s+\(pid\s+(\d+)\)(?:[.;]|(?=\s|$))/i;
 
 /**
- * Best-effort readiness tracking for the ShellStart tool contract. The
- * detached child pid is also its process-group id, so group liveness remains
- * authoritative even when the shell leader exits before a descendant.
+ * Best-effort readiness tracking for the ShellStart tool contract. On
+ * macOS/Linux the detached child pid is also its process-group id, so group
+ * liveness remains authoritative even when the shell leader exits before a
+ * descendant.
+ *
+ * Windows has no process groups, so the extension instead hands each job's
+ * whole tree to a Windows job object (KILL_ON_JOB_CLOSE) held by a per-job
+ * watchdog that outlives the shell root and records its state in a marker file
+ * whose path travels in the ShellStart details (`ownershipMarker`). The verdict
+ * is liveness-based, not freshness-based: while the root is alive the job runs;
+ * after the root exits, a `running` record naming a live watchdog keeps it
+ * running, a terminal record (`released`/`terminated`/`failed`) or a dead
+ * watchdog pid verifies it clear (KILL_ON_JOB_CLOSE makes the kernel kill every
+ * member when the watchdog's sole handle closes), and a missing or unreadable
+ * record is UNVERIFIABLE — it keeps readiness blocked rather than claiming
+ * completion from absent evidence.
+ *
+ * Honest bounds: results that carry no ownership marker (older extension,
+ * text-only fallback) degrade to root-pid liveness on Windows, which cannot see
+ * descendants that outlive the shell; and a `running` record can over-report by
+ * at most one watchdog poll after its last refresh.
  */
 export class BackgroundProcessReadiness {
   private readonly processes = new Map<number, TrackedBackgroundProcess>();
@@ -40,7 +64,7 @@ export class BackgroundProcessReadiness {
       return undefined;
     }
     const pid = Number(match[3]);
-    if (!Number.isSafeInteger(pid) || pid <= 0 || process.platform === "win32") {
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
       this.unverifiable.add(singleLine(text).slice(0, 500));
       this.revision += 1;
       return undefined;
@@ -57,8 +81,20 @@ export class BackgroundProcessReadiness {
   }
 
   snapshot(): BackgroundReadinessSnapshot {
-    for (const [processGroupId] of this.processes) {
-      if (!processGroupIsAlive(processGroupId)) {
+    for (const [processGroupId, tracked] of this.processes) {
+      let alive: boolean;
+      if (process.platform === "win32" && tracked.ownershipMarker) {
+        // Job-object ownership bounds the job, not the root pid: keep a
+        // root-exited job accounted for until its record verifies completion,
+        // and treat missing evidence as blocking (it stays in `running` —
+        // fail closed), never as clear.
+        alive = ownershipVerdict(tracked.ownershipMarker, processIsAlive(tracked.pid), processIsAlive) !== "clear";
+      } else {
+        alive = process.platform === "win32"
+          ? processIsAlive(tracked.pid)
+          : processGroupIsAlive(processGroupId);
+      }
+      if (!alive) {
         this.processes.delete(processGroupId);
         this.revision += 1;
       }
@@ -94,9 +130,11 @@ function structuredShellStart(value: unknown): TrackedBackgroundProcess | undefi
       const id = typeof record.id === "string" ? record.id : undefined;
       const label = typeof record.label === "string" ? record.label : undefined;
       const pid = typeof record.pid === "number" ? record.pid : undefined;
+      // Windows details carry no process group; the root pid stands in for it.
       const processGroupId = typeof record.processGroupId === "number" ? record.processGroupId : pid;
-      if (id && label && positiveSafeInteger(pid) && positiveSafeInteger(processGroupId) && process.platform !== "win32") {
-        return { id, label, pid, processGroupId };
+      const ownershipMarker = typeof record.ownershipMarker === "string" ? record.ownershipMarker : undefined;
+      if (id && label && positiveSafeInteger(pid) && positiveSafeInteger(processGroupId)) {
+        return { id, label, pid, processGroupId, ...(ownershipMarker ? { ownershipMarker } : {}) };
       }
       return undefined;
     }
@@ -140,6 +178,17 @@ export function textFromToolResult(value: unknown): string {
 function processGroupIsAlive(processGroupId: number): boolean {
   try {
     process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return isErrnoException(error) && error.code === "EPERM";
+  }
+}
+
+/** Single-process liveness (Windows: no process groups to query). EPERM means
+ *  the process exists but is not ours to signal — alive, not dead. */
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
     return true;
   } catch (error) {
     return isErrnoException(error) && error.code === "EPERM";

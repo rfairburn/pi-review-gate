@@ -466,7 +466,8 @@ automatic review.
 ## Background shell tools
 
 The extension provides `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
-`ShellStop` directly through Pi. Background jobs are detached process groups, wake the
+`ShellStop` directly through Pi. Background jobs run in this platform's fixed shell —
+Bash as its own detached process group on macOS/Linux, PowerShell on Windows — wake the
 agent on configured output or exit events, survive ordinary turn settlement, and are
 reaped when the Pi session ends. At the top level, review-gate consumes the shell
 controller's typed lifecycle state and defers automatic review while any job is alive.
@@ -477,9 +478,17 @@ accepts steering during that interval, and performs a final inspection turn befo
 review. Executor timeouts are suspended while a verified process group remains active;
 external or unparseable `ShellStart` success responses fail closed.
 
-Platform scope is basic: the background-shell family keeps its current process-model
-assumptions and is unsupported on Windows; native Windows operation is not claimed for
-it. For interactive commands, Pi ships its native `bash` tool on every platform and an
+The shell is a fixed per-platform contract: `ShellStart` runs commands in Bash on
+macOS/Linux and PowerShell on Windows — `pwsh.exe` first, then the built-in
+`powershell.exe`, matching Pi's native powershell-tool discovery; there is no shell
+selection in arguments or configuration. If neither executable resolves on a Windows
+host, `ShellStart` fails with a clear error before starting any job. Each Windows job
+carries an in-job watchdog process of the same PowerShell edition that force-kills the
+job's whole process tree (`taskkill /F /T`) when the host disappears; `ShellStop`,
+session shutdown, and escalation take the same tree down by forced kill, since Windows
+has no portable signals or process groups.
+
+For interactive commands, Pi ships its native `bash` tool on every platform and an
 optional `powershell` tool on Windows; review-gate treats `powershell` like `bash`
 wherever it handles shell commands — side-effect evidence and worker shell-tool
 authorization — subject to actual host availability and authorization: a host that has

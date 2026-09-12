@@ -8,6 +8,7 @@
   "types": "dist/src/index.d.ts",
   "bin": {
     "pi-review-gate": "scripts/pi-review-gate.sh",
+    "pi-review-gate-cmd": "scripts/pi-review-gate.cmd",
     "pi-review-web": "scripts/pi-review-web.sh"
   },
   "files": [

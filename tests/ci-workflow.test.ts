@@ -294,8 +294,8 @@ function callerReleaseConditions(): void {
 function callerRunsOnlyAfterBothRequiredChecks(): void {
   const source = readWorkflow();
   const release = releaseJobBlock();
-  assert.match(release, /needs: \[verify, full-tests\]/,
-    "the publisher must need both required check jobs");
+  assert.match(release, /needs: \[verify, full-tests, windows-launcher\]/,
+    "the publisher must need Linux verification and native Windows launcher checks");
   assert.match(source, /^  verify:$/m);
   assert.match(source, /^  full-tests:$/m);
   // GitHub evaluates a needed job as failure when it fails OR is skipped; the
@@ -303,7 +303,7 @@ function callerRunsOnlyAfterBothRequiredChecks(): void {
   // only as long as the condition is not overridden.
   assert.doesNotMatch(release, /always\(\)|failure\(\)|cancelled\(\)/,
     "overriding the implicit success() guard would let failed or skipped checks publish");
-  for (const neededJob of ["verify", "full-tests"]) {
+  for (const neededJob of ["verify", "full-tests", "windows-launcher"]) {
     const job = blockOf(source, neededJob, 2);
     assert.doesNotMatch(job, /continue-on-error/,
       `a continue-on-error step or job in ${neededJob} would convert failure into success upstream of the publisher`);
@@ -390,6 +390,30 @@ test("release caller passes no secrets and carries the only write grant", () => 
 
 test("reusable release builder independently enforces the same trust boundary", () => {
   reusableReleaseWorkflowMirrorsTheBoundary();
+});
+
+test("windows launcher job runs the native .cmd coverage on every enforced trigger path", () => {
+  const source = readWorkflow();
+  const job = blockOf(source, "windows-launcher", 2);
+  assert.match(source, /^  windows-launcher:$/m, "the job id must stay stable for downstream callers");
+  assert.match(job, /runs-on: windows-latest/,
+    "the .cmd launcher and helper need a genuinely native Windows runner");
+  assert.match(job, /node-version: 20\.x/, "the supported Node floor must be exercised natively");
+  assert.match(job, /PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"/,
+    "the launcher tier needs no browser, so Chromium provisioning stays skipped");
+  assert.match(job, /run: npm run build:test/,
+    "dist-test is not checked in: the job must compile the tests it runs");
+  assert.match(job, /run: node --test dist-test\/tests\/launcher-cmd\.test\.js/,
+    "the focused launcher test file (including native win32 cases) must run");
+  assert.match(job, /run: npm run build$/m,
+    "the launcher's development build seam must be validated with the native toolchain");
+  assert.match(job, /run: node scripts\/check-docs\.cjs/,
+    "the public docs surface must validate with the same deterministic rules");
+  assert.doesNotMatch(job, /shellcheck/, "shellcheck is unavailable on Windows runners");
+  for (const line of job.split("\n").filter((candidate) => candidate.includes("run:"))) {
+    assert.doesNotMatch(line, /npm run test:run|npm run test:integration/,
+      `the native job must stay focused on launcher coverage, not the full suite: ${line.trim()}`);
+  }
 });
 
 test("activation tests keep the default runtime role in CI", () => {

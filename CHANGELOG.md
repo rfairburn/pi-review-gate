@@ -15,7 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.40]
+## [0.1.0-dev.41]
+
+### Added
+
++- Run `ShellStart` in PowerShell on native Windows, preferring `pwsh.exe` then
++  `powershell.exe` with Pi-compatible invocation and UTF-8 initialization; retain
++  Bash on macOS/Linux with no shell-selection setting. Windows Job Object ownership
++  and a watchdog account for descendants after shell-root exit and preserve
++  fail-closed readiness, stop, and host-exit cleanup. Add native Windows shell tests
++  as a publishing prerequisite alongside the existing launcher checks
++  ([#99](https://github.com/rfairburn/pi-review-gate/issues/99)).
++
++## [0.1.0-dev.40]
 
 ### Added
 

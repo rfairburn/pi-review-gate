@@ -38,6 +38,40 @@ npm run test:package     # stage+build in scratch, npm pack, install-into-consum
 ```
 
 The complete suite (`npm run test:run`) executes up to four test files concurrently.
+
+### Development prerequisites
+
+- **Node.js 20 or newer and npm.** CI exercises Node 20 and Node 24; the optional real
+  runtime regression needs Node 22.19 or newer (see below).
+- **TypeScript and type definitions** arrive as ordinary `devDependencies` via
+  `npm install`; the runtime dependencies (including Playwright, undici, and the HTML/PDF
+  parsing stack) are ordinary npm packages.
+- **A Git executable on `PATH`.** The delegated-execution, capture/landing, conflict,
+  and recovery test tiers drive the real `git` binary (worktrees, private bare
+  repositories, plumbing commands, and `git merge-file`), matching what the production
+  code invokes.
+- **`shellcheck` on `PATH`** for `npm run check:static`, which runs
+  `shellcheck scripts/*.sh`.
+- **Bash and Unix utilities** for launcher and background-process tests; some paths
+  require `/bin/bash` and POSIX process-group behavior. These suites are not evidence
+  of native Windows compatibility. **`tar` on `PATH`** is used to extract release
+  packages by `scripts/release/packaging.cjs` and its verification tests.
+- **Playwright's Chromium build** for the browser test tier. Install-time provisioning
+  covers it; after a skipped install, run `npx playwright install chromium`
+  (`--with-deps` adds Linux OS libraries, as the CI full-suite job does). Static checks,
+  packaging smoke, the pure/unit and execution tiers, and the DDGS-mocked web-tool unit
+  tests do not need Chromium — CI's fast job runs them with provisioning skipped
+  entirely.
+- **Optional: `PI_BROWSER_AGENT_RUNTIME`** pointing at an installed Pi agent-core
+  `dist/index.js` enables `tests/browser-native-error.test.ts` (CI uses
+  `@earendil-works/pi-agent-core@0.85.0`, which needs Node >=22.19; the model stream is
+  mocked, with no live model calls). Without it the test skips itself. See
+  [Web tools](web-tools.md#interactive-browser).
+- **`python3` is not needed by the test suite**: DDGS interactions are mocked. In the
+  runtime, Python is used only by `WebSearch` — launch-time venv creation/validation via
+  `scripts/ensure-ddgs.sh` plus one Python process per search
+  (`src/web/network.ts`).
+
 In a working checkout, compile with `npm run build:test` and then run `npm run
 test:run`: that covers the process, Git, filesystem, and end-to-end tiers before
 finalizing a phase without touching the live `dist/`. `npm test` (and
@@ -119,7 +153,9 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
   config location) fail closed with distinct actionable diagnostics.
 - Builds the extension when `src/index.ts` is present, otherwise requires the packaged
   `dist/src/index.js`.
-- Runs `scripts/ensure-ddgs.sh` to provision the pinned web-search dependency.
+- Runs `scripts/ensure-ddgs.sh` to create, validate, and repair the pinned web-search
+  venv (creating or repairing it requires a `python3` interpreter on `PATH`; fails
+  closed when the environment cannot be established).
 - Refreshes the discoverable orchestration skill at
   `~/.agents/skills/orchestrator/SKILL.md` (and its recovery runbook) from the packaged
   sources, then executes the installed `pi` with the extension, forwarding all

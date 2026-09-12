@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.39]
+
+### Documentation
+
+- Inventory runtime, optional-feature, launcher, and development dependencies;
+  document Git on `PATH` for delegated worktrees, user-installed versus provisioned
+  web dependencies, and current platform limitations
+  ([#109](https://github.com/rfairburn/pi-review-gate/issues/109)).
+
 ## [0.1.0-dev.38]
 
 ### Added

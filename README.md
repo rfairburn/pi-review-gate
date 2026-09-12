@@ -68,12 +68,25 @@ receipts of exactly what the model was told.
 
 ## Prerequisites
 
-- Node.js 20 or newer.
+- Node.js 20 or newer for this extension; your installed Pi version may require a
+  newer Node.js (see [Getting started](docs/getting-started.md#prerequisites)).
 - Pi, installed independently.
+- Git on `PATH` — required for delegated execution (worker worktrees, capture,
+  landing, recovery, and diff3 conflict materialization); ordinary review evidence
+  capture uses Git when available and falls back to a filesystem walk without it.
 - At least one harness installed and authenticated by its own login/configuration
   (Codex CLI, Claude CLI, a Pi-scoped model, or a generic CLI program). Do not put
   OAuth tokens or API keys in the review-gate config file — see
   [Security model](docs/security-model.md#secrets-and-authentication).
+
+Two web-tool dependencies sit outside the npm tree: `WebSearch` needs a user-installed
+`python3` interpreter, and the launcher automatically creates and validates the pinned
+DDGS venv for it at launch (creating or repairing that venv needs package-index access;
+a valid cached environment starts offline). `npm install` downloads Playwright's
+Chromium for `BrowserExtract` and the interactive browser tools unless skipped.
+`WebFetch` needs neither. The full inventory, including what is user-installed versus
+automatic, lives in [Getting started](docs/getting-started.md#prerequisites), along
+with the current Bash/Unix requirements of the shell launcher and `ShellStart`.
 
 ## Installation
 

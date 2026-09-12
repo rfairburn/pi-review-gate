@@ -17,14 +17,19 @@
  * background-shell-integration.test.ts on Linux/macOS; nothing in this file
  * mocks a shell — the PATH fixture below changes what `where` really finds,
  * and every fallback case proves its preconditions (pwsh.exe genuinely
- * absent, real 5.x powershell.exe retained) before it runs.
+ * absent, real 5.x powershell.exe retained) before it runs. Test-owned
+ * temp-file cleanup uses bounded retry (tests/helpers/temp-file-cleanup.ts):
+ * a just-killed process can hold its redirected-output handles open briefly
+ * on Windows, and a transient EPERM in cleanup must neither fail an
+ * otherwise-passing lifecycle assertion nor mask a real body failure.
  */
 import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
 import { spawn, spawnSync } from "node:child_process";
 import { basename, dirname, join } from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { runWithTempCleanup } from "./helpers/temp-file-cleanup";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
 import { POWERSHELL_ARGS, wrapWithPowerShellWatchdog } from "../src/background-shell/jobs";
 import { findWindowsExecutable, resolveWindowsPowerShell, spawnBackgroundJob } from "../src/background-shell/shell";
@@ -291,7 +296,7 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
 
   it("fails clearly without starting a job when no PowerShell is on PATH", SKIP, async () => {
     const emptyDir = mkdtempSync(join(tmpdir(), "pi-review-no-ps-"));
-    try {
+    await runWithTempCleanup([emptyDir], { recursive: true }, async () => {
       await withPath(emptyDir, async () => {
         const { call, controller } = wire();
         const result = await call("ShellStart", { command: "Write-Output never", label: "no-ps" });
@@ -301,9 +306,7 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
         expect(controller.snapshot().running).toEqual([]);
         expect(textOf(await call("ShellList", {}))).toContain("No background jobs");
       });
-    } finally {
-      rmSync(emptyDir, { recursive: true, force: true });
-    }
+    });
   });
 });
 
@@ -513,7 +516,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
 
   it("keeps a root-exited job accounted for and blocks readiness until the tree is verified gone", SKIP, async () => {
     const outFile = freshOutFile("pi-review-descendant");
-    try {
+    await runWithTempCleanup([outFile, `${outFile}.err`], {}, async () => {
       const { sent, call, controller } = wire();
       const result = await call("ShellStart", {
         command: detachedGrandchildCommand(outFile),
@@ -554,10 +557,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       expect(await until(() => sent.length > 0, 30_000), "exit wake after verified release").toBe(true);
       expect(sent[0].content).toContain("exited 0");
       expect(readiness.snapshot().running.length, "readiness clear once verified").toBe(0);
-    } finally {
-      rmSync(outFile, { force: true });
-      rmSync(`${outFile}.err`, { force: true });
-    }
+    });
   });
 
   // Host death AFTER the root has already exited: no signal handler runs, and
@@ -566,7 +566,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   // it alone holds — can. Polls at 1 s here so both checks land quickly.
   async function runHostDeathAfterRootExit(): Promise<void> {
     const outFile = freshOutFile("pi-review-hostdeath");
-    try {
+    await runWithTempCleanup([outFile, `${outFile}.err`], {}, async () => {
       const parent = spawn(process.execPath, ["-e", "setTimeout(()=>{},120_000)"], { stdio: "ignore" });
       const maybeParentPid = parent.pid;
       if (!maybeParentPid) throw new Error("test parent did not start");
@@ -588,10 +588,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       } finally {
         try { parent.kill("SIGKILL"); } catch { /* already gone */ }
       }
-    } finally {
-      rmSync(outFile, { force: true });
-      rmSync(`${outFile}.err`, { force: true });
-    }
+    });
   }
 
   it("terminates descendants when the host dies after the root has exited (PowerShell 7)", SKIP, async () => {
@@ -610,7 +607,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   // command never ran and the exit is not a clean 0.)
   it("fails closed before running the command when ownership cannot be established", SKIP, async () => {
     const markerDir = mkdtempSync(join(tmpdir(), "pi-review-owner-fail-"));
-    try {
+    await runWithTempCleanup([markerDir], { recursive: true }, async () => {
       const wrapped = wrapWithPowerShellWatchdog(
         "Write-Output OWNERFAIL-CANARY; exit 0",
         process.pid,
@@ -626,9 +623,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       expect(await until(() => child.exitCode !== null || child.signalCode !== null, 30_000), "wrapper exited").toBe(true);
       expect(out).not.toContain("OWNERFAIL-CANARY");
       expect(child.exitCode === 0, "no clean exit without established ownership").toBe(false);
-    } finally {
-      rmSync(markerDir, { recursive: true, force: true });
-    }
+    });
   });
   // Paths with spaces and apostrophes must survive BOTH quoting layers: the
   // .Replace argument inside the wrapper script, and the assignment in the
@@ -637,7 +632,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   it("establishes ownership through marker/stop paths containing spaces and apostrophes", SKIP, async () => {
     const dir = join(tmpdir(), "pi review owner", "it's here");
     mkdirSync(dir, { recursive: true });
-    try {
+    await runWithTempCleanup([join(tmpdir(), "pi review owner")], { recursive: true }, async () => {
       const markerPath = join(dir, "job file.job");
       const wrapped = wrapWithPowerShellWatchdog(
         "Write-Output HOSTILEPATH-OK; exit 0",
@@ -663,9 +658,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       expect(await until(() => {
         try { return readFileSync(markerPath, "utf8").includes("released"); } catch { return false; }
       }, 30_000), "watchdog released itself").toBe(true);
-    } finally {
-      rmSync(join(tmpdir(), "pi review owner"), { recursive: true, force: true });
-    }
+    });
   });
 
   // Natural descendant completion: the root exits immediately, the grandchild
@@ -675,7 +668,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   // anyone killing anything. Exercises the accounting-query release path.
   async function runNaturalCompletion(): Promise<void> {
     const outFile = freshOutFile("pi-review-natural");
-    try {
+    await runWithTempCleanup([outFile, `${outFile}.err`], {}, async () => {
       const { sent, call } = wire();
       const result = await call("ShellStart", {
         command: (
@@ -710,10 +703,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       expect(await until(() => sent.length > 0, 30_000), "exit wake after natural completion").toBe(true);
       expect(sent[0].content).toContain("exited 0");
       expect(readiness.snapshot().running.length, "clear once verified empty").toBe(0);
-    } finally {
-      rmSync(outFile, { force: true });
-      rmSync(`${outFile}.err`, { force: true });
-    }
+    });
   }
 
   it("keeps readiness blocked across watchdog polls until a descendant finishes naturally (PowerShell 7)", SKIP, async () => {

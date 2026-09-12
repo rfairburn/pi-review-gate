@@ -1347,18 +1347,17 @@ if (isWindows) {
     await mkdir(fixture.agentDir, { recursive: true });
     await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
 
-    // PowerShell delivers % literally; the helper must keep it literal all the
-    // way into pi (no cmd.exe reparse between the helper and pi), so %VAR%
-    // text is never expanded and no second shell pass can corrupt it.
-    // Metacharacters are a documented boundary of every batch file reached
-    // from PowerShell: PowerShell does not quote arguments that contain no
-    // whitespace, so cmd.exe would split on unquoted & | ^ before the .cmd is
-    // entered — a PowerShell caller must cmd-escape them with carets, exactly
-    // as for any batch file. The .cmd's raw %* passthrough then delivers the
-    // caret-unescaped literal text byte for byte.
+    // Check literal percent text and protected metacharacters through a real
+    // PowerShell-to-batch invocation. The helper must not add another cmd.exe
+    // parsing pass before pi; caller-side shell expansion remains separate.
+    // PowerShell's single quotes delimit its string, but are not forwarded to
+    // cmd.exe. Include literal double quotes around the metacharacter argument
+    // so it stays protected both on batch entry and when %* is forwarded to
+    // Node. A single layer of caret escaping is consumed on entry, exposing
+    // the metacharacters during forwarding (observed on native Windows CI).
     const result = spawnSync(
       "powershell.exe",
-      ["-NoProfile", "-Command", "& '.\\scripts\\pi-review-gate.cmd' --pct '100%PI%' --label 'a^&b^|c^^d'; exit $LASTEXITCODE"],
+      ["-NoProfile", "-Command", "& '.\\scripts\\pi-review-gate.cmd' --pct '100%PI%' --label '\"a&b|c^d\"'; exit $LASTEXITCODE"],
       { env: fixtureEnv(fixture), cwd: resolve(""), encoding: "utf8" },
     );
 

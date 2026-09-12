@@ -180,9 +180,13 @@ skill through an atomic rename, exporting `PI_REVIEW_GATE_DDGS_PYTHON`, and exec
 through a shell: publication runs in-process (`fs.linkSync`/`fs.renameSync`), Python is
 spawned with argument arrays, and pi/npm are executed by resolving their npm `.cmd`
 shim's JavaScript entry point and spawning Node directly (POSIX uses plain `execvp`),
-with a fixed-token cmd.exe fallback only for the development build. A literal `%VAR%`
-typed on a cmd.exe command line is expanded by cmd before the batch sees it (PowerShell
-delivers it literally); POSIX permission modes (0700/0600/0644) are requested for parity
+with a fixed-token cmd.exe fallback only for the development build. Invoking a `.cmd`
+file from PowerShell still crosses cmd.exe parsing: PowerShell string delimiters alone
+do not protect batch metacharacters. For example, pass `--label '\"a&b|c^d\"'` from
+PowerShell so literal double quotes protect the value through batch forwarding.
+Command-shell expansion (including `%VAR%`) can happen before the helper receives an
+argument; the helper does not perform an additional shell expansion. POSIX permission
+modes (0700/0600/0644) are requested for parity
 and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest`
 (`.github/workflows/ci.yml`, focused `launcher-cmd` tests); macOS/Linux behavior of the
 POSIX launcher is unchanged.

@@ -6,6 +6,10 @@ tools, and the external executor protocol. Field defaults live in
 [Configuration](configuration.md); crash and restart behavior lives in
 [Recovery](recovery.md).
 
+Delegated execution requires a Git executable on `PATH`: subtask capture, isolated
+worktrees, landing, recovery, and diff3 conflict materialization all invoke Git and fail
+closed without it. See [Getting started](getting-started.md#prerequisites).
+
 ## Subtask tools
 
 With at least one worker resource selected, the extension exposes one exact-schema tool

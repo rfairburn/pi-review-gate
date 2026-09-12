@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.42]
+
+### Added
+
+- Publish native Windows PowerShell `ShellStart` support: fixed platform shells,
+  Pi-compatible invocation, and Windows Job Object ownership that retains descendants
+  after shell-root exit, with fail-closed readiness and host-exit cleanup. Includes
+  the Windows launcher skill-publication contention correction recorded under the
+  b41 candidate below. b41 was not published because native test teardown failed
+  ([#99](https://github.com/rfairburn/pi-review-gate/issues/99),
+  [#108](https://github.com/rfairburn/pi-review-gate/issues/108)).
+
+### Fixed
+
+- Tolerate bounded transient Windows file-handle contention when deleting native
+  lifecycle-test temporary files, preserving process-death assertions and surfacing
+  persistent cleanup failures
+  ([#113](https://github.com/rfairburn/pi-review-gate/issues/113)).
+
 ## [0.1.0-dev.41]
 
 ### Added

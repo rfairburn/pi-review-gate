@@ -40,7 +40,12 @@
  * - Refreshes the discoverable orchestrator skill at
  *   ~/.agents/skills/orchestrator/SKILL.md (and its recovery runbook) from
  *   the packaged sources, staged to a temporary file and published with an
- *   atomic rename so concurrent launches replace whole files only.
+ *   atomic rename so concurrent launches replace whole files only. On
+ *   Windows the rename-replace can transiently fail with EPERM/EACCES/EBUSY
+ *   while an external holder (an antivirus or indexing filter scanning
+ *   freshly closed files) keeps the staged file or destination open, so the
+ *   rename alone is retried with a short bounded backoff; every other error
+ *   and every unsafe path still fails closed.
  * - Prints the same launch diagnostics and forwards all remaining arguments
  *   to `pi --extension <dist/src/index.js>`.
  *
@@ -121,6 +126,77 @@ function isDirectory(candidate) {
     return fs.statSync(candidate).isDirectory();
   } catch {
     return false;
+  }
+}
+
+/**
+ * Transient Windows rename-contention errnos. On Windows, fs.renameSync is
+ * MoveFileExW(..., MOVEFILE_REPLACE_EXISTING), which — unlike POSIX
+ * rename(2)'s unconditional replacement — must open and delete both the
+ * staged source and the destination; while anything holds either open
+ * without FILE_SHARE_DELETE — briefly, as external file scanners (antivirus,
+ * indexing filters) are known to do with freshly closed files — the move
+ * fails with one of these errnos. (The PR112 Windows CI failure hit exactly
+ * this rename under concurrent first launches; the specific errno and holder
+ * could not be confirmed off Windows, so no single cause is claimed.)
+ * Node itself
+ * always opens files with FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+ * so plain concurrent launchers never block each other; only these brief
+ * external holders do. Such contention clears on its own, so these — and
+ * only these — errnos are retried with a bounded backoff (graceful-fs
+ * practice); every other errno stays an immediate fail-closed publication
+ * failure.
+ */
+const SKILL_PUBLISH_TRANSIENT_ERRNOS = new Set(["EPERM", "EACCES", "EBUSY"]);
+const SKILL_PUBLISH_RETRY_ATTEMPTS = 5;
+const SKILL_PUBLISH_RETRY_DELAY_MS = 50;
+
+const skillPublishSleepSignal = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Move a staged file into place with rename-replace, retrying only the
+ * transient Windows rename-contention errnos (see the constant above) while
+ * the destination is not a directory: each retry re-runs the same single
+ * atomic rename after a short bounded sleep, so a contended but normal
+ * concurrent launch still publishes one complete whole file, and readers
+ * never observe a missing or partially written file at any point. POSIX
+ * rename(2) has no sharing violations, so no retry happens off win32. Every
+ * other errno (including a directory occupying the destination), a
+ * destination that turns out to be a directory, and exhaustion of the
+ * bounded backoff fail closed immediately: nothing is published and the
+ * caller receives the last error for its diagnostics. Only the rename step
+ * is retried — staging, permissions, and validation errors are never
+ * retried or masked.
+ */
+function renameIntoPlaceWithContentionRetry(rename, options = {}) {
+  const attempts = options.attempts ?? SKILL_PUBLISH_RETRY_ATTEMPTS;
+  const delayMs = options.delayMs ?? SKILL_PUBLISH_RETRY_DELAY_MS;
+  const sleep = options.sleep ?? ((ms) => {
+    Atomics.wait(skillPublishSleepSignal, 0, 0, ms);
+  });
+  const platform = options.platform ?? process.platform;
+  const destinationOccupiedByDirectory = options.isDirectory
+    ?? (options.destination === undefined
+      ? () => false
+      : () => isDirectory(options.destination));
+  let lastError = null;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      rename();
+      // The rename is the single atomic publication step: success means the
+      // complete file is in place, however many contention retries it took.
+      return { published: true, attempts: attempt, lastError: attempt > 1 ? lastError : null };
+    } catch (error) {
+      lastError = error;
+      const code = error && typeof error === "object" ? error.code : undefined;
+      const retriable = attempt < attempts
+        && platform === "win32"
+        && typeof code === "string"
+        && SKILL_PUBLISH_TRANSIENT_ERRNOS.has(code)
+        && !destinationOccupiedByDirectory();
+      if (!retriable) return { published: false, attempts: attempt, lastError };
+      sleep(delayMs);
+    }
   }
 }
 
@@ -578,7 +654,12 @@ function findPythonInterpreter() {
  * regular destination in a single step, so concurrent launches publishing the
  * same skill cannot fail over each other, and readers never observe a missing
  * or partially written skill file. A destination directory is rejected instead
- * of published into.
+ * of published into. On Windows the rename alone can transiently fail while
+ * anything briefly holds the staged file or destination open (external
+ * file scanners are a known such holder; see
+ * renameIntoPlaceWithContentionRetry); only that step is retried, and every
+ * staging, permission, and unexpected failure still fails closed with the
+ * underlying filesystem error reported.
  */
 function publishOrchestratorSkillFile(skillSource, skillDestination) {
   const dir = path.dirname(skillDestination);
@@ -611,19 +692,31 @@ function publishOrchestratorSkillFile(skillSource, skillDestination) {
   // Atomic rename with exact whole-file replacement semantics: rename()
   // replaces an existing regular destination in a single step, so concurrent
   // launches publishing the same skill cannot fail over each other and
-  // readers never observe a missing or partially written skill file.
-  try {
-    fs.renameSync(tmp, skillDestination);
-    return true;
-  } catch {
-    removeQuietly(tmp);
-    if (isDirectory(skillDestination)) {
-      note(`pi-review-gate: ${skillDestination} exists but is not a replaceable regular file (a directory appeared there?); move or rename that path and re-run the launcher\n`);
-    } else {
-      note(`pi-review-gate: unexpected failure publishing the orchestrator skill to ${skillDestination}; re-run the launcher\n`);
+  // readers never observe a missing or partially written skill file. Only the
+  // rename is retried, and only for the transient Windows contention errnos
+  // with a bounded backoff; a recovered publication is reported on stderr so
+  // the contention stays visible, and any final failure keeps the original
+  // fail-closed diagnostics — now including the underlying OS error.
+  const outcome = renameIntoPlaceWithContentionRetry(
+    () => fs.renameSync(tmp, skillDestination),
+    { destination: skillDestination },
+  );
+  if (outcome.published) {
+    if (outcome.attempts > 1) {
+      note(`pi-review-gate: publishing the orchestrator skill to ${skillDestination} was contended (${outcome.lastError.code}: ${outcome.lastError.message}); published whole after ${outcome.attempts} attempts\n`);
     }
-    return false;
+    return true;
   }
+  removeQuietly(tmp);
+  if (isDirectory(skillDestination)) {
+    note(`pi-review-gate: ${skillDestination} exists but is not a replaceable regular file (a directory appeared there?); move or rename that path and re-run the launcher\n`);
+  } else {
+    const detail = outcome.lastError && typeof outcome.lastError === "object" && outcome.lastError.code
+      ? ` (${outcome.lastError.code}: ${outcome.lastError.message})`
+      : "";
+    note(`pi-review-gate: unexpected failure publishing the orchestrator skill to ${skillDestination}${detail}; re-run the launcher\n`);
+  }
+  return false;
 }
 
 /**
@@ -755,12 +848,15 @@ if (require.main === module) {
 module.exports = {
   DDGS_VERSION,
   MANAGEMENT_VERBS,
+  SKILL_PUBLISH_RETRY_ATTEMPTS,
+  SKILL_PUBLISH_RETRY_DELAY_MS,
   cmdQuote,
   compatibilityFallbackConfigPath,
   ddgsPythonPath,
   initializeDefaultReviewGateConfig,
   normalizeWindowsShellPath,
   piAgentConfigPath,
+  renameIntoPlaceWithContentionRetry,
   resolveCmdShimTarget,
   resolvePiAgentDir,
   resolvePiInvocation,

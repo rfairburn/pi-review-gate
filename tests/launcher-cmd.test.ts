@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -25,12 +26,25 @@ const isWindows = process.platform === "win32";
 const helperModule = require(helperPath) as {
   DDGS_VERSION: string;
   MANAGEMENT_VERBS: Set<string>;
+  SKILL_PUBLISH_RETRY_ATTEMPTS: number;
+  SKILL_PUBLISH_RETRY_DELAY_MS: number;
   cmdQuote: (arg: string) => string;
   compatibilityFallbackConfigPath: (resolution: { homeDir: string; platform: string }) => string;
   ddgsPythonPath: (venv: string, platform: string) => string;
   initializeDefaultReviewGateConfig: (primary: string, fallback: string) => string | null;
   normalizeWindowsShellPath: (filePath: string) => string;
   piAgentConfigPath: (env: NodeJS.ProcessEnv, resolution: { homeDir: string; platform: string }) => string;
+  renameIntoPlaceWithContentionRetry: (
+    rename: () => void,
+    options?: {
+      destination?: string;
+      attempts?: number;
+      delayMs?: number;
+      sleep?: (ms: number) => void;
+      platform?: string;
+      isDirectory?: () => boolean;
+    },
+  ) => { published: boolean; attempts: number; lastError: (Error & { code?: string }) | null };
   resolveCmdShimTarget: (shimPath: string) => string | null;
   resolvePiAgentDir: (env: NodeJS.ProcessEnv, resolution: { homeDir: string; platform: string }) => string;
   resolvePiInvocation: (env: NodeJS.ProcessEnv, platform: string) =>
@@ -718,6 +732,143 @@ test("launcher helper fails closed when a directory appears at a skill path befo
   assert.deepEqual(await readdir(join(skillDir, "SKILL.md")), [], "no file may be published into the directory");
   await assertNoTempLitter(skillDir);
   assert.equal(await launchStarted(fixture), false, "the helper must not start pi when skill publication fails");
+});
+
+// ---------------------------------------------------------------------------
+// Skill publication rename: transient Windows contention (deterministic seam
+// regression). The native concurrent-launch test above exercises the real
+// publication on every platform, but the Windows rename-contention window
+// (an external scanner briefly holding a freshly closed file open without
+// FILE_SHARE_DELETE, failing the MoveFileExW replace with EPERM/EACCES/EBUSY)
+// is not reproducible off Windows, so the bounded retry contract itself is
+// pinned through the production helper's injected seam.
+// ---------------------------------------------------------------------------
+
+const errnoError = (code: string) =>
+  Object.assign(new Error(`${code}: operation not permitted, rename`), { code });
+
+test("skill publication rename publishes whole on the first uncontended attempt", () => {
+  let renames = 0;
+  const sleeps: number[] = [];
+  const outcome = helperModule.renameIntoPlaceWithContentionRetry(() => {
+    renames += 1;
+  }, { sleep: () => {} });
+
+  assert.equal(outcome.published, true);
+  assert.equal(outcome.attempts, 1);
+  assert.equal(outcome.lastError, null, "an uncontended rename must report no contention");
+  assert.equal(renames, 1);
+});
+
+test("skill publication rename retries transient Windows contention and publishes whole", () => {
+  const calls: string[] = [];
+  const delays: number[] = [];
+  const outcome = helperModule.renameIntoPlaceWithContentionRetry(() => {
+    if (calls.filter((call) => call === "rename").length < 2) {
+      calls.push("rename");
+      throw errnoError(calls.length === 1 ? "EPERM" : "EBUSY");
+    }
+    calls.push("rename");
+  }, { platform: "win32", sleep: (ms) => delays.push(ms) });
+
+  assert.equal(outcome.published, true, "a transiently contended launch must still publish");
+  assert.equal(outcome.attempts, 3);
+  assert.equal(outcome.lastError?.code, "EBUSY", "the contended attempt's error must be reported");
+  assert.deepEqual(calls, ["rename", "rename", "rename"], "the same atomic rename is retried");
+  assert.deepEqual(delays, [helperModule.SKILL_PUBLISH_RETRY_DELAY_MS, helperModule.SKILL_PUBLISH_RETRY_DELAY_MS],
+    "retries must use the contracted bounded backoff");
+});
+
+test("skill publication rename fails closed after bounded retries under persistent contention", () => {
+  let renames = 0;
+  let sleeps = 0;
+  const outcome = helperModule.renameIntoPlaceWithContentionRetry(() => {
+    renames += 1;
+    throw errnoError("EACCES");
+  }, { platform: "win32", sleep: () => { sleeps += 1; } });
+
+  assert.equal(outcome.published, false, "persistent contention must not publish");
+  assert.equal(outcome.attempts, helperModule.SKILL_PUBLISH_RETRY_ATTEMPTS, "the backoff must stay bounded");
+  assert.equal(sleeps, helperModule.SKILL_PUBLISH_RETRY_ATTEMPTS - 1);
+  assert.equal(outcome.lastError?.code, "EACCES", "the final error must be surfaced for diagnostics");
+  assert.ok(renames === helperModule.SKILL_PUBLISH_RETRY_ATTEMPTS);
+});
+
+test("skill publication rename never retries when a directory occupies the destination", () => {
+  // win32 is set explicitly so the directory exclusion — not the platform
+  // guard — is what stops the retry, deterministically on every host.
+  let renames = 0;
+  let sleeps = 0;
+  const outcome = helperModule.renameIntoPlaceWithContentionRetry(() => {
+    renames += 1;
+    throw errnoError("EPERM");
+  }, { platform: "win32", isDirectory: () => true, sleep: () => { sleeps += 1; } });
+
+  assert.equal(outcome.published, false, "a directory at the destination must fail closed");
+  assert.equal(renames, 1, "a directory race is not transient contention and must not be retried");
+  assert.equal(sleeps, 0);
+});
+
+test("skill publication rename does not retry non-transient errnos", () => {
+  // win32 is set explicitly so the errno filter — not the platform guard —
+  // is what rejects these codes, deterministically on every host.
+  for (const code of ["ENOTEMPTY", "EISDIR", "ENOENT", "EINVAL"]) {
+    let renames = 0;
+    let sleeps = 0;
+    const outcome = helperModule.renameIntoPlaceWithContentionRetry(() => {
+      renames += 1;
+      throw errnoError(code);
+    }, { platform: "win32", sleep: () => { sleeps += 1; } });
+
+    assert.equal(outcome.published, false, `${code} must fail closed`);
+    assert.equal(renames, 1, `${code} must not be retried`);
+    assert.equal(sleeps, 0, `${code} must fail immediately`);
+  }
+});
+
+test("skill publication rename does not retry on POSIX", () => {
+  // POSIX rename(2) has no sharing violations: an EPERM there is a real
+  // failure and must stay a single fail-closed attempt.
+  let renames = 0;
+  const outcome = helperModule.renameIntoPlaceWithContentionRetry(() => {
+    renames += 1;
+    throw errnoError("EPERM");
+  }, { platform: "linux", sleep: () => { throw new Error("no POSIX retry may sleep"); } });
+
+  assert.equal(outcome.published, false);
+  assert.equal(renames, 1);
+});
+
+test("skill publication rename probes the real destination for the directory fail-closed check", () => {
+  // The production default (no isDirectory override) must inspect the real
+  // destination: a genuine directory there stops the retry and fails closed.
+  // win32 is set explicitly so the real-filesystem exclusion — not the
+  // platform guard — executes, deterministically on every host.
+  const scratch = mkdtempSync(join(tmpdir(), "pi-review-cmd-rename-dir-"));
+  try {
+    const occupied = join(scratch, "SKILL.md");
+    mkdirSync(occupied);
+    let renames = 0;
+    const outcome = helperModule.renameIntoPlaceWithContentionRetry(() => {
+      renames += 1;
+      throw errnoError("EPERM");
+    }, { destination: occupied, platform: "win32", sleep: () => { throw new Error("a directory destination must not be retried"); } });
+
+    assert.equal(outcome.published, false);
+    assert.equal(renames, 1);
+
+    // A destination that is absent or a regular file keeps the transient
+    // retry available (the normal concurrent-launch state).
+    const absent = join(scratch, "absent.md");
+    const retryable = helperModule.renameIntoPlaceWithContentionRetry(() => {
+      renames += 1;
+      throw errnoError("EPERM");
+    }, { destination: absent, platform: "win32", attempts: 2, delayMs: 1, sleep: () => {} });
+    assert.equal(retryable.published, false);
+    assert.equal(renames, 3, "an absent destination must keep the bounded retry");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });
 
 test("concurrent first launches never clobber or expose partial JSON", async () => {

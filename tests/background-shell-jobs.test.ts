@@ -460,10 +460,15 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     // The fail helper writes the record (so readiness can distinguish "nothing
     // ran" from lost evidence) and aborts before the user command runs.
     expect(wrapped).toContain(
-      "function __pi_review_fail { try { Set-Content -LiteralPath $__pi_review_marker -Value '0 failed' } catch {}; exit 1 }",
+      "function __pi_review_fail($stage) { try { Set-Content -LiteralPath $__pi_review_marker -Value '0 failed' } catch {};",
+
     );
-    const failCount = wrapped.split("__pi_review_fail }").length - 1;
-    expect(failCount >= 8, `every pre-command failure path routes through the helper (found ${failCount})`).toBe(true);
+    for (const stage of ["parent-identity", "self-path", "root-identity", "watchdog-spawn", "watchdog-alive", "ownership-handshake", "stop-during-startup", "record-unreadable", "record-mismatch"]) {
+      const gate = wrapped.indexOf(`__pi_review_fail '${stage}'`);
+      expect(gate !== -1 && gate < wrapped.indexOf(COMMAND), `${stage} aborts before the command`).toBe(true);
+    }
+    expect(wrapped).toContain('[Console]::Error.WriteLine("pi-review-gate: ShellStart aborted');
+    expect(wrapped).not.toContain("1>&2");
     // The marker variable is defined before any failure can occur.
     expect(wrapped.indexOf("$__pi_review_marker = 'C:\\pi-review-bg\\test.job'") !== -1).toBe(true);
     expect(wrapped.indexOf("$__pi_review_marker =") < wrapped.indexOf("GetProcessById(4242)")).toBe(true);
@@ -481,7 +486,7 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
   it("launches a hidden watchdog process of the same shell edition with isolated stdio", () => {
     // Same edition as the running shell (works on PowerShell 7 and 5.1 alike).
     expect(wrapped).toContain("$__pi_review_self = (Get-Process -Id $PID).Path");
-    expect(wrapped).toContain("if (-not $__pi_review_self) { __pi_review_fail }");
+    expect(wrapped).toContain("if (-not $__pi_review_self) { __pi_review_fail 'self-path' }");
     expect(wrapped).toContain("$__psi.CreateNoWindow = $true");
     expect(wrapped).toContain("$__psi.RedirectStandardInput = $true");
     expect(wrapped).toContain("$__psi.RedirectStandardOutput = $true");
@@ -489,7 +494,8 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     expect(wrapped).toContain("[System.Diagnostics.Process]::Start($__psi)");
     // A watchdog that already exited gives no protection: fail closed BEFORE
     // the user command runs.
-    expect(wrapped).toContain("if ($__pi_review_watchdog.WaitForExit(300)) { __pi_review_fail }");
+    expect(wrapped).toContain("if ($__pi_review_watchdog.WaitForExit(300)) { __pi_review_fail 'watchdog-alive' }");
+    expect(wrapped).toContain("$__psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($__pi_review_watchdog_command))");
   });
 
   it("creates a kill-on-close job object and assigns the shell root to it", () => {
@@ -522,7 +528,7 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     // Timeout or early watchdog exit: stderr diagnostic + fail, never an
     // unprotected run.
     expect(wrapped).toContain("the command was NOT run.");
-    const failGate = wrapped.lastIndexOf("__pi_review_fail }");
+    const failGate = wrapped.indexOf("__pi_review_fail 'ownership-handshake'");
     expect(failGate > wait && failGate < command).toBe(true);
   });
 
@@ -565,7 +571,7 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
   it("validates the watchdog's running record before executing the command", () => {
     // A stop request that arrived during startup aborts the job, and the
     // record must be exactly this watchdog's "<pid> running".
-    const stopCheck = wrapped.indexOf(`if (Test-Path -LiteralPath 'C:\\pi-review-bg\\test.stop') { exit 1 }`);
+    const stopCheck = wrapped.indexOf(`if (Test-Path -LiteralPath 'C:\\pi-review-bg\\test.stop') { __pi_review_fail 'stop-during-startup' }`);
     const recordCheck = wrapped.indexOf("$__pi_review_record -ne ([string]$__pi_review_watchdog.Id + ' running')");
     const command = wrapped.indexOf(COMMAND);
     expect(stopCheck !== -1 && recordCheck !== -1 && stopCheck < recordCheck && recordCheck < command).toBe(true);
@@ -587,19 +593,19 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
   });
 
   it("runs the command in a child scope and captures $? before any other statement", () => {
-    const block = `& {\n${COMMAND}\n}`;
+    const block = `& {\n${COMMAND}\n$__pi_review_status[0] = $?\n$__pi_review_status[1] = $LASTEXITCODE\n}`;
     const idx = wrapped.indexOf(block);
-    expect(idx !== -1, "command block present").toBe(true);
-    // The very next line after the closing brace is the $? capture: any earlier
-    // statement would overwrite it and a failed cmdlet would look like success.
-    expect(wrapped.slice(idx + block.length).startsWith("\n$__pi_review_ok = $?"), "first statement after the command block").toBe(true);
+    expect(idx !== -1, "capture the command status immediately, inside its scope").toBe(true);
+    const holder = wrapped.indexOf("$__pi_review_status = @($null, $null)");
+    expect(holder !== -1 && holder < idx, "mutable status holder belongs to the outer scope").toBe(true);
   });
 
   it("preserves the exit status", () => {
-    expect(wrapped).toContain("$__pi_review_rc = $LASTEXITCODE");
+    expect(wrapped).toContain("$__pi_review_status[1] = $LASTEXITCODE");
+    expect(wrapped).toContain("if ($null -eq $__pi_review_status[1]) { $__pi_review_status[1] = 0 }");
     // Failed cmdlet (false $?, no native status) maps to nonzero.
-    expect(wrapped).toContain("if (-not $__pi_review_ok -and $__pi_review_rc -eq 0) { $__pi_review_rc = 1 }");
-    expect(wrapped.trimEnd().endsWith("exit $__pi_review_rc")).toBe(true);
+    expect(wrapped).toContain("if (-not $__pi_review_status[0] -and $__pi_review_status[1] -eq 0) { $__pi_review_status[1] = 1 }");
+    expect(wrapped.trimEnd().endsWith("exit $__pi_review_status[1]")).toBe(true);
   });
 
   it("stays Windows-PowerShell-5.1 compatible (no PS7-only operators)", () => {

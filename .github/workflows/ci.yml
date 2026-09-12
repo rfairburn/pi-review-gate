@@ -148,6 +148,8 @@ jobs:
         run: npm run build
       - name: Static docs validation
         run: node scripts/check-docs.cjs
+      - name: Docs checker regression tests
+        run: node --test dist-test/tests/governance-docs.test.js
 
   release:
     # Publishes the numbered prerelease for a validated main push by calling the

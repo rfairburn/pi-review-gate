@@ -632,6 +632,28 @@ test("docs checker accepts a new public doc in repo and installed layouts", () =
   }
 });
 
+test("docs checker resolves cross-page anchors with platform-independent inventory keys", () => {
+  for (const sourceOnly of [true, false]) {
+    const root = makeDocsFixture({ sourceOnly });
+    try {
+      fs.appendFileSync(path.join(root, "README.md"), "\n[Release heading](docs/releases.md#releases)\n");
+      fs.appendFileSync(path.join(root, "docs", "configuration.md"),
+        "\n[Getting started](getting-started.md#getting-started)\n");
+      const valid = runDocsChecker(root);
+      assert.equal(valid.status, 0, `cross-page anchors must resolve on ${process.platform}: ${valid.stderr}`);
+
+      fs.appendFileSync(path.join(root, "docs", "configuration.md"),
+        "\n[Missing heading](getting-started.md#nonexistent-heading)\n");
+      const invalid = runDocsChecker(root);
+      assert.notEqual(invalid.status, 0, "normalizing inventory keys must not bypass anchor validation");
+      assert.match(invalid.stderr, /anchor "nonexistent-heading".*has no matching heading/);
+      assert.doesNotMatch(invalid.stderr, /not a validated markdown page/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("docs checker still rejects arbitrary local planning doc references", () => {
   const root = makeDocsFixture({ sourceOnly: false });
   try {

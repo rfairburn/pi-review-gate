@@ -490,8 +490,15 @@ function ddgsPythonPath(venv, platform) {
  */
 function ensureDdgs(homeDir, env) {
   const platform = process.platform;
-  const cacheRoot = env.XDG_CACHE_HOME || path.join(homeDir, ".cache");
-  const venv = env.PI_REVIEW_GATE_DDGS_VENV || path.join(cacheRoot, `ddgs-${DDGS_VERSION}`);
+  // Cache-root parity with scripts/ensure-ddgs.sh: ${XDG_CACHE_HOME:-$HOME/.cache}
+  // + /pi-review-gate, with the pinned venv as the default member of that
+  // dedicated cache directory. An explicit PI_REVIEW_GATE_DDGS_VENV still wins.
+  const cacheRoot = joinForPlatform(
+    platform,
+    env.XDG_CACHE_HOME || joinForPlatform(platform, homeDir, ".cache"),
+    "pi-review-gate",
+  );
+  const venv = env.PI_REVIEW_GATE_DDGS_VENV || joinForPlatform(platform, cacheRoot, `ddgs-${DDGS_VERSION}`);
   const python = ddgsPythonPath(venv, platform);
 
   if (!fs.existsSync(python)) {

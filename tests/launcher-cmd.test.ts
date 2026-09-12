@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { after, before, test } from "node:test";
 import { piAgentConfigPath, reviewGateConfigCandidates } from "../src/config-path";
@@ -130,15 +130,7 @@ async function makeFixture(prefix: string, options: { skipNpmShim?: boolean; emp
     // Empty venv: the helper must take the fresh-provisioning path.
     await mkdir(ddgsVenv, { recursive: true });
   } else {
-    await mkdir(join(ddgsVenv, "bin"), { recursive: true });
-    const ddgsPythonPath = join(ddgsVenv, "bin", "python");
-    await writeFile(ddgsPythonPath, [
-      "#!/usr/bin/env bash",
-      "{ printf 'CALL\\t'; printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
-      "exit 0",
-      "",
-    ].join("\n"), "utf8");
-    await chmod(ddgsPythonPath, 0o755);
+    await writePosixDdgsPythonStub(ddgsVenv);
   }
 
   return {
@@ -179,6 +171,44 @@ function npmCmdShim(targetRelative: string): string {
   ].join("\r\n");
 }
 
+/**
+ * A POSIX stub venv python that records its invocations and succeeds at every
+ * probe the helper makes (isolated-mode version check and pip check), so the
+ * venv counts as a valid cached environment.
+ */
+async function writePosixDdgsPythonStub(venv: string): Promise<void> {
+  await mkdir(join(venv, "bin"), { recursive: true });
+  const pythonPath = join(venv, "bin", "python");
+  await writeFile(pythonPath, [
+    "#!/usr/bin/env bash",
+    "{ printf 'CALL\\t'; printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
+    "exit 0",
+    "",
+  ].join("\n"), "utf8");
+  await chmod(pythonPath, 0o755);
+}
+
+/**
+ * Present a valid cached DDGS venv at an arbitrary location through the same
+ * seam the helper resolves: a POSIX stub interpreter on POSIX, and a junction
+ * to the really provisioned shared venv on native Windows (real python.exe,
+ * real pinned install — no pip cost beyond the once-per-run before() hook).
+ */
+async function stageValidDdgsVenvAt(venv: string): Promise<void> {
+  if (isWindows) {
+    if (!sharedWindowsVenv) throw new Error("the shared Windows DDGS venv must be provisioned in before()");
+    await mkdir(dirname(venv), { recursive: true });
+    await symlink(sharedWindowsVenv, venv, "junction");
+  } else {
+    await writePosixDdgsPythonStub(venv);
+  }
+}
+
+/** The venv the default fixture environment directs the helper at. */
+function fixtureDdgsVenv(fixture: Fixture): string {
+  return isWindows ? sharedWindowsVenv ?? fixture.ddgsVenv : fixture.ddgsVenv;
+}
+
 function fixtureEnv(fixture: Fixture, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   // Sanitize inherited gate variables so the tests observe the helper's own
@@ -198,7 +228,7 @@ function fixtureEnv(fixture: Fixture, overrides: NodeJS.ProcessEnv = {}): NodeJS
   env.CAPTURE_FILE = join(fixture.capture, "pi.json");
   // Native Windows tests share one really provisioned venv; POSIX tests use a
   // stub python at the same seam the helper resolves (Scripts\ vs bin\).
-  env.PI_REVIEW_GATE_DDGS_VENV = isWindows ? sharedWindowsVenv ?? fixture.ddgsVenv : fixture.ddgsVenv;
+  env.PI_REVIEW_GATE_DDGS_VENV = fixtureDdgsVenv(fixture);
   return { ...env, ...overrides };
 }
 
@@ -348,7 +378,8 @@ test("launcher helper resolves, exports and forwards on a normal launch", async 
   assert.equal(launch.disabledEnv, null);
   assert.equal(launch.agentDirEnv, null);
   assert.ok(launch.ddgsEnv, "the DDGS python must be exported for the extension's web search");
-  assert.equal(launch.ddgsEnv, helperModule.ddgsPythonPath(fixture.ddgsVenv, process.platform));
+  assert.equal(launch.ddgsEnv, helperModule.ddgsPythonPath(fixtureDdgsVenv(fixture), process.platform),
+    "the exported interpreter must come from the venv the environment requested");
   assert.match(result.stdout, new RegExp(`pi-review-gate config: ${escapeRegExp(fixture.defaultConfigPath)}`));
   assert.match(result.stdout, new RegExp(`pi-review-gate extension: ${escapeRegExp(extensionPath)}`));
   assert.match(result.stdout,
@@ -553,7 +584,13 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
     assert.equal(await pathExists(join(fixture.capture, "npm-args")), false,
       "packaged mode must not invoke npm");
     const launch = await capturedLaunch(fixture);
-    assert.deepEqual(launch.args.slice(0, 2), ["--extension", join(realStage, "dist", "src", "index.js")]);
+    assert.equal(launch.args[0], "--extension");
+    // Compare through realpath: the staged helper's __dirname and the test's
+    // scratch path may surface different spellings of the same directory
+    // (/private/var vs /var on macOS; 8.3 short names like RUNNER~1 in the
+    // Windows CI temp dir), but realpath normalizes both to one form.
+    assert.equal(await realpath(launch.args[1]), join(realStage, "dist", "src", "index.js"),
+      "packaged mode must use the staged artifact");
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
@@ -731,6 +768,10 @@ test("concurrent first launches never clobber or expose partial JSON", async () 
 // native Windows provisioning itself is covered by the win32-only tests).
 // ---------------------------------------------------------------------------
 
+/** Honest evidence boundary for the POSIX bash-stub DDGS tests on Windows. */
+const posixDdgsSkipReason =
+  "POSIX bash-stub coverage; the native Windows equivalents below drive the real helper, .cmd entry point and Python";
+
 const venvPythonStub = (behavior: "valid" | "fail-first" | "refuse") => [
   "#!/usr/bin/env bash",
   "{ printf 'CALL\\t'; printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
@@ -747,7 +788,7 @@ const venvPythonStub = (behavior: "valid" | "fail-first" | "refuse") => [
   "",
 ].join("\n");
 
-test("helper uses a valid cached DDGS venv without provisioning", async () => {
+test("helper uses a valid cached DDGS venv without provisioning", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-cached-");
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
@@ -765,7 +806,7 @@ test("helper uses a valid cached DDGS venv without provisioning", async () => {
   for (const call of calls) assert.equal(call.split("\t")[1], "-I", `not isolated: ${call}`);
 });
 
-test("helper repairs an invalid cached venv and continues", async () => {
+test("helper repairs an invalid cached venv and continues", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-repair-");
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
@@ -786,7 +827,7 @@ test("helper repairs an invalid cached venv and continues", async () => {
   assert.equal((await capturedLaunch(fixture)).ddgsEnv, join(fixture.ddgsVenv, "bin", "python"));
 });
 
-test("helper refuses to continue when the DDGS venv stays broken", async () => {
+test("helper refuses to continue when the DDGS venv stays broken", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-refuse-");
   const venvPythonPath = join(fixture.ddgsVenv, "bin", "python");
   await writeFile(venvPythonPath, venvPythonStub("refuse"), "utf8");
@@ -799,7 +840,7 @@ test("helper refuses to continue when the DDGS venv stays broken", async () => {
   assert.equal(await launchStarted(fixture), false, "a broken venv must stop the launch");
 });
 
-test("helper provisions a fresh DDGS venv without Bash", async () => {
+test("helper provisions a fresh DDGS venv without Bash", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-fresh-", { emptyDdgsVenv: true });
   // The venv starts empty: the helper must find an interpreter (python3 first,
   // then python), create the venv, install, validate, and export the python.
@@ -837,7 +878,7 @@ test("helper provisions a fresh DDGS venv without Bash", async () => {
   for (const call of calls) assert.equal(call.split("\t")[1], "-I", `not isolated: ${call}`);
 });
 
-test("helper fails closed when no isolated-mode Python interpreter is available", async () => {
+test("helper fails closed when no isolated-mode Python interpreter is available", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-nopython-", { emptyDdgsVenv: true });
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
@@ -856,7 +897,7 @@ test("helper fails closed when no isolated-mode Python interpreter is available"
   assert.equal(await launchStarted(fixture), false);
 });
 
-test("helper propagates a failing venv creation", async () => {
+test("helper propagates a failing venv creation", { skip: isWindows ? posixDdgsSkipReason : false }, async () => {
   const fixture = await makeFixture("pi-review-cmd-ddgs-venvfail-", { emptyDdgsVenv: true });
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
@@ -869,6 +910,82 @@ test("helper propagates a failing venv creation", async () => {
   assert.equal(result.status, 3, "the venv toolchain's own exit status must propagate");
   assert.match(result.stderr, /could not create the DDGS/);
   assert.equal(await launchStarted(fixture), false);
+});
+
+// ---------------------------------------------------------------------------
+// DDGS cache-root parity with scripts/ensure-ddgs.sh (real helper entrypoint,
+// no path algorithm in the test): the default cache root must carry the
+// pi-review-gate component, XDG_CACHE_HOME must relocate it, and an explicit
+// PI_REVIEW_GATE_DDGS_VENV must keep winning over both.
+// ---------------------------------------------------------------------------
+
+async function ddgsCacheFixture(prefix: string): Promise<Fixture> {
+  const fixture = await makeFixture(prefix);
+  await mkdir(fixture.agentDir, { recursive: true });
+  await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+  return fixture;
+}
+
+test("helper provisions DDGS in the launcher's default pi-review-gate cache root", async () => {
+  const fixture = await ddgsCacheFixture("pi-review-cmd-ddgs-cacheroot-");
+  // A valid venv at the Bash launcher's default location
+  // ${XDG_CACHE_HOME:-$HOME/.cache}/pi-review-gate/ddgs-<version> must be
+  // discovered, validated (never re-provisioned) and exported as-is.
+  const defaultVenv = join(fixture.home, ".cache", "pi-review-gate", `ddgs-${helperModule.DDGS_VERSION}`);
+  await stageValidDdgsVenvAt(defaultVenv);
+  const env = fixtureEnv(fixture);
+  delete env.XDG_CACHE_HOME;
+  delete env.PI_REVIEW_GATE_DDGS_VENV;
+
+  const result = await runHelperExpectingFailure([], env);
+
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.doesNotMatch(result.stderr, /creating DDGS|installing DDGS/,
+    "the venv at the default pi-review-gate cache root must be treated as cached");
+  const launch = await capturedLaunch(fixture);
+  assert.equal(launch.ddgsEnv, helperModule.ddgsPythonPath(defaultVenv, process.platform),
+    "the exported interpreter must live inside the default pi-review-gate cache root");
+});
+
+test("helper honors XDG_CACHE_HOME for the DDGS cache root", async () => {
+  const fixture = await ddgsCacheFixture("pi-review-cmd-ddgs-xdg-");
+  const xdgRoot = join(fixture.root, "xdg cache with spaces");
+  const xdgVenv = join(xdgRoot, "pi-review-gate", `ddgs-${helperModule.DDGS_VERSION}`);
+  await stageValidDdgsVenvAt(xdgVenv);
+  const env = fixtureEnv(fixture, { XDG_CACHE_HOME: xdgRoot });
+  delete env.PI_REVIEW_GATE_DDGS_VENV;
+
+  const result = await runHelperExpectingFailure([], env);
+
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.doesNotMatch(result.stderr, /creating DDGS|installing DDGS/,
+    "the venv under XDG_CACHE_HOME/pi-review-gate must be treated as cached");
+  const launch = await capturedLaunch(fixture);
+  assert.equal(launch.ddgsEnv, helperModule.ddgsPythonPath(xdgVenv, process.platform));
+  assert.equal(await pathExists(join(fixture.home, ".cache")), false,
+    "the default cache root must stay untouched when XDG_CACHE_HOME relocates it");
+});
+
+test("an explicit PI_REVIEW_GATE_DDGS_VENV wins over the default and XDG cache roots", async () => {
+  const fixture = await ddgsCacheFixture("pi-review-cmd-ddgs-explicit-");
+  // A fresh location (makeFixture pre-creates its default venv directory, and
+  // a junction cannot occupy an existing path on Windows).
+  const explicitVenv = join(fixture.root, "explicit ddgs venv");
+  await stageValidDdgsVenvAt(explicitVenv);
+  const env = fixtureEnv(fixture, {
+    XDG_CACHE_HOME: join(fixture.root, "xdg ignored"),
+    PI_REVIEW_GATE_DDGS_VENV: explicitVenv,
+  });
+
+  const result = await runHelperExpectingFailure([], env);
+
+  assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+  assert.doesNotMatch(result.stderr, /creating DDGS|installing DDGS/);
+  const launch = await capturedLaunch(fixture);
+  assert.equal(launch.ddgsEnv, helperModule.ddgsPythonPath(explicitVenv, process.platform),
+    "the explicit override must win over every implicit cache root");
+  assert.equal(await pathExists(join(fixture.root, "xdg ignored")), false,
+    "an explicit venv override must not provision anything under XDG_CACHE_HOME");
 });
 
 // ---------------------------------------------------------------------------
@@ -1067,7 +1184,14 @@ test(".cmd entry point delegates unconditionally to the helper with raw passthro
 // ---------------------------------------------------------------------------
 
 function runCmd(command: string, env: NodeJS.ProcessEnv, cwd = resolve("")) {
-  return spawnSync("cmd.exe", ["/d", "/s", "/c", command], { env, cwd, encoding: "utf8" });
+  // windowsVerbatimArguments: the command string is already quoted exactly as
+  // cmd.exe expects it; Node's default argument encoding would escape the
+  // embedded quotes as \" — and cmd.exe does not honor backslash escaping, so
+  // the .cmd would receive extra literal quote characters (observed on native
+  // Windows CI). /c without /s lets cmd.exe preserve a fully quoted
+  // executable path (its quote-preservation rule) while executing unquoted
+  // command strings verbatim.
+  return spawnSync("cmd.exe", ["/d", "/c", command], { env, cwd, encoding: "utf8", windowsVerbatimArguments: true });
 }
 
 if (isWindows) {
@@ -1226,9 +1350,15 @@ if (isWindows) {
     // PowerShell delivers % literally; the helper must keep it literal all the
     // way into pi (no cmd.exe reparse between the helper and pi), so %VAR%
     // text is never expanded and no second shell pass can corrupt it.
+    // Metacharacters are a documented boundary of every batch file reached
+    // from PowerShell: PowerShell does not quote arguments that contain no
+    // whitespace, so cmd.exe would split on unquoted & | ^ before the .cmd is
+    // entered — a PowerShell caller must cmd-escape them with carets, exactly
+    // as for any batch file. The .cmd's raw %* passthrough then delivers the
+    // caret-unescaped literal text byte for byte.
     const result = spawnSync(
       "powershell.exe",
-      ["-NoProfile", "-Command", "& '.\\scripts\\pi-review-gate.cmd' --pct '100%PI%' --label 'a&b|c^d'; exit $LASTEXITCODE"],
+      ["-NoProfile", "-Command", "& '.\\scripts\\pi-review-gate.cmd' --pct '100%PI%' --label 'a^&b^|c^^d'; exit $LASTEXITCODE"],
       { env: fixtureEnv(fixture), cwd: resolve(""), encoding: "utf8" },
     );
 
@@ -1293,9 +1423,116 @@ if (isWindows) {
       assert.equal(await pathExists(join(fixture.capture, "npm-args")), false,
         "packaged mode must not invoke npm");
       const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
-      assert.deepEqual(launch.args.slice(0, 2), ["--extension", join(stage, "dist", "src", "index.js")]);
+      assert.equal(launch.args[0], "--extension");
+      // realpath comparison: the Windows CI temp dir surfaces 8.3 short names
+      // (RUNNER~1) in one spelling and not the other; realpath normalizes.
+      assert.equal(await realpath(launch.args[1]), join(await realpath(stage), "dist", "src", "index.js"),
+        "packaged mode must use the staged artifact through the .cmd entry point");
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }
+  });
+
+  test("native helper repairs an invalid cached venv by installing the pinned wheel", async () => {
+    const fixture = await makeFixture("pi-review-cmd-native-repair-");
+    await mkdir(fixture.agentDir, { recursive: true });
+    await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+    // A really created venv without ddgs installed: a valid python at the
+    // exact seam the helper resolves, but an invalid cached environment. The
+    // helper must install the pinned wheel into it and continue — the native
+    // counterpart of the POSIX repair stub.
+    const brokenVenv = fixture.ddgsVenv;
+    const create = spawnSync(`python -I -m venv "${brokenVenv}"`, { shell: true, stdio: "pipe" });
+    assert.equal(create.status, 0, `python -m venv must work natively: ${String(create.stderr)}`);
+
+    const result = runCmd(
+      "scripts\\pi-review-gate.cmd --model example",
+      fixtureEnv(fixture, { PI_REVIEW_GATE_DDGS_VENV: brokenVenv }),
+    );
+
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    assert.match(String(result.stderr), /installing DDGS/);
+    assert.doesNotMatch(String(result.stderr), /creating DDGS/,
+      "an existing venv python must never trigger venv re-creation");
+    const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
+    assert.equal(launch.ddgsEnv, join(brokenVenv, "Scripts", "python.exe"));
+  });
+
+  test("native helper fails closed when the broken venv cannot be repaired", async () => {
+    const fixture = await makeFixture("pi-review-cmd-native-refuse-");
+    await mkdir(fixture.agentDir, { recursive: true });
+    await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+    // A venv-shaped directory whose interpreter is not Python (the Node binary
+    // deterministically rejects the -I flag): validation fails, the pinned
+    // install fails, and the helper must exit with the toolchain's own status
+    // without launching pi.
+    await mkdir(join(fixture.ddgsVenv, "Scripts"), { recursive: true });
+    await copyFile(process.execPath, join(fixture.ddgsVenv, "Scripts", "python.exe"));
+
+    const result = runCmd(
+      "scripts\\pi-review-gate.cmd --model example",
+      fixtureEnv(fixture, { PI_REVIEW_GATE_DDGS_VENV: fixture.ddgsVenv }),
+    );
+
+    assert.equal(result.status, 9, "the failing interpreter's own exit status must propagate");
+    assert.match(String(result.stderr), /installing DDGS/);
+    assert.equal(await launchStarted(fixture), false);
+  });
+
+  test("native helper fails closed when no isolated-mode Python interpreter is available", async () => {
+    // Staged packaged layout: no src/index.ts, so no build runs and the
+    // restricted PATH cannot break npm resolution before the DDGS probe.
+    const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-native-nopy-"));
+    try {
+      const stage = join(scratch, "package dir with spaces");
+      await mkdir(join(stage, "scripts"), { recursive: true });
+      await mkdir(join(stage, "skills", "orchestrator", "references"), { recursive: true });
+      await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
+      await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
+      await copyFile(resolve("skills/orchestrator/SKILL.md"), join(stage, "skills/orchestrator/SKILL.md"));
+      await copyFile(
+        resolve("skills/orchestrator/references/recovery.md"),
+        join(stage, "skills/orchestrator/references/recovery.md"),
+      );
+      await mkdir(join(stage, "dist", "src"), { recursive: true });
+      await writeFile(join(stage, "dist", "src", "index.js"), "module.exports = { activate() {} };\n", "utf8");
+
+      const fixture = await makeFixture("pi-review-cmd-native-nopy-fix-");
+      const env = fixtureEnv(fixture);
+      // Only the fake pi shim is on PATH: no python3, no python, no npm.
+      env.PATH = fixture.bin;
+      delete env.XDG_CACHE_HOME;
+      env.PI_REVIEW_GATE_DDGS_VENV = join(fixture.root, "missing ddgs venv");
+
+      const outcome = await runStagedHelperExpectingFailure(
+        join(stage, "scripts", "pi-review-gate-launcher.cjs"), ["--model", "example"], env, scratch,
+      );
+
+      assert.equal(outcome.status, 1);
+      assert.match(outcome.stderr, /Python 3 is required to provision the DDGS web-search dependency/);
+      assert.equal(await launchStarted(fixture), false, "a missing interpreter must stop the launch");
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("native helper propagates a failing venv creation", async () => {
+    const fixture = await makeFixture("pi-review-cmd-native-venvfail-");
+    await mkdir(fixture.agentDir, { recursive: true });
+    await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
+    // An existing regular file at the venv target makes the real toolchain's
+    // `python -I -m venv` fail; the helper must propagate that status and
+    // never launch pi over a failed provisioning.
+    const blocked = join(fixture.root, "venv path is a file");
+    await writeFile(blocked, "not a venv\n", "utf8");
+
+    const result = runCmd(
+      "scripts\\pi-review-gate.cmd --model example",
+      fixtureEnv(fixture, { PI_REVIEW_GATE_DDGS_VENV: blocked }),
+    );
+
+    assert.equal(result.status, 1, "the venv toolchain's own exit status must propagate");
+    assert.match(String(result.stderr), /could not create the DDGS/);
+    assert.equal(await launchStarted(fixture), false);
   });
 }

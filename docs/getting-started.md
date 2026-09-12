@@ -44,16 +44,19 @@ Behavioral detail lives in the linked pages.
   These scripts use tools such as `dirname`, `mkdir`, `mktemp`, `chmod`, `cp`, and
   `rm`; Bash alone is not the entire launcher environment. Normal launch provisions
   or validates DDGS even if the session will not use `WebSearch`.
-- **Bash at `/bin/bash`, for `ShellStart`.** Its watchdog and process-tree cleanup
-  currently depend on POSIX process groups and shell utilities such as `sleep` and
-  `kill`. Native Windows PowerShell support for this background tool is not yet
-  implemented; Pi's separate native `powershell` tool does not supply that backend.
+- **Platform shell, for `ShellStart`.** macOS/Linux use `/bin/bash`, POSIX process
+  groups and utilities such as `sleep` and `kill`. Windows uses `pwsh.exe` first,
+  then `powershell.exe`, on `PATH`; neither available means no job can start.
+  Windows descendant ownership uses PowerShell/.NET with Windows Job Objects;
+  inability to establish that protection prevents the user command from running.
+  There is no shell-selection argument or configuration.
 
 On Windows, Git must still be available on `PATH` for delegated execution; Git for
 Windows supplies the executable. Requiring Git does not itself require using its
 bundled Bash as the launch shell. The native `.cmd` launcher needs no Bash or WSL;
-ShellStart's POSIX requirements remain a separate limitation. Launcher verification
-alone does not establish native Windows worktree/landing/recovery compatibility.
+ShellStart uses PowerShell on Windows independently of the launch shell. Launcher
+and shell verification do not establish native Windows worktree/landing/recovery
+compatibility.
 Minimum Git, Python, and external harness versions are not pinned in the package
 engine declaration; do not interpret that absence as verification of every version.
 

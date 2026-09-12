@@ -291,19 +291,20 @@ function callerReleaseConditions(): void {
     "the publisher must not gain alternate trigger paths through the caller");
 }
 
-function callerRunsOnlyAfterBothRequiredChecks(): void {
+function callerRunsOnlyAfterAllRequiredChecks(): void {
   const source = readWorkflow();
   const release = releaseJobBlock();
-  assert.match(release, /needs: \[verify, full-tests, windows-launcher\]/,
-    "the publisher must need Linux verification and native Windows launcher checks");
+  assert.match(release, /needs: \[verify, full-tests, windows-launcher, windows-shell\]/,
+    "the publisher must need Linux verification and both native Windows check jobs");
   assert.match(source, /^  verify:$/m);
   assert.match(source, /^  full-tests:$/m);
+  assert.match(source, /^  windows-shell:$/m);
   // GitHub evaluates a needed job as failure when it fails OR is skipped; the
   // implicit success() guard therefore blocks the publisher in both cases, but
   // only as long as the condition is not overridden.
   assert.doesNotMatch(release, /always\(\)|failure\(\)|cancelled\(\)/,
     "overriding the implicit success() guard would let failed or skipped checks publish");
-  for (const neededJob of ["verify", "full-tests", "windows-launcher"]) {
+  for (const neededJob of ["verify", "full-tests", "windows-launcher", "windows-shell"]) {
     const job = blockOf(source, neededJob, 2);
     assert.doesNotMatch(job, /continue-on-error/,
       `a continue-on-error step or job in ${neededJob} would convert failure into success upstream of the publisher`);
@@ -378,9 +379,9 @@ function reusableReleaseWorkflowMirrorsTheBoundary(): void {
   assert.ok(pinnedActions(source).size >= 2, "checkout and setup-node must be SHA-pinned in the builder");
 }
 
-test("release caller publishes only correct main pushes after both required checks", () => {
+test("release caller publishes only correct main pushes after all required checks", () => {
   callerReleaseConditions();
-  callerRunsOnlyAfterBothRequiredChecks();
+  callerRunsOnlyAfterAllRequiredChecks();
 });
 
 test("release caller passes no secrets and carries the only write grant", () => {

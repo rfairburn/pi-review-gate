@@ -151,10 +151,35 @@ jobs:
       - name: Docs checker regression tests
         run: node --test dist-test/tests/governance-docs.test.js
 
+  windows-shell:
+    # Real PowerShell processes and Job Object ownership on native Windows;
+    # both shell-discovery outcomes and descendant cleanup gate publishing.
+    name: Windows shell (Node 24)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build test bundle
+        run: npm run build:test
+      - name: Run Windows shell tests (native)
+        run: >-
+          node --test
+          dist-test/tests/background-shell-windows.test.js
+          dist-test/tests/background-shell-jobs.test.js
+          dist-test/tests/background-process-readiness.test.js
+
   release:
     # Publishes the numbered prerelease for a validated main push by calling the
     # reusable builder. It runs only after all verification jobs succeeded:
-    # with `needs: [verify, full-tests, windows-launcher]` GitHub's implicit success() guard skips
+    # with `needs: [verify, full-tests, windows-launcher, windows-shell]` GitHub's implicit success() guard skips
     # this job when a needed job failed or was skipped, and the explicit `if`
     # re-pins the trust boundary (original push event, refs/heads/main, this
     # repository). PRs, manual dispatches, and foreign repositories can never
@@ -163,7 +188,7 @@ jobs:
     # unused and the job grants exactly `contents: write` — the only write
     # permission anywhere in this workflow.
     name: Publish numbered prerelease
-    needs: [verify, full-tests, windows-launcher]
+    needs: [verify, full-tests, windows-launcher, windows-shell]
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&

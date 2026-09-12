@@ -552,6 +552,291 @@ export function wrapWithParentWatchdog(command: string, parentPid: number, pollS
   ].join("\n");
 }
 
+/** Argument list for the Windows background shell — identical to Pi's native
+ *  powershell tool (dist/core/tools/powershell.js + dist/utils/shell.js):
+ *  non-interactive, profile-free, execution-policy bypassed, one -Command. */
+export const POWERSHELL_ARGS = [
+  "-NoProfile",
+  "-NonInteractive",
+  "-ExecutionPolicy",
+  "Bypass",
+  "-Command",
+] as const;
+
+/** Best-effort UTF-8 console-output initialization, byte-identical to the
+ *  prefix Pi's powershell tool prepends before every command. Administrator-
+ *  enforced execution policies and console code pages can still take
+ *  precedence; the try/catch makes the prefix best-effort by design. */
+export const POWERSHELL_UTF8_PREFIX =
+  "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}";
+
+/** Quote a value as a PowerShell single-quoted string literal (the only escape
+ *  that form needs is doubling the quote). Used to embed per-job file paths in
+ *  generated scripts without any interpolation hazard. */
+function psLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Wrap a command so the job kills itself when pi-review-gate goes away — the
+ * Windows counterpart of wrapWithParentWatchdog.
+ *
+ * The guarantee is the same (a job must die when the host dies by ANY means,
+ * and owned work must stay accounted for after the shell root exits), but
+ * Windows has no process groups and no portable signals, so the mechanism
+ * differs in five ways:
+ *
+ * - Ownership is a Windows JOB OBJECT, not a tree walk. The watchdog creates
+ *   it with JOB_OBJECT_LIMIT_DIE_ON_CLOSE (LimitFlags 0x2000, written at
+ *   offset 16 of JOBOBJECT_BASIC_LIMIT_INFORMATION via
+ *   JobObjectExtendedLimitInformation) and assigns THIS shell to it before the
+ *   user command runs; every process the shell then creates — including
+ *   Start-Process grandchildren — joins the job automatically, and no
+ *   breakaway flag is set, so a process in the job cannot create processes
+ *   outside it (escape attempts fail). The watchdog holds the only handle:
+ *   while it lives, the tree is owned; if it dies for any reason, the kernel
+ *   terminates every member immediately (fail closed — work may be lost,
+ *   orphans never are).
+ * - Ownership SURVIVES THE ROOT'S EXIT. The wrapper deliberately does NOT kill
+ *   the watchdog when the shell exits: the watchdog keeps holding the job as
+ *   long as owned processes remain (recording its pid and state in
+ *   `ownership.markerPath` so readiness and the extension can see that),
+ *   releases itself within one poll once the job's accounting query verifies
+ *   it empty, and terminates the whole job — TerminateJobObject through the
+ *   job handle ONLY, never taskkill by pid (after the root exits that pid may
+ *   identify an unrelated process) — when the host disappears or the stop file
+ *   (`ownership.stopPath`) appears. That is what keeps descendants cleanable
+ *   and non-surviving past host death even though a tree walk from the root
+ *   pid can no longer reach them once that pid is gone.
+ * - The watchdog is a SEPARATE PROCESS of the same shell edition (launched via
+ *   .NET ProcessStartInfo from inside the wrapper: hidden window, its own stdio
+ *   pipes so it can never hold the job's pipes open after the command
+ *   finishes; console output additionally redirected to the null stream so a
+ *   dead pipe can never block it). Its script text travels as an
+ *   -EncodedCommand (base64 of UTF-16LE): the ONLY transport that cannot be
+ *   mangled by command-line quote/backslash re-interpretation — a raw script
+ *   in a -Command argument must be C-style escaped, and any escape slip lets
+ *   the host's argument splitter end the string early (a `"` sequence read as
+ *   end-of-string truncates the watchdog at its first quote). Encoded form is
+ *   byte-exact on both editions (the flag exists since PowerShell 3.0). It
+ *   runs plain PowerShell, identically on PowerShell 7 and Windows PowerShell
+ *   5.1 — no threads, no cross-thread runspace dependence.
+ * - Identity is creation-time, not just a pid: before anything else the wrapper
+ *   records the parent's AND its own StartTime ticks and fails closed (exit 1,
+ *   command never runs) when it cannot; the watchdog then treats the parent as
+ *   gone unless the pid exists AND its creation time still matches, so a reused
+ *   pid cannot keep the job alive.
+ * - The user command runs in a child scope (`& { ... }`) so assignments in the
+ *   command cannot leak into wrapper state (the Bash version uses a subshell
+ *   for the same reason).
+ *
+ * Fail-closed handshake: the watchdog writes `ownership.markerPath` only AFTER
+ * the job object exists and this shell is assigned to it; the wrapper waits for
+ * that marker (bounded by `readyTimeoutMs`, failing fast if the watchdog exits
+ * first) before running the command, so a failure to establish lifecycle
+ * ownership aborts the job with exit 1 and no unprotected execution. Every
+ * pre-command failure also records `0 failed` in the marker so readiness can
+ * distinguish "ownership was never established, nothing ran" from lost
+ * evidence (which must stay blocking, not clear), and writes a bounded,
+ * stage-named diagnostic to stderr so ShellLog shows WHY the job aborted
+ * instead of a bare exit 1. Diagnostics use [Console]::Error.WriteLine rather
+ * than stream redirection: PowerShell reserves `1>&2` ("The '1>&2' operator is
+ * reserved for future use") — only OTHER streams may be redirected onto the
+ * success stream, so redirecting output to stderr that way is a parse error
+ * that kills the whole wrapper before any line of it runs.
+ *
+ * Exit status is preserved: the command runs in a child scope (`& { ... }`),
+ * and its own `$?` / `$LASTEXITCODE` are captured as the block's last
+ * statements, pushed into a wrapper-owned array — a reference object, so
+ * element mutation crosses the scope boundary while plain variable
+ * assignments would not. (One scope out, `$?` reflects the block invocation's
+ * completion, so capturing there would read a failed cmdlet (non-terminating
+ * error) as success.) The captured pair then maps: a failed cmdlet (false
+ * success, no native status) becomes 1,
+ * a native failure keeps its own code, and an explicit `exit N` ends the shell
+ * directly with N, like Bash. The watchdog is intentionally left running on
+ * every exit path — it releases itself within one poll once no owned process
+ * remains, so a finished job still leaves nothing behind.
+ *
+ * The script stays Windows-PowerShell-5.1 compatible (no `??`, no ternary),
+ * because discovery may fall back to the built-in edition.
+ */
+export function wrapWithPowerShellWatchdog(
+  command: string,
+  parentPid: number,
+  pollSeconds = 5,
+  ownership: { markerPath: string; stopPath: string },
+  readyTimeoutMs = 30_000,
+): string {
+  // One line on purpose: it sits inside a single-quoted here-string below, and
+  // a line starting with `'@` would terminate that here-string early. The
+  // watchdog script uses only single-quoted strings so its runtime substitution
+  // stays plain string replacement; the finished script travels to the watchdog
+  // as an -EncodedCommand (base64 of UTF-16LE), which is byte-exact on both
+  // editions and needs no command-line quote/backslash escaping at all. Per-job
+  // file paths are substituted into the watchdog command at RUNTIME (.Replace),
+  // never embedded in the here-string text, so a hostile path cannot terminate
+  // the here-string.
+  const watchdog =
+    `[Console]::SetOut([System.IO.StreamWriter]::Null); [Console]::SetError([System.IO.StreamWriter]::Null); ` +
+    `$mk = __PI_MARKER__; $st = __PI_STOP__; ` +
+    // kernel32 job-object surface, compiled in-process (Add-Type works on both
+    // PowerShell editions; no external dependency).
+    `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobApi { [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a,String n); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j,int c,IntPtr i,uint l); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j,uint e); [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint a,bool b,int p); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); }' } catch { exit 1 }; ` +
+    // JOB_OBJECT_LIMIT_DIE_ON_CLOSE (0x2000): when the last handle to the job
+    // closes, the kernel terminates every member. The watchdog holds that only
+    // handle, so a dead watchdog can never leave owned work behind.
+    // LimitFlags sits at offset 16 of JOBOBJECT_BASIC_LIMIT_INFORMATION (after
+    // the two LARGE_INTEGER time limits); it is set through
+    // JobObjectExtendedLimitInformation (class 9), sized 144 bytes on 64-bit
+    // and 112 on 32-bit. The rest of the zeroed buffer keeps every other limit
+    // at its default, and NO breakaway flag is set: with both
+    // JOB_OBJECT_LIMIT_BREAKAWAY_OK and SILENT_BREAKAWAY_OK absent, a process
+    // in the job cannot create processes outside it — escape attempts fail.
+    `$job = [PiReviewBgJobApi]::CreateJobObjectW([IntPtr]::Zero, $null); if ($job -eq [IntPtr]::Zero) { exit 1 }; ` +
+    `$size = 144; if ([IntPtr]::Size -eq 4) { $size = 112 }; ` +
+    `$lim = [Runtime.InteropServices.GCHandle]::Alloc((New-Object byte[] $size), [Runtime.InteropServices.GCHandleType]::Pinned); ` +
+    `[Runtime.InteropServices.Marshal]::WriteInt32($lim.AddrOfPinnedObject(), 16, 0x2000); ` +
+    `$configured = [PiReviewBgJobApi]::SetInformationJobObject($job, 9, $lim.AddrOfPinnedObject(), $size); $lim.Free(); if (-not $configured) { exit 1 }; ` +
+    // Job-accounting query used to verify the job is EMPTY before release.
+    `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobQuery { [DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr j,int c,IntPtr b,uint n,IntPtr r); }' -ErrorAction Stop } catch { exit 1 }; ` +
+    // Assign THIS shell (root pid substituted at runtime — never a bare parent
+    // pid that could be ours) to the job. Existing children (the watchdog)
+    // stay OUT of the job on purpose: it must survive its own termination path.
+    `$rp = [PiReviewBgJobApi]::OpenProcess(0x1FFFFF, $false, __PI_ROOT__); if ($rp -eq [IntPtr]::Zero) { exit 1 }; ` +
+    `if (-not [PiReviewBgJobApi]::AssignProcessToJobObject($job, $rp)) { exit 1 }; ` +
+    `[void][PiReviewBgJobApi]::CloseHandle($rp); ` +
+    // Handshake record: written only now that ownership is established.
+    `try { Set-Content -LiteralPath $mk -Value "$PID running" } catch { exit 1 }; ` +
+    `while ($true) { Start-Sleep -Seconds ${pollSeconds}; ` +
+    // Heartbeat: the same record, refreshed mtime — readiness keys off the pid
+    // and state, so a delayed heartbeat can never look like completion.
+    `try { Set-Content -LiteralPath $mk -Value "$PID running" } catch {}; ` +
+    // Explicit stop request (ShellStop / shutdown): terminate the whole job
+    // through the job handle ONLY — never taskkill by pid: after the root
+    // exits that pid may identify an unrelated process. The record stays
+    // "running"; the watchdog's own death then proves completion via
+    // kill-on-close (a dead watchdog cannot leave members alive).
+    `if (Test-Path -LiteralPath $st) { [void][PiReviewBgJobApi]::TerminateJobObject($job, 1); exit 0 }; ` +
+    // Host death: pid AND creation-time identity, so a reused pid cannot keep
+    // the job alive. TerminateJobObject reaches descendants that outlived the
+    // root — and again only through the job handle, never by (possibly reused)
+    // pid.
+    `$parentAlive = $false; try { $pp = [System.Diagnostics.Process]::GetProcessById(${parentPid}); if ($pp.StartTime.Ticks -eq __PI_TICKS__) { $parentAlive = $true }; $pp.Dispose() } catch {}; ` +
+    `if (-not $parentAlive) { [void][PiReviewBgJobApi]::TerminateJobObject($job, 1); exit 0 }; ` +
+    // Root exited: release only when the job is EMPTY — ActiveProcesses in
+    // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (class 1; offset 40, struct size
+    // 48) counts live members. Live descendants keep the watchdog — and with
+    // it the ownership, the record, and the host-death kill — alive until they
+    // are gone. A failed query cannot prove emptiness: fail closed (the
+    // watchdog's death then kills every member via kill-on-close).
+    `$rootAlive = $false; try { $rt = [System.Diagnostics.Process]::GetProcessById(__PI_ROOT__); if ($rt.StartTime.Ticks -eq __PI_ROOT_TICKS__) { $rootAlive = $true }; $rt.Dispose() } catch {}; ` +
+    `if (-not $rootAlive) { $accounting = [Runtime.InteropServices.Marshal]::AllocHGlobal(48); try { if (-not [PiReviewBgJobQuery]::QueryInformationJobObject($job, 1, $accounting, 48, [IntPtr]::Zero)) { exit 1 }; $active = [Runtime.InteropServices.Marshal]::ReadInt32($accounting, 40) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($accounting) }; if ($active -eq 0) { try { Set-Content -LiteralPath $mk -Value "$PID released" -ErrorAction Stop } catch {}; exit 0 } } }`;
+  return [
+    POWERSHELL_UTF8_PREFIX,
+    // Defined first so EVERY pre-command failure path can record it.
+    `$__pi_review_marker = ${psLiteral(ownership.markerPath)}`,
+    // The fail helper records '0 failed' (so readiness can distinguish "nothing
+    // ran" from lost evidence), names the failing stage on stderr so ShellLog
+    // is actionable instead of a bare exit 1, and aborts before any execution.
+    `function __pi_review_fail($stage) { try { Set-Content -LiteralPath $__pi_review_marker -Value '0 failed' } catch {}; try { [Console]::Error.WriteLine("pi-review-gate: ShellStart aborted before running the command (stage '$stage'); nothing ran under ownership.") } catch {}; exit 1 }`,
+    // Establish the parent's creation-time identity BEFORE anything else runs;
+    // without it the watchdog cannot tell the real host from a pid reuse, so
+    // the job fails to start rather than running unwatched.
+    `try { $__pi_review_parent_process = [System.Diagnostics.Process]::GetProcessById(${parentPid}) } catch { __pi_review_fail 'parent-identity' }`,
+    `try { $__pi_review_parent_start = $__pi_review_parent_process.StartTime } catch { __pi_review_fail 'parent-identity' }`,
+    `$__pi_review_self = (Get-Process -Id $PID).Path`,
+    `if (-not $__pi_review_self) { __pi_review_fail 'self-path' }`,
+    // This shell's own creation-time identity: the watchdog must not mistake a
+    // reused pid for the root it owns.
+    `try { $__pi_review_root_ticks = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.Ticks } catch { __pi_review_fail 'root-identity' }`,
+    `# Watchdog: same shell edition, hidden, isolated stdio (it must never hold the job's pipes open). It owns the job object for this whole tree.`,
+    `$__pi_review_watchdog_command = @'`,
+    watchdog,
+    `'@`,
+    // Root pid and both creation-time identities are substituted from runtime
+    // values (numeric — no quoting needed). The per-job file paths need DOUBLE
+    // quoting: the outer psLiteral quotes the argument to .Replace in THIS
+    // script, and the inner one becomes part of the watchdog script text, so
+    // `$mk = <path>` there stays a string assignment even for paths with
+    // spaces or apostrophes.
+    `$__pi_review_watchdog_command = $__pi_review_watchdog_command.Replace('__PI_TICKS__', [string]$__pi_review_parent_start.Ticks).Replace('__PI_ROOT__', [string]$PID).Replace('__PI_ROOT_TICKS__', [string]$__pi_review_root_ticks).Replace('__PI_MARKER__', ${psLiteral(psLiteral(ownership.markerPath))}).Replace('__PI_STOP__', ${psLiteral(psLiteral(ownership.stopPath))})`,
+    `$__psi = New-Object System.Diagnostics.ProcessStartInfo`,
+    `$__psi.FileName = $__pi_review_self`,
+    // The watchdog script travels as an -EncodedCommand (base64 of UTF-16LE):
+    // byte-exact on both editions, and immune to command-line quote/backslash
+    // re-interpretation — a raw script in a -Command argument must be C-style
+    // escaped, and an even run of backslashes before a quote makes the host's
+    // argument splitter end the string there (the old inline escape produced
+    // exactly that at the Add-Type block's first quote).
+    `$__psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($__pi_review_watchdog_command))`,
+    `$__psi.UseShellExecute = $false`,
+    `$__psi.CreateNoWindow = $true`,
+    `$__psi.RedirectStandardInput = $true`,
+    `$__psi.RedirectStandardOutput = $true`,
+    `$__psi.RedirectStandardError = $true`,
+    `try { $__pi_review_watchdog = [System.Diagnostics.Process]::Start($__psi) } catch { __pi_review_fail 'watchdog-spawn' }`,
+    `if (-not $__pi_review_watchdog -or $__pi_review_watchdog.Id -le 0) { __pi_review_fail 'watchdog-alive' }`,
+    // Verify the watchdog actually started: a healthy shell is still running
+    // after this grace window; one that already exited gives no protection, so
+    // fail closed before the user command runs.
+    `if ($__pi_review_watchdog.WaitForExit(300)) { __pi_review_fail 'watchdog-alive' }`,
+    `[void]$__pi_review_watchdog.BeginOutputReadLine()`,
+    `[void]$__pi_review_watchdog.BeginErrorReadLine()`,
+    // Ownership handshake: the record appears only AFTER the job object exists
+    // and this shell is assigned to it. Without it, descendants would run
+    // unprotected — fail closed before the user command runs. A watchdog that
+    // exits first means the handshake cannot succeed: stop waiting immediately.
+    `$__pi_review_ready = $false; $__pi_review_waited = 0`,
+    `while (-not $__pi_review_ready -and $__pi_review_waited -lt ${readyTimeoutMs}) { if (Test-Path -LiteralPath $__pi_review_marker) { $__pi_review_ready = $true } elseif ($__pi_review_watchdog.HasExited) { break } else { Start-Sleep -Milliseconds 250; $__pi_review_waited += 250 } }`,
+    // stderr, not stream redirection: `1>&2` is a PowerShell parse error
+    // ("reserved for future use") that would kill this whole script at parse
+    // time — before any line of it runs and before any marker exists.
+    `if (-not $__pi_review_ready) { try { [Console]::Error.WriteLine('pi-review-gate: descendant ownership could not be established (the job-object watchdog did not confirm); the command was NOT run.') } catch {}; __pi_review_fail 'ownership-handshake' }`,
+    // Strict handshake validation BEFORE any execution: a stop request that
+    // arrived during startup aborts the job, and the record must be exactly
+    // this watchdog's "<pid> running" — anything else (missing, failed,
+    // terminal, or a dead watchdog) means ownership is not established, so
+    // the command never runs.
+    // Strict validation failures are also "nothing ran" paths: record it and
+    // say why. (If the watchdog already died, kill-on-close may have taken this
+    // shell with the job — the writes are best-effort, the exit is not.)
+    `if (Test-Path -LiteralPath ${psLiteral(ownership.stopPath)}) { __pi_review_fail 'stop-during-startup' }`,
+    `try { $__pi_review_record = (Get-Content -LiteralPath $__pi_review_marker -Raw -ErrorAction Stop).Trim() } catch { __pi_review_fail 'record-unreadable' }`,
+    `if ($__pi_review_watchdog.HasExited -or $__pi_review_record -ne ([string]$__pi_review_watchdog.Id + ' running')) { __pi_review_fail 'record-mismatch' }`,
+    // Child scope: the call operator runs the command in a CHILD scope —
+    // ordinary variable assignments stay out of the wrapper's state (and an
+    // explicit `exit` still ends the whole shell, with that code). The one
+    // exception is the status holder below: an array is a reference object,
+    // so element mutation from the child scope reaches the caller.
+    // The watchdog is deliberately NOT killed here: it keeps holding the job
+    // object for descendants that outlive this shell and releases itself when
+    // none remain.
+    `$__pi_review_status = @($null, $null)`,
+    `& {`,
+    command,
+    // The block's LAST statements (nothing may run between the command and
+    // them): capture the command's own success and native exit status from
+    // INSIDE the child scope — one scope out, `$?` reflects the block
+    // invocation's completion rather than the command's result, and plain
+    // assignments would not survive the block's return at all. An explicit
+    // `exit` in the command still ends the whole shell before these lines.
+    `$__pi_review_status[0] = $?`,
+    `$__pi_review_status[1] = $LASTEXITCODE`,
+    `}`,
+    // An early return skips the block-tail capture. Read invocation status
+    // immediately, before any statement can overwrite it, and use that pair
+    // only when the command did not reach its normal in-scope capture.
+    `$__pi_review_invocation_ok = $?`,
+    `if ($null -eq $__pi_review_status[0]) { $__pi_review_status[0] = $__pi_review_invocation_ok; $__pi_review_status[1] = $LASTEXITCODE }`,
+    // Map the captured pair: a failed cmdlet (false success, no native status)
+    // becomes 1; a native failure keeps its own code.
+    `if ($null -eq $__pi_review_status[1]) { $__pi_review_status[1] = 0 }`,
+    `if (-not $__pi_review_status[0] -and $__pi_review_status[1] -eq 0) { $__pi_review_status[1] = 1 }`,
+    `exit $__pi_review_status[1]`,
+  ].join("\n");
+}
+
 /** Bounded human summary of a job's wake rules, shared by the ShellStart
  *  result text and the expanded result views. Empty string when no rule is
  *  active; the model-facing text appends "nothing" itself. */

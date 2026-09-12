@@ -470,7 +470,8 @@ automatic review.
 ## Background shell tools
 
 The extension provides `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
-`ShellStop` directly through Pi. Background jobs are detached process groups, wake the
+`ShellStop` directly through Pi. Background jobs run in this platform's fixed shell —
+Bash as its own detached process group on macOS/Linux, PowerShell on Windows — wake the
 agent on configured output or exit events, survive ordinary turn settlement, and are
 reaped when the Pi session ends. At the top level, review-gate consumes the shell
 controller's typed lifecycle state and defers automatic review while any job is alive.
@@ -478,12 +479,25 @@ The last job's ordinary exit wake resumes the orchestrator without a duplicate a
 notification; jobs with exit waking disabled still receive a review-readiness wake. A Pi
 executor likewise keeps its RPC session alive while tracked background work runs,
 accepts steering during that interval, and performs a final inspection turn before
-review. Executor timeouts are suspended while a verified process group remains active;
-external or unparseable `ShellStart` success responses fail closed.
+review. Executor timeouts are suspended while verified background work remains active
+(a POSIX process group or Windows owned job); external or unparseable `ShellStart`
+success responses fail closed.
 
-Platform scope is basic: the background-shell family keeps its current process-model
-assumptions and is unsupported on Windows; native Windows operation is not claimed for
-it. For interactive commands, Pi ships its native `bash` tool on every platform and an
+The shell is a fixed per-platform contract: `ShellStart` runs commands in Bash on
+macOS/Linux and PowerShell on Windows — `pwsh.exe` first, then the built-in
+`powershell.exe`, matching Pi's native powershell-tool discovery; there is no shell
+selection in arguments or configuration. If neither executable resolves on a Windows
+host, `ShellStart` fails with a clear error before starting any job. Windows commands
+use Pi's non-interactive, profile-free PowerShell invocation and best-effort UTF-8
+console-output initialization. Before the user command runs, a watchdog of the same
+PowerShell edition establishes a Windows Job Object with kill-on-close protection.
+The watchdog holds ownership even if the original shell exits before its descendants;
+`ShellStop`, session shutdown, and host disappearance terminate the owned job rather
+than targeting a potentially reused shell PID. If ownership cannot be established,
+the user command does not run. Missing or unreadable ownership evidence after root
+exit keeps readiness blocked rather than reporting completion.
+
+For interactive commands, Pi ships its native `bash` tool on every platform and an
 optional `powershell` tool on Windows; review-gate treats `powershell` like `bash`
 wherever it handles shell commands — side-effect evidence and worker shell-tool
 authorization — subject to actual host availability and authorization: a host that has

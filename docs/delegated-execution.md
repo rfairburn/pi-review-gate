@@ -453,13 +453,19 @@ changes.
 
 The default **Quiet** notification mode keeps ordinary running and reviewing transitions
 in passive UI telemetry while still notifying for every task landing, failure, conflict,
-or recovery requirement. **Noisy** additionally starts turns for running and reviewing
+or recovery requirement, except synchronous landings confirmed by the orchestrator's own
+tool result (see below). **Noisy** additionally starts turns for running and reviewing
 transitions. In quiet mode, each `LANDED`, failed, conflicted, or recovery-required task
 wakes the orchestrator, while ordinary `RUNNING` and `REVIEWING` transitions remain
 passive UI telemetry; noisy mode additionally wakes on those two interactive states.
 
 Every task landing is reported immediately with its still-active siblings so the
-orchestrator can top off freed capacity without waiting for the entire execution. Each
+orchestrator can top off freed capacity without waiting for the entire execution. The one
+exception is a synchronous landing triggered by the orchestrator itself — `SubtasksForceMerge`,
+`SubtasksInterrupt` with `interrupt_with_merge`, or a gate cleared by `SubtasksMarkClean`:
+its direct tool result already confirms that landing and carries the same group aggregate
+(complete verdict or not-yet-complete siblings plus top-off opportunity), so no separate
+completion notification follows for it. Each
 completion reports the durable execution revision, per-phase task timing, and estimated
 post-settlement capacity after already-queued work. Final completion also reports wall
 time, summed task time, and peak concurrent workers. Internal `CAPTURING`, `ACCEPTED`,

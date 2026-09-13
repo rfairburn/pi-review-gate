@@ -52,6 +52,7 @@ import { renderSubtaskWidget } from "./subtask-widget";
 import {
   buildWakeFailureDiagnostic,
   capNotificationText,
+  completionGroupAggregateLines,
   formatExecutionEvent,
   formatResearchCompletion,
   formatWakeFailureDiagnostic,
@@ -59,12 +60,14 @@ import {
   formatWatchEvent,
   isActionableWakeKind,
   isQuietSuppressedWake,
+  isToolResultConfirmedCompletionWake,
   notificationLane,
   deliveryForLane,
   stateTransitionNotice,
   subtaskNotificationMode,
   watchCheckpointDelivery,
   WAKE_FAILURE_NOTIFICATION_CAP,
+  type SubtaskWakeActor,
 } from "./subtask-notifications";
 import { notifyDispatchCards } from "./dispatch-cards";
 import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
@@ -123,7 +126,28 @@ export interface BackgroundForceMergeInput {
   taskId?: string;
   mergeAnyhow: boolean;
   instructionId: string;
-  actor: "model" | "user" | "system";
+  /** #117: the invoking actor decides completion-wake delivery (see isToolResultConfirmedCompletionWake). */
+  actor: SubtaskWakeActor;
+}
+
+/** Per-landed-task aggregate folded into a mark-clean result (#117). */
+export interface BackgroundMarkCleanAggregate {
+  executionId: string;
+  taskId: string;
+  /** Group aggregate lines built by the shared completion formatter. */
+  aggregate: string;
+}
+
+export interface BackgroundMarkCleanResult {
+  cleared: boolean;
+  paths: string[];
+  /**
+   * #117: group aggregates folded into this result for landed tasks whose
+   * completion wakes were suppressed because the model's direct tool result
+   * already confirms them. Absent when no aggregate is folded in (user-actor
+   * invocations keep their per-task completion wakes).
+   */
+  completionAggregates?: BackgroundMarkCleanAggregate[];
 }
 
 export interface BackgroundSchedulingSnapshot {
@@ -237,6 +261,13 @@ export interface BackgroundInspection {
    * matching). Absent on start/inspect results.
    */
   addedTaskIds?: string[];
+  /**
+   * #117: group aggregate folded into the direct tool result when a
+   * synchronous landing's completion wake is suppressed because the model's
+   * own tool result already confirms it (force-merge / interrupt-with-merge).
+   * Absent whenever a completion wake is still delivered for the landing.
+   */
+  completionAggregate?: string;
   conflictGate?: BackgroundConflictGate;
   tasks: Array<BackgroundTaskRecord & {
     timing: BackgroundTaskTimingSummary;
@@ -1657,14 +1688,23 @@ export class BackgroundExecutionController {
         await this.save(group);
       });
       await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
-      await this.completeLandedBookkeeping(task, "completion wake", () =>
-        this.wake(task, "completion", `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`));
+      // #117: a model tool call's direct result already confirms this
+      // synchronous landing, so the follow-up completion wake is suppressed
+      // and its group aggregate is folded into the returned inspection instead.
+      let completionAggregate: string | undefined;
+      if (isToolResultConfirmedCompletionWake("completion", input.actor)) {
+        completionAggregate = this.completionAggregateFor(group, task);
+      } else {
+        await this.completeLandedBookkeeping(task, "completion wake", () =>
+          this.wake(task, "completion", `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`));
+      }
       // Always persist the landed state and any bookkeeping diagnostics recorded
       // after the initial save (e.g., when the first save failed).
       await this.completeLandedBookkeeping(task, "durable save", async () => {
         await this.save(group);
       });
-      return this.inspect(group.executionId, task.taskId);
+      const inspection = this.inspect(group.executionId, task.taskId);
+      return completionAggregate ? { ...inspection, completionAggregate } : inspection;
     } catch (error) {
       const cancelledWhileWaiting = !pending.acquired && pending.abort.signal.aborted;
       if (command.status !== "failed") {
@@ -1690,7 +1730,14 @@ export class BackgroundExecutionController {
     }
   }
 
-  async markClean(): Promise<{ cleared: boolean; paths: string[] }> {
+  /**
+   * #117: `actor` decides whether the per-task completion wakes for landed
+   * tasks are delivered (user commands) or folded into this result (model tool
+   * calls). Omitted callers predate the model/user split and keep the
+   * notifying default.
+   */
+  async markClean(input?: { actor?: SubtaskWakeActor }): Promise<BackgroundMarkCleanResult> {
+    const actor: SubtaskWakeActor = input?.actor ?? "user";
     const entries = [...this.conflictGates.entries()];
     if (entries.length === 0) return { cleared: false, paths: [] };
     // #25 multi-target: validate every outstanding gate before releasing any —
@@ -1734,17 +1781,41 @@ export class BackgroundExecutionController {
       clearedPaths.push(...gate.paths);
     }
     await this.publishAssociations();
+    const completionAggregates: BackgroundMarkCleanAggregate[] = [];
     for (const [, { gate }] of entries) {
       const group = this.groups.get(gate.executionId);
       const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
       if (task) {
         this.addActivity(task, "landed", "Conflict resolution validated; queued landing attempts released.");
         await this.save(group!);
-        await this.wake(task, "completion", `Task ${task.taskId} conflict resolution was validated and landed.`);
+        // #117: a model tool call's direct result already confirms each
+        // validated landing, so its completion wake is suppressed and the group
+        // aggregate is folded into this result instead.
+        if (isToolResultConfirmedCompletionWake("completion", actor)) {
+          completionAggregates.push({
+            executionId: group!.executionId,
+            taskId: task.taskId,
+            aggregate: this.completionAggregateFor(group!, task),
+          });
+        } else {
+          await this.wake(task, "completion", `Task ${task.taskId} conflict resolution was validated and landed.`);
+        }
       }
     }
     this.updateIndicator();
-    return { cleared: true, paths: clearedPaths };
+    return completionAggregates.length > 0
+      ? { cleared: true, paths: clearedPaths, completionAggregates }
+      : { cleared: true, paths: clearedPaths };
+  }
+
+  /**
+   * #117: the group aggregate a suppressed completion wake would have
+   * conveyed, built by the same shared formatter (subtask-notifications) the
+   * wake path uses, so folded-in tool-result text and delivered wakes cannot
+   * drift.
+   */
+  private completionAggregateFor(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): string {
+    return completionGroupAggregateLines(group, this.schedulingSnapshot(group, task)).join("\n");
   }
 
   /**

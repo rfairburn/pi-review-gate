@@ -121,6 +121,28 @@ export function watchCheckpointDelivery(): SubtaskWakeDelivery {
   return deliveryForLane("soon");
 }
 
+/** Actors that can invoke a control operation (force-merge, interrupt, mark-clean). */
+export type SubtaskWakeActor = "model" | "user" | "system";
+
+/**
+ * #117: synchronous landings already confirmed by the caller's own tool
+ * result. When a MODEL tool call performs a landing synchronously
+ * (SubtasksForceMerge, interrupt_with_merge via delegation, or
+ * SubtasksMarkClean releasing a gate), the direct tool result confirms that
+ * exact landing; the per-task completion wake would only repeat it in a later
+ * turn, so it is suppressed and the group aggregate it would have conveyed is
+ * folded into the tool result instead. User-actor command invocations have no
+ * model tool result confirming the landing, and executor-driven landings never
+ * pass through a control tool at all, so their completion wakes are preserved
+ * in every case.
+ */
+export function isToolResultConfirmedCompletionWake(
+  kind: SubtaskWakeKind,
+  actor: SubtaskWakeActor,
+): boolean {
+  return kind === "completion" && actor === "model";
+}
+
 // ── Model-facing lifecycle contract prose (derived from the policy above) ────
 
 /** "LANDED, REPORTED, FAILED, CONFLICTED" — the quiet-mode wake set, in prose order. */
@@ -155,10 +177,22 @@ export function lifecycleWakeGuidanceLine(): string {
   ].join(" ");
 }
 
+/**
+ * #117: shared carve-out prose for synchronous landings already confirmed by
+ * the caller's own tool result (see isToolResultConfirmedCompletionWake). Every
+ * model-facing contract line that asserts completion notifications
+ * unconditionally appends this single sentence so the prose cannot drift from
+ * behavior.
+ */
+export function synchronousLandingNotificationCarveOut(): string {
+  return "Synchronous landings you trigger yourself (SubtasksForceMerge, SubtasksInterrupt interrupt_with_merge, or a gate cleared by your SubtasksMarkClean) are confirmed by their direct tool result instead of a separate completion notification; that result carries the group aggregate (complete verdict or not-yet-complete siblings plus top-off opportunity).";
+}
+
 /** Shared prompt-guidance sentence about terminal wakes versus passive polling. */
 export function terminalWakeGuidanceLine(): string {
   return [
     "Each task completion, failure, and critical conflict triggers a model notification.",
+    synchronousLandingNotificationCarveOut(),
     `Ordinary ${NOISY_INTERACTIVE_WAKE_STATES.map((state) => state.label.toLowerCase()).join("/") } transitions do so only in noisy mode.`,
     "Use SubtasksInspect whenever you need current status or diagnostics; avoid tight repetitive polling.",
   ].join(" ");
@@ -167,12 +201,14 @@ export function terminalWakeGuidanceLine(): string {
 /**
  * Kind-neutral completion guidance: execute groups land, research groups
  * report, and both completions wake the orchestrator even in quiet mode and
- * list incomplete siblings.
+ * list incomplete siblings — except synchronous landings already confirmed by
+ * the caller's own tool result (#117).
  */
 export function completionNotificationGuidanceLine(): string {
   return [
     `Every task completion (an execute task landing or a research task reporting) triggers a notification and lists every sibling that has not completed, even in quiet mode, so freed capacity can be topped off immediately.`,
-    "Do not verify aggregate outputs until the execution-complete notification.",
+    synchronousLandingNotificationCarveOut(),
+    "Do not verify aggregate outputs until the execution-complete verdict arrives, whether as a completion notification or folded into one of those direct results.",
   ].join(" ");
 }
 
@@ -183,8 +219,8 @@ export function completionNotificationGuidanceLine(): string {
 export function notificationModeContractProse(mode: SubtaskNotificationMode, successVerb: string): string {
   const interactive = interactiveWakeStateList();
   return mode === "quiet"
-    ? `Quiet notification mode is active: ordinary ${interactive} transitions remain passive UI telemetry. Every task still triggers a turn when it ${successVerb}, fails, conflicts, or requires recovery, and completion events identify siblings that remain active.`
-    : `Noisy notification mode is active: ${interactive} transitions trigger turns in addition to every successful, failed, conflicted, or recovery-required task.`;
+    ? `Quiet notification mode is active: ordinary ${interactive} transitions remain passive UI telemetry. Every task still triggers a turn when it ${successVerb}, fails, conflicts, or requires recovery, and completion events identify siblings that remain active. ${synchronousLandingNotificationCarveOut()}`
+    : `Noisy notification mode is active: ${interactive} transitions trigger turns in addition to every successful, failed, conflicted, or recovery-required task. ${synchronousLandingNotificationCarveOut()}`;
 }
 
 // ── No-action acknowledgement ────────────────────────────────────────────────
@@ -229,13 +265,18 @@ export interface SubtaskEventScheduling {
   globallyDispatchPending: number;
 }
 
-export function formatExecutionEvent(
+/**
+ * #117: the group aggregate lines a completion event conveys — the top-off
+ * opportunity (when scheduling is known) plus either the execution COMPLETE
+ * verdict or the not-yet-complete sibling list. Shared by formatExecutionEvent
+ * and the synchronous tool-result fold-in (isToolResultConfirmedCompletionWake)
+ * so a delivered completion wake and the aggregate folded into a direct tool
+ * result can never drift.
+ */
+export function completionGroupAggregateLines(
   group: BackgroundExecutionGroup,
-  task: BackgroundTaskRecord,
-  kind: SubtaskWakeKind,
-  content: string,
   scheduling?: SubtaskEventScheduling,
-): string {
+): string[] {
   const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
   const successVerb = group.kind === "research" ? "reported" : "landed";
   // Finding 15: totals come from the persisted aggregate counts so they stay
@@ -247,6 +288,40 @@ export function formatExecutionEvent(
   const total = group.totalTaskCount ?? group.tasks.length;
   const incomplete = group.tasks.filter((candidate) => candidate.state !== successState);
   const active = group.tasks.filter((candidate) => isActiveTaskState(candidate.state));
+  const lines: string[] = [];
+  if (scheduling) {
+    const topOff = Math.max(0, scheduling.estimatedImmediatelyAvailableSlots - scheduling.globallyDispatchPending);
+    lines.push(`Top-off opportunity: up to ${topOff} additional task(s) may be submitted with SubtasksAdd if planned work remains.`);
+  }
+  if (incomplete.length === 0) {
+    lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} COMPLETE: ${successful}/${total} tasks ${successVerb}.`);
+    lines.push(group.kind === "research"
+      ? "All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group."
+      : "All requested task outputs have landed; aggregate verification is now appropriate.");
+  } else {
+    const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
+    lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} ${disposition}: ${successful}/${total} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
+    lines.push(`This is a partial task completion, not completion of the whole group. Do not claim outputs from tasks that have not ${successVerb}.`);
+    lines.push(`Tasks not yet ${successVerb}:`);
+    for (const candidate of incomplete) {
+      lines.push(`- ${candidate.taskId} · ${candidate.definition.title} · ${candidate.state}`);
+    }
+  }
+  return lines;
+}
+
+export function formatExecutionEvent(
+  group: BackgroundExecutionGroup,
+  task: BackgroundTaskRecord,
+  kind: SubtaskWakeKind,
+  content: string,
+  scheduling?: SubtaskEventScheduling,
+): string {
+  const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
+  const successVerb = group.kind === "research" ? "reported" : "landed";
+  // Finding 15: totals come from the persisted aggregate counts so they stay
+  // truthful after settled tasks are evicted from the bounded inline window.
+  const archivedSettled = group.settledArchivedCount ?? 0;
   const title = task.definition.title;
   const lines = [
     content,
@@ -263,18 +338,17 @@ export function formatExecutionEvent(
   ];
   if (landedPaths.length > 0) lines.push(`Landed paths: ${[...new Set(landedPaths)].join(", ")}`);
   if (kind === "completion") {
-    if (scheduling) {
-      const topOff = Math.max(0, scheduling.estimatedImmediatelyAvailableSlots - scheduling.globallyDispatchPending);
-      lines.push(`Top-off opportunity: up to ${topOff} additional task(s) may be submitted with SubtasksAdd if planned work remains.`);
-    }
+    // #117: the completion aggregate block is shared with the synchronous
+    // tool-result fold-in so both convey identical group information.
+    lines.push(...completionGroupAggregateLines(group, scheduling));
+    return lines.join("\n");
   }
+  const successful = group.tasks.filter((candidate) => candidate.state === successState).length + archivedSettled;
+  const total = group.totalTaskCount ?? group.tasks.length;
+  const incomplete = group.tasks.filter((candidate) => candidate.state !== successState);
+  const active = group.tasks.filter((candidate) => isActiveTaskState(candidate.state));
   if (incomplete.length === 0) {
-    if (kind === "completion") {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} COMPLETE: ${successful}/${total} tasks ${successVerb}.`);
-      lines.push(group.kind === "research"
-        ? "All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group."
-        : "All requested task outputs have landed; aggregate verification is now appropriate.");
-    } else if (kind === "failure") {
+    if (kind === "failure") {
       lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} has ${successful}/${total} tasks ${successVerb}, but this interaction reported a failure.`);
       lines.push(`Inspect the failed command and verify the ${group.kind === "research" ? "reports" : "landed output"} before treating the group as successful.`);
     } else {
@@ -286,9 +360,7 @@ export function formatExecutionEvent(
   }
   const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
   lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} ${disposition}: ${successful}/${total} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
-  if (kind === "completion") {
-    lines.push(`This is a partial task completion, not completion of the whole group. Do not claim outputs from tasks that have not ${successVerb}.`);
-  } else if (kind === "failure") {
+  if (kind === "failure") {
     lines.push("The whole execution is not successfully complete. Use the task handles and states below to recover deliberately.");
   }
   lines.push(`Tasks not yet ${successVerb}:`);

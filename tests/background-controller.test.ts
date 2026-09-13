@@ -2404,7 +2404,7 @@ workerResources: { "default": { selection: { source: "external", id: "tail-detac
   }
 });
 
-async function setupInterruptedMergeTask(unique: string): Promise<{
+async function setupInterruptedMergeTask(unique: string, pi?: unknown): Promise<{
   root: string;
   controller: BackgroundExecutionController;
   started: BackgroundInspection;
@@ -2444,7 +2444,7 @@ workerResources: { "default": { selection: { source: "external", id: "slow-merge
     },
     retainBundles: "always",
   });
-  const controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
+  const controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: pi ?? {} });
   const started = await controller.start([{
     title: "merge target",
     instructions: "write draft.txt",
@@ -4948,6 +4948,295 @@ review: { activeReviewers: [
   } finally {
     await controller?.shutdown().catch(() => undefined);
     await controller?.detach().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── #117: tool-result-confirmed completion notification deduplication ────────
+
+interface SubtaskEventMessage {
+  customType?: string;
+  content: string;
+}
+
+function subtaskEvents(messages: SubtaskEventMessage[]): SubtaskEventMessage[] {
+  return messages.filter((message) => message.customType === "pi-review-subtask-event");
+}
+
+/**
+ * #117 harness: a single-task execution whose landing genuinely conflicts with
+ * a concurrent main-workspace change (the worker worktree and main both modify
+ * shared.txt after capture). The conflicted failure wake is delivered through
+ * the real pi.sendMessage seam; the test then resolves the markers and drives
+ * markClean with the actor under test.
+ */
+async function setupConflictedLanding(unique: string): Promise<{
+  root: string;
+  controller: BackgroundExecutionController;
+  started: BackgroundInspection;
+  taskId: string;
+  messages: SubtaskEventMessage[];
+  cleanup: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), `pi-review-background-dedupe-${unique}-`));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+  await writeFile(join(root, "base.txt"), "base\n", "utf8");
+  await writeFile(join(root, "shared.txt"), "base shared\n", "utf8");
+  await execFileAsync("git", ["add", "base.txt", "shared.txt"], { cwd: root });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+  const sentinel = `${unique.toUpperCase()}_SENTINEL`;
+  const executor = join(root, `conflict-executor-${unique}.cjs`);
+  await writeFile(executor, [
+    "#!/usr/bin/env node",
+    "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+    "process.stdin.on('end',()=>{",
+    `if(prompt.includes('${sentinel}')){`,
+    "fs.writeFileSync('marker.txt','landed\\n');",
+    // Candidate side: the worker worktree modifies shared.txt.
+    "fs.writeFileSync('shared.txt','candidate shared\\n');",
+    // Current side: main diverges on the same file while the turn is in
+    // flight, so landing revalidation materializes a genuine conflict.
+    `fs.writeFileSync(${JSON.stringify(join(root, "shared.txt"))},'current shared\\n');}`,
+    "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
+    "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
+    "});",
+  ].join("\n"), "utf8");
+  await chmod(executor, 0o755);
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: {
+      [`dedupe-${unique}`]: {
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" }
+      }
+    },
+    execution: {
+      maxWorkers: 1,
+      workerResources: { "default": { selection: { source: "external", id: `dedupe-${unique}` }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
+    },
+    retainBundles: "always",
+  });
+  const messages: SubtaskEventMessage[] = [];
+  const controller = new BackgroundExecutionController({
+    pi: { sendMessage: (message: SubtaskEventMessage) => messages.push(message) },
+    config,
+    state: createState(),
+    cwd: () => root,
+  });
+  const started = await controller.start([{
+    title: "conflict target",
+    instructions: sentinel,
+    acceptanceCriteria: ["marker.txt exists"],
+  }]);
+  const taskId = started.tasks[0]!.taskId;
+  await waitFor(() => controller.inspect(started.executionId, taskId).tasks[0]?.state === "conflicted");
+  return {
+    root,
+    controller,
+    started,
+    taskId,
+    messages,
+    cleanup: async () => {
+      await controller.shutdown().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test("#117 model-actor mark-clean suppresses the completion wake and folds in the group aggregate", async () => {
+  const scenario = await setupConflictedLanding("model-markclean");
+  try {
+    const { controller, started, taskId, messages } = scenario;
+    // The conflicted failure wake is still delivered — suppression never
+    // touches failures, conflicts, or recovery requirements.
+    assert.equal(subtaskEvents(messages).length, 1, "the conflicted landing keeps its failure wake");
+    assert.match(subtaskEvents(messages)[0]!.content, /requires recovery attention at state CONFLICTED/);
+
+    await writeFile(join(scenario.root, "shared.txt"), "resolved\n", "utf8");
+    const outcome = await controller.markClean({ actor: "model" });
+    assert.equal(outcome.cleared, true);
+    assert.deepEqual(outcome.paths, ["shared.txt"]);
+    assert.equal(controller.inspect(started.executionId, taskId).tasks[0]?.state, "landed");
+
+    // The validated landing is confirmed by the direct result itself: its
+    // group aggregate is folded in and no completion notification follows.
+    assert.equal(outcome.completionAggregates?.length, 1);
+    assert.equal(outcome.completionAggregates![0]!.executionId, started.executionId);
+    assert.equal(outcome.completionAggregates![0]!.taskId, taskId);
+    assert.ok(outcome.completionAggregates![0]!.aggregate.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+    assert.ok(outcome.completionAggregates![0]!.aggregate.includes("All requested task outputs have landed; aggregate verification is now appropriate."));
+    assert.equal(subtaskEvents(messages).length, 1, "no completion notification follows a model-confirmed validated landing");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 user-actor mark-clean keeps the completion wake and folds nothing in", async () => {
+  const scenario = await setupConflictedLanding("user-markclean");
+  try {
+    const { controller, started, messages } = scenario;
+    assert.equal(subtaskEvents(messages).length, 1, "the conflicted landing keeps its failure wake");
+
+    await writeFile(join(scenario.root, "shared.txt"), "resolved\n", "utf8");
+    const outcome = await controller.markClean({ actor: "user" });
+    assert.equal(outcome.cleared, true);
+    assert.deepEqual(outcome.paths, ["shared.txt"]);
+    assert.equal(outcome.completionAggregates, undefined, "user invocations keep the wake and get no folded aggregate");
+
+    await waitFor(() => subtaskEvents(messages).length === 2);
+    const completion = subtaskEvents(messages)[1]!;
+    assert.ok(completion.content.includes("conflict resolution was validated and landed"));
+    assert.ok(completion.content.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 model-actor force-merge suppresses the completion wake and folds the aggregate into the result", async () => {
+  const messages: SubtaskEventMessage[] = [];
+  const scenario = await setupInterruptedMergeTask("model-force", {
+    sendMessage: (message: SubtaskEventMessage) => messages.push(message),
+  });
+  try {
+    const { controller, started, taskId } = scenario;
+    const landed = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId,
+      mergeAnyhow: false,
+      instructionId: "dedupe-model-force",
+      actor: "model",
+    });
+    assert.equal(landed.tasks[0]?.state, "landed");
+    assert.ok(landed.completionAggregate, "the group aggregate is folded into the direct result");
+    assert.ok(landed.completionAggregate!.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+    assert.ok(landed.completionAggregate!.includes("All requested task outputs have landed; aggregate verification is now appropriate."));
+    assert.equal(subtaskEvents(messages).length, 0, "no completion notification follows a model-confirmed force-merge landing");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 user-actor force-merge keeps the completion wake and folds nothing in", async () => {
+  const messages: SubtaskEventMessage[] = [];
+  const scenario = await setupInterruptedMergeTask("user-force", {
+    sendMessage: (message: SubtaskEventMessage) => messages.push(message),
+  });
+  try {
+    const { controller, started, taskId } = scenario;
+    const landed = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId,
+      mergeAnyhow: false,
+      instructionId: "dedupe-user-force",
+      actor: "user",
+    });
+    assert.equal(landed.tasks[0]?.state, "landed");
+    assert.equal(landed.completionAggregate, undefined, "the wake still carries the aggregate, so nothing is folded in");
+
+    await waitFor(() => subtaskEvents(messages).length === 1);
+    const completion = subtaskEvents(messages)[0]!;
+    assert.ok(completion.content.includes("force-merged and landed mechanically"));
+    assert.ok(completion.content.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 a later distinct sibling completion still notifies after a suppressed model landing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-dedupe-sibling-"));
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+    await writeFile(join(root, "base.txt"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+    const executor = join(root, "sibling-executor.cjs");
+    await writeFile(executor, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+      "process.stdin.on('end',()=>{",
+      "if(prompt.includes('DEDUPE_A_SENTINEL')){fs.writeFileSync('a.txt','a landed\\n');setTimeout(()=>console.log(JSON.stringify({type:'assistant',text:'late completion'})),30000);return;}",
+      "if(prompt.includes('DEDUPE_B_SENTINEL'))fs.writeFileSync('b.txt','b landed\\n');",
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
+      "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
+      "});",
+    ].join("\n"), "utf8");
+    await chmod(executor, 0o755);
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: {
+        "dedupe-sibling": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
+      execution: {
+        maxWorkers: 1,
+        workerResources: { "default": { selection: { source: "external", id: "dedupe-sibling" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
+      },
+      retainBundles: "always",
+    });
+    const messages: SubtaskEventMessage[] = [];
+    controller = new BackgroundExecutionController({
+      pi: { sendMessage: (message: SubtaskEventMessage) => messages.push(message) },
+      config,
+      state: createState(),
+      cwd: () => root,
+    });
+    const started = await controller.start([
+      { title: "interrupted first", instructions: "DEDUPE_A_SENTINEL", acceptanceCriteria: ["a.txt exists"] },
+      { title: "sibling second", instructions: "DEDUPE_B_SENTINEL", acceptanceCriteria: ["b.txt exists"] },
+    ]);
+    const taskA = started.tasks[0]!.taskId;
+    const taskB = started.tasks[1]!.taskId;
+    await waitFor(() => controller!.inspect(started.executionId, taskA).tasks[0]?.state === "running");
+    await waitForAsync(async () => {
+      const waveRoot = controller!.inspect(started.executionId, taskA).tasks[0]?.waveRoot;
+      if (!waveRoot) return false;
+      return readFile(join(waveRoot, "workers", taskA, "a.txt"), "utf8").then(() => true, () => false);
+    });
+    await controller.interrupt({
+      executionId: started.executionId,
+      taskId: taskA,
+      mode: "interrupt_as_failure",
+      instructionId: "dedupe-sibling-interrupt",
+      actor: "user",
+    });
+
+    // The model-confirmed landing of A is suppressed; because B has not
+    // completed, the folded aggregate must list it as a sibling.
+    const landed = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId: taskA,
+      mergeAnyhow: false,
+      instructionId: "dedupe-sibling-force",
+      actor: "model",
+    });
+    assert.equal(landed.tasks[0]?.state, "landed");
+    assert.ok(landed.completionAggregate, "the not-yet-complete aggregate is folded into the direct result");
+    assert.ok(landed.completionAggregate!.includes("Tasks not yet landed:"), "the folded aggregate names the outstanding sibling");
+    assert.ok(landed.completionAggregate!.includes(taskB));
+    assert.equal(subtaskEvents(messages).length, 0, "the suppressed landing delivers nothing immediately");
+
+    // B's own executor-driven completion is a distinct event and still wakes.
+    await waitFor(() => controller!.inspect(started.executionId).tasks.every((task) => task.state === "landed"));
+    await waitFor(() => subtaskEvents(messages).length === 1);
+    const siblingCompletion = subtaskEvents(messages)[0]!;
+    assert.ok(siblingCompletion.content.includes(taskB), "the sibling completion names its own task");
+    assert.ok(siblingCompletion.content.includes("Landed paths: b.txt"));
+    assert.ok(!siblingCompletion.content.includes("force-merged and landed mechanically"), "the suppressed landing never arrives as a later notification");
+  } finally {
+    await controller?.shutdown().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

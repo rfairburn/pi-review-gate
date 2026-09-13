@@ -131,12 +131,11 @@ A minimal example using Codex as the reviewer:
   "reviewerTimeoutMs": 600000,
   "maxCorrectionCycles": 3,
   "retainBundles": "on-failure",
-  "externalAgents": [
-    {
-      "id": "codex",
+  "externalAgents": {
+    "codex": {
       "adapter": "codex-cli"
     }
-  ],
+  },
   "review": {
     "activeReviewers": [
       { "source": "external", "id": "codex" }

@@ -6,18 +6,20 @@
   "maxFileBytes": 1048576,
   "maxSnapshotBytes": 52428800,
   "retainBundles": "on-failure",
-  "externalAgents": [
-    {
-      "id": "claude",
+  "externalAgents": {
+    "claude": {
       "adapter": "claude-cli",
       "review": {
         "timeoutMs": 600000
       }
     }
-  ],
+  },
   "review": {
     "activeReviewers": [
-      { "source": "external", "id": "claude" }
+      {
+        "source": "external",
+        "id": "claude"
+      }
     ]
   }
 }

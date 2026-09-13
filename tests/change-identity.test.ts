@@ -80,37 +80,36 @@ test("runReview includes changeIdentity in reviewer context and invocation metad
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
-        {
-          id: "ci-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            `const base=${JSON.stringify(VALID_BASE)};`,
-            `const candidate=${JSON.stringify(VALID_CANDIDATE)};`,
-            "const ok=s.includes('<change_identity>')",
-            "&& s.includes('base: '+base)",
-            "&& s.includes('candidate: '+candidate)",
-            "&& s.includes('range: '+base+'..'+candidate)",
-            "&& s.includes('This review verdict applies specifically to candidate commit '+candidate);",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'change identity visible',findings:[]}",
-            ":{verdict:'needs_changes',summary:'missing change identity',findings:[{severity:'blocking',file:'session',line:null,issue:'change identity not in prompt',recommendation:'include change identity'}]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "ci-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          `const base=${JSON.stringify(VALID_BASE)};`,
+          `const candidate=${JSON.stringify(VALID_CANDIDATE)};`,
+          "const ok=s.includes('<change_identity>')",
+          "&& s.includes('base: '+base)",
+          "&& s.includes('candidate: '+candidate)",
+          "&& s.includes('range: '+base+'..'+candidate)",
+          "&& s.includes('This review verdict applies specifically to candidate commit '+candidate);",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'change identity visible',findings:[]}",
+          ":{verdict:'needs_changes',summary:'missing change identity',findings:[{severity:'blocking',file:'session',line:null,issue:'change identity not in prompt',recommendation:'include change identity'}]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "ci-checker" }
       ] },
@@ -147,36 +146,35 @@ test("runAskReviewer includes changeIdentity in reviewer context and metadata", 
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
-        {
-          id: "ci-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            `const base=${JSON.stringify(VALID_BASE)};`,
-            `const candidate=${JSON.stringify(VALID_CANDIDATE)};`,
-            "const ok=s.includes('<change_identity>')",
-            "&& s.includes('base: '+base)",
-            "&& s.includes('candidate: '+candidate)",
-            "&& s.includes('range: '+base+'..'+candidate);",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'change identity visible',findings:[]}",
-            ":{verdict:'needs_changes',summary:'missing change identity',findings:[]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "ci-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          `const base=${JSON.stringify(VALID_BASE)};`,
+          `const candidate=${JSON.stringify(VALID_CANDIDATE)};`,
+          "const ok=s.includes('<change_identity>')",
+          "&& s.includes('base: '+base)",
+          "&& s.includes('candidate: '+candidate)",
+          "&& s.includes('range: '+base+'..'+candidate);",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'change identity visible',findings:[]}",
+          ":{verdict:'needs_changes',summary:'missing change identity',findings:[]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "ci-checker" }
       ] },
@@ -259,32 +257,31 @@ test("runReview preserves existing behavior when changeIdentity is omitted", asy
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
-        {
-          id: "omit-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const noIdentity=!s.includes('<change_identity>')",
-            "&& !s.includes('change identity');",
-            "process.stdout.write(JSON.stringify(noIdentity",
-            "?{verdict:'pass',summary:'no identity when omitted',findings:[]}",
-            ":{verdict:'needs_changes',summary:'unexpected identity',findings:[]}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "omit-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const noIdentity=!s.includes('<change_identity>')",
+          "&& !s.includes('change identity');",
+          "process.stdout.write(JSON.stringify(noIdentity",
+          "?{verdict:'pass',summary:'no identity when omitted',findings:[]}",
+          ":{verdict:'needs_changes',summary:'unexpected identity',findings:[]}));",
+          "});",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "omit-checker" }
       ] },
@@ -316,31 +313,30 @@ test("runAskReviewer preserves existing behavior when changeIdentity is omitted"
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
-        {
-          id: "omit-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const noIdentity=!s.includes('<change_identity>');",
-            "process.stdout.write(JSON.stringify(noIdentity",
-            "?{verdict:'pass',summary:'no identity when omitted',findings:[]}",
-            ":{verdict:'needs_changes',summary:'unexpected identity',findings:[]}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "omit-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const noIdentity=!s.includes('<change_identity>');",
+          "process.stdout.write(JSON.stringify(noIdentity",
+          "?{verdict:'pass',summary:'no identity when omitted',findings:[]}",
+          ":{verdict:'needs_changes',summary:'unexpected identity',findings:[]}));",
+          "});",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "omit-checker" }
       ] },
@@ -382,21 +378,20 @@ test("reused bundle removes stale change-identity.json when identity is omitted"
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
-        {
-          id: "passing",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))",
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "passing": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))",
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "passing" }
       ] },

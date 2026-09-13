@@ -237,18 +237,20 @@ test("wave-worker runs one executor turn and normalizes to candidate", async () 
     const config = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "pi", model: "test-model" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "pi", model: "test-model" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [{ resourceId: "default" }] },
       },
-      externalAgents: [{
-        id: "fake-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "fake-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     // Override the executor adapter to use our fake.
@@ -256,7 +258,8 @@ workerResources: [{ resourceId: "default", selection: { source: "pi", model: "te
       ...config,
       execution: {
 ...config.execution,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "fake-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     };
 
@@ -334,18 +337,20 @@ test("wave-worker returns no_changes when executor makes no modifications", asyn
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "noop-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "noop-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "noop-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "noop-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const result = await runWaveWorker({
@@ -381,18 +386,20 @@ test("wave-worker returns executor_error on non-zero exit", async () => {
       enabled: true,
       execution: {
 retryPolicy: NO_RETRY,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fail-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "fail-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "fail-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "fail-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const result = await runWaveWorker({
@@ -424,11 +431,13 @@ test("wave-worker checkpoints and pauses when adapter initialization fails", asy
     const config = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{
-          resourceId: "missing",
-          selection: { source: "external", id: "missing" },
-          maxConcurrent: 1,
-        }],
+workerResources: {
+  "missing": {
+    selection: { source: "external", id: "missing" },
+    maxConcurrent: 1
+  }
+},
+  routes: { execute: [{ resourceId: "missing" }], research: [] },
 retryPolicy: NO_RETRY,
       },
     });
@@ -485,14 +494,16 @@ test("wave-worker checkpoints partial edits and automatically recovers a failed 
       enabled: true,
       execution: {
 retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 2 },
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "retry-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "retry-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "retry-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: [command], timeoutMs: 15_000 },
-      }],
+      externalAgents: {
+        "retry-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [command], timeoutMs: 15000 }
+        }
+      },
     });
 
     const result = await runWaveWorker({
@@ -554,26 +565,29 @@ test("wave-worker hands a verified checkpoint to the next executor pool entry in
     const config = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [
-          { resourceId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
-          { resourceId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
-        ],
+workerResources: {
+  "qwen": {
+    selection: { source: "external", id: "qwen" }, maxConcurrent: 1
+  },
+  "deepseek": {
+    selection: { source: "external", id: "deepseek" }, maxConcurrent: 1
+  }
+},
+  routes: { execute: [{ resourceId: "qwen" }, { resourceId: "deepseek" }], research: [] },
 retryPolicy: NO_RETRY,
       },
-      externalAgents: [
-        {
-          id: "qwen",
+      externalAgents: {
+        "qwen": {
           adapter: "run-as-binary",
           command: process.execPath,
-          execution: { protocol: "pi-review-executor-jsonl-v1", args: [primaryCommand], timeoutMs: 15_000 },
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [primaryCommand], timeoutMs: 15000 }
         },
-        {
-          id: "deepseek",
+        "deepseek": {
           adapter: "run-as-binary",
           command: process.execPath,
-          execution: { protocol: "pi-review-executor-jsonl-v1", args: [fallbackCommand], timeoutMs: 15_000 },
-        },
-      ],
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [fallbackCommand], timeoutMs: 15000 }
+        }
+      },
     });
     const pool = resolvedWorkerResources(config);
 
@@ -628,18 +642,20 @@ test("wave-worker returns timeout on executor timeout", async () => {
       enabled: true,
       execution: {
 retryPolicy: NO_RETRY,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "to-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "to-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "to-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 500, // Short timeout
-        },
-      }],
+      externalAgents: {
+        "to-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 500, // Short timeout
+          }
+        }
+      },
     });
 
     const result = await runWaveWorker({
@@ -674,18 +690,20 @@ test("wave-worker returns cancelled on abort signal", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "cancel-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "cancel-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "cancel-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 30_000,
-        },
-      }],
+      externalAgents: {
+        "cancel-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 30000,
+          }
+        }
+      },
     });
 
     const controller = new AbortController();
@@ -726,18 +744,20 @@ test("wave-worker returns executor_error on empty response", async () => {
       enabled: true,
       execution: {
 retryPolicy: NO_RETRY,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "empty-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "empty-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "empty-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "empty-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const result = await runWaveWorker({
@@ -773,18 +793,20 @@ test("wave-worker validates artifact directory is under waveRoot", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "artifact-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "artifact-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "artifact-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "artifact-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     await assert.rejects(
@@ -821,18 +843,20 @@ test("wave-worker validates artifact directory is outside worktree", async () =>
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "artifact2-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "artifact2-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "artifact2-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "artifact2-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     await assert.rejects(
@@ -894,18 +918,20 @@ test("wave-worker executor runs in effectiveCwd, not worktreeRoot", async () => 
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "cwd-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "cwd-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "cwd-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "cwd-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const result = await runWaveWorker({
@@ -946,18 +972,20 @@ test("wave-worker does not mutate source repository", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "source-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "source-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "source-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "source-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const result = await runWaveWorker({
@@ -994,18 +1022,20 @@ test("wave-worker result type carries all required fields", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "type-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "type-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "type-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "type-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const result: WaveWorkerResult = await runWaveWorker({
@@ -1045,18 +1075,20 @@ test("wave-worker progress callbacks are invoked", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "progress-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "progress-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "progress-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "progress-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const phases: string[] = [];
@@ -1113,18 +1145,20 @@ test("resumeWaveWorker resumes the exact prior session", async () => {
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     // First run: initial turn.
@@ -1207,26 +1241,29 @@ test("resumeWaveWorker uses the configured default without a caller lease and ho
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-        workerResources: [
-          { resourceId: "resource-a", selection: { source: "external", id: "exec-a" }, maxConcurrent: 1 },
-          { resourceId: "resource-b", selection: { source: "external", id: "exec-b" }, maxConcurrent: 1 },
-        ],
+        workerResources: {
+          "resource-a": {
+            selection: { source: "external", id: "exec-a" }, maxConcurrent: 1
+          },
+          "resource-b": {
+            selection: { source: "external", id: "exec-b" }, maxConcurrent: 1
+          }
+        },
+          routes: { execute: [{ resourceId: "resource-a" }, { resourceId: "resource-b" }], research: [] },
         retryPolicy: NO_RETRY,
       },
-      externalAgents: [
-        {
-          id: "exec-a",
+      externalAgents: {
+        "exec-a": {
           adapter: "run-as-binary",
           command: process.execPath,
-          execution: { protocol: "pi-review-executor-jsonl-v1", args: [commandA], timeoutMs: 15000 },
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [commandA], timeoutMs: 15000 }
         },
-        {
-          id: "exec-b",
+        "exec-b": {
           adapter: "run-as-binary",
           command: process.execPath,
-          execution: { protocol: "pi-review-executor-jsonl-v1", args: [commandB], timeoutMs: 15000 },
-        },
-      ],
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [commandB], timeoutMs: 15000 }
+        }
+      },
     });
     const pool = resolvedWorkerResources(config);
 
@@ -1322,18 +1359,20 @@ test("resumeWaveWorker correction changes produce replacement sole-base-parent c
     const firstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume2-first" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume2-first" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume2-first",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [firstCommand],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume2-first": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [firstCommand],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     // First run.
@@ -1364,18 +1403,20 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
     const resumeConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume2-correction" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume2-correction" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume2-correction",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [resumeCommand],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume2-correction": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [resumeCommand],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     // Resume with corrections. The changed executor selection must use a new
@@ -1451,18 +1492,20 @@ test("resumeWaveWorker unchanged confirmation reports no_changes only when truly
     const config: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume3-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume3-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume3-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [command],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume3-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [command],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     // First run: make some changes.
@@ -1479,18 +1522,20 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
     const firstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume3-first" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume3-first" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume3-first",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [firstCommand],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume3-first": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [firstCommand],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const firstResult = await runWaveWorker({
@@ -1549,18 +1594,20 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
     const revertFirstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume3-revert-first" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume3-revert-first" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume3-revert-first",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [revertFirstCommand],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume3-revert-first": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [revertFirstCommand],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const revertFirstResult = await runWaveWorker({
@@ -1591,18 +1638,20 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
     const revertConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume3-revert" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume3-revert" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume3-revert",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [revertCommand],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume3-revert": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [revertCommand],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const revertResumeResult = await resumeWaveWorker({
@@ -1651,18 +1700,20 @@ test("resumeWaveWorker failure paths do not pin accepted refs", async () => {
     const firstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume4-first" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume4-first" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume4-first",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [firstCommand],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume4-first": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [firstCommand],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const firstResult = await runWaveWorker({
@@ -1689,18 +1740,20 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
     const failConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume4-fail" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume4-fail" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume4-fail",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [failCommand],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume4-fail": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [failCommand],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const failResult = await resumeWaveWorker({
@@ -1755,18 +1808,20 @@ test("resumeWaveWorker returns cancelled on abort signal", async () => {
     const firstConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume5-first" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume5-first" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume5-first",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [firstCommand],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "resume5-first": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [firstCommand],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const firstResult = await runWaveWorker({
@@ -1794,18 +1849,20 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
     const slowConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "resume5-slow" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "resume5-slow" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "resume5-slow",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [slowCommand],
-          timeoutMs: 30_000,
-        },
-      }],
+      externalAgents: {
+        "resume5-slow": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [slowCommand],
+            timeoutMs: 30000,
+          }
+        }
+      },
     });
 
     const controller = new AbortController();
@@ -1860,18 +1917,20 @@ test("resumeWaveWorker rejects turn < 2", async () => {
     const dummyConfig: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "dummy-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "dummy-exec" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "dummy-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [join(root, "dummy.cjs")],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "dummy-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [join(root, "dummy.cjs")],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     await assert.rejects(
@@ -1907,18 +1966,20 @@ test("resumeWaveWorker requires a prior candidate checkpoint", async () => {
     const dummyConfig7: ReviewGateConfig = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "dummy-exec7" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "dummy-exec7" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "dummy-exec7",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [join(root, "dummy7.cjs")],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "dummy-exec7": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [join(root, "dummy7.cjs")],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
 
     const noCandidateResult: WaveWorkerResult = {
@@ -1977,18 +2038,20 @@ test("resumeWaveWorker recovers candidate-less read-only research from its verif
       enabled: true,
       execution: {
 retryPolicy: NO_RETRY,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "research-executor" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "research-executor" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "research-executor",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [executor],
-          timeoutMs: 15000,
-        },
-      }],
+      externalAgents: {
+        "research-executor": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [executor],
+            timeoutMs: 15000,
+          }
+        }
+      },
     });
     const priorResult = await runWaveWorker({
       sourceRoot: capture.discovery.captureRoot,

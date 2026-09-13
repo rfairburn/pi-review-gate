@@ -37,15 +37,17 @@ test("landed operation can rehydrate its checkpoint, continue, land, and dedupli
     const config = normalizeConfig({
       enabled: false,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "continuable",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30_000 },
-      }],
+      externalAgents: {
+        "continuable": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30000 }
+        }
+      },
       execution: {
 retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "continuable" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "continuable" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     const wave = await executeWave({
@@ -153,26 +155,28 @@ test("reviewed continuation of a -gN original wave lands and keeps its immutable
     ].join("");
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [{
-        id: "continuable",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30_000 },
-      }, {
-          id: "passing",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-              "-e",
-              "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
-            ],
-            timeoutMs: 30_000,
-          },
-        }],
+externalAgents: {
+  "continuable": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30000 }
+  },
+  "passing": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
+      ],
+      timeoutMs: 30000,
+    }
+  }
+},
 execution: {
-        workerResources: [{ resourceId: "default", selection: { source: "external", id: "continuable" }, maxConcurrent: 1 }],
+        workerResources: { "default": { selection: { source: "external", id: "continuable" }, maxConcurrent: 1 } },
+          routes: { execute: [{ resourceId: "default" }], research: [] },
         retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
       },
 review: { activeReviewers: [
@@ -260,15 +264,17 @@ test("continuing one task lands only that task and leaves an already-landed sibl
     const config = normalizeConfig({
       enabled: false,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "ordered",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30_000 },
-      }],
+      externalAgents: {
+        "ordered": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30000 }
+        }
+      },
       execution: {
 retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "ordered" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "ordered" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     const wave = await executeWave({
@@ -326,15 +332,17 @@ test("a confirmed-dead writer can be reconciled and continued in a fresh executo
     const config = normalizeConfig({
       enabled: false,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "restartable",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30_000 },
-      }],
+      externalAgents: {
+        "restartable": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30000 }
+        }
+      },
       execution: {
 retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "restartable" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "restartable" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     const wave = await executeWave({
@@ -401,15 +409,17 @@ test("continuation whose checkpoint belongs to another task fails before restori
     const config = normalizeConfig({
       enabled: false,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "xtaskable",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30_000 },
-      }],
+      externalAgents: {
+        "xtaskable": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30000 }
+        }
+      },
       execution: {
 retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "xtaskable" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "xtaskable" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     const wave = await executeWave({

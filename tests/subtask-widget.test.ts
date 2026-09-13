@@ -11,17 +11,23 @@ import type { BackgroundTaskKind, BackgroundTaskState } from "../src/execution/t
 const config = normalizeConfig({
   enabled: true,
   review: { activeReviewers: [] },
-  externalAgents: [{
-    id: "fake",
-    adapter: "run-as-binary",
-    command: process.execPath,
-    execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-  }],
+  externalAgents: {
+    "fake": {
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+    }
+  },
   execution: {
-workerResources: [
-      { resourceId: "pi-entry", selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1 },
-      { resourceId: "external-fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
-    ],
+workerResources: {
+  "pi-entry": {
+    selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1
+  },
+  "external-fake": {
+    selection: { source: "external", id: "fake" }, maxConcurrent: 1
+  }
+},
+  routes: { execute: [{ resourceId: "pi-entry" }, { resourceId: "external-fake" }], research: [{ resourceId: "pi-entry" }] },
   },
 });
 
@@ -73,24 +79,26 @@ test("executorDisplayLabel prefers the actual invocation model over mutable sett
   const modelAgentConfig = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "with-model",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      model: "agent-model-9",
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const, model: "execution-override-7" },
-    }],
+    externalAgents: {
+      "with-model": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        model: "agent-model-9",
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const, model: "execution-override-7" }
+      }
+    },
   });
   const rePointedConfig = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "with-model",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      model: "catalog-changed-later",
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-    }],
+    externalAgents: {
+      "with-model": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        model: "catalog-changed-later",
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+      }
+    },
   });
   // The execution-level override is what actually ran — the label shows it
   // exactly, not the agent-level default.
@@ -114,16 +122,19 @@ test("executorDisplayLabel keeps the recorded model-less external identity under
   const modelLessConfig = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+      }
+    },
     execution: {
-workerResources: [
-        { resourceId: "external-fake", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 },
-      ],
+workerResources: {
+  "external-fake": {
+    selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1
+  }
+},
     },
   });
   // Later catalog edit: the same agent id now claims a model that never
@@ -131,17 +142,20 @@ workerResources: [
   const catalogGainedModel = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      model: "never-served-9",
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        model: "never-served-9",
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+      }
+    },
     execution: {
-workerResources: [
-        { resourceId: "external-fake", selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1 },
-      ],
+workerResources: {
+  "external-fake": {
+    selection: { source: "external" as const, id: "fake" }, maxConcurrent: 1
+  }
+},
     },
   });
   // Resource reassignment: the same entry id now resolves to an entirely
@@ -149,16 +163,19 @@ workerResources: [
   const entryReassigned = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+      }
+    },
     execution: {
-workerResources: [
-        { resourceId: "external-fake", selection: { source: "pi" as const, model: "gpt-reassigned" }, maxConcurrent: 1 },
-      ],
+workerResources: {
+  "external-fake": {
+    selection: { source: "pi" as const, model: "gpt-reassigned" }, maxConcurrent: 1
+  }
+},
     },
   });
   // A model-less external invocation reports no executorModel: the recorded

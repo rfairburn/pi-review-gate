@@ -120,47 +120,47 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "file-writer" }, maxConcurrent: 1 }],
+      workerResources: { "default": { selection: { source: "external", id: "file-writer" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
           },
-externalAgents: [
-        {
-          id: "file-writer",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "let input='';",
-              "process.stdin.on('data',(d)=>{input+=d;});",
-              "process.stdin.on('end',()=>{",
-              '  const fs=require("fs");',
-              '  const path=require("path");',
-              '  const cwd=process.cwd();',
-              // Extract the title from the prompt to determine which file to create
-              // Parse title from "Subtask: <title>" line in the prompt
-              '  const subtaskMatch=input.match(/Subtask:\\s*(.+)/);',
-              '  const title=subtaskMatch?subtaskMatch[1].trim():"unknown";',
-              // Create a file based on the title
-              '  if(title.includes("index")){',
-              '    fs.writeFileSync(path.join(cwd,"index.html"),"<h1>Index</h1>\\n");',
-              '  }else if(title.includes("about")){',
-              '    fs.writeFileSync(path.join(cwd,"about.html"),"<h1>About</h1>\\n");',
-              '  }else{',
-              '    fs.writeFileSync(path.join(cwd,"output.txt"),"done\\n");',
-              '  }',
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"Created file."})+"\\n");',
-              "  process.exit(0);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: 15000,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "file-writer": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "let input='';",
+          "process.stdin.on('data',(d)=>{input+=d;});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          '  const path=require("path");',
+          '  const cwd=process.cwd();',
+          // Extract the title from the prompt to determine which file to create
+          // Parse title from "Subtask: <title>" line in the prompt
+          '  const subtaskMatch=input.match(/Subtask:\\s*(.+)/);',
+          '  const title=subtaskMatch?subtaskMatch[1].trim():"unknown";',
+          // Create a file based on the title
+          '  if(title.includes("index")){',
+          '    fs.writeFileSync(path.join(cwd,"index.html"),"<h1>Index</h1>\\n");',
+          '  }else if(title.includes("about")){',
+          '    fs.writeFileSync(path.join(cwd,"about.html"),"<h1>About</h1>\\n");',
+          '  }else{',
+          '    fs.writeFileSync(path.join(cwd,"output.txt"),"done\\n");',
+          '  }',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Created file."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 15000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -181,41 +181,41 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "prompt-target-writer" }, maxConcurrent: 1 }],
+      workerResources: { "default": { selection: { source: "external", id: "prompt-target-writer" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
           },
-externalAgents: [
-        {
-          id: "prompt-target-writer",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-          "-e",
-          [
-            "let input='';",
-            "process.stdin.on('data',(d)=>{input+=d;});",
-            "process.stdin.on('end',()=>{",
-            '  const fs=require("fs");',
-            '  const path=require("path");',
-            '  const match=input.match(/Create a file at (.+?\\/(?:index|about)\\.html)(?:\\s|$)/);',
-            '  if(!match) process.exit(10);',
-            '  const target=match[1];',
-            '  const sourceTarget=path.join(process.env.TEST_SOURCE_ROOT,path.basename(target));',
-            '  if(target===sourceTarget || fs.existsSync(sourceTarget)) process.exit(11);',
-            '  fs.mkdirSync(path.dirname(target),{recursive:true});',
-            '  fs.writeFileSync(target,"<h1>"+path.basename(target)+"</h1>\\n");',
-            '  process.stdout.write(JSON.stringify({type:"session",sessionId:"prompt-writer"})+"\\n");',
-            '  process.stdout.write(JSON.stringify({type:"assistant",text:"Created "+target})+"\\n");',
-            "});",
-          ].join(""),
-        ],
-            env: { TEST_SOURCE_ROOT: sourceRoot },
-            timeoutMs: 15000,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "prompt-target-writer": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "let input='';",
+          "process.stdin.on('data',(d)=>{input+=d;});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          '  const path=require("path");',
+          '  const match=input.match(/Create a file at (.+?\\/(?:index|about)\\.html)(?:\\s|$)/);',
+          '  if(!match) process.exit(10);',
+          '  const target=match[1];',
+          '  const sourceTarget=path.join(process.env.TEST_SOURCE_ROOT,path.basename(target));',
+          '  if(target===sourceTarget || fs.existsSync(sourceTarget)) process.exit(11);',
+          '  fs.mkdirSync(path.dirname(target),{recursive:true});',
+          '  fs.writeFileSync(target,"<h1>"+path.basename(target)+"</h1>\\n");',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"prompt-writer"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Created "+target})+"\\n");',
+          "});",
+        ].join(""),
+      ],
+      env: { TEST_SOURCE_ROOT: sourceRoot },
+      timeoutMs: 15000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -233,31 +233,31 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "noop" }, maxConcurrent: 1 }],
+      workerResources: { "default": { selection: { source: "external", id: "noop" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
           },
-externalAgents: [
-        {
-          id: "noop",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "process.stdin.resume();",
-              "process.stdin.on('end',()=>{",
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"noop"})+"\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"No changes needed."})+"\\n");',
-              "  process.exit(0);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: 15000,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "noop": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('end',()=>{",
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"noop"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"No changes needed."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 15000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -486,36 +486,36 @@ test("regression: ignored HTML paths remain excluded and not reported as landed"
 ...makeConfigWithFileWriter(),
 execution: {
           ...makeConfigWithFileWriter().execution!,
-          workerResources: [{ resourceId: "default", selection: { source: "external", id: "mixed-writer" }, maxConcurrent: 1 }],
+          workerResources: { "default": { selection: { source: "external", id: "mixed-writer" }, maxConcurrent: 1 } },
+            routes: { execute: [{ resourceId: "default" }], research: [] },
         },
-externalAgents: [
-            {
-              id: "mixed-writer",
-              adapter: "run-as-binary",
-              command: process.execPath,
-              args: [],
-              execution: {
-                args: [
-                "-e",
-                [
-                  "process.stdin.resume();",
-                  "process.stdin.on('end',()=>{",
-                  '  const fs=require("fs");',
-                  '  const path=require("path");',
-                  '  const cwd=process.cwd();',
-                  '  fs.writeFileSync(path.join(cwd,"output.txt"),"output\\n");',
-                  '  fs.writeFileSync(path.join(cwd,"debug.log"),"debug\\n");',
-                  '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-                  '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-                  "  process.exit(0);",
-                  "});",
-                ].join(""),
-              ],
-                timeoutMs: 15000,
-                protocol: "pi-review-executor-jsonl-v1",
-              },
-            }
-        ],
+externalAgents: {
+  "mixed-writer": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          '  const path=require("path");',
+          '  const cwd=process.cwd();',
+          '  fs.writeFileSync(path.join(cwd,"output.txt"),"output\\n");',
+          '  fs.writeFileSync(path.join(cwd,"debug.log"),"debug\\n");',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 15000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
       },
       artifactDir,
       waveId: "regression-ignore",
@@ -842,36 +842,36 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-          workerResources: [{ resourceId: "default", selection: { source: "external", id: "pwd-checker" }, maxConcurrent: 1 }],
+          workerResources: { "default": { selection: { source: "external", id: "pwd-checker" }, maxConcurrent: 1 } },
+            routes: { execute: [{ resourceId: "default" }], research: [] },
                   },
-externalAgents: [
-            {
-              id: "pwd-checker",
-              adapter: "run-as-binary",
-              command: process.execPath,
-              args: [],
-              execution: {
-                args: [
-                "-e",
-                [
-                  "process.stdin.resume();",
-                  "process.stdin.on('end',()=>{",
-                  '  const pwd=process.env.PWD;',
-                  '  const cwd=process.cwd();',
-                  // Write PWD to a file in cwd for verification
-                  '  const fs=require("fs");',
-                  '  fs.writeFileSync(cwd+"/pwd-output.txt", pwd+"\\n"+cwd+"\\n");',
-                  '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-                  '  process.stdout.write(JSON.stringify({type:"assistant",text:"PWD: "+pwd})+"\\n");',
-                  "  process.exit(0);",
-                  "});",
-                ].join(""),
-              ],
-                timeoutMs: 15000,
-                protocol: "pi-review-executor-jsonl-v1",
-              },
-            }
-        ],
+externalAgents: {
+  "pwd-checker": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('end',()=>{",
+          '  const pwd=process.env.PWD;',
+          '  const cwd=process.cwd();',
+          // Write PWD to a file in cwd for verification
+          '  const fs=require("fs");',
+          '  fs.writeFileSync(cwd+"/pwd-output.txt", pwd+"\\n"+cwd+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"PWD: "+pwd})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 15000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
       },
       artifactDir,
       waveId: "regression-pwd",

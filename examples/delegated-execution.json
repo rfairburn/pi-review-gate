@@ -14,32 +14,29 @@
     ]
   },
   "execution": {
-    "workerResources": [
-      {
-        "resourceId": "local-primary",
+    "workerResources": {
+      "local-primary": {
         "selection": {
           "source": "pi",
           "model": "openai-codex/gpt-5.6-sol"
         },
         "maxConcurrent": 1
       },
-      {
-        "resourceId": "codex-cloud-overflow",
+      "codex-cloud-overflow": {
         "selection": {
           "source": "external",
           "id": "codex-luna"
         },
         "maxConcurrent": 3
       },
-      {
-        "resourceId": "claude-overflow",
+      "claude-overflow": {
         "selection": {
           "source": "external",
           "id": "claude"
         },
         "maxConcurrent": 4
       }
-    ],
+    },
     "routes": {
       "execute": [
         { "resourceId": "local-primary", "thinkingLevel": "high" },
@@ -61,9 +58,8 @@
       "maxSameIncidentRepeats": 2
     }
   },
-  "externalAgents": [
-    {
-      "id": "codex-luna",
+  "externalAgents": {
+    "codex-luna": {
       "adapter": "codex-cli",
       "command": "codex",
       "review": {
@@ -77,8 +73,7 @@
         "timeoutMs": 1800000
       }
     },
-    {
-      "id": "codex-sol",
+    "codex-sol": {
       "adapter": "codex-cli",
       "command": "codex",
       "review": {
@@ -92,15 +87,13 @@
         "timeoutMs": 1800000
       }
     },
-    {
-      "id": "claude",
+    "claude": {
       "adapter": "claude-cli",
       "command": "claude",
       "review": { "timeoutMs": 600000 },
       "execution": { "timeoutMs": 1800000 }
     },
-    {
-      "id": "my-binary-agent",
+    "my-binary-agent": {
       "adapter": "run-as-binary",
       "command": "/absolute/path/to/my-agent",
       "execution": {
@@ -109,5 +102,5 @@
         "timeoutMs": 1800000
       }
     }
-  ]
+  }
 }

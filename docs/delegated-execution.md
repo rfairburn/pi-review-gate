@@ -94,10 +94,36 @@ and closes its old browser before creating a new runtime.
 ## Worker resources, routes, and concurrency
 
 Fresh tasks scan their `execution.routes.execute` or `execution.routes.research`
-ordering and use the first eligible `workerResources` entry with remaining shared
-capacity. The two priorities are independent subsets: either route can exclude a
+ordering and use the first referenced resource with remaining shared capacity.
+The two priorities are independent ordered subsets: either route can exclude a
 resource, and per-route reasoning lets the same local model use different effort without
-creating a second capacity bucket.
+creating a second capacity bucket. A missing or empty route means no models for that
+role — the catalog never supplies a default order, so a resource that is not listed in
+a role's route is not used by that role.
+
+`execution.workerResources` is an object keyed by stable resource ID; each value holds
+the selection and the shared `maxConcurrent` capacity. `externalAgents` is likewise an
+object keyed by agent ID. Ordered behavior lives only in the route arrays, which are
+lists of `{ resourceId, thinkingLevel? }` references. The legacy array forms of both
+catalogs are deprecated: they are still imported at load time and converted to the
+keyed form (identities, references, routes, and reasoning are preserved), but that
+import support will be removed in a future version without a fixed date or version
+([#116](https://github.com/rfairburn/pi-review-gate/issues/116)). Save the canonical
+object form now — `/review-settings` saves already write both catalogs as objects, so
+a saved config no longer depends on the legacy import. If you are still on a legacy
+array when a release removes that import, first run an intervening release that still
+supports the conversion and save once through `/review-settings` to persist the
+canonical object form, then upgrade to the removing release. In `/review-settings`
+the worker catalog displays alphabetically and edits by key with no reorder controls;
+external agents are not editable in this UI; ordering is set only in the two priority
+routes. Explicitly adding a worker resource enrolls it in each supported role's
+priority (in addition order, with the model's default reasoning); if its model is
+changed before leaving the pool editor, enrollment and reasoning are re-derived
+from the final selection — enrolling it in any supported route it is not yet
+listed in. An explicit exclusion made through a priority route sticks: a
+resource that exists when the pool editor opens is never enrolled into a route
+it was excluded from just because its model changed later. Opening or saving
+settings never enrolls preexisting resources into missing or empty priorities.
 
 When `/review-settings` switches a resource to a different model, the previous model's
 reasoning is discarded for that resource's retained route entries — the model and its

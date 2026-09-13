@@ -9,40 +9,41 @@ import {
 
 const CANONICAL_REVIEW = {
   enabled: true,
-  externalAgents: [
-    {
-      id: "reviewer",
+  externalAgents: {
+    "reviewer": {
       adapter: "generic-cli",
       command: "node",
       args: [],
-      review: {},
-    },
-  ],
+      review: {}
+    }
+  },
   review: { activeReviewers: [{ source: "external", id: "reviewer" }] },
 };
 
 const CANONICAL_EXECUTION = {
   enabled: true,
   execution: {
-    workerResources: [
-      { resourceId: "primary", selection: { source: "external", id: "exec" }, maxConcurrent: 1 },
-      { resourceId: "spare", selection: { source: "external", id: "exec2" }, maxConcurrent: 1 },
-    ],
+    workerResources: {
+      "primary": {
+        selection: { source: "external", id: "exec" }, maxConcurrent: 1
+      },
+      "spare": {
+        selection: { source: "external", id: "exec2" }, maxConcurrent: 1
+      }
+    },
   },
-  externalAgents: [
-    {
-      id: "exec",
+  externalAgents: {
+    "exec": {
       adapter: "run-as-binary",
       command: "node",
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
+      execution: { protocol: "pi-review-executor-jsonl-v1" }
     },
-    {
-      id: "exec2",
+    "exec2": {
       adapter: "run-as-binary",
       command: "node",
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
-    },
-  ],
+      execution: { protocol: "pi-review-executor-jsonl-v1" }
+    }
+  },
 };
 
 // ── old-only reviewer records are rejected with actionable diagnostics ──────

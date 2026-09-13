@@ -56,8 +56,9 @@ const helperModule = require(helperPath) as {
 const zeroModelDefaultConfig = {
   enabled: true,
   review: { activeReviewers: [] },
+  externalAgents: {},
   execution: {
-    workerResources: [],
+    workerResources: {},
     routes: { execute: [], research: [] },
   },
 };

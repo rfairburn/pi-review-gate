@@ -7,7 +7,7 @@
  * in the controller (finding 14). No controller state, scheduling, or delivery
  * policy lives here.
  */
-import { externalAgentCatalog, resolvedWorkerResources, resolvedWorkerRoute, type ExecutorSelection, type ReviewGateConfig } from "../config";
+import { resolvedExternalAgent, resolvedWorkerResource, resolvedWorkerRoute, type ExecutorSelection, type ReviewGateConfig } from "../config";
 import {
   clipActivity,
   type BackgroundActivityEvent,
@@ -41,11 +41,11 @@ export function executorDisplayLabel(
   // entry id resolved against current configuration.
   if (!task.executorEntryId) return "executor pending";
   const entry = resolvedWorkerRoute(config, kind).find((candidate) => candidate.entryId === task.executorEntryId)
-    ?? resolvedWorkerResources(config).find((candidate) => candidate.entryId === task.executorEntryId);
+    ?? resolvedWorkerResource(config, task.executorEntryId);
   if (!entry) return task.executorEntryId;
   if (entry.selection.source === "pi") return entry.selection.model;
   const externalId = entry.selection.id;
-  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === externalId);
+  const agent = resolvedExternalAgent(config, externalId);
   return agent && "model" in agent && typeof agent.model === "string" && agent.model
     ? agent.model
     : externalId;

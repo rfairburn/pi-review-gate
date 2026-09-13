@@ -181,20 +181,29 @@ through `/review-settings` materializes an explicit model-supported level.
 Pi and the selected provider own reasoning effort and token-budget behavior;
 review-gate does not impose a second output-side thinking cap. Reviewer and executor
 selections remain separate from the orchestrator. External harness reasoning is
-configured natively through `externalAgents[].review.args` and
-`externalAgents[].execution.args` (for example a Codex CLI role can use
+configured natively through each `externalAgents` entry's `review.args` and
+`execution.args` roles (for example a Codex CLI role can use
 `["-c", "model_reasoning_effort=\"high\""]`, Claude Code can use
 `["--effort", "high"]`, and arbitrary binary adapters may use their own arguments or
 environment variables).
 
 ### The `externalAgents` catalog
 
-`externalAgents` is one configured catalog shared by both menus. Each entry has an
-optional `review` role, `execution` role, or both. Role sections can override shared
-arguments, environment, model, protocol, and timeout, so one harness can use different
-limits for review and execution. An inactive external definition does not need to be
-installed; its command is checked when that definition is selected or run. Pi-scoped
-internal models are never copied into the external catalog.
+`externalAgents` is one configured catalog shared by both menus: an object keyed by
+stable agent ID, where each value has an optional `review` role, `execution` role, or
+both. Role sections can override shared arguments, environment, model, protocol, and
+timeout, so one harness can use different limits for review and execution. An inactive
+external definition does not need to be installed; its command is checked when that
+definition is selected or run. Pi-scoped internal models are never copied into the
+external catalog.
+
+The legacy array form (entries carrying their own `id`) is deprecated but still
+imported at load time and converted to the keyed object, preserving every identity,
+reference, and setting. That import support will be removed in a future version without
+a fixed date or version ([#116](https://github.com/rfairburn/pi-review-gate/issues/116));
+save the canonical object form now — `/review-settings` saves already write it. The
+worker catalog follows the same shape and deprecation; see
+[Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency).
 
 ### Pre-cutover configuration fields
 
@@ -225,7 +234,8 @@ remain authoritative.
 The `execution` block (`workerResources`, `routes`, `maxWorkers`,
 `subtaskNotifications`, `deferredPiTools`, `retryPolicy`) and the reviewer/execution route matrix are
 documented with the behavior they control in
-[Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency).
+[Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency),
+including the keyed-catalog shape, legacy array import, and deprecation.
 A complete end-to-end example is `examples/delegated-execution.json`.
 
 Defaults: `execution.maxWorkers` is `4` (allowed range 1–16) and
@@ -284,16 +294,18 @@ boundaries are owned by [Web tools](web-tools.md) and
 
 - **Worker resources** defines Pi-scoped models and execution-capable entries from
   `externalAgents`, each with one physical maximum concurrency shared by every
-  background-task kind.
+  background-task kind. The catalog displays alphabetically and edits by stable key —
+  it has no reorder controls, because row order never defines identity or scheduling.
 - **Execution priority** and **Research priority** are independently ordered subsets of
-  those resources. Either route can exclude a resource. Per-route reasoning lets the
-  same local model use different effort without creating a second capacity bucket.
+  those resources, referenced by key. Either route can exclude a resource; a missing or
+  empty route means no models for that role. Per-route reasoning lets the same local
+  model use different effort without creating a second capacity bucket.
 - **Reviewers** is a multi-selection, `/scoped-models`-style picker over the same
   Pi-scoped models plus review-capable entries from `externalAgents`. Clearing every
   reviewer is valid and disables automatic review without disabling delegated execution.
   Each selected internal reviewer has its own **Reasoning** row.
 - **Timeouts** edits the default reviewer and executor timeouts in minutes. Explicit
-  `externalAgents[].review.timeoutMs` and `externalAgents[].execution.timeoutMs` values
+  `review.timeoutMs` and `execution.timeoutMs` values on an `externalAgents` entry
   override these defaults for that external harness role.
 - **Review policy** edits `maxCorrectionCycles` and
   `implementationGuidanceAfterCorrectionAttempts` as non-negative whole numbers.

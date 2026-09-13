@@ -48,29 +48,31 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean; rese
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: options.researchCapable ? "codex-cli" : "run-as-binary",
-      command: process.execPath,
-      execution: {
-        ...(options.researchCapable ? {} : { protocol: "pi-review-executor-jsonl-v1" as const }),
-        args: options.slowExecutor
+    externalAgents: {
+      "fake": {
+        adapter: options.researchCapable ? "codex-cli" : "run-as-binary",
+        command: process.execPath,
+        execution: {
+          ...(options.researchCapable ? {} : { protocol: "pi-review-executor-jsonl-v1" as const }),
+          args: options.slowExecutor
           ? ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"]
           : undefined,
-      },
-    }],
+        }
+      }
+    },
     execution: options.resourceCapacity === undefined
       ? {
           deferredPiTools: options.deferredPiTools,
           // A single external executor at the default shared capacity of four.
-          workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 4 }],
+          workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 4 } },
         }
       : {
-          workerResources: [{
-            resourceId: "fake-shared",
-            selection: { source: "external", id: "fake" },
-            maxConcurrent: options.resourceCapacity,
-          }],
+          workerResources: {
+            "fake-shared": {
+              selection: { source: "external", id: "fake" },
+              maxConcurrent: options.resourceCapacity
+            }
+          },
           routes: { execute: [{ resourceId: "fake-shared" }], research: [] },
           maxWorkers: 4,
           deferredPiTools: options.deferredPiTools,
@@ -283,20 +285,20 @@ test("saved executor settings govern queued dispatch while existing leases keep 
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: ["qwen", "deepseek"].map((id) => ({
-      id,
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: {
-        protocol: "pi-review-executor-jsonl-v1",
-        args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
-      },
-    })),
+    externalAgents: {
+      qwen: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"] } },
+      deepseek: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"] } },
+    },
     execution: {
-workerResources: [
-        { resourceId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
-        { resourceId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
-      ],
+workerResources: {
+  "qwen": {
+    selection: { source: "external", id: "qwen" }, maxConcurrent: 1
+  },
+  "deepseek": {
+    selection: { source: "external", id: "deepseek" }, maxConcurrent: 1
+  }
+},
+  routes: { execute: [{ resourceId: "qwen" }, { resourceId: "deepseek" }], research: [] },
 maxWorkers: 1,
     },
   });
@@ -328,9 +330,9 @@ maxWorkers: 1,
     const inspect = (taskId: string) => inspectTool("live-settings-inspect", { executionId, taskId }, undefined, undefined, {}).then((response: Record<string, any>) => response.details as Record<string, any>);
     await waitUntil(async () => (await inspect(firstTaskId)).tasks[0]?.executorEntryId === "qwen");
 
-    config.execution!.workerResources = [
-      { resourceId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
-    ];
+    config.execution!.workerResources = {
+      deepseek: { selection: { source: "external", id: "deepseek" }, maxConcurrent: 1 },
+    };
     config.execution!.maxWorkers = 2;
     manager.sync();
 

@@ -691,7 +691,8 @@ test("end-to-end: registered SubtasksInspect serves bounded evidence navigation"
     enabled: true,
     review: { activeReviewers: [] },
     execution: {
-workerResources: [{ resourceId: "default", selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
@@ -966,7 +967,8 @@ test("controller: operation.json context is confined, bounded, and ownership-val
     enabled: true,
     review: { activeReviewers: [] },
     execution: {
-workerResources: [{ resourceId: "default", selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
@@ -1157,7 +1159,8 @@ test("controller: artifact root escaping the wave root is refused before any con
     enabled: true,
     review: { activeReviewers: [] },
     execution: {
-workerResources: [{ resourceId: "default", selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
@@ -1218,7 +1221,8 @@ test("controller: an operation record naming an unverifiable artifact directory 
     enabled: true,
     review: { activeReviewers: [] },
     execution: {
-workerResources: [{ resourceId: "default", selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "pi", model: "model-x" }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => sourceRoot });
@@ -1725,23 +1729,24 @@ test("regression #50: registered SubtasksInspect exposes completed needs_changes
     const config = normalizeConfig({
       enabled: true,
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "active-exec" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "active-exec" }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-      externalAgents: [{
-        id: "active-exec",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: [executorScript],
-          timeoutMs: 60_000,
-        },
-      }],
+      externalAgents: {
+        "active-exec": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: [executorScript],
+            timeoutMs: 60000,
+          }
+        }
+      },
     });
-    config.externalAgents = [
-      ...(config.externalAgents ?? []),
-      {
-        id: "blocking",
+    config.externalAgents = {
+      ...(config.externalAgents ?? {}),
+      "blocking": {
         adapter: "generic-cli" as const,
         command: process.execPath,
         args: [],
@@ -1750,10 +1755,10 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
             "-e",
             "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'impl.txt',line:null,issue:'ACTIVE-CORRECTION-FINDING-MARKER must be addressed',recommendation:'add the missing behavior'}]})))",
           ],
-          timeoutMs: 30_000,
-        },
-      },
-    ];
+          timeoutMs: 30000,
+        }
+      }
+    };
     config.review = { activeReviewers: [{ source: "external", id: "blocking" }] };
     config.maxCorrectionCycles = 1;
 

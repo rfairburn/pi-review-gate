@@ -283,20 +283,20 @@ test("a review window keeps its original reviewer selection after live config ch
   beginAgentRun(state);
   const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}},
-      {
-        id: "two",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -390,20 +390,20 @@ test("reconcileRestoredReviewWindows re-freezes restored windows onto the curren
   const state = reconciledWindowState();
   const configA = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}},
-      {
-        id: "two",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -413,20 +413,20 @@ review: { activeReviewers: [
 
   const configB = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}},
-      {
-        id: "two",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "two" }
     ] },
@@ -450,20 +450,20 @@ test("reconcileRestoredReviewWindows reports no change when the reviewer selecti
   const state = reconciledWindowState();
   const configA = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}},
-      {
-        id: "two",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -475,20 +475,20 @@ review: { activeReviewers: [
 enabled: true,
 timeoutMs: 999999,
 maxPatchBytes: 123456,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}},
-      {
-        id: "two",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -507,20 +507,20 @@ test("reconcileWindowReviewerSelection swaps only the reviewer selection of a fr
 enabled: true,
 reviewerTimeoutMs: 555,
 maxPatchBytes: 100,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}},
-      {
-        id: "two",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -533,20 +533,20 @@ review: { activeReviewers: [
 enabled: true,
 reviewerTimeoutMs: 777,
 maxPatchBytes: 200,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}},
-      {
-        id: "two",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "two" }
     ] },
@@ -574,14 +574,14 @@ test("reconcileWindowReviewerSelection recovers a zero-usable frozen window with
   // Frozen while the only selection was unresolvable: nothing usable to run.
   const staleConfig = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "gone" }
     ] },
@@ -592,14 +592,14 @@ review: { activeReviewers: [
   // The settings are fixed in-session; the next review must be able to run.
   const fixedConfig = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -620,14 +620,14 @@ test("unresolved reviewer selections travel with the frozen config object", () =
   const state = reconciledWindowState();
   const staleConfig = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" },
       { source: "external", id: "gone" }
@@ -642,14 +642,14 @@ review: { activeReviewers: [
   // it observes exactly what it started with.
   const fixedConfig = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -663,14 +663,14 @@ test("duplicated and unresolved selections travel with the materialized config o
   const state = reconciledWindowState();
   const staleConfig = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" },
       { source: "external", id: "one" },
@@ -690,14 +690,14 @@ review: { activeReviewers: [
   // own selection metadata.
   const fixedConfig = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -713,16 +713,15 @@ test("historical results without a saved identity render by raw reviewer id, not
   // to a codex-cli selection with model-b.
   const configB = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "codex-cli",
-        args: [],
-        review: {
-          model: "model-b",
-        },
-      }
-    ],
+externalAgents: {
+  "one": {
+    adapter: "codex-cli",
+    args: [],
+    review: {
+      model: "model-b",
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -756,20 +755,20 @@ test("reconcileRestoredReviewWindows treats a missing selection digest as change
   // "two".
   const configB = normalizeConfig({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}},
-      {
-        id: "two",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "two" }
     ] },

@@ -22,6 +22,7 @@ import {
 } from "../src/execution/wave-controller";
 import type { ReviewGateConfig } from "../src/config";
 import type { WaveWorkerTask } from "../src/execution/wave-worker";
+import { agentCatalog } from "./helpers";
 
 const execFileAsync = promisify(execFile);
 
@@ -185,35 +186,35 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-writer" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake-writer" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
-externalAgents: [
-        {
-          id: "fake-writer",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "process.stdin.resume();",
-              "process.stdin.on('data',()=>{});",
-              "process.stdin.on('end',()=>{",
-              '  const fs=require("fs");',
-              '  const p=require("path").join(process.cwd(),"output.txt");',
-              '  fs.writeFileSync(p,"hello from worker\\n");',
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-              "  process.exit(0);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "fake-writer": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          '  const p=require("path").join(process.cwd(),"output.txt");',
+          '  fs.writeFileSync(p,"hello from worker\\n");',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -235,32 +236,32 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-fail" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake-fail" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
-externalAgents: [
-        {
-          id: "fake-fail",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "process.stdin.resume();",
-              "process.stdin.on('data',()=>{});",
-              "process.stdin.on('end',()=>{",
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"fail"})+"\\n");',
-              "  process.exit(1);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "fake-fail": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"fail"})+"\\n");',
+          "  process.exit(1);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -282,39 +283,39 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-mixed" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake-mixed" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
-externalAgents: [
-        {
-          id: "fake-mixed",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "let input='';",
-              "process.stdin.on('data',(d)=>{input+=d;});",
-              "process.stdin.on('end',()=>{",
-              '  const fs=require("fs");',
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  if(input.includes("FAILTHISONE")){',
-              '    process.stdout.write(JSON.stringify({type:"assistant",text:"fail"})+"\\n");',
-              "    process.exit(1);",
-              "  }",
-              '  const p=require("path").join(process.cwd(),"output.txt");',
-              '  fs.writeFileSync(p,"hello from worker\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-              "  process.exit(0);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "fake-mixed": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "let input='';",
+          "process.stdin.on('data',(d)=>{input+=d;});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  if(input.includes("FAILTHISONE")){',
+          '    process.stdout.write(JSON.stringify({type:"assistant",text:"fail"})+"\\n");',
+          "    process.exit(1);",
+          "  }",
+          '  const p=require("path").join(process.cwd(),"output.txt");',
+          '  fs.writeFileSync(p,"hello from worker\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -335,34 +336,34 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-slow" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake-slow" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
-externalAgents: [
-        {
-          id: "fake-slow",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "process.stdin.resume();",
-              "process.stdin.on('data',()=>{});",
-              "process.stdin.on('end',()=>{",
-              "  setTimeout(()=>{",
-              '    process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '    process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-              "    process.exit(0);",
-              "  }, 5000);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "fake-slow": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          "  setTimeout(()=>{",
+          '    process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '    process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "    process.exit(0);",
+          "  }, 5000);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -388,44 +389,44 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-gated" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake-gated" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
-externalAgents: [
-        {
-          id: "fake-gated",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "process.stdin.resume();",
-              "process.stdin.on('data',()=>{});",
-              "process.stdin.on('end',()=>{",
-              '  const fs=require("fs");',
-              '  const path=require("path");',
-              '  const dir=process.env.PI_GATE_DIR;',
-              '  const id=path.basename(process.cwd());',
-              '  if(dir){',
-              '    fs.writeFileSync(path.join(dir,"ready-"+id),String(process.pid));',
-              '    while(!fs.existsSync(path.join(dir,"release-"+id))){',
-              "      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,50);",
-              "    }",
-              "  }",
-              '  fs.writeFileSync(path.join(process.cwd(),"output.txt"),"hello from worker\\n");',
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-              "  process.exit(0);",
-              "});",
-            ].join(""),
-          ],
-            env: { PI_GATE_DIR: gateDir },
-            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "fake-gated": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          '  const path=require("path");',
+          '  const dir=process.env.PI_GATE_DIR;',
+          '  const id=path.basename(process.cwd());',
+          '  if(dir){',
+          '    fs.writeFileSync(path.join(dir,"ready-"+id),String(process.pid));',
+          '    while(!fs.existsSync(path.join(dir,"release-"+id))){',
+          "      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,50);",
+          "    }",
+          "  }",
+          '  fs.writeFileSync(path.join(process.cwd(),"output.txt"),"hello from worker\\n");',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      env: { PI_GATE_DIR: gateDir },
+      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -447,32 +448,32 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-noop" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake-noop" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
-externalAgents: [
-        {
-          id: "fake-noop",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "process.stdin.resume();",
-              "process.stdin.on('data',()=>{});",
-              "process.stdin.on('end',()=>{",
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"No changes."})+"\\n");',
-              "  process.exit(0);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "fake-noop": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"No changes."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -856,10 +857,9 @@ test("reviewer milestones reach execution activity updates", async () => {
   const config: ReviewGateConfig = {
     ...baseConfig,
     enabled: true,
-    externalAgents: [
-      ...(baseConfig.externalAgents ?? []),
-      {
-        id: "passing",
+    externalAgents: {
+      ...(baseConfig.externalAgents ?? {}),
+      "passing": {
         adapter: "generic-cli",
         command: process.execPath,
         args: [],
@@ -869,9 +869,9 @@ test("reviewer milestones reach execution activity updates", async () => {
             "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'all good',findings:[]})))",
           ],
           timeoutMs: TEST_EXECUTOR_TIMEOUT_MS,
-        },
-      },
-    ],
+        }
+      }
+    },
     review: { activeReviewers: [{ source: "external", id: "passing" }] },
   };
   const activity: string[] = [];
@@ -1081,12 +1081,17 @@ test("fresh workers overflow through the ordered executor pool by per-model capa
   const config: ReviewGateConfig = {
     ...makeConfigWithWritingExecutor(),
     execution: {
-      workerResources: [
-        { resourceId: "primary", selection: { source: "external", id: "primary" }, maxConcurrent: 1 },
-        { resourceId: "overflow", selection: { source: "external", id: "overflow" }, maxConcurrent: 1 },
-      ],
+      workerResources: {
+        "primary": {
+          selection: { source: "external", id: "primary" }, maxConcurrent: 1
+        },
+        "overflow": {
+          selection: { source: "external", id: "overflow" }, maxConcurrent: 1
+        }
+      },
+        routes: { execute: [{ resourceId: "primary" }, { resourceId: "overflow" }], research: [] },
     },
-    externalAgents: [writer("primary"), writer("overflow")],
+    externalAgents: agentCatalog(writer("primary"), writer("overflow")),
   };
 
   try {

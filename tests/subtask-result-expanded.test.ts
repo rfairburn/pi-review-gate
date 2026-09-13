@@ -108,17 +108,19 @@ function harness(options: { notifySink?: (message: string) => void; cwd?: () => 
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: {
-        protocol: "pi-review-executor-jsonl-v1" as const,
-        args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
-      },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1" as const,
+          args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
+        }
+      }
+    },
     execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   const manager = new ExecutionToolManager({

@@ -50,16 +50,18 @@ function dispatchHarness(activeTools: string[]): DispatchHarness {
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      // The research-capable codex adapter routes research groups through the
-      // read-only research intersection, mirroring real role rules.
-      adapter: "codex-cli",
-      command: process.execPath,
-      execution: {},
-    }],
+    externalAgents: {
+      "fake": {
+        // The research-capable codex adapter routes research groups through the
+        // read-only research intersection, mirroring real role rules.
+        adapter: "codex-cli",
+        command: process.execPath,
+        execution: {}
+      }
+    },
     execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [{ resourceId: "default" }] },
     },
   });
   const manager = new ExecutionToolManager({

@@ -6,6 +6,9 @@ import test from "node:test";
 import { DEFAULT_CONFIG, loadConfig, normalizeConfig, recoverConfig } from "../src/config";
 
 const resources = [{ resourceId: "worker", selection: { source: "pi", model: "test/model", thinkingLevel: "low" }, maxConcurrent: 2 }];
+// Recovery inputs stay in the deprecated legacy array form on purpose; every
+// recovered config carries the canonical keyed catalog.
+const recoveredResources = { worker: { selection: { source: "pi", model: "test/model", thinkingLevel: "low" }, maxConcurrent: 2 } };
 const reviewers = [{ source: "pi", model: "test/reviewer", thinkingLevel: "high" }];
 const configured = {
   review: { activeReviewers: reviewers },
@@ -42,7 +45,7 @@ test("invalid execution setting preserves resources and routes regardless of inp
     workerResources: resources,
     deferredPiTools: false,
   } });
-  assert.deepEqual(config.execution?.workerResources, resources);
+  assert.deepEqual(config.execution?.workerResources, recoveredResources);
   assert.deepEqual(config.execution?.routes, normalizeConfig(configured).execution?.routes);
   assert.equal(config.execution?.deferredPiTools, false);
   assert.equal(config.execution?.maxWorkers, undefined);
@@ -57,9 +60,24 @@ test("invalid collection entries do not discard healthy siblings or invent repla
     },
   });
   assert.deepEqual(config.review?.activeReviewers, reviewers);
-  assert.deepEqual(config.execution?.workerResources, resources);
+  assert.deepEqual(config.execution?.workerResources, recoveredResources);
   assert.deepEqual(config.execution?.routes?.execute, [{ resourceId: "worker", thinkingLevel: undefined }]);
   assert.equal(warnings?.length, 3);
+});
+
+test("keyed catalogs recover per key, dropping only the corrupted entry", () => {
+  const agents = {
+    "healthy": { adapter: "generic-cli" as const, command: process.execPath, args: [], review: {} },
+    "broken": { adapter: "generic-cli" as const, command: 42, args: [], review: {} },
+  };
+  const { config, warnings } = recoverConfig({
+    enabled: true,
+    externalAgents: agents,
+    review: { activeReviewers: [{ source: "external", id: "healthy" }] },
+  });
+  assert.deepEqual(Object.keys(config.externalAgents!), ["healthy"]);
+  assert.equal(config.review?.activeReviewers?.length, 1);
+  assert.deepEqual(warnings, ["externalAgents.broken is invalid or unsupported; using its default."]);
 });
 
 test("recovery preserves valid coupled delay bounds and ignores obsolete copies when canonical data exists", () => {
@@ -89,7 +107,7 @@ test("file loading recovers without overwriting settings and keeps the explicit 
       assert.equal(loaded.globallyDisabled, undefined);
       assert.equal(loaded.config.web?.enabled, true);
       assert.equal(readFileSync(path, "utf8"), text);
-      if (text.startsWith('{"')) assert.deepEqual(loaded.config.execution?.workerResources, resources);
+      if (text.startsWith('{"')) assert.deepEqual(loaded.config.execution?.workerResources, recoveredResources);
     }
     assert.equal(loadConfig({ PI_REVIEW_GATE_CONFIG: path, PI_REVIEW_GATE_DISABLED: "1" }).globallyDisabled, true);
   } finally {

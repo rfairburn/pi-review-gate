@@ -164,16 +164,18 @@ test("execute workers inherit ApplyPatch through the active-tool snapshot while 
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "codex-cli",
-      command: process.execPath,
-      execution: {
-        args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
-      },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "codex-cli",
+        command: process.execPath,
+        execution: {
+          args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
+        }
+      }
+    },
     execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [{ resourceId: "default" }] },
     },
     ui: { subtasksViewExpanded: false },
   });

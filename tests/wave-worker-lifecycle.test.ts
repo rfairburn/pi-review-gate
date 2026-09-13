@@ -9,6 +9,7 @@ import { reviewerProgressLabel, runWaveWorkerLifecycle, type WaveWorkerLifecycle
 import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
 import { buildSubtaskEvidence, readSubtaskEvidence } from "../src/execution/subtask-evidence";
 import { normalizeConfig, type ActiveReviewerSelection, type ExternalAgentConfig, type ReviewGateConfig } from "../src/config";
+import { agentCatalog } from "./helpers";
 import type { WaveWorkerTask } from "../src/execution/wave-worker";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -128,9 +129,10 @@ function buildConfig(
   return normalizeConfig({
     enabled: true,
     execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: executorId }, maxConcurrent: 1 }],
+      workerResources: { "default": { selection: { source: "external", id: executorId }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
     },
-    externalAgents: [
+    externalAgents: agentCatalog(
       {
         id: executorId,
         adapter: "run-as-binary",
@@ -142,7 +144,7 @@ function buildConfig(
         },
       },
       ...extraAgents,
-    ],
+    ),
     ...(activeReviewers.length > 0 ? { review: { activeReviewers } } : {}),
   });
 }
@@ -294,8 +296,8 @@ test("lifecycle resolves current review settings after executor work completes",
       },
     });
     const config = buildConfig(executor);
-    const executorAgent = config.externalAgents![0]!;
-    config.externalAgents = [executorAgent, reviewer("old", oldReviewerMarker)];
+    const executorAgent = config.externalAgents!["fake-exec"]!;
+    config.externalAgents = agentCatalog({ id: "fake-exec", ...executorAgent }, reviewer("old", oldReviewerMarker));
     config.review = { activeReviewers: [{ source: "external", id: "old" }] };
 
     const running = runWaveWorkerLifecycle({
@@ -313,7 +315,7 @@ test("lifecycle resolves current review settings after executor work completes",
       await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
     }
     await access(startedMarker);
-    config.externalAgents = [executorAgent, reviewer("new", newReviewerMarker)];
+    config.externalAgents = agentCatalog({ id: "fake-exec", ...executorAgent }, reviewer("new", newReviewerMarker));
     config.review = { activeReviewers: [{ source: "external", id: "new" }] };
 
     const result = await running;
@@ -481,15 +483,14 @@ test("lifecycle: steering during review aborts reviewers and resumes the executo
     const config: ReviewGateConfig = {
 ...baseConfig,
 enabled: true,
-externalAgents: [
-        ...baseConfig.externalAgents!,
-        {
-          id: "slow-pass",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: ["-e", [
+externalAgents: {
+  ...baseConfig.externalAgents!,
+  "slow-pass": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["-e", [
           "const fs=require('node:fs');const path=require('node:path');",
           "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
           "const request=fs.readFileSync(path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'request.md'),'utf8');",
@@ -497,10 +498,10 @@ externalAgents: [
           "process.stdout.write(JSON.stringify(visible?{verdict:'pass',summary:'authoritative steering visible',findings:[]}:{verdict:'needs_changes',summary:'steering missing',findings:[{severity:'blocking',issue:'steering missing',recommendation:'include steering'}]}));",
           "},2000))",
         ].join("")],
-            timeoutMs: 5_000,
-          },
-        }
-      ],
+      timeoutMs: 5000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "slow-pass" }
       ] },
@@ -553,15 +554,14 @@ test("lifecycle: turn-interrupt steering during review supersedes the review lik
     const config: ReviewGateConfig = {
 ...baseConfig,
 enabled: true,
-externalAgents: [
-        ...baseConfig.externalAgents!,
-        {
-          id: "slow-pass",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: ["-e", [
+externalAgents: {
+  ...baseConfig.externalAgents!,
+  "slow-pass": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["-e", [
           "const fs=require('node:fs');const path=require('node:path');",
           "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{",
           "const request=fs.readFileSync(path.join(process.env.PI_REVIEW_GATE_BUNDLE_DIR,'request.md'),'utf8');",
@@ -569,10 +569,10 @@ externalAgents: [
           "process.stdout.write(JSON.stringify(visible?{verdict:'pass',summary:'authoritative steering visible',findings:[]}:{verdict:'needs_changes',summary:'steering missing',findings:[{severity:'blocking',issue:'steering missing',recommendation:'include steering'}]}));",
           "},2000))",
         ].join("")],
-            timeoutMs: 5_000,
-          },
-        }
-      ],
+      timeoutMs: 5000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "slow-pass" }
       ] },
@@ -1042,16 +1042,15 @@ test("lifecycle: reviewer-blocked does not create artifact directory", async () 
     // Config with a duplicated enabled reviewer selection causes reviewer_blocked.
     const config = buildConfig(await createFakeExecutor(root).then((e) => e.command));
     config.enabled = true;
-    config.externalAgents = [
+    config.externalAgents = {
       ...config.externalAgents!,
-      {
-        id: "dup-reviewer",
+      "dup-reviewer": {
         adapter: "generic-cli" as const,
         command: process.execPath,
         args: [],
-        review: { args: ["-e", "process.stdout.write('{}')"], timeoutMs: 15000 },
-      },
-    ];
+        review: { args: ["-e", "process.stdout.write('{}')"], timeoutMs: 15000 }
+      }
+    };
     config.review = {
       activeReviewers: [
         { source: "external", id: "dup-reviewer" },
@@ -1098,38 +1097,37 @@ test("lifecycle: reviewer receives task acceptance criteria in evidence", async 
     const config: ReviewGateConfig = {
 ...baseConfig,
 enabled: true,
-externalAgents: [
-        ...baseConfig.externalAgents!,
-        {
-          id: "evidence-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const ok=s.includes('Acceptance criteria:')",
-            "&& s.includes('worker-output.txt exists with content')",
-            "&& s.includes('Task instructions:')",
-            "&& s.includes('Create worker-output.txt')",
-            "&& s.includes('Implemented the change.')",
-            "&& s.includes('Workspace snapshot disclosure:')",
-            "&& s.includes('Git-ignored files are not present');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'evidence complete',findings:[]}",
-            ":{verdict:'needs_changes',summary:'missing evidence',findings:[]}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  ...baseConfig.externalAgents!,
+  "evidence-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const ok=s.includes('Acceptance criteria:')",
+          "&& s.includes('worker-output.txt exists with content')",
+          "&& s.includes('Task instructions:')",
+          "&& s.includes('Create worker-output.txt')",
+          "&& s.includes('Implemented the change.')",
+          "&& s.includes('Workspace snapshot disclosure:')",
+          "&& s.includes('Git-ignored files are not present');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'evidence complete',findings:[]}",
+          ":{verdict:'needs_changes',summary:'missing evidence',findings:[]}));",
+          "});",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "evidence-checker" }
       ] },
@@ -1189,19 +1187,18 @@ test("lifecycle: an executor completion report resolves review without a tree ch
 ...baseConfig,
 enabled: true,
 maxCorrectionCycles: 2,
-externalAgents: [
-        ...baseConfig.externalAgents!,
-        {
-          id: "response-evidence-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: ["-e", reviewerScript],
-            timeoutMs: 15_000,
-          },
-        }
-      ],
+externalAgents: {
+  ...baseConfig.externalAgents!,
+  "response-evidence-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["-e", reviewerScript],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "response-evidence-checker" }
       ] },
@@ -1241,35 +1238,34 @@ test("lifecycle: reviewer receives the executor's isolated path mapping", async 
     const config: ReviewGateConfig = {
 ...baseConfig,
 enabled: true,
-externalAgents: [
-        ...baseConfig.externalAgents!,
-        {
-          id: "path-mapping-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            `const sourceRoot=${JSON.stringify(sourceDir)};`,
-            `const aliasRoot=${JSON.stringify(aliasRoot)};`,
-            `const workerPath=${JSON.stringify(expectedWorkerPath)};`,
-            "const ok=!s.includes(sourceRoot)&&!s.includes(aliasRoot)&&s.includes(workerPath);",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'review paths are isolated',findings:[]}",
-            ":{verdict:'needs_changes',summary:'review received source paths',findings:[{severity:'blocking',file:'session',line:null,issue:'source path leaked',recommendation:'rewrite it'}]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  ...baseConfig.externalAgents!,
+  "path-mapping-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          `const sourceRoot=${JSON.stringify(sourceDir)};`,
+          `const aliasRoot=${JSON.stringify(aliasRoot)};`,
+          `const workerPath=${JSON.stringify(expectedWorkerPath)};`,
+          "const ok=!s.includes(sourceRoot)&&!s.includes(aliasRoot)&&s.includes(workerPath);",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'review paths are isolated',findings:[]}",
+          ":{verdict:'needs_changes',summary:'review received source paths',findings:[{severity:'blocking',file:'session',line:null,issue:'source path leaked',recommendation:'rewrite it'}]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "path-mapping-checker" }
       ] },

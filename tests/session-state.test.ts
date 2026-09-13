@@ -80,17 +80,16 @@ test("session state round-trips review evidence and associations only for the sa
     const secret = "must-not-be-written-to-session-state";
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-        {
-          id: "reviewer",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            env: { PRIVATE_TOKEN: secret },
-          },
-        }
-      ],
+externalAgents: {
+  "reviewer": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      env: { PRIVATE_TOKEN: secret },
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "reviewer" }
       ] },
@@ -192,14 +191,14 @@ test("session state preserves snapshot omission records through save and restore
     // selection digest, exactly as the production runtime persists it.
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-        {
-          id: "reviewer",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-        review: {}}
-      ],
+externalAgents: {
+  "reviewer": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "reviewer" }
       ] },
@@ -393,22 +392,20 @@ function stableJsonForTest(value: unknown): string {
 test("reviewerSelectionDigest is insensitive to unrelated settings but tracks reviewer changes", () => {
   const base = {
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli" as const,
-        command: process.execPath,
-        args: [],
-        review: {},
-      },
-      {
-        id: "two",
-        adapter: "generic-cli" as const,
-        command: process.execPath,
-        args: [],
-        review: {},
-      }
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -439,16 +436,15 @@ review: { activeReviewers: [
     reviewerSelectionDigest(defaultSelection),
     reviewerSelectionDigest(normalizeConfig({
 ...base,
-externalAgents: [
-...base.externalAgents!,
-        {
-          id: "three",
-          adapter: "generic-cli" as const,
-          command: process.execPath,
-          args: [],
-          review: {},
-        }
-      ],
+externalAgents: {
+  ...base.externalAgents!,
+  "three": {
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" },
       { source: "external", id: "two" },
@@ -461,32 +457,30 @@ review: { activeReviewers: [
     reviewerSelectionDigest(a),
     reviewerSelectionDigest(normalizeConfig({
 ...base,
-externalAgents: [
-...base.externalAgents!,
-        {
-          id: "three",
-          adapter: "generic-cli" as const,
-          command: process.execPath,
-          args: [],
-          review: {},
-        }
-      ],
+externalAgents: {
+  ...base.externalAgents!,
+  "three": {
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
     })),
   );
   assert.notEqual(
     reviewerSelectionDigest(a),
     reviewerSelectionDigest(normalizeConfig({
 ...base,
-externalAgents: [
-        {
-          id: "one",
-          adapter: "generic-cli" as const,
-          command: "/usr/bin/other",
-          args: [],
-          review: {},
-        },
-base.externalAgents![1]!
-      ],
+externalAgents: {
+  ...base.externalAgents!,
+  one: {
+    adapter: "generic-cli" as const,
+    command: "/usr/bin/other",
+    args: [],
+    review: {},
+  },
+},
     })),
   );
   // A renamed selection (stale id) is part of the selection identity.
@@ -515,20 +509,20 @@ test("reviewer selection digest round-trips through sidecar save and restore", a
     });
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-        {
-          id: "one",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-        review: {}},
-        {
-          id: "two",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-        review: {}}
-      ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  },
+  "two": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "one" }
       ] },
@@ -553,14 +547,14 @@ review: { activeReviewers: [
 test("reviewerSelectionDigest distinguishes unresolved-only and duplicate-only changes on materialized configs", () => {
   const base = {
 enabled: true,
-externalAgents: [
-      {
-        id: "alpha",
-        adapter: "generic-cli" as const,
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "alpha": {
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "alpha" }
     ] },
@@ -621,9 +615,9 @@ test("frozen selection digest reports a missing-only reviewer change across save
     const alpha = { id: "alpha", adapter: "generic-cli" as const, command: process.execPath, args: [], review: {} };
     const configA = normalizeConfig({
 enabled: true,
-externalAgents: [
-alpha
-      ],
+externalAgents: {
+  [alpha.id]: { adapter: "generic-cli" as const, command: process.execPath, args: [], review: {} },
+},
 review: { activeReviewers: [
         { source: "external", id: "alpha" },
         { source: "external", id: "missingA" }
@@ -631,9 +625,9 @@ review: { activeReviewers: [
     });
     const configB = normalizeConfig({
 enabled: true,
-externalAgents: [
-alpha
-      ],
+externalAgents: {
+  [alpha.id]: { adapter: "generic-cli" as const, command: process.execPath, args: [], review: {} },
+},
 review: { activeReviewers: [
         { source: "external", id: "alpha" },
         { source: "external", id: "missingB" }
@@ -705,14 +699,14 @@ test("sidecars whose review window lacks the reviewer selection digest are rejec
     });
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-        {
-          id: "reviewer",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-        review: {}}
-      ],
+externalAgents: {
+  "reviewer": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "reviewer" }
       ] },
@@ -782,14 +776,14 @@ test("sidecars predating the omission ledger fail restore explicitly and are pre
     });
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-        {
-          id: "reviewer",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-        review: {}}
-      ],
+externalAgents: {
+  "reviewer": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "reviewer" }
       ] },
@@ -838,14 +832,14 @@ test("superseded-format sidecars carrying the obsolete reviewConfigurationError 
     });
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-        {
-          id: "reviewer",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-        review: {}}
-      ],
+externalAgents: {
+  "reviewer": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "reviewer" }
       ] },

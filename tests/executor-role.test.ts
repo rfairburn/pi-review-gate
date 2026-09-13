@@ -259,17 +259,19 @@ async function catalogProducedByExecutionToolManager(): Promise<ExecutorToolCata
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: {
-        protocol: "pi-review-executor-jsonl-v1",
-        args: ["-e", "process.stdin.resume();setInterval(()=>{},1000)"],
-      },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1",
+          args: ["-e", "process.stdin.resume();setInterval(()=>{},1000)"],
+        }
+      }
+    },
     execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   const manager = new ExecutionToolManager({

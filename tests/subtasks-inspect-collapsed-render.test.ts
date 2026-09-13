@@ -32,14 +32,16 @@ function harness() {
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+      }
+    },
     execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 4 }],
+      workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 4 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   const manager = new ExecutionToolManager({ pi, config, state: createState(), cwd: () => process.cwd() });

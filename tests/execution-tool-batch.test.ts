@@ -65,6 +65,10 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean; rese
           deferredPiTools: options.deferredPiTools,
           // A single external executor at the default shared capacity of four.
           workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 4 } },
+          routes: {
+            execute: [{ resourceId: "default" }],
+            research: options.researchCapable ? [{ resourceId: "default" }] : [],
+          },
         }
       : {
           workerResources: {

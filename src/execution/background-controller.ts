@@ -1693,6 +1693,10 @@ export class BackgroundExecutionController {
       // and its group aggregate is folded into the returned inspection instead.
       let completionAggregate: string | undefined;
       if (isToolResultConfirmedCompletionWake("completion", input.actor)) {
+        // #117 review fix: suppression removes only the notification. The
+        // actionable-completion watch housekeeping still runs so a stale
+        // checkpoint can never fire after this direct-result-confirmed landing.
+        this.retireWakeWatch(task, "completion", { group, task });
         completionAggregate = this.completionAggregateFor(group, task);
       } else {
         await this.completeLandedBookkeeping(task, "completion wake", () =>
@@ -1792,6 +1796,10 @@ export class BackgroundExecutionController {
         // validated landing, so its completion wake is suppressed and the group
         // aggregate is folded into this result instead.
         if (isToolResultConfirmedCompletionWake("completion", actor)) {
+          // #117 review fix: same watch housekeeping as the delivered wake
+          // path — folding the aggregate into this result never leaves a stale
+          // checkpoint armed or queued for this group.
+          this.retireWakeWatch(task, "completion", { group: group!, task });
           completionAggregates.push({
             executionId: group!.executionId,
             taskId: task.taskId,
@@ -3065,12 +3073,9 @@ export class BackgroundExecutionController {
     await this.input.faults?.wake?.({ taskId: task.taskId, taskState: task.state, kind });
     // Finding 14: wake eligibility, lanes, and delivery shapes are policy owned
     // by ./subtask-notifications; this method only sequences the fault seam,
-    // watch cancellation, persistence-aware snapshots, and delivery.
-    if (isActionableWakeKind(kind)) {
-      const owner = eventSnapshot?.group
-        ?? [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
-      if (owner) this.cancelWatch(owner.executionId);
-    }
+    // watch housekeeping (retireWakeWatch), persistence-aware snapshots, and
+    // delivery.
+    this.retireWakeWatch(task, kind, eventSnapshot);
     const mode = subtaskNotificationMode(this.input.config);
     if (isQuietSuppressedWake(kind, mode)) return;
     const lane = notificationLane(kind);
@@ -3116,6 +3121,26 @@ export class BackgroundExecutionController {
     } catch (error) {
       await this.input.notify?.(`review gate: task notification could not be delivered: ${messageOf(error)}`);
     }
+  }
+
+  /**
+   * #117 review fix: wake-side watch housekeeping, separated from notification
+   * delivery. An actionable wake kind retires the owning group's one-shot
+   * watch — both the armed checkpoint timer and any queued checkpoint
+   * inspection — so a stale checkpoint can never fire after the event it was
+   * watching for. Tool-result-suppressed completions (model force-merge /
+   * mark-clean) run this same housekeeping; only the notification itself is
+   * folded into the caller's direct result instead of being delivered.
+   */
+  private retireWakeWatch(
+    task: BackgroundTaskRecord,
+    kind: "completion" | "failure" | "state",
+    eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
+  ): void {
+    if (!isActionableWakeKind(kind)) return;
+    const owner = eventSnapshot?.group
+      ?? [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
+    if (owner) this.cancelWatch(owner.executionId);
   }
 
   private cancelWatch(executionId: string): boolean {

@@ -97,15 +97,17 @@ function controllerConfig(root: string, executorPath: string, maxConcurrent = 1)
   return normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: executorPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: executorPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+      }
+    },
     execution: {
       maxWorkers: maxConcurrent,
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent }],
+      workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
 }
@@ -565,7 +567,8 @@ test("failures before prompt delivery never publish a dispatch record", async ()
     const config = normalizeConfig({
       enabled: true,
       execution: {
-        workerResources: [{ resourceId: "missing", selection: { source: "external", id: "missing" }, maxConcurrent: 1 }],
+        workerResources: { "missing": { selection: { source: "external", id: "missing" }, maxConcurrent: 1 } },
+          routes: { execute: [{ resourceId: "missing" }], research: [] },
         retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 0 },
       },
     });

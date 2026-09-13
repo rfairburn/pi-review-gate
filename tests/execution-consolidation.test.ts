@@ -3,28 +3,31 @@ import test from "node:test";
 
 function noChangeExecutorConfig(): Record<string, unknown> {
   return {
-    externalAgents: [{
-      id: "fixture-noop",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: {
-        protocol: "pi-review-executor-jsonl-v1",
-        args: ["-e", [
-          "process.stdin.resume();",
-          "process.stdin.on('data',()=>{});",
-          "process.stdin.on('end',()=>{",
-          'process.stdout.write(JSON.stringify({type:"session",sessionId:"fixture"})+"\\n");',
-          'process.stdout.write(JSON.stringify({type:"assistant",text:"No changes."})+"\\n");',
-          "});",
-        ].join("")],
-      },
-    }],
+    externalAgents: {
+      "fixture-noop": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: {
+          protocol: "pi-review-executor-jsonl-v1",
+          args: ["-e", [
+              "process.stdin.resume();",
+              "process.stdin.on('data',()=>{});",
+              "process.stdin.on('end',()=>{",
+              'process.stdout.write(JSON.stringify({type:"session",sessionId:"fixture"})+"\\n");',
+              'process.stdout.write(JSON.stringify({type:"assistant",text:"No changes."})+"\\n");',
+              "});",
+            ].join("")],
+        }
+      }
+    },
     execution: {
-workerResources: [{
-        resourceId: "fixture-noop",
-        selection: { source: "external", id: "fixture-noop" },
-        maxConcurrent: 1,
-      }],
+workerResources: {
+  "fixture-noop": {
+    selection: { source: "external", id: "fixture-noop" },
+    maxConcurrent: 1
+  }
+},
+  routes: { execute: [{ resourceId: "fixture-noop" }], research: [] },
     },
   };
 }
@@ -50,7 +53,7 @@ parallelEnabled: true,
   const next = await persistReviewSettings(configPath, {
 operatingMode: "orchestrate",
 modeCycleShortcut: "alt+m",
-workerResources: [],
+workerResources: {},
 activeReviewers: [],
 reviewerTimeoutMs: 600000,
 executorTimeoutMs: 1800000,
@@ -170,34 +173,34 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-        workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake-slow-writer" }, maxConcurrent: 4 }],
+        workerResources: { "default": { selection: { source: "external", id: "fake-slow-writer" }, maxConcurrent: 4 } },
+          routes: { execute: [{ resourceId: "default" }], research: [] },
       },
-externalAgents: [
-          {
-            id: "fake-slow-writer",
-            adapter: "run-as-binary",
-            command: process.execPath,
-            args: [],
-            execution: {
-              args: ["-e", [
-            "process.stdin.resume();",
-            "process.stdin.on('data',()=>{});",
-            "process.stdin.on('end',()=>{",
-            "  setTimeout(()=>{",
-            '    const fs=require("fs");',
-            '    const p=require("path").join(process.cwd(),"output.txt");',
-            '    fs.writeFileSync(p,"hello from worker\\n");',
-            '    process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-            '    process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-            "    process.exit(0);",
-            "  }, 2000);",
-            "});",
-          ].join("")],
-              timeoutMs: 10000,
-              protocol: "pi-review-executor-jsonl-v1",
-            },
-          }
-      ],
+externalAgents: {
+  "fake-slow-writer": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: ["-e", [
+          "process.stdin.resume();",
+          "process.stdin.on('data',()=>{});",
+          "process.stdin.on('end',()=>{",
+          "  setTimeout(()=>{",
+          '    const fs=require("fs");',
+          '    const p=require("path").join(process.cwd(),"output.txt");',
+          '    fs.writeFileSync(p,"hello from worker\\n");',
+          '    process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '    process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "    process.exit(0);",
+          "  }, 2000);",
+          "});",
+        ].join("")],
+      timeoutMs: 10000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
     };
 
     // Wait for a worker progress/start signal after capture, not a fixed sleep.

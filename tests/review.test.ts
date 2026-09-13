@@ -23,7 +23,7 @@ import {
   rememberUserRequest,
   setReviewWindowBaseline,
 } from "../src/state";
-import { fakeNeedsChangesConfig } from "./helpers";
+import { agentCatalog, fakeNeedsChangesConfig } from "./helpers";
 
 const baseConfig = fakeNeedsChangesConfig({ maxCorrectionCycles: 1 });
 
@@ -128,10 +128,10 @@ test("runReview uses an OR gate and preserves individual blocking finding identi
 
     const config: ReviewGateConfig = {
 ...baseConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 blockingReviewer("alpha", markerA, markerB, "alpha finding", "fix alpha"),
 blockingReviewer("beta", markerB, markerA, "beta finding", "fix beta")
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" },
         { source: "external", id: "beta" }
@@ -168,10 +168,10 @@ test("multi-review aggregation treats pass plus infrastructure error as pass wit
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
+externalAgents: agentCatalog(
 jsonReviewer("passing", "{verdict:'pass',summary:'logic is sound',findings:[]}"),
 exitReviewer("offline")
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "passing" },
         { source: "external", id: "offline" }
@@ -225,10 +225,10 @@ test("parallel reviewers cannot inspect in-flight sibling outputs or runtime ses
       config: {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
+externalAgents: agentCatalog(
 reviewer("fast"),
 reviewer("slow")
-        ],
+        ),
 review: { activeReviewers: [
           { source: "external", id: "fast" },
           { source: "external", id: "slow" }
@@ -260,11 +260,11 @@ test("multi-review aggregation keeps needs_changes authoritative despite pass or
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
+externalAgents: agentCatalog(
 jsonReviewer("passing", "{verdict:'pass',summary:'looks good',findings:[]}"),
 jsonReviewer("blocking", "{verdict:'needs_changes',summary:'bug remains',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'wrong branch',recommendation:'fix branch'}]}"),
 exitReviewer("offline")
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "passing" },
         { source: "external", id: "blocking" },
@@ -294,10 +294,10 @@ test("multi-review aggregation returns error when no reviewer completes a usable
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
+externalAgents: agentCatalog(
 exitReviewer("offline-a"),
 exitReviewer("offline-b")
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "offline-a" },
         { source: "external", id: "offline-b" }
@@ -325,9 +325,9 @@ test("a stale enabled reviewer id produces a bounded outcome while resolvable re
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
+externalAgents: agentCatalog(
 jsonReviewer("ok", "{verdict:'pass',summary:'healthy reviewer ran',findings:[]}")
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "ok" },
         { source: "external", id: "gone" }
@@ -369,19 +369,18 @@ test("same-id reviewer replacement keeps the original configuration fingerprint 
     const configA: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
-        {
-          id: "one",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: ["-e", originalScript],
-            env: { REVIEW_GATE_TEST_SECRET: secret },
-            timeoutMs: 15000,
-          },
-        }
-      ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["-e", originalScript],
+      env: { REVIEW_GATE_TEST_SECRET: secret },
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "one" }
       ] },
@@ -410,18 +409,17 @@ review: { activeReviewers: [
     // The settings are replaced in-session: same id, different command/args.
     const configB: ReviewGateConfig = {
 ...configA,
-externalAgents: [
-        {
-          id: "one",
-          adapter: "generic-cli",
-          command: "/usr/bin/env",
-          args: [],
-          review: {
-            args: ["node", "-e", "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'replacement ran',findings:[]})))"],
-            timeoutMs: 20000,
-          },
-        }
-      ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: "/usr/bin/env",
+    args: [],
+    review: {
+      args: ["node", "-e", "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'replacement ran',findings:[]})))"],
+      timeoutMs: 20000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "one" }
       ] },
@@ -491,27 +489,26 @@ test("a review with only unresolvable selections errors without invoking any rev
     const config: ReviewGateConfig = {
 ...baseConfig,
 retainBundles: "always",
-externalAgents: [
-        {
-          id: "ok",
-          adapter: "generic-cli" as const,
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const p=${JSON.stringify(okInvocations)};`,
-            "fs.writeFileSync(p,'ran');",
-            "process.stdin.resume();",
-            "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'must not run',findings:[]})))",
-          ].join(""),
+externalAgents: {
+  "ok": {
+    adapter: "generic-cli" as const,
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const p=${JSON.stringify(okInvocations)};`,
+          "fs.writeFileSync(p,'ran');",
+          "process.stdin.resume();",
+          "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'must not run',findings:[]})))",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "gone" }
       ] },
@@ -546,21 +543,23 @@ test("a duplicate enabled reviewer id runs once instead of blocking the whole re
     const config: ReviewGateConfig = {
       ...baseConfig,
       retainBundles: "always",
-      externalAgents: [{
-        ...counting,
-        review: {
-          ...counting.review!,
-          args: [
-            "-e",
-            [
-              "const fs=require('node:fs');",
-              `const p=${JSON.stringify(invocations)};`,
-              "fs.writeFileSync(p,String((Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0))+1));",
-              counting.review!.args![1],
-            ].join(""),
-          ],
+      externalAgents: {
+        [counting.id]: {
+          ...counting,
+          review: {
+            ...counting.review!,
+            args: [
+              "-e",
+              [
+                "const fs=require('node:fs');",
+                `const p=${JSON.stringify(invocations)};`,
+                "fs.writeFileSync(p,String((Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0))+1));",
+                counting.review!.args![1],
+              ].join(""),
+            ],
+          },
         },
-      }],
+      },
       review: { activeReviewers: [{ source: "external", id: "codex" }, { source: "external", id: "codex" }] },
     };
 
@@ -643,10 +642,10 @@ test("an aborted multi-review is atomic, records a tombstone, and later passes s
     });
     const config: ReviewGateConfig = {
 ...baseConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 reviewer("fast"),
 reviewer("slow")
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "fast" },
         { source: "external", id: "slow" }
@@ -742,10 +741,10 @@ test("runReview retains on any reviewer error even when another reviewer request
       config: {
 ...baseConfig,
 retainBundles: "on-failure",
-externalAgents: [
+externalAgents: agentCatalog(
 jsonReviewer("blocking", "{verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]}"),
 jsonReviewer("bad-json", "{verdict:'maybe',summary:'invalid verdict',findings:[]}")
-        ],
+        ),
 review: { activeReviewers: [
           { source: "external", id: "blocking" },
           { source: "external", id: "bad-json" }
@@ -779,7 +778,7 @@ test("runReview writes changed file artifacts into retained bundles", async () =
       config: {
         ...baseConfig,
         retainBundles: "always",
-        externalAgents: [jsonReviewer("passing", "{verdict:'pass',summary:'ok',findings:[]}")],
+        externalAgents: agentCatalog(jsonReviewer("passing", "{verdict:'pass',summary:'ok',findings:[]}")),
         review: { activeReviewers: [{ source: "external", id: "passing" }] },
       },
     });
@@ -811,10 +810,10 @@ test("runAskReviewer passes with a warning and retains evidence when another ans
       config: {
 ...baseConfig,
 retainBundles: "on-failure",
-externalAgents: [
+externalAgents: agentCatalog(
 jsonReviewer("passing", "{verdict:'pass',summary:'answer ready',findings:[]}"),
 jsonReviewer("bad-json", "{verdict:'maybe',summary:'invalid verdict',findings:[]}")
-        ],
+        ),
 review: { activeReviewers: [
           { source: "external", id: "passing" },
           { source: "external", id: "bad-json" }
@@ -844,36 +843,35 @@ test("runReview prompt preserves request context and original baseline across co
 
     const config: ReviewGateConfig = {
 ...baseConfig,
-externalAgents: [
-        {
-          id: "prompt-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const ok=s.includes('Initial user request:')",
-            "&& s.includes('update Fleet release bits')",
-            "&& s.includes('Additional user guidance during the same agent run:')",
-            "&& s.includes('the -geolite2 needs to go back for pinterest')",
-            "&& s.includes('-fleet_image = \"before\"')",
-            "&& s.includes('+fleet_image = \"after-geolite2\"');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'ok',findings:[]}",
-            ":{verdict:'needs_changes',summary:'missing context',findings:[{severity:'blocking',file:'main.tf',line:null,issue:'prompt lacked continued context',recommendation:'include original and mid-run request context'}]}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "prompt-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const ok=s.includes('Initial user request:')",
+          "&& s.includes('update Fleet release bits')",
+          "&& s.includes('Additional user guidance during the same agent run:')",
+          "&& s.includes('the -geolite2 needs to go back for pinterest')",
+          "&& s.includes('-fleet_image = \"before\"')",
+          "&& s.includes('+fleet_image = \"after-geolite2\"');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'ok',findings:[]}",
+          ":{verdict:'needs_changes',summary:'missing context',findings:[{severity:'blocking',file:'main.tf',line:null,issue:'prompt lacked continued context',recommendation:'include original and mid-run request context'}]}));",
+          "});",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "prompt-checker" }
       ] },
@@ -915,35 +913,34 @@ test("runAskReviewer answers with request and evidence even when there is no pat
 
     const config: ReviewGateConfig = {
 ...baseConfig,
-externalAgents: [
-        {
-          id: "prompt-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const ok=s.includes('Reviewer question:')",
-            "&& s.includes('does this plan look legit?')",
-            "&& s.includes('Plan the Fleet release update')",
-            "&& s.includes('planning-session-tool')",
-            "&& s.includes('no baseline available');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'The plan is reviewable from evidence even without a patch.',findings:[]}",
-            ":{verdict:'needs_changes',summary:'missing planning context',findings:[{severity:'blocking',file:'session',line:null,issue:'prompt lacked planning evidence',recommendation:'include evidence for no-patch reviewer questions'}]}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "prompt-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const ok=s.includes('Reviewer question:')",
+          "&& s.includes('does this plan look legit?')",
+          "&& s.includes('Plan the Fleet release update')",
+          "&& s.includes('planning-session-tool')",
+          "&& s.includes('no baseline available');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'The plan is reviewable from evidence even without a patch.',findings:[]}",
+          ":{verdict:'needs_changes',summary:'missing planning context',findings:[{severity:'blocking',file:'session',line:null,issue:'prompt lacked planning evidence',recommendation:'include evidence for no-patch reviewer questions'}]}));",
+          "});",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "prompt-checker" }
       ] },
@@ -981,33 +978,32 @@ test("accepted reviewer Q&A is visible to later automatic and question reviews",
     });
     const config: ReviewGateConfig = {
 ...baseConfig,
-externalAgents: [
-        {
-          id: "prompt-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const ok=s.includes('Accepted reviewer questions and answers')",
-            "&&s.includes('show the exact fix')",
-            "&&s.includes('```diff');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'accepted Q&A visible',findings:[]}",
-            ":{verdict:'needs_changes',summary:'missing accepted Q&A',findings:[]}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "prompt-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const ok=s.includes('Accepted reviewer questions and answers')",
+          "&&s.includes('show the exact fix')",
+          "&&s.includes('```diff');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'accepted Q&A visible',findings:[]}",
+          ":{verdict:'needs_changes',summary:'missing accepted Q&A',findings:[]}));",
+          "});",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "prompt-checker" }
       ] },
@@ -1048,35 +1044,34 @@ test("correction-attempt escalation reaches automatic and question review prompt
     const config: ReviewGateConfig = {
 ...baseConfig,
 implementationGuidanceAfterCorrectionAttempts: 1,
-externalAgents: [
-        {
-          id: "prompt-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const ok=s.includes('Concrete-guidance escalation is active: 1 correction attempt(s) have occurred, meeting the configured threshold of 1')",
-            "&&s.includes('concise prose that explains and defends the proposed correction')",
-            "&&s.includes('concise fenced implementation diff showing exactly what code you expect to see for that finding to pass')",
-            "&&s.includes('the diff does not have to be minimal')",
-            "&&s.includes('rendered under the formatted Guidance section');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'escalation visible',findings:[]}",
-            ":{verdict:'needs_changes',summary:'missing escalation',findings:[]}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "prompt-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const ok=s.includes('Concrete-guidance escalation is active: 1 correction attempt(s) have occurred, meeting the configured threshold of 1')",
+          "&&s.includes('concise prose that explains and defends the proposed correction')",
+          "&&s.includes('concise fenced implementation diff showing exactly what code you expect to see for that finding to pass')",
+          "&&s.includes('the diff does not have to be minimal')",
+          "&&s.includes('rendered under the formatted Guidance section');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'escalation visible',findings:[]}",
+          ":{verdict:'needs_changes',summary:'missing escalation',findings:[]}));",
+          "});",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "prompt-checker" }
       ] },
@@ -1117,33 +1112,32 @@ test("concrete-guidance escalation starts at the configured correction-attempt t
     const config: ReviewGateConfig = {
 ...baseConfig,
 implementationGuidanceAfterCorrectionAttempts: 2,
-externalAgents: [
-        {
-          id: "threshold-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const active=s.includes('Concrete-guidance escalation is active:');",
-            "const below=s.includes('below threshold');",
-            "const ok=below?!active:active&&s.includes('2 correction attempt(s) have occurred, meeting the configured threshold of 2');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'threshold honored',guidance:null,findings:[],error:null}",
-            ":{verdict:'needs_changes',summary:'wrong threshold mode',guidance:null,findings:[],error:null}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "threshold-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const active=s.includes('Concrete-guidance escalation is active:');",
+          "const below=s.includes('below threshold');",
+          "const ok=below?!active:active&&s.includes('2 correction attempt(s) have occurred, meeting the configured threshold of 2');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'threshold honored',guidance:null,findings:[],error:null}",
+          ":{verdict:'needs_changes',summary:'wrong threshold mode',guidance:null,findings:[],error:null}));",
+          "});",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "threshold-checker" }
       ] },
@@ -1196,44 +1190,43 @@ test("runReview frames temp-like outside files as captured side effects, not sub
 
     const config: ReviewGateConfig = {
 ...baseConfig,
-externalAgents: [
-        {
-          id: "prompt-checker",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "let s='';",
-            "process.stdin.on('data',c=>s+=c);",
-            "process.stdin.on('end',()=>{",
-            "const submitted=(s.match(/<submitted_changes_json>\\n([\\s\\S]*?)\\n<\\/submitted_changes_json>/)||[])[1]||'';",
-            "const side=(s.match(/<captured_side_effect_changes_json>\\n([\\s\\S]*?)\\n<\\/captured_side_effect_changes_json>/)||[])[1]||'';",
-            "const submittedPatch=(s.match(/<submitted_patch_diff>\\n([\\s\\S]*?)\\n<\\/submitted_patch_diff>/)||[])[1]||'';",
-            "const sidePatch=(s.match(/<captured_side_effect_patch_diff>\\n([\\s\\S]*?)\\n<\\/captured_side_effect_patch_diff>/)||[])[1]||'';",
-            `const outside=${JSON.stringify(outside)};`,
-            "const ok=submitted.includes('index.ts')",
-            "&& !submitted.includes(outside)",
-            "&& side.includes(outside)",
-            "&& side.includes('external_temp_like')",
-            "&& side.includes('heuristic')",
-            "&& submittedPatch.includes('+after')",
-            "&& !submittedPatch.includes(outside)",
-            "&& sidePatch.includes(outside)",
-            "&& s.includes('A temp-like side-effect classification is a heuristic');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'side effects framed separately',findings:[]}",
-            ":{verdict:'needs_changes',summary:'side effects were not framed separately',findings:[{severity:'blocking',file:'reviewer-prompt',line:null,issue:'external temp side effect was mixed into submitted changes',recommendation:'separate submitted changes from captured side effects'}]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "prompt-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "let s='';",
+          "process.stdin.on('data',c=>s+=c);",
+          "process.stdin.on('end',()=>{",
+          "const submitted=(s.match(/<submitted_changes_json>\\n([\\s\\S]*?)\\n<\\/submitted_changes_json>/)||[])[1]||'';",
+          "const side=(s.match(/<captured_side_effect_changes_json>\\n([\\s\\S]*?)\\n<\\/captured_side_effect_changes_json>/)||[])[1]||'';",
+          "const submittedPatch=(s.match(/<submitted_patch_diff>\\n([\\s\\S]*?)\\n<\\/submitted_patch_diff>/)||[])[1]||'';",
+          "const sidePatch=(s.match(/<captured_side_effect_patch_diff>\\n([\\s\\S]*?)\\n<\\/captured_side_effect_patch_diff>/)||[])[1]||'';",
+          `const outside=${JSON.stringify(outside)};`,
+          "const ok=submitted.includes('index.ts')",
+          "&& !submitted.includes(outside)",
+          "&& side.includes(outside)",
+          "&& side.includes('external_temp_like')",
+          "&& side.includes('heuristic')",
+          "&& submittedPatch.includes('+after')",
+          "&& !submittedPatch.includes(outside)",
+          "&& sidePatch.includes(outside)",
+          "&& s.includes('A temp-like side-effect classification is a heuristic');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'side effects framed separately',findings:[]}",
+          ":{verdict:'needs_changes',summary:'side effects were not framed separately',findings:[{severity:'blocking',file:'reviewer-prompt',line:null,issue:'external temp side effect was mixed into submitted changes',recommendation:'separate submitted changes from captured side effects'}]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "prompt-checker" }
       ] },

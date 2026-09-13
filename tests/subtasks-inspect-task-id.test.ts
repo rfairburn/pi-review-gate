@@ -64,14 +64,16 @@ async function managerWithGroup(
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "unstarted",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
-    }],
+    externalAgents: {
+      "unstarted": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] }
+      }
+    },
     execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   // Nothing may ever dispatch in these fixtures: settlement is never needed.
@@ -170,14 +172,16 @@ test("registered shared guidance requires an explicit taskId for inspection only
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "unstarted",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
-    }],
+    externalAgents: {
+      "unstarted": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] }
+      }
+    },
     execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
   config.execution!.maxWorkers = 0;

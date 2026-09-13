@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.43]
+
+### Changed
+
+- Store Worker resources and external agents as ID-keyed catalogs, with alphabetical
+  Worker resources display and no catalog reorder controls. Explicit role priorities,
+  independent reasoning settings, shared capacity, and reviewer order remain separate.
+- Missing Execution or Research priorities now mean no models, just like empty lists;
+  loading or saving never infers priorities from the resource catalog.
+- Import legacy catalog arrays at load time and write canonical objects on normal
+  saves, without rewriting configuration during load. Legacy imports are deprecated;
+  removal is tracked in #116 without a fixed date or version. After removal, an interim
+  conversion-supporting release can save old configurations before upgrading.
+
 ## [0.1.0-dev.42]
 
 ### Added

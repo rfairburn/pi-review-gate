@@ -83,42 +83,42 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "reporting-writer" }, maxConcurrent: 1 }],
+      workerResources: { "default": { selection: { source: "external", id: "reporting-writer" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
           },
-externalAgents: [
-        {
-          id: "reporting-writer",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "let input='';",
-              "process.stdin.on('data',(d)=>{input+=d;});",
-              "process.stdin.on('end',()=>{",
-              '  const fs=require("fs");',
-              '  const path=require("path");',
-              '  const cwd=process.cwd();',
-              // Read files to report what the worker sees
-              '  const committed=fs.existsSync(path.join(cwd,"committed.txt"))?fs.readFileSync(path.join(cwd,"committed.txt"),"utf8"):null;',
-              '  const staged=fs.existsSync(path.join(cwd,"staged.txt"))?fs.readFileSync(path.join(cwd,"staged.txt"),"utf8"):null;',
-              '  const untracked=fs.existsSync(path.join(cwd,"untracked.txt"))?fs.readFileSync(path.join(cwd,"untracked.txt"),"utf8"):null;',
-              '  const ignored=fs.existsSync(path.join(cwd,"ignored-marker.txt"));',
-              '  const report=JSON.stringify({committed,staged,untracked,ignored});',
-              '  fs.writeFileSync(path.join(cwd,"report.json"),report);',
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-              "  process.exit(0);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: 30_000,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "reporting-writer": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "let input='';",
+          "process.stdin.on('data',(d)=>{input+=d;});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          '  const path=require("path");',
+          '  const cwd=process.cwd();',
+          // Read files to report what the worker sees
+          '  const committed=fs.existsSync(path.join(cwd,"committed.txt"))?fs.readFileSync(path.join(cwd,"committed.txt"),"utf8"):null;',
+          '  const staged=fs.existsSync(path.join(cwd,"staged.txt"))?fs.readFileSync(path.join(cwd,"staged.txt"),"utf8"):null;',
+          '  const untracked=fs.existsSync(path.join(cwd,"untracked.txt"))?fs.readFileSync(path.join(cwd,"untracked.txt"),"utf8"):null;',
+          '  const ignored=fs.existsSync(path.join(cwd,"ignored-marker.txt"));',
+          '  const report=JSON.stringify({committed,staged,untracked,ignored});',
+          '  fs.writeFileSync(path.join(cwd,"report.json"),report);',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 30000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -141,38 +141,38 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "targeted-writer" }, maxConcurrent: 1 }],
+      workerResources: { "default": { selection: { source: "external", id: "targeted-writer" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
           },
-externalAgents: [
-        {
-          id: "targeted-writer",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "let input='';",
-              "process.stdin.on('data',(d)=>{input+=d;});",
-              "process.stdin.on('end',()=>{",
-              '  const fs=require("fs");',
-              '  const p=require("path").join(process.cwd(),"contested-file.txt");',
-              '  const title=(input.match(/"title":"([^"]*)"/)||[])[1]||"unknown";',
-              // Completely replace the file with unique content per worker
-              '  const content="Worker: "+title+"\\nData: "+Math.random()+"\\nTimestamp: "+Date.now();',
-              '  fs.writeFileSync(p,content);',
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-              "  process.exit(0);",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: 30_000,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "targeted-writer": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "let input='';",
+          "process.stdin.on('data',(d)=>{input+=d;});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          '  const p=require("path").join(process.cwd(),"contested-file.txt");',
+          '  const title=(input.match(/"title":"([^"]*)"/)||[])[1]||"unknown";',
+          // Completely replace the file with unique content per worker
+          '  const content="Worker: "+title+"\\nData: "+Math.random()+"\\nTimestamp: "+Date.now();',
+          '  fs.writeFileSync(p,content);',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "  process.exit(0);",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 30000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 
@@ -197,45 +197,45 @@ maxFileBytes: 1_048_576,
 maxSnapshotBytes: 52_428_800,
 retainBundles: "never",
 execution: {
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "sync-slow" }, maxConcurrent: 1 }],
+      workerResources: { "default": { selection: { source: "external", id: "sync-slow" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
           },
-externalAgents: [
-        {
-          id: "sync-slow",
-          adapter: "run-as-binary",
-          command: process.execPath,
-          args: [],
-          execution: {
-            args: [
-            "-e",
-            [
-              "let input='';",
-              "process.stdin.on('data',(d)=>{input+=d;});",
-              "process.stdin.on('end',()=>{",
-              '  const fs=require("fs");',
-              `  const syncFile="${escapedSyncFile}";`,
-              `  const markerFile="${escapedMarkerFile}";`,
-              '  const p=require("path").join(process.cwd(),"slow-output.txt");',
-              '  fs.writeFileSync(p,"slow result\\n");',
-              // Write started marker for deterministic synchronization
-              '  fs.writeFileSync(markerFile,"started");',
-              '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
-              '  const check=()=>{',
-              '    try{fs.accessSync(syncFile);setTimeout(check,50);}',
-              '    catch(e){',
-              '      process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
-              "      process.exit(0);",
-              "    }",
-              "  };",
-              "  check();",
-              "});",
-            ].join(""),
-          ],
-            timeoutMs: 30000,
-            protocol: "pi-review-executor-jsonl-v1",
-          },
-        }
-    ],
+externalAgents: {
+  "sync-slow": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    args: [],
+    execution: {
+      args: [
+        "-e",
+        [
+          "let input='';",
+          "process.stdin.on('data',(d)=>{input+=d;});",
+          "process.stdin.on('end',()=>{",
+          '  const fs=require("fs");',
+          `  const syncFile="${escapedSyncFile}";`,
+          `  const markerFile="${escapedMarkerFile}";`,
+          '  const p=require("path").join(process.cwd(),"slow-output.txt");',
+          '  fs.writeFileSync(p,"slow result\\n");',
+          // Write started marker for deterministic synchronization
+          '  fs.writeFileSync(markerFile,"started");',
+          '  process.stdout.write(JSON.stringify({type:"session",sessionId:"fake"})+"\\n");',
+          '  const check=()=>{',
+          '    try{fs.accessSync(syncFile);setTimeout(check,50);}',
+          '    catch(e){',
+          '      process.stdout.write(JSON.stringify({type:"assistant",text:"Done."})+"\\n");',
+          "      process.exit(0);",
+          "    }",
+          "  };",
+          "  check();",
+          "});",
+        ].join(""),
+      ],
+      timeoutMs: 30000,
+      protocol: "pi-review-executor-jsonl-v1",
+    }
+  }
+},
   };
 }
 

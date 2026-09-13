@@ -104,15 +104,17 @@ function executionConfig(script: string): ReviewGateConfig {
   return normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "multi-target-fake",
-      adapter: "run-as-binary" as const,
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [script] },
-    }],
+    externalAgents: {
+      "multi-target-fake": {
+        adapter: "run-as-binary" as const,
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [script] }
+      }
+    },
     execution: {
       maxWorkers: 2,
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "multi-target-fake" }, maxConcurrent: 2 }],
+      workerResources: { "default": { selection: { source: "external", id: "multi-target-fake" }, maxConcurrent: 2 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
     retainBundles: "always",
   });

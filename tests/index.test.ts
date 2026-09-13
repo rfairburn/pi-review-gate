@@ -11,6 +11,7 @@ import { reapAll } from "../src/background-shell";
 import { queueModelDelivery } from "../src/durable-delivery";
 import { freezeReviewWindowConfig } from "../src/state";
 import { SessionStateStore } from "../src/session-state";
+import { agentCatalog } from "./helpers";
 
 const executionToolNames = [
   "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
@@ -58,21 +59,20 @@ test("automatic review waits for ShellStart process groups and resumes the orche
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'background work reviewed',findings:[]})))`,
-        ],
-            timeoutMs: 15_000,
-          },
-        }
-      ],
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'background work reviewed',findings:[]})))`,
+    ],
+      timeoutMs: 15000,
+    }
+    }
+    },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -182,21 +182,20 @@ test("native ShellStart exit wake replaces the redundant aggregate-ready wake", 
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'background work reviewed',findings:[]})))`,
-        ],
-            timeoutMs: 15_000,
-          },
-        }
-      ],
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'background work reviewed',findings:[]})))`,
+    ],
+      timeoutMs: 15000,
+    }
+    }
+    },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -253,29 +252,28 @@ test("a clean native exit wake is queued before settlement review begins", { ski
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `fs.writeFileSync(${JSON.stringify(reviewerStarted)},'started');`,
-            "const timer=setInterval(()=>{",
-            `if(!fs.existsSync(${JSON.stringify(reviewerRelease)}))return;`,
-            "clearInterval(timer);",
-            "process.stdout.write(JSON.stringify({verdict:'pass',summary:'ordered review',findings:[]}));",
-            "},10);",
-          ].join(""),
-        ],
-            timeoutMs: 15_000,
-          },
-        }
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(reviewerStarted)},'started');`,
+        "const timer=setInterval(()=>{",
+        `if(!fs.existsSync(${JSON.stringify(reviewerRelease)}))return;`,
+        "clearInterval(timer);",
+        "process.stdout.write(JSON.stringify({verdict:'pass',summary:'ordered review',findings:[]}));",
+        "},10);",
+      ].join(""),
       ],
+        timeoutMs: 15000,
+      }
+      }
+      },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -335,18 +333,17 @@ test("a replacement ShellStart job keeps review blocked after an earlier idle-tr
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked')`],
-            timeoutMs: 15_000,
-          },
-        }
-      ],
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked')`],
+      timeoutMs: 15000,
+    }
+    }
+    },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -417,30 +414,31 @@ test("automatic review waits while execution subtasks remain active", async () =
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [{
-        id: "slow-executor",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: {
-          protocol: "pi-review-executor-jsonl-v1",
-          args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
-        },
-      }, {
-          id: "reviewer",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-              "-e",
-              `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed',findings:[]}))`,
-            ],
-            timeoutMs: 15_000,
-          },
-        }
-      ],
+externalAgents: {
+  "slow-executor": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    execution: {
+      protocol: "pi-review-executor-jsonl-v1",
+      args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"],
+    }
+  },
+  "reviewer": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed',findings:[]}))`,
+    ],
+      timeoutMs: 15000,
+    }
+    }
+    },
 execution: {
-        workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow-executor" }, maxConcurrent: 1 }],
+        workerResources: { "default": { selection: { source: "external", id: "slow-executor" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
       },
 review: { activeReviewers: [
         { source: "external", id: "reviewer" }
@@ -499,14 +497,16 @@ test("session_start keeps launch-authorized native discovery active in the conse
     await writeFile(configPath, JSON.stringify({
       ...indexTestConfig,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "fake",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-      }],
+      externalAgents: {
+        "fake": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+        }
+      },
       execution: {
-        workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+        workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     }), "utf8");
     process.env.PI_REVIEW_GATE_CONFIG = configPath;
@@ -578,14 +578,16 @@ test("session_start captures execution tools before applying the conservative de
     await writeFile(configPath, JSON.stringify({
       ...indexTestConfig,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "fake",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "fake": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     }), "utf8");
     process.env.PI_REVIEW_GATE_CONFIG = configPath;
@@ -1040,9 +1042,9 @@ test("a persisted review window reconciles to changed reviewer settings on reloa
     const configPath = join(dir, "review-gate.json");
     const writeConfig = (value: Record<string, unknown>) => writeFile(configPath, JSON.stringify({ ...indexTestConfig, ...value }), "utf8");
     await writeConfig({
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("alpha", alphaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" }
       ] },
@@ -1059,9 +1061,9 @@ review: { activeReviewers: [
 
     // The user changes the reviewer settings to set B and resumes.
     await writeConfig({
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("beta", betaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "beta" }
       ] },
@@ -1125,10 +1127,10 @@ test("in-session reviewer settings changes reconcile open review windows without
     // Both reviewers exist in the catalog; only alpha is selected initially.
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("alpha", alphaInvocations),
 countingPassReviewer("beta", betaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" }
       ] },
@@ -1228,9 +1230,9 @@ test("a zero-usable frozen window recovers when reviewer settings are fixed in-s
     // usable to run and reviews must fail closed without clearing it.
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("alpha", alphaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "gone" }
       ] },
@@ -1333,10 +1335,10 @@ test("a reviewer settings change during an active invocation keeps the in-flight
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 releaseGatedCountingPassReviewer("alpha", alphaInvocations, alphaStarted, alphaRelease, alphaEmitted),
 countingPassReviewer("beta", betaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" }
       ] },
@@ -1479,9 +1481,9 @@ test("a superseded-format sidecar keeps historical identities honest after recon
     // Session 1: reviewer id "one" under identity A.
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewerWithPromptDump("one", oneInvocationsA, join(dir, "prompt-a.txt"))
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "one" }
       ] },
@@ -1519,9 +1521,9 @@ review: { activeReviewers: [
     // Session 2: the same reviewer id now has a different identity (B).
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewerWithPromptDump("one", oneInvocationsB, promptB)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "one" }
       ] },
@@ -1578,9 +1580,9 @@ test("a persisted review window reconciles with a label/count-only notice and no
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("alpha", alphaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" }
       ] },
@@ -1595,9 +1597,9 @@ review: { activeReviewers: [
 
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("beta", betaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "beta" }
       ] },
@@ -1630,9 +1632,9 @@ test("a stale reviewer selection reconciles with bounded outcomes while healthy 
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("alpha", alphaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" }
       ] },
@@ -1648,9 +1650,9 @@ review: { activeReviewers: [
     // Set B renames/replaces the reviewer but leaves a stale selection behind.
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("beta", betaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "beta" },
         { source: "external", id: "gone" }
@@ -1702,9 +1704,9 @@ test("a persisted window with zero usable reviewers is retained with an actionab
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("alpha", alphaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" }
       ] },
@@ -1720,9 +1722,9 @@ review: { activeReviewers: [
     // Set B references only a stale selection: no reviewer can be invoked.
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("beta", betaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "gone" }
       ] },
@@ -1767,9 +1769,9 @@ test("a persisted window reconciles to an added reviewer and runs the whole curr
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("alpha", alphaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" }
       ] },
@@ -1786,10 +1788,10 @@ review: { activeReviewers: [
     // Set B adds a second reviewer alongside the original one.
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 countingPassReviewer("alpha", alphaInvocations),
 countingPassReviewer("beta", betaInvocations)
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" },
         { source: "external", id: "beta" }
@@ -2145,21 +2147,20 @@ test("cap status is concise while reviewer results are delivered once in the tra
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
 maxCorrectionCycles: 0,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]})))",
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]})))",
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -2221,21 +2222,20 @@ test("review pause collects separate exchanges and defers reviewer execution unt
 ...indexTestConfig,
 maxCorrectionCycles: 1,
 retainBundles: "always",
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed accumulated paused work',findings:[]})))`,
-        ],
-            timeoutMs: 15000,
-          },
-        }
-      ],
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed accumulated paused work',findings:[]})))`,
+    ],
+      timeoutMs: 15000,
+    }
+    }
+    },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -2316,26 +2316,25 @@ test("user steering during review is held until reviewer feedback is queued", as
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "process.stdin.resume();",
-            "process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify(",
-            "{verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]}",
-            ")),50));",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "process.stdin.resume();",
+          "process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify(",
+          "{verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]}",
+          ")),50));",
+        ].join(""),
       ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -2388,36 +2387,35 @@ test("agent end skips reviewer when primary turn signal is already aborted", asy
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            `require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'started');`,
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            "const ok=input.includes('Initial user request:')",
-            "&& input.includes('change index')",
-            "&& input.includes('redirect to finish safely')",
-            "&& input.includes('-before')",
-            "&& input.includes('+after redirected');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'kept interrupted context',findings:[]}",
-            ":{verdict:'needs_changes',summary:'lost interrupted context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing aborted run context',recommendation:'preserve baseline and request history across abort'}]}));",
-            "});",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          `require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'started');`,
+        "process.stdin.resume();",
+        "let input='';",
+        "process.stdin.on('data',chunk=>input+=chunk);",
+        "process.stdin.on('end',()=>{",
+        "const ok=input.includes('Initial user request:')",
+        "&& input.includes('change index')",
+        "&& input.includes('redirect to finish safely')",
+        "&& input.includes('-before')",
+        "&& input.includes('+after redirected');",
+        "process.stdout.write(JSON.stringify(ok",
+        "?{verdict:'pass',summary:'kept interrupted context',findings:[]}",
+        ":{verdict:'needs_changes',summary:'lost interrupted context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing aborted run context',recommendation:'preserve baseline and request history across abort'}]}));",
+        "});",
+      ].join(""),
       ],
+        timeoutMs: 15000,
+      }
+      }
+      },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -2508,25 +2506,24 @@ test("/new shutdown silently aborts review work before its context becomes stale
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `fs.writeFileSync(${JSON.stringify(markerPath)},'started');`,
-            "setInterval(()=>{},1000);",
-          ].join(""),
-        ],
-            timeoutMs: 300000,
-          },
-        }
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(markerPath)},'started');`,
+        "setInterval(()=>{},1000);",
+      ].join(""),
       ],
+        timeoutMs: 300000,
+      }
+      }
+      },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -2605,44 +2602,43 @@ test("escape terminal input aborts an active reviewer process", async () => {
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const markerPath=${JSON.stringify(markerPath)};`,
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "fs.writeFileSync(markerPath,'started');",
-            "if(count===0){setInterval(()=>{},1000);}",
-            "else {",
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            "const ok=input.includes('Initial user request:')",
-            "&& input.includes('change index')",
-            "&& input.includes('redirect after cancelling review')",
-            "&& input.includes('-before')",
-            "&& input.includes('+after redirected');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'kept cancelled review context',findings:[]}",
-            ":{verdict:'needs_changes',summary:'lost cancelled review context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing cancelled review context',recommendation:'preserve baseline and request history across review cancellation'}]}));",
-            "});",
-            "}",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const markerPath=${JSON.stringify(markerPath)};`,
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "fs.writeFileSync(markerPath,'started');",
+          "if(count===0){setInterval(()=>{},1000);}",
+          "else {",
+          "process.stdin.resume();",
+          "let input='';",
+          "process.stdin.on('data',chunk=>input+=chunk);",
+          "process.stdin.on('end',()=>{",
+          "const ok=input.includes('Initial user request:')",
+          "&& input.includes('change index')",
+          "&& input.includes('redirect after cancelling review')",
+          "&& input.includes('-before')",
+          "&& input.includes('+after redirected');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'kept cancelled review context',findings:[]}",
+          ":{verdict:'needs_changes',summary:'lost cancelled review context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing cancelled review context',recommendation:'preserve baseline and request history across review cancellation'}]}));",
+          "});",
+          "}",
+        ].join(""),
         ],
-            timeoutMs: 300000,
-          },
+          timeoutMs: 300000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -2743,44 +2739,43 @@ test("kitty CSI-u escape aborts an active reviewer process; release and modified
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const pidPath=${JSON.stringify(pidPath)};`,
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "fs.writeFileSync(pidPath,String(process.pid));",
-            "if(count===0){setInterval(()=>{},1000);}",
-            "else {",
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            "const ok=input.includes('Initial user request:')",
-            "&& input.includes('change index')",
-            "&& input.includes('redirect after cancelling review')",
-            "&& input.includes('-before')",
-            "&& input.includes('+after redirected');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'kept cancelled review context',findings:[]}",
-            ":{verdict:'needs_changes',summary:'lost cancelled review context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing cancelled review context',recommendation:'preserve baseline and request history across review cancellation'}]}));",
-            "});",
-            "}",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const pidPath=${JSON.stringify(pidPath)};`,
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "fs.writeFileSync(pidPath,String(process.pid));",
+          "if(count===0){setInterval(()=>{},1000);}",
+          "else {",
+          "process.stdin.resume();",
+          "let input='';",
+          "process.stdin.on('data',chunk=>input+=chunk);",
+          "process.stdin.on('end',()=>{",
+          "const ok=input.includes('Initial user request:')",
+          "&& input.includes('change index')",
+          "&& input.includes('redirect after cancelling review')",
+          "&& input.includes('-before')",
+          "&& input.includes('+after redirected');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'kept cancelled review context',findings:[]}",
+          ":{verdict:'needs_changes',summary:'lost cancelled review context',findings:[{severity:'blocking',file:'session',line:null,issue:'missing cancelled review context',recommendation:'preserve baseline and request history across review cancellation'}]}));",
+          "});",
+          "}",
+        ].join(""),
         ],
-            timeoutMs: 300000,
-          },
+          timeoutMs: 300000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -2887,21 +2882,20 @@ test("/review-cancel stops an active automatic review and reports when no review
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "slow",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          `require('node:fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`,
-        ],
-            timeoutMs: 300000,
-          },
-        }
-      ],
+externalAgents: {
+  "slow": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`,
+    ],
+      timeoutMs: 300000,
+    }
+    }
+    },
 review: { activeReviewers: [
         { source: "external", id: "slow" }
       ] },
@@ -2995,21 +2989,20 @@ test("legacy queued inputs without active delivery records are counted when a re
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "slow",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
-        ],
-            timeoutMs: 300000,
-          },
-        }
-      ],
+externalAgents: {
+  "slow": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
+    ],
+      timeoutMs: 300000,
+    }
+    }
+    },
 review: { activeReviewers: [
         { source: "external", id: "slow" }
       ] },
@@ -3144,7 +3137,7 @@ test("sidecars whose review window lacks the selection digest are rejected at re
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [countingPassReviewerWithPromptDump("one", invocations, join(dir, "prompt.txt"))],
+externalAgents: agentCatalog(countingPassReviewerWithPromptDump("one", invocations, join(dir, "prompt.txt"))),
 review: { activeReviewers: [
         { source: "external", id: "one" }
       ] },
@@ -3223,7 +3216,7 @@ test("queued inputs without durable delivery records are reported unreleasable, 
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [countingPassReviewerWithPromptDump("one", invocations, join(dir, "prompt.txt"))],
+externalAgents: agentCatalog(countingPassReviewerWithPromptDump("one", invocations, join(dir, "prompt.txt"))),
 review: { activeReviewers: [
         { source: "external", id: "one" }
       ] },
@@ -3322,21 +3315,20 @@ test("a failure after listener registration still unregisters, settles, and clea
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
-        ],
-            timeoutMs: 300000,
-          },
-        }
-      ],
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
+    ],
+      timeoutMs: 300000,
+    }
+    }
+    },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -3417,44 +3409,43 @@ test("automatic correction turns preserve original baseline and accumulated evid
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            "if(count===0){",
-            "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]}));",
-            "return;",
-            "}",
-            "const ok=input.includes('original-tool-evidence')",
-            "&& input.includes('fix-tool-evidence')",
-            "&& input.includes('first assistant summary')",
-            "&& input.includes('second assistant summary')",
-            "&& input.includes('-before')",
-            "&& input.includes('+fixed');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'kept accumulated evidence',findings:[]}",
-            ":{verdict:'needs_changes',summary:'lost accumulated evidence',findings:[{severity:'blocking',file:'session',line:null,issue:'review prompt lost original baseline or evidence across automatic correction',recommendation:'preserve original baseline and accumulated evidence across automatic correction turns'}]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "process.stdin.resume();",
+          "let input='';",
+          "process.stdin.on('data',chunk=>input+=chunk);",
+          "process.stdin.on('end',()=>{",
+          "if(count===0){",
+          "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]}));",
+          "return;",
+          "}",
+          "const ok=input.includes('original-tool-evidence')",
+          "&& input.includes('fix-tool-evidence')",
+          "&& input.includes('first assistant summary')",
+          "&& input.includes('second assistant summary')",
+          "&& input.includes('-before')",
+          "&& input.includes('+fixed');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'kept accumulated evidence',findings:[]}",
+          ":{verdict:'needs_changes',summary:'lost accumulated evidence',findings:[{severity:'blocking',file:'session',line:null,issue:'review prompt lost original baseline or evidence across automatic correction',recommendation:'preserve original baseline and accumulated evidence across automatic correction turns'}]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -3518,50 +3509,49 @@ test("automatic correction is reviewed when it exactly restores the original bas
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            `const bundlePathRecord=${JSON.stringify(bundlePathRecord)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "const bundle=process.env.PI_REVIEW_GATE_BUNDLE_DIR;",
-            "const firstBundle=fs.existsSync(bundlePathRecord)?fs.readFileSync(bundlePathRecord,'utf8'):'';",
-            "if(!firstBundle&&bundle)fs.writeFileSync(bundlePathRecord,bundle);",
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            "if(count===0){",
-            "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'restore required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'original content was removed',recommendation:'restore the original content'}]}));",
-            "return;",
-            "}",
-            "const ok=input.includes('no net submitted workspace changes')",
-            "&& input.includes('original content was removed')",
-            "&& input.includes('restore the original content')",
-            "&& input.includes('correction-tool-evidence')",
-            "&& bundle===firstBundle",
-            "&& fs.readFileSync(bundle+'/exchanges/0002/submitted.patch','utf8').includes('-incorrect')",
-            "&& fs.readFileSync(bundle+'/exchanges/0002/submitted.patch','utf8').includes('+original')",
-            "&& fs.readFileSync(bundle+'/exchanges/0002/tool-events.md','utf8').includes('correction-tool-evidence');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'exact restoration validated',findings:[]}",
-            ":{verdict:'needs_changes',summary:'lost exact-restoration context',findings:[{severity:'blocking',file:'session',line:null,issue:'follow-up review lost the prior feedback or correction evidence',recommendation:'preserve and review the correction window'}]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          `const bundlePathRecord=${JSON.stringify(bundlePathRecord)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "const bundle=process.env.PI_REVIEW_GATE_BUNDLE_DIR;",
+          "const firstBundle=fs.existsSync(bundlePathRecord)?fs.readFileSync(bundlePathRecord,'utf8'):'';",
+          "if(!firstBundle&&bundle)fs.writeFileSync(bundlePathRecord,bundle);",
+          "process.stdin.resume();",
+          "let input='';",
+          "process.stdin.on('data',chunk=>input+=chunk);",
+          "process.stdin.on('end',()=>{",
+          "if(count===0){",
+          "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'restore required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'original content was removed',recommendation:'restore the original content'}]}));",
+          "return;",
+          "}",
+          "const ok=input.includes('no net submitted workspace changes')",
+          "&& input.includes('original content was removed')",
+          "&& input.includes('restore the original content')",
+          "&& input.includes('correction-tool-evidence')",
+          "&& bundle===firstBundle",
+          "&& fs.readFileSync(bundle+'/exchanges/0002/submitted.patch','utf8').includes('-incorrect')",
+          "&& fs.readFileSync(bundle+'/exchanges/0002/submitted.patch','utf8').includes('+original')",
+          "&& fs.readFileSync(bundle+'/exchanges/0002/tool-events.md','utf8').includes('correction-tool-evidence');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'exact restoration validated',findings:[]}",
+          ":{verdict:'needs_changes',summary:'lost exact-restoration context',findings:[{severity:'blocking',file:'session',line:null,issue:'follow-up review lost the prior feedback or correction evidence',recommendation:'preserve and review the correction window'}]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -3646,17 +3636,16 @@ test("automatic correction starts each reviewer in a fresh session against the s
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "codex",
-          adapter: "codex-cli",
-          command: reviewerPath,
-          args: [],
-          review: {
-            timeoutMs: 15000,
-          },
-        }
-      ],
+externalAgents: {
+  "codex": {
+    adapter: "codex-cli",
+    command: reviewerPath,
+    args: [],
+    review: {
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
         { source: "external", id: "codex" }
       ] },
@@ -3725,44 +3714,43 @@ test("/review-continue after cap preserves original baseline and accumulated evi
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
 maxCorrectionCycles: 0,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            "if(count===0){",
-            "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]}));",
-            "return;",
-            "}",
-            "const ok=input.includes('capped-original-evidence')",
-            "&& input.includes('continued-fix-evidence')",
-            "&& input.includes('first capped summary')",
-            "&& input.includes('continued summary')",
-            "&& input.includes('-before')",
-            "&& input.includes('+fixed after continue');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'kept capped continuation evidence',findings:[]}",
-            ":{verdict:'needs_changes',summary:'lost capped continuation evidence',findings:[{severity:'blocking',file:'session',line:null,issue:'review prompt lost evidence after correction cap and review-continue',recommendation:'preserve evidence across capped continuation'}]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "process.stdin.resume();",
+          "let input='';",
+          "process.stdin.on('data',chunk=>input+=chunk);",
+          "process.stdin.on('end',()=>{",
+          "if(count===0){",
+          "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]}));",
+          "return;",
+          "}",
+          "const ok=input.includes('capped-original-evidence')",
+          "&& input.includes('continued-fix-evidence')",
+          "&& input.includes('first capped summary')",
+          "&& input.includes('continued summary')",
+          "&& input.includes('-before')",
+          "&& input.includes('+fixed after continue');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'kept capped continuation evidence',findings:[]}",
+          ":{verdict:'needs_changes',summary:'lost capped continuation evidence',findings:[{severity:'blocking',file:'session',line:null,issue:'review prompt lost evidence after correction cap and review-continue',recommendation:'preserve evidence across capped continuation'}]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -3843,50 +3831,49 @@ test("normal user input after cap continues the unresolved review window with co
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
 maxCorrectionCycles: 0,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            "if(count===0){",
-            "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]}));",
-            "return;",
-            "}",
-            "const ok=input.includes('fresh-task-evidence')",
-            "&& input.includes('old-capped-evidence')",
-            "&& input.includes('first capped summary')",
-            "&& input.includes('missing guard')",
-            "&& input.includes('complete feedback transmitted to the implementing model with correction deferred at the cap')",
-            "&& input.includes('Initial user request:')",
-            "&& input.includes('change index')",
-            "&& input.includes('Additional user guidance during the same review window:')",
-            "&& input.includes('start a different task')",
-            "&& input.includes('-before')",
-            "&& input.includes('+fresh change')",
-            ";",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:'capped window retained complete context',findings:[]}",
-            ":{verdict:'needs_changes',summary:'capped window lost context',findings:[{severity:'blocking',file:'session',line:null,issue:'normal prompt after cap lost evidence, feedback, or baseline',recommendation:'keep the unresolved review window intact'}]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "process.stdin.resume();",
+          "let input='';",
+          "process.stdin.on('data',chunk=>input+=chunk);",
+          "process.stdin.on('end',()=>{",
+          "if(count===0){",
+          "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:1,issue:'missing guard',recommendation:'add the guard'}]}));",
+          "return;",
+          "}",
+          "const ok=input.includes('fresh-task-evidence')",
+          "&& input.includes('old-capped-evidence')",
+          "&& input.includes('first capped summary')",
+          "&& input.includes('missing guard')",
+          "&& input.includes('complete feedback transmitted to the implementing model with correction deferred at the cap')",
+          "&& input.includes('Initial user request:')",
+          "&& input.includes('change index')",
+          "&& input.includes('Additional user guidance during the same review window:')",
+          "&& input.includes('start a different task')",
+          "&& input.includes('-before')",
+          "&& input.includes('+fresh change')",
+          ";",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:'capped window retained complete context',findings:[]}",
+          ":{verdict:'needs_changes',summary:'capped window lost context',findings:[{severity:'blocking',file:'session',line:null,issue:'normal prompt after cap lost evidence, feedback, or baseline',recommendation:'keep the unresolved review window intact'}]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -3952,41 +3939,40 @@ test("a passed review remains available to /ask-reviewer-interactive but is chec
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
 maxCorrectionCycles: 0,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            `const outside=${JSON.stringify(outside)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            "const firstContext=input.includes(outside)&&input.includes('outside_workspace')&&input.includes('first Docker task');",
-            "const ok=count===0",
-            "?firstContext",
-            ":count===1",
-            "?firstContext&&input.includes('Reviewer question:')&&input.includes('what changed outside the workspace?')&&input.includes('-FROM alpine:3.19')&&input.includes('+FROM alpine:3.20')",
-            ":!input.includes(outside)&&!input.includes('first Docker task')&&input.includes('second Docker task')&&input.includes('+FROM alpine:3.21');",
-            "process.stdout.write(JSON.stringify(ok",
-            "?{verdict:'pass',summary:count===0?'first window complete':count===1?'passed context retained for question':'second window isolated',findings:[]}",
-            ":{verdict:'needs_changes',summary:'review windows mixed',findings:[{severity:'blocking',file:'session',line:null,issue:'a review used changes or context from the wrong window',recommendation:'checkpoint passed changes and open an isolated window'}]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          `const outside=${JSON.stringify(outside)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "process.stdin.resume();",
+          "let input='';",
+          "process.stdin.on('data',chunk=>input+=chunk);",
+          "process.stdin.on('end',()=>{",
+          "const firstContext=input.includes(outside)&&input.includes('outside_workspace')&&input.includes('first Docker task');",
+          "const ok=count===0",
+          "?firstContext",
+          ":count===1",
+          "?firstContext&&input.includes('Reviewer question:')&&input.includes('what changed outside the workspace?')&&input.includes('-FROM alpine:3.19')&&input.includes('+FROM alpine:3.20')",
+          ":!input.includes(outside)&&!input.includes('first Docker task')&&input.includes('second Docker task')&&input.includes('+FROM alpine:3.21');",
+          "process.stdout.write(JSON.stringify(ok",
+          "?{verdict:'pass',summary:count===0?'first window complete':count===1?'passed context retained for question':'second window isolated',findings:[]}",
+          ":{verdict:'needs_changes',summary:'review windows mixed',findings:[{severity:'blocking',file:'session',line:null,issue:'a review used changes or context from the wrong window',recommendation:'checkpoint passed changes and open an isolated window'}]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -4072,33 +4058,32 @@ test("repeated no-progress reviewer feedback stops automatic correction loop", a
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
 maxCorrectionCycles: 30,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "process.stdin.resume();",
-            "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({",
-            "verdict:'needs_changes',summary:'sentinel flag',findings:[{",
-            "severity:'blocking',file:'session',line:null,",
-            "issue:count===0?'The user explicitly instructed review-gate to flag this rather than report pass. No file content change is needed.':'The user explicitly instructed review-gate to flag this request instead of reporting passed. No implementation change is required.',",
-            "recommendation:count===0?'Keep this as the requested review-gate sentinel flag.':'Keep this as the requested sentinel flag.'",
-            "}]})));",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "process.stdin.resume();",
+          "process.stdin.on('end',()=>process.stdout.write(JSON.stringify({",
+          "verdict:'needs_changes',summary:'sentinel flag',findings:[{",
+          "severity:'blocking',file:'session',line:null,",
+          "issue:count===0?'The user explicitly instructed review-gate to flag this rather than report pass. No file content change is needed.':'The user explicitly instructed review-gate to flag this request instead of reporting passed. No implementation change is required.',",
+          "recommendation:count===0?'Keep this as the requested review-gate sentinel flag.':'Keep this as the requested sentinel flag.'",
+          "}]})));",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -4158,7 +4143,7 @@ test("a passing multi-model review discloses every result and reviews changes ma
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const reviewer = (id: string, countPath: string, peerSummary: string) => ({
       id,
-      adapter: "generic-cli",
+      adapter: "generic-cli" as const,
       command: process.execPath,
       args: [],
       review: {
@@ -4190,10 +4175,10 @@ test("a passing multi-model review discloses every result and reviews changes ma
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
+externalAgents: agentCatalog(
 reviewer("alpha", alphaCount, "beta approved with useful observation"),
 reviewer("beta", betaCount, "alpha approved with useful observation")
-      ],
+      ),
 review: { activeReviewers: [
         { source: "external", id: "alpha" },
         { source: "external", id: "beta" }
@@ -4278,18 +4263,17 @@ test("an unchanged response to a passing transmission closes without another rev
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "passing",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(invocationCount)},'1');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'final useful observation',guidance:'consider a later cleanup',findings:[]})))`],
-            timeoutMs: 15000,
-          },
-        }
-      ],
+externalAgents: {
+  "passing": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(invocationCount)},'1');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'final useful observation',guidance:'consider a later cleanup',findings:[]})))`],
+      timeoutMs: 15000,
+    }
+    }
+    },
 review: { activeReviewers: [
         { source: "external", id: "passing" }
       ] },
@@ -4351,27 +4335,26 @@ test("/ask-reviewer pauses an active turn before invoking the reviewer and then 
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
 maxCorrectionCycles: 1,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');`,
-            "process.stdin.resume();let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>",
-            "process.stdout.write(JSON.stringify(s.includes('paused at a stable boundary')",
-            "?{verdict:'pass',summary:'reviewed the paused workspace',guidance:null,findings:[],error:null}",
-            ":{verdict:'needs_changes',summary:'missing paused exchange',guidance:null,findings:[],error:null})));",
-          ].join(""),
-        ],
-            timeoutMs: 15000,
-          },
-        }
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          `require('node:fs').writeFileSync(${JSON.stringify(invocationMarker)},'invoked');`,
+        "process.stdin.resume();let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>",
+        "process.stdout.write(JSON.stringify(s.includes('paused at a stable boundary')",
+        "?{verdict:'pass',summary:'reviewed the paused workspace',guidance:null,findings:[],error:null}",
+        ":{verdict:'needs_changes',summary:'missing paused exchange',guidance:null,findings:[],error:null})));",
+      ].join(""),
       ],
+        timeoutMs: 15000,
+      }
+      }
+      },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -4441,33 +4424,32 @@ test("provider-error agent_end followed by a successful retry keeps the original
     const configPath = join(dir, "review-gate.json");
     await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-        {
-          id: "fake",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [
-          "-e",
-          [
-            "const fs=require('node:fs');",
-            `const invocationPath=${JSON.stringify(invocationPath)};`,
-            "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
-            "fs.writeFileSync(invocationPath,String(count+1));",
-            "process.stdin.resume();",
-            "let input='';",
-            "process.stdin.on('data',chunk=>input+=chunk);",
-            "process.stdin.on('end',()=>{",
-            `fs.writeFileSync(${JSON.stringify(promptPath)},input);`,
-            "process.stdout.write(JSON.stringify({verdict:'pass',summary:'retry mutation reviewed against the original baseline',findings:[]}));",
-            "});",
-          ].join(""),
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        [
+          "const fs=require('node:fs');",
+          `const invocationPath=${JSON.stringify(invocationPath)};`,
+          "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
+          "fs.writeFileSync(invocationPath,String(count+1));",
+          "process.stdin.resume();",
+          "let input='';",
+          "process.stdin.on('data',chunk=>input+=chunk);",
+          "process.stdin.on('end',()=>{",
+          `fs.writeFileSync(${JSON.stringify(promptPath)},input);`,
+          "process.stdout.write(JSON.stringify({verdict:'pass',summary:'retry mutation reviewed against the original baseline',findings:[]}));",
+          "});",
+        ].join(""),
         ],
-            timeoutMs: 15000,
-          },
+          timeoutMs: 15000,
         }
-      ],
+        }
+        },
 review: { activeReviewers: [
         { source: "external", id: "fake" }
       ] },
@@ -4546,21 +4528,20 @@ async function createUncertainTransmissionHarness(input: {
   const configPath = join(input.dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
 ...indexTestConfig,
-externalAgents: [
-      {
-        id: "fake",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewed',findings:[]})))",
       ],
-          timeoutMs: 15000,
-        },
-      }
-    ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "fake" }
     ] },

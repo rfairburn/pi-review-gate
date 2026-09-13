@@ -54,15 +54,17 @@ test("background tasks return immediately, land independently, and additions cap
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "fake",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "fake": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 2,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 2 }],
+workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 2 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
       retainBundles: "always",
     });
@@ -166,15 +168,17 @@ test("settled tasks move to bounded archives and restore through stable task han
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "archive",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
-      }],
+      externalAgents: {
+        "archive": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] }
+        }
+      },
       execution: {
 maxWorkers: 2,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "archive" }, maxConcurrent: 2 }],
+workerResources: { "default": { selection: { source: "external", id: "archive" }, maxConcurrent: 2 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
       retainBundles: "always",
     });
@@ -353,15 +357,17 @@ test("restored active tasks bound routine history without losing cumulative timi
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "never-started",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", "process.stdin.resume()"] },
-      }],
+      externalAgents: {
+        "never-started": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", "process.stdin.resume()"] }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "never-started" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "never-started" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     config.execution!.maxWorkers = 0;
@@ -439,15 +445,17 @@ test("parallel independent landings accumulate in the parent review checkpoint",
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "checkpoint",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
-      }],
+      externalAgents: {
+        "checkpoint": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] }
+        }
+      },
       execution: {
 maxWorkers: 3,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "checkpoint" }, maxConcurrent: 3 }],
+workerResources: { "default": { selection: { source: "external", id: "checkpoint" }, maxConcurrent: 3 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     const state = createState();
@@ -521,18 +529,20 @@ test("research tasks report without review or landing and quarantine accidental 
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "researcher",
-        adapter: "codex-cli",
-        command: executor,
-        execution: {},
-      }],
+      externalAgents: {
+        "researcher": {
+          adapter: "codex-cli",
+          command: executor,
+          execution: {}
+        }
+      },
       execution: {
-        workerResources: [{
-          resourceId: "researcher",
-          selection: { source: "external", id: "researcher" },
-          maxConcurrent: 2,
-        }],
+        workerResources: {
+          "researcher": {
+            selection: { source: "external", id: "researcher" },
+            maxConcurrent: 2
+          }
+        },
         routes: {
           execute: [],
           research: [{ resourceId: "researcher" }],
@@ -670,24 +680,25 @@ test("noisy subtask notifications wake the orchestrator when active execution en
     ].join("\n"), "utf8");
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [{
-        id: "fake",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
-      }, {
-          id: "passing",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})),100))"],
-            timeoutMs: 5_000,
-          },
-        }
-      ],
+externalAgents: {
+  "fake": {
+    adapter: "run-as-binary",
+    command: process.execPath,
+    execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] }
+  },
+  "passing": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})),100))"],
+      timeoutMs: 5000,
+    }
+  }
+},
 execution: {
-        workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+        workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 1 } },
+          routes: { execute: [{ resourceId: "default" }], research: [] },
         maxWorkers: 1,
         subtaskNotifications: "noisy",
       },
@@ -753,15 +764,17 @@ test("steering unsupported by a live turn is applied after it settles even when 
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "deferred",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
-      }],
+      externalAgents: {
+        "deferred": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "deferred" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "deferred" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
@@ -813,15 +826,17 @@ test("interrupt steering fails with a concrete unsupported status when live cont
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "slow",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
-      }],
+      externalAgents: {
+        "slow": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "slow" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
@@ -899,15 +914,17 @@ test("interrupt steering flows through the canonical command record to acknowled
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "slow",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
-      }],
+      externalAgents: {
+        "slow": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "slow" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
@@ -979,15 +996,17 @@ test("interrupt steering without a live control stays durably queued and applies
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "deferred",
-        adapter: "run-as-binary",
-        command: process.execPath,
-        execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] },
-      }],
+      externalAgents: {
+        "deferred": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: [executor] }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "deferred" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "deferred" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
@@ -1050,16 +1069,18 @@ test("queued steering is incorporated before startup and landing events distingu
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "steerable",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "steerable": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
 subtaskNotifications: "noisy",
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "steerable" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "steerable" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
       retainBundles: "always",
     });
@@ -1143,15 +1164,17 @@ test("interrupt quiesces a writer and force-merge lands its verified checkpoint"
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "slow",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "slow": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "slow" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
       retainBundles: "always",
     });
@@ -1460,15 +1483,17 @@ test("force-merge save failure after landing preserves the landed outcome", asyn
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "slow",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "slow": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "slow" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
       retainBundles: "always",
     });
@@ -1572,15 +1597,17 @@ test("interrupt before executor startup terminalizes a restored auto-queued cont
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "restore-fake",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "restore-fake": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "restore-fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "restore-fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     // Nothing may ever be dispatched in this scenario: every task stays queued.
@@ -1664,15 +1691,17 @@ test("interrupt before executor startup terminalizes an ordinary queued continue
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "queued-continue-fake",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "queued-continue-fake": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "queued-continue-fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "queued-continue-fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     config.execution!.maxWorkers = 0;
@@ -1855,15 +1884,17 @@ test("interrupt during pre-dispatch continuation startup terminalizes the queued
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "predispatch-fake",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "predispatch-fake": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "predispatch-fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "predispatch-fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     // Keep the restored task queued until the queued steering instruction that
@@ -2010,15 +2041,17 @@ test("force-merge publish and wake failures after landing are recorded durably",
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "slow",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "slow": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "slow" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
       retainBundles: "always",
     });
@@ -2102,15 +2135,17 @@ test("settled save tails prune by exact identity and overlapping saves serialize
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "tail-fake",
-        adapter: "run-as-binary",
-        command: join(root, "unused-executor.cjs"),
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "tail-fake": {
+          adapter: "run-as-binary",
+          command: join(root, "unused-executor.cjs"),
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "tail-fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "tail-fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     // Keep every task queued: saves happen without dispatching any executor.
@@ -2157,15 +2192,17 @@ test("a failed save tail propagates to its caller, prunes, and does not wedge la
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "tail-fail-fake",
-        adapter: "run-as-binary",
-        command: join(root, "unused-executor.cjs"),
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "tail-fail-fake": {
+          adapter: "run-as-binary",
+          command: join(root, "unused-executor.cjs"),
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "tail-fail-fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "tail-fail-fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     // Keep every task queued: saves happen without dispatching any executor.
@@ -2222,15 +2259,17 @@ test("repeated group creation and detach/shutdown quiesce save tails before clea
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "tail-detach-fake",
-        adapter: "run-as-binary",
-        command: join(root, "unused-executor.cjs"),
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "tail-detach-fake": {
+          adapter: "run-as-binary",
+          command: join(root, "unused-executor.cjs"),
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "tail-detach-fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "tail-detach-fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     // Keep every task queued: saves happen without dispatching any executor.
@@ -2391,15 +2430,17 @@ async function setupInterruptedMergeTask(unique: string): Promise<{
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "slow-merge",
-      adapter: "run-as-binary",
-      command: executor,
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
-    }],
+    externalAgents: {
+      "slow-merge": {
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" }
+      }
+    },
     execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "slow-merge" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "slow-merge" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
     },
     retainBundles: "always",
   });
@@ -2464,15 +2505,17 @@ async function setupFaultScenario(faults: BackgroundFaultHooks): Promise<{
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fault-fake",
-      adapter: "run-as-binary",
-      command: executor,
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
-    }],
+    externalAgents: {
+      "fault-fake": {
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" }
+      }
+    },
     execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fault-fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "fault-fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
     },
     retainBundles: "always",
   });
@@ -2512,15 +2555,17 @@ function boundedScalingConfig() {
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "unstarted",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] },
-    }],
+    externalAgents: {
+      "unstarted": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", ""] }
+      }
+    },
     execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
     },
     retainBundles: "always",
   });
@@ -3922,16 +3967,18 @@ async function setupBlockingFailureHarness(options: { notifications: "quiet" | "
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "blocking-fake",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "blocking-fake": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
 subtaskNotifications: options.notifications,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "blocking-fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "blocking-fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
       retainBundles: "always",
     });
@@ -4255,17 +4302,23 @@ test("regression: synthetic launch failure stays terminal because the fixture ga
 const watchConfig = normalizeConfig({
   enabled: true,
   review: { activeReviewers: [] },
-  externalAgents: [{
-    id: "fake",
-    adapter: "run-as-binary",
-    command: process.execPath,
-    execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-  }],
+  externalAgents: {
+    "fake": {
+      adapter: "run-as-binary",
+      command: process.execPath,
+      execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+    }
+  },
   execution: {
-workerResources: [
-      { resourceId: "pi-entry", selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1 },
-      { resourceId: "external-fake", selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
-    ],
+workerResources: {
+  "pi-entry": {
+    selection: { source: "pi", model: "gpt-x" }, maxConcurrent: 1
+  },
+  "external-fake": {
+    selection: { source: "external", id: "fake" }, maxConcurrent: 1
+  }
+},
+  routes: { execute: [{ resourceId: "pi-entry" }, { resourceId: "external-fake" }], research: [{ resourceId: "pi-entry" }] },
   },
 });
 
@@ -4372,16 +4425,18 @@ test("widget and watch keep the recorded model-less external identity when the c
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "fake",
-        adapter: "run-as-binary",
-        command: executor,
-        env: { PI_TEST_HANDSHAKE_DIR: root },
-        execution: { protocol: "pi-review-executor-jsonl-v1" },
-      }],
+      externalAgents: {
+        "fake": {
+          adapter: "run-as-binary",
+          command: executor,
+          env: { PI_TEST_HANDSHAKE_DIR: root },
+          execution: { protocol: "pi-review-executor-jsonl-v1" }
+        }
+      },
       execution: {
 maxWorkers: 1,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 1 }],
+workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 1 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     const widgets: unknown[] = [];
@@ -4426,14 +4481,15 @@ workerResources: [{ resourceId: "default", selection: { source: "external", id: 
     // Catalog edit plus resource reassignment while the task is still active:
     // the agent id now claims a model that never served the task, and the same
     // entry id resolves to a different executor selection entirely.
-    const agent = (config.externalAgents ?? []).find((candidate) => candidate.id === "fake");
+    const agent = config.externalAgents!["fake"];
     assert.ok(agent, "harness must define the fake agent");
     agent.model = "never-ran-7";
-    config.execution!.workerResources = [{
-      resourceId: "external-fake",
-      selection: { source: "pi", model: "gpt-reassigned" },
-      maxConcurrent: 1,
-    }];
+    config.execution!.workerResources = {
+      "external-fake": {
+        selection: { source: "pi", model: "gpt-reassigned" },
+        maxConcurrent: 1,
+      },
+    };
 
     // Synchronous re-render against the edited settings: no awaits between the
     // edit and the assertion, so the task is still the same active invocation.
@@ -4501,15 +4557,17 @@ test("watch checkpoint delivery options come from the shared notification policy
     const config = normalizeConfig({
       enabled: true,
       review: { activeReviewers: [] },
-      externalAgents: [{
-        id: "fake",
-        adapter: "run-as-binary",
-        command: executor,
-        execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-      }],
+      externalAgents: {
+        "fake": {
+          adapter: "run-as-binary",
+          command: executor,
+          execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+        }
+      },
       execution: {
 maxWorkers: 2,
-workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent: 2 }],
+workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 2 } },
+  routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
     const contents: string[] = [];
@@ -4594,27 +4652,33 @@ test("active widget and watch labels follow the failover successor during execut
 
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-        { id: "exec-a", adapter: "run-as-binary", command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execA], timeoutMs: 30_000 } },
-        // The agent-level model is a decoy: the execution-level override is
-        // what actually runs and must be what the UI shows.
-        { id: "exec-b", adapter: "run-as-binary", command: process.execPath, model: "agent-b-default", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execB], timeoutMs: 30_000, model: "exec-b-effective" } },
-        {
-          id: "gate-reviewer",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [reviewer],
-            timeoutMs: 20_000,
-          },
-        }
-      ],
+externalAgents: {
+  "exec-a": {
+    adapter: "run-as-binary", command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execA], timeoutMs: 30000 }
+  },
+  "exec-b": {
+    adapter: "run-as-binary", command: process.execPath, model: "agent-b-default", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execB], timeoutMs: 30000, model: "exec-b-effective" }
+  },
+  "gate-reviewer": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [reviewer],
+      timeoutMs: 20000,
+    }
+  }
+},
 execution: {
-        workerResources: [
-          { resourceId: "res-a", selection: { source: "external" as const, id: "exec-a" }, maxConcurrent: 1 },
-          { resourceId: "res-b", selection: { source: "external" as const, id: "exec-b" }, maxConcurrent: 1 },
-        ],
+        workerResources: {
+          "res-a": {
+            selection: { source: "external" as const, id: "exec-a" }, maxConcurrent: 1
+          },
+          "res-b": {
+            selection: { source: "external" as const, id: "exec-b" }, maxConcurrent: 1
+          }
+        },
+        routes: { execute: [{ resourceId: "res-a" }, { resourceId: "res-b" }], research: [] },
         retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
       },
 retainBundles: "always",
@@ -4768,25 +4832,33 @@ test("failover to a model-less external executor clears the predecessor's model 
     // model-a and fall back to the successor's own identity.
     const config = normalizeConfig({
 enabled: true,
-externalAgents: [
-        { id: "exec-a", adapter: "run-as-binary", command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execA], timeoutMs: 30_000 } },
-        { id: "exec-b", adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execB], timeoutMs: 30_000 } },
-        {
-          id: "gate-reviewer",
-          adapter: "generic-cli",
-          command: process.execPath,
-          args: [],
-          review: {
-            args: [reviewer],
-            timeoutMs: 20_000,
-          },
-        }
-      ],
+externalAgents: {
+  "exec-a": {
+    adapter: "run-as-binary", command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execA], timeoutMs: 30000 }
+  },
+  "exec-b": {
+    adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [execB], timeoutMs: 30000 }
+  },
+  "gate-reviewer": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [reviewer],
+      timeoutMs: 20000,
+    }
+  }
+},
 execution: {
-        workerResources: [
-          { resourceId: "res-a", selection: { source: "external" as const, id: "exec-a" }, maxConcurrent: 1 },
-          { resourceId: "res-b", selection: { source: "external" as const, id: "exec-b" }, maxConcurrent: 1 },
-        ],
+        workerResources: {
+          "res-a": {
+            selection: { source: "external" as const, id: "exec-a" }, maxConcurrent: 1
+          },
+          "res-b": {
+            selection: { source: "external" as const, id: "exec-b" }, maxConcurrent: 1
+          }
+        },
+        routes: { execute: [{ resourceId: "res-a" }, { resourceId: "res-b" }], research: [] },
         retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
       },
 retainBundles: "always",

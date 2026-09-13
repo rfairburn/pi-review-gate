@@ -13,11 +13,17 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     customFutureKey: { keep: true },
-    externalAgents: [
-      { id: "one", adapter: "generic-cli", command: process.execPath, args: [], review: {} },
-      { id: "two", adapter: "generic-cli", command: process.execPath, args: [], review: {} },
-      { id: "fake", adapter: "run-as-binary", command: process.execPath, args: [], execution: { protocol: "pi-review-executor-jsonl-v1" } },
-    ],
+    externalAgents: {
+      "one": {
+        adapter: "generic-cli", command: process.execPath, args: [], review: {}
+      },
+      "two": {
+        adapter: "generic-cli", command: process.execPath, args: [], review: {}
+      },
+      "fake": {
+        adapter: "run-as-binary", command: process.execPath, args: [], execution: { protocol: "pi-review-executor-jsonl-v1" }
+      }
+    },
     review: { activeReviewers: [{ source: "external", id: "one" }] },
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
@@ -40,11 +46,12 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   await registered.handler("", contextWithSelections(selections));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.workerResources, [{
-    resourceId: "external-fake",
-    selection: { source: "external", id: "fake" },
-    maxConcurrent: 1,
-  }]);
+  assert.deepEqual(saved.execution.workerResources, {
+    "external-fake": {
+      selection: { source: "external", id: "fake" },
+      maxConcurrent: 1,
+    },
+  });
   assert.deepEqual(saved.execution.routes, {
     execute: [{ resourceId: "external-fake" }],
     research: [],
@@ -57,31 +64,30 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   ]);
   // The canonical catalog keeps the configured agent order; settings saves
   // never reorder or migrate the shared external agent list.
-  assert.deepEqual(saved.externalAgents.map((agent: { id: string }) => agent.id), ["one", "two", "fake"]);
+  assert.deepEqual(Object.keys(saved.externalAgents), ["one", "two", "fake"]);
   assert.equal(saved.reviewers, undefined);
   assert.equal(saved.enabledReviewerIds, undefined);
   assert.deepEqual(saved.customFutureKey, { keep: true });
-  assert.deepEqual(config.execution?.workerResources, [{
-    resourceId: "external-fake",
-    selection: { source: "external", id: "fake" },
-    maxConcurrent: 1,
-  }]);
+  assert.deepEqual(config.execution?.workerResources, {
+    "external-fake": {
+      selection: { source: "external", id: "fake" },
+      maxConcurrent: 1,
+    },
+  });
 });
 
-test("/review-settings builds and reorders an executor pool with per-model concurrency", async () => {
+test("/review-settings builds a keyed executor catalog with per-model concurrency", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-pool-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
     enabled: false,
     review: { activeReviewers: [] },
-    externalAgents: ["qwen", "deepseek"].map((id) => ({
-      id,
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
-    })),
+    externalAgents: {
+      qwen: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" } },
+      deepseek: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" } },
+    },
     execution: {
-workerResources: [],
+workerResources: {},
     },
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
@@ -96,18 +102,21 @@ workerResources: [],
     "Add worker resource",
     "deepseek [run-as-binary]",
     "3",
-    "2. deepseek [run-as-binary] · shared max 3",
-    "Move up",
-    "Back",
     "Back",
     "Save changes",
   ]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.workerResources, [
-    { resourceId: "external-deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 3 },
-    { resourceId: "external-qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
-  ]);
+  // The catalog is keyed and unordered: saves persist insertion order, and
+  // role priorities live in the explicit routes.
+  assert.deepEqual(saved.execution.workerResources, {
+    "external-qwen": { selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+    "external-deepseek": { selection: { source: "external", id: "deepseek" }, maxConcurrent: 3 },
+  });
+  assert.deepEqual(saved.execution.routes, {
+    execute: [{ resourceId: "external-qwen" }, { resourceId: "external-deepseek" }],
+    research: [],
+  });
   assert.equal(saved.execution.activeExecutor, undefined);
 });
 
@@ -117,17 +126,23 @@ test("/review-settings independently excludes a shared worker resource from rese
   await writeFile(configPath, JSON.stringify({
     enabled: false,
     review: { activeReviewers: [] },
-    externalAgents: ["qwen", "deepseek"].map((id) => ({
-      id,
-      adapter: "codex-cli",
-      command: process.execPath,
-      execution: {},
-    })),
+    externalAgents: {
+      qwen: { adapter: "codex-cli", command: process.execPath, execution: {} },
+      deepseek: { adapter: "codex-cli", command: process.execPath, execution: {} },
+    },
     execution: {
-workerResources: [
-        { resourceId: "qwen", selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
-        { resourceId: "deepseek", selection: { source: "external", id: "deepseek" }, maxConcurrent: 2 },
-      ],
+workerResources: {
+  "qwen": {
+    selection: { source: "external", id: "qwen" }, maxConcurrent: 1
+  },
+  "deepseek": {
+    selection: { source: "external", id: "deepseek" }, maxConcurrent: 2
+  }
+},
+      routes: {
+        execute: [{ resourceId: "qwen" }, { resourceId: "deepseek" }],
+        research: [{ resourceId: "qwen" }, { resourceId: "deepseek" }]
+      },
     },
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
@@ -145,7 +160,40 @@ workerResources: [
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.deepEqual(saved.execution.routes.execute, [{ resourceId: "qwen" }, { resourceId: "deepseek" }]);
   assert.deepEqual(saved.execution.routes.research, [{ resourceId: "qwen" }]);
-  assert.equal(saved.execution.workerResources[1].maxConcurrent, 2);
+  assert.equal(saved.execution.workerResources.deepseek.maxConcurrent, 2);
+});
+
+test("worker resource rows sort by displayed label, not saved key", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-label-sort-"));
+  const configPath = join(dir, "review-gate.json");
+  // Saved keys sort a-key < b-key, but the displayed labels sort alpha < zeta,
+  // so label ordering must win over key ordering (case-insensitively).
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    externalAgents: {
+      "alpha": { adapter: "codex-cli", command: process.execPath, execution: {} },
+      "zeta": { adapter: "codex-cli", command: process.execPath, execution: {} }
+    },
+    execution: {
+      workerResources: {
+        "a-key": { selection: { source: "external", id: "zeta" }, maxConcurrent: 1 },
+        "b-key": { selection: { source: "external", id: "alpha" }, maxConcurrent: 2 }
+      }
+    }
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  // Selecting row 1 by its label only passes when alpha (key b-key) is listed
+  // first; a key-based sort would put zeta (key a-key) on row 1.
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "2 models · 3 slots"),
+    "1. alpha [codex-cli] · shared max 2",
+    "Back",
+    undefined,
+  ]));
 });
 
 test("/review-settings clear-all saves a valid review-disabled configuration", async () => {
@@ -153,14 +201,14 @@ test("/review-settings clear-all saves a valid review-disabled configuration", a
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -185,14 +233,14 @@ test("root Escape leaves the settings file unchanged", async () => {
   const configPath = join(dir, "review-gate.json");
   const original = JSON.stringify({
 enabled: true,
-externalAgents: [
-      {
-        id: "one",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-      review: {}}
-    ],
+externalAgents: {
+  "one": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {}
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "one" }
     ] },
@@ -235,14 +283,15 @@ test("internal executor uses the exact Pi model label and canonical value", asyn
   ], [{ model: reasoningModel("openai-codex", "gpt-5.6-sol") }]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.workerResources, [{
-    resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s",
-    selection: {
-      source: "pi",
-      model: "openai-codex/gpt-5.6-sol",
+  assert.deepEqual(saved.execution.workerResources, {
+    "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s": {
+      selection: {
+        source: "pi",
+        model: "openai-codex/gpt-5.6-sol",
+      },
+      maxConcurrent: 1,
     },
-    maxConcurrent: 1,
-  }]);
+  });
   assert.deepEqual(saved.execution.routes, {
     execute: [{ resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s", thinkingLevel: "high" }],
     research: [{ resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtc29s", thinkingLevel: "high" }],
@@ -254,17 +303,16 @@ test("first settings save persists the normalized shared external catalog", asyn
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({
 enabled: true,
-externalAgents: [
-      {
-        id: "legacy",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: ["legacy-reviewer.cjs"],
-        },
-      }
-    ],
+externalAgents: {
+  "legacy": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["legacy-reviewer.cjs"],
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "legacy" }
     ] },
@@ -279,15 +327,16 @@ review: { activeReviewers: [
   assert.deepEqual(saved.review.activeReviewers, [{ source: "external", id: "legacy" }]);
   // The canonical config is persisted as configured; review defaults are
   // applied at resolution time, never rewritten into the stored record.
-  assert.deepEqual(saved.externalAgents, [{
-    id: "legacy",
-    adapter: "generic-cli",
-    command: process.execPath,
-    args: [],
-    review: {
-      args: ["legacy-reviewer.cjs"],
+  assert.deepEqual(saved.externalAgents, {
+    legacy: {
+      adapter: "generic-cli",
+      command: process.execPath,
+      args: [],
+      review: {
+        args: ["legacy-reviewer.cjs"],
+      },
     },
-  }]);
+  });
 });
 
 test("reviewer picker includes scoped models and shared review-capable external agents", async () => {
@@ -296,13 +345,14 @@ test("reviewer picker includes scoped models and shared review-capable external 
   await writeFile(configPath, JSON.stringify({
     enabled: false,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "codex",
-      adapter: "codex-cli",
-      command: "codex",
-      review: { timeoutMs: 300000 },
-      execution: { timeoutMs: 1800000 },
-    }],
+    externalAgents: {
+      "codex": {
+        adapter: "codex-cli",
+        command: "codex",
+        review: { timeoutMs: 300000 },
+        execution: { timeoutMs: 1800000 }
+      }
+    },
   }), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
@@ -544,7 +594,13 @@ test("internal executor and reviewers persist independent per-model reasoning le
     // pi launcher is not installed on PATH.
     enabled: false,
     execution: {
-      workerResources: [{ selection: { source: "pi", model: "openai-codex/gpt-5.6-luna" }, maxConcurrent: 4 }],
+      workerResources: {
+        "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ": { selection: { source: "pi", model: "openai-codex/gpt-5.6-luna" }, maxConcurrent: 4 },
+      },
+      routes: {
+        execute: [{ resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ", thinkingLevel: "high" }],
+        research: [{ resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ" }],
+      },
     },
     review: {
       activeReviewers: [
@@ -576,14 +632,15 @@ test("internal executor and reviewers persist independent per-model reasoning le
   ], scoped));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.workerResources, [{
-    resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
-    selection: {
-      source: "pi",
-      model: "openai-codex/gpt-5.6-luna",
+  assert.deepEqual(saved.execution.workerResources, {
+    "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ": {
+      selection: {
+        source: "pi",
+        model: "openai-codex/gpt-5.6-luna",
+      },
+      maxConcurrent: 4,
     },
-    maxConcurrent: 4,
-  }]);
+  });
   assert.deepEqual(saved.execution.routes, {
     execute: [{
       resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
@@ -738,7 +795,7 @@ test("switching a worker model normalizes stale route reasoning to a supported l
     enabled: false,
     review: { activeReviewers: [] },
     execution: {
-      workerResources: [{ resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 }],
+      workerResources: { [resourceId]: { selection: { source: "pi", model: priorModel }, maxConcurrent: 1 } },
       routes: {
         execute: [{ resourceId, thinkingLevel: "high" }],
         research: [{ resourceId }],
@@ -773,11 +830,12 @@ test("switching a worker model normalizes stale route reasoning to a supported l
 
   assert.deepEqual(errors, []);
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.workerResources, [{
-    resourceId,
-    selection: { source: "pi", model: nextModel },
-    maxConcurrent: 1,
-  }]);
+  assert.deepEqual(saved.execution.workerResources, {
+    [resourceId]: {
+      selection: { source: "pi", model: nextModel },
+      maxConcurrent: 1,
+    },
+  });
   assert.deepEqual(saved.execution.routes, {
     execute: [{ resourceId, thinkingLevel: "minimal" }],
     research: [{ resourceId, thinkingLevel: "minimal" }],
@@ -819,10 +877,10 @@ test("switching a worker model discards prior reasoning even when the new model 
     enabled: false,
     review: { activeReviewers: [] },
     execution: {
-      workerResources: [
-        { resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 },
-        { resourceId: otherResourceId, selection: { source: "pi", model: otherModel }, maxConcurrent: 2 },
-      ],
+      workerResources: {
+        [resourceId]: { selection: { source: "pi", model: priorModel }, maxConcurrent: 1 },
+        [otherResourceId]: { selection: { source: "pi", model: otherModel }, maxConcurrent: 2 },
+      },
       routes: {
         execute: [{ resourceId, thinkingLevel: "medium" }, { resourceId: otherResourceId, thinkingLevel: "xhigh" }],
         research: [{ resourceId }, { resourceId: otherResourceId, thinkingLevel: "max" }],
@@ -854,7 +912,7 @@ test("switching a worker model discards prior reasoning even when the new model 
   ], scoped));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.workerResources.map((entry: { selection: { model?: string } }) => entry.selection), [
+  assert.deepEqual(Object.values(saved.execution.workerResources as Record<string, { selection: { model?: string } }>).map((entry) => entry.selection), [
     { source: "pi", model: nextModel },
     { source: "pi", model: otherModel },
   ]);
@@ -880,7 +938,7 @@ test("switching a worker model selects the new model's pinned reasoning over a s
     enabled: false,
     review: { activeReviewers: [] },
     execution: {
-      workerResources: [{ resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 }],
+      workerResources: { [resourceId]: { selection: { source: "pi", model: priorModel }, maxConcurrent: 1 } },
       routes: {
         execute: [{ resourceId, thinkingLevel: "high" }],
         research: [{ resourceId }],
@@ -911,11 +969,12 @@ test("switching a worker model selects the new model's pinned reasoning over a s
   ], scoped));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.workerResources, [{
-    resourceId,
-    selection: { source: "pi", model: nextModel },
-    maxConcurrent: 1,
-  }]);
+  assert.deepEqual(saved.execution.workerResources, {
+    [resourceId]: {
+      selection: { source: "pi", model: nextModel },
+      maxConcurrent: 1,
+    },
+  });
   // The new model's configured/pinned reasoning governs both routes even though
   // it also supports the prior level.
   assert.deepEqual(saved.execution.routes, {
@@ -956,7 +1015,7 @@ test("switching a worker from a minimal-only model selects the new model's own d
     enabled: false,
     review: { activeReviewers: [] },
     execution: {
-      workerResources: [{ resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 }],
+      workerResources: { [resourceId]: { selection: { source: "pi", model: priorModel }, maxConcurrent: 1 } },
       routes: {
         execute: [{ resourceId, thinkingLevel: "minimal" }],
         research: [{ resourceId }],
@@ -1007,7 +1066,7 @@ test("switching a worker to a single-level model normalizes both routes to that 
     enabled: false,
     review: { activeReviewers: [] },
     execution: {
-      workerResources: [{ resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 }],
+      workerResources: { [resourceId]: { selection: { source: "pi", model: priorModel }, maxConcurrent: 1 } },
       routes: {
         execute: [{ resourceId, thinkingLevel: "high" }],
         research: [{ resourceId }],
@@ -1056,7 +1115,7 @@ test("switching a worker to a model without configurable reasoning normalizes to
     enabled: false,
     review: { activeReviewers: [] },
     execution: {
-      workerResources: [{ resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 }],
+      workerResources: { [resourceId]: { selection: { source: "pi", model: priorModel }, maxConcurrent: 1 } },
       routes: {
         execute: [{ resourceId, thinkingLevel: "high" }],
         research: [{ resourceId }],
@@ -1103,14 +1162,15 @@ test("switching a worker to an external agent drops its reasoning overrides", as
   await writeFile(configPath, JSON.stringify({
     enabled: false,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: process.execPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: process.execPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" }
+      }
+    },
     execution: {
-      workerResources: [{ resourceId, selection: { source: "pi", model: priorModel }, maxConcurrent: 1 }],
+      workerResources: { [resourceId]: { selection: { source: "pi", model: priorModel }, maxConcurrent: 1 } },
       routes: {
         execute: [{ resourceId, thinkingLevel: "high" }],
         research: [{ resourceId }],
@@ -1137,17 +1197,352 @@ test("switching a worker to an external agent drops its reasoning overrides", as
   ], scoped));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.execution.workerResources, [{
-    resourceId,
-    selection: { source: "external", id: "fake" },
-    maxConcurrent: 1,
-  }]);
+  assert.deepEqual(saved.execution.workerResources, {
+    [resourceId]: {
+      selection: { source: "external", id: "fake" },
+      maxConcurrent: 1,
+    },
+  });
   // External agents own their configuration; the stale pi reasoning override is
   // dropped, and the non-research-capable agent leaves the research route empty.
   assert.deepEqual(saved.execution.routes, {
     execute: [{ resourceId }],
     research: [],
   });
+});
+
+test("adding a model cannot overwrite a stable key whose resource was switched to another model", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-add-collision-"));
+  const configPath = join(dir, "review-gate.json");
+  const priorModel = "openai-codex/gpt-5.6-luna";
+  const switchedModel = "openai-codex/gpt-5.6-sol";
+  // The resource was created for priorModel and then switched: it keeps its
+  // stable generated key while serving the new model.
+  const stableKey = executorEntryId({ source: "pi", model: priorModel });
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {
+      workerResources: { [stableKey]: { selection: { source: "pi", model: switchedModel }, maxConcurrent: 2 } },
+      routes: { execute: [{ resourceId: stableKey, thinkingLevel: "high" }] },
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [
+    { model: reasoningModel("openai-codex", "gpt-5.6-luna") },
+    { model: reasoningModel("openai-codex", "gpt-5.6-sol") },
+  ];
+  const errors: string[] = [];
+  const ctx = contextWithSelections([
+    rootSettingsRow("Worker resources", "1 model · 2 slots"),
+    "Add worker resource",
+    "gpt-5.6-luna [openai-codex]",
+    "Back",
+    "Save changes",
+  ], scoped) as { ui: { notify: (message: string, type?: string) => void } };
+  ctx.ui.notify = (message, type) => { if (type === "error") errors.push(message); };
+
+  await registered.handler("", ctx);
+
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!, /already belongs to another resource/);
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  // Identity, capacity, and route references of the switched resource survive.
+  assert.deepEqual(saved.execution.workerResources, {
+    [stableKey]: { selection: { source: "pi", model: switchedModel }, maxConcurrent: 2 },
+  });
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId: stableKey, thinkingLevel: "high" }]);
+});
+
+test("adding a run-as-binary resource then switching it to Pi enrolls research with the final selection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-add-transition-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    externalAgents: {
+      fake: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" } },
+    },
+    execution: {},
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [{ model: reasoningModel("openai-codex", "gpt-5.6-sol") }];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
+    "fake [run-as-binary]",
+    "1  current",
+    "1. fake [run-as-binary] · shared max 1",
+    executorEntryRow("Model", "fake [run-as-binary]"),
+    "gpt-5.6-sol [openai-codex]",
+    "Back",
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.execution.workerResources, {
+    "external-fake": { selection: { source: "pi", model: "openai-codex/gpt-5.6-sol" }, maxConcurrent: 1 },
+  });
+  // Enrollment follows the final selection: the resource is research-capable
+  // now, so both roles carry it with the final model's default reasoning.
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId: "external-fake", thinkingLevel: "high" }]);
+  assert.deepEqual(saved.execution.routes.research, [{ resourceId: "external-fake", thinkingLevel: "high" }]);
+});
+
+test("changing an existing resource's model never enrolls it into an excluded route", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-exclusion-"));
+  const configPath = join(dir, "review-gate.json");
+  const priorModel = "openai-codex/gpt-5.6-luna";
+  const nextModel = "openai-codex/gpt-5.6-sol";
+  const resourceId = executorEntryId({ source: "pi", model: priorModel });
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {
+      workerResources: { [resourceId]: { selection: { source: "pi", model: priorModel }, maxConcurrent: 1 } },
+      // Research route intentionally omits this preexisting resource.
+      routes: { execute: [{ resourceId, thinkingLevel: "high" }] },
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [
+    { model: reasoningModel("openai-codex", "gpt-5.6-luna") },
+    { model: reasoningModel("openai-codex", "gpt-5.6-sol") },
+  ];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "1 model · 1 slot"),
+    "1. gpt-5.6-luna [openai-codex] · shared max 1",
+    executorEntryRow("Model", "gpt-5.6-luna [openai-codex]"),
+    "gpt-5.6-sol [openai-codex]",
+    "Back",
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.deepEqual(saved.execution.workerResources, {
+    [resourceId]: { selection: { source: "pi", model: nextModel }, maxConcurrent: 1 },
+  });
+  // The explicit exclusion survives the model change; only reasoning re-pairs.
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId, thinkingLevel: "high" }]);
+  assert.deepEqual(saved.execution.routes.research, []);
+});
+
+test("an explicit exclusion of a newly added resource sticks across later pool edits", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-new-exclusion-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {},
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [{ model: reasoningModel("openai-codex", "gpt-5.6-luna") }];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
+    "gpt-5.6-luna [openai-codex]",
+    "1  current",
+    "Back",
+    rootSettingsRow("Research priority", "gpt-5.6-luna"),
+    "1. gpt-5.6-luna [openai-codex] · High · shared max 1",
+    "Exclude from this route",
+    "Back",
+    rootSettingsRow("Worker resources", "1 model · 1 slot"),
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  const resourceId = executorEntryId({ source: "pi", model: "openai-codex/gpt-5.6-luna" });
+  // The explicit exclusion survives re-entering the pool editor without a
+  // model change; execution enrollment from the Add is untouched.
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId, thinkingLevel: "high" }]);
+  assert.deepEqual(saved.execution.routes.research, []);
+});
+
+test("an explicit exclusion of a session-added resource survives a later model change", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-exclusion-model-change-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {},
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [
+    { model: reasoningModel("openai-codex", "gpt-5.6-luna") },
+    { model: reasoningModel("openai-codex", "gpt-5.6-sol") },
+  ];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
+    "gpt-5.6-luna [openai-codex]",
+    "1  current",
+    "Back",
+    rootSettingsRow("Research priority", "gpt-5.6-luna"),
+    "1. gpt-5.6-luna [openai-codex] · High · shared max 1",
+    "Exclude from this route",
+    "Back",
+    rootSettingsRow("Worker resources", "1 model · 1 slot"),
+    "1. gpt-5.6-luna [openai-codex] · shared max 1",
+    executorEntryRow("Model", "gpt-5.6-luna [openai-codex]"),
+    "gpt-5.6-sol [openai-codex]",
+    "Back",
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  // The stable identity key (derived from the Add-time selection) is
+  // preserved across the model switch; only the selection changes.
+  const stableId = executorEntryId({ source: "pi", model: "openai-codex/gpt-5.6-luna" });
+  assert.deepEqual(saved.execution.workerResources, {
+    [stableId]: { selection: { source: "pi", model: "openai-codex/gpt-5.6-sol" }, maxConcurrent: 1 },
+  });
+  // The explicit exclusion sticks: the resource existed when this pool visit
+  // opened, so its model change never re-enrolls it into Research. Execution
+  // stays enrolled from the Add, with reasoning re-paired to the changed
+  // model's default.
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId: stableId, thinkingLevel: "high" }]);
+  assert.deepEqual(saved.execution.routes.research, []);
+});
+
+test("an explicit per-route thinking level survives re-entering the pool editor without a model change", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-level-visit-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {},
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [{ model: reasoningModel("openai-codex", "gpt-5.6-luna") }];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
+    "gpt-5.6-luna [openai-codex]",
+    "1  current",
+    "Back",
+    rootSettingsRow("Execution priority", "gpt-5.6-luna"),
+    "1. gpt-5.6-luna [openai-codex] · High · shared max 1",
+    "Thinking  High",
+    "Max",
+    "Back",
+    "Back",
+    rootSettingsRow("Worker resources", "1 model · 1 slot"),
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  const resourceId = executorEntryId({ source: "pi", model: "openai-codex/gpt-5.6-luna" });
+  // The explicit Max survives the pool re-visit; the untouched research
+  // route keeps the Add-time default.
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId, thinkingLevel: "max" }]);
+  assert.deepEqual(saved.execution.routes.research, [{ resourceId, thinkingLevel: "high" }]);
+});
+
+test("an explicit per-route thinking level survives a pool re-visit after an earlier model switch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-level-switch-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {},
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scopedModels = [
+    { model: reasoningModel("openai-codex", "gpt-5.6-luna") },
+    { model: reasoningModel("openai-codex", "gpt-5.6-sol") },
+  ];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
+    "gpt-5.6-luna [openai-codex]",
+    "1  current",
+    "1. gpt-5.6-luna [openai-codex] · shared max 1",
+    executorEntryRow("Model", "gpt-5.6-luna [openai-codex]"),
+    "gpt-5.6-sol [openai-codex]",
+    "Back",
+    "Back",
+    rootSettingsRow("Execution priority", "gpt-5.6-sol"),
+    "1. gpt-5.6-sol [openai-codex] · High · shared max 1",
+    "Thinking  High",
+    "Max",
+    "Back",
+    "Back",
+    rootSettingsRow("Worker resources", "1 model · 1 slot"),
+    "Back",
+    "Save changes",
+  ], scopedModels));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  // Stable identity key survives the switch; the explicit Max set after the
+  // switch survives the later pool re-visit.
+  const stableId = executorEntryId({ source: "pi", model: "openai-codex/gpt-5.6-luna" });
+  assert.deepEqual(saved.execution.workerResources, {
+    [stableId]: { selection: { source: "pi", model: "openai-codex/gpt-5.6-sol" }, maxConcurrent: 1 },
+  });
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId: stableId, thinkingLevel: "max" }]);
+  assert.deepEqual(saved.execution.routes.research, [{ resourceId: stableId, thinkingLevel: "high" }]);
+});
+
+test("add/remove/re-add of one worker resource keeps exactly one route entry per role", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-readd-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    execution: {},
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const scoped = [{ model: reasoningModel("openai-codex", "gpt-5.6-luna") }];
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Worker resources", "0 models · 0 slots"),
+    "Add worker resource",
+    "gpt-5.6-luna [openai-codex]",
+    "1  current",
+    "1. gpt-5.6-luna [openai-codex] · shared max 1",
+    "Remove",
+    "Add worker resource",
+    "gpt-5.6-luna [openai-codex]",
+    "1  current",
+    "Back",
+    "Save changes",
+  ], scoped));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  const resourceId = executorEntryId({ source: "pi", model: "openai-codex/gpt-5.6-luna" });
+  assert.deepEqual(saved.execution.workerResources, {
+    [resourceId]: { selection: { source: "pi", model: "openai-codex/gpt-5.6-luna" }, maxConcurrent: 1 },
+  });
+  assert.deepEqual(saved.execution.routes.execute, [{ resourceId, thinkingLevel: "high" }]);
+  assert.deepEqual(saved.execution.routes.research, [{ resourceId, thinkingLevel: "high" }]);
 });
 
 function assertEffectiveReasoningSupported(savedConfig: unknown, scopedModels: unknown[], kind: "execute" | "research"): void {

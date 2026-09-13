@@ -306,21 +306,20 @@ test("Escape immediately aborts an active /review-now", async () => {
       cwd: () => dir,
       config: {
 ...reviewConfig(),
-externalAgents: [
-          {
-            id: "slow",
-            adapter: "generic-cli",
-            command: process.execPath,
-            args: [],
-            review: {
-              args: [
-            "-e",
-            `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
-          ],
-              timeoutMs: 300_000,
-            },
-          }
-        ],
+externalAgents: {
+  "slow": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
+    ],
+      timeoutMs: 300000,
+    }
+    }
+    },
 review: { activeReviewers: [
           { source: "external", id: "slow" }
         ] },
@@ -388,21 +387,20 @@ test("/review-cancel stops an active /review-now, reports quiescence, and works 
       cancellation: createReviewCancellationCoordinator(),
       config: {
 ...reviewConfig(),
-externalAgents: [
-          {
-            id: "slow",
-            adapter: "generic-cli",
-            command: process.execPath,
-            args: [],
-            review: {
-              args: [
-            "-e",
-            `require('node:fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`,
-          ],
-              timeoutMs: 300_000,
-            },
-          }
-        ],
+externalAgents: {
+  "slow": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000)`,
+    ],
+      timeoutMs: 300000,
+    }
+    }
+    },
 review: { activeReviewers: [
           { source: "external", id: "slow" }
         ] },
@@ -808,21 +806,20 @@ test("Escape immediately aborts an active /ask-reviewer and clears its terminal 
       cwd: () => dir,
       config: {
 ...reviewConfig(),
-externalAgents: [
-          {
-            id: "slow",
-            adapter: "generic-cli",
-            command: process.execPath,
-            args: [],
-            review: {
-              args: [
-            "-e",
-            `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
-          ],
-              timeoutMs: 300_000,
-            },
-          }
-        ],
+externalAgents: {
+  "slow": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},'started');process.stdin.resume();setInterval(()=>{},1000)`,
+    ],
+      timeoutMs: 300000,
+    }
+    }
+    },
 review: { activeReviewers: [
           { source: "external", id: "slow" }
         ] },
@@ -1024,21 +1021,20 @@ function reviewConfig(): ReviewGateConfig {
 function passingReviewConfig(): ReviewGateConfig {
   return {
 ...reviewConfig(),
-externalAgents: [
-      {
-        id: "passing",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
+externalAgents: {
+  "passing": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
         "-e",
         "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'approved',findings:[]})))",
       ],
-          timeoutMs: 15000,
-        },
-      }
-    ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "passing" }
     ] },
@@ -1048,14 +1044,13 @@ review: { activeReviewers: [
 function passingReviewWithQuestionCheckConfig(): ReviewGateConfig {
   return {
 ...reviewConfig(),
-externalAgents: [
-      {
-        id: "prompt-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
+externalAgents: {
+  "prompt-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
         "-e",
         [
           "process.stdin.resume();",
@@ -1076,10 +1071,10 @@ externalAgents: [
           "});",
         ].join(""),
       ],
-          timeoutMs: 15000,
-        },
-      }
-    ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "prompt-checker" }
     ] },
@@ -1089,34 +1084,32 @@ review: { activeReviewers: [
 function multiReviewerReviewConfig(): ReviewGateConfig {
   return {
 ...reviewConfig(),
-externalAgents: [
-      {
-        id: "blocking",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
-          "-e",
-          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
-        ],
-          timeoutMs: 15000,
-        },
-      },
-      {
-        id: "claude",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
-          "-e",
-          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'claude found no blocking issues',findings:[]})))",
-        ],
-          timeoutMs: 15000,
-        },
-      }
-    ],
+externalAgents: {
+  "blocking": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'fix required',findings:[{severity:'blocking',file:'index.ts',line:null,issue:'missing test',recommendation:'add coverage'}]})))",
+      ],
+      timeoutMs: 15000,
+    }
+  },
+  "claude": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'claude found no blocking issues',findings:[]})))",
+      ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "blocking" },
       { source: "external", id: "claude" }
@@ -1128,34 +1121,32 @@ function askReviewerPartialErrorConfig(): ReviewGateConfig {
   return {
 ...reviewConfig(),
 retainBundles: "on-failure",
-externalAgents: [
-      {
-        id: "passing",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
-          "-e",
-          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewer answer ready',findings:[]})))",
-        ],
-          timeoutMs: 15000,
-        },
-      },
-      {
-        id: "bad-json",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
-          "-e",
-          "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'maybe',summary:'invalid verdict',findings:[]})))",
-        ],
-          timeoutMs: 15000,
-        },
-      }
-    ],
+externalAgents: {
+  "passing": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'reviewer answer ready',findings:[]})))",
+      ],
+      timeoutMs: 15000,
+    }
+  },
+  "bad-json": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'maybe',summary:'invalid verdict',findings:[]})))",
+      ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "passing" },
       { source: "external", id: "bad-json" }
@@ -1167,14 +1158,13 @@ function cappedWindowAskReviewerConfig(): ReviewGateConfig {
   return {
 ...reviewConfig(),
 maxCorrectionCycles: 0,
-externalAgents: [
-      {
-        id: "prompt-checker",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
+externalAgents: {
+  "prompt-checker": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
         "-e",
         [
           "process.stdin.resume();",
@@ -1195,10 +1185,10 @@ externalAgents: [
           "});",
         ].join(""),
       ],
-          timeoutMs: 15000,
-        },
-      }
-    ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "prompt-checker" }
     ] },
@@ -1208,14 +1198,13 @@ review: { activeReviewers: [
 function askReviewerConfig(): ReviewGateConfig {
   return {
 ...reviewConfig(),
-externalAgents: [
-      {
-        id: "fake",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: [
+externalAgents: {
+  "fake": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
         "-e",
         [
           "process.stdin.resume();",
@@ -1229,10 +1218,10 @@ externalAgents: [
           "});",
         ].join(""),
       ],
-          timeoutMs: 15000,
-        },
-      }
-    ],
+      timeoutMs: 15000,
+    }
+  }
+},
 review: { activeReviewers: [
       { source: "external", id: "fake" }
     ] },

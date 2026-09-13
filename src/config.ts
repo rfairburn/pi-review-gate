@@ -98,11 +98,16 @@ export interface ExecutorPoolEntry {
 }
 
 /** One physical/provider capacity bucket shared by every background-task kind. */
-export interface WorkerResourceEntry {
-  resourceId: string;
+export interface WorkerResourceValue {
   selection: ExecutorSelection;
   maxConcurrent: number;
 }
+
+/**
+ * Unordered worker catalog keyed by stable resource ID. The key is the
+ * resource's identity; ordered route lists reference keys, never positions.
+ */
+export type WorkerResourceCatalog = Record<string, WorkerResourceValue>;
 
 /** A role-specific ordered reference to a shared worker resource. */
 export interface WorkerRouteEntry {
@@ -163,6 +168,12 @@ export interface ExternalAgentConfig {
   execution?: ExternalAgentRoleConfig;
 }
 
+/** Stored form of one external agent definition; the catalog key carries the id. */
+export type ExternalAgentValue = Omit<ExternalAgentConfig, "id">;
+
+/** Unordered external-agent catalog keyed by stable agent ID. */
+export type ExternalAgentCatalog = Record<string, ExternalAgentValue>;
+
 export type ActiveReviewerSelection =
   | { source: "pi"; model: string; thinkingLevel?: ThinkingLevel }
   | { source: "external"; id: string };
@@ -204,8 +215,8 @@ export const DEFAULT_EXECUTION_RETRY_POLICY: ExecutionRetryPolicy = {
 };
 
 export interface ExecutionConfig {
-  /** Shared physical/provider capacity. Route lists never create extra slots. */
-  workerResources?: WorkerResourceEntry[];
+  /** Unordered shared-capacity catalog keyed by resource ID; routes reference keys. */
+  workerResources?: WorkerResourceCatalog;
   /** Independent ordered resource eligibility for execution and research. */
   routes?: WorkerRoutesConfig;
   maxWorkers?: number;
@@ -236,7 +247,7 @@ export interface ReviewGateConfig {
   waveArtifactTtlMs?: number;
   retainBundles: RetainBundles;
   review?: ReviewSelectionConfig;
-  externalAgents?: ExternalAgentConfig[];
+  externalAgents?: ExternalAgentCatalog;
   execution?: ExecutionConfig;
   ui?: ReviewGateUiConfig;
   web?: WebConfig;
@@ -337,7 +348,8 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
   // agent definitions and route/resource entries remain atomic: never invent
   // a model, reasoning pair, command or authorization reference to repair one.
   const containers = new Set(["web", "web.search", "web.fetch", "ui", "review",
-    "execution", "execution.retryPolicy", "execution.routes"]);
+    "execution", "execution.retryPolicy", "execution.routes",
+    "execution.workerResources", "externalAgents"]);
   const recover = (parent: Record<string, unknown>, key: string, input: unknown, path: string): void => {
     const attempt = (replacement: unknown): boolean => {
       const previous = Object.getOwnPropertyDescriptor(parent, key);
@@ -582,7 +594,6 @@ export interface ReviewerResolution {
 export function resolveReviewers(config: ReviewGateConfig, scopedModels?: string[]): ReviewerResolution {
   const selections = config.review?.activeReviewers ?? [];
   const scoped = new Set(scopedModels ?? []);
-  const agents = new Map(externalAgentCatalog(config).map((agent) => [agent.id, agent]));
   const reviewers: DeciderConfig[] = [];
   const unknownIds: string[] = [];
   const counts = new Map<string, number>();
@@ -605,7 +616,7 @@ export function resolveReviewers(config: ReviewGateConfig, scopedModels?: string
       });
       continue;
     }
-    const agent = agents.get(selection.id);
+    const agent = resolvedExternalAgent(config, selection.id);
     const reviewer = agent ? reviewerFromExternalAgent(agent, config.reviewerTimeoutMs) : undefined;
     if (!reviewer) {
       unknownIds.push(key);
@@ -635,7 +646,7 @@ export function reviewerSelectionKey(selection: ActiveReviewerSelection): string
 export function frozenReviewerSelection(
   config: ReviewGateConfig,
   resolution: ReviewerResolution,
-): { activeReviewers: ActiveReviewerSelection[]; externalAgents: ExternalAgentConfig[] } {
+): { activeReviewers: ActiveReviewerSelection[]; externalAgents: ExternalAgentCatalog } {
   const unknown = new Set(resolution.unknownIds);
   const activeReviewers = (config.review?.activeReviewers ?? [])
     .filter((selection) => !unknown.has(reviewerSelectionKey(selection)))
@@ -644,12 +655,13 @@ export function frozenReviewerSelection(
     activeReviewers.filter((selection): selection is { source: "external"; id: string } => selection.source === "external")
       .map((selection) => selection.id),
   );
-  return {
-    activeReviewers,
-    externalAgents: externalAgentCatalog(config)
-      .filter((agent) => needed.has(agent.id))
-      .map(cloneExternalAgent),
-  };
+  const catalog = config.externalAgents ?? {};
+  const externalAgents: ExternalAgentCatalog = {};
+  for (const id of needed) {
+    if (!Object.prototype.hasOwnProperty.call(catalog, id)) continue;
+    defineOwnKey(externalAgents, id, cloneExternalAgentValue(catalog[id]!));
+  }
+  return { activeReviewers, externalAgents };
 }
 
 /**
@@ -672,7 +684,7 @@ export function automaticReviewEnabled(config: ReviewGateConfig, scopedModels?: 
  */
 export function configWithReviewers(
   config: ReviewGateConfig,
-  selection: { activeReviewers: readonly ActiveReviewerSelection[]; externalAgents: readonly ExternalAgentConfig[] },
+  selection: { activeReviewers: readonly ActiveReviewerSelection[]; externalAgents: ExternalAgentCatalog },
   enabled: boolean,
 ): ReviewGateConfig {
   const { ui: _ui, ...reviewRelevantConfig } = config;
@@ -680,7 +692,7 @@ export function configWithReviewers(
     ...reviewRelevantConfig,
     enabled,
     review: { activeReviewers: selection.activeReviewers.map((s) => ({ ...s })) },
-    externalAgents: selection.externalAgents.map(cloneExternalAgent),
+    externalAgents: cloneExternalAgentCatalog(selection.externalAgents),
   };
 }
 
@@ -741,7 +753,7 @@ export function activeExternalExecutor(
   selection: ExecutorSelection | undefined,
 ): ExternalExecutorConfig | undefined {
   if (selection?.source !== "external") return undefined;
-  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === selection.id);
+  const agent = resolvedExternalAgent(config, selection.id);
   return agent ? executorFromExternalAgent(agent, config.executorTimeoutMs) : undefined;
 }
 
@@ -749,41 +761,63 @@ export function resolvedExecutorPool(config: ReviewGateConfig): ExecutorPoolEntr
   return resolvedWorkerRoute(config, "execute");
 }
 
-export function resolvedWorkerResources(config: ReviewGateConfig): ExecutorPoolEntry[] {
-  if (config.execution?.workerResources === undefined) return [];
-  return config.execution.workerResources.map((entry) => ({
-    entryId: entry.resourceId,
-    selection: cloneExecutorSelection(entry.selection),
-    maxConcurrent: entry.maxConcurrent,
-  }));
+/** Direct keyed lookup of one worker resource; keys are data, not property names. */
+export function resolvedWorkerResource(config: ReviewGateConfig, resourceId: string): ExecutorPoolEntry | undefined {
+  const catalog = config.execution?.workerResources;
+  if (!catalog) return undefined;
+  const value = Object.prototype.hasOwnProperty.call(catalog, resourceId) ? catalog[resourceId] : undefined;
+  if (!value) return undefined;
+  return {
+    entryId: resourceId,
+    selection: cloneExecutorSelection(value.selection),
+    maxConcurrent: value.maxConcurrent,
+  };
 }
 
+/** Keyed clone of the worker catalog, for settings and other keyed consumers. */
+export function resolvedWorkerCatalog(config: ReviewGateConfig): WorkerResourceCatalog {
+  return cloneWorkerCatalog(config.execution?.workerResources ?? {});
+}
+
+/** Derived capacity list of the keyed catalog, for shared-capacity accounting. */
+export function resolvedWorkerResources(config: ReviewGateConfig): ExecutorPoolEntry[] {
+  const catalog = config.execution?.workerResources;
+  if (!catalog) return [];
+  return Object.keys(catalog).map((resourceId) => {
+    const value = catalog[resourceId]!;
+    return {
+      entryId: resourceId,
+      selection: cloneExecutorSelection(value.selection),
+      maxConcurrent: value.maxConcurrent,
+    };
+  });
+}
+
+/**
+ * Resolve one role's ordered route against the keyed catalog. Missing or empty
+ * routes mean no models for that role; there is no fallback to catalog order.
+ * Research additionally enforces capability: an explicit route entry cannot
+ * widen what the research role may use, so unsupported selections are omitted
+ * even when a route names them directly.
+ */
 export function resolvedWorkerRoute(config: ReviewGateConfig, kind: "execute" | "research"): ExecutorPoolEntry[] {
-  const resources = resolvedWorkerResources(config);
   const configured = config.execution?.routes?.[kind];
-  // Existing installations remain immediately usable for both roles until a
-  // role-specific route is saved. Once present, omission from the list is an
-  // explicit exclusion.
-  const eligible = kind === "research"
-    ? resources.filter((entry) => workerResourceSupportsResearch(config, entry))
-    : resources;
-  if (configured === undefined) return eligible;
-  const byId = new Map(eligible.map((entry) => [entry.entryId, entry]));
+  if (!configured || configured.length === 0) return [];
   return configured.flatMap((route) => {
-    const resource = byId.get(route.resourceId);
+    const resource = resolvedWorkerResource(config, route.resourceId);
     if (!resource) return [];
+    if (kind === "research" && !workerResourceSupportsResearch(config, resource.selection)) return [];
     const selection = resource.selection.source === "pi" && route.thinkingLevel
       ? { ...resource.selection, thinkingLevel: route.thinkingLevel }
-      : cloneExecutorSelection(resource.selection);
+      : resource.selection;
     return [{ ...resource, selection }];
   });
 }
 
 /** Research is enforced by Pi and initially best-effort for Codex/Claude. */
-export function workerResourceSupportsResearch(config: ReviewGateConfig, entry: ExecutorPoolEntry): boolean {
-  const selection = entry.selection;
+export function workerResourceSupportsResearch(config: ReviewGateConfig, selection: ExecutorSelection): boolean {
   if (selection.source === "pi") return true;
-  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === selection.id);
+  const agent = resolvedExternalAgent(config, selection.id);
   return agent?.adapter === "codex-cli" || agent?.adapter === "claude-cli";
 }
 
@@ -812,7 +846,7 @@ export function executorSelectionKey(selection: ExecutorSelection): string {
  */
 export function executorAgentFingerprint(config: ReviewGateConfig, selection: ExecutorSelection): string {
   if (selection.source === "pi") return `pi:${selection.model}`;
-  const agent = externalAgentCatalog(config).find((candidate) => candidate.id === selection.id);
+  const agent = resolvedExternalAgent(config, selection.id);
   if (!agent) return `external:missing:${selection.id}`;
   const merged = mergedAgentRole(agent, agent.execution ?? {}, config.executorTimeoutMs);
   const resolved: Record<string, unknown> = {
@@ -827,8 +861,20 @@ export function executorAgentFingerprint(config: ReviewGateConfig, selection: Ex
   return `external:${createHash("sha256").update(canonicalStableJson(resolved)).digest("hex")}`;
 }
 
+/** Direct keyed lookup of one external agent; keys are data, not property names. */
+export function resolvedExternalAgent(config: ReviewGateConfig, id: string): ExternalAgentConfig | undefined {
+  const catalog = config.externalAgents;
+  if (!catalog) return undefined;
+  const value = Object.prototype.hasOwnProperty.call(catalog, id) ? catalog[id] : undefined;
+  if (!value) return undefined;
+  return { ...cloneExternalAgentValue(value), id };
+}
+
+/** Derived alphabetical list of the keyed agent catalog, for display and enumeration. */
 export function externalAgentCatalog(config: ReviewGateConfig): ExternalAgentConfig[] {
-  return (config.externalAgents ?? []).map(cloneExternalAgent);
+  const catalog = config.externalAgents;
+  if (!catalog) return [];
+  return Object.keys(catalog).sort().map((id) => ({ ...cloneExternalAgentValue(catalog[id]!), id }));
 }
 
 export function externalAgentSupportsReview(agent: ExternalAgentConfig): boolean {
@@ -952,23 +998,40 @@ function normalizeActiveReviewers(value: unknown): ActiveReviewerSelection[] {
   });
 }
 
-function normalizeExternalAgents(value: unknown): ExternalAgentConfig[] {
-  if (!Array.isArray(value)) {
-    throw new Error("externalAgents must be an array");
+/**
+ * Canonical form is an object keyed by agent ID. The legacy array form is
+ * deprecated but still imported at load: each entry's id becomes its key.
+ * Duplicate ids fail validation instead of silently overwriting.
+ */
+function normalizeExternalAgents(value: unknown): ExternalAgentCatalog {
+  const rawEntries: Array<readonly [string, unknown]> = [];
+  if (Array.isArray(value)) {
+    for (const [index, entry] of value.entries()) {
+      if (!isRecord(entry)) throw new Error(`externalAgents[${index}] must be an object`);
+      if (typeof entry.id !== "string" || !entry.id.trim()) {
+        throw new Error(`externalAgents[${index}] requires id`);
+      }
+      rawEntries.push([entry.id.trim(), entry]);
+    }
+  } else {
+    if (!isRecord(value)) throw new Error("externalAgents must be an object");
+    rawEntries.push(...Object.entries(value));
   }
-  const agents = value.map(normalizeExternalAgent);
-  validateUniqueConfiguredIds(agents, "external agent");
-  return agents;
+  const catalog: ExternalAgentCatalog = {};
+  for (const [id, entry] of rawEntries) {
+    validateConfiguredId(id, "external agent");
+    if (Object.prototype.hasOwnProperty.call(catalog, id)) {
+      throw new Error(`external agent id must be unique: ${id}`);
+    }
+    defineOwnKey(catalog, id, normalizeExternalAgent(entry, id));
+  }
+  return catalog;
 }
 
-function normalizeExternalAgent(value: unknown): ExternalAgentConfig {
+function normalizeExternalAgent(value: unknown, id: string): ExternalAgentValue {
   if (!isRecord(value)) {
     throw new Error("external agent must be an object");
   }
-  if (typeof value.id !== "string" || !value.id.trim()) {
-    throw new Error("external agent requires id");
-  }
-  validateConfiguredId(value.id, "external agent");
   if (typeof value.adapter !== "string" || !["codex-cli", "claude-cli", "generic-cli", "run-as-binary"].includes(value.adapter)) {
     throw new Error("unsupported external agent adapter");
   }
@@ -982,7 +1045,7 @@ function normalizeExternalAgent(value: unknown): ExternalAgentConfig {
   const review = normalizeExternalAgentRole(value.review, "review");
   const execution = normalizeExternalAgentRole(value.execution, "execution");
   if (!review && !execution) {
-    throw new Error(`external agent requires review or execution role: ${value.id}`);
+    throw new Error(`external agent requires review or execution role: ${id}`);
   }
   if (adapter === "generic-cli" && execution) {
     throw new Error("generic-cli external agents support only the review role");
@@ -996,7 +1059,6 @@ function normalizeExternalAgent(value: unknown): ExternalAgentConfig {
     }
   }
   return {
-    id: value.id,
     adapter,
     command,
     args: normalizeStringArray(value.args, "external agent args"),
@@ -1042,7 +1104,7 @@ function normalizeExecution(value: unknown): ExecutionConfig {
     : normalizeWorkerResources(value.workerResources);
   const routes = value.routes === undefined
     ? undefined
-    : normalizeWorkerRoutes(value.routes, workerResources ?? []);
+    : normalizeWorkerRoutes(value.routes, workerResources ?? {});
   const maxWorkers = normalizeMaxWorkers(value.maxWorkers);
   const retryPolicy = normalizeExecutionRetryPolicy(value.retryPolicy);
   const subtaskNotifications = normalizeSubtaskNotificationMode(value.subtaskNotifications);
@@ -1059,35 +1121,51 @@ function normalizeExecution(value: unknown): ExecutionConfig {
   };
 }
 
-function normalizeWorkerResources(value: unknown): WorkerResourceEntry[] {
-  if (!Array.isArray(value)) throw new Error("execution.workerResources must be an array");
-  const entries = value.map((entry, index) => {
-    if (!isRecord(entry)) throw new Error(`execution.workerResources[${index}] must be an object`);
-    const selection = normalizeActiveExecutor(entry.selection);
-    if (!selection) throw new Error(`execution.workerResources[${index}].selection cannot be null`);
-    const resourceId = typeof entry.resourceId === "string" && entry.resourceId.trim()
-      ? entry.resourceId.trim()
-      : executorEntryId(selection);
-    validateConfiguredId(resourceId, `execution.workerResources[${index}].resourceId`);
-    return {
-      resourceId,
-      selection,
-      maxConcurrent: normalizeRequiredWorkerCount(entry.maxConcurrent, `execution.workerResources[${index}].maxConcurrent`),
-    };
-  });
-  validateUniqueConfiguredIds(entries.map((entry) => ({ id: entry.resourceId })), "worker resource");
+/**
+ * Canonical form is an object keyed by stable resource ID. The legacy array
+ * form is deprecated but still imported at load: each entry's resourceId (or
+ * its established generated id when omitted) becomes its key. Duplicate ids
+ * and duplicate selections fail validation instead of silently overwriting.
+ */
+function normalizeWorkerResources(value: unknown): WorkerResourceCatalog {
+  const rawEntries: Array<readonly [string, unknown]> = [];
+  if (Array.isArray(value)) {
+    for (const [index, entry] of value.entries()) {
+      if (!isRecord(entry)) throw new Error(`execution.workerResources[${index}] must be an object`);
+      const selection = normalizeActiveExecutor(entry.selection);
+      if (!selection) throw new Error(`execution.workerResources[${index}].selection cannot be null`);
+      const resourceId = typeof entry.resourceId === "string" && entry.resourceId.trim()
+        ? entry.resourceId.trim()
+        : executorEntryId(selection);
+      rawEntries.push([resourceId, entry]);
+    }
+  } else {
+    if (!isRecord(value)) throw new Error("execution.workerResources must be an object");
+    rawEntries.push(...Object.entries(value));
+  }
+  const catalog: WorkerResourceCatalog = {};
   const selections = new Set<string>();
-  for (const entry of entries) {
-    const key = executorSelectionKey(entry.selection);
+  for (const [resourceId, entry] of rawEntries) {
+    validateConfiguredId(resourceId, "worker resource");
+    if (Object.prototype.hasOwnProperty.call(catalog, resourceId)) {
+      throw new Error(`worker resource id must be unique: ${resourceId}`);
+    }
+    if (!isRecord(entry)) throw new Error(`execution.workerResources.${resourceId} must be an object`);
+    const selection = normalizeActiveExecutor(entry.selection);
+    if (!selection) throw new Error(`execution.workerResources.${resourceId}.selection cannot be null`);
+    const key = executorSelectionKey(selection);
     if (selections.has(key)) throw new Error(`duplicate worker resource selection: ${key}`);
     selections.add(key);
+    defineOwnKey(catalog, resourceId, {
+      selection,
+      maxConcurrent: normalizeRequiredWorkerCount(entry.maxConcurrent, `execution.workerResources.${resourceId}.maxConcurrent`),
+    });
   }
-  return entries;
+  return catalog;
 }
 
-function normalizeWorkerRoutes(value: unknown, resources: readonly (WorkerResourceEntry | ExecutorPoolEntry)[]): WorkerRoutesConfig {
+function normalizeWorkerRoutes(value: unknown, catalog: WorkerResourceCatalog): WorkerRoutesConfig {
   if (!isRecord(value)) throw new Error("execution.routes must be an object");
-  const resourceIds = new Set(resources.map((entry) => "resourceId" in entry ? entry.resourceId : entry.entryId));
   const normalizeRoute = (candidate: unknown, field: string): WorkerRouteEntry[] | undefined => {
     if (candidate === undefined) return undefined;
     if (!Array.isArray(candidate)) throw new Error(`${field} must be an array`);
@@ -1095,7 +1173,9 @@ function normalizeWorkerRoutes(value: unknown, resources: readonly (WorkerResour
       if (!isRecord(entry)) throw new Error(`${field}[${index}] must be an object`);
       const resourceId = normalizeOptionalNonEmptyString(entry.resourceId, `${field}[${index}].resourceId`);
       if (!resourceId) throw new Error(`${field}[${index}].resourceId is required`);
-      if (!resourceIds.has(resourceId)) throw new Error(`${field}[${index}] references unknown worker resource ${resourceId}`);
+      if (!Object.prototype.hasOwnProperty.call(catalog, resourceId)) {
+        throw new Error(`${field}[${index}] references unknown worker resource ${resourceId}`);
+      }
       return {
         resourceId,
         thinkingLevel: normalizeOptionalThinkingLevel(entry.thinkingLevel, `${field}[${index}].thinkingLevel`),
@@ -1251,22 +1331,46 @@ function mergedAgentRole(agent: ExternalAgentConfig, role: ExternalAgentRoleConf
   };
 }
 
-function cloneExternalAgent(agent: ExternalAgentConfig): ExternalAgentConfig {
+function cloneExternalAgentValue(value: ExternalAgentValue): ExternalAgentValue {
   return {
-    ...agent,
-    args: agent.args ? [...agent.args] : undefined,
-    env: agent.env ? { ...agent.env } : undefined,
-    review: agent.review ? {
-      ...agent.review,
-      args: agent.review.args ? [...agent.review.args] : undefined,
-      env: agent.review.env ? { ...agent.review.env } : undefined,
+    ...value,
+    args: value.args ? [...value.args] : undefined,
+    env: value.env ? { ...value.env } : undefined,
+    review: value.review ? {
+      ...value.review,
+      args: value.review.args ? [...value.review.args] : undefined,
+      env: value.review.env ? { ...value.review.env } : undefined,
     } : undefined,
-    execution: agent.execution ? {
-      ...agent.execution,
-      args: agent.execution.args ? [...agent.execution.args] : undefined,
-      env: agent.execution.env ? { ...agent.execution.env } : undefined,
+    execution: value.execution ? {
+      ...value.execution,
+      args: value.execution.args ? [...value.execution.args] : undefined,
+      env: value.execution.env ? { ...value.execution.env } : undefined,
     } : undefined,
   };
+}
+
+export function cloneExternalAgentCatalog(catalog: ExternalAgentCatalog): ExternalAgentCatalog {
+  const out: ExternalAgentCatalog = {};
+  for (const [id, value] of Object.entries(catalog)) {
+    defineOwnKey(out, id, cloneExternalAgentValue(value));
+  }
+  return out;
+}
+
+export function cloneWorkerCatalog(catalog: WorkerResourceCatalog): WorkerResourceCatalog {
+  const out: WorkerResourceCatalog = {};
+  for (const [resourceId, value] of Object.entries(catalog)) {
+    defineOwnKey(out, resourceId, {
+      selection: cloneExecutorSelection(value.selection),
+      maxConcurrent: value.maxConcurrent,
+    });
+  }
+  return out;
+}
+
+/** Define an own data property even for keys like "__proto__" or "constructor". */
+function defineOwnKey<K extends string>(target: Record<K, unknown>, key: K, value: unknown): void {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
 }
 
 function normalizeStringRecord(value: unknown, field: string): Record<string, string> | undefined {

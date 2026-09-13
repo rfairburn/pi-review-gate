@@ -204,6 +204,10 @@ async function buildPoolHarness(
   const base = {
     execution: {
       workerResources: resources,
+      routes: {
+        execute: resources.map((resource) => ({ resourceId: resource.resourceId })),
+        research: [],
+      },
       retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
     },
     externalAgents: agents,
@@ -748,7 +752,7 @@ test("recovery with an unchanged agent id that now resolves to a different model
     // model. The resource id (res-a) and selection id (exec-a) stay identical,
     // so only the recorded fingerprint can prove old-session compatibility.
     const driftedConfig = structuredClone(harness.config);
-    const rePointed = (driftedConfig.externalAgents ?? []).find((agent) => agent.id === "exec-a");
+    const rePointed = driftedConfig.externalAgents?.["exec-a"];
     assert.ok(rePointed, "harness must define the exec-a agent");
     rePointed.model = "model-a-drifted";
     rePointed.execution = { protocol: "pi-review-executor-jsonl-v1", args: [join(harness.root, "exec-b.cjs")], timeoutMs: 30_000 };
@@ -802,7 +806,7 @@ function withInheritedAgentEnv(
   env: Record<string, string>,
   roleEnv?: Record<string, string>,
 ): void {
-  const agent = (config.externalAgents ?? []).find((candidate) => candidate.id === agentId);
+  const agent = config.externalAgents?.[agentId];
   assert.ok(agent, `harness must define the ${agentId} agent`);
   agent.env = { ...env };
   if (roleEnv && agent.execution) agent.execution.env = { ...roleEnv };
@@ -828,7 +832,7 @@ test("recovery with an unchanged agent id whose inherited env changed starts a n
     // and untouched. A resolution that only looked at role env would have kept
     // the fingerprint stable and silently resumed the stale session.
     const driftedConfig = structuredClone(harness.config);
-    const driftedAgent = (driftedConfig.externalAgents ?? []).find((agent) => agent.id === "exec-a");
+    const driftedAgent = driftedConfig.externalAgents?.["exec-a"];
     assert.ok(driftedAgent, "harness must define the exec-a agent");
     driftedAgent.env = { ...(driftedAgent.env ?? {}), EAC_INHERITED: "two" };
 
@@ -888,7 +892,7 @@ test("recovery with only a shadowed base env value changed resumes the exact pri
     // Change only the base value that the role env overrides: the effective
     // merged invocation is unchanged, so session compatibility must hold.
     const shadowedConfig = structuredClone(harness.config);
-    const shadowedAgent = (shadowedConfig.externalAgents ?? []).find((agent) => agent.id === "exec-a");
+    const shadowedAgent = shadowedConfig.externalAgents?.["exec-a"];
     assert.ok(shadowedAgent, "harness must define the exec-a agent");
     shadowedAgent.env = { ...(shadowedAgent.env ?? {}), EAC_ROLE: "other-base" };
 

@@ -257,16 +257,18 @@ initialize_default_review_gate_config() {
     echo "pi-review-gate: could not set private permissions on the new default config; refusing to continue with a non-private config file" >&2
     return 1
   fi
-  # Zero-model defaults: explicitly empty reviewer and worker selections, so
-  # nothing is invoked or configured implicitly until the user opts in.
+  # Zero-model defaults: explicitly empty reviewer, external-agent, and worker
+  # catalogs, so nothing is invoked or configured implicitly until the user
+  # opts in.
   if ! cat > "$tmp" <<'EOF'
 {
   "enabled": true,
   "review": {
     "activeReviewers": []
   },
+  "externalAgents": {},
   "execution": {
-    "workerResources": [],
+    "workerResources": {},
     "routes": {
       "execute": [],
       "research": []

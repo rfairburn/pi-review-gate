@@ -82,8 +82,9 @@ const DEFAULT_CONFIG_CONTENT = `{
   "review": {
     "activeReviewers": []
   },
+  "externalAgents": {},
   "execution": {
-    "workerResources": [],
+    "workerResources": {},
     "routes": {
       "execute": [],
       "research": []

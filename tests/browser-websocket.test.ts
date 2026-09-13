@@ -623,18 +623,17 @@ test("quiet live WebSocket survives shortened idle budget across turns and revie
   const reviewConfig = normalizeConfig({
 enabled: true,
 retainBundles: "never",
-externalAgents: [
-      {
-        id: "fixture",
-        adapter: "generic-cli",
-        command: process.execPath,
-        args: [],
-        review: {
-          args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started');process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'fixture reviewed',findings:[]})),800))`],
-          timeoutMs: 15_000,
-        },
-      }
-    ],
+externalAgents: {
+  "fixture": {
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started');process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'fixture reviewed',findings:[]})),800))`],
+      timeoutMs: 15000,
+    }
+    }
+    },
 review: { activeReviewers: [
       { source: "external", id: "fixture" }
     ] },

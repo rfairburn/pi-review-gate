@@ -23,8 +23,9 @@ const execFileAsync = promisify(execFile);
 const zeroModelDefaultConfig = {
   enabled: true,
   review: { activeReviewers: [] },
+  externalAgents: {},
   execution: {
-    workerResources: [],
+    workerResources: {},
     routes: { execute: [], research: [] },
   },
 };

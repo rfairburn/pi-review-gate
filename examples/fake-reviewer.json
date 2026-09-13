@@ -6,20 +6,24 @@
   "maxFileBytes": 1048576,
   "maxSnapshotBytes": 52428800,
   "retainBundles": "on-failure",
-  "externalAgents": [
-    {
-      "id": "fake-reviewer",
+  "externalAgents": {
+    "fake-reviewer": {
       "adapter": "generic-cli",
       "command": "node",
       "review": {
-        "args": ["scripts/fake-reviewer.cjs"],
+        "args": [
+          "scripts/fake-reviewer.cjs"
+        ],
         "timeoutMs": 5000
       }
     }
-  ],
+  },
   "review": {
     "activeReviewers": [
-      { "source": "external", "id": "fake-reviewer" }
+      {
+        "source": "external",
+        "id": "fake-reviewer"
+      }
     ]
   }
 }

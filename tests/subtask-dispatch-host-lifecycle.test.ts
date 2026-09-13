@@ -138,15 +138,17 @@ function controllerConfig(root: string, executorPath: string, maxConcurrent = 1)
   return normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
-    externalAgents: [{
-      id: "fake",
-      adapter: "run-as-binary",
-      command: executorPath,
-      execution: { protocol: "pi-review-executor-jsonl-v1" as const },
-    }],
+    externalAgents: {
+      "fake": {
+        adapter: "run-as-binary",
+        command: executorPath,
+        execution: { protocol: "pi-review-executor-jsonl-v1" as const }
+      }
+    },
     execution: {
       maxWorkers: maxConcurrent,
-      workerResources: [{ resourceId: "default", selection: { source: "external", id: "fake" }, maxConcurrent }],
+      workerResources: { "default": { selection: { source: "external", id: "fake" }, maxConcurrent } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
 }

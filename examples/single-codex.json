@@ -6,18 +6,20 @@
   "maxFileBytes": 1048576,
   "maxSnapshotBytes": 52428800,
   "retainBundles": "on-failure",
-  "externalAgents": [
-    {
-      "id": "codex",
+  "externalAgents": {
+    "codex": {
       "adapter": "codex-cli",
       "review": {
         "timeoutMs": 600000
       }
     }
-  ],
+  },
   "review": {
     "activeReviewers": [
-      { "source": "external", "id": "codex" }
+      {
+        "source": "external",
+        "id": "codex"
+      }
     ]
   }
 }

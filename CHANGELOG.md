@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.44]
+
+### Fixed
+
+- Avoid duplicate completion notifications for synchronous model-tool force-merge,
+  interrupt-with-merge, and conflict-resolution landings. Direct results retain the
+  group completion and capacity information, and completed operations still cancel
+  stale watches. User-command, asynchronous, failure, and recovery notifications
+  remain unchanged.
+- Correct documentation and model guidance about completion notification contents;
+  execution revision and task timing are available through `SubtasksInspect`.
+
 ## [0.1.0-dev.43]
 
 ### Changed

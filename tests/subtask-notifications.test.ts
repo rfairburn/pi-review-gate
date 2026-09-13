@@ -5,6 +5,7 @@ import {
   buildWakeFailureDiagnostic,
   boundDiagnosticText,
   capNotificationText,
+  completionGroupAggregateLines,
   deliveryForLane,
   fitWakeFailureDiagnostic,
   completionNotificationGuidanceLine,
@@ -16,6 +17,7 @@ import {
   interactiveWakeStateList,
   isActionableWakeKind,
   isQuietSuppressedWake,
+  isToolResultConfirmedCompletionWake,
   isTurnWake,
   lifecycleWakeGuidanceLine,
   noActionResponseNotice,
@@ -27,6 +29,7 @@ import {
   QUIET_TURN_WAKE_STATE_LABELS,
   stateTransitionNotice,
   subtaskNotificationMode,
+  synchronousLandingNotificationCarveOut,
   terminalWakeGuidanceLine,
   watchCheckpointDelivery,
   TRUNCATION_MARKER,
@@ -137,13 +140,19 @@ test("completion guidance is kind-neutral and covers reported research completio
   const line = completionNotificationGuidanceLine();
   assert.ok(line.includes("Every task completion (an execute task landing or a research task reporting) triggers a notification"));
   assert.ok(line.includes("lists every sibling that has not completed, even in quiet mode"));
-  assert.ok(line.includes("Do not verify aggregate outputs until the execution-complete notification."));
+  // #117: the unconditional promise is carved out for synchronous landings
+  // already confirmed by the caller's own tool result.
+  assert.ok(line.includes(synchronousLandingNotificationCarveOut()), "guidance carries the shared synchronous-landing carve-out");
+  assert.ok(line.includes("Do not verify aggregate outputs until the execution-complete verdict arrives, whether as a completion notification or folded into one of those direct results."));
   assert.ok(!line.includes("Every task landing triggers"), "guidance no longer names only execute landings");
 });
 
 test("terminal wake guidance separates completion/failure/conflict turns from noisy-only transitions", () => {
   const line = terminalWakeGuidanceLine();
   assert.ok(line.includes("Each task completion, failure, and critical conflict triggers a model notification."));
+  // #117: the shared carve-out keeps this line from overpromising for
+  // synchronous landings confirmed by their own tool result.
+  assert.ok(line.includes(synchronousLandingNotificationCarveOut()));
   assert.ok(line.includes("Ordinary running/reviewing transitions do so only in noisy mode."));
   assert.ok(line.includes("avoid tight repetitive polling"));
 });
@@ -154,15 +163,77 @@ test("notification mode prose is derived from the policy state lists", () => {
     quiet,
     "Quiet notification mode is active: ordinary RUNNING and REVIEWING transitions remain passive UI telemetry. "
     + "Every task still triggers a turn when it lands, fails, conflicts, or requires recovery, and completion events "
-    + "identify siblings that remain active.",
+    + `identify siblings that remain active. ${synchronousLandingNotificationCarveOut()}`,
   );
   assert.ok(quiet.includes(interactiveWakeStateList()));
   const noisy = notificationModeContractProse("noisy", "reports");
   assert.equal(
     noisy,
     "Noisy notification mode is active: RUNNING and REVIEWING transitions trigger turns in addition to every "
-    + "successful, failed, conflicted, or recovery-required task.",
+    + `successful, failed, conflicted, or recovery-required task. ${synchronousLandingNotificationCarveOut()}`,
   );
+});
+
+// ── #117: tool-result-confirmed completion suppression policy ────────────────
+
+test("isToolResultConfirmedCompletionWake suppresses only model-actor completion wakes", () => {
+  // Model-actor synchronous landings are confirmed by their direct tool result.
+  assert.equal(isToolResultConfirmedCompletionWake("completion", "model"), true);
+  // User command invocations have no model tool result confirming the landing.
+  assert.equal(isToolResultConfirmedCompletionWake("completion", "user"), false);
+  // System/executor-driven landings never pass through a control tool call.
+  assert.equal(isToolResultConfirmedCompletionWake("completion", "system"), false);
+  // Non-completion wakes are never suppressed by this policy: failures
+  // (which also carry conflict/recovery diagnostics) always keep their turn.
+  for (const kind of ["failure", "state"] as const) {
+    assert.equal(isToolResultConfirmedCompletionWake(kind, "model"), false);
+  }
+});
+
+// ── #117: shared completion group aggregate formatter ────────────────────────
+
+test("completionGroupAggregateLines emits the top-off line plus COMPLETE verdict", () => {
+  const group = fixtureGroup({
+    tasks: [fixtureTask({ state: "landed" }), fixtureTask({ taskId: "task-2", state: "landed" })],
+  });
+  const lines = completionGroupAggregateLines(group, {
+    estimatedImmediatelyAvailableSlots: 3,
+    globallyDispatchPending: 1,
+  });
+  assert.deepEqual(lines, [
+    "Top-off opportunity: up to 2 additional task(s) may be submitted with SubtasksAdd if planned work remains.",
+    `Execution ${group.executionId} COMPLETE: 2/2 tasks landed.`,
+    "All requested task outputs have landed; aggregate verification is now appropriate.",
+  ]);
+});
+
+test("completionGroupAggregateLines lists not-yet-complete siblings when the group is still in progress", () => {
+  const group = fixtureGroup({
+    tasks: [
+      fixtureTask({ state: "landed" }),
+      fixtureTask({ taskId: "task-2", state: "running", definition: { title: "Second task", instructions: "work", acceptanceCriteria: ["done"] } }),
+    ],
+  });
+  const lines = completionGroupAggregateLines(group);
+  assert.deepEqual(lines, [
+    `Execution ${group.executionId} IN PROGRESS: 1/2 landed; 1 not landed.`,
+    "This is a partial task completion, not completion of the whole group. Do not claim outputs from tasks that have not landed.",
+    "Tasks not yet landed:",
+    "- task-2 · Second task · running",
+  ]);
+});
+
+test("completionGroupAggregateLines matches the aggregate section of formatExecutionEvent", () => {
+  const group = fixtureGroup({
+    tasks: [
+      fixtureTask({ state: "landed" }),
+      fixtureTask({ taskId: "task-2", state: "running", definition: { title: "Second task", instructions: "work", acceptanceCriteria: ["done"] } }),
+    ],
+  });
+  const scheduling = { estimatedImmediatelyAvailableSlots: 5, globallyDispatchPending: 2 };
+  const standalone = completionGroupAggregateLines(group, scheduling).join("\n");
+  const fullEvent = formatExecutionEvent(group, group.tasks[0], "completion", "Task task-1 landed.", scheduling);
+  assert.ok(fullEvent.includes(standalone), "the delivered wake carries the identical aggregate lines");
 });
 
 // ── No-action acknowledgement wording (tested separately from transitions) ───

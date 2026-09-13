@@ -99,7 +99,7 @@ const SHARED_PROMPT_GUIDELINES = [
   lifecycleWakeGuidanceLine(),
   "SubtasksInspect always requires an explicit taskId, even for a single-task execution; for every other operation a taskId may be omitted only when the supplied executionId contains exactly one task, otherwise use the returned taskId.",
   completionNotificationGuidanceLine(),
-  "Start/add distinguish tasks already assigned for executor startup from tasks still waiting for capacity. Completion events report durable phase timing, execution revision, peak concurrency on final completion, and estimated post-settlement capacity for SubtasksAdd.",
+  "Start/add distinguish tasks already assigned for executor startup from tasks still waiting for capacity. Completion events report the COMPLETE verdict or not-yet-complete sibling list, plus the estimated top-off opportunity for SubtasksAdd when scheduling information is available. Use SubtasksInspect for the durable execution revision, peak concurrency, and per-phase task timing instead of expecting them in completion notifications.",
   "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call SubtasksMarkClean.",
   "Use SubtasksForceMerge only for a stopped task with a verified checkpoint; mergeAnyhow may intentionally materialize conflicts in main. Every force-merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
   "A request to cancel or stop without landing means interrupt_as_failure. Use interrupt_with_merge only when the user explicitly wants a mechanical checkpoint landing; it never guarantees the requested changes are present or correct, so inspect the main workspace manually afterward in every case.",
@@ -385,7 +385,7 @@ export class ExecutionToolManager {
         actor: "user",
       });
     });
-    register("subtask-mark-clean", "Validate resolved conflict markers and resume queued landings.", async () => this.controller.markClean());
+    register("subtask-mark-clean", "Validate resolved conflict markers and resume queued landings.", async () => this.controller.markClean({ actor: "user" }));
     this.commandsRegistered = true;
   }
 
@@ -598,11 +598,19 @@ export class ExecutionToolManager {
           return backgroundResult("force_merge", inspection, false);
         }
         case "mark_clean": {
-          const cleared = await this.controller.markClean();
+          // #117: the model's direct result confirms each validated landing, so
+          // the controller folds the group aggregates in instead of waking.
+          const cleared = await this.controller.markClean({ actor: "model" });
+          const aggregates = (cleared.completionAggregates ?? [])
+            .map((entry) => `Group aggregate for ${entry.executionId} / ${entry.taskId}:\n${entry.aggregate}`)
+            .join("\n\n");
           return result(
-            cleared.cleared
-              ? `Conflict gate cleared for ${cleared.paths.length} path(s); queued landings are waking automatically.`
-              : "No workspace conflict gate is active.",
+            [
+              cleared.cleared
+                ? `Conflict gate cleared for ${cleared.paths.length} path(s); each landed task's group aggregate is included below instead of a separate completion notification.`
+                : "No workspace conflict gate is active.",
+              aggregates,
+            ].filter((part) => part.length > 0).join("\n"),
             cleared,
             false,
           );
@@ -1002,13 +1010,18 @@ function backgroundResult(
     ? ` Scheduler at acceptance: ${scheduling.dispatchAssigned} task(s) assigned and starting, ${scheduling.dispatchPending} still pending dispatch; ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} global workers and ${scheduling.activePoolLeases}/${scheduling.configuredPoolCapacity} executor-pool slots are occupied; ${scheduling.estimatedImmediatelyAvailableSlots} slot(s) appear immediately available. Assignment is not proof that executor startup has completed.`
     : "";
   const toolName = EXECUTION_TOOL_NAMES[action];
-  const summary = action === "start" || action === "add"
+  let summary = action === "start" || action === "add"
     ? `${toolName} accepted: ${inspection.kind} group ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract} Internal progress stays available in SubtasksInspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.`
     : action === "force_merge"
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Force-merge only reports a mechanical landing attempt; always inspect the main workspace manually because it does not prove the requested changes are present or correct.`
     : action === "interrupt" && inspection.tasks.some((task) => task.commands.some((command) => command.action === "interrupt" && command.mode === "interrupt_with_merge"))
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Interrupt-with-merge only attempted a mechanical checkpoint landing; always inspect the main workspace manually because this status does not prove the requested changes are present or correct.`
       : `${toolName}: ${inspection.kind} group ${inspection.executionId}, ${active} active task(s).`;
+  // #117: when the synchronous landing's completion wake was suppressed, its
+  // group aggregate is folded into this direct result instead.
+  if (inspection.completionAggregate) {
+    summary += `\nGroup aggregate for this synchronous landing, folded into this result instead of a separate completion notification:\n${inspection.completionAggregate}`;
+  }
   return result(formatInspectionForModel(summary, inspection, action === "inspect"), { action, ...inspection }, isError);
 }
 

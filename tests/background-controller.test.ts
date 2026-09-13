@@ -18,14 +18,18 @@ import {
   type BackgroundInspection,
   type BackgroundStateTransition,
   type BackgroundTaskRecord,
+  type BackgroundWatchSubscription,
   formatWatchEvent,
 } from "../src/execution/background-controller";
+import { EXECUTION_TOOL_NAMES, ExecutionToolManager } from "../src/execution/tool";
 import { INLINE_SETTLED_TASK_LIMIT } from "../src/execution/background-group-store";
 import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
 import { isActiveTaskState, transitionTaskState } from "../src/execution/task-state";
 import type { ExecutorLiveControl } from "../src/execution/types";
 import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline } from "../src/state";
 import { sourceMutationCoordinator } from "../src/execution/source-mutation-lease";
+
+const EXECUTION_TOOL_NAME_LIST = Object.values(EXECUTION_TOOL_NAMES);
 
 const execFileAsync = promisify(execFile);
 
@@ -2404,7 +2408,11 @@ workerResources: { "default": { selection: { source: "external", id: "tail-detac
   }
 });
 
-async function setupInterruptedMergeTask(unique: string): Promise<{
+async function setupInterruptedMergeTask(
+  unique: string,
+  pi?: unknown,
+  options?: { notificationMode?: "quiet" | "noisy"; interruptInSetup?: boolean },
+): Promise<{
   root: string;
   controller: BackgroundExecutionController;
   started: BackgroundInspection;
@@ -2438,13 +2446,14 @@ async function setupInterruptedMergeTask(unique: string): Promise<{
       }
     },
     execution: {
+      ...(options?.notificationMode ? { subtaskNotifications: options.notificationMode } : {}),
 maxWorkers: 1,
 workerResources: { "default": { selection: { source: "external", id: "slow-merge" }, maxConcurrent: 1 } },
   routes: { execute: [{ resourceId: "default" }], research: [] },
     },
     retainBundles: "always",
   });
-  const controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
+  const controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: pi ?? {} });
   const started = await controller.start([{
     title: "merge target",
     instructions: "write draft.txt",
@@ -2457,14 +2466,16 @@ workerResources: { "default": { selection: { source: "external", id: "slow-merge
     if (!waveRoot) return false;
     return readFile(join(waveRoot, "workers", taskId, "draft.txt"), "utf8").then(() => true, () => false);
   });
-  const interrupted = await controller.interrupt({
-    executionId: started.executionId,
-    taskId,
-    mode: "interrupt_as_failure",
-    instructionId: `setup-interrupt-${unique}`,
-    actor: "user",
-  });
-  assert.equal(interrupted.tasks[0]?.state, "interrupted");
+  if (options?.interruptInSetup !== false) {
+    const interrupted = await controller.interrupt({
+      executionId: started.executionId,
+      taskId,
+      mode: "interrupt_as_failure",
+      instructionId: `setup-interrupt-${unique}`,
+      actor: "user",
+    });
+    assert.equal(interrupted.tasks[0]?.state, "interrupted");
+  }
   return {
     root,
     controller,
@@ -4949,5 +4960,797 @@ review: { activeReviewers: [
     await controller?.shutdown().catch(() => undefined);
     await controller?.detach().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── #117: tool-result-confirmed completion notification deduplication ────────
+
+interface SubtaskEventMessage {
+  customType?: string;
+  content: string;
+}
+
+function subtaskEvents(messages: SubtaskEventMessage[]): SubtaskEventMessage[] {
+  return messages.filter((message) => message.customType === "pi-review-subtask-event");
+}
+
+/** Completion wakes only. The two markers below exist solely in
+ * completionGroupAggregateLines — the aggregate block appended to completion
+ * wakes (and folded into synchronous tool results) — while state wakes reuse
+ * similar "not yet landed" wording and failure wakes use the curated
+ * diagnostic preamble. This keeps counts exact in noisy mode, where ordinary
+ * RUNNING/REVIEWING state wakes are delivered too. */
+function completionEvents(messages: SubtaskEventMessage[]): SubtaskEventMessage[] {
+  return subtaskEvents(messages).filter((message) =>
+    message.content.includes("All requested task outputs have landed; aggregate verification is now appropriate.")
+    || message.content.includes("This is a partial task completion, not completion of the whole group."));
+}
+
+/** Failure wakes only (curated diagnostic preamble), distinct from the state
+ * transitions noisy mode additionally delivers. */
+function failureEvents(messages: SubtaskEventMessage[]): SubtaskEventMessage[] {
+  return subtaskEvents(messages).filter((message) => message.content.includes("requires recovery attention"));
+}
+
+/** One-shot watch checkpoints, delivered on their own custom type. */
+function watchEvents(messages: SubtaskEventMessage[]): SubtaskEventMessage[] {
+  return messages.filter((message) => message.customType === "pi-review-subtask-watch");
+}
+
+type ExecuteTool = (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
+
+function toolExecute(tools: Array<Record<string, any>>, name: string): ExecuteTool {
+  const tool = tools.find((candidate) => candidate.name === name);
+  assert.ok(tool, `${name} was not registered`);
+  return tool.execute as ExecuteTool;
+}
+
+/**
+ * #117 harness: an execution whose landing genuinely conflicts with a
+ * concurrent main-workspace change (the worker worktree and main both modify
+ * shared.txt after capture). The conflicted failure wake is delivered through
+ * the real pi.sendMessage seam and is awaited here so consumers never race its
+ * delivery; the test then resolves the markers and drives markClean with the
+ * actor under test. With `activeSibling`, a second task keeps the group active
+ * (so a watch can be armed) and lands on its own a few seconds later.
+ */
+async function setupConflictedLanding(
+  unique: string,
+  options?: { notificationMode?: "quiet" | "noisy"; activeSibling?: boolean },
+): Promise<{
+  root: string;
+  controller: BackgroundExecutionController;
+  started: BackgroundInspection;
+  taskId: string;
+  siblingTaskId?: string;
+  messages: SubtaskEventMessage[];
+  cleanup: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), `pi-review-background-dedupe-${unique}-`));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+  await writeFile(join(root, "base.txt"), "base\n", "utf8");
+  await writeFile(join(root, "shared.txt"), "base shared\n", "utf8");
+  await execFileAsync("git", ["add", "base.txt", "shared.txt"], { cwd: root });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+  const sentinel = `${unique.toUpperCase()}_SENTINEL`;
+  const siblingSentinel = `${unique.toUpperCase()}_B_SENTINEL`;
+  const executor = join(root, `conflict-executor-${unique}.cjs`);
+  await writeFile(executor, [
+    "#!/usr/bin/env node",
+    "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+    "process.stdin.on('end',()=>{",
+    // Active sibling: lands on its own a few seconds after dispatch so the
+    // group stays active (watch-armable) and later completes distinctly.
+    `if(prompt.includes('${siblingSentinel}')){fs.writeFileSync('b.txt','b landed\\n');setTimeout(()=>{console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));},2500);return;}`,
+    `if(prompt.includes('${sentinel}')){`,
+    "fs.writeFileSync('marker.txt','landed\\n');",
+    // Candidate side: the worker worktree modifies shared.txt.
+    "fs.writeFileSync('shared.txt','candidate shared\\n');",
+    // Current side: main diverges on the same file while the turn is in
+    // flight, so landing revalidation materializes a genuine conflict.
+    `fs.writeFileSync(${JSON.stringify(join(root, "shared.txt"))},'current shared\\n');}`,
+    "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
+    "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
+    "});",
+  ].join("\n"), "utf8");
+  await chmod(executor, 0o755);
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: {
+      [`dedupe-${unique}`]: {
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" }
+      }
+    },
+    execution: {
+      ...(options?.notificationMode ? { subtaskNotifications: options.notificationMode } : {}),
+      maxWorkers: 1,
+      workerResources: { "default": { selection: { source: "external", id: `dedupe-${unique}` }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
+    },
+    retainBundles: "always",
+  });
+  const messages: SubtaskEventMessage[] = [];
+  const controller = new BackgroundExecutionController({
+    pi: { sendMessage: (message: SubtaskEventMessage) => messages.push(message) },
+    config,
+    state: createState(),
+    cwd: () => root,
+  });
+  const started = await controller.start(options?.activeSibling
+    ? [
+      { title: "conflict target", instructions: sentinel, acceptanceCriteria: ["marker.txt exists"] },
+      { title: "sibling second", instructions: siblingSentinel, acceptanceCriteria: ["b.txt exists"] },
+    ]
+    : [{
+      title: "conflict target",
+      instructions: sentinel,
+      acceptanceCriteria: ["marker.txt exists"],
+    }]);
+  const taskId = started.tasks[0]!.taskId;
+  await waitFor(() => controller.inspect(started.executionId, taskId).tasks[0]?.state === "conflicted");
+  // The conflicted failure wake is part of the established precondition: it
+  // lands after the state transition's save/publish steps, so wait for it
+  // instead of letting consumers race its delivery.
+  await waitFor(() => failureEvents(messages).length === 1);
+  return {
+    root,
+    controller,
+    started,
+    taskId,
+    ...(options?.activeSibling ? { siblingTaskId: started.tasks[1]!.taskId } : {}),
+    messages,
+    cleanup: async () => {
+      await controller.shutdown().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * #117 harness: a two-task execution with one worker slot — A runs first,
+ * writes a.txt, then stalls; B waits in the queue (an active sibling) and,
+ * once dispatched, lands on its own after a short delay. The fixture
+ * interrupts A once its checkpoint file is visible so A becomes
+ * force-mergeable while B remains active.
+ */
+async function setupInterruptedSiblingPair(unique: string): Promise<{
+  root: string;
+  controller: BackgroundExecutionController;
+  started: BackgroundInspection;
+  taskA: string;
+  taskB: string;
+  messages: SubtaskEventMessage[];
+  cleanup: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), `pi-review-background-dedupe-sibling-${unique}-`));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+  await writeFile(join(root, "base.txt"), "base\n", "utf8");
+  await execFileAsync("git", ["add", "base.txt"], { cwd: root });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+  const sentinelA = `${unique.toUpperCase()}_A_SENTINEL`;
+  const sentinelB = `${unique.toUpperCase()}_B_SENTINEL`;
+  const executor = join(root, `sibling-executor-${unique}.cjs`);
+  await writeFile(executor, [
+    "#!/usr/bin/env node",
+    "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+    "process.stdin.on('end',()=>{",
+    `if(prompt.includes('${sentinelA}')){fs.writeFileSync('a.txt','a landed\\n');setTimeout(()=>console.log(JSON.stringify({type:'assistant',text:'late completion'})),30000);return;}`,
+    // B lands on its own a few seconds after dispatch so it is still active
+    // well past any checkpoint deadline armed during the test.
+    `if(prompt.includes('${sentinelB}')){fs.writeFileSync('b.txt','b landed\\n');setTimeout(()=>{console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));},3000);return;}`,
+    "});",
+  ].join("\n"), "utf8");
+  await chmod(executor, 0o755);
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: {
+      [`dedupe-sibling-${unique}`]: {
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" }
+      }
+    },
+    execution: {
+      maxWorkers: 1,
+      workerResources: { "default": { selection: { source: "external", id: `dedupe-sibling-${unique}` }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
+    },
+    retainBundles: "always",
+  });
+  const messages: SubtaskEventMessage[] = [];
+  const controller = new BackgroundExecutionController({
+    pi: { sendMessage: (message: SubtaskEventMessage) => messages.push(message) },
+    config,
+    state: createState(),
+    cwd: () => root,
+  });
+  const started = await controller.start([
+    { title: "interrupted first", instructions: sentinelA, acceptanceCriteria: ["a.txt exists"] },
+    { title: "sibling second", instructions: sentinelB, acceptanceCriteria: ["b.txt exists"] },
+  ]);
+  const taskA = started.tasks[0]!.taskId;
+  const taskB = started.tasks[1]!.taskId;
+  await waitFor(() => controller.inspect(started.executionId, taskA).tasks[0]?.state === "running");
+  await waitForAsync(async () => {
+    const waveRoot = controller.inspect(started.executionId, taskA).tasks[0]?.waveRoot;
+    if (!waveRoot) return false;
+    return access(join(waveRoot, "workers", taskA, "a.txt")).then(() => true, () => false);
+  });
+  await controller.interrupt({
+    executionId: started.executionId,
+    taskId: taskA,
+    mode: "interrupt_as_failure",
+    instructionId: `sibling-interrupt-${unique}`,
+    actor: "user",
+  });
+  return {
+    root,
+    controller,
+    started,
+    taskA,
+    taskB,
+    messages,
+    cleanup: async () => {
+      await controller.shutdown().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * #117 harness (registered tools): the same git/executor fixtures as the
+ * controller-level scenarios above, driven through the real registered
+ * Subtasks* tools (ExecutionToolManager) so the folded aggregate is asserted
+ * on the exact direct tool results the model receives.
+ */
+async function setupToolHarness(
+  unique: string,
+  options: { conflict?: boolean; executorLines: string[] | ((root: string) => string[]) },
+): Promise<{
+  root: string;
+  manager: ExecutionToolManager;
+  tools: Array<Record<string, any>>;
+  messages: SubtaskEventMessage[];
+  cleanup: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), `pi-review-background-dedupe-tools-${unique}-`));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: root });
+  await writeFile(join(root, "base.txt"), "base\n", "utf8");
+  if (options.conflict) await writeFile(join(root, "shared.txt"), "base shared\n", "utf8");
+  await execFileAsync("git", ["add", ...(options.conflict ? ["base.txt", "shared.txt"] : ["base.txt"])], { cwd: root });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
+  const executor = join(root, `tool-executor-${unique}.cjs`);
+  const lines = typeof options.executorLines === "function" ? options.executorLines(root) : options.executorLines;
+  await writeFile(executor, lines.join("\n"), "utf8");
+  await chmod(executor, 0o755);
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: {
+      [`tools-${unique}`]: {
+        adapter: "run-as-binary",
+        command: executor,
+        execution: { protocol: "pi-review-executor-jsonl-v1" }
+      }
+    },
+    execution: {
+      maxWorkers: 1,
+      workerResources: { "default": { selection: { source: "external", id: `tools-${unique}` }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "default" }], research: [] },
+    },
+    retainBundles: "always",
+  });
+  const tools: Array<Record<string, any>> = [];
+  const messages: SubtaskEventMessage[] = [];
+  const manager = new ExecutionToolManager({
+    pi: {
+      registerTool: (tool: Record<string, any>) => { tools.push(tool); },
+      registerCommand() {},
+      setToolActive() {},
+      getActiveTools: () => ["read", "bash", ...EXECUTION_TOOL_NAME_LIST],
+      sendMessage: (message: SubtaskEventMessage) => messages.push(message),
+    },
+    config,
+    state: createState(),
+    cwd: () => root,
+  });
+  manager.sync();
+  return {
+    root,
+    manager,
+    tools,
+    messages,
+    cleanup: async () => {
+      await manager.shutdown().catch(() => undefined);
+      await manager.detach().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test("#117 model-actor mark-clean suppresses the completion wake and folds in the group aggregate", async () => {
+  for (const mode of ["quiet", "noisy"] as const) {
+    const scenario = await setupConflictedLanding(`model-markclean-${mode}`, { notificationMode: mode });
+    try {
+      const { controller, started, taskId, messages } = scenario;
+      // The conflicted failure wake is still delivered — suppression never
+      // touches failures, conflicts, or recovery requirements.
+      assert.equal(failureEvents(messages).length, 1, "the conflicted landing keeps its failure wake");
+      assert.match(failureEvents(messages)[0]!.content, /requires recovery attention at state CONFLICTED/);
+
+      await writeFile(join(scenario.root, "shared.txt"), "resolved\n", "utf8");
+      const outcome = await controller.markClean({ actor: "model" });
+      assert.equal(outcome.cleared, true);
+      assert.deepEqual(outcome.paths, ["shared.txt"]);
+      assert.equal(controller.inspect(started.executionId, taskId).tasks[0]?.state, "landed");
+
+      // The validated landing is confirmed by the direct result itself: its
+      // group aggregate is folded in and no completion notification follows.
+      assert.equal(outcome.completionAggregates?.length, 1);
+      assert.equal(outcome.completionAggregates![0]!.executionId, started.executionId);
+      assert.equal(outcome.completionAggregates![0]!.taskId, taskId);
+      assert.ok(outcome.completionAggregates![0]!.aggregate.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+      assert.ok(outcome.completionAggregates![0]!.aggregate.includes("All requested task outputs have landed; aggregate verification is now appropriate."));
+      assert.equal(completionEvents(messages).length, 0, "no completion notification follows a model-confirmed validated landing");
+    } finally {
+      await scenario.cleanup();
+    }
+  }
+});
+
+test("#117 user-actor mark-clean keeps the completion wake and folds nothing in", async () => {
+  for (const mode of ["quiet", "noisy"] as const) {
+    const scenario = await setupConflictedLanding(`user-markclean-${mode}`, { notificationMode: mode });
+    try {
+      const { controller, started, messages } = scenario;
+
+      await writeFile(join(scenario.root, "shared.txt"), "resolved\n", "utf8");
+      const outcome = await controller.markClean({ actor: "user" });
+      assert.equal(outcome.cleared, true);
+      assert.deepEqual(outcome.paths, ["shared.txt"]);
+      assert.equal(outcome.completionAggregates, undefined, "user invocations keep the wake and get no folded aggregate");
+
+      await waitFor(() => completionEvents(messages).length === 1);
+      const completion = completionEvents(messages)[0]!;
+      assert.ok(completion.content.includes("conflict resolution was validated and landed"));
+      assert.ok(completion.content.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+    } finally {
+      await scenario.cleanup();
+    }
+  }
+});
+
+test("#117 model-actor force-merge suppresses the completion wake and folds the aggregate into the result", async () => {
+  for (const mode of ["quiet", "noisy"] as const) {
+    const messages: SubtaskEventMessage[] = [];
+    const scenario = await setupInterruptedMergeTask(`model-force-${mode}`, {
+      sendMessage: (message: SubtaskEventMessage) => messages.push(message),
+    }, { notificationMode: mode });
+    try {
+      const { controller, started, taskId } = scenario;
+      const landed = await controller.forceMerge({
+        executionId: started.executionId,
+        taskId,
+        mergeAnyhow: false,
+        instructionId: `dedupe-model-force-${mode}`,
+        actor: "model",
+      });
+      assert.equal(landed.tasks[0]?.state, "landed");
+      assert.ok(landed.completionAggregate, "the group aggregate is folded into the direct result");
+      assert.ok(landed.completionAggregate!.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+      assert.ok(landed.completionAggregate!.includes("All requested task outputs have landed; aggregate verification is now appropriate."));
+      assert.equal(completionEvents(messages).length, 0, "no completion notification follows a model-confirmed force-merge landing");
+    } finally {
+      await scenario.cleanup();
+    }
+  }
+});
+
+test("#117 user-actor force-merge keeps the completion wake and folds nothing in", async () => {
+  for (const mode of ["quiet", "noisy"] as const) {
+    const messages: SubtaskEventMessage[] = [];
+    const scenario = await setupInterruptedMergeTask(`user-force-${mode}`, {
+      sendMessage: (message: SubtaskEventMessage) => messages.push(message),
+    }, { notificationMode: mode });
+    try {
+      const { controller, started, taskId } = scenario;
+      const landed = await controller.forceMerge({
+        executionId: started.executionId,
+        taskId,
+        mergeAnyhow: false,
+        instructionId: `dedupe-user-force-${mode}`,
+        actor: "user",
+      });
+      assert.equal(landed.tasks[0]?.state, "landed");
+      assert.equal(landed.completionAggregate, undefined, "the wake still carries the aggregate, so nothing is folded in");
+
+      await waitFor(() => completionEvents(messages).length === 1);
+      const completion = completionEvents(messages)[0]!;
+      assert.ok(completion.content.includes("force-merged and landed mechanically"));
+      assert.ok(completion.content.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+    } finally {
+      await scenario.cleanup();
+    }
+  }
+});
+
+test("#117 model interrupt_with_merge returns the folded aggregate without a duplicate completion", async () => {
+  for (const mode of ["quiet", "noisy"] as const) {
+    // Model actor: the delegated force-merge is confirmed by this same call's
+    // direct result, so it folds the aggregate and suppresses the wake.
+    {
+      const messages: SubtaskEventMessage[] = [];
+      const scenario = await setupInterruptedMergeTask(`model-intmerge-${mode}`, {
+        sendMessage: (message: SubtaskEventMessage) => messages.push(message),
+      }, { notificationMode: mode, interruptInSetup: false });
+      try {
+        const { controller, started, taskId } = scenario;
+        const landed = await controller.interrupt({
+          executionId: started.executionId,
+          taskId,
+          mode: "interrupt_with_merge",
+          instructionId: `dedupe-intmerge-${mode}`,
+          actor: "model",
+        });
+        assert.equal(landed.tasks[0]?.state, "landed");
+        assert.ok(landed.completionAggregate, "the interrupt-with-merge result carries the folded aggregate");
+        assert.ok(landed.completionAggregate!.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+        assert.equal(completionEvents(messages).length, 0, "no duplicate completion follows a model-confirmed interrupt-with-merge landing");
+      } finally {
+        await scenario.cleanup();
+      }
+    }
+    // User actor: no model tool result confirms the landing, so the wake stays.
+    {
+      const messages: SubtaskEventMessage[] = [];
+      const scenario = await setupInterruptedMergeTask(`user-intmerge-${mode}`, {
+        sendMessage: (message: SubtaskEventMessage) => messages.push(message),
+      }, { notificationMode: mode, interruptInSetup: false });
+      try {
+        const { controller, started, taskId } = scenario;
+        const landed = await controller.interrupt({
+          executionId: started.executionId,
+          taskId,
+          mode: "interrupt_with_merge",
+          instructionId: `dedupe-intmerge-${mode}`,
+          actor: "user",
+        });
+        assert.equal(landed.tasks[0]?.state, "landed");
+        assert.equal(landed.completionAggregate, undefined, "the wake still carries the aggregate, so nothing is folded in");
+
+        await waitFor(() => completionEvents(messages).length === 1);
+        const completion = completionEvents(messages)[0]!;
+        assert.ok(completion.content.includes("force-merged and landed mechanically"));
+        assert.ok(completion.content.includes(`Execution ${started.executionId} COMPLETE: 1/1 tasks landed.`));
+      } finally {
+        await scenario.cleanup();
+      }
+    }
+  }
+});
+
+test("#117 a later distinct sibling completion still notifies after a suppressed model landing", async () => {
+  const scenario = await setupInterruptedSiblingPair("notify");
+  try {
+    const { controller, started, taskA, taskB, messages } = scenario;
+
+    // The model-confirmed landing of A is suppressed; because B has not
+    // completed, the folded aggregate must list it as a sibling.
+    const landed = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId: taskA,
+      mergeAnyhow: false,
+      instructionId: "dedupe-sibling-force",
+      actor: "model",
+    });
+    assert.equal(landed.tasks[0]?.state, "landed");
+    assert.ok(landed.completionAggregate, "the not-yet-complete aggregate is folded into the direct result");
+    assert.ok(landed.completionAggregate!.includes("Tasks not yet landed:"), "the folded aggregate names the outstanding sibling");
+    assert.ok(landed.completionAggregate!.includes(taskB));
+    assert.equal(subtaskEvents(messages).length, 0, "the suppressed landing delivers nothing immediately");
+
+    // B's own executor-driven completion is a distinct event and still wakes.
+    await waitFor(() => controller.inspect(started.executionId).tasks.every((task) => task.state === "landed"));
+    await waitFor(() => subtaskEvents(messages).length === 1);
+    const siblingCompletion = subtaskEvents(messages)[0]!;
+    assert.ok(siblingCompletion.content.includes(taskB), "the sibling completion names its own task");
+    assert.ok(siblingCompletion.content.includes("Landed paths: b.txt"));
+    assert.ok(!siblingCompletion.content.includes("force-merged and landed mechanically"), "the suppressed landing never arrives as a later notification");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 a suppressed model force-merge cancels the group's armed watch instead of letting a stale checkpoint fire", async () => {
+  const scenario = await setupInterruptedSiblingPair("watch-force");
+  try {
+    const { controller, started, taskA, taskB, messages } = scenario;
+    // Arm the one-shot checkpoint while B keeps the group active. The
+    // deadline lands well after the force-merge completes, so without the
+    // cancellation it would fire as a stale checkpoint after A's landing was
+    // already confirmed by the direct tool result.
+    const armed = controller.watch(started.executionId, 1_200);
+    assert.equal(armed.replaced, false);
+
+    const landed = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId: taskA,
+      mergeAnyhow: false,
+      instructionId: "dedupe-watch-force",
+      actor: "model",
+    });
+    assert.equal(landed.tasks[0]?.state, "landed");
+    assert.ok(landed.completionAggregate?.includes(taskB), "the direct result still names the outstanding sibling");
+    assert.equal(completionEvents(messages).length, 0, "no completion notification follows the suppressed landing");
+
+    // Both watch representations are retired by the suppressed completion:
+    // the armed timer and any queued checkpoint snapshot. (The undelivered
+    // 25 ms delivery window has no deterministic seam with real timers, so
+    // the armed-timer case above carries the observable regression and this
+    // pins both representations through the shared cancelWatch path.)
+    const internals = controller as unknown as {
+      watches: Map<string, unknown>;
+      pendingWatchInspections: Array<{ executionId: string }>;
+    };
+    assert.equal(internals.watches.has(started.executionId), false, "the armed watch timer was cancelled");
+    assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
+
+    // Past the original deadline: without the cancellation a stale
+    // checkpoint would have fired here while B was still active.
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_500));
+    assert.equal(watchEvents(messages).length, 0, "no stale checkpoint fires after the direct-result-confirmed landing");
+
+    // B's own executor-driven completion is a distinct event and still wakes.
+    await waitFor(() => controller.inspect(started.executionId).tasks.every((task) => task.state === "landed"));
+    await waitFor(() => completionEvents(messages).length === 1);
+    const siblingCompletion = completionEvents(messages)[0]!;
+    assert.ok(siblingCompletion.content.includes(taskB), "the sibling completion names its own task");
+    assert.ok(!siblingCompletion.content.includes("force-merged and landed mechanically"), "the suppressed landing never arrives as a later notification");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 a suppressed model mark-clean cancels the group's armed watch instead of letting a stale checkpoint fire", async () => {
+  const scenario = await setupConflictedLanding("watch-markclean", { activeSibling: true });
+  try {
+    const { controller, started, taskId, siblingTaskId, messages } = scenario;
+    assert.ok(siblingTaskId, "the active sibling started");
+    // B keeps the group active after A's conflicted landing (whose failure
+    // wake already delivered), so the one-shot checkpoint can be armed. The
+    // deadline lands well after markClean completes.
+    const armed = controller.watch(started.executionId, 1_200);
+    assert.equal(armed.replaced, false);
+
+    await writeFile(join(scenario.root, "shared.txt"), "resolved\n", "utf8");
+    const outcome = await controller.markClean({ actor: "model" });
+    assert.equal(outcome.cleared, true);
+    assert.deepEqual(outcome.paths, ["shared.txt"]);
+    assert.equal(controller.inspect(started.executionId, taskId).tasks[0]?.state, "landed");
+    assert.equal(outcome.completionAggregates?.length, 1);
+    assert.ok(outcome.completionAggregates![0]!.aggregate.includes(siblingTaskId), "the folded aggregate names the still-active sibling");
+    assert.equal(completionEvents(messages).length, 0, "no completion notification follows the suppressed validated landing");
+
+    const internals = controller as unknown as {
+      watches: Map<string, unknown>;
+      pendingWatchInspections: Array<{ executionId: string }>;
+    };
+    assert.equal(internals.watches.has(started.executionId), false, "the armed watch timer was cancelled");
+    assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
+
+    // Past the original deadline: without the cancellation a stale
+    // checkpoint would have fired here while B was still active.
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_500));
+    assert.equal(watchEvents(messages).length, 0, "no stale checkpoint fires after the direct-result-confirmed landing");
+
+    // B's own executor-driven completion is a distinct event and still wakes.
+    await waitFor(() => controller.inspect(started.executionId).tasks.every((task) => task.state === "landed"));
+    await waitFor(() => completionEvents(messages).length === 1);
+    const siblingCompletion = completionEvents(messages)[0]!;
+    assert.ok(siblingCompletion.content.includes(siblingTaskId), "the sibling completion names its own task");
+    assert.ok(!siblingCompletion.content.includes("conflict resolution was validated and landed"), "the suppressed landing never arrives as a later notification");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 a conflicted model force-merge keeps its failure wake and conflict gate", async () => {
+  for (const mode of ["quiet", "noisy"] as const) {
+    const messages: SubtaskEventMessage[] = [];
+    const scenario = await setupInterruptedMergeTask(`conflict-force-${mode}`, {
+      sendMessage: (message: SubtaskEventMessage) => messages.push(message),
+    }, { notificationMode: mode });
+    try {
+      const { controller, started, taskId } = scenario;
+      // Main diverges on the checkpoint's file, so the forced landing plan
+      // conflicts and mergeAnyhow materializes the markers in main.
+      await writeFile(join(scenario.root, "draft.txt"), "main diverged\n", "utf8");
+      const inspection = await controller.forceMerge({
+        executionId: started.executionId,
+        taskId,
+        mergeAnyhow: true,
+        instructionId: `dedupe-conflict-force-${mode}`,
+        actor: "model",
+      });
+      assert.equal(inspection.tasks[0]?.state, "conflicted");
+      assert.equal(inspection.completionAggregate, undefined, "a conflicted landing is not a confirmed landing; nothing folds in");
+
+      // Suppression is completion-only: the failure wake with the conflict
+    // gate diagnostic is still delivered.
+      await waitFor(() => failureEvents(messages).length === 1);
+      const failure = failureEvents(messages)[0]!;
+      assert.match(failure.content, /requires recovery attention at state CONFLICTED/);
+      assert.ok(failure.content.includes("draft.txt"), "the gate names the conflicted path");
+      assert.ok(failure.content.includes("SubtasksMarkClean"), "recovery still points at SubtasksMarkClean");
+      assert.equal(completionEvents(messages).length, 0);
+
+      // The gate stays active for subsequent landings.
+      const prompt = controller.criticalPrompt();
+      assert.ok(prompt?.includes("CRITICAL REVIEW-GATE WORKSPACE CONFLICT"));
+      assert.ok(prompt?.includes("SubtasksMarkClean"));
+    } finally {
+      await scenario.cleanup();
+    }
+  }
+});
+
+test("#117 registered SubtasksInterrupt interrupt_with_merge returns the folded aggregate with no duplicate completion", async () => {
+  const scenario = await setupToolHarness("tool-intmerge", {
+    executorLines: [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');process.stdin.resume();process.stdin.on('end',()=>{",
+      "fs.writeFileSync('draft.txt','recover me\\n');",
+      "setTimeout(()=>console.log(JSON.stringify({type:'assistant',text:'late completion'})),30000);",
+      "});",
+    ],
+  });
+  try {
+    const { tools, messages } = scenario;
+    const start = toolExecute(tools, "SubtasksStart");
+    const inspect = toolExecute(tools, "SubtasksInspect");
+    const started = await start("tool-intmerge-start", {
+      tasks: [{ title: "interrupt-with-merge target", instructions: "write draft.txt", acceptanceCriteria: ["draft.txt exists"] }],
+    }, undefined, undefined, {});
+    assert.equal(started.isError, false);
+    const executionId = started.details.executionId;
+    const taskId = started.details.tasks[0].taskId;
+
+    await waitForAsync(async () => {
+      const polled = await inspect("tool-intmerge-poll", { executionId, taskId }, undefined, undefined, {});
+      const waveRoot = polled.details.tasks[0]?.waveRoot;
+      if (!waveRoot) return false;
+      return access(join(waveRoot, "workers", taskId, "draft.txt")).then(() => true, () => false);
+    });
+
+    const interrupt = toolExecute(tools, "SubtasksInterrupt");
+    const merged = await interrupt("tool-intmerge-merge", {
+      executionId,
+      taskId,
+      interruptMode: "interrupt_with_merge",
+    }, undefined, undefined, {});
+    assert.equal(merged.isError, false);
+    const text = merged.content[0].text;
+    // The direct tool result confirms the landing and carries the group
+    // aggregate instead of a separate completion notification.
+    assert.ok(text.includes("Group aggregate for this synchronous landing, folded into this result instead of a separate completion notification:"));
+    assert.ok(text.includes(`Execution ${executionId} COMPLETE: 1/1 tasks landed.`));
+    assert.ok(text.includes("All requested task outputs have landed; aggregate verification is now appropriate."));
+    // The mechanical-landing caveat is preserved.
+    assert.match(text, /inspect the main workspace manually/i);
+    assert.ok(typeof merged.details.completionAggregate === "string" && merged.details.completionAggregate.length > 0, "the details carry the folded aggregate");
+    assert.ok(text.includes(merged.details.completionAggregate), "the rendered result embeds the exact folded aggregate");
+    assert.equal(completionEvents(messages).length, 0, "no duplicate completion notification follows the registered tool result");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 registered SubtasksForceMerge result renders the folded group aggregate", async () => {
+  const scenario = await setupToolHarness("tool-forcemerge", {
+    executorLines: [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');process.stdin.resume();process.stdin.on('end',()=>{",
+      "fs.writeFileSync('draft.txt','recover me\\n');",
+      "setTimeout(()=>console.log(JSON.stringify({type:'assistant',text:'late completion'})),30000);",
+      "});",
+    ],
+  });
+  try {
+    const { tools, messages } = scenario;
+    const start = toolExecute(tools, "SubtasksStart");
+    const inspect = toolExecute(tools, "SubtasksInspect");
+    const started = await start("tool-force-start", {
+      tasks: [{ title: "force-merge target", instructions: "write draft.txt", acceptanceCriteria: ["draft.txt exists"] }],
+    }, undefined, undefined, {});
+    assert.equal(started.isError, false);
+    const executionId = started.details.executionId;
+    const taskId = started.details.tasks[0].taskId;
+
+    await waitForAsync(async () => {
+      const polled = await inspect("tool-force-poll", { executionId, taskId }, undefined, undefined, {});
+      const waveRoot = polled.details.tasks[0]?.waveRoot;
+      if (!waveRoot) return false;
+      return access(join(waveRoot, "workers", taskId, "draft.txt")).then(() => true, () => false);
+    });
+
+    // Stop the task first (interrupt_as_failure never lands, so no wake).
+    const interrupt = toolExecute(tools, "SubtasksInterrupt");
+    const stopped = await interrupt("tool-force-stop", {
+      executionId,
+      taskId,
+      interruptMode: "interrupt_as_failure",
+    }, undefined, undefined, {});
+    assert.equal(stopped.isError, false);
+
+    const forceMerge = toolExecute(tools, "SubtasksForceMerge");
+    const landed = await forceMerge("tool-force-merge", { executionId, taskId }, undefined, undefined, {});
+    assert.equal(landed.isError, false);
+    const text = landed.content[0].text;
+    assert.ok(text.includes("Group aggregate for this synchronous landing, folded into this result instead of a separate completion notification:"));
+    assert.ok(text.includes(`Execution ${executionId} COMPLETE: 1/1 tasks landed.`));
+    // The mechanical-landing caveat is preserved.
+    assert.match(text, /Force-merge only reports a mechanical landing attempt/i);
+    assert.ok(typeof landed.details.completionAggregate === "string" && landed.details.completionAggregate.length > 0, "the details carry the folded aggregate");
+    assert.equal(completionEvents(messages).length, 0, "no duplicate completion notification follows the registered tool result");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#117 registered SubtasksMarkClean result renders each landed task's folded aggregate", async () => {
+  const scenario = await setupToolHarness("tool-markclean", {
+    conflict: true,
+    executorLines: (root) => [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+      "process.stdin.on('end',()=>{",
+      `if(prompt.includes('TOOL_MARKCLEAN_SENTINEL')){`,
+      "fs.writeFileSync('marker.txt','landed\\n');",
+      "fs.writeFileSync('shared.txt','candidate shared\\n');",
+      `fs.writeFileSync(${JSON.stringify(join(root, "shared.txt"))},'current shared\\n');}`,
+      "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
+      "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
+      "});",
+    ],
+  });
+  try {
+    const { tools, messages } = scenario;
+    const start = toolExecute(tools, "SubtasksStart");
+    const inspect = toolExecute(tools, "SubtasksInspect");
+    const started = await start("tool-markclean-start", {
+      tasks: [{ title: "conflict target", instructions: "TOOL_MARKCLEAN_SENTINEL", acceptanceCriteria: ["marker.txt exists"] }],
+    }, undefined, undefined, {});
+    assert.equal(started.isError, false);
+    const executionId = started.details.executionId;
+    const taskId = started.details.tasks[0].taskId;
+
+    // Wait for the genuine conflicted landing and its (delivered) failure wake.
+    await waitForAsync(async () => {
+      const polled = await inspect("tool-markclean-poll", { executionId, taskId }, undefined, undefined, {});
+      return polled.details.tasks[0]?.state === "conflicted" && failureEvents(messages).length === 1;
+    });
+
+    await writeFile(join(scenario.root, "shared.txt"), "resolved\n", "utf8");
+    const markClean = toolExecute(tools, "SubtasksMarkClean");
+    const cleared = await markClean("tool-markclean-run", {}, undefined, undefined, {});
+    assert.equal(cleared.isError, false);
+    const text = cleared.content[0].text;
+    assert.ok(text.includes("Conflict gate cleared for 1 path(s); each landed task's group aggregate is included below instead of a separate completion notification."));
+    assert.ok(text.includes(`Group aggregate for ${executionId} / ${taskId}:`));
+    assert.ok(text.includes(`Execution ${executionId} COMPLETE: 1/1 tasks landed.`));
+    assert.equal(failureEvents(messages).length, 1, "the conflicted failure wake is untouched");
+    assert.equal(completionEvents(messages).length, 0, "no completion notification follows the model-confirmed validated landing");
+  } finally {
+    await scenario.cleanup();
   }
 });

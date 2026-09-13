@@ -52,6 +52,7 @@ import { renderSubtaskWidget } from "./subtask-widget";
 import {
   buildWakeFailureDiagnostic,
   capNotificationText,
+  completionGroupAggregateLines,
   formatExecutionEvent,
   formatResearchCompletion,
   formatWakeFailureDiagnostic,
@@ -59,12 +60,14 @@ import {
   formatWatchEvent,
   isActionableWakeKind,
   isQuietSuppressedWake,
+  isToolResultConfirmedCompletionWake,
   notificationLane,
   deliveryForLane,
   stateTransitionNotice,
   subtaskNotificationMode,
   watchCheckpointDelivery,
   WAKE_FAILURE_NOTIFICATION_CAP,
+  type SubtaskWakeActor,
 } from "./subtask-notifications";
 import { notifyDispatchCards } from "./dispatch-cards";
 import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
@@ -123,7 +126,28 @@ export interface BackgroundForceMergeInput {
   taskId?: string;
   mergeAnyhow: boolean;
   instructionId: string;
-  actor: "model" | "user" | "system";
+  /** #117: the invoking actor decides completion-wake delivery (see isToolResultConfirmedCompletionWake). */
+  actor: SubtaskWakeActor;
+}
+
+/** Per-landed-task aggregate folded into a mark-clean result (#117). */
+export interface BackgroundMarkCleanAggregate {
+  executionId: string;
+  taskId: string;
+  /** Group aggregate lines built by the shared completion formatter. */
+  aggregate: string;
+}
+
+export interface BackgroundMarkCleanResult {
+  cleared: boolean;
+  paths: string[];
+  /**
+   * #117: group aggregates folded into this result for landed tasks whose
+   * completion wakes were suppressed because the model's direct tool result
+   * already confirms them. Absent when no aggregate is folded in (user-actor
+   * invocations keep their per-task completion wakes).
+   */
+  completionAggregates?: BackgroundMarkCleanAggregate[];
 }
 
 export interface BackgroundSchedulingSnapshot {
@@ -237,6 +261,13 @@ export interface BackgroundInspection {
    * matching). Absent on start/inspect results.
    */
   addedTaskIds?: string[];
+  /**
+   * #117: group aggregate folded into the direct tool result when a
+   * synchronous landing's completion wake is suppressed because the model's
+   * own tool result already confirms it (force-merge / interrupt-with-merge).
+   * Absent whenever a completion wake is still delivered for the landing.
+   */
+  completionAggregate?: string;
   conflictGate?: BackgroundConflictGate;
   tasks: Array<BackgroundTaskRecord & {
     timing: BackgroundTaskTimingSummary;
@@ -1657,14 +1688,27 @@ export class BackgroundExecutionController {
         await this.save(group);
       });
       await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
-      await this.completeLandedBookkeeping(task, "completion wake", () =>
-        this.wake(task, "completion", `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`));
+      // #117: a model tool call's direct result already confirms this
+      // synchronous landing, so the follow-up completion wake is suppressed
+      // and its group aggregate is folded into the returned inspection instead.
+      let completionAggregate: string | undefined;
+      if (isToolResultConfirmedCompletionWake("completion", input.actor)) {
+        // #117 review fix: suppression removes only the notification. The
+        // actionable-completion watch housekeeping still runs so a stale
+        // checkpoint can never fire after this direct-result-confirmed landing.
+        this.retireWakeWatch(task, "completion", { group, task });
+        completionAggregate = this.completionAggregateFor(group, task);
+      } else {
+        await this.completeLandedBookkeeping(task, "completion wake", () =>
+          this.wake(task, "completion", `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`));
+      }
       // Always persist the landed state and any bookkeeping diagnostics recorded
       // after the initial save (e.g., when the first save failed).
       await this.completeLandedBookkeeping(task, "durable save", async () => {
         await this.save(group);
       });
-      return this.inspect(group.executionId, task.taskId);
+      const inspection = this.inspect(group.executionId, task.taskId);
+      return completionAggregate ? { ...inspection, completionAggregate } : inspection;
     } catch (error) {
       const cancelledWhileWaiting = !pending.acquired && pending.abort.signal.aborted;
       if (command.status !== "failed") {
@@ -1690,7 +1734,14 @@ export class BackgroundExecutionController {
     }
   }
 
-  async markClean(): Promise<{ cleared: boolean; paths: string[] }> {
+  /**
+   * #117: `actor` decides whether the per-task completion wakes for landed
+   * tasks are delivered (user commands) or folded into this result (model tool
+   * calls). Omitted callers predate the model/user split and keep the
+   * notifying default.
+   */
+  async markClean(input?: { actor?: SubtaskWakeActor }): Promise<BackgroundMarkCleanResult> {
+    const actor: SubtaskWakeActor = input?.actor ?? "user";
     const entries = [...this.conflictGates.entries()];
     if (entries.length === 0) return { cleared: false, paths: [] };
     // #25 multi-target: validate every outstanding gate before releasing any —
@@ -1734,17 +1785,45 @@ export class BackgroundExecutionController {
       clearedPaths.push(...gate.paths);
     }
     await this.publishAssociations();
+    const completionAggregates: BackgroundMarkCleanAggregate[] = [];
     for (const [, { gate }] of entries) {
       const group = this.groups.get(gate.executionId);
       const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
       if (task) {
         this.addActivity(task, "landed", "Conflict resolution validated; queued landing attempts released.");
         await this.save(group!);
-        await this.wake(task, "completion", `Task ${task.taskId} conflict resolution was validated and landed.`);
+        // #117: a model tool call's direct result already confirms each
+        // validated landing, so its completion wake is suppressed and the group
+        // aggregate is folded into this result instead.
+        if (isToolResultConfirmedCompletionWake("completion", actor)) {
+          // #117 review fix: same watch housekeeping as the delivered wake
+          // path — folding the aggregate into this result never leaves a stale
+          // checkpoint armed or queued for this group.
+          this.retireWakeWatch(task, "completion", { group: group!, task });
+          completionAggregates.push({
+            executionId: group!.executionId,
+            taskId: task.taskId,
+            aggregate: this.completionAggregateFor(group!, task),
+          });
+        } else {
+          await this.wake(task, "completion", `Task ${task.taskId} conflict resolution was validated and landed.`);
+        }
       }
     }
     this.updateIndicator();
-    return { cleared: true, paths: clearedPaths };
+    return completionAggregates.length > 0
+      ? { cleared: true, paths: clearedPaths, completionAggregates }
+      : { cleared: true, paths: clearedPaths };
+  }
+
+  /**
+   * #117: the group aggregate a suppressed completion wake would have
+   * conveyed, built by the same shared formatter (subtask-notifications) the
+   * wake path uses, so folded-in tool-result text and delivered wakes cannot
+   * drift.
+   */
+  private completionAggregateFor(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): string {
+    return completionGroupAggregateLines(group, this.schedulingSnapshot(group, task)).join("\n");
   }
 
   /**
@@ -2994,12 +3073,9 @@ export class BackgroundExecutionController {
     await this.input.faults?.wake?.({ taskId: task.taskId, taskState: task.state, kind });
     // Finding 14: wake eligibility, lanes, and delivery shapes are policy owned
     // by ./subtask-notifications; this method only sequences the fault seam,
-    // watch cancellation, persistence-aware snapshots, and delivery.
-    if (isActionableWakeKind(kind)) {
-      const owner = eventSnapshot?.group
-        ?? [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
-      if (owner) this.cancelWatch(owner.executionId);
-    }
+    // watch housekeeping (retireWakeWatch), persistence-aware snapshots, and
+    // delivery.
+    this.retireWakeWatch(task, kind, eventSnapshot);
     const mode = subtaskNotificationMode(this.input.config);
     if (isQuietSuppressedWake(kind, mode)) return;
     const lane = notificationLane(kind);
@@ -3045,6 +3121,26 @@ export class BackgroundExecutionController {
     } catch (error) {
       await this.input.notify?.(`review gate: task notification could not be delivered: ${messageOf(error)}`);
     }
+  }
+
+  /**
+   * #117 review fix: wake-side watch housekeeping, separated from notification
+   * delivery. An actionable wake kind retires the owning group's one-shot
+   * watch — both the armed checkpoint timer and any queued checkpoint
+   * inspection — so a stale checkpoint can never fire after the event it was
+   * watching for. Tool-result-suppressed completions (model force-merge /
+   * mark-clean) run this same housekeeping; only the notification itself is
+   * folded into the caller's direct result instead of being delivered.
+   */
+  private retireWakeWatch(
+    task: BackgroundTaskRecord,
+    kind: "completion" | "failure" | "state",
+    eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
+  ): void {
+    if (!isActionableWakeKind(kind)) return;
+    const owner = eventSnapshot?.group
+      ?? [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
+    if (owner) this.cancelWatch(owner.executionId);
   }
 
   private cancelWatch(executionId: string): boolean {

@@ -43,6 +43,15 @@
  *   provenance; a queued task says "not yet sent"/"not yet available"; a
  *   record that predates its own dispatch says exactly that. No prompt is ever
  *   reconstructed from the task definition or labeled exact.
+ * - #121 rendering-only deduplication: when the captured sent prompt contains
+ *   the submitted instructions verbatim, the repeated instruction span inside
+ *   the rendered prompt is replaced by {@link SUBMITTED_INSTRUCTIONS_MARKER},
+ *   which names the already-shown submitted block and states that it is a
+ *   rendering abbreviation, never prompt content. The surrounding actual
+ *   capture (worker framing, isolation directives, additions) still renders in
+ *   full, and a prompt that does not contain the submitted text verbatim —
+ *   path-rewritten, transformed, or otherwise differing — is rendered in full
+ *   so no difference between submitted and sent is hidden.
  * - Steering/continuation acknowledgements are transport facts only: delivery
  *   status never establishes task compliance, and the submitted instruction is
  *   never mislabeled as the entire delivered adapter message.
@@ -401,6 +410,13 @@ function initialDispatchRecordOf(live: Record<string, any> | undefined, task: Re
 // SubtasksStart / SubtasksAdd: submitted definitions and dispatch provenance
 // ---------------------------------------------------------------------------
 
+/** #121 rendering-only marker for the repeated submitted-instruction span
+ * inside a rendered captured sent prompt. The identical submitted instructions
+ * are shown in full elsewhere in the same expanded view; the marker names that
+ * fact and never claims that the marker text itself was sent to the worker. */
+export const SUBMITTED_INSTRUCTIONS_MARKER =
+  "<Submitted instructions — identical text shown above; rendering abbreviation, not part of the sent prompt>";
+
 /**
  * Start/Add expanded view: the actual submitted task definitions and the
  * truthful dispatch provenance.
@@ -502,10 +518,13 @@ function renderSubmittedTask(lines: LineBuilder, task: Record<string, any>, live
   // transport boundary. The live projection wins, then the returned record's
   // own snapshot. Neither is ever reconstructed from the task definition or
   // later configuration, and nothing here claims turn acknowledgement or task
-  // compliance — those are separate facts recorded elsewhere.
+  // compliance — those are separate facts recorded elsewhere. #121: the
+  // deduplication input is the same submitted instructions this block renders,
+  // so the marker can only ever abbreviate text already shown above.
   const dispatch = dispatchRecordOf(live, task);
   if (dispatch) {
-    renderDispatchRecord(lines, dispatch, initialDispatchRecordOf(live, task));
+    const submittedInstructions = typeof definition?.instructions === "string" ? definition.instructions : undefined;
+    renderDispatchRecord(lines, dispatch, initialDispatchRecordOf(live, task), submittedInstructions);
   } else if (state === "queued") {
     lines.add("Dispatch: not yet started", "muted");
     lines.add("Captured base commit: not yet available", "muted");
@@ -546,8 +565,15 @@ function renderSubmittedTask(lines: LineBuilder, task: Record<string, any>, live
  * isolated worker worktree. A recovery re-dispatch is distinguished from the
  * captured original when both records are available — the latest actual
  * dispatch is what the task is running on, and the original stays shown, not
- * replaced silently. */
-function renderDispatchRecord(lines: LineBuilder, dispatch: Record<string, any>, initial: Record<string, any> | undefined): void {
+ * replaced silently. #121: each captured prompt body is deduplicated against
+ * the submitted instructions with a rendering-only marker when they overlap
+ * verbatim (see {@link renderCapturedPromptBody}). */
+function renderDispatchRecord(
+  lines: LineBuilder,
+  dispatch: Record<string, any>,
+  initial: Record<string, any> | undefined,
+  submittedInstructions: string | undefined,
+): void {
   const turn = typeof dispatch.executorTurn === "number" ? dispatch.executorTurn : "?";
   lines.add(`Dispatch: dispatched to executor transport (turn ${turn})`);
   lines.add(`Captured base commit: ${stringOr(dispatch.baseCommit, "(unrecorded)")}`);
@@ -566,25 +592,65 @@ function renderDispatchRecord(lines: LineBuilder, dispatch: Record<string, any>,
     lines.add("");
     lines.label(`Initial dispatch (turn ${initialTurn}) — prompt sent to worker:`);
     if (initialSentPrompt !== undefined) {
-      for (const line of initialSentPrompt.split("\n")) lines.addPreserved(line);
+      renderCapturedPromptBody(lines, initialSentPrompt, submittedInstructions);
     } else {
       lines.add("(not recorded)", "muted");
     }
     lines.add("");
     lines.label(`Latest actual dispatch (turn ${turn}) — prompt sent to worker:`);
     if (sentPrompt !== undefined) {
-      for (const line of sentPrompt.split("\n")) lines.addPreserved(line);
+      renderCapturedPromptBody(lines, sentPrompt, submittedInstructions);
     } else {
       lines.add("(not recorded)", "muted");
     }
   } else {
     lines.label("Prompt sent to worker:");
     if (sentPrompt !== undefined) {
-      for (const line of sentPrompt.split("\n")) lines.addPreserved(line);
+      renderCapturedPromptBody(lines, sentPrompt, submittedInstructions);
     } else {
       lines.add("(not recorded)", "muted");
     }
   }
+}
+
+/** Renders one captured sent-prompt body with the #121 rendering-only
+ * deduplication: when the submitted instructions are contained verbatim in the
+ * captured prompt, the repeated instruction span is replaced by
+ * {@link SUBMITTED_INSTRUCTIONS_MARKER} — the identical text is already shown
+ * in full in the same expanded view, so nothing is hidden and the marker never
+ * claims to be prompt content. Everything before and after the span
+ * (worker-specific framing, isolation directives, added context) still renders
+ * exactly. A prompt whose instruction text itself differs — path-rewritten,
+ * transformed, or otherwise changed so the submitted text is not contained
+ * verbatim — is rendered in full, never abbreviated; a prompt containing the
+ * verbatim span with additional framing is abbreviated while all surrounding
+ * framing still renders exactly.
+ *
+ * Row accounting: every logical line renders as its own display row, and the
+ * rows join with newlines. A prefix that ends with a newline would therefore
+ * gain an extra newline before the marker row, and a suffix that begins with
+ * one would gain an extra newline after it, so one boundary row on each side
+ * is folded into the row join. For a span aligned to whole prompt lines (the
+ * normal case) the rendered rows reconstruct `prefix + marker + suffix`
+ * byte-exactly; a mid-line span renders as its own row, which is the visible
+ * abbreviation itself. */
+function renderCapturedPromptBody(lines: LineBuilder, sentPrompt: string, submittedInstructions: string | undefined): void {
+  if (submittedInstructions && submittedInstructions.trim().length > 0 && sentPrompt.includes(submittedInstructions)) {
+    const start = sentPrompt.indexOf(submittedInstructions);
+    const before = sentPrompt.slice(0, start);
+    const after = sentPrompt.slice(start + submittedInstructions.length);
+    const prefixRows = before.split("\n");
+    if (prefixRows.length > 0 && prefixRows[prefixRows.length - 1] === "") prefixRows.pop();
+    for (const line of prefixRows) lines.addPreserved(line);
+    lines.add(SUBMITTED_INSTRUCTIONS_MARKER, "muted");
+    if (after.length > 0) {
+      const suffixRows = after.split("\n");
+      if (suffixRows.length > 0 && suffixRows[0] === "") suffixRows.shift();
+      for (const line of suffixRows) lines.addPreserved(line);
+    }
+    return;
+  }
+  for (const line of sentPrompt.split("\n")) lines.addPreserved(line);
 }
 
 // ---------------------------------------------------------------------------

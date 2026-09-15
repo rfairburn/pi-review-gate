@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.47]
+
+### Fixed
+
+- Make the background-submission regression test independent of host speed by
+  explicitly holding and releasing fake worker completion, while preserving
+  nonblocking submission, independent landing, and capacity-notification checks.
+  Production behavior is unchanged.
+- Attach worker lifecycle rejection handling before awaiting the task-start manifest
+  write, preventing unhandled rejections during early interruption while preserving
+  the original failure and cancellation reporting.
+
 ## [0.1.0-dev.46]
 
 ### Changed

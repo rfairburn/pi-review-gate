@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.45]
+
+### Fixed
+
+- Show repeated submitted instructions only once in expanded SubtasksStart and
+  SubtasksAdd results when the captured worker prompt contains the exact text.
+  A rendering-only marker replaces the repeated span; differing instructions,
+  worker-specific content, and unavailable-prompt status remain visible. Collapsed
+  results and model-visible context are unchanged.
+
 ## [0.1.0-dev.44]
 
 ### Fixed

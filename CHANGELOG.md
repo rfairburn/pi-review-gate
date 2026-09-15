@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.48]
+
+### Changed
+
+- Make `/subtask-add <prompt>` submit one task in a new execution group using
+  existing routing and workspace defaults. All supplied text, including JSON and
+  execution-id-looking text, is treated as instructions; the former execution-ID
+  plus task-JSON slash-command syntax is removed.
+- With no arguments, `/subtask-add` collects task fields and new/existing-group
+  settings interactively, then asks for explicit confirmation before submission.
+  Cancellation creates no work. Structured model-facing Start/Add APIs and batch
+  support remain unchanged.
+
 ## [0.1.0-dev.47]
 
 ### Fixed

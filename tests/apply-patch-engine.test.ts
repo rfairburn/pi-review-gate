@@ -6,7 +6,9 @@
 // Copyright (c) 2025 OpenAI, MIT License (see LICENSES/MIT-openai-agents-js.txt).
 // The full engine is adapted in src/apply-patch/engine.ts; these cases lock the
 // parser behavior pi-review-gate depends on (first-match anchors, whitespace
-// fuzz, EOF handling, trailing-newline preservation, create mode).
+// fuzz, EOF handling, trailing-newline preservation). Create-mode cases are not
+// ported: the engine retains update application only, because canonical
+// `*** Add File:` hunks carry their final content directly.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { applyDiff } from "../src/apply-patch/engine";
@@ -14,16 +16,6 @@ import { applyDiff } from "../src/apply-patch/engine";
 test("applies added lines to empty input via V4A floating hunk", () => {
   const diff = ["@@", "+hello", "+world"].join("\n");
   assert.equal(applyDiff("", diff), "hello\nworld\n");
-});
-
-test("applies plus-prefixed content for create mode", () => {
-  const diff = ["+hello", "+world", "+"].join("\n");
-  assert.equal(applyDiff("", diff, "create"), "hello\nworld\n");
-});
-
-test("rejects create diff without + prefixes", () => {
-  const diff = ["line1", "line2"].join("\n");
-  assert.throws(() => applyDiff("", diff, "create"));
 });
 
 test("applies floating hunk without marker or line numbers", () => {
@@ -246,27 +238,22 @@ test("preserves the first match instead of imposing unique-anchor matching", () 
 test("Example 3: config.yml toggle debug flag with context", () => {
   const input = ["env: dev", "debug: false", "log_level: info"].join("\n");
   const diff = [" env: dev", "-debug: false", "+debug: true", " log_level: info"].join("\n");
-  assert.equal(applyDiff(input, diff, "default"), ["env: dev", "debug: true", "log_level: info"].join("\n"));
+  assert.equal(applyDiff(input, diff), ["env: dev", "debug: true", "log_level: info"].join("\n"));
 });
 
 test("Example 4: pure insertion between context lines", () => {
   const input = ["import os", "", "def main():", '    print("Running app")'].join("\n");
   const diff = [" import os", "+import sys", "", " def main():", '     print("Running app")'].join("\n");
   assert.equal(
-    applyDiff(input, diff, "default"),
+    applyDiff(input, diff),
     ["import os", "import sys", "", "def main():", '    print("Running app")'].join("\n"),
   );
 });
 
-test("Example 12: create file with blank line", () => {
-  const diff = ["+MIT License", "+", "+Copyright (c) 2025"].join("\n");
-  assert.equal(applyDiff("", diff, "create"), ["MIT License", "", "Copyright (c) 2025"].join("\n"));
-});
-
 test("Example 14: move keeps content unchanged; delete body is a no-op", () => {
   const input = "Legacy content";
-  assert.equal(applyDiff(input, [" Legacy content"].join("\n"), "default"), "Legacy content");
-  assert.equal(applyDiff(input, "", "default"), input);
+  assert.equal(applyDiff(input, [" Legacy content"].join("\n")), "Legacy content");
+  assert.equal(applyDiff(input, ""), input);
 });
 
 test("Example 20: two separate hunks in one file using @@", () => {
@@ -295,7 +282,7 @@ test("Example 20: two separate hunks in one file using @@", () => {
     "+}",
   ].join("\n");
   assert.equal(
-    applyDiff(input, diff, "default"),
+    applyDiff(input, diff),
     [
       "function add(a, b) {",
       "  return a + b; // simple add",

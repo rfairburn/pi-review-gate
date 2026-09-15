@@ -185,12 +185,9 @@ async function prepareOperation(
     const target = await confinePath(rootLexical, rootReal, op.path, `operation ${index + 1} path`);
     await requireAbsent(target.absolute, op.path);
     entry.destination = target;
-    // Canonical envelope adds carry final content (each `+line` contributes
-    // `line + "\n"`); legacy structured creates keep V4A create-mode semantics.
-    const newContent = op.createContent !== undefined ? op.createContent : createContent(op.diff ?? "", op.path);
-    // NUL validation applies to both provenances: canonical add lines bypass
-    // createContent(), so the final content is checked here regardless of how
-    // it was produced.
+    // Canonical envelope adds carry the final content (each `+line`
+    // contributes `line + "\n"`).
+    const newContent = op.createContent ?? "";
     if (newContent.includes("\0")) {
       throw new Error(`create_file ${op.path}: refusing to write binary content (NUL byte)`);
     }
@@ -213,7 +210,7 @@ async function prepareOperation(
   const source = await readSource(rootLexical, rootReal, op.path, `operation ${index + 1} path`);
   let updated: string;
   try {
-    updated = applyDiff(source.body, op.diff ?? "", "default");
+    updated = applyDiff(source.body, op.diff ?? "");
   } catch (error) {
     throw new Error(`update_file ${op.path}: ${messageOf(error)}`);
   }
@@ -295,7 +292,9 @@ async function commitOperation(
       changed: true,
       ...countDiffLines(diff),
       bytes: Buffer.byteLength(content, "utf8"),
-      requestedDiff: clipText(op.createContent !== undefined ? "" : (op.diff ?? ""), MAX_REQUESTED_DIFF_CHARS),
+      // Canonical adds have no headerless diff body; the requested envelope is
+      // retained at request level.
+      requestedDiff: "",
       finalDiff: diff,
       mutated: true,
     };
@@ -582,19 +581,6 @@ function joinEncoding(content: string, hadBom: boolean, hadCrlf: boolean): strin
   let result = hadCrlf ? content.replace(/\n/g, "\r\n") : content;
   if (hadBom) result = `\uFEFF${result}`;
   return result;
-}
-
-function createContent(diff: string, display: string): string {
-  let content: string;
-  try {
-    content = applyDiff("", diff, "create");
-  } catch (error) {
-    throw new Error(`create_file ${display}: ${messageOf(error)}`);
-  }
-  if (content.includes("\0")) {
-    throw new Error(`create_file ${display}: refusing to write binary content (NUL byte)`);
-  }
-  return content;
 }
 
 function renderFinalDiff(options: {

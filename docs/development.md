@@ -347,4 +347,6 @@ re-collapse with their real renderers.
   envelope parser (`src/apply-patch/envelope.ts`) implements the publicly documented
   OpenAI/Codex apply_patch grammar so patches authored by OpenAI models apply unchanged;
   it is an independent implementation of the public format — no Codex source code is
-  copied.
+  copied. Only the headerless update application is retained from the upstream engine:
+  create-file mode was removed with the legacy structured `operation` argument because
+  canonical `*** Add File:` hunks carry their final content directly.

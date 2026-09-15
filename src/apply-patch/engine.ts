@@ -11,28 +11,20 @@
 /// and summarized in NOTICE.
 ///
 /// Modifications from upstream:
-/// - Retained the headerless V4A diff application only; file headers
+/// - Retained the headerless V4A update application only; file headers
 ///   ("*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:")
-///   are parsed outside this engine because pi-review-gate's ApplyPatch tool
-///   receives the operation type and paths as structured JSON arguments.
+///   are parsed by the canonical envelope parser (envelope.ts), and the
+///   create-file mode is dropped because canonical `*** Add File:` hunks carry
+///   their final content directly.
 /// - Errors carry the same informative diagnostics as upstream.
 ///
-/// Applies a headerless V4A diff to the provided file content.
-/// - mode "default": patch an existing file using V4A sections ("@@" + +/-/space lines).
-/// - mode "create": create-file syntax that requires every line to start with "+".
-///
-/// The function preserves trailing newlines from the original file and throws
-/// when the diff cannot be applied cleanly.
+/// Applies a headerless V4A update diff to the provided file content using
+/// V4A sections ("@@" + +/-/space lines). The function preserves trailing
+/// newlines from the original file and throws when the diff cannot be applied
+/// cleanly.
 
-export type ApplyDiffMode = "default" | "create";
-
-export function applyDiff(input: string, diff: string, mode: ApplyDiffMode = "default"): string {
+export function applyDiff(input: string, diff: string): string {
   const diffLines = normalizeDiffLines(diff);
-
-  if (mode === "create") {
-    return parseCreateDiff(diffLines);
-  }
-
   const { chunks } = parseUpdateDiff(diffLines, input);
   return applyChunks(input, chunks);
 }
@@ -49,13 +41,6 @@ const END_SECTION_MARKERS = [
   "*** Delete File:",
   "*** Add File:",
   END_FILE,
-];
-
-const SECTION_TERMINATORS = [
-  END_PATCH,
-  "*** Update File:",
-  "*** Delete File:",
-  "*** Add File:",
 ];
 
 function normalizeDiffLines(diff: string): string[] {
@@ -78,26 +63,6 @@ function readStr(state: ParserState, prefix: string): string {
     return current.slice(prefix.length);
   }
   return "";
-}
-
-function parseCreateDiff(lines: string[]): string {
-  const parser: ParserState = {
-    lines: [...lines, END_PATCH],
-    index: 0,
-    fuzz: 0,
-  };
-  const output: string[] = [];
-
-  while (!isDone(parser, SECTION_TERMINATORS)) {
-    const line = parser.lines[parser.index];
-    parser.index += 1;
-    if (!line.startsWith("+")) {
-      throw new Error(`Invalid Add File Line: ${line}`);
-    }
-    output.push(line.slice(1));
-  }
-
-  return output.join("\n");
 }
 
 function parseUpdateDiff(lines: string[], input: string): { chunks: Chunk[]; fuzz: number } {

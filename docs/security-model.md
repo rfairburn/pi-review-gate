@@ -199,15 +199,16 @@ and may mix multiple file operations per call. It follows the public apply_patch
 used by OpenAI Codex (the V4A diff contract at
 https://developers.openai.com/api/docs/guides/tools-apply-patch); Pi's JSON tool
 transport carries one argument value, so the whole envelope travels as that string — the
-minimal transport difference from Codex's stdin/heredoc delivery. A legacy single-file
-structured `operation` object remains accepted for compatibility with earlier sessions
-but is deliberately not part of the model-facing guidance.
+minimal transport difference from Codex's stdin/heredoc delivery. The canonical envelope
+is the only supported request format: requests still carrying the removed legacy
+single-file structured `operation` argument are rejected before any filesystem mutation.
 
 ### Input contract
 
-`ApplyPatch` takes exactly one argument: either the canonical `patch` envelope or the
-legacy `operation` object, enforced both by the JSON schema (`oneOf` with
-`additionalProperties: false`) and at runtime.
+`ApplyPatch` takes exactly one argument: the canonical `patch` envelope, enforced both
+by the JSON schema (a single required `patch` property with `additionalProperties:
+false`) and at runtime. A request carrying the removed legacy structured `operation`
+argument is rejected before any filesystem mutation.
 
 The canonical envelope follows the public Codex grammar:
 
@@ -229,12 +230,9 @@ single-file operations. Deliberate deviations from upstream: `*** Environment ID
 are rejected (this tool patches the local workspace only), and an update hunk without any
 change line is rejected with a Codex-style diagnostic.
 
-Legacy structured calls keep their earlier contract: a discriminated V4A file operation
-(`create_file`, `update_file`, or `delete_file`) whose variants have their own required
-and forbidden fields, a non-empty **headerless** diff body (no `*** Begin/Update/Add`
-/Delete` markers and no path header), and the same path normalization. In both forms,
-every path is a non-empty workspace-relative string; a single leading `@` convention
-marker is stripped before use.
+Every envelope path is a non-empty workspace-relative string (absolute paths inside the
+workspace are also accepted); a single leading `@` convention marker is stripped before
+use.
 
 The tool is registered in both the top-level orchestrator and the Pi-native executor
 runtimes; it is active by default under Pi's normal registered-tool policy and is never
@@ -256,10 +254,9 @@ POSIX provides no multi-file atomicity, so the tool reports partial state truthf
 instead of claiming atomicity it cannot provide; a process crash mid-request can leave a
 partial set, and ordinary failures report exactly what was applied.
 
-Successful canonical calls return the upstream Codex `print_summary` text (`Success.
-Updated the following files:` followed by git-style `A`/`M`/`D` lines grouped by status,
-with moved files listed under their source path); Pi's structured details are additive.
-Legacy calls keep the familiar per-operation summaries.
+Successful calls return the upstream Codex `print_summary` text (`Success. Updated the
+following files:` followed by git-style `A`/`M`/`D` lines grouped by status, with moved
+files listed under their source path); Pi's structured details are additive.
 
 ### Per-file safety properties:
 
@@ -272,9 +269,11 @@ Legacy calls keep the familiar per-operation summaries.
   traversal, absolute paths outside the workspace, symlink escapes, symlinked targets,
   directories and other non-regular files, binary or non-UTF-8 content,
   create-over-existing, update/delete-missing, and unsafe move destinations are rejected
-  with informative diagnostics. V4A file-level header lines inside `operation.diff`
-  (e.g. a stray `*** End Patch`) are likewise rejected up front instead of being
-  silently treated as section terminators.
+  with informative diagnostics. A V4A file-level header line inside an update hunk (e.g.
+  a stray `*** End Patch`) is consumed by the envelope grammar as a hunk or operation
+  terminator and never reaches the diff engine; whatever follows must therefore be a valid
+  hunk header or `*** End Patch`, and any leftover body line is rejected rather than
+  silently applied.
 - Each individual file mutation is staged through a same-directory temporary file, so a
   failed operation never exposes a partial write of its own target. New files and move
   destinations are committed through an atomic no-overwrite link, so a target that appears
@@ -302,9 +301,9 @@ Legacy calls keep the familiar per-operation summaries.
   update that does carry `moveTo` performs the rename and reports it as such.
 - Failures throw with an informative message so Pi marks the tool result as an error and
   the model can correct the envelope and resubmit only the remaining operations.
-- Review evidence pre-captures every envelope path (including move destinations) — or
-  `operation.path`/`operation.moveTo` for legacy calls — as mutation candidates before
-  execution, applying the same leading-`@` normalization the tool uses. Because change
+- Review evidence pre-captures every envelope path (including move destinations) as
+  mutation candidates before execution, applying the same leading-`@` normalization the
+  tool uses. Because change
   detection compares baseline snapshots against disk state, successful changes remain in
   the review capture even when the overall call errors after a partial failure.
   Successful and failed calls both remain review evidence. Results expose

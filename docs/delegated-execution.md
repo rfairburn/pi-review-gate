@@ -63,9 +63,43 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   rearmed, so this never becomes a polling loop or recurring heartbeat.
 
 User analogs are available as `/subtasks` and the `/subtask-*` commands for inspect,
-add, steer, interrupt, force-merge, and mark-clean. These commands open interactive
-execution/task and action pickers when handles are omitted; their explicit-handle forms
-remain available for scripting.
+add, steer, interrupt, force-merge, and mark-clean. The commands that accept explicit
+handles (inspect, steer, interrupt, and force-merge) also open interactive pickers when
+handles are omitted; `/subtask-add` and `/subtask-mark-clean` take no execution handle.
+
+`/subtask-add` also accepts human submission without JSON (#120). Plain text after the
+command — `/subtask-add investigate why the notification appears twice` — immediately
+submits exactly one task in a new execution group: the text becomes the task's
+instructions (leading and trailing whitespace trimmed by the established command
+argument handling; interior whitespace is preserved as written), and everything else
+uses the `SubtasksStart` defaults (the `execute` kind, the current session workspace,
+and the established model/role routing), with no further input requested. The title
+derives from the prompt and the single default acceptance criterion restates the
+instructions, so no additional task requirements are invented.
+
+The whole nonblank argument is the raw prompt text: text beginning with an existing
+execution id, JSON-only arguments, arrays, and prose or pasted code containing JSON
+are all submitted verbatim as the instructions — never parsed as submission JSON,
+never rejected, and never interpreted as task metadata (`/subtask-add
+{"title":"example","instructions":"quoted sample"}` creates one new group whose
+task instructions are that literal JSON text with default metadata). The human
+command performs no execution-handle detection and has no explicit JSON form;
+structured task submission stays on the model-facing `SubtasksStart` and
+`SubtasksAdd` APIs, which keep their interfaces and batching unchanged.
+
+With no arguments, `/subtask-add` opens a staged multi-field form: choose **Create a
+new execution group** (choosing the `execute` or `research` kind and optionally a
+target workspace, blank meaning the current session workspace) or **Add to an
+existing execution group** (picking a group by its id, kind, and workspace; the added
+task inherits that immutable kind and target). The form collects a required title,
+instructions, and one or more acceptance criteria (one per line) plus optional
+relevant context, validates them, and stages everything behind an explicit final
+submission step: the staged destination, kind, workspace, and task fields are shown
+for confirmation, nothing is dispatched until the staged submission is explicitly
+confirmed, and cancellation — at any earlier stage or at that final step — creates
+neither a task nor a group. A workspace is an existing, explicitly authorized
+development checkout or Git worktree used as the group's capture and landing
+destination; each task still executes in its own managed isolated worktree.
 
 ## Pi worker settlement and browser ownership
 
@@ -185,6 +219,23 @@ and executor `PWD` is set to its actual isolated cwd. Clean worktrees are remove
 completion; dirty or conflicted worktrees are preserved for diagnosis. This is worktree
 and instruction isolation, not an OS sandbox — see
 [Security model](security-model.md#isolation-limits).
+
+**Worker workspace contract**: Each managed worktree is a detached-HEAD worktree at a
+synthetic captured base commit whose tree already includes the target workspace's
+uncommitted content. The named issue branch belongs to the target capture/landing
+checkout: prepare it there, pass that checkout as the execution group's `workspace`,
+and reference the branch in worker task text as context only — never as a checkout or
+commit instruction, and never by handing workers the repository's own branch and commit
+conventions as working instructions. Workers must not check out, create, switch, or
+delete branches in their managed worktrees or alter Git worktree ownership metadata;
+the harness owns capture, checkpointing, and landing, and worker prompts carry this
+contract authoritatively. Checking out a branch whose commit differs from the current one
+inside a managed worktree resets its tree to that branch's committed state and can drop
+captured content that tree lacks, while conflicting local edits make the checkout refuse
+rather than discarding them (same-commit branch creation changes only HEAD attachment);
+checkpoint validation fails closed on such a worktree. Recovery steps for an already
+damaged worktree live in the shipped orchestrator skill's recovery runbook
+(`skills/orchestrator/references/recovery.md`).
 
 ## Conflicts and gates
 

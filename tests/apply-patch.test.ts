@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, readdir, readFile, rm, symlink, writeFile, mkdtemp
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
-import { APPLY_PATCH_TOOL_NAME, applyPatchToolSchema, parseApplyPatchOperation, registerApplyPatchTool, renderApplyPatchCall, renderApplyPatchResult, renderExpandedApplyPatchResult } from "../src/apply-patch/tool";
+import { APPLY_PATCH_TOOL_NAME, applyPatchToolSchema, registerApplyPatchTool, renderApplyPatchCall, renderApplyPatchResult, renderExpandedApplyPatchResult } from "../src/apply-patch/tool";
 import { collectEvidenceChanges, createEvidenceState, extractCandidatePaths, recordToolCallEvidence, recordToolResultEvidence, shouldRecordToolCallEvidence, shouldRecordToolResultEvidence } from "../src/evidence";
 import { activate } from "../src/index";
 import { ExecutionToolManager } from "../src/execution/tool";
@@ -53,15 +53,17 @@ async function tempWorkspace(): Promise<string> {
   return mkdtemp(join(tmpdir(), "pi-review-apply-patch-"));
 }
 
-function updateOperation(path: string, diff: string, moveTo?: string): Record<string, unknown> {
-  return { operation: { type: "update_file", path, diff, ...(moveTo ? { moveTo } : {}) } };
+function updateEnvelope(path: string, diff: string, moveTo?: string): Record<string, unknown> {
+  const lines = diff.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return { patch: envelope("*** Update File: " + path, ...(moveTo !== undefined ? ["*** Move to: " + moveTo] : []), ...lines) };
 }
 
 // ---------------------------------------------------------------------------
 // Registration, schema, and visibility
 // ---------------------------------------------------------------------------
 
-test("ApplyPatch registers with a canonical-envelope-first strict schema and sequential execution", () => {
+test("ApplyPatch registers with a canonical-envelope-only strict schema and sequential execution", () => {
   const { tools } = harness();
   const tool = tools.find((candidate) => candidate.name === APPLY_PATCH_TOOL_NAME)!;
   assert.equal(tool.label, APPLY_PATCH_TOOL_NAME);
@@ -73,38 +75,17 @@ test("ApplyPatch registers with a canonical-envelope-first strict schema and seq
   assert.ok(typeof tool.renderCall === "function");
   assert.ok(typeof tool.renderResult === "function");
 
-  const schema = applyPatchToolSchema() as { additionalProperties: boolean; properties: Record<string, any>; oneOf: Array<Record<string, any>> };
+  // The shipped schema exposes only the canonical envelope: one required
+  // `patch` property, no legacy `operation` argument, and no oneOf branches.
+  const schema = applyPatchToolSchema() as { additionalProperties: boolean; required?: string[]; properties: Record<string, any>; oneOf?: unknown };
   assert.equal(schema.additionalProperties, false);
-  // Exactly one of the canonical patch envelope or the legacy structured
-  // operation object may be present.
-  assert.deepEqual(
-    schema.oneOf.map((branch) => branch.required),
-    [["patch"], ["operation"]],
-  );
+  assert.deepEqual(schema.required, ["patch"]);
+  assert.deepEqual(Object.keys(schema.properties), ["patch"]);
+  assert.equal(schema.oneOf, undefined);
   const patch = schema.properties.patch as { type: string; description: string };
   assert.equal(patch.type, "string");
   assert.ok(patch.description.includes("*** Begin Patch"));
   assert.ok(patch.description.includes("applied sequentially"));
-  // The legacy operation argument is a discriminated oneOf with
-  // operation-specific required and forbidden fields.
-  const operation = schema.properties.operation as { description: string; oneOf: Array<Record<string, any>> };
-  assert.ok(operation.description.length > 0);
-  assert.deepEqual(
-    operation.oneOf.map((branch) => branch.properties.type.enum[0]),
-    ["create_file", "update_file", "delete_file"],
-  );
-  for (const branch of operation.oneOf) {
-    assert.equal(branch.type, "object");
-    assert.equal(branch.additionalProperties, false);
-  }
-  const [createBranch, updateBranch, deleteBranch] = operation.oneOf;
-  assert.deepEqual([...createBranch.required].sort(), ["diff", "path", "type"]);
-  assert.ok(!("moveTo" in createBranch.properties), "create_file must not expose moveTo");
-  assert.deepEqual([...updateBranch.required].sort(), ["diff", "path", "type"]);
-  assert.equal(updateBranch.properties.moveTo.type, "string");
-  assert.deepEqual([...deleteBranch.required].sort(), ["path", "type"]);
-  assert.ok(!("diff" in deleteBranch.properties), "delete_file must not expose diff");
-  assert.ok(!("moveTo" in deleteBranch.properties), "delete_file must not expose moveTo");
 });
 
 test("registerApplyPatchTool returns false when the host cannot register tools", () => {
@@ -216,61 +197,48 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
 });
 
 // ---------------------------------------------------------------------------
-// Operation parsing and validation
+// Request validation: canonical envelope only
 // ---------------------------------------------------------------------------
 
-test("operation parsing enforces operation-specific required and forbidden fields", () => {
-  assert.deepEqual(parseApplyPatchOperation({ operation: { type: "delete_file", path: "a.txt" } }), { type: "delete_file", path: "a.txt" });
-  assert.deepEqual(
-    parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "-x" } }),
-    { type: "update_file", path: "a.txt", diff: "-x" },
-  );
-  assert.deepEqual(
-    parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "-x", moveTo: "b.txt" } }),
-    { type: "update_file", path: "a.txt", diff: "-x", moveTo: "b.txt" },
-  );
-
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "unknown", path: "a" } }), /operation\.type must be one of/);
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "create_file", path: "a.txt" } }), /operation\.diff is required/);
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "" } }), /operation\.diff is required/);
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "delete_file", path: "a.txt", diff: "-x" } }), /operation\.diff is not valid/);
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "create_file", path: "a.txt", diff: "+x", moveTo: "b.txt" } }), /moveTo is not valid/);
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "-x", moveTo: "a.txt" } }), /moveTo must differ/);
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "-x", extra: 1 } }), /extra is not valid/);
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "update_file", path: "", diff: "-x" } }), /operation\.path is required/);
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "-x" }, extra: true }), /exactly one argument/);
-  assert.throws(() => parseApplyPatchOperation({}), /exactly one argument/);
+test("legacy structured operation requests are rejected before any filesystem mutation", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await writeFile(join(dir, "existing.txt"), "keep\n", "utf8");
+    for (const params of [
+      { operation: { type: "create_file", path: "created.txt", diff: "+x\n" } },
+      { operation: { type: "update_file", path: "existing.txt", diff: "-keep\n+kept\n" } },
+      { operation: { type: "delete_file", path: "existing.txt" } },
+    ]) {
+      await assert.rejects(
+        execute(params, { cwd: dir }),
+        /the legacy structured 'operation' argument is no longer supported/,
+      );
+    }
+    // A request carrying both arguments is rejected as well.
+    await assert.rejects(
+      execute({ patch: envelope("*** Add File: created.txt", "+x"), operation: { type: "delete_file", path: "existing.txt" } }, { cwd: dir }),
+      /exactly one argument/,
+    );
+    // Rejection happens before any mutation.
+    assert.equal(await readFile(join(dir, "existing.txt"), "utf8"), "keep\n");
+    await assert.rejects(lstat(join(dir, "created.txt")));
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
-test("operation parsing normalizes a single leading @ path marker", () => {
-  assert.equal(parseApplyPatchOperation({ operation: { type: "delete_file", path: "@src/a.txt" } }).path, "src/a.txt");
-  assert.throws(() => parseApplyPatchOperation({ operation: { type: "delete_file", path: "@" } }), /empty after removing the leading '@'/);
-});
-
-test("diff bodies containing V4A header lines are rejected before mutation", () => {
-  // The engine treats file-level headers as section terminators, so a body
-  // that still carries one would silently apply zero or partial chunks.
-  assert.throws(
-    () => parseApplyPatchOperation({ operation: { type: "create_file", path: "a.txt", diff: "*** Begin Patch\n+x" } }),
-    /headerless/,
-  );
-  assert.throws(
-    () => parseApplyPatchOperation({ operation: { type: "create_file", path: "a.txt", diff: "*** Add File: a.txt\n+x" } }),
-    /headerless/,
-  );
-  assert.throws(
-    () => parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "*** Update File: a.txt\n@@\n-x" } }),
-    /headerless/,
-  );
-  assert.throws(
-    () => parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "@@\n-x\n*** End Patch" } }),
-    /headerless/,
-  );
-  // '*** End of File' is a valid EOF anchor, not a header.
-  assert.deepEqual(
-    parseApplyPatchOperation({ operation: { type: "update_file", path: "a.txt", diff: "@@\n+x\n*** End of File" } }),
-    { type: "update_file", path: "a.txt", diff: "@@\n+x\n*** End of File" },
-  );
+test("requests without the patch argument are rejected before any filesystem mutation", async () => {
+  const dir = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    await assert.rejects(execute({}, { cwd: dir }), /exactly one argument/);
+    await assert.rejects(execute("not an object", { cwd: dir }), /object with a patch argument/);
+    assert.deepEqual(await readdir(dir), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -291,7 +259,7 @@ test("create_file commit refuses to overwrite a concurrently created target", as
     };
     try {
       await assert.rejects(
-        execute({ operation: { type: "create_file", path: "raced.txt", diff: "+mine\n" } }, { cwd: dir }),
+        execute({ patch: envelope("*** Add File: raced.txt", "+mine") }, { cwd: dir }),
         /already exists; create_file refuses to overwrite/,
       );
     } finally {
@@ -309,32 +277,35 @@ test("create_file writes new files and rejects create-over-existing, directories
   const dir = await tempWorkspace();
   try {
     const { execute } = harness();
-    const created = await execute({ operation: { type: "create_file", path: "src/new.txt", diff: "+hello\n+world\n" } }, { cwd: dir });
-    assert.match(created.content[0].text, /created src\/new\.txt/);
-    // Upstream V4A create emits a trailing newline only for an explicit final '+' line.
-    assert.equal(await readFile(join(dir, "src/new.txt"), "utf8"), "hello\nworld");
+    const created = await execute({ patch: envelope("*** Add File: src/new.txt", "+hello", "+world") }, { cwd: dir });
+    assert.match(created.content[0].text, /Success\. Updated the following files:\nA src\/new\.txt/);
+    // Codex newline semantics: every Add File line contributes the line plus
+    // a newline.
+    assert.equal(await readFile(join(dir, "src/new.txt"), "utf8"), "hello\nworld\n");
     assert.equal(created.details.operation, "create_file");
     assert.equal(created.details.mutated, true);
 
-    const trailing = await execute({ operation: { type: "create_file", path: "src/eol.txt", diff: "+a\n+\n" } }, { cwd: dir });
-    assert.equal(await readFile(join(dir, "src/eol.txt"), "utf8"), "a\n");
+    // A bare '+' line contributes an empty line.
+    const trailing = await execute({ patch: envelope("*** Add File: src/eol.txt", "+a", "+") }, { cwd: dir });
+    assert.equal(await readFile(join(dir, "src/eol.txt"), "utf8"), "a\n\n");
     void trailing;
 
     await assert.rejects(
-      execute({ operation: { type: "create_file", path: "src/new.txt", diff: "+again\n" } }, { cwd: dir }),
+      execute({ patch: envelope("*** Add File: src/new.txt", "+again") }, { cwd: dir }),
       /already exists/,
     );
     await assert.rejects(
-      execute({ operation: { type: "create_file", path: "src", diff: "+x\n" } }, { cwd: dir }),
+      execute({ patch: envelope("*** Add File: src", "+x") }, { cwd: dir }),
       /already exists and is a directory/,
     );
     await assert.rejects(
-      execute({ operation: { type: "create_file", path: "bin.bin", diff: "+\u0000\n" } }, { cwd: dir }),
+      execute({ patch: envelope("*** Add File: bin.bin", "+\u0000") }, { cwd: dir }),
       /binary content/,
     );
+    // A non-plus line inside an Add File section is not a valid hunk header.
     await assert.rejects(
-      execute({ operation: { type: "create_file", path: "bad.txt", diff: "no prefix\n" } }, { cwd: dir }),
-      /Invalid Add File Line/,
+      execute({ patch: envelope("*** Add File: bad.txt", "no prefix") }, { cwd: dir }),
+      /not a valid hunk header/,
     );
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -349,8 +320,8 @@ test("update_file patches content and preserves mode, BOM, line endings, and tra
     await writeFile(target, "\uFEFFone\r\ntwo\r\n", "utf8");
     await chmod(target, 0o600);
 
-    const result = await execute(updateOperation("notes.txt", "@@ one\n-two\n+TWO\n"), { cwd: dir });
-    assert.match(result.content[0].text, /updated notes\.txt \(\+1 −1 lines\)/);
+    const result = await execute(updateEnvelope("notes.txt", "@@ one\n-two\n+TWO\n"), { cwd: dir });
+    assert.match(result.content[0].text, /Success\. Updated the following files:\nM notes\.txt/);
     const updated = await readFile(target, "utf8");
     assert.equal(updated, "\uFEFFone\r\nTWO\r\n");
     assert.equal((await lstat(target)).mode & 0o777, 0o600);
@@ -359,7 +330,7 @@ test("update_file patches content and preserves mode, BOM, line endings, and tra
 
     // No-change update is a successful no-op that does not replace the file.
     const beforeNoop = await lstat(target);
-    const noop = await execute(updateOperation("notes.txt", " one\r\n TWO\r\n"), { cwd: dir });
+    const noop = await execute(updateEnvelope("notes.txt", " one\n TWO\n"), { cwd: dir });
     assert.equal(noop.details.changed, false);
     assert.equal(noop.details.mutated, false);
     assert.equal((await lstat(target)).ino, beforeNoop.ino);
@@ -367,7 +338,7 @@ test("update_file patches content and preserves mode, BOM, line endings, and tra
     // Trailing newline state survives EOF appends.
     const noTrailing = join(dir, "tail.txt");
     await writeFile(noTrailing, "a\nb", "utf8");
-    await execute(updateOperation("tail.txt", "@@\n+c\n*** End of File"), { cwd: dir });
+    await execute(updateEnvelope("tail.txt", "@@\n+c\n*** End of File"), { cwd: dir });
     assert.equal(await readFile(noTrailing, "utf8"), "a\nb\nc");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -381,7 +352,7 @@ test("update_file preserves exact permission bits independent of the process uma
     const target = join(dir, "perm.txt");
     await writeFile(target, "one\ntwo\n", "utf8");
     await chmod(target, 0o666);
-    await execute(updateOperation("perm.txt", "-two\n+TWO\n"), { cwd: dir });
+    await execute(updateEnvelope("perm.txt", "-two\n+TWO\n"), { cwd: dir });
     assert.equal((await lstat(target)).mode & 0o777, 0o666);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -393,7 +364,7 @@ test("line counts include content lines that themselves start with -- or ++", as
   try {
     const { execute } = harness();
     await writeFile(join(dir, "flags.txt"), "a\n-- off\n++ on\nb\n", "utf8");
-    const result = await execute(updateOperation("flags.txt", "@@ a\n--- off\n-++ on\n+done\n"), { cwd: dir });
+    const result = await execute(updateEnvelope("flags.txt", "@@ a\n--- off\n-++ on\n+done\n"), { cwd: dir });
     assert.equal(await readFile(join(dir, "flags.txt"), "utf8"), "a\ndone\nb\n");
     assert.equal(result.details.addedLines, 1);
     assert.equal(result.details.removedLines, 2);
@@ -410,7 +381,7 @@ test("update_file failures are atomic and leave no temporary files", async () =>
     const original = "one\ntwo\nthree\n";
     await writeFile(target, original, "utf8");
 
-    await assert.rejects(execute(updateOperation("code.py", "@@ one\n-missing\n+replacement\n"), { cwd: dir }), /Invalid Context/);
+    await assert.rejects(execute(updateEnvelope("code.py", "@@ one\n-missing\n+replacement\n"), { cwd: dir }), /Invalid Context/);
     assert.equal(await readFile(target, "utf8"), original);
     const files = await readdir(dir);
     assert.deepEqual(files.filter((name) => name.endsWith(".tmp")), [], "temporary files must be cleaned up");
@@ -425,10 +396,10 @@ test("update_file reports binary and missing-target failures informatively", asy
   try {
     const { execute } = harness();
     await writeFile(join(dir, "blob.bin"), Buffer.from([0x00, 0xff, 0x0a]));
-    await assert.rejects(execute(updateOperation("blob.bin", "-x\n+y\n"), { cwd: dir }), /binary or not valid UTF-8/);
-    await assert.rejects(execute(updateOperation("missing.txt", "-x\n+y\n"), { cwd: dir }), /does not exist/);
+    await assert.rejects(execute(updateEnvelope("blob.bin", "-x\n+y\n"), { cwd: dir }), /binary or not valid UTF-8/);
+    await assert.rejects(execute(updateEnvelope("missing.txt", "-x\n+y\n"), { cwd: dir }), /does not exist/);
     await mkdir(join(dir, "sub"), { recursive: true });
-    await assert.rejects(execute(updateOperation("sub", "-x\n+y\n"), { cwd: dir }), /not a regular file/);
+    await assert.rejects(execute(updateEnvelope("sub", "-x\n+y\n"), { cwd: dir }), /not a regular file/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -439,23 +410,23 @@ test("delete_file removes files and rejects missing or non-regular targets", asy
   try {
     const { execute } = harness();
     await writeFile(join(dir, "gone.txt"), "bye\n", "utf8");
-    const result = await execute({ operation: { type: "delete_file", path: "gone.txt" } }, { cwd: dir });
-    assert.match(result.content[0].text, /deleted gone\.txt/);
+    const result = await execute({ patch: envelope("*** Delete File: gone.txt") }, { cwd: dir });
+    assert.match(result.content[0].text, /Success\. Updated the following files:\nD gone\.txt/);
     await assert.rejects(lstat(join(dir, "gone.txt")));
     // Deletions of reasonably sized text files expose a bounded final diff.
     assert.ok(typeof result.details.finalDiff === "string");
     assert.match(result.details.finalDiff as string, /\+\+\+ \/dev\/null/);
     assert.match(result.details.finalDiff as string, /-bye/);
     assert.equal(result.details.removedLines, 1);
-    await assert.rejects(execute({ operation: { type: "delete_file", path: "gone.txt" } }, { cwd: dir }), /does not exist/);
+    await assert.rejects(execute({ patch: envelope("*** Delete File: gone.txt") }, { cwd: dir }), /does not exist/);
     await mkdir(join(dir, "folder"), { recursive: true });
-    await assert.rejects(execute({ operation: { type: "delete_file", path: "folder" } }, { cwd: dir }), /not a regular file/);
+    await assert.rejects(execute({ patch: envelope("*** Delete File: folder") }, { cwd: dir }), /not a regular file/);
 
     // Binary/non-UTF-8 files are rejected before mutation: ApplyPatch only
     // handles UTF-8 text files.
     await writeFile(join(dir, "blob.bin"), Buffer.from([0x00, 0xff, 0x0a]));
     await assert.rejects(
-      execute({ operation: { type: "delete_file", path: "blob.bin" } }, { cwd: dir }),
+      execute({ patch: envelope("*** Delete File: blob.bin") }, { cwd: dir }),
       /binary or not valid UTF-8/,
     );
     assert.equal((await readFile(join(dir, "blob.bin"))).length, 3, "the binary file must remain");
@@ -463,7 +434,7 @@ test("delete_file removes files and rejects missing or non-regular targets", asy
     // Valid UTF-8 containing a NUL byte is also refused.
     await writeFile(join(dir, "nul.txt"), "a\u0000b\n", "utf8");
     await assert.rejects(
-      execute({ operation: { type: "delete_file", path: "nul.txt" } }, { cwd: dir }),
+      execute({ patch: envelope("*** Delete File: nul.txt") }, { cwd: dir }),
       /refusing to delete binary content \(NUL byte\)/,
     );
     await assert.doesNotReject(lstat(join(dir, "nul.txt")));
@@ -488,7 +459,7 @@ test("delete_file aborts before unlinking when cancellation arrives during valid
     };
     try {
       await assert.rejects(
-        execute({ operation: { type: "delete_file", path: "late-abort.txt" } }, { cwd: dir, signal: controller.signal }),
+        execute({ patch: envelope("*** Delete File: late-abort.txt") }, { cwd: dir, signal: controller.signal }),
         /cancel|abort/i,
       );
     } finally {
@@ -505,8 +476,9 @@ test("update_file with moveTo patches and atomically renames within the workspac
   try {
     const { execute } = harness();
     await writeFile(join(dir, "old.txt"), "one\ntwo\n", "utf8");
-    const result = await execute(updateOperation("old.txt", "-one\n+FIRST\n", "nested/new.txt"), { cwd: dir });
-    assert.match(result.content[0].text, /moved it to nested\/new\.txt/);
+    const result = await execute(updateEnvelope("old.txt", "-one\n+FIRST\n", "nested/new.txt"), { cwd: dir });
+    // Upstream reports a moved file under its source path as modified.
+    assert.match(result.content[0].text, /Success\. Updated the following files:\nM old\.txt/);
     assert.equal(await readFile(join(dir, "nested/new.txt"), "utf8"), "FIRST\ntwo\n");
     await assert.rejects(lstat(join(dir, "old.txt")));
     assert.equal(result.details.moveTo, "nested/new.txt");
@@ -516,8 +488,8 @@ test("update_file with moveTo patches and atomically renames within the workspac
 
     await writeFile(join(dir, "a.txt"), "x\n", "utf8");
     await writeFile(join(dir, "b.txt"), "y\n", "utf8");
-    await assert.rejects(execute(updateOperation("a.txt", "-x\n+X\n", "b.txt"), { cwd: dir }), /already exists/);
-    await assert.rejects(execute(updateOperation("a.txt", "-x\n+X\n", "a.txt"), { cwd: dir }), /must differ/);
+    await assert.rejects(execute(updateEnvelope("a.txt", "-x\n+X\n", "b.txt"), { cwd: dir }), /already exists/);
+    await assert.rejects(execute(updateEnvelope("a.txt", "-x\n+X\n", "a.txt"), { cwd: dir }), /resolves to the same file/);
     assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "x\n");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -537,7 +509,7 @@ test("move destination preparation failure leaves the source file unchanged", as
     // The destination cannot be prepared (an intermediate component is a
     // regular file); the rejection must happen before any mutation.
     await assert.rejects(
-      execute(updateOperation("src.txt", "-one\n+FIRST\n", "blocker/dst.txt"), { cwd: dir }),
+      execute(updateEnvelope("src.txt", "-one\n+FIRST\n", "blocker/dst.txt"), { cwd: dir }),
       (error: Error) => /intermediate path component is not a directory|moving to blocker\/dst\.txt failed/.test(error.message),
     );
     assert.equal(await readFile(target, "utf8"), original);
@@ -563,7 +535,7 @@ test("move fails safely on filesystems without hard-link support", async () => {
     };
     try {
       await assert.rejects(
-        execute(updateOperation("src.txt", "-one\n+FIRST\n", "dst.txt"), { cwd: dir }),
+        execute(updateEnvelope("src.txt", "-one\n+FIRST\n", "dst.txt"), { cwd: dir }),
         /moving to dst\.txt failed.*link unsupported/s,
       );
     } finally {
@@ -592,7 +564,7 @@ test("create_file fails safely on filesystems without hard-link support", async 
     };
     try {
       await assert.rejects(
-        execute({ operation: { type: "create_file", path: "no-link.txt", diff: "+x\n" } }, { cwd: dir }),
+        execute({ patch: envelope("*** Add File: no-link.txt", "+x") }, { cwd: dir }),
         /link unsupported/,
       );
     } finally {
@@ -625,7 +597,7 @@ test("move commit failure leaves the source file unchanged and creates no destin
     };
     try {
       await assert.rejects(
-        execute(updateOperation("src.txt", "-one\n+FIRST\n", "dst.txt"), { cwd: dir }),
+        execute(updateEnvelope("src.txt", "-one\n+FIRST\n", "dst.txt"), { cwd: dir }),
         /moving to dst\.txt failed and the source was left unchanged/,
       );
     } finally {
@@ -654,25 +626,25 @@ test("paths escaping the workspace are rejected before mutation", async () => {
 
     for (const path of ["../victim.txt", "sub/../../victim.txt", outside, join(outside, "victim.txt"), ".", "/etc/hosts"]) {
       await assert.rejects(
-        execute({ operation: { type: "create_file", path, diff: "+nope\n" } }, { cwd: dir }),
+        execute({ patch: envelope("*** Add File: " + path, "+nope") }, { cwd: dir }),
         (error: Error) => /outside the current workspace|workspace root/.test(error.message),
         `expected confinement rejection for ${path}`,
       );
     }
     await assert.rejects(
-      execute(updateOperation("../victim.txt", "-original\n+new\n"), { cwd: dir }),
+      execute(updateEnvelope("../victim.txt", "-original\n+new\n"), { cwd: dir }),
       /outside the current workspace/,
     );
     await mkdir(join(dir, "sub"), { recursive: true });
     await assert.rejects(
-      execute(updateOperation("sub/../../victim.txt", "-original\n+new\n"), { cwd: dir }),
+      execute(updateEnvelope("sub/../../victim.txt", "-original\n+new\n"), { cwd: dir }),
       /outside the current workspace/,
     );
     assert.equal(await readFile(join(outside, "victim.txt"), "utf8"), "original\n");
 
     // Absolute paths inside the workspace remain allowed.
-    await execute({ operation: { type: "create_file", path: join(dir, "inside.txt"), diff: "+ok\n" } }, { cwd: dir });
-    assert.equal(await readFile(join(dir, "inside.txt"), "utf8"), "ok");
+    await execute({ patch: envelope("*** Add File: " + join(dir, "inside.txt"), "+ok") }, { cwd: dir });
+    assert.equal(await readFile(join(dir, "inside.txt"), "utf8"), "ok\n");
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
@@ -687,10 +659,10 @@ test("symlink escapes and symlinked targets are rejected without following them"
     await writeFile(join(outside, "target.txt"), "outside\n", "utf8");
     await symlink(join(outside, "target.txt"), join(dir, "link.txt"));
 
-    await assert.rejects(execute(updateOperation("link.txt", "-outside\n+inside\n"), { cwd: dir }), /outside the current workspace|symlink/);
-    await assert.rejects(execute({ operation: { type: "delete_file", path: "link.txt" } }, { cwd: dir }), /outside the current workspace|symlink/);
+    await assert.rejects(execute(updateEnvelope("link.txt", "-outside\n+inside\n"), { cwd: dir }), /outside the current workspace|symlink/);
+    await assert.rejects(execute({ patch: envelope("*** Delete File: link.txt") }, { cwd: dir }), /outside the current workspace|symlink/);
     await assert.rejects(
-      execute({ operation: { type: "create_file", path: "link.txt", diff: "+x\n" } }, { cwd: dir }),
+      execute({ patch: envelope("*** Add File: link.txt", "+x") }, { cwd: dir }),
       /outside the current workspace|already exists/,
     );
     assert.equal(await readFile(join(outside, "target.txt"), "utf8"), "outside\n");
@@ -700,7 +672,7 @@ test("symlink escapes and symlinked targets are rejected without following them"
     await writeFile(join(outside, "docs", "nested.txt"), "outside\n", "utf8");
     await symlink(join(outside, "docs"), join(dir, "docs-link"));
     await assert.rejects(
-      execute(updateOperation("docs-link/nested.txt", "-outside\n+inside\n"), { cwd: dir }),
+      execute(updateEnvelope("docs-link/nested.txt", "-outside\n+inside\n"), { cwd: dir }),
       (error: Error) => /outside the current workspace|symlink|not a regular file/.test(error.message),
     );
     assert.equal(await readFile(join(outside, "docs", "nested.txt"), "utf8"), "outside\n");
@@ -726,14 +698,14 @@ test("ApplyPatch renders compact call and result summaries with supported theme 
     },
   };
   const call = renderApplyPatchCall(
-    { operation: { type: "update_file", path: "src/app.ts", moveTo: "src/main.ts", diff: "-a" } },
+    { patch: envelope("*** Update File: src/app.ts", "*** Move to: src/main.ts", "@@", "-a") },
     theme,
   ) as { render(width: number): string[] };
   const callLine = call.render(120).join("\n");
   assert.match(callLine, /ApplyPatch/);
-  assert.match(callLine, /update_file/);
-  assert.match(callLine, /src\/app\.ts/);
-  assert.match(callLine, /src\/main\.ts/);
+  // The compact call header summarizes the envelope: operation count plus
+  // the first file paths (move destinations are not part of that scan).
+  assert.match(callLine, /1 file operation\(s\) · src\/app\.ts/);
 
   // Canonical collapsed card: bounded header plus per-file inventory, with
   // no raw summary block and no legacy bounded diff previews. Expansion (the
@@ -815,17 +787,15 @@ test("ApplyPatch renders compact call and result summaries with supported theme 
   assert.match(errorRendered.render(120).join("\n"), /error\)\[ApplyPatch failed: boom\]/);
 });
 
-test("ApplyPatch call evidence pre-captures operation.path and operation.moveTo mutation candidates", async () => {
+test("ApplyPatch call evidence pre-captures envelope path and move destination mutation candidates", async () => {
   const dir = await tempWorkspace();
   try {
     await writeFile(join(dir, "existing.txt"), "before\n", "utf8");
     const state = createEvidenceState();
-    const input = {
-      operation: { type: "update_file", path: "existing.txt", moveTo: "renamed.txt", diff: "-before\n+after\n" },
-    };
+    const input = { patch: envelope("*** Update File: existing.txt", "*** Move to: renamed.txt", "-before", "+after") };
     const extracted = extractCandidatePaths("ApplyPatch", input);
     assert.deepEqual(extracted.paths.map((candidate) => candidate.path).sort(), ["existing.txt", "renamed.txt"]);
-    assert.ok(extracted.paths.every((candidate) => candidate.source.startsWith("ApplyPatch:operation.")));
+    assert.ok(extracted.paths.every((candidate) => candidate.source.startsWith("ApplyPatch:patch")));
     assert.ok(extracted.riskSignals.includes("apply_patch_mutation"));
 
     assert.equal(shouldRecordToolCallEvidence("ApplyPatch"), true);
@@ -847,14 +817,12 @@ test("ApplyPatch call evidence pre-captures operation.path and operation.moveTo 
   }
 });
 
-test("ApplyPatch evidence normalizes leading @ markers on operation.path and operation.moveTo", async () => {
+test("ApplyPatch evidence normalizes leading @ markers on envelope path and move destination", async () => {
   const dir = await tempWorkspace();
   try {
     await mkdir(join(dir, "src"), { recursive: true });
     await writeFile(join(dir, "src", "a.ts"), "before\n", "utf8");
-    const input = {
-      operation: { type: "update_file", path: "@src/a.ts", moveTo: "@src/b.ts", diff: "-before\n+after\n" },
-    };
+    const input = { patch: envelope("*** Update File: @src/a.ts", "*** Move to: @src/b.ts", "-before", "+after") };
 
     // The leading '@' convention marker is stripped exactly like the tool's
     // own path handling, so candidates point at the mutated files.
@@ -888,14 +856,14 @@ for (const obstacle of ["conflict gate", "landing lease"] as const) {
       const target = join(dir, "conflict.txt");
       await writeFile(target, "unresolved\n");
       const { execute } = harness();
-      await execute(updateOperation("conflict.txt", "-unresolved\n+resolved\n"), { cwd: dir, signal: t.signal });
+      await execute(updateEnvelope("conflict.txt", "-unresolved\n+resolved\n"), { cwd: dir, signal: t.signal });
       assert.equal(await readFile(target, "utf8"), "resolved\n");
       if (obstacle === "conflict gate") {
         assert.equal(sourceMutationCoordinator.blocked(dir).blocked, true, "foreground editing must not clear the automatic landing gate");
       }
       const cancelled = new AbortController();
       cancelled.abort(new Error("cancelled foreground patch"));
-      await assert.rejects(execute(updateOperation("conflict.txt", "-resolved\n+wrong\n"), { cwd: dir, signal: cancelled.signal }), /cancel/i);
+      await assert.rejects(execute(updateEnvelope("conflict.txt", "-resolved\n+wrong\n"), { cwd: dir, signal: cancelled.signal }), /cancel/i);
       assert.equal(await readFile(target, "utf8"), "resolved\n");
     } finally {
       release();
@@ -913,13 +881,13 @@ test("ApplyPatch aborts before mutating when the signal is already aborted", asy
     const controller = new AbortController();
     controller.abort();
     await assert.rejects(
-      execute(updateOperation("abort.txt", "-original\n+new\n"), { cwd: dir, signal: controller.signal }),
+      execute(updateEnvelope("abort.txt", "-original\n+new\n"), { cwd: dir, signal: controller.signal }),
       (error: Error) => /cancel|abort/i.test(error.message),
     );
     assert.equal(await readFile(target, "utf8"), "original\n");
 
     await assert.rejects(
-      execute({ operation: { type: "create_file", path: "never.txt", diff: "+x\n" } }, { cwd: dir, signal: controller.signal }),
+      execute({ patch: envelope("*** Add File: never.txt", "+x") }, { cwd: dir, signal: controller.signal }),
       (error: Error) => /cancel|abort/i.test(error.message),
     );
     await assert.rejects(lstat(join(dir, "never.txt")));
@@ -1232,7 +1200,7 @@ test("an external edit landing during the staging window is not overwritten by a
     };
     try {
       await assert.rejects(
-        execute({ operation: { type: "update_file", path: "race.txt", diff: "-two\n+TWO\n" } }, { cwd: dir }),
+        execute(updateEnvelope("race.txt", "-two\n+TWO\n"), { cwd: dir }),
         /changed after validation; refusing to overwrite concurrent edits/,
       );
     } finally {

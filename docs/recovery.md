@@ -152,6 +152,29 @@ verified checkpoint, hashed artifact inventory, current bundle, and safe next ac
 (see [Delegated execution](delegated-execution.md#steering-continuation-and-failure-handling)).
 A restarted task warns when its prior runtime configuration differs.
 
+## Worker worktree branch-checkout damage
+
+Worker prompts carry an authoritative workspace contract: a managed worktree is a
+detached-HEAD worktree at a synthetic captured base (which already contains the target
+workspace's uncommitted content), the task's named issue branch belongs to the target
+capture/landing checkout, and the harness owns checkpointing and landing. A worker that
+nonetheless checks out a branch inside its managed worktree has its HEAD attached and, when the branch's commit differs from the current
+commit, its tree reset to that branch's committed state (same-commit branch creation
+changes only HEAD attachment); checkpoint validation fails closed and
+blocks review or landing for that worktree.
+
+There is no automatic repair for this case. The shipped orchestrator skill's recovery
+runbook documents verified, current-capability manual salvage: verify the quiesced
+writer and worktree identity, pin retained commits and stashed uncommitted content to
+create-only refs in the wave's private repository, export the retained material for
+explicit user-authorized manual application in the target checkout (read-only for the
+worktree), and restore detachment without changing the working tree only when attempting
+normal continuation. Detachment alone does not create, verify, or
+revalidate any durable checkpoint, and content already destroyed by the checkout is
+reported as lost rather than guessed at. See the shipped orchestrator skill's recovery
+runbook (`skills/orchestrator/references/recovery.md`) and
+[Delegated execution](delegated-execution.md#landing-and-source-preservation).
+
 ## What shutdown preserves and removes
 
 The page cache is force-removed on session/application shutdown. Shutdown also removes

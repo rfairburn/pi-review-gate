@@ -157,6 +157,10 @@ interface ExecutionToolManagerInput {
 
 interface CommandUi {
   select(title: string, options: string[]): Promise<string | undefined>;
+  /** Existing Pi confirmation dialog convention: `true` confirms, `false` or
+   * dismissal (undefined) cancels. Optional because some hosts expose only
+   * select/input/editor. */
+  confirm?(title: string, message: string): Promise<boolean | undefined>;
   input?(title: string, placeholder?: string): Promise<string | undefined>;
   editor?(title: string, initial?: string): Promise<string | undefined>;
 }
@@ -280,21 +284,24 @@ export class ExecutionToolManager {
       const selected = await selectTask(this.controller, ctx, "Inspect background subtask");
       return selected ? this.controller.inspectTask(selected.executionId, selected.taskId) : undefined;
     });
-    register("subtask-add", "Pick an execution and add JSON task definitions; explicit arguments remain optional.", async (args, ctx) => {
-      let [executionId, json] = splitFirst(args);
-      const ui = commandUi(ctx);
-      if (!executionId) executionId = await selectExecution(this.controller, ctx, "Add tasks to execution");
-      if (!executionId) return undefined;
-      if (!json) {
-        if (!ui?.editor && !ui?.input) throw new Error("interactive editor/input is unavailable; use /subtask-add <executionId> <task-or-array-json>");
-        json = (await ui.editor?.("Task JSON (one object or an array)", ""))
-          ?? (await ui.input?.("Task JSON (one object or an array)"))
-          ?? "";
-      }
-      if (!json.trim()) return undefined;
-      const parsed = JSON.parse(json) as unknown;
-      const tasks = normalizeTasks(Array.isArray(parsed) ? parsed : [parsed]);
-      return this.controller.add(executionId, tasks);
+    register("subtask-add", "Submit a subtask: the plain text argument is the raw instructions of one task in one new group immediately; no arguments opens the staged task form with an explicit submission step.", async (args, ctx) => {
+      const trimmed = args.trim();
+      // #120: no arguments opens the staged multi-field submission form
+      // (new or existing group). This replaces the former pick-an-execution
+      // flow, which only existed for the JSON path.
+      if (!trimmed) return await this.subtaskAddForm(ctx);
+      // #120 (correction): every nonblank argument is the raw task
+      // instructions of exactly one task in one new default execution group —
+      // including text that begins with an existing execution id, JSON-only
+      // text, arrays, and prose or pasted code containing JSON. The human
+      // command performs no JSON parsing or handle detection; structured
+      // task submission stays on the model-facing SubtasksStart/SubtasksAdd
+      // APIs, which are unchanged.
+      await this.prepareCommandDispatch(ctx);
+      return await this.controller.start(
+        this.withParentTools([plainTextSubtaskDefinition(trimmed)], "execute"),
+        "execute",
+      );
     });
     register("subtask-steer", "Pick and steer a queued, active, or reviewing task; explicit arguments remain optional.", async (args, ctx) => {
       const explicit = args.trim().length > 0;
@@ -379,6 +386,151 @@ export class ExecutionToolManager {
     });
     register("subtask-mark-clean", "Validate resolved conflict markers and resume queued landings.", async () => this.controller.markClean({ actor: "user" }));
     this.commandsRegistered = true;
+  }
+
+  /** #120: command submissions reuse the tool path's context wiring so scoped
+   * model routing and the live indicator stay authoritative and identical. */
+  private async prepareCommandDispatch(ctx: unknown): Promise<void> {
+    this.controller.setUiContext(ctx);
+    const models = scopedModelChoices(ctx)?.map((choice) => choice.model);
+    if (models) this.controller.setScopedModels(models);
+  }
+
+  /**
+   * #120: the no-argument /subtask-add staged form. Every prompt stages one
+   * field and fields are kept until explicit submission; cancellation at any
+   * stage (a dismissed prompt) creates neither a task nor a group, and required
+   * fields are validated before anything is submitted. New groups use the
+   * SubtasksStart defaults (kind chosen in the form; an omitted or blank
+   * workspace resolves to the current session workspace); existing groups
+   * contribute their immutable kind and target workspace, which added tasks
+   * inherit without retargeting. Submission routes through the same controller
+   * Start/Add behavior and role routing the model tools use.
+   */
+  private async subtaskAddForm(ctx: unknown): Promise<BackgroundInspection | undefined> {
+    await this.prepareCommandDispatch(ctx);
+    const ui = commandUi(ctx);
+    if (!ui || (!ui.input && !ui.editor)) {
+      throw new Error("interactive form is unavailable; use /subtask-add <prompt> to submit one new group");
+    }
+    const destination = await ui.select("Submit a subtask", [
+      "Create a new execution group",
+      "Add to an existing execution group",
+    ]);
+    if (!destination) return undefined;
+
+    if (destination === "Add to an existing execution group") {
+      const groups = this.controller.list();
+      if (groups.length === 0) {
+        // Fail fast before collecting task fields: there is nothing to add to.
+        throw new Error("no execution groups are available");
+      }
+      const labels = groups.map((inspection) =>
+        `${inspection.executionId} · ${inspection.kind} · workspace ${inspection.cwd} · ${inspection.activeCount} active · ${inspection.historicalCount} total`);
+      const selected = await ui.select("Existing execution group", labels);
+      if (!selected) return undefined;
+      const target = groups[labels.indexOf(selected)];
+      if (!target) return undefined;
+      const task = await this.formTaskFields(ui);
+      if (!task) return undefined;
+      // Explicit final submission step: nothing is dispatched until the staged
+      // destination/task/settings are confirmed. Cancellation creates neither
+      // a task nor a group. Added tasks inherit the group's immutable kind and
+      // target workspace; the form never retargets the group.
+      const confirmed = await this.confirmStagedSubmission(ui, {
+        destination: `existing execution group ${target.executionId}`,
+        kind: target.kind,
+        workspace: target.cwd,
+        task,
+      });
+      if (!confirmed) return undefined;
+      return await this.controller.add(target.executionId, this.withParentTools([task], target.kind));
+    }
+
+    const task = await this.formTaskFields(ui);
+    if (!task) return undefined;
+    const kind = await ui.select("Execution kind", ["execute", "research"]);
+    if (!kind) return undefined;
+    if (kind !== "execute" && kind !== "research") throw new Error("kind must be execute or research");
+    const workspace = await this.formPrompt(ui, "Target workspace (optional; leave blank to use the current session workspace)");
+    if (workspace === undefined) return undefined;
+    const resolvedWorkspace = workspace.trim();
+    // Explicit final submission step: the staged destination, kind, workspace,
+    // and task fields are shown for confirmation; nothing is dispatched until
+    // the user explicitly submits, and cancellation creates no group.
+    const confirmed = await this.confirmStagedSubmission(ui, {
+      destination: "a new execution group",
+      kind,
+      workspace: resolvedWorkspace ? resolvedWorkspace : this.input.cwd(),
+      task,
+    });
+    if (!confirmed) return undefined;
+    return await this.controller.start(
+      this.withParentTools([task], kind),
+      kind,
+      resolvedWorkspace ? resolvedWorkspace : undefined,
+    );
+  }
+
+  /** #120 (correction): the explicit final submission step of the staged
+   * form. The complete staged input — destination, execution kind, target
+   * workspace, and task fields — is summarized for confirmation and nothing
+   * is dispatched until the user explicitly submits; cancellation or
+   * dismissal creates neither a task nor a group. Uses the existing
+   * confirm-dialog convention and fails closed when the host does not expose
+   * it, before anything is submitted. */
+  private async confirmStagedSubmission(
+    ui: CommandUi,
+    staged: { destination: string; kind: string; workspace: string; task: BackgroundTaskDefinition },
+  ): Promise<boolean> {
+    if (typeof ui.confirm !== "function") {
+      throw new Error("interactive confirmation is unavailable; nothing was submitted; re-run in an interactive UI");
+    }
+    const message = [
+      `destination: ${staged.destination}`,
+      `kind: ${staged.kind}`,
+      `workspace: ${staged.workspace}`,
+      `title: ${staged.task.title}`,
+      `instructions: ${staged.task.instructions}`,
+      `acceptance criteria (${staged.task.acceptanceCriteria.length}): ${staged.task.acceptanceCriteria.join("; ")}`,
+      ...(staged.task.relevantContext !== undefined ? [`relevant context: ${staged.task.relevantContext}`] : []),
+    ].join("\n");
+    return (await ui.confirm("Submit staged subtask?", message)) === true;
+  }
+
+  /** The staged task fields shared by both destinations: a required title,
+   * instructions, and one or more acceptance criteria (one per line), plus
+   * optional relevant context. Returns undefined when the user dismisses a
+   * prompt; throws when a required field is blank, before anything is
+   * submitted. */
+  private async formTaskFields(ui: CommandUi): Promise<BackgroundTaskDefinition | undefined> {
+    const title = await this.formPrompt(ui, "Task title");
+    if (title === undefined) return undefined;
+    if (!title.trim()) throw new Error("title is required; nothing was submitted");
+    const instructions = await this.formPrompt(ui, "Task instructions");
+    if (instructions === undefined) return undefined;
+    if (!instructions.trim()) throw new Error("instructions are required; nothing was submitted");
+    const criteriaText = await this.formPrompt(ui, "Acceptance criteria (one per line)");
+    if (criteriaText === undefined) return undefined;
+    const acceptanceCriteria = criteriaText.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+    if (acceptanceCriteria.length === 0) throw new Error("at least one acceptance criterion is required; nothing was submitted");
+    const contextText = await this.formPrompt(ui, "Relevant context (optional; leave blank to omit)");
+    if (contextText === undefined) return undefined;
+    const relevantContext = contextText.trim() ? contextText.trim() : undefined;
+    const [task] = normalizeTasks([{
+      title,
+      instructions,
+      acceptanceCriteria,
+      ...(relevantContext !== undefined ? { relevantContext } : {}),
+    }]);
+    return task;
+  }
+
+  /** One staged form prompt: prefers the multiline editor and falls back to a
+   * single-line input only when no editor is available, so cancelling the
+   * available prompt (undefined) is never swallowed by a fallback prompt. */
+  private async formPrompt(ui: CommandUi, title: string): Promise<string | undefined> {
+    return ui.editor ? await ui.editor(title, "") : await ui.input?.(title);
   }
 
   private register(): void {
@@ -1316,20 +1468,20 @@ async function selectTask(
   return choice ? { executionId: choice.executionId, taskId: choice.taskId } : undefined;
 }
 
-async function selectExecution(
-  controller: BackgroundExecutionController,
-  ctx: unknown,
-  title: string,
-): Promise<string | undefined> {
-  const ui = commandUi(ctx);
-  if (!ui) throw new Error("this command requires an interactive selector UI or an explicit executionId");
-  const choices = controller.list().map((inspection) => ({
-    executionId: inspection.executionId,
-    label: `${inspection.executionId} · ${inspection.activeCount} active · ${inspection.historicalCount} total`,
-  }));
-  if (choices.length === 0) throw new Error("no execution groups are available");
-  const selected = await ui.select(title, choices.map((choice) => choice.label));
-  return choices.find((choice) => choice.label === selected)?.executionId;
+/** #120: defaults for the plain-text /subtask-add submission. The prompt is
+ * preserved as the instructions with only the established command-argument
+ * surrounding-whitespace trim (interior whitespace is untouched); the title
+ * derives from it, and the single acceptance criterion restates the
+ * instructions without inventing any additional task requirement. Kind
+ * defaults to execute and the workspace to the current session workspace (the
+ * SubtasksStart defaults). */
+function plainTextSubtaskDefinition(prompt: string): BackgroundTaskDefinition {
+  const instructions = prompt.trim();
+  return {
+    title: clipPlain(instructions, 80),
+    instructions,
+    acceptanceCriteria: ["The task instructions are completed as written."],
+  };
 }
 
 function commandUi(ctx: unknown): CommandUi | undefined {

@@ -1,20 +1,20 @@
 /// ApplyPatch tool registration and argument parsing.
 ///
-/// The advertised contract is the canonical OpenAI/Codex apply_patch envelope
-/// carried in a single `patch` string (Pi's JSON tool transport carries one
-/// argument value, so the whole multi-file envelope travels as that string —
-/// the minimal transport difference from Codex's stdin/heredoc delivery). The
-/// legacy single-file structured `operation` object remains accepted for
-/// compatibility but is deliberately not part of the model-facing guidance.
-/// Execution is delegated to the sequential request engine (request.ts),
-/// which applies file operations in envelope order, stops at the first
-/// failure, retains earlier successes, and reports applied / failed /
-/// not-attempted operations plus any uncertain effects of the failed one.
+/// The only supported request format is the canonical OpenAI/Codex apply_patch
+/// envelope carried in a single `patch` string (Pi's JSON tool transport
+/// carries one argument value, so the whole multi-file envelope travels as
+/// that string — the minimal transport difference from Codex's stdin/heredoc
+/// delivery). Requests still carrying the removed legacy single-file
+/// structured `operation` argument are rejected before any filesystem
+/// mutation. Execution is delegated to the sequential request engine
+/// (request.ts), which applies file operations in envelope order, stops at
+/// the first failure, retains earlier successes, and reports applied / failed
+/// / not-attempted operations plus any uncertain effects of the failed one.
 
 import { isAbsolute } from "node:path";
 import { expandableResult } from "../tool-result-expansion";
 import { parseApplyPatchEnvelope, type ApplyPatchFileOp } from "./envelope";
-import { normalizeApplyPatchPath, normalizeApplyPatchPathMarker } from "./paths";
+import { normalizeApplyPatchPathMarker } from "./paths";
 import { performApplyPatchRequest, type AppliedOperation, type ApplyPatchFailure, type ApplyPatchOperationType } from "./request";
 import {
   renderApplyPatchResult,
@@ -35,138 +35,37 @@ export type { ApplyPatchRendererTheme };
 export { normalizeApplyPatchPathMarker };
 
 // ---------------------------------------------------------------------------
-// Legacy structured operation (compatibility)
-// ---------------------------------------------------------------------------
-
-export interface ApplyPatchCreateOperation {
-  type: "create_file";
-  path: string;
-  diff: string;
-}
-
-export interface ApplyPatchUpdateOperation {
-  type: "update_file";
-  path: string;
-  diff: string;
-  moveTo?: string;
-}
-
-export interface ApplyPatchDeleteOperation {
-  type: "delete_file";
-  path: string;
-}
-
-export type ParsedApplyPatchOperation = ApplyPatchCreateOperation | ApplyPatchUpdateOperation | ApplyPatchDeleteOperation;
-
-const OPERATION_TYPES: readonly ApplyPatchOperationType[] = ["create_file", "update_file", "delete_file"];
-
-/**
- * File-level V4A header lines. The engine treats them as section terminators,
- * so a body that still carries one would silently apply zero or partial
- * chunks; they are rejected up front with an informative diagnostic.
- */
-const FORBIDDEN_DIFF_HEADERS = /^\*\*\* (Begin Patch|End Patch|Add File:|Update File:|Delete File:|Move to:)/;
-
-function rejectDiffHeaders(diff: string): void {
-  for (const line of diff.split(/\r?\n/)) {
-    if (FORBIDDEN_DIFF_HEADERS.test(line)) {
-      throw new Error(
-        `operation.diff must be headerless; remove the line "${line.trim()}" — the operation type and paths are structured fields`,
-      );
-    }
-  }
-}
-
-/**
- * Validates the strict legacy structured `operation` argument. Kept for
- * compatibility with earlier sessions; the canonical `patch` envelope is the
- * preferred contract. Paths are normalized (a single leading `@` convention
- * marker is stripped) but not yet confined to the workspace; confinement
- * happens during request preflight.
- */
-export function parseApplyPatchOperation(params: unknown): ParsedApplyPatchOperation {
-  if (!isRecord(params)) throw new Error("request must be an object with an operation argument");
-  const keys = Object.keys(params);
-  if (keys.length !== 1 || keys[0] !== "operation") {
-    throw new Error(`ApplyPatch takes exactly one argument, operation; got ${keys.length === 0 ? "none" : keys.join(", ")}`);
-  }
-  const operation = params.operation;
-  if (!isRecord(operation)) throw new Error("operation must be an object");
-
-  const type = operation.type;
-  if (typeof type !== "string" || !OPERATION_TYPES.includes(type as ApplyPatchOperationType)) {
-    throw new Error(`operation.type must be one of ${OPERATION_TYPES.join(", ")}`);
-  }
-  const operationType = type as ApplyPatchOperationType;
-
-  const allowedKeys = operationType === "delete_file"
-    ? new Set(["type", "path"])
-    : new Set(["type", "path", "diff", ...(operationType === "update_file" ? ["moveTo"] : [])]);
-  for (const key of Object.keys(operation)) {
-    if (!allowedKeys.has(key)) throw new Error(`operation.${key} is not valid for operation type ${operationType}`);
-  }
-
-  const path = normalizeApplyPatchPath(operation.path, "operation.path");
-  if (operationType === "delete_file") {
-    return { type: operationType, path };
-  }
-
-  const diff = operation.diff;
-  if (typeof diff !== "string" || !diff.trim()) {
-    throw new Error(`operation.diff is required for ${operationType} and must be a non-empty headerless V4A diff body`);
-  }
-  rejectDiffHeaders(diff);
-  if (operationType === "create_file") {
-    return { type: operationType, path, diff };
-  }
-
-  const moveToRaw = operation.moveTo;
-  if (moveToRaw === undefined) return { type: operationType, path, diff };
-  const moveTo = normalizeApplyPatchPath(moveToRaw, "operation.moveTo");
-  if (moveTo === path) throw new Error("operation.moveTo must differ from operation.path");
-  return { type: operationType, path, diff, moveTo };
-}
-
-// ---------------------------------------------------------------------------
-// Request parsing (canonical envelope preferred, legacy operation accepted)
+// Request parsing (canonical envelope only)
 // ---------------------------------------------------------------------------
 
 export interface ParsedApplyPatchRequest {
   operations: ApplyPatchFileOp[];
-  /** Raw canonical envelope text (legacy structured requests carry none). */
-  patch?: string;
+  /** Raw canonical envelope text. */
+  patch: string;
 }
 
 /**
  * Validates the tool arguments and returns the ordered file operations of the
- * request. Exactly one of `patch` (canonical multi-file envelope) or
- * `operation` (legacy single-file object) may be present.
+ * request. The only accepted argument is the canonical `patch` envelope; the
+ * removed legacy structured `operation` argument is rejected with an explicit
+ * diagnostic before any filesystem mutation.
  */
 export function parseApplyPatchRequest(params: unknown): ParsedApplyPatchRequest {
-  if (!isRecord(params)) throw new Error("request must be an object with a patch or operation argument");
+  if (!isRecord(params)) throw new Error("request must be an object with a patch argument");
   const keys = Object.keys(params);
-  const hasPatch = keys.includes("patch");
-  const hasOperation = keys.includes("operation");
-  if (hasPatch === hasOperation) {
+  if (keys.length !== 1 || keys[0] !== "patch") {
+    const legacyNote = keys.includes("operation")
+      ? "; the legacy structured 'operation' argument is no longer supported, send the canonical patch envelope instead"
+      : "";
     throw new Error(
-      `ApplyPatch takes exactly one argument, either the canonical patch envelope or the legacy operation object; got ${keys.length === 0 ? "none" : keys.join(", ")}`,
+      `ApplyPatch takes exactly one argument, the canonical patch envelope; got ${keys.length === 0 ? "none" : keys.join(", ")}${legacyNote}`,
     );
-  }
-  if (hasOperation) {
-    const operation = parseApplyPatchOperation(params);
-    return { operations: [legacyOperationToFileOp(operation)] };
   }
   const operations = parseApplyPatchEnvelope(params.patch);
   if (operations.length === 0) {
     throw new Error("patch contains no file operations; every ApplyPatch request must modify at least one file");
   }
-  return { operations, patch: typeof params.patch === "string" ? params.patch : undefined };
-}
-
-function legacyOperationToFileOp(operation: ParsedApplyPatchOperation): ApplyPatchFileOp {
-  if (operation.type === "delete_file") return { type: "delete_file", path: operation.path };
-  if (operation.type === "create_file") return { type: "create_file", path: operation.path, diff: operation.diff };
-  return { type: "update_file", path: operation.path, diff: operation.diff, ...(operation.moveTo ? { moveTo: operation.moveTo } : {}) };
+  return { operations, patch: params.patch as string };
 }
 
 // ---------------------------------------------------------------------------
@@ -174,20 +73,10 @@ function legacyOperationToFileOp(operation: ParsedApplyPatchOperation): ApplyPat
 // ---------------------------------------------------------------------------
 
 export function applyPatchToolSchema(): Record<string, unknown> {
-  const path = {
-    type: "string",
-    minLength: 1,
-    description: "File path relative to the current workspace. A leading '@' is tolerated and stripped.",
-  };
-  const diff = {
-    type: "string",
-    minLength: 1,
-    description:
-      "Headerless V4A diff body (no *** Begin/Update/Add/Delete markers, no path header). For update_file: '@@' anchor lines plus ' ' context, '-' removal, and '+' addition lines; '*** End of File' anchors a section at end-of-file. For create_file: every line must start with '+'; a final '+' line yields a trailing newline.",
-  };
   return {
     type: "object",
     additionalProperties: false,
+    required: ["patch"],
     properties: {
       patch: {
         type: "string",
@@ -199,52 +88,7 @@ export function applyPatchToolSchema(): Record<string, unknown> {
           "'*** Delete File: <path>' — then '*** End Patch'. " +
           "A single request may mix operations across multiple files. Operations are applied sequentially in order and the request stops at the first failure: earlier operations remain applied, later ones are not attempted, and the error reports which operations applied, failed, and were skipped.",
       },
-      operation: {
-        description:
-          "Legacy single-file structured operation, kept for compatibility with earlier sessions. Prefer the canonical patch envelope.",
-        oneOf: [
-          {
-            type: "object",
-            additionalProperties: false,
-            required: ["type", "path", "diff"],
-            properties: {
-              type: { type: "string", enum: ["create_file"], description: "Create a new file from the diff body." },
-              path,
-              diff,
-            },
-          },
-          {
-            type: "object",
-            additionalProperties: false,
-            required: ["type", "path", "diff"],
-            properties: {
-              type: { type: "string", enum: ["update_file"], description: "Patch an existing file; optionally rename it via moveTo." },
-              path,
-              diff,
-              moveTo: {
-                type: "string",
-                minLength: 1,
-                description:
-                  "Optional new workspace-relative path. The patched content is committed at the destination before the source is removed, so a failed move leaves the source unchanged; the destination must not already exist.",
-              },
-            },
-          },
-          {
-            type: "object",
-            additionalProperties: false,
-            required: ["type", "path"],
-            properties: {
-              type: { type: "string", enum: ["delete_file"], description: "Delete an existing file." },
-              path,
-            },
-          },
-        ],
-      },
     },
-    oneOf: [
-      { type: "object", required: ["patch"] },
-      { type: "object", required: ["operation"] },
-    ],
   };
 }
 
@@ -262,17 +106,9 @@ export interface ApplyPatchToolOptions {
  * tested without registering a tool.
  */
 export function renderApplyPatchCall(args: unknown, theme: ApplyPatchRendererTheme): unknown {
-  if (isRecord(args) && typeof args.patch === "string") {
-    const suffix = ` · ${summarizeEnvelopeForCall(args.patch)}`;
-    return textComponent((width) => [
-      clip(theme.fg("toolTitle", theme.bold(APPLY_PATCH_TOOL_NAME)) + theme.fg("accent", suffix), width),
-    ]);
-  }
-  const operation = isRecord(args) && isRecord(args.operation) ? args.operation : undefined;
-  const type = typeof operation?.type === "string" ? operation.type : "operation";
-  const path = typeof operation?.path === "string" ? operation.path : "";
-  const moveTo = typeof operation?.moveTo === "string" ? ` → ${operation.moveTo}` : "";
-  const suffix = path ? ` · ${type} · ${path}${moveTo}` : ` · ${type}`;
+  const suffix = isRecord(args) && typeof args.patch === "string"
+    ? ` · ${summarizeEnvelopeForCall(args.patch)}`
+    : "";
   return textComponent((width) => [
     clip(theme.fg("toolTitle", theme.bold(APPLY_PATCH_TOOL_NAME)) + theme.fg("accent", suffix), width),
   ]);
@@ -337,13 +173,13 @@ export function registerApplyPatchTool(pi: unknown, options: ApplyPatchToolOptio
     description:
       "Apply a canonical OpenAI/Codex apply_patch envelope to the current workspace. One request carries '*** Begin Patch' ... '*** End Patch' and may mix " +
       "'*** Add File:' (plus-prefixed lines), '*** Update File:' (with optional '*** Move to:' rename and '@@ [anchor]' hunks of ' '/'-'/'+' lines, optionally anchored with '*** End of File'), " +
-      "and '*** Delete File:' operations across multiple files; disjoint hunks per file are supported. The complete envelope is parsed before any mutation, then operations are applied sequentially in order and the request stops at the first failure: earlier operations remain applied, later ones are not attempted, and the error reports which operations applied, failed, and were skipped (including any uncertain effects of the failed operation). A legacy single-file structured 'operation' argument remains accepted for compatibility; prefer the patch envelope.",
+      "and '*** Delete File:' operations across multiple files; disjoint hunks per file are supported. The complete envelope is parsed before any mutation, then operations are applied sequentially in order and the request stops at the first failure: earlier operations remain applied, later ones are not attempted, and the error reports which operations applied, failed, and were skipped (including any uncertain effects of the failed operation).",
     promptSnippet:
       "Use ApplyPatch with the canonical apply_patch envelope ('*** Begin Patch' ... '*** End Patch') for precise multi-file create/update/rename/delete mutations; the whole envelope is parsed before mutation, operations are applied sequentially and stop at the first failure (earlier successes stay applied), and every path is confined to the current workspace.",
     promptGuidelines: [
       "Send one canonical patch envelope per ApplyPatch call: '*** Begin Patch', then '*** Add File: <path>' (+ lines), '*** Update File: <path>' (optional '*** Move to: <path>', '@@ [anchor]' hunks, optional '*** End of File'), or '*** Delete File: <path>', then '*** End Patch'. Mix operations for multiple files in one envelope; disjoint hunks per file are supported.",
       "ApplyPatch applies operations sequentially in envelope order and stops at the first failure: earlier operations stay applied, later ones are skipped, and the error lists the applied, failed, and not-attempted operations. Fix the diagnostic and resubmit only the remaining operations rather than working around a failed patch with shell commands.",
-      "Paths are workspace-relative (a leading '@' is stripped). The legacy single-file 'operation' argument is still accepted but the patch envelope is the preferred contract.",
+      "Paths are workspace-relative (a leading '@' is stripped).",
     ],
     executionMode: "sequential",
     parameters: applyPatchToolSchema(),
@@ -385,10 +221,10 @@ async function executeApplyPatch(
     const message = failureMessage(applied, failed, notAttempted);
     throw new ApplyPatchExecutionError(message, failureDetails(result, request));
   }
-  const requestedDiff = clipText(request.patch ?? request.operations[0]!.diff ?? "", MAX_REQUESTED_DIFF_CHARS);
-  // Canonical envelope calls get the upstream Codex print_summary text; legacy
-  // structured calls keep the familiar per-operation summaries.
-  const summary = request.patch !== undefined ? canonicalSuccessSummary(applied) : requestSummary(applied);
+  const requestedDiff = clipText(request.patch, MAX_REQUESTED_DIFF_CHARS);
+  // The model-facing success text follows the upstream Codex print_summary
+  // format for every call.
+  const summary = canonicalSuccessSummary(applied);
   const details: Record<string, unknown> = {
     operations: applied.map(outcomeDetails),
     requestedDiff,
@@ -403,12 +239,11 @@ async function executeApplyPatch(
 }
 
 /**
- * Model-facing success text for canonical envelope calls, following the
- * upstream Codex print_summary format: "Success. Updated the following
- * files:" followed by git-style A/M/D lines grouped by status (application
- * order within a group), using the patch's path spelling. A moved file is
- * reported under its source path, exactly like upstream. Pi's structured
- * details remain additive.
+ * Model-facing success text following the upstream Codex print_summary format:
+ * "Success. Updated the following files:" followed by git-style A/M/D lines
+ * grouped by status (application order within a group), using the patch's path
+ * spelling. A moved file is reported under its source path, exactly like
+ * upstream. Pi's structured details remain additive.
  */
 function canonicalSuccessSummary(applied: AppliedOperation[]): string {
   const markFor = (operation: ApplyPatchOperationType): "A" | "M" | "D" =>
@@ -495,7 +330,7 @@ function failureDetails(
     } : {}),
     notAttempted: [...result.notAttempted],
     ...(result.finalDiff !== undefined ? { finalDiff: result.finalDiff } : {}),
-    requestedDiff: clipText(request.patch ?? request.operations[0]!.diff ?? "", MAX_REQUESTED_DIFF_CHARS),
+    requestedDiff: clipText(request.patch, MAX_REQUESTED_DIFF_CHARS),
     mutated: result.applied.some((outcome) => outcome.mutated),
   };
 }
@@ -528,16 +363,6 @@ function failureMessage(applied: AppliedOperation[], failed: ApplyPatchFailure, 
 function displayOf(failed: ApplyPatchFailure): string {
   const label = `${failed.operation} ${failed.path}`;
   return failed.moveTo !== undefined ? `${label} (moveTo ${failed.moveTo})` : label;
-}
-
-/** Familiar per-operation summaries, kept for legacy structured calls. */
-function requestSummary(outcomes: AppliedOperation[]): string {
-  if (outcomes.length === 1) return successSummary(outcomes[0]!);
-  return `ApplyPatch applied ${outcomes.length} file operation(s): ${outcomes.map(summaryClause).join("; ")}.`;
-}
-
-function successSummary(outcome: AppliedOperation): string {
-  return `ApplyPatch ${summaryClause(outcome)}.`;
 }
 
 function summaryClause(outcome: AppliedOperation): string {

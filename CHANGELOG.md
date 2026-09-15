@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.49]
+
+### Changed
+
+- Clarify detached managed-worktree ownership in worker prompts and the shipped
+  orchestration skill: issue branches belong to the separate target checkout, and
+  workers must preserve the synthetic captured baseline rather than switch branches.
+- Document recovery with current Git and harness capabilities, including retained
+  commit and dirty-content preservation, evidence-based export, and the distinction
+  between supported continuation and explicitly authorized manual salvage. No new
+  recovery engine or ForceMerge behavior is introduced.
+
 ## [0.1.0-dev.48]
 
 ### Changed

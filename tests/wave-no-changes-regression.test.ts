@@ -804,6 +804,14 @@ test("correction feedback paths are rewritten and isolation remains authoritativ
     rewritten.lastIndexOf("Workspace isolation (authoritative)") > rewritten.lastIndexOf("src/app.ts"),
     "the isolation directive must follow correction text",
   );
+  assert.ok(
+    rewritten.includes("never check out, create, switch, or delete Git branches"),
+    "continuation prompts must carry the detached-worktree branch rule",
+  );
+  assert.ok(
+    rewritten.includes("belongs to the target capture/landing checkout"),
+    "continuation prompts must keep the branch in the target checkout",
+  );
 });
 
 // ── Regression test: executor PWD matches actual cwd ────────────────────────

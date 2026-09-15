@@ -82,6 +82,111 @@ If continuation rejects a stale bundle, inspect again and retry with the returne
 
 Continuation uses the current `/review-settings`; a changed model or configuration is expected outside the happy path and should be treated as a warning, not as proof the checkpoint is invalid.
 
+## Recover a worker worktree whose detached HEAD was replaced by a branch checkout
+
+Workers run in detached-HEAD managed worktrees created at a synthetic captured base commit — pinned as `refs/pi-review-gate/waves/<waveId>/base` in the wave's private bare repository — whose tree already includes the target checkout's uncommitted content. Two accident classes differ materially:
+
+- **Branch creation without a start point** (`git checkout -b <name>` or `git switch -c <name>` at the detached HEAD) damages only HEAD attachment: HEAD's commit and the working tree are unchanged — creating a branch at the current commit captures nothing new but destroys nothing either — and a plain `git checkout --detach` restores the detached state with the ancestry precondition intact. Treat it like any other attached-HEAD finding and confirm the survey below; inspection may then still list normal continuation as safe.
+- **Checking out an existing branch, or branch creation with an explicit start point that differs from the current commit**, moves HEAD and the working tree to that commit's tree. Git refuses when a dirty tracked file or a needed untracked file would be overwritten, and otherwise carries compatible local edits over — but it silently drops from the working tree any content that exists only in the current tree, including captured baseline content the branch's tree lacks and committed worker content from earlier detached commits. That dropped content is recoverable only from the pinned base ref, salvage refs, and the reflog — never from the moved worktree.
+
+Prevent both with the workspace contract in the orchestrator skill; there is no polling or early detection that would catch it sooner.
+
+The failure usually surfaces as checkpoint or candidate validation rejecting an attached HEAD ("Worker must use detached HEAD") before review or landing. Recovery is manual mechanical salvage with ordinary Git in the worker worktree and the wave's private repository. It never touches the target checkout, its branches, or its worktree metadata, and never relies on future capabilities.
+
+### Verify before acting
+
+First confirm the writer is quiesced: the task is stopped or interrupted, and `SubtasksInspect` reports no live or uncertain writer. Then survey read-only, before any mutation:
+
+```text
+git -C <worktree> rev-parse --show-toplevel
+git -C <worktree> rev-parse --git-common-dir      # must resolve to the wave's wave-repo.git
+git -C <worktree> symbolic-ref --short HEAD       # a branch name here means HEAD is attached (damaged)
+git -C <worktree> rev-parse HEAD
+git -C <worktree> rev-parse refs/pi-review-gate/waves/<waveId>/base
+git -C <worktree> status --porcelain              # uncommitted worker content still present?
+git -C <worktree> log --oneline -g HEAD           # HEAD reflog: what the checkout did, step by step
+git -C <worktree> log --oneline <branch>          # commits the worker made while attached, if any
+```
+
+Resolve the wave root from the task's artifact directory (`SubtasksInspect` reports it); `<worktree>`'s common dir must resolve to that wave root's `wave-repo.git`. If identity cannot be established, stop: this runbook does not apply.
+
+Distinguish what actually survived:
+
+- **Retained commits** the worker made while attached are safe objects in the wave repository regardless of later HEAD movement. Their SHAs come from the branch tip, the HEAD reflog, or the durable operation record.
+- **Uncommitted worker edits** may still be present in the working tree (a checkout carries compatible local edits over). `git status --porcelain` is the evidence.
+- **Working-tree-only worker content** that the checkout overwrote (worker edits clobbered by the branch's tree and never committed or stashed) is what can be irrecoverably lost; the reflog records the tree moves, not the destroyed worktree content. The captured baseline itself is not lost this way: it remains pinned at `refs/pi-review-gate/waves/<waveId>/base` and the target checkout still holds its own copy, so a truthful loss report distinguishes these two cases.
+
+### Preserve the retained content first
+
+Pin everything found before changing anything. Create-only salvage refs keep later work from destroying evidence; export (below) reads only these refs and never needs to mutate the worktree. Create a create-only salvage ref in the wave repository (the `000…0` old-value argument makes the update fail if the ref already exists):
+
+```text
+git -C <worktree> update-ref refs/pi-review-gate/waves/<waveId>/salvage/<taskId> <retainedCommitSha> 0000000000000000000000000000000000000000
+git -C <worktree> rev-parse refs/pi-review-gate/waves/<waveId>/salvage/<taskId>
+```
+
+If uncommitted content is still present, capture it as a stash commit before anything else (do not commit on the attached branch; do not apply or drop the stash). Stash creates commits, which need a committer identity — pass one explicitly per command instead of editing configuration:
+
+```text
+git -C <worktree> -c user.name=pi-review-gate-recovery -c user.email=pi-review-gate-recovery@invalid stash push --include-untracked -m "salvage <waveId>/<taskId>: retained worker content before detachment repair"
+git -C <worktree> rev-parse refs/stash   # stash SHA to pin under its own create-only ref (next step)
+```
+
+Pin the stash SHA under its own create-only ref, because the retained-commit pin above refuses to replace `salvage/<taskId>` by design:
+
+```text
+git -C <worktree> update-ref refs/pi-review-gate/waves/<waveId>/salvage/<taskId>-stash <stashSha> 0000000000000000000000000000000000000000
+git -C <worktree> rev-parse refs/pi-review-gate/waves/<waveId>/salvage/<taskId>-stash
+```
+
+This keeps the stashed content reachable even if the stash ref is later overwritten. Verify reachability (`git -C <worktree> cat-file -t <sha>`, `git -C <worktree> show --stat <sha>`) for every pinned SHA before proceeding.
+
+Determine the worker's own commit range from evidence, never by assuming HEAD's immediate parent is all worker work. Read the HEAD reflog to find each contiguous run of worker commits (commit entries between checkout entries) and note which commit each run started from: a run on the attached branch starts at the branch tip, but a worker that also committed while detached before the checkout has a separate earlier run on the captured base. Export one diff per run (below); a single diff spanning the first worker commit's parent to the last does not cover disjoint runs, and a diff from the captured base to the branch tip is not the worker delta at all. Pin each retained run tip the reflog identifies under its own create-only ref (`refs/pi-review-gate/waves/<waveId>/salvage/<taskId>-run<N>`) as well, so the exported ranges stay reachable even if the reflog is later truncated.
+
+### Export the retained material (read-only for the worktree)
+
+Export the worker's own delta as reviewable material before considering any worktree mutation — everything below reads only the pinned refs and the commits the reflog names, so it works even if the worktree is never detached again:
+
+```text
+# One diff per contiguous run of worker commits identified from the reflog
+# (each run's start commit is the commit the run built on, from reflog evidence)
+git -C <worktree> diff --binary <runStartCommit> <runTipCommit>
+# Stashed tracked content: staged and unstaged changes collapsed into one
+# diff by `stash show` (the stash still records the index state in its second parent,
+# so the split below remains recoverable)
+git -C <worktree> stash show --binary -p <stashSha>
+# Optional: recover the staged/unstaged split from the stash's second parent
+# (the index tree at stash time)
+git -C <worktree> diff --binary <stashSha>^1 <stashSha>^2   # staged at stash time
+git -C <worktree> diff --binary <stashSha>^2 <stashSha>     # unstaged at stash time
+# Stashed untracked files: only when the stash was taken with untracked files
+# present; the stash then has a third parent (a parentless commit holding them)
+git -C <worktree> show --binary <stashSha>^3
+```
+
+`stashSha^3` fails with "unknown revision" when the stash has no untracked parent — two-parent stashes are complete without it. Write the exported material into files under the task's artifact directory — never into the target checkout.
+
+Applying that material in the target checkout is a separate, explicit, user-authorized manual recovery step — it is ordinary content salvage, not a harness landing, and exporting alone has placed nothing anywhere. It must not be described as a verified checkpoint, review success, or recovered correctness. Joint review of the applied result decides whether the implementation is actually correct.
+
+### Restore detachment honestly (only if attempting normal continuation)
+
+Detachment is a mutation of the failed worktree; skip this section when export alone is the goal. With the working tree clean or stashed, detach without changing the working tree:
+
+```text
+git -C <worktree> checkout --detach                      # bare form: detaches at the current commit; the working tree does not change
+git -C <worktree> symbolic-ref --short HEAD              # must now fail: HEAD is detached again
+```
+
+Never use `git checkout --detach <sha>` here: when `<sha>` differs from the current commit, that form moves HEAD *and* resets the working tree to `<sha>`'s tree, which is exactly the destructive movement being recovered from. The bare form is the only detach that is guaranteed tree-preserving.
+
+State plainly what this repairs: detachment restores only the mechanical precondition that harness validation checks. It does not create, verify, or revalidate any durable harness checkpoint, does not recover content the checkout already abandoned, and does not by itself make the task landable.
+
+### Choose between normal and manual recovery
+
+- **Normal continuation is available only when inspection still lists it as safe.** Harness validation requires a detached HEAD whose commit is the captured base or is based on it (`git merge-base HEAD <baseCommit>` must resolve to the base commit). A worker that committed on top of a checked-out branch generally fails that ancestry check, so the automatic candidate/checkpoint path stays closed even after detachment — that rejection is the fail-closed design working. A verified durable checkpoint that already existed before the damage remains valid as a durable record; whether continuation can proceed still depends on what inspection reports about the now-damaged worktree.
+- **Manual mechanical salvage** is the supported path when the automatic path is unavailable and the retained content is verified. Export per **Export the retained material** above — a diff that spans from the captured base to a foreign branch tip is **not** the retained result (it also contains the branch's own deltas and the inverse of the captured uncommitted content) and must never be applied into the target checkout. Stashed or exported content is not restored by any continuation: even where normal continuation is safe, it resumes from durable harness state, and the only path for salvaged uncommitted content is the user-authorized manual application above.
+- **Unsupported or unverifiable cases**: no readable reflog, unidentifiable worktree identity, missing wave repository, or reflog/status evidence that content was destroyed by the checkout. Preserve the worktree and all artifacts exactly as they are, report exactly what is lost and what remains unverifiable, and do not reset, re-checkout, or fabricate a state. Never run `git reset --hard` or any destructive command before the retained content is pinned and verified, and never accept the attached branch as a valid candidate.
+
 ## Recover review rejection or correction failure
 
 Routine `needs_changes` feedback belongs inside the worker lifecycle: let the worker correct blocking findings and review the replacement result. Passing and non-blocking advice do not require scope expansion.

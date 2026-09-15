@@ -164,6 +164,12 @@ export interface PersistedConflictGate {
   activatedAt: string;
   manifestPath: string;
   reason: string;
+  /** #126 approved (explicit force-merge only): preserved conflicts whose gate
+   * stays unresolved until manually resolved. Entries with a `sidecarPath` keep
+   * the worker version alongside the intact target (markClean validates it);
+   * entries without one record a worker-side deletion (no bytes fabricated).
+   * Persisted so markClean keeps enforcing it after restore. */
+  sidecars?: Array<{ path: string; sidecarPath?: string }>;
 }
 
 export interface ExecutionAssociationsSnapshot {
@@ -704,7 +710,23 @@ function isValidConflictGate(value: unknown): value is PersistedConflictGate {
     && Array.isArray(value.paths)
     && typeof value.activatedAt === "string"
     && typeof value.manifestPath === "string"
-    && typeof value.reason === "string";
+    && typeof value.reason === "string"
+    // A malformed sidecar entry must reject the snapshot rather than be
+    // dropped: a restored gate without it could clear a sidecar conflict
+    // while the worker version still sits alongside.
+    && (value.sidecars === undefined || isValidSidecarList(value.sidecars));
+}
+
+function isValidSidecarList(value: unknown): value is Array<{ path: string; sidecarPath?: string }> {
+  // A malformed entry must reject the snapshot rather than be dropped. The
+  // sidecar path is optional (worker-side deletion records carry none) but, when
+  // present, must be a string — never a number, object, or other type.
+  return Array.isArray(value)
+    && value.every((entry) =>
+      isRecord(entry)
+      && typeof entry.path === "string"
+      && (entry.sidecarPath === undefined || typeof entry.sidecarPath === "string"),
+    );
 }
 
 function summarizePendingDeliveries(deliveries: ReadonlyArray<{ status?: unknown; kind?: unknown }>): PendingDeliverySummary {

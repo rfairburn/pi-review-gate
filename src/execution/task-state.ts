@@ -63,6 +63,35 @@ export function isForceMergeCandidateTaskState(state: BackgroundTaskState): bool
 
 export type BackgroundTaskDefinition = WaveWorkerTask;
 
+/**
+ * #126: durable provenance for a force-merge that landed without the ordinary
+ * verified-checkpoint path — either an explicit override of a lifecycle refusal
+ * against a genuinely verified checkpoint, or a salvaged snapshot of worker
+ * work. Presence never implies review success or a normal checkpoint; it is
+ * evidence that the landing was forced and must be inspected manually.
+ */
+export interface ForceMergeSalvageProvenance {
+  /** Why ordinary landing was unavailable at request time. */
+  reason: string;
+  /** Where the landed snapshot came from. */
+  sourceKind: "verified_checkpoint" | "worktree" | "retained_ref";
+  branchName?: string;
+  headSha?: string;
+  refName?: string;
+  candidateCommit: string;
+  candidateRef: string;
+  /** Paths transferred into the target. */
+  attributedPaths: string[];
+  /** Base-only paths the source abandoned; preserved in the target, not deletions. */
+  baselineOnlyPaths: string[];
+  /** Paths whose ownership could not be proven; not transferred. */
+  ambiguousPaths: string[];
+  /** #126 correction: set when this salvage superseded a verified checkpoint
+   * that did not carry all identified retained work. Presence never implies
+   * review success; it records which checkpoint was subsumed. */
+  supersededCheckpoint?: { commitSha: string; ref: string };
+}
+
 export interface BackgroundCommandRecord {
   instructionId: string;
   action: "continue" | "steer" | "interrupt" | "force_merge";
@@ -77,6 +106,8 @@ export interface BackgroundCommandRecord {
   deliveredAt?: string;
   acknowledgedAt?: string;
   error?: string;
+  /** #126: present when this force-merge landed via forced salvage. */
+  salvage?: ForceMergeSalvageProvenance;
 }
 
 export interface BackgroundActivityEvent {
@@ -309,6 +340,19 @@ function stateFromWorkerProgressPhase(phase: SubtaskProgressPhase | string | und
 
 export function isStoppedForExit(task: BackgroundTaskRecord): boolean {
   return task.state === "stopped_for_application_exit";
+}
+
+/**
+ * #126 correction: a settled task whose forced-salvage provenance names
+ * untransferred ambiguous paths retains its wave root through cleanup and
+ * restart so the source bytes — not merely path names — stay accessible for
+ * inspection or a later explicit action. Truly resolved work (no ambiguous
+ * exclusions) is unaffected and cleaned as before.
+ */
+export function salvageEvidenceRequiresRetention(task: BackgroundTaskRecord): boolean {
+  return task.commands.some((command) =>
+    command.action === "force_merge"
+    && (command.salvage?.ambiguousPaths.length ?? 0) > 0);
 }
 
 export function isArchivableTaskState(state: BackgroundTaskState): state is "landed" | "reported" {

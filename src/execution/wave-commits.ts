@@ -467,7 +467,7 @@ async function gitOut(args: string[], cwd: string, envOverrides: Record<string, 
  * adopted or created commit SHA, which may differ from `createCommitSha`
  * when an equal-identity commit already won the race.
  */
-async function ensureCandidateSnapshotRef(
+export async function ensureCandidateSnapshotRef(
   capture: WaveCaptureResult,
   taskId: string,
   treeSha: string,

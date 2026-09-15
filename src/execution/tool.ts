@@ -101,7 +101,7 @@ const SHARED_PROMPT_GUIDELINES = [
   completionNotificationGuidanceLine(),
   "Start/add distinguish tasks already assigned for executor startup from tasks still waiting for capacity. Completion events report the COMPLETE verdict or not-yet-complete sibling list, plus the estimated top-off opportunity for SubtasksAdd when scheduling information is available. Use SubtasksInspect for the durable execution revision, peak concurrency, and per-phase task timing instead of expecting them in completion notifications.",
   "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call SubtasksMarkClean.",
-  "Use SubtasksForceMerge only for a stopped task with a verified checkpoint; mergeAnyhow may intentionally materialize conflicts in main. Every force-merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
+  "Use SubtasksForceMerge on a stopped execute task to land its verified checkpoint, or — when no ordinary checkpoint exists (for example after an attached-HEAD checkpoint failure, interruption, or failed critical state) — to salvage an identified snapshot of the worker's actual work from its retained worktree or surviving refs. An explicit force-merge merges ALL identified work in one call for every source kind: clean paths apply and ordinary text conflicts materialize standard diff3 markers that you then resolve and clear with SubtasksMarkClean; there is no clean-only mode and no second force option. A verified checkpoint is landed only when it carries all identified retained work; newer retained work supersedes it, and unorderable sources are surfaced as ambiguous instead of guessed. Salvage transfers only evidence-backed content, preserves conflicting and ambiguous target content, records forced-salvage provenance without fabricating review or a normal checkpoint, and never auto-lands deferred work afterward. Every force-merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
   "A request to cancel or stop without landing means interrupt_as_failure. Use interrupt_with_merge only when the user explicitly wants a mechanical checkpoint landing; it never guarantees the requested changes are present or correct, so inspect the main workspace manually afterward in every case.",
   terminalWakeGuidanceLine(),
 ];
@@ -123,7 +123,7 @@ function toolDescription(action: Action): string {
     case "interrupt":
       return "Interrupt a queued or active background subtask as failure; execute tasks may explicitly request checkpoint landing.";
     case "force_merge":
-      return "Mechanically attempt to land a stopped task's verified checkpoint; manual workspace inspection is always required afterward.";
+      return "Mechanically attempt to land a stopped task's verified checkpoint, or salvage an identified snapshot of its worker work when no ordinary checkpoint exists; manual workspace inspection is always required afterward.";
     case "mark_clean":
       return "Validate that main-workspace conflict markers are resolved and wake queued independent landings.";
   }
@@ -138,7 +138,7 @@ function toolPromptSnippet(action: Action): string {
     case "continue": return "Resume stopped work from a verified checkpoint with SubtasksContinue.";
     case "steer": return "Change queued or in-flight work with SubtasksSteer, optionally interrupting the active turn first (interrupt: true); steering supersedes review.";
     case "interrupt": return "Stop work with SubtasksInterrupt and choose the requested landing semantics explicitly.";
-    case "force_merge": return "Use SubtasksForceMerge only for a stopped verified checkpoint, then inspect main manually.";
+    case "force_merge": return "Use SubtasksForceMerge on a stopped task (verified checkpoint, or salvage when none exists), then inspect main manually.";
     case "mark_clean": return "After resolving materialized conflicts in main, call SubtasksMarkClean.";
   }
 }
@@ -357,37 +357,29 @@ export class ExecutionToolManager {
         actor: "user",
       });
     });
-    register("subtask-force-merge", "Mechanically land a stopped checkpoint, then manually inspect the workspace; explicit arguments remain optional.", async (args, ctx) => {
-      let [executionId, taskId, mode] = words(args);
-      const explicitTarget = Boolean(executionId && taskId);
+    register("subtask-force-merge", "Merge all identified work of a stopped task into main — landing its verified checkpoint or salvaging identified worker work, materializing standard conflict markers for ordinary text conflicts in the same call — then manually inspect the workspace; explicit arguments remain optional.", async (args, ctx) => {
+      let [executionId, taskId, legacyMode] = words(args);
       if (!executionId || !taskId) {
         const selected = await selectTask(
           this.controller,
           ctx,
           "Force-merge execution subtask",
-          (task, inspection) => inspection.kind === "execute" && Boolean(task.bundle) && isForceMergeCandidateTaskState(task.state),
+          (task, inspection) => inspection.kind === "execute" && Boolean(task.waveRoot) && isForceMergeCandidateTaskState(task.state),
         );
         if (!selected) return undefined;
         executionId = selected.executionId;
         taskId = selected.taskId;
       }
-      if (!mode) {
-        if (explicitTarget) mode = "clean";
-        else {
-        const ui = commandUi(ctx);
-        if (!ui) throw new Error("interactive selector is unavailable; use /subtask-force-merge <executionId> <taskId> [anyhow]");
-        const selectedMode = await ui.select("Force-merge mode", ["Clean merge only", "Merge anyhow and materialize conflicts"]);
-        if (!selectedMode) return undefined;
-        mode = selectedMode === "Merge anyhow and materialize conflicts" ? "anyhow" : "clean";
-        }
-      }
-      if (mode !== "clean" && mode !== "anyhow") {
+      // A legacy third argument ("clean" | "anyhow") is still accepted for
+      // compatibility; an explicit force-merge always merges all identified
+      // work, so the value no longer changes behavior.
+      if (legacyMode !== undefined && legacyMode !== "clean" && legacyMode !== "anyhow") {
         throw new Error("mode must be clean or anyhow");
       }
       return this.controller.forceMerge({
         executionId,
         taskId,
-        mergeAnyhow: mode === "anyhow",
+        mergeAnyhow: legacyMode === "anyhow",
         instructionId: `user-force-merge-${randomUUID()}`,
         actor: "user",
       });
@@ -979,7 +971,7 @@ function toolSchema(action: Action): Record<string, unknown> {
     case "force_merge":
       properties.executionId = executionId;
       properties.taskId = taskId;
-      properties.mergeAnyhow = { type: "boolean", description: "Allow ordinary conflict markers to be materialized. Every force-merge attempt requires manual workspace inspection afterward." };
+      properties.mergeAnyhow = { type: "boolean", description: "Retained for caller compatibility; it no longer changes behavior. An explicit force-merge always merges all identified work in one call: clean paths apply and ordinary text conflicts materialize standard diff3 markers that are then resolved and cleared with SubtasksMarkClean. Every force-merge attempt requires manual workspace inspection afterward." };
       properties.instructionId = instructionId;
       break;
     case "mark_clean":

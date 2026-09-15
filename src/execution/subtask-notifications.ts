@@ -550,8 +550,10 @@ export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): W
   if (live.bundle) {
     suggestedActions.push(`SubtasksContinue (executionId ${group.executionId}, taskId ${task.taskId}) to resume from the durable checkpoint`);
     if (group.kind === "execute" && !isActiveTaskState(live.state)) {
-      suggestedActions.push(`SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) to land the checkpoint mechanically; manual workspace inspection is still required afterward`);
+      suggestedActions.push(`SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) to land the checkpoint mechanically, or salvage an identified snapshot of the worker's retained work when no verified checkpoint exists; manual workspace inspection is still required afterward`);
     }
+  } else if (group.kind === "execute" && !isActiveTaskState(live.state)) {
+    suggestedActions.push(`No durable continuation bundle is available; SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) may still salvage an identified snapshot of the worker's retained work without a checkpoint — manual inspection required — or restart the task with SubtasksAdd if its outcome is still needed`);
   } else {
     suggestedActions.push("No durable continuation bundle is available; inspect the execution record and restart the task with SubtasksAdd if its outcome is still needed");
   }

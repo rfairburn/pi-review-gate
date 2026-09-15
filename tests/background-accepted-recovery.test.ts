@@ -106,7 +106,7 @@ execution: {
   };
 }
 
-test("accepted result survives materializer preparation failure, restart and clean-only force landing", async () => {
+test("accepted result survives materializer preparation failure, restart and explicit force landing", async () => {
   const f = await fixture();
   try {
     const before = f.controller.inspect(f.started.executionId).tasks[0]!;
@@ -128,14 +128,22 @@ test("accepted result survives materializer preparation failure, restart and cle
     assert.deepEqual(task.result!.taskResults[0]!.reviewReport, before.result!.taskResults[0]!.reviewReport);
     assert.deepEqual(task.result!.taskResults[0]!.reviewCycles, before.result!.taskResults[0]!.reviewCycles);
     const force = { executionId: f.started.executionId, taskId: f.taskId, actor: "user" as const, mergeAnyhow: false };
-    await assert.rejects(restored.forceMerge({ ...force, instructionId: "conflict-check" }), /main remains unchanged/);
-    assert.equal(await readFile(join(f.root, "base.txt"), "utf8"), "parent\n");
-    assert.equal(await git(f.root, "rev-parse", "HEAD"), f.head);
-    // Remove only the test's parent edit, making the retained candidate land cleanly.
-    await writeFile(join(f.root, "base.txt"), "base\n");
-    const landed = await restored.forceMerge({ ...force, instructionId: "safe-reland" });
-    assert.equal(landed.tasks[0]!.state, "landed");
+    // #126: an explicit force-merge always merges all identified work in one
+    // call. The restored controller has no injected materializer fault, so the
+    // overlap is materialized as diff3 markers and the task becomes conflicted
+    // under an active gate — there is no clean-only refusal any more.
+    const conflicted = await restored.forceMerge({ ...force, instructionId: "conflict-check" });
+    assert.equal(conflicted.tasks[0]!.state, "conflicted");
+    assert.ok(conflicted.conflictGate);
+    assert.match(await readFile(join(f.root, "base.txt"), "utf8"), /<<<<<<< current workspace/);
+    await assert.rejects(restored.markClean(), /Conflict markers remain/);
+    // Resolving the conflict in favor of the accepted worker content lands it.
+    await writeFile(join(f.root, "base.txt"), "accepted\n");
+    const cleared = await restored.markClean();
+    assert.equal(cleared.cleared, true);
+    assert.equal((await restored.inspectTask(f.started.executionId, f.taskId)).tasks[0]!.state, "landed");
     assert.equal(await readFile(join(f.root, "base.txt"), "utf8"), "accepted\n");
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), f.head);
     assert.equal(await readFile(f.calls, "utf8"), calls, "recovery must not execute the accepted worker again");
   } finally { await f.cleanup(); }
 });
@@ -328,7 +336,9 @@ test("recovery reserves continuation admission against overlapping continuations
     await f.controller.interrupt({ executionId: f.started.executionId, taskId: f.taskId,
       mode: "interrupt_as_failure", instructionId: "stop-admitted", actor: "user" });
     const forceVerifying = pauseRecovery();
-    const merging = assert.rejects(force("force-wins-admission"), /main remains unchanged/);
+    // #126: the force-merge proceeds past admission and hits the injected
+    // materializer fault; the clean-only refusal no longer exists.
+    const merging = assert.rejects(force("force-wins-admission"), /Injected materializer PREPARATION failure/);
     await forceVerifying;
     assert.ok(controller.pendingForceMerges.has(f.taskId));
     await assert.rejects(request("continue-during-force"), /force-merge in progress/);

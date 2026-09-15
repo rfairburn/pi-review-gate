@@ -182,3 +182,44 @@ settled subtask wave roots, completed execution manifests, and review bundles. O
 genuinely unlanded recovery checkpoints are preserved for exact-session restart. Clean
 worktrees are removed after completion; dirty or conflicted worktrees are preserved for
 diagnosis ([Delegated execution](delegated-execution.md#landing-and-source-preservation)).
+
+## Explicit salvage of worker work without a checkpoint
+
+Some failed tasks never produce an ordinary verified checkpoint: the executor left the
+worktree on an attached branch, was interrupted before normalization, or the operation
+ended in a failed critical state. `SubtasksContinue` cannot resume those tasks, but an
+explicit `SubtasksForceMerge` can still salvage an identified snapshot of the worker's
+actual work — retained commits, staged and unstaged edits, and task-created files —
+without requiring any ordinary lifecycle eligibility.
+
+- **Source identification.** While the worker worktree is retained it is the
+  authoritative source. After clean-worktree cleanup, surviving refs in the private
+  repository are enumerated; a ref is a candidate only when part of its delta against
+  the captured base is provably worker-created (proven by object identity against the
+  target repository, not by branch name or timestamp). Because that repository is
+shared by every task of the group, a ref is selected only when durable
+checkpoint-failure incident evidence attributes it to this task, or when it is the
+sole candidate and no sibling task can own it. Otherwise the candidates are surfaced
+and nothing is transferred.
+- **Attribution.** The captured base is synthetic and includes the target's uncommitted
+  files, which no source branch can contain. A path present in the base but absent from
+  the source's own history is a baseline-only file abandoned by the checkout — never an
+  assumed worker deletion. When the source derives from the captured base, every delta
+  is session-local; otherwise committed changes are attributed only when every commit
+  that touched the path since the shared ancestor was created during the task's
+  session. Ambiguous paths are excluded and reported.
+- **What salvage does not do.** It captures without mutating the worktree or its index,
+  asserts no review status, fabricates no normal checkpoint, publishes no continuation
+  bundle for unverified work, changes no ordinary lifecycle state, and never auto-lands
+delayed work afterward. Forced-salvage provenance (source, transferred paths, and the
+  baseline-only/ambiguous exclusions) is recorded durably on the task command and as an
+operation incident so the source evidence explains what happened to it.
+- **Landing semantics.** The salvaged candidate lands through the ordinary tree-diff
+  landing path: the same conflict gate, force-merge marker materialization, rollback
+  protection, and manual-inspection requirement. Conflicting target content is preserved
+  or materialized as markers — never silently overwritten. Forced-salvage provenance is
+recorded in every outcome, including a conflicted force-merge landing that transfers
+the non-conflicting paths.
+
+The full product semantics live in
+[Delegated execution](delegated-execution.md#explicit-salvage).

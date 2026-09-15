@@ -258,10 +258,14 @@ lands the task's verified checkpoint when one exists, and otherwise salvages an
 identified snapshot of the worker's actual work (explicit salvage below).
 An explicit force-merge always merges all identified work in one call: clean paths
 apply and ordinary text conflicts install diff3 markers in main (`mergeAnyhow` is
-accepted for caller compatibility only and controls nothing). Binary conflicts
-preserve the target in place and save the worker version alongside at a collision-safe
-`<path>.worker-<blob>` name, naming both paths in the gate and manifest for manual
-resolution. Both `interrupt_with_merge` and every direct force merge are mechanical
+accepted for caller compatibility only and controls nothing). A conflict that cannot
+carry text markers (binary, symlink/type change, oversized side, or worker-side
+deletion) is preserved in place instead of aborting the merge: the target stays intact
+and any available worker version is saved alongside at a collision-safe
+`<path>.worker-<blob>` name, while a worker-side deletion records its intent without
+fabricating bytes; both are named in the gate and manifest for manual resolution.
+Ordinary reviewed landing does not preserve these — it refuses the whole transfer
+before any mutation and names the limit. Both `interrupt_with_merge` and every direct force merge are mechanical
 landing attempts,
 not verification that the requested changes are present or correct. The main workspace
 must always be inspected manually afterward, including when the task's authoritative

@@ -154,6 +154,9 @@ export interface WaveLandingOutcome {
   alreadyAppliedPaths?: string[];
   /** Conflict details. */
   conflicts?: Array<{ path: string; reason: string }>;
+  /** True when the landing-conflict callback actually mutated the source
+   * workspace (conflicts materialized); false/absent means nothing landed. */
+  conflictMaterialized?: boolean;
   /** Failure details. */
   failedAtPath?: string | null;
   failureReason?: string;
@@ -215,8 +218,15 @@ export interface WaveControllerInput {
   executorPool?: ExecutorPoolScheduler;
   /** Capacity already reserved by the caller for the first dispatched tasks. */
   initialExecutorLeases?: ExecutorPoolLease[];
-  /** Called while holding the source lease when landing detects conflicts. */
-  onLandingConflict?: (input: { capture: WaveCaptureResult; plan: LandingPlan }) => void | Promise<void>;
+  /** Called while holding the source lease when landing detects conflicts.
+   * Return `{ materialized: true }` only if the callback actually mutated the
+   * source workspace (for example, wrote conflict markers or preserved
+   * worker versions alongside); otherwise return `{ materialized: false }` so
+   * the durable progress and manifest do not claim a change that did not
+   * happen. */
+  onLandingConflict?: (input: { capture: WaveCaptureResult; plan: LandingPlan }) =>
+    | { materialized: boolean }
+    | Promise<{ materialized: boolean }>;
   /** Register live control for a specific task's current executor turn. */
   onLiveControl?: (taskId: string, control: ExecutorLiveControl | undefined) => void;
   /** Claim task steering deferred until its current executor turn settles. */
@@ -326,6 +336,8 @@ export interface WaveManifest {
   landingAlreadyAppliedPaths?: string[];
   /** Landing conflicts. */
   landingConflicts?: Array<{ path: string; reason: string }>;
+  /** True when a conflicted landing's onLandingConflict callback actually materialized markers into the source (D1). Absent when no callback ran or it made no change. */
+  landingConflictMaterialized?: boolean;
   /** Landing failure details. */
   landingFailedAtPath?: string | null;
   landingFailureReason?: string;
@@ -488,6 +500,7 @@ function buildManifest(
     ...(landingOutcome?.appliedPaths ? { landingAppliedPaths: landingOutcome.appliedPaths } : {}),
     ...(landingOutcome?.alreadyAppliedPaths ? { landingAlreadyAppliedPaths: landingOutcome.alreadyAppliedPaths } : {}),
     ...(landingOutcome?.conflicts ? { landingConflicts: landingOutcome.conflicts } : {}),
+    ...(typeof landingOutcome?.conflictMaterialized === "boolean" ? { landingConflictMaterialized: landingOutcome.conflictMaterialized } : {}),
     ...(landingOutcome?.failedAtPath !== undefined ? { landingFailedAtPath: landingOutcome.failedAtPath } : {}),
     ...(landingOutcome?.failureReason ? { landingFailureReason: landingOutcome.failureReason } : {}),
     ...(landingOutcome?.manifestPath ? { landingManifestPath: landingOutcome.manifestPath } : {}),
@@ -1602,8 +1615,14 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
 
   // If plan has conflicts, skip landing.
   if (landingPlan.conflicts.length > 0) {
-    await input.onLandingConflict?.({ capture, plan: landingPlan });
-    const landingConflictMessage = `Landing planning found ${landingPlan.conflicts.length} conflict(s) — nothing landed; source workspace unchanged by this wave and conflict resolution is required`;
+    const conflictResolution = await input.onLandingConflict?.({ capture, plan: landingPlan });
+    // #126 D1: report the source-workspace truth. Only a callback that
+    // actually materialized conflicts may claim the workspace changed; with no
+    // callback (or one that declined to mutate) nothing landed.
+    const conflictMaterialized = conflictResolution?.materialized === true;
+    const landingConflictMessage = conflictMaterialized
+      ? `Landing planning found ${landingPlan.conflicts.length} conflict(s) — conflicts were materialized in the source workspace (clean paths applied and conflict markers written); conflict resolution is required`
+      : `Landing planning found ${landingPlan.conflicts.length} conflict(s) — nothing landed; source workspace unchanged by this wave and conflict resolution is required`;
     emitProgress(onProgress, "completed", landingConflictMessage, undefined, {
       waveId, waveRoot, baseCommit: capture.baseCommit, maxWorkers,
       counts: computeCounts(taskItems, results, activeSlots, taskPhases),
@@ -1616,7 +1635,11 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
       integrationResult.status,
       "conflicted",
       integrationOutcome,
-      { status: "conflicted", conflicts: landingPlan.conflicts },
+      {
+        status: "conflicted",
+        conflicts: landingPlan.conflicts,
+        ...(conflictMaterialized ? { conflictMaterialized: true } : {}),
+      },
       handles,
       taskExecutorInfo,
       taskReviewCycles,

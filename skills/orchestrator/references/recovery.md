@@ -21,9 +21,9 @@ Read the packet for:
 
 1. **Current state and latest command.** Distinguish an active task from a stopped task, and distinguish a queued steer from an acknowledged or failed one.
 2. **Writer ownership.** A live controller, process, or uncertain owner blocks continuation and force-merge. Wait for an event or interrupt the known live task; do not create a competing writer.
-3. **Checkpoint status.** Continue or force-merge only from a verified recovery checkpoint or an accepted commit. Missing, invalid, or unverifiable checkpoints require a replacement task or explicit manual recovery, not optimistic reuse.
+3. **Checkpoint status.** `SubtasksContinue` requires a verified recovery checkpoint or an accepted commit; missing, invalid, or unverifiable checkpoints require a replacement task or explicit manual recovery, not optimistic reuse. `SubtasksForceMerge` lands an accepted commit or verified checkpoint when one is present and otherwise salvages the identified work from retained state — it never asserts review success.
 4. **Source-workspace disposition.** `unchanged` means this task did not land; `landed` means it mechanically reached main; `recovery_required` means source state may be uncertain.
-5. **Conflict status.** Determine whether main already contains diff3 markers (or a preserved binary target with the worker version saved alongside) and an active conflict gate, or whether the attempted landing refused before touching main because a conflict could not be represented.
+5. **Conflict status.** Determine whether main already contains diff3 markers (or preserved unrepresentable conflicts — an intact target with a worker version saved alongside, or a recorded worker-side deletion) and an active conflict gate, or whether the attempted landing refused before touching main. Ordinary reviewed landing refuses any conflict it cannot represent; an explicit force-merge preserves them instead.
 6. **Recovery manifests and safe actions.** Follow the packet's safe/blocked actions. A verified landing-recovery manifest may be reconciled during continuation; an unverified manifest blocks source mutation.
 7. **Artifacts and diagnostics.** Use the task artifact directory, activity, reviewer result, failed stage, and error-state exception to decide whether the worker should continue, be replaced, or have its checkpoint landed.
 
@@ -37,10 +37,10 @@ Do not poll for ordinary progress. Inspect once for a decision, take the selecte
 | `paused_recoverable` | Execution stopped but a durable bundle/checkpoint may be reusable. | Inspect ownership and checkpoint, then use `SubtasksContinue` when listed as safe. |
 | `interrupted` | A user or model intentionally stopped the task. It may or may not have a reusable checkpoint. | Inspect. Continue if the checkpoint is verified and the work should resume; otherwise replace or leave explicitly incomplete. |
 | `stopped_for_application_exit` | The owning application shut down and retained task state. | Resume the exact parent conversation and cwd; allow automatic restart recovery, then inspect only if it does not become active or reports a problem. |
-| `failed` | The task stopped without a usable automatic recovery path, often without a bundle. | Inspect diagnostics. If no verified checkpoint exists, start a replacement task for the remaining outcome and retain the failed task as history. |
+| `failed` | The task stopped without a usable automatic recovery path, often without a bundle. | Inspect diagnostics. If no verified checkpoint exists, either start a replacement task for the remaining outcome or use `SubtasksForceMerge` to salvage the retained work when landing that identified work is the desired outcome; retain the failed task as history. |
 | `failed_critical` or source `recovery_required` | Recovery state or source rollback is unsafe or unverifiable. | Stop source mutations. Inspect recovery manifests and blocked actions; do not continue automatically. Report the exact source-state risk if the tool cannot establish a safe action. |
 | `conflicted` with an active conflict gate | Main contains materialized diff3 markers and automatic landings are paused. | Resolve all gated paths in main, verify the combined result, then call `SubtasksMarkClean`. |
-| Force-merge refused before any mutation | The landing could not represent a conflict (symlink, non-regular destination, type change, oversized side, or a binary target with a worker-side deletion), so main was left unchanged and the exact limits were reported. | Continue/rework the task or resolve the overlap directly in main if authorized; do not retry expecting another mode — an explicit force-merge always merges all identified work. |
+| Landing refused before any mutation | An ordinary reviewed landing met a conflict it cannot represent (binary, symlink/type change, oversized side, or worker-side deletion), so nothing was transferred and the limits were reported; or a force-merge met a genuinely unsafe path (escaping destination or unsafe symlinked ancestor). | For a normal landing, rework the task or resolve the overlap directly in main if authorized, then retry. An explicit force-merge does not refuse these representability limits — it preserves them — so do not expect another mode; only unsafe paths refuse. |
 | `landed` | The task's mechanical landing completed. | Inspect affected paths and run combined validation; do not continue recovery unless new incremental work is explicitly desired. |
 | Research `reported` | A read-only report completed; main was never eligible to change. | Read and synthesize the report. |
 
@@ -207,7 +207,7 @@ There are three materially different failures:
 
 ### Conflict markers are already in main
 
-Normal landing or an explicit `SubtasksForceMerge` has materialized diff3 markers (or preserved a binary target with the worker version saved alongside) and activated a conflict gate. Automatic landings are blocked, although workers may continue executing in their separate worktrees.
+Normal landing has materialized diff3 markers, or an explicit `SubtasksForceMerge` has materialized markers or preserved an unrepresentable conflict (an intact target with any available worker version saved alongside, or a recorded worker-side deletion). Either path activated a conflict gate. Automatic landings are blocked, although workers may continue executing in their separate worktrees.
 
 1. Read the critical conflict notice or inspect the gate for the exact paths, task, execution, and manifest.
 2. Resolve every conflict in the main workspace using the effective task request, current main intent, captured base, and worker result. Do not blindly choose one side.
@@ -219,7 +219,7 @@ Normal landing or an explicit `SubtasksForceMerge` has materialized diff3 marker
 
 ### The landing refused before touching main
 
-An attempted landing (normal or explicit force-merge) refuses up front, names every affected path and its concrete limit, and transfers nothing when a conflict cannot be represented: a symlink or non-regular destination, an oversized side, a path-type change, or a binary target with a worker-side deletion. Main is left unchanged, and no second force option exists to retry differently.
+An ordinary reviewed landing refuses up front, names every affected path and its concrete limit, and transfers nothing when a conflict cannot be represented: a binary, symlink/type change, oversized side, or worker-side deletion. An explicit force-merge does not refuse those representability limits — it preserves them there instead — so the refusal it can still produce is for a genuinely unsafe path (an escaping destination or an unsafe symlinked ancestor). In either refusal, main is left unchanged, and no second force option exists to retry differently.
 
 Choose deliberately among:
 
@@ -241,11 +241,11 @@ Do not call `SubtasksMarkClean` for rollback recovery unless an actual conflict 
 
 ## Force-land a stopped checkpoint
 
-Use `SubtasksForceMerge` only for a stopped execution task with no live writer and an accepted commit or verified checkpoint.
+Use `SubtasksForceMerge` only for a stopped execution task with no live writer. It lands an accepted commit or verified checkpoint when one is present; otherwise it salvages the identified work from retained state (a dirty worktree or surviving refs). A force-merge never asserts review success.
 
 - An explicit `SubtasksForceMerge` merges all identified work in one call: clean paths apply and ordinary text conflicts are written to main with diff3 markers immediately, so the task becomes `conflicted` and the workspace conflict gate blocks automatic landings until `SubtasksMarkClean`. There is no clean-only mode and no second force option.
-- A binary conflict cannot carry text markers: the target is preserved in place and the worker version is saved alongside at a collision-safe `<path>.worker-<blob>` name; both paths are named in the gate reason and recorded in the conflict manifest, and choosing a side plus removing the other file remains the manual resolution.
-- If the landing refuses before any mutation, main remains unchanged and the error names the unrepresentable paths and limits; prefer continuation or an explicit integration decision.
+- A conflict that cannot carry text markers is preserved in place instead of aborting the merge: for a binary, symlink/type-change, or oversized side the target stays intact and any available worker version is saved alongside at a collision-safe `<path>.worker-<blob>` name; for a worker-side deletion the target is kept and the deletion intent is recorded without fabricating bytes (no sidecar file). Both are named in the gate reason and recorded in the conflict manifest. Preservation is not resolution: choose a side, remove any saved worker version you do not keep, then call `SubtasksMarkClean`.
+- Only genuinely unsafe paths (an escaping destination or an unsafe symlinked ancestor) still refuse before any mutation; in that case main remains unchanged and the error names the limits. Prefer continuation or an explicit integration decision.
 - If a force-merge reports no remaining changes, inspect main anyway: the result may already be present, may have been superseded, or may be absent from the checkpoint.
 
 Never describe force-merge acknowledgement alone as successful task completion.

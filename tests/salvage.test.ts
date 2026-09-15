@@ -908,6 +908,223 @@ test("salvage — binary conflicts preserve the target and save the worker versi
   }
 });
 
+// #126 approved U2 fallback (explicit force-merge only): a symlink/type
+// conflict cannot carry text markers, so instead of aborting the whole merge
+// the target is preserved intact and the worker version (its link target) is
+// saved alongside while the remaining identified work still merges in the same call.
+test("salvage — a symlink/type conflict is preserved with the worker version alongside", async () => {
+  const scenario = await startSalvageScenario(
+    "symlink-conflict",
+    [
+      // Worker replaces the base regular file with a symlink (a type change).
+      "fs.rmSync('doc.txt');fs.symlinkSync('elsewhere','doc.txt');",
+      "fs.writeFileSync('dirty.txt','worker dirty\\n');",
+      sessionLine("salvage-symlink-conflict"),
+      HANG_LINE,
+    ].join("\n"),
+    async (dir) => {
+      await writeFile(join(dir, "doc.txt"), "base doc\n", "utf8");
+      await git(["add", "doc.txt"], dir);
+      await git(["commit", "--quiet", "-m", "symlink base"], dir);
+    },
+  );
+  try {
+    await waitFor(() => scenario.controller.inspect(scenario.executionId, scenario.taskId).tasks[0]?.state === "running");
+    await worktreeFileVisible(scenario, "dirty.txt");
+    await scenario.controller.interrupt({
+      executionId: scenario.executionId,
+      taskId: scenario.taskId,
+      mode: "interrupt_as_failure",
+      instructionId: "salvage-interrupt-symlink",
+      actor: "user",
+    });
+    // The target's own copy diverged from the base after capture (regular file).
+    await writeFile(join(scenario.root, "doc.txt"), "target doc\n", "utf8");
+
+    const conflicted = await scenario.controller.forceMerge({
+      executionId: scenario.executionId,
+      taskId: scenario.taskId,
+      mergeAnyhow: false,
+      instructionId: "salvage-symlink-force",
+      actor: "user",
+    });
+    const task = conflicted.tasks[0]!;
+    assert.equal(task.state, "conflicted");
+    assert.ok(conflicted.conflictGate?.paths.includes("doc.txt"), "the type conflict is gated for manual resolution");
+    // The clean path still transferred in the same call — the merge did not abort.
+    assert.equal(await readFile(join(scenario.root, "dirty.txt"), "utf8"), "worker dirty\n");
+    // The target's regular file is preserved intact (not turned into a symlink)…
+    const docStat = await stat(join(scenario.root, "doc.txt"));
+    assert.ok(docStat.isFile() && !docStat.isSymbolicLink(), "the target stays a regular file");
+    assert.equal(await readFile(join(scenario.root, "doc.txt"), "utf8"), "target doc\n");
+    // …and the worker's symlink version is recorded alongside (its target string).
+    const sidecar = (await readdir(scenario.root)).find((entry) => /^doc\.txt\.worker-[0-9a-f]{12}$/.test(entry));
+    assert.ok(sidecar, "the worker symlink version is saved alongside");
+    assert.equal(await readFile(join(scenario.root, sidecar!), "utf8"), "elsewhere");
+    // Both are named for manual resolution; the gate stays while the sidecar exists.
+    assert.match(String(conflicted.conflictGate?.reason), /doc\.txt\.worker-[0-9a-f]{12}/);
+    await assert.rejects(
+      scenario.controller.markClean({ actor: "user" }),
+      /still has its worker version saved alongside at .*doc\.txt\.worker-[0-9a-f]{12}/,
+    );
+    // Resolving by keeping the target means removing the sidecar, then markClean.
+    await rm(join(scenario.root, sidecar!));
+    assert.equal((await scenario.controller.markClean({ actor: "user" })).cleared, true);
+    assert.equal(scenario.controller.inspect(scenario.executionId, scenario.taskId).tasks[0]!.state, "landed");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+// #126 approved U2 fallback (explicit force-merge only): a worker-side deletion
+// of an unrepresentable (binary) path has no bytes to save. The target is
+// preserved intact, the deletion intent is recorded without fabricating content,
+// and the remaining identified work still merges in the same call.
+test("salvage — a binary worker-side deletion is recorded without fabricating bytes", async () => {
+  const scenario = await startSalvageScenario(
+    "binary-deletion",
+    [
+      // Worker deletes the base binary file.
+      "fs.rmSync('gone.bin');",
+      "fs.writeFileSync('dirty.txt','worker dirty\\n');",
+      sessionLine("salvage-binary-deletion"),
+      HANG_LINE,
+    ].join("\n"),
+    async (dir) => {
+      await writeFile(join(dir, "gone.bin"), Buffer.from([0x00, 0x10, 0x20]));
+      await git(["add", "gone.bin"], dir);
+      await git(["commit", "--quiet", "-m", "binary base"], dir);
+    },
+  );
+  try {
+    await waitFor(() => scenario.controller.inspect(scenario.executionId, scenario.taskId).tasks[0]?.state === "running");
+    await worktreeFileVisible(scenario, "dirty.txt");
+    await scenario.controller.interrupt({
+      executionId: scenario.executionId,
+      taskId: scenario.taskId,
+      mode: "interrupt_as_failure",
+      instructionId: "salvage-interrupt-deletion",
+      actor: "user",
+    });
+    // The target's own copy diverged from the base after capture (delete/modify).
+    await writeFile(join(scenario.root, "gone.bin"), Buffer.from([0x00, 0x30, 0x40]));
+
+    const conflicted = await scenario.controller.forceMerge({
+      executionId: scenario.executionId,
+      taskId: scenario.taskId,
+      mergeAnyhow: false,
+      instructionId: "salvage-deletion-force",
+      actor: "user",
+    });
+    const task = conflicted.tasks[0]!;
+    assert.equal(task.state, "conflicted");
+    assert.ok(conflicted.conflictGate?.paths.includes("gone.bin"), "the deletion conflict is gated for manual resolution");
+    // The clean path still transferred in the same call — the merge did not abort.
+    assert.equal(await readFile(join(scenario.root, "dirty.txt"), "utf8"), "worker dirty\n");
+    // The target's binary is preserved intact (NOT deleted by the worker side)…
+    assert.deepEqual(await readFile(join(scenario.root, "gone.bin")), Buffer.from([0x00, 0x30, 0x40]));
+    // …and no worker bytes were fabricated: there is no sidecar for a deletion.
+    const entries = await readdir(scenario.root);
+    assert.ok(!entries.some((entry) => /^gone\.bin\.worker-/.test(entry)), "no worker version is fabricated for a deletion");
+    // The gate records the deletion intent without a sidecar path to validate.
+    const gateSidecar = (conflicted.conflictGate?.sidecars ?? []).find((item) => item.path === "gone.bin");
+    assert.ok(gateSidecar, "the deletion conflict is recorded in the gate");
+    assert.equal(gateSidecar!.sidecarPath, undefined, "a worker-side deletion has no sidecar to validate");
+    // Record-only: markClean is the explicit resolution act (no file to check).
+    assert.equal((await scenario.controller.markClean({ actor: "user" })).cleared, true);
+    assert.equal(scenario.controller.inspect(scenario.executionId, scenario.taskId).tasks[0]!.state, "landed");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+// #126 approved U2 fallback (explicit force-merge only): one force-merge call
+// landing a clean path, an ordinary diff3 text conflict, and a preserved
+// non-text (symlink/type) conflict together pins the mixed gate — the marker
+// check on the text path plus the sidecar-existence check on the preserved path
+// must BOTH be satisfied before markClean clears.
+test("salvage — a mixed clean / text-conflict / preserved landing gates until both resolve", async () => {
+  const scenario = await startSalvageScenario(
+    "mixed-conflict",
+    [
+      // Worker modifies the shared base file (text conflict with the target).
+      "fs.writeFileSync('shared.txt','worker shared\\n');",
+      // Worker replaces doc.txt with a symlink (a type change → preserved + sidecar).
+      "fs.rmSync('doc.txt');fs.symlinkSync('elsewhere','doc.txt');",
+      // Worker creates a clean-only file.
+      "fs.writeFileSync('dirty.txt','worker dirty\\n');",
+      sessionLine("salvage-mixed-conflict"),
+      HANG_LINE,
+    ].join("\n"),
+    async (dir) => {
+      await writeFile(join(dir, "shared.txt"), "base shared\n", "utf8");
+      await writeFile(join(dir, "doc.txt"), "base doc\n", "utf8");
+      await git(["add", "shared.txt", "doc.txt"], dir);
+      await git(["commit", "--quiet", "-m", "mixed base"], dir);
+    },
+  );
+  try {
+    await waitFor(() => scenario.controller.inspect(scenario.executionId, scenario.taskId).tasks[0]?.state === "running");
+    await worktreeFileVisible(scenario, "dirty.txt");
+    await scenario.controller.interrupt({
+      executionId: scenario.executionId,
+      taskId: scenario.taskId,
+      mode: "interrupt_as_failure",
+      instructionId: "salvage-interrupt-mixed",
+      actor: "user",
+    });
+    // The target diverges from the base on both conflict paths after capture.
+    await writeFile(join(scenario.root, "shared.txt"), "target shared\n", "utf8");
+    await writeFile(join(scenario.root, "doc.txt"), "target doc\n", "utf8");
+
+    const conflicted = await scenario.controller.forceMerge({
+      executionId: scenario.executionId,
+      taskId: scenario.taskId,
+      mergeAnyhow: false,
+      instructionId: "salvage-mixed-force",
+      actor: "user",
+    });
+    assert.equal(conflicted.tasks[0]!.state, "conflicted");
+    // The clean path still transferred in the same call — the merge did not abort.
+    assert.equal(await readFile(join(scenario.root, "dirty.txt"), "utf8"), "worker dirty\n");
+    // The ordinary text conflict landed as diff3 markers on shared.txt…
+    const shared = await readFile(join(scenario.root, "shared.txt"), "utf8");
+    assert.match(shared, /<<<<<<< /);
+    assert.match(shared, /=======/);
+    assert.match(shared, />>>>>>> /);
+    // …and the preserved type conflict kept doc.txt an intact regular file with
+    // the worker's symlink version saved alongside.
+    const docStat = await stat(join(scenario.root, "doc.txt"));
+    assert.ok(docStat.isFile() && !docStat.isSymbolicLink(), "the target stays a regular file");
+    assert.equal(await readFile(join(scenario.root, "doc.txt"), "utf8"), "target doc\n");
+    const sidecar = (await readdir(scenario.root)).find((entry) => /^doc\.txt\.worker-[0-9a-f]{12}$/.test(entry));
+    assert.ok(sidecar, "the worker symlink version is saved alongside");
+    // The gate names both the text-conflict path and the preserved path.
+    assert.ok(conflicted.conflictGate?.paths.includes("shared.txt"), "text conflict is gated");
+    assert.ok(conflicted.conflictGate?.paths.includes("doc.txt"), "preserved conflict is gated");
+    const gateDoc = (conflicted.conflictGate?.sidecars ?? []).find((item) => item.path === "doc.txt");
+    assert.ok(gateDoc && typeof gateDoc.sidecarPath === "string", "the preserved entry records its sidecar");
+
+    // markClean is refused while the text-conflict markers remain…
+    await assert.rejects(
+      scenario.controller.markClean({ actor: "user" }),
+      /Conflict markers remain in:/,
+    );
+    // …and, once the markers are resolved, still while the sidecar exists.
+    await writeFile(join(scenario.root, "shared.txt"), "resolved shared\n", "utf8");
+    await assert.rejects(
+      scenario.controller.markClean({ actor: "user" }),
+      /still has its worker version saved alongside at .*doc\.txt\.worker-[0-9a-f]{12}/,
+    );
+    // Removing the sidecar (choosing the target) satisfies both checks.
+    await rm(join(scenario.root, sidecar!));
+    assert.equal((await scenario.controller.markClean({ actor: "user" })).cleared, true);
+    assert.equal(scenario.controller.inspect(scenario.executionId, scenario.taskId).tasks[0]!.state, "landed");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
 test("salvage — a live writer still blocks force-merge before any salvage", async () => {
   const scenario = await startSalvageScenario("live-writer", [
     sessionLine("salvage-live"),

@@ -743,6 +743,98 @@ review: { activeReviewers: [
   }
 });
 
+test("a record-only (worker-side deletion) sidecar entry round-trips without fabricating a path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-record-sidecar-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "implement the durable change");
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, { cwd: root, capturedAt: "2026-08-16T00:00:00.000Z", files: new Map(), omissions: [], omissionsTruncated: false });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+    freezeReviewWindowConfig(state, config);
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    await store.save(state, {
+      waveRoots: [],
+      bundles: [],
+      conflictGate: {
+        executionId: "exec-del",
+        taskId: "task-del",
+        sourceRoot: root,
+        paths: ["gone.bin"],
+        activatedAt: "2026-08-16T00:00:00.000Z",
+        manifestPath: join(root, "conflict.json"),
+        reason: "worker-side deletion recorded",
+        // #126 U2: a worker-side deletion has no bytes to save, so the durable
+        // entry carries only the path — never a fabricated sidecar location.
+        sidecars: [{ path: "gone.bin" }],
+      },
+    }, state.reviewWindow!.reviewConfig);
+
+    const restored = await store.restore(root);
+    assert.ok(restored);
+    assert.deepEqual(
+      restored.execution.conflictGate?.sidecars,
+      [{ path: "gone.bin" }],
+      "a record-only sidecar entry must restore exactly, with no fabricated sidecarPath",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a malformed sidecar entry rejects the snapshot fail-closed and preserves the file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-bad-sidecar-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "implement the durable change");
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, { cwd: root, capturedAt: "2026-08-16T00:00:00.000Z", files: new Map(), omissions: [], omissionsTruncated: false });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+    freezeReviewWindowConfig(state, config);
+    const store = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: root });
+    await store.save(state, {
+      waveRoots: [],
+      bundles: [],
+      conflictGate: {
+        executionId: "exec-bad",
+        taskId: "task-bad",
+        sourceRoot: root,
+        paths: ["image.bin"],
+        activatedAt: "2026-08-16T00:00:00.000Z",
+        manifestPath: join(root, "conflict.json"),
+        reason: "binary conflict",
+        sidecars: [{ path: "image.bin", sidecarPath: "image.bin.worker-abc123def456" }],
+      },
+    }, state.reviewWindow!.reviewConfig);
+
+    // Corrupt the persisted sidecar entry (sidecarPath must be a string) and
+    // re-sign the document so the failure is the shape check, not integrity.
+    const raw = JSON.parse(await readFile(store.path, "utf8"));
+    const gate = raw.execution?.conflictGate ?? raw.execution?.conflictGates?.[0];
+    assert.ok(gate?.sidecars?.[0], "the persisted gate must carry its sidecar entry");
+    gate.sidecars[0].sidecarPath = 42;
+    const { integritySha256: _integrity, ...unsigned } = raw;
+    raw.integritySha256 = createHash("sha256").update(stableJsonForTest(JSON.parse(JSON.stringify(unsigned)))).digest("hex");
+    const corrupted = `${JSON.stringify(raw)}\n`;
+    await writeFile(store.path, corrupted, "utf8");
+
+    // A wrong-typed sidecar field must reject the snapshot rather than be
+    // dropped: a restored gate without it could clear a sidecar conflict while
+    // the worker version still sits alongside.
+    await assert.rejects(
+      () => store.restore(root),
+      (error: unknown) => error instanceof SessionStateInvalidStateError,
+    );
+    assert.equal(await readFile(store.path, "utf8"), corrupted, "the malformed sidecar is preserved byte-for-byte");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("sidecars without a review window restore even without a selection digest", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-windowless-"));
   try {

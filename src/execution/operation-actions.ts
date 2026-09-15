@@ -130,7 +130,11 @@ export async function inspectOperation(bundle: ReattachmentBundle): Promise<Oper
     ? "The wave changes were landed into the source workspace."
     : sourceDisposition === "recovery_required"
       ? "Landing rollback was incomplete; inspect the recovery manifest before modifying the source workspace."
-      : "The wave did not land executor changes; the source workspace remains unchanged by this wave.";
+      : manifest.landingConflictMaterialized === true
+        // D1: a conflicted landing whose onLandingConflict callback materialized
+        // markers did change the source — do not claim it is unchanged.
+        ? "Conflicts were materialized into the source workspace by this wave; resolve them and call SubtasksMarkClean."
+        : "The wave did not land executor changes; the source workspace remains unchanged by this wave.";
   return {
     bundle: createReattachmentBundle(record, waveRoot),
     staleBundle: bundle.expectedRevision !== record.revision,
@@ -284,7 +288,12 @@ export async function continueOperation(input: {
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
   takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
   onWorkerSettled?: (lifecycle: WaveWorkerLifecycleResult) => void | Promise<void>;
-  onLandingConflict?: (input: { capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>; plan: LandingPlan }) => void | Promise<void>;
+  /** Called while holding the source lease when landing detects conflicts.
+   * Return `{ materialized: true }` only if the callback actually mutated the
+   * source workspace; otherwise return `{ materialized: false }`. */
+  onLandingConflict?: (input: { capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>; plan: LandingPlan }) =>
+    | { materialized: boolean }
+    | Promise<{ materialized: boolean }>;
 }): Promise<{
   inspection: OperationInspection;
   lifecycle?: WaveWorkerLifecycleResult;
@@ -1018,6 +1027,7 @@ async function publishContinuationManifest(
     delete manifest.landingAppliedPaths;
     delete manifest.landingAlreadyAppliedPaths;
     delete manifest.landingConflicts;
+    delete manifest.landingConflictMaterialized;
     delete manifest.landingFailedAtPath;
     delete manifest.landingFailureReason;
     delete manifest.landingManifestPath;
@@ -1057,6 +1067,7 @@ async function publishContinuationManifest(
     delete manifest.landingAppliedPaths;
     delete manifest.landingAlreadyAppliedPaths;
     delete manifest.landingConflicts;
+    delete manifest.landingConflictMaterialized;
     delete manifest.landingFailedAtPath;
     delete manifest.landingFailureReason;
     delete manifest.landingManifestPath;

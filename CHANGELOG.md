@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.50]
+
+### Changed
+
+- Explicit ForceMerge can merge identified retained worker work without a verified
+  checkpoint, retaining source attribution and unresolved evidence across restart
+  rather than inventing review or checkpoint success.
+- ForceMerge materializes text conflicts in one call without a second force option.
+  Binary and other unrepresentable conflicts preserve target content, retain available
+  worker content alongside, and record unresolved operations for manual resolution
+  while the remaining identified work merges. Normal reviewed landing is unchanged.
+- Protect sidecar destinations from incoming-path collisions and overwrite races,
+  and stream large nonconflicting files during explicit conflict materialization.
+  Unsupported atomic sidecar installation fails closed without an unsafe fallback.
+- Correct conflict progress reporting and recovery guidance to distinguish actual
+  workspace changes, preserved conflicts, and verified continuation eligibility.
+
 ## [0.1.0-dev.49]
 
 ### Changed

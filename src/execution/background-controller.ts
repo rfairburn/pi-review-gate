@@ -192,10 +192,14 @@ export interface BackgroundConflictGate {
   activatedAt: string;
   manifestPath: string;
   reason: string;
-  /** #126 approved binary handling: conflicted paths whose worker version was
-   * saved alongside the preserved target. The conflict stays unresolved while
-   * a sidecar file still exists; markClean validates each one. */
-  sidecars?: Array<{ path: string; sidecarPath: string }>;
+  /** #126 approved (explicit force-merge only): conflicted paths whose content
+   * could not carry text markers and was preserved instead. Entries with a
+   * `sidecarPath` keep the worker version alongside the intact target — the
+   * conflict stays unresolved while that file still exists and markClean
+   * validates it. Entries without one record a worker-side deletion: no bytes
+   * were fabricated, so resolution is the orchestrator's explicit act after
+   * inspecting the gate and its manifest. */
+  sidecars?: Array<{ path: string; sidecarPath?: string }>;
 }
 
 interface RuntimeTask {
@@ -1807,15 +1811,29 @@ export class BackgroundExecutionController {
         // clean-only refusal to retry; `input.mergeAnyhow` is accepted for
         // caller compatibility but controls nothing.
         await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
-        const materialized = await materializeLandingConflicts(capture, plan, `forced subtask ${task.taskId}`);
+        // #126 approved representation modes (explicit force-merge only):
+        // binary conflicts keep their target in place with the worker version
+        // saved alongside, and other unrepresentable conflicts are preserved —
+        // available worker bytes alongside, deletions recorded — while the
+        // remaining identified work still merges in this same call.
+        const materialized = await materializeLandingConflicts(capture, plan, `forced subtask ${task.taskId}`, {
+          binarySidecars: true,
+          preserveUnrepresentable: true,
+        });
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
-        // #126 approved binary handling: binary conflicts cannot carry markers,
-        // so the preserved target and the worker version saved alongside must
-        // both be named. The gate reason is rendered by SubtasksInspect and the
-        // failure wake, so it is the visible durable place for the pairing.
+        // #126 approved: conflicts that cannot carry markers are preserved
+        // instead of represented, so the preserved target and any worker
+        // version saved alongside (or a recorded deletion) must both be named.
+        // The gate reason is rendered by SubtasksInspect and the failure wake,
+        // so it is the visible durable place for the pairing.
         const sidecarNote = materialized.sidecars.length > 0
-          ? ` Binary conflict(s) preserved in place with the worker version saved alongside: ${materialized.sidecars.map((sidecar) => `${sidecar.path} -> ${sidecar.sidecarPath}`).join("; ")}. Choose a side and remove the other file; the sidecar alone never resolves the conflict.`
+          ? ` Unrepresentable conflict(s) preserved without markers: ${materialized.sidecars.map((sidecar) => sidecar.sidecarPath
+              ? `${sidecar.path} -> worker version saved alongside at ${sidecar.sidecarPath}`
+              : `${sidecar.path}: worker-side deletion recorded; the target is preserved and no worker version exists`).join("; ")} Resolve each path in the main workspace, remove any saved worker version you do not keep, then call SubtasksMarkClean; preservation is not resolution.`
           : "";
+        const gateSidecars = materialized.sidecars.map((sidecar) => sidecar.sidecarPath
+          ? { path: sidecar.path, sidecarPath: sidecar.sidecarPath }
+          : { path: sidecar.path });
         const conflictGate: BackgroundConflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
@@ -1824,7 +1842,7 @@ export class BackgroundExecutionController {
           activatedAt: new Date().toISOString(),
           manifestPath: materialized.manifestPath,
           reason: `Forced task ${task.taskId} materialized conflicts that require immediate resolution.${sidecarNote}`,
-          ...(materialized.sidecars.length > 0 ? { sidecars: materialized.sidecars } : {}),
+          ...(gateSidecars.length > 0 ? { sidecars: gateSidecars } : {}),
         };
         this.setConflictGate(conflictGate);
         transitionTaskState(task, "conflicted");
@@ -2138,19 +2156,34 @@ export class BackgroundExecutionController {
     // dirty root is named so the remaining work stays actionable.
     const dirty: string[] = [];
     for (const [, { gate }] of entries) {
-      const unresolved = await unresolvedConflictMarkers(gate.sourceRoot, gate.paths);
+      // #126 approved force-only fallback: preserved non-text conflicts
+      // (symlink/type change, oversized side, worker-side deletion) never carry
+      // diff3 markers, and their destination may be a symlink or a large/special
+      // file. Reading them adds no verification value and could follow an unsafe
+      // symlink or allocate unboundedly, so they are excluded from the marker
+      // scan; their resolution is governed by the sidecar check below plus the
+      // explicit markClean attestation.
+      const preserved = new Set((gate.sidecars ?? []).map((sidecar) => sidecar.path));
+      const unresolved = await unresolvedConflictMarkers(
+        gate.sourceRoot,
+        gate.paths.filter((path) => !preserved.has(path)),
+      );
       if (unresolved.length > 0) {
         dirty.push(entries.length === 1 ? unresolved.join(", ") : `${gate.sourceRoot}: ${unresolved.join(", ")}`);
       }
-      // #126 approved binary handling: a sidecar conflict is resolved only
-      // once the worker version saved alongside has been handled (chosen or
-      // discarded). While it still exists, the gate stays unresolved.
+      // #126 approved (explicit force-merge only): a preserved conflict is
+      // resolved only once the worker version saved alongside has been handled
+      // (chosen or discarded). While it still exists, the gate stays
+      // unresolved. Record-only entries (worker-side deletion) have no file to
+      // check; their resolution is the orchestrator's explicit act attested by
+      // markClean.
       for (const sidecar of gate.sidecars ?? []) {
+        if (!sidecar.sidecarPath) continue;
         const present = await stat(sidecar.sidecarPath).catch(() => undefined);
         if (present) {
           dirty.push(entries.length === 1
-            ? `binary conflict ${sidecar.path} still has its worker version saved alongside at ${sidecar.sidecarPath}; choose a side and remove the other file`
-            : `${gate.sourceRoot}: binary conflict ${sidecar.path} still has its worker version saved alongside at ${sidecar.sidecarPath}`);
+            ? `preserved conflict ${sidecar.path} still has its worker version saved alongside at ${sidecar.sidecarPath}; choose a side and remove the other file`
+            : `${gate.sourceRoot}: preserved conflict ${sidecar.path} still has its worker version saved alongside at ${sidecar.sidecarPath}`);
         }
       }
     }
@@ -2869,14 +2902,13 @@ export class BackgroundExecutionController {
       takeDeferredSteering: () => this.takeDeferredSteering(group, task),
       onLandingConflict: async ({ capture, plan }) => {
         await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
+        // Ordinary reviewed landing keeps the pre-#126 contract: every conflict
+        // that cannot carry text markers refuses the whole transfer before any
+        // mutation (materializeLandingConflicts throws). Only ordinary text
+        // conflicts reach here and are materialized as diff3 markers in the
+        // source workspace.
         const materialized = await materializeLandingConflicts(capture, plan, `subtask ${task.taskId}`);
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
-        // #126 approved binary handling: name the preserved-target/worker-
-        // version pairs in the gate so SubtasksInspect and the failure wake
-        // identify both files for manual resolution.
-        const sidecarNote = materialized.sidecars.length > 0
-          ? ` Binary conflict(s) preserved in place with the worker version saved alongside: ${materialized.sidecars.map((sidecar) => `${sidecar.path} -> ${sidecar.sidecarPath}`).join("; ")}. Choose a side and remove the other file; the sidecar alone never resolves the conflict.`
-          : "";
         const conflictGate: BackgroundConflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
@@ -2884,15 +2916,15 @@ export class BackgroundExecutionController {
           paths: materialized.paths,
           activatedAt: new Date().toISOString(),
           manifestPath: materialized.manifestPath,
-          reason: `Task ${task.taskId} requires immediate conflict resolution.${sidecarNote}`,
-          ...(materialized.sidecars.length > 0 ? { sidecars: materialized.sidecars } : {}),
+          reason: `Task ${task.taskId} requires immediate conflict resolution.`,
         };
         this.setConflictGate(conflictGate);
         transitionTaskState(task, "conflicted");
-        this.addActivity(task, "conflicted", `Conflicts materialized in ${materialized.paths.join(", ")}.${sidecarNote}`);
+        this.addActivity(task, "conflicted", `Conflicts materialized in ${materialized.paths.join(", ")}.`);
         await this.save(group);
         await this.publishAssociations();
         await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
+        return { materialized: true };
       },
     });
     task.result = result;
@@ -3050,22 +3082,20 @@ export class BackgroundExecutionController {
         },
         onLandingConflict: async ({ capture, plan }) => {
           await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
+          // Ordinary reviewed continuation landing keeps the pre-#126 contract:
+          // unrepresentable conflicts refuse the whole transfer before any
+          // mutation; only text conflicts are materialized here.
           const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
           await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
-          // #126 approved binary handling: same gate identification as the
-          // other landing paths.
-          const sidecarNote = materialized.sidecars.length > 0
-            ? ` Binary conflict(s) preserved in place with the worker version saved alongside: ${materialized.sidecars.map((sidecar) => `${sidecar.path} -> ${sidecar.sidecarPath}`).join("; ")}. Choose a side and remove the other file; the sidecar alone never resolves the conflict.`
-            : "";
           const conflictGate = this.activateConflictGate(
             group, task, materialized.paths, materialized.manifestPath,
-            `Continued task ${task.taskId} requires immediate conflict resolution.${sidecarNote}`,
-            materialized.sidecars,
+            `Continued task ${task.taskId} requires immediate conflict resolution.`,
           );
-          this.addActivity(task, "conflicted", `Conflicts materialized in ${materialized.paths.join(", ")}.${sidecarNote}`);
+          this.addActivity(task, "conflicted", `Conflicts materialized in ${materialized.paths.join(", ")}.`);
           await this.save(group);
           await this.publishAssociations();
           await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
+          return { materialized: true };
         },
         onUpdate: (update) => this.continuationProgress(group, task, update),
       });
@@ -3147,8 +3177,9 @@ export class BackgroundExecutionController {
     paths: string[],
     manifestPath: string,
     reason: string,
-    sidecars?: Array<{ path: string; sidecarPath: string }>,
   ): BackgroundConflictGate {
+    // Ordinary reviewed landing never produces sidecars (unrepresentable
+    // conflicts refuse before mutation), so no sidecar pairing is recorded.
     const gate: BackgroundConflictGate = {
       executionId: group.executionId,
       taskId: task.taskId,
@@ -3157,7 +3188,6 @@ export class BackgroundExecutionController {
       activatedAt: new Date().toISOString(),
       manifestPath,
       reason,
-      ...(sidecars && sidecars.length > 0 ? { sidecars } : {}),
     };
     this.setConflictGate(gate);
     transitionTaskState(task, "conflicted");

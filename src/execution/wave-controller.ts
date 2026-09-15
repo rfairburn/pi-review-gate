@@ -937,6 +937,15 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
         settled: false,
       };
 
+      // Own the lifecycle rejection synchronously, before the intervening
+      // task-start manifest write below. A rejection that lands while that
+      // write is still pending (for example an aborted base-snapshot Git
+      // child) would otherwise surface as an unhandled rejection before the
+      // awaited handle.promise below attaches its handler. Ownership only;
+      // the original rejection still reaches that await and keeps its
+      // truthful executor_error handling.
+      void handle.promise.catch(() => undefined);
+
       handles.push(handle);
 
       // Write manifest at task start with truthful "starting" status.

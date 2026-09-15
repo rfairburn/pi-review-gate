@@ -164,6 +164,10 @@ export interface PersistedConflictGate {
   activatedAt: string;
   manifestPath: string;
   reason: string;
+  /** #126 approved binary handling: preserved-target/worker-version pairs whose
+   * gate stays unresolved until the sidecar is handled. Persisted so markClean
+   * keeps enforcing it after restore. */
+  sidecars?: Array<{ path: string; sidecarPath: string }>;
 }
 
 export interface ExecutionAssociationsSnapshot {
@@ -704,7 +708,20 @@ function isValidConflictGate(value: unknown): value is PersistedConflictGate {
     && Array.isArray(value.paths)
     && typeof value.activatedAt === "string"
     && typeof value.manifestPath === "string"
-    && typeof value.reason === "string";
+    && typeof value.reason === "string"
+    // A malformed sidecar entry must reject the snapshot rather than be
+    // dropped: a restored gate without it could clear a sidecar conflict
+    // while the worker version still sits alongside.
+    && (value.sidecars === undefined || isValidSidecarList(value.sidecars));
+}
+
+function isValidSidecarList(value: unknown): value is Array<{ path: string; sidecarPath: string }> {
+  return Array.isArray(value)
+    && value.every((entry) =>
+      isRecord(entry)
+      && typeof entry.path === "string"
+      && typeof entry.sidecarPath === "string",
+    );
 }
 
 function summarizePendingDeliveries(deliveries: ReadonlyArray<{ status?: unknown; kind?: unknown }>): PendingDeliverySummary {

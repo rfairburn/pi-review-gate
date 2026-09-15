@@ -1257,6 +1257,22 @@ function renderForceMerge(lines: LineBuilder, details: Record<string, any>, args
   if (typeof details.cwd === "string" && details.cwd.trim()) {
     lines.add(`Target: ${details.cwd}`);
   }
+  // #126: forced-salvage provenance, when the landing did not use an ordinary
+  // verified checkpoint.
+  const salvageCommand = matchingCommand(details, args);
+  const salvage = isRecord(salvageCommand?.salvage) ? salvageCommand.salvage : undefined;
+  if (salvage) {
+    lines.add(salvage.sourceKind === "verified_checkpoint"
+      ? "Source: its verified checkpoint — landed despite the operation lifecycle state; no review success asserted"
+      : `Source: ${stringOr(salvage.sourceKind, "unknown")} — no ordinary verified checkpoint was landed`, "warning");
+    const notTransferred = [
+      ...(Array.isArray(salvage.baselineOnlyPaths) ? salvage.baselineOnlyPaths.filter((p): p is string => typeof p === "string") : []),
+      ...(Array.isArray(salvage.ambiguousPaths) ? salvage.ambiguousPaths.filter((p): p is string => typeof p === "string") : []),
+    ];
+    if (notTransferred.length > 0) {
+      lines.add(`Not transferred: ${notTransferred.slice(0, 12).join(", ")}${notTransferred.length > 12 ? ` (+${notTransferred.length - 12} more)` : ""}`, "muted");
+    }
+  }
   const state = task ? stringOr(task.state, "unknown") : undefined;
   if (state === "conflicted") {
     lines.add("Result: conflicts materialized", "warning");

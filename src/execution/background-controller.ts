@@ -24,7 +24,7 @@ import {
 import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
 import { continueOperation, inspectOperation, readVerifiedAcceptedResult, verifyRecoveryCheckpoint } from "./operation-actions";
 import type { OperationRecord, ReattachmentBundle } from "./operation-record";
-import { createReattachmentBundle, operationOwnershipStatus, readOperationRecord } from "./operation-record";
+import { createIncident, createReattachmentBundle, operationOwnershipStatus, readOperationRecord, writeOperationRecord } from "./operation-record";
 import { resolveArtifactRoot } from "./evidence/sources";
 import { buildSubtaskEvidence, readConfinedOperationRecord, readSubtaskEvidence, type SubtaskEvidenceRead, type SubtaskEvidenceSelector, type SubtaskEvidenceUnavailable } from "./subtask-evidence";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
@@ -35,12 +35,14 @@ import {
   isArchivableTaskState,
   MAX_ACTIVITY,
   newTask,
+  salvageEvidenceRequiresRetention,
   stateFromContinuationProgress,
   stateFromWaveProgress,
   taskTiming,
   transitionTaskState,
   isStoppedForExit,
   type BackgroundActivityEvent,
+  type ForceMergeSalvageProvenance,
   type BackgroundCommandRecord,
   type BackgroundTaskDefinition,
   type BackgroundTaskKind,
@@ -75,6 +77,19 @@ import { executeWave, type WaveProgressUpdate } from "./wave-controller";
 import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult } from "./wave-worker";
 import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
+import {
+  buildAttributedCandidateTree,
+  buildSalvageCommit,
+  captureWorktreeSnapshot,
+  evaluateCandidateAgainstCheckpoint,
+  incidentBranchNames,
+  listSalvageRefCandidates,
+  salvageRefCandidate,
+  salvageWorktreeCandidate,
+  selectSalvageSource,
+  treeShaOf,
+  type SalvageCandidateIdentity,
+} from "./salvage";
 import { researchWorkspaceChanges, waveLineageOf } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
 import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
@@ -177,6 +192,10 @@ export interface BackgroundConflictGate {
   activatedAt: string;
   manifestPath: string;
   reason: string;
+  /** #126 approved binary handling: conflicted paths whose worker version was
+   * saved alongside the preserved target. The conflict stays unresolved while
+   * a sidecar file still exists; markClean validates each one. */
+  sidecars?: Array<{ path: string; sidecarPath: string }>;
 }
 
 interface RuntimeTask {
@@ -193,6 +212,61 @@ interface PendingForceMerge {
   done: Promise<void>;
   /** True once the source mutation lease has been acquired. */
   acquired: boolean;
+}
+
+/**
+ * #126: the landing source an explicit force-merge resolved to.
+ * `checkpoint` is the ordinary verified-checkpoint path (unchanged behavior);
+ * `forced_checkpoint` is an explicit override of a lifecycle refusal against a
+ * genuinely verified checkpoint; `salvage` is an identified snapshot of actual
+ * worker work captured without any ordinary checkpoint, or — when newer
+ * retained work provably subsumes one — the snapshot that supersedes it.
+ */
+type ForceMergeLandingSource =
+  | { kind: "checkpoint"; commitSha: string; ref: string }
+  | { kind: "forced_checkpoint"; commitSha: string; ref: string; reason: string }
+  | { kind: "salvage"; candidate: SalvageCandidateIdentity; supersededCheckpoint?: { commitSha: string; ref: string } };
+
+/** Human-readable description of where a salvaged landing came from. */
+function describeSalvageSource(source: ForceMergeLandingSource): string {
+  if (source.kind !== "salvage") return "its verified checkpoint";
+  const candidate = source.candidate;
+  if (candidate.sourceKind === "worktree") {
+    const where = candidate.branchName
+      ? `branch "${candidate.branchName}"`
+      : `head ${candidate.headSha?.slice(0, 12) ?? "unknown"}`;
+    return `the retained worker worktree (${where})`;
+  }
+  return `retained ref ${candidate.refName ?? "unknown"}`;
+}
+
+/** Durable forced-salvage provenance for a force-merge whose source is not the
+ * ordinary verified checkpoint. Undefined for that ordinary path, which
+ * records no salvage. */
+function salvageProvenanceFor(
+  source: ForceMergeLandingSource,
+  commitSha: string,
+  checkpoint?: { changedPaths?: string[] },
+): ForceMergeSalvageProvenance | undefined {
+  if (source.kind === "checkpoint") return undefined;
+  const superseded = source.kind === "salvage" ? source.supersededCheckpoint : undefined;
+  return {
+    reason: source.kind === "forced_checkpoint"
+      ? source.reason
+      : superseded
+        ? `verified checkpoint ${superseded.ref} (${superseded.commitSha.slice(0, 12)}) superseded by identified newer retained work; salvaged from ${describeSalvageSource(source)}`
+        : `no ordinary verified checkpoint; salvaged from ${describeSalvageSource(source)}`,
+    sourceKind: source.kind === "forced_checkpoint" ? "verified_checkpoint" : source.candidate.sourceKind,
+    ...(superseded ? { supersededCheckpoint: superseded } : {}),
+    ...(source.kind === "salvage" && source.candidate.branchName ? { branchName: source.candidate.branchName } : {}),
+    ...(source.kind === "salvage" && source.candidate.headSha ? { headSha: source.candidate.headSha } : {}),
+    ...(source.kind === "salvage" && source.candidate.refName ? { refName: source.candidate.refName } : {}),
+    candidateCommit: commitSha,
+    candidateRef: source.kind === "salvage" ? source.candidate.candidateRef : source.ref,
+    attributedPaths: source.kind === "salvage" ? [...source.candidate.attributedPaths] : [...(checkpoint?.changedPaths ?? [])],
+    baselineOnlyPaths: source.kind === "salvage" ? [...source.candidate.baselineOnlyPaths] : [],
+    ambiguousPaths: source.kind === "salvage" ? [...source.candidate.ambiguousPaths] : [],
+  };
 }
 
 interface PersistedGroupRevision {
@@ -1129,11 +1203,17 @@ export class BackgroundExecutionController {
   /** Restore metadata from the task's already-owned wave, never from a guessed
    * operation id. Inspection verifies the checkpoint and supplies the current
    * revision; result evidence is separately tied to that exact checkpoint.
+   *
+   * #126: with `tolerateUnverifiedCheckpoint`, an explicit force-merge may
+   * proceed past a missing or unverified checkpoint into salvage capture.
+   * Only a *verified* checkpoint is then published as the task's continuation
+   * bundle, so salvage never launders into ordinary continuation eligibility.
    */
   private async recoverTaskAssociation(
     group: BackgroundExecutionGroup,
     task: BackgroundTaskRecord,
     explicit?: ReattachmentBundle,
+    options?: { tolerateUnverifiedCheckpoint?: boolean },
   ): Promise<void> {
     if (group.kind === "research") return this.recoverResearchTaskAssociation(group, task, explicit);
     if (!task.waveRoot) {
@@ -1168,13 +1248,19 @@ export class BackgroundExecutionController {
       throw new Error(`Stale reattachment bundle revision ${explicit.expectedRevision}; current operation revision is ${inspection.bundle.expectedRevision}. Inspect and retry with the returned bundle.`);
     }
     if (inspection.live) throw new Error("Recovery operation still has a live writer.");
-    if ((!task.bundle || explicit) && inspection.checkpointVerification.status !== "verified") {
+    const verifiedCheckpoint = inspection.checkpointVerification.status === "verified";
+    if ((!task.bundle || explicit) && !verifiedCheckpoint
+      && options?.tolerateUnverifiedCheckpoint !== true) {
       throw new Error(`Recovery checkpoint is not verified: ${inspection.checkpointVerification.error ?? inspection.checkpointVerification.status}`);
     }
-    const accepted = inspection.checkpointVerification.status === "verified"
+    const accepted = verifiedCheckpoint
       ? await readVerifiedAcceptedResult(inspection) : undefined;
     if (this.detachEpoch !== epoch || this.detaching > 0) throw new Error("Controller detached during recovery verification.");
-    task.bundle = { ...inspection.bundle };
+    // A tolerated, unverified checkpoint is inspected for salvage but never
+    // published as a durable continuation bundle.
+    if (verifiedCheckpoint || options?.tolerateUnverifiedCheckpoint !== true) {
+      task.bundle = { ...inspection.bundle };
+    }
     if (accepted && (!task.result || task.result.taskResults[0]?.acceptedCommitSha !== accepted.acceptedCommitSha)) {
       task.result = {
         waveId: inspection.bundle.waveId, waveRoot: ownedRoot, sourceRoot: inspection.manifest.sourceRoot,
@@ -1573,14 +1659,24 @@ export class BackgroundExecutionController {
     task: BackgroundTaskRecord,
     pending: PendingForceMerge,
   ): Promise<BackgroundInspection> {
-    await this.recoverTaskAssociation(group, task);
-    const bundle = task.bundle;
-    if (!bundle) throw new Error(`Task ${task.taskId} has no verified recovery bundle.`);
+    // #126: an explicit force-merge is salvage-capable. Association recovery
+    // tolerates a missing or unverified checkpoint; only a verified checkpoint
+    // is published as the task's continuation bundle, so salvage never launders
+    // into ordinary continuation eligibility.
+    if (!task.waveRoot) {
+      throw new Error(`Task ${task.taskId} has no durable wave ownership anchor; there is no recoverable work to force-merge.`);
+    }
+    await this.recoverTaskAssociation(group, task, undefined, { tolerateUnverifiedCheckpoint: true });
+    const bundle = task.bundle ?? (await this.resolveUnverifiedForceMergeBundle(task));
+    if (!bundle) throw new Error(`Task ${task.taskId} has no durable wave/operation anchor; there is no recoverable work to force-merge.`);
+    // #126 correction: an explicit force-merge always merges all identified
+    // work in one call, so the request carries no mode; `input.mergeAnyhow`
+    // is accepted for caller compatibility but recorded nowhere and controls
+    // nothing.
     const command: BackgroundCommandRecord = {
       instructionId: input.instructionId,
       action: "force_merge",
       actor: input.actor,
-      mode: input.mergeAnyhow ? "merge_anyhow" : "clean_only",
       status: "queued",
       createdAt: new Date().toISOString(),
     };
@@ -1599,16 +1695,79 @@ export class BackgroundExecutionController {
     }
 
     const inspection = await inspectOperation(bundle);
-    const checkpoint = inspection.record.checkpoint;
-    const commitSha = checkpoint?.commitSha;
-    if (inspection.live || inspection.record.state === "failed_critical"
-      || inspection.manifest.sourceWorkspace.disposition === "recovery_required"
-      || inspection.checkpointVerification.status !== "verified" || !commitSha) {
+    // Real source authority is preserved regardless of salvage: a live or
+    // uncertain writer must be interrupted and acknowledged first, and an
+    // incomplete landing rollback blocks further mutation.
+    if (inspection.live) {
       command.status = "failed";
-      command.error = "Force-merge requires a stopped verified checkpoint and no unresolved landing recovery; inspect operation ownership and recovery diagnostics.";
+      command.error = `Force-merge requires no live or uncertain writer on task ${task.taskId}; interrupt it and await acknowledgement before force-merging.`;
       await this.save(group);
       throw new Error(command.error);
     }
+    if (inspection.manifest.sourceWorkspace.disposition === "recovery_required") {
+      command.status = "failed";
+      command.error = `Force-merge requires an unresolved landing recovery to be resolved first: inspect and complete the landing recovery for task ${task.taskId}.`;
+      await this.save(group);
+      throw new Error(command.error);
+    }
+    // #126: ordinary lifecycle gates no longer wall off explicit salvage. A
+    // verified checkpoint still lands through the unchanged ordinary path; a
+    // verified checkpoint under failed_critical is an explicit override of the
+    // lifecycle refusal; anything else salvages an identified snapshot of the
+    // worker's actual work (retained worktree first, surviving refs otherwise).
+    const checkpoint = inspection.record.checkpoint;
+    const verifiedCheckpoint = inspection.checkpointVerification.status === "verified" && Boolean(checkpoint?.commitSha);
+    let source: ForceMergeLandingSource;
+    if (verifiedCheckpoint) {
+      // #126 correction: a verified checkpoint must not silently hide newer
+      // retained work. The retained worktree is inspected for identified
+      // content the checkpoint's tree does not carry; when it provably
+      // subsumes the checkpoint it supersedes it, and anything that cannot be
+      // ordered is surfaced rather than guessed. Surviving refs are excluded
+      // as superseded review history (see identifyWorkBeyondCheckpoint). This
+      // inspection is read-only (private repository + retained worktree) and
+      // runs before the source-mutation lease.
+      let supersession;
+      try {
+        supersession = await this.identifyWorkBeyondCheckpoint(task, inspection.record, checkpoint!);
+      } catch (error) {
+        command.status = "failed";
+        command.error = messageOf(error);
+        await this.save(group);
+        throw error;
+      }
+      if (supersession.kind === "ambiguous") {
+        command.status = "failed";
+        command.error = supersession.message;
+        task.summary = supersession.message;
+        await this.save(group);
+        throw new Error(supersession.message);
+      }
+      if (supersession.kind === "salvage") {
+        source = {
+          kind: "salvage",
+          candidate: supersession.candidate,
+          supersededCheckpoint: { commitSha: checkpoint!.commitSha, ref: checkpoint!.ref },
+        };
+      } else {
+        source = inspection.record.state === "failed_critical"
+          ? { kind: "forced_checkpoint", commitSha: checkpoint!.commitSha, ref: checkpoint!.ref, reason: "verified checkpoint despite failed_critical operation state" }
+          : { kind: "checkpoint", commitSha: checkpoint!.commitSha, ref: checkpoint!.ref };
+      }
+    } else {
+      // Salvage capture is read-only (private repository + retained worktree)
+      // and runs before the source-mutation lease; a refusal marks the command
+      // failed durably, matching the other pre-acquisition refusals.
+      try {
+        source = await this.captureSalvageSource(group, task, inspection.record);
+      } catch (error) {
+        command.status = "failed";
+        command.error = messageOf(error);
+        await this.save(group);
+        throw error;
+      }
+    }
+    const commitSha = source.kind === "salvage" ? source.candidate.commitSha : source.commitSha;
     const originalCapture = await readWaveCaptureRecord(bundle.waveRoot);
     const lineage = waveLineageOf(originalCapture);
     const generation = inspection.record.generation;
@@ -1630,23 +1789,33 @@ export class BackgroundExecutionController {
       command.status = "delivered";
       command.deliveredAt = new Date().toISOString();
       transitionTaskState(task, "waiting_to_land");
-      this.addActivity(task, "force_merge", `Force-merge requested from ${commitSha}. This is a mechanical landing attempt; manual inspection of the main workspace is required afterward in every outcome.`);
+      this.addActivity(task, "force_merge", source.kind === "checkpoint"
+        ? `Force-merge requested from ${commitSha}. This is a mechanical landing attempt; manual inspection of the main workspace is required afterward in every outcome.`
+        : source.kind === "forced_checkpoint"
+          ? `Forced force-merge requested from its verified checkpoint (candidate ${commitSha}) despite the operation lifecycle state (${source.reason}); no review success is asserted. Manual inspection of the main workspace is required in every outcome.`
+          : source.supersededCheckpoint
+            ? `Salvage force-merge requested from ${describeSalvageSource(source)} (candidate ${commitSha}); it supersedes the verified checkpoint ${source.supersededCheckpoint.ref} (${source.supersededCheckpoint.commitSha.slice(0, 12)}), which does not carry all identified retained work. No review success is asserted; manual inspection of the main workspace is required in every outcome.`
+            : `Salvage force-merge requested from ${describeSalvageSource(source)} (candidate ${commitSha}); no ordinary verified checkpoint is being landed. Manual inspection of the main workspace is required in every outcome.`);
       await this.save(group);
 
       await pinCommit(capture, commitSha, { type: "integration" });
       const plan = await planWaveLanding(capture, commitSha, group.cwd);
       if (plan.conflicts.length > 0) {
-        if (!input.mergeAnyhow) {
-          transitionTaskState(task, "paused_recoverable");
-          task.summary = `Force-merge found ${plan.conflicts.length} conflict(s); main remains unchanged. Manual workspace inspection is required before choosing recovery.`;
-          command.status = "failed";
-          command.error = task.summary;
-          await this.save(group);
-          throw new Error(`${task.summary} Re-run SubtasksForceMerge with mergeAnyhow only if ordinary conflict markers should be materialized.`);
-        }
+        // #126 correction: an explicit force-merge merges ALL identified work
+        // in one call for every source kind — clean paths apply and ordinary
+        // text conflicts materialize standard diff3 markers here. There is no
+        // clean-only refusal to retry; `input.mergeAnyhow` is accepted for
+        // caller compatibility but controls nothing.
         await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
         const materialized = await materializeLandingConflicts(capture, plan, `forced subtask ${task.taskId}`);
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
+        // #126 approved binary handling: binary conflicts cannot carry markers,
+        // so the preserved target and the worker version saved alongside must
+        // both be named. The gate reason is rendered by SubtasksInspect and the
+        // failure wake, so it is the visible durable place for the pairing.
+        const sidecarNote = materialized.sidecars.length > 0
+          ? ` Binary conflict(s) preserved in place with the worker version saved alongside: ${materialized.sidecars.map((sidecar) => `${sidecar.path} -> ${sidecar.sidecarPath}`).join("; ")}. Choose a side and remove the other file; the sidecar alone never resolves the conflict.`
+          : "";
         const conflictGate: BackgroundConflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
@@ -1654,14 +1823,35 @@ export class BackgroundExecutionController {
           paths: materialized.paths,
           activatedAt: new Date().toISOString(),
           manifestPath: materialized.manifestPath,
-          reason: `Forced task ${task.taskId} materialized conflicts that require immediate resolution.`,
+          reason: `Forced task ${task.taskId} materialized conflicts that require immediate resolution.${sidecarNote}`,
+          ...(materialized.sidecars.length > 0 ? { sidecars: materialized.sidecars } : {}),
         };
         this.setConflictGate(conflictGate);
         transitionTaskState(task, "conflicted");
-        task.summary = `Force-merge materialized conflict markers in ${materialized.paths.join(", ")}. Resolve them and manually inspect the complete workspace; force-merge does not verify the requested result.`;
+        const salvageConflictNote = source.kind === "salvage" && source.supersededCheckpoint
+          ? `this snapshot supersedes the verified checkpoint ${source.supersededCheckpoint.ref} but carries no review behind it`
+          : source.kind === "salvage"
+            ? "salvaged content has no ordinary checkpoint or review behind it"
+            : "force-merge does not verify the requested result";
+        task.summary = (source.kind === "salvage"
+          ? `Salvage force-merge from ${describeSalvageSource(source)} materialized conflicts in ${materialized.paths.join(", ")}. Resolve them and manually inspect the complete workspace; ${salvageConflictNote}.`
+          : `Force-merge materialized conflicts in ${materialized.paths.join(", ")}. Resolve them and manually inspect the complete workspace; force-merge does not verify the requested result.`) + sidecarNote;
         command.status = "acknowledged";
         command.acknowledgedAt = new Date().toISOString();
+        // #126: a conflicted salvage still transferred its non-conflicting
+        // paths, so the forced-salvage provenance is recorded durably here as
+        // well; it must survive the later markClean landing and never read
+        // like an ordinary verified-checkpoint merge.
+        command.salvage = salvageProvenanceFor(source, commitSha, checkpoint);
         await this.save(group);
+        if (command.salvage) {
+          const salvageProvenance = command.salvage;
+          await this.completeLandedBookkeeping(task, "salvage provenance", () =>
+            this.recordSalvageProvenanceIncident(task, salvageProvenance, {
+              appliedPaths: materialized.appliedPaths,
+              conflictPaths: materialized.paths,
+            }), "conflicted");
+        }
         await this.publishAssociations();
         await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
         return this.inspect(group.executionId, task.taskId);
@@ -1670,9 +1860,22 @@ export class BackgroundExecutionController {
       const landing = await executeWaveLanding(plan, capture);
       if (landing.status !== "landed") throw new Error(`Force-merge landing ended in ${landing.status}.`);
       const paths = [...landing.appliedPaths, ...landing.alreadyAppliedPaths];
-      task.summary = paths.length > 0
-        ? "Stopped task force-merged mechanically into the main workspace; manual workspace inspection is still required to confirm the requested changes are present and correct."
-        : "Force-merge checkpoint contains no changes that remain to be landed; manual workspace inspection is still required to determine whether the requested changes are present.";
+      // #126: durable forced-salvage provenance is recorded with the landed
+      // state; it never implies review success or a normal checkpoint.
+      command.salvage = salvageProvenanceFor(source, commitSha, checkpoint);
+      task.summary = source.kind === "checkpoint"
+        ? (paths.length > 0
+            ? "Stopped task force-merged mechanically into the main workspace; manual workspace inspection is still required to confirm the requested changes are present and correct."
+            : "Force-merge checkpoint contains no changes that remain to be landed; manual workspace inspection is still required to determine whether the requested changes are present.")
+        : source.kind === "forced_checkpoint"
+          ? (paths.length > 0
+              ? `Verified checkpoint force-merged into the main workspace from ${describeSalvageSource(source)} despite the operation lifecycle state (${source.reason}); no review success was asserted, so manual inspection is still required to confirm what actually arrived.`
+              : "Force-merge checkpoint contains no changes that remain to be landed; manual workspace inspection is still required to determine whether the requested changes are present.")
+          : (paths.length > 0
+              ? source.supersededCheckpoint
+                ? `Salvage force-merge landed ${describeSalvageSource(source)} into the main workspace, superseding verified checkpoint ${source.supersededCheckpoint.ref}; no review success was asserted, so manual inspection is required to confirm what actually arrived.`
+                : `Salvage force-merge landed ${describeSalvageSource(source)} into the main workspace without an ordinary checkpoint or review; manual inspection is required to confirm what actually arrived.`
+              : "Salvage force-merge identified no remaining changes to land; manual inspection is still required to determine whether the requested changes are present.");
       command.status = "acknowledged";
       command.acknowledgedAt = new Date().toISOString();
       // The landing mutated main (finding 2): run the parent checkpoint as
@@ -1683,6 +1886,11 @@ export class BackgroundExecutionController {
       await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId });
       });
+      if (command.salvage) {
+        const salvageProvenance = command.salvage;
+        await this.completeLandedBookkeeping(task, "salvage provenance", () =>
+          this.recordSalvageProvenanceIncident(task, salvageProvenance));
+      }
       transitionTaskState(task, "landed");
       await this.completeLandedBookkeeping(task, "durable save", async () => {
         await this.save(group);
@@ -1700,7 +1908,13 @@ export class BackgroundExecutionController {
         completionAggregate = this.completionAggregateFor(group, task);
       } else {
         await this.completeLandedBookkeeping(task, "completion wake", () =>
-          this.wake(task, "completion", `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`));
+          this.wake(task, "completion", source.kind === "checkpoint"
+            ? `Task ${task.taskId} force-merged and landed mechanically. This does not verify that the requested changes are present or correct; inspect the main workspace manually before claiming success.`
+            : source.kind === "forced_checkpoint"
+              ? `Task ${task.taskId} landed its verified checkpoint despite the operation lifecycle state (${source.reason}); no review success was asserted. Inspect the main workspace manually before claiming success.`
+              : source.supersededCheckpoint
+                ? `Task ${task.taskId} was salvaged and landed from ${describeSalvageSource(source)}, superseding its verified checkpoint ${source.supersededCheckpoint.ref}; no review success was asserted. Inspect the main workspace manually before claiming success.`
+                : `Task ${task.taskId} was salvaged and landed from ${describeSalvageSource(source)} without an ordinary checkpoint or review. Inspect the main workspace manually before claiming success.`));
       }
       // Always persist the landed state and any bookkeeping diagnostics recorded
       // after the initial save (e.g., when the first save failed).
@@ -1734,6 +1948,180 @@ export class BackgroundExecutionController {
     }
   }
 
+  /** #126: resolve the operation bundle when no verified bundle is published on
+   * the task (the salvage path). A missing wave root or record means there is
+   * no recoverable anchor; other read errors are surfaced as-is. */
+  private async resolveUnverifiedForceMergeBundle(task: BackgroundTaskRecord): Promise<ReattachmentBundle | undefined> {
+    if (!task.waveRoot) return undefined;
+    let ownedRoot: string;
+    try {
+      ownedRoot = await realpath(task.waveRoot);
+    } catch {
+      return undefined;
+    }
+    try {
+      const record = await readOperationRecord(join(ownedRoot, "artifacts", task.taskId, "operation.json"));
+      return createReattachmentBundle(record, ownedRoot);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * #126: identify and capture a salvage snapshot of the task's actual worker
+   * work when no ordinary verified checkpoint is available. A retained
+   * worktree is the authoritative source (it holds dirty work no ref can);
+   * only when it is gone are surviving refs in the private repository
+   * identified, with durable incident evidence breaking ties. Refusals throw
+   * an explicit unresolved status; nothing is transferred and the task state
+   * is left for inspection.
+   */
+  private async captureSalvageSource(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    record: OperationRecord,
+  ): Promise<ForceMergeLandingSource> {
+    const capture = await readWaveCaptureRecord(task.waveRoot!);
+    const worktreeStat = await stat(record.worktreeRoot).catch(() => undefined);
+    if (worktreeStat?.isDirectory()) {
+      // The retained worktree is this task's own checkout (identity-checked
+      // against the private repository); sibling tasks cannot claim it.
+      const candidate = await salvageWorktreeCandidate(capture, task.taskId, record.title, record.worktreeRoot);
+      if (!candidate.differsFromBase) {
+        throw new Error(`No provably worker-owned content identified in the retained work for task ${task.taskId}; nothing was transferred.`);
+      }
+      return { kind: "salvage", candidate };
+    }
+    const candidates = await listSalvageRefCandidates(capture, record, task.taskId);
+    // #126 review: the wave's private repository is shared by every task of
+    // this group, so a surviving branch-head ref may belong to a sibling task.
+    // Durable incident evidence naming refs and proven task-owned namespaces
+    // are the only ownership proofs; with siblings present, an unnamed sole
+    // branch-head candidate cannot be excluded and selection falls through to
+    // ambiguous rather than transferring another task's work.
+    const siblings = group.tasks.filter((candidate) => candidate.taskId !== task.taskId && candidate.waveRoot === task.waveRoot);
+    const siblingNamedRefs = new Set<string>();
+    for (const sibling of siblings) {
+      try {
+        const siblingRecord = await readOperationRecord(join(task.waveRoot!, "artifacts", sibling.taskId, "operation.json"));
+        for (const name of incidentBranchNames(siblingRecord)) siblingNamedRefs.add(name);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+      }
+    }
+    const selection = selectSalvageSource(candidates, { hasSiblingTasks: siblings.length > 0 });
+    if (selection.kind === "none") {
+      throw new Error(`No recoverable worker work identified for task ${task.taskId}: ${selection.reason}.`);
+    }
+    if (selection.kind === "ambiguous") {
+      // Ambiguity-only candidates are named here too: surviving evidence with
+      // unproven ownership is reported, never called nonexistent.
+      const listing = selection.candidates.map((c) => {
+        const shortName = c.refName.replace(/^refs\/heads\//, "");
+        return `${c.refName} (tip ${c.tipSha.slice(0, 12)}; attributed ${c.attributedPaths.length}, ambiguous ${c.ambiguousPaths.length}${c.taskOwned ? "; task-owned immutable ref" : ""}${c.incidentNamed ? "; named in this task's checkpoint-failure incident" : ""}${siblingNamedRefs.has(shortName) ? "; also named in another task's incidents" : ""})`;
+      }).join("; ");
+      const ownershipNote = siblings.length > 0 && !selection.candidates.some((c) => c.incidentNamed)
+        ? " The wave's private repository is shared by this group's tasks and no durable evidence attributes exactly one ref to this task."
+        : "";
+      throw new Error(`Multiple plausible salvage sources for task ${task.taskId} and no durable evidence identifies exactly one; none was transferred: ${listing}.${ownershipNote}`);
+    }
+    const candidate = await salvageRefCandidate(capture, task.taskId, record.title, selection.candidate);
+    return { kind: "salvage", candidate };
+  }
+
+  /**
+   * #126 correction: a verified checkpoint must not silently hide newer
+   * retained work. The retained worktree is inspected for committed/staged/
+   * unstaged/task-created content the checkpoint's tree does not carry; when
+   * it provably subsumes the checkpoint it supersedes it, and anything that
+   * cannot be ordered is surfaced rather than guessed.
+   *
+   * The worktree is never assumed to be a superset of the checkpoint: a branch
+   * switch can abandon older worker commits or the captured uncommitted
+   * baseline. It supersedes only when every checkpoint delta is preserved with
+   * identical content or provably newer content (its head descends from a
+   * commit carrying the checkpoint's tree). Surviving refs — branch heads and
+   * this task's own candidate/review namespaces — are superseded review
+   * history: their candidate commits all share the wave base as parent, so
+   * they pass identity verification but cannot be ordered against the accepted
+   * checkpoint. Landing one would regress to an older cycle's tree and refusing
+   * on one would block an ordinary reviewed landing, so refs are excluded from
+   * this decision entirely. The inspection is read-only; on ambiguity nothing
+   * is transferred, no stale checkpoint is regressed to, and no prior work is
+   * dropped.
+   */
+  private async identifyWorkBeyondCheckpoint(
+    task: BackgroundTaskRecord,
+    record: OperationRecord,
+    checkpoint: { commitSha: string; ref: string },
+  ): Promise<
+    | { kind: "none" }
+    | { kind: "salvage"; candidate: SalvageCandidateIdentity }
+    | { kind: "ambiguous"; message: string }
+  > {
+    const capture = await readWaveCaptureRecord(task.waveRoot!);
+    const repoPath = capture.repositoryPath;
+    const checkpointTree = await treeShaOf(repoPath, checkpoint.commitSha);
+
+    const worktreeStat = await stat(record.worktreeRoot).catch(() => undefined);
+    if (!worktreeStat?.isDirectory()) return { kind: "none" };
+    const snapshot = await captureWorktreeSnapshot(capture, record.worktreeRoot);
+    if (snapshot.finalTree === checkpointTree) return { kind: "none" };
+    const candidateTree = await buildAttributedCandidateTree(capture, snapshot.finalTree, snapshot.classification);
+    const supersession = await evaluateCandidateAgainstCheckpoint(
+      capture, checkpointTree, candidateTree, snapshot.classification, snapshot.headSha,
+    );
+    if (supersession.beyondPaths.length === 0) return { kind: "none" };
+    if (!supersession.subsumesCheckpoint) {
+      const message = `Verified checkpoint ${checkpoint.ref} (${checkpoint.commitSha.slice(0, 12)}) and the retained worker worktree both carry identified changes; the worktree does not preserve every checkpoint delta with identical or provably newer content, so it is not a provable superset; nothing was transferred. The worktree carries beyond-checkpoint path(s) ${supersession.beyondPaths.join(", ")}. Manual inspection of the retained worktree is required before choosing a recovery.`;
+      return { kind: "ambiguous", message };
+    }
+    const commit = await buildSalvageCommit(capture, task.taskId, record.title, candidateTree, resolve(record.worktreeRoot));
+    return {
+      kind: "salvage",
+      candidate: {
+        ...commit,
+        ...snapshot.classification,
+        sourceKind: "worktree",
+        headSha: snapshot.headSha,
+        ...(snapshot.branchName ? { branchName: snapshot.branchName } : {}),
+      },
+    };
+  }
+
+  /** #126: durable operation-record provenance for a salvaged force-merge.
+   * This is tolerated bookkeeping: it records what happened to the source
+   * evidence and never changes the truthful operation state or asserts review
+   * success. `conflicted` reports an outcome where only the non-conflicting
+   * paths were transferred and materialized markers await resolution. */
+  private async recordSalvageProvenanceIncident(
+    task: BackgroundTaskRecord,
+    provenance: ForceMergeSalvageProvenance,
+    conflicted?: { appliedPaths: string[]; conflictPaths: string[] },
+  ): Promise<void> {
+    if (!task.waveRoot) return;
+    const ownedRoot = await realpath(task.waveRoot);
+    const record = await readOperationRecord(join(ownedRoot, "artifacts", task.taskId, "operation.json"));
+    const outcome = conflicted
+      ? `Transferred ${conflicted.appliedPaths.length} non-conflicting path(s); ${conflicted.conflictPaths.length} conflict(s) await resolution (${conflicted.conflictPaths.join(", ")});`
+      : `Landed all attributed paths;`;
+    const checkpointNote = provenance.sourceKind === "verified_checkpoint"
+      ? "despite the operation lifecycle state"
+      : provenance.supersededCheckpoint
+        ? `superseding verified checkpoint ${provenance.supersededCheckpoint.ref} (${provenance.supersededCheckpoint.commitSha.slice(0, 12)})`
+        : "without an ordinary verified checkpoint";
+    record.incidents.push(createIncident({
+      attempt: record.attempts.length,
+      generation: record.generation,
+      cause: "salvage",
+      stage: "force_merge",
+      message: `Explicit force-merge ${conflicted ? "materialized conflicts from" : "landed"} candidate ${provenance.candidateCommit} from ${provenance.sourceKind} ${checkpointNote}; no review status was asserted. ${outcome} ${provenance.baselineOnlyPaths.length} baseline-only and ${provenance.ambiguousPaths.length} ambiguous path(s) were not transferred.`,
+      retryable: false,
+    }));
+    await writeOperationRecord(record);
+  }
+
   /**
    * #117: `actor` decides whether the per-task completion wakes for landed
    * tasks are delivered (user commands) or folded into this result (model tool
@@ -1753,6 +2141,17 @@ export class BackgroundExecutionController {
       const unresolved = await unresolvedConflictMarkers(gate.sourceRoot, gate.paths);
       if (unresolved.length > 0) {
         dirty.push(entries.length === 1 ? unresolved.join(", ") : `${gate.sourceRoot}: ${unresolved.join(", ")}`);
+      }
+      // #126 approved binary handling: a sidecar conflict is resolved only
+      // once the worker version saved alongside has been handled (chosen or
+      // discarded). While it still exists, the gate stays unresolved.
+      for (const sidecar of gate.sidecars ?? []) {
+        const present = await stat(sidecar.sidecarPath).catch(() => undefined);
+        if (present) {
+          dirty.push(entries.length === 1
+            ? `binary conflict ${sidecar.path} still has its worker version saved alongside at ${sidecar.sidecarPath}; choose a side and remove the other file`
+            : `${gate.sourceRoot}: binary conflict ${sidecar.path} still has its worker version saved alongside at ${sidecar.sidecarPath}`);
+        }
       }
     }
     if (dirty.length > 0) {
@@ -1841,8 +2240,9 @@ export class BackgroundExecutionController {
     return [
       "CRITICAL REVIEW-GATE WORKSPACE CONFLICT:",
       ...gates.flatMap((target) => [
-        `Execution ${target.executionId}, task ${target.taskId} materialized merge-conflict markers in the source workspace ${target.sourceRoot}.`,
+        `Execution ${target.executionId}, task ${target.taskId} materialized merge conflicts in the source workspace ${target.sourceRoot}.`,
         `Conflicted paths: ${target.paths.join(", ")}.`,
+        `Gate detail: ${target.reason}`,
       ]),
       "Automatic task landings into these targets are blocked. Resolve these files now, verify each workspace, then call SubtasksMarkClean.",
       "Do not claim any of these workspaces is clean or continue unrelated source mutations while a gate remains active.",
@@ -1913,32 +2313,48 @@ export class BackgroundExecutionController {
     for (const [executionId, group] of [...this.groups]) {
       const settled = group.tasks.filter((task) => task.state === "landed" || task.state === "reported");
       for (const task of settled) {
-        if (task.waveRoot) await removeOwnedWaveRoot(task.waveRoot);
-        task.waveRoot = undefined;
+        // #126 correction: a landed salvage whose provenance names untransferred
+        // ambiguous paths keeps its wave root so the source bytes — not merely
+        // path names — survive cleanup and restart. Truly resolved work is
+        // cleaned exactly as before.
+        const retain = salvageEvidenceRequiresRetention(task);
+        if (task.waveRoot && !retain) await removeOwnedWaveRoot(task.waveRoot);
+        if (!retain) task.waveRoot = undefined;
         task.bundle = undefined;
         task.updatedAt = new Date().toISOString();
       }
+      // Whole-group retirement is deferred while any settled task (inline or
+      // archived) still anchors retained source evidence: removing the
+      // execution root would destroy the durable reference to it.
+      let archivedRetention = false;
       if (settled.length === group.tasks.length) {
-        // Whole-group retirement: recover the wave roots recorded in the
-        // (evicted) task archives once, shutdown-only, before the root is
-        // removed so sequential top-offs do not leave their workspace
-        // artifacts behind. Every archive is loaded through the integrity and
-        // execution-ownership checks before its waveRoot is trusted — a
-        // malformed or tampered archive is skipped, never acted on
-        // destructively. Recovery archives themselves are deleted with the
-        // group exactly as before; this scan never deletes them early.
+        // Recover the wave roots recorded in the (evicted) task archives once,
+        // shutdown-only, before the root is removed so sequential top-offs do
+        // not leave their workspace artifacts behind. Every archive is loaded
+        // through the integrity and execution-ownership checks before its
+        // waveRoot is trusted — a malformed or tampered archive is skipped,
+        // never acted on destructively. Recovery archives themselves are
+        // deleted with the group exactly as before; this scan never deletes
+        // them early.
         const archiveDir = join(group.root, "tasks");
         for (const entry of await readdir(archiveDir).catch(() => [] as string[])) {
           if (!entry.endsWith(".json") || entry === "index.json") continue;
           try {
             const archived = await this.loadArchivedTask(group, entry.slice(0, -".json".length));
-            if (archived?.waveRoot) await removeOwnedWaveRoot(archived.waveRoot).catch(() => undefined);
+            if (!archived) continue;
+            if (salvageEvidenceRequiresRetention(archived)) {
+              archivedRetention = true;
+              continue;
+            }
+            if (archived.waveRoot) await removeOwnedWaveRoot(archived.waveRoot).catch(() => undefined);
           } catch {
             // Never act destructively on malformed, tampered, or foreign
             // archive contents. The execution root cleanup below remains
             // independently owned.
           }
         }
+      }
+      if (settled.length === group.tasks.length && !archivedRetention) {
         await removeOwnedExecutionRoot(group.root);
         this.groups.delete(executionId);
         this.dropActiveTasks(executionId);
@@ -2455,6 +2871,12 @@ export class BackgroundExecutionController {
         await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
         const materialized = await materializeLandingConflicts(capture, plan, `subtask ${task.taskId}`);
         await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
+        // #126 approved binary handling: name the preserved-target/worker-
+        // version pairs in the gate so SubtasksInspect and the failure wake
+        // identify both files for manual resolution.
+        const sidecarNote = materialized.sidecars.length > 0
+          ? ` Binary conflict(s) preserved in place with the worker version saved alongside: ${materialized.sidecars.map((sidecar) => `${sidecar.path} -> ${sidecar.sidecarPath}`).join("; ")}. Choose a side and remove the other file; the sidecar alone never resolves the conflict.`
+          : "";
         const conflictGate: BackgroundConflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
@@ -2462,11 +2884,12 @@ export class BackgroundExecutionController {
           paths: materialized.paths,
           activatedAt: new Date().toISOString(),
           manifestPath: materialized.manifestPath,
-          reason: `Task ${task.taskId} requires immediate conflict resolution.`,
+          reason: `Task ${task.taskId} requires immediate conflict resolution.${sidecarNote}`,
+          ...(materialized.sidecars.length > 0 ? { sidecars: materialized.sidecars } : {}),
         };
         this.setConflictGate(conflictGate);
         transitionTaskState(task, "conflicted");
-        this.addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
+        this.addActivity(task, "conflicted", `Conflicts materialized in ${materialized.paths.join(", ")}.${sidecarNote}`);
         await this.save(group);
         await this.publishAssociations();
         await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
@@ -2629,8 +3052,17 @@ export class BackgroundExecutionController {
           await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
           const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
           await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
-          const conflictGate = this.activateConflictGate(group, task, materialized.paths, materialized.manifestPath, `Continued task ${task.taskId} requires immediate conflict resolution.`);
-          this.addActivity(task, "conflicted", `Conflict markers materialized in ${materialized.paths.join(", ")}.`);
+          // #126 approved binary handling: same gate identification as the
+          // other landing paths.
+          const sidecarNote = materialized.sidecars.length > 0
+            ? ` Binary conflict(s) preserved in place with the worker version saved alongside: ${materialized.sidecars.map((sidecar) => `${sidecar.path} -> ${sidecar.sidecarPath}`).join("; ")}. Choose a side and remove the other file; the sidecar alone never resolves the conflict.`
+            : "";
+          const conflictGate = this.activateConflictGate(
+            group, task, materialized.paths, materialized.manifestPath,
+            `Continued task ${task.taskId} requires immediate conflict resolution.${sidecarNote}`,
+            materialized.sidecars,
+          );
+          this.addActivity(task, "conflicted", `Conflicts materialized in ${materialized.paths.join(", ")}.${sidecarNote}`);
           await this.save(group);
           await this.publishAssociations();
           await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
@@ -2715,6 +3147,7 @@ export class BackgroundExecutionController {
     paths: string[],
     manifestPath: string,
     reason: string,
+    sidecars?: Array<{ path: string; sidecarPath: string }>,
   ): BackgroundConflictGate {
     const gate: BackgroundConflictGate = {
       executionId: group.executionId,
@@ -2724,6 +3157,7 @@ export class BackgroundExecutionController {
       activatedAt: new Date().toISOString(),
       manifestPath,
       reason,
+      ...(sidecars && sidecars.length > 0 ? { sidecars } : {}),
     };
     this.setConflictGate(gate);
     transitionTaskState(task, "conflicted");
@@ -2910,6 +3344,10 @@ export class BackgroundExecutionController {
     task: BackgroundTaskRecord,
     step: string,
     run: () => Promise<unknown>,
+    /** What actually happened to the workspace when the tolerated step ran:
+     * "landed" (default; every ordinary call site) or "conflicted" for the
+     * mergeAnyhow salvage branch that materialized markers without landing. */
+    outcome: "landed" | "conflicted" = "landed",
   ): Promise<void> {
     try {
       await run();
@@ -2919,12 +3357,16 @@ export class BackgroundExecutionController {
       this.addActivity(
         task,
         "bookkeeping",
-        `Task ${task.taskId} landed in the main workspace, but post-landing ${step} failed; the landed outcome is preserved. ${message}`,
+        outcome === "landed"
+          ? `Task ${task.taskId} landed in the main workspace, but post-landing ${step} failed; the landed outcome is preserved. ${message}`
+          : `Task ${task.taskId} materialized conflicts in the main workspace, but post-conflict ${step} failed; the conflicted outcome is preserved. ${message}`,
       );
       try {
-        await this.input.notify?.(`review gate: task ${task.taskId} landed, but ${step} failed afterward (landing preserved): ${message}`);
+        await this.input.notify?.(outcome === "landed"
+          ? `review gate: task ${task.taskId} landed, but ${step} failed afterward (landing preserved): ${message}`
+          : `review gate: task ${task.taskId} materialized conflicts, but ${step} failed afterward (conflicts preserved): ${message}`);
       } catch {
-        // Notification is best-effort; the landed outcome is already recorded.
+        // Notification is best-effort; the outcome is already recorded.
       }
     }
   }

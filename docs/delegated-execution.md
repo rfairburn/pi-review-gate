@@ -202,12 +202,44 @@ parent session's own workspace), clears the gates, and wakes queued landings.
 
 **Interrupt and force merge**: `SubtasksInterrupt` explicitly chooses failure or merge
 disposition. A normal cancellation uses `interrupt_as_failure`; `interrupt_with_merge`
-must be requested explicitly. `SubtasksForceMerge` operates only on a stopped task with
-an accepted commit or verified checkpoint; `mergeAnyhow` may deliberately install
-ordinary conflict markers in main. Both `interrupt_with_merge` and every direct force
-merge are mechanical landing attempts, not verification that the requested changes are
-present or correct. The main workspace must always be inspected manually afterward,
-including when the task's authoritative state is `landed`.
+must be requested explicitly. `SubtasksForceMerge` operates only on a stopped task; it
+lands the task's verified checkpoint when one exists, and otherwise salvages an
+identified snapshot of the worker's actual work (explicit salvage below).
+An explicit force-merge always merges all identified work in one call: clean paths
+apply and ordinary text conflicts install diff3 markers in main (`mergeAnyhow` is
+accepted for caller compatibility only and controls nothing). Binary conflicts
+preserve the target in place and save the worker version alongside at a collision-safe
+`<path>.worker-<blob>` name, naming both paths in the gate and manifest for manual
+resolution. Both `interrupt_with_merge` and every direct force merge are mechanical
+landing attempts,
+not verification that the requested changes are present or correct. The main workspace
+must always be inspected manually afterward, including when the task's authoritative
+state is `landed`.
+
+### Explicit salvage
+
+When a stopped task has no ordinary verified checkpoint — for
+example after an attached-HEAD checkpoint failure, interruption before normalization,
+a failed critical operation state, or another ordinary lifecycle inconsistency — an
+explicit `SubtasksForceMerge` still salvages an identified snapshot of the worker's
+actual work: retained commits, staged and unstaged edits, and task-created files. The
+retained worker worktree is the authoritative source while it exists; only after it has
+been cleaned up are surviving refs in the private repository considered. That
+repository is shared by every task of the group, so a ref is selected only when
+durable checkpoint-failure evidence attributes it to this task, or when it is the sole
+candidate and no sibling task can own it; otherwise the candidates are surfaced and
+nothing is transferred. Salvage captures without mutating the worktree or its index,
+and transfers only
+evidence-backed content: work whose ownership cannot be proven — and baseline files
+that a divergent checkout simply did not carry — is preserved in the target and
+reported as unrecovered or ambiguous, never guessed; a file present only in the
+captured baseline is never treated as a worker deletion. The landing reuses the
+ordinary conflict gate, force-merge marker materialization, and rollback protection. Salvage
+records forced-salvage provenance durably on the task command and the operation record,
+asserts no review status, fabricates no normal checkpoint, publishes no continuation
+bundle for unverified work, and never auto-lands deferred work afterward. When no
+recoverable work can be identified, or when several sources remain ambiguous,
+force-merge reports an explicit unresolved status instead of transferring anything.
 
 ## Steering, continuation, and failure handling
 
@@ -233,7 +265,8 @@ unsupported status as a failed steering acknowledgement instead of acknowledging
 queued delivery as an interruption.
 
 Stopped tasks retain verified checkpoints and reattachment bundles for
-`SubtasksContinue` or `SubtasksForceMerge`.
+`SubtasksContinue`; stopped tasks without a usable checkpoint remain salvageable
+through explicit `SubtasksForceMerge` from their retained worktree or surviving refs.
 
 **Failures, retry, and recovery**: Executor failures are checkpointed to a protected
 recovery ref before bounded retry. If same-executor recovery is exhausted, a verified

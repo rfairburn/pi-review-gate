@@ -566,6 +566,16 @@ function forceMergeCard(details: Record<string, any>, args: Record<string, any> 
         ? "in progress"
         : stringOr(state, "outcome not established");
   const lines = headerLines("SubtasksForceMerge", `${stringOr(task?.taskId ?? args?.taskId, "?")} · ${outcome}`);
+  // #126: forced-salvage provenance, when the landing did not use an ordinary
+  // verified checkpoint.
+  const salvageCommand = matchingCommand(details, args);
+  const salvage = isRecord(salvageCommand?.salvage) ? salvageCommand.salvage : undefined;
+  if (salvage) {
+    const salvageNote = salvage.sourceKind === "verified_checkpoint"
+      ? "Forced landing of its verified checkpoint — no review success asserted"
+      : `Salvaged from ${stringOr(salvage.sourceKind, "unknown")} — no ordinary checkpoint or review`;
+    lines.push(...bodyLines([salvageNote], "warning", 1));
+  }
   if (state === "conflicted") {
     lines.push(...bodyLines(["Manual resolution required"], "warning", 1));
   }

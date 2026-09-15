@@ -37,7 +37,9 @@ export type IncidentCause =
   | "workspace_error"
   | "review_error"
   | "integration_error"
-  | "landing_error";
+  | "landing_error"
+  /** #126: an explicit force-merge landed salvaged or forced-checkpoint work. */
+  | "salvage";
 
 export interface ExecutionIncident {
   incidentId: string;

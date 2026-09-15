@@ -111,6 +111,9 @@ review: { activeReviewers: [
         activatedAt: "2026-08-16T00:00:00.000Z",
         manifestPath: "/tmp/pi-review-execution-one/conflict.json",
         reason: "resolve the conflict",
+        // #126 approved binary handling: the sidecar pair is part of the
+        // durable gate contract — markClean must keep enforcing it after restore.
+        sidecars: [{ path: "image.bin", sidecarPath: "image.bin.worker-abc123def456" }],
       },
       bundles: [{
         version: 1,
@@ -138,6 +141,7 @@ review: { activeReviewers: [
     assert.equal(restored.execution.bundles[0]?.expectedRevision, 7);
     assert.deepEqual(restored.execution.groupRoots, ["/tmp/pi-review-execution-one"]);
     assert.deepEqual(restored.execution.conflictGate?.paths, ["conflicted.txt"]);
+    assert.deepEqual(restored.execution.conflictGate?.sidecars, [{ path: "image.bin", sidecarPath: "image.bin.worker-abc123def456" }]);
 
     const target = createState();
     replaceReviewGateState(target, restored.state);

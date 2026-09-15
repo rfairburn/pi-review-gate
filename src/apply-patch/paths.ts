@@ -15,17 +15,6 @@ export function normalizeApplyPatchPathMarker(value: string): string {
   return candidate;
 }
 
-/** Validates and normalizes a raw path argument without workspace confinement. */
-export function normalizeApplyPatchPath(value: unknown, field: string): string {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`${field} is required and must be a non-empty string`);
-  }
-  const candidate = normalizeApplyPatchPathMarker(value);
-  if (!candidate) throw new Error(`${field} is empty after removing the leading '@'`);
-  if (candidate.includes("\0")) throw new Error(`${field} contains a NUL byte`);
-  return candidate;
-}
-
 export interface ConfinedPath {
   /** Lexical absolute path inside the workspace root. */
   absolute: string;

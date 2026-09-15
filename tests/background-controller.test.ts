@@ -35,6 +35,10 @@ const execFileAsync = promisify(execFile);
 
 test("background tasks return immediately, land independently, and additions capture prior landings", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-background-controller-"));
+  const executor = join(root, "executor.cjs");
+  const releaseGate = join(root, "release-gate");
+  let controller: BackgroundExecutionController | undefined;
+  let restored: BackgroundExecutionController | undefined;
   try {
     await execFileAsync("git", ["init", "-q"], { cwd: root });
     await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
@@ -42,17 +46,20 @@ test("background tasks return immediately, land independently, and additions cap
     await writeFile(join(root, "base.txt"), "base\n", "utf8");
     await execFileAsync("git", ["add", "base.txt"], { cwd: root });
     await execFileAsync("git", ["commit", "-qm", "base"], { cwd: root });
-    const executor = join(root, "executor.cjs");
     await writeFile(executor, [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
-      "process.stdin.on('end',()=>setTimeout(()=>{",
+      "process.stdin.on('end',()=>{",
+      "const finish=()=>{",
       "if(prompt.includes('FIRST_SENTINEL'))fs.writeFileSync('first.txt','first landed\\n');",
       "if(prompt.includes('PEER_SENTINEL'))fs.writeFileSync('peer.txt','peer landed\\n');",
       "if(prompt.includes('SECOND_SENTINEL'))fs.writeFileSync('second.txt',fs.existsSync('first.txt')?'saw first\\n':'missed first\\n');",
       "console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));",
       "console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));",
-      "},350));",
+      "};",
+      "const gate=process.env.PI_REVIEW_EXECUTOR_TEST_GATE+(prompt.includes('PEER_SENTINEL')?'-peer':'');",
+      "const poll=setInterval(()=>{if(gate&&fs.existsSync(gate)){clearInterval(poll);finish();}},10);",
+      "});",
     ].join("\n"), "utf8");
     await chmod(executor, 0o755);
     const config = normalizeConfig({
@@ -62,6 +69,7 @@ test("background tasks return immediately, land independently, and additions cap
         "fake": {
           adapter: "run-as-binary",
           command: executor,
+          env: { PI_REVIEW_EXECUTOR_TEST_GATE: releaseGate },
           execution: { protocol: "pi-review-executor-jsonl-v1" }
         }
       },
@@ -73,27 +81,33 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
       retainBundles: "always",
     });
     const messages: string[] = [];
-    const controller = new BackgroundExecutionController({
+    controller = new BackgroundExecutionController({
       pi: { sendMessage: (message: { content: string }) => messages.push(message.content) },
       config,
       state: createState(),
       cwd: () => root,
     });
 
-    const startedAt = Date.now();
-    const first = await controller.start([
-      {
-        title: "first",
-        instructions: "FIRST_SENTINEL",
-        acceptanceCriteria: ["first.txt exists"],
-      },
-      {
-        title: "peer",
-        instructions: "PEER_SENTINEL",
-        acceptanceCriteria: ["peer.txt exists"],
-      },
-    ]);
-    assert.ok(Date.now() - startedAt < 300, "start should return before the deliberately delayed worker");
+    // Deterministic nonblocking proof (#128): the fake executors hold every
+    // turn's completion behind the release gate, so a controller.start that
+    // waited for worker completion would never resolve and must trip the
+    // finite deadline below instead of racing a host-speed threshold.
+    const first = await awaitBounded(
+      controller.start([
+        {
+          title: "first",
+          instructions: "FIRST_SENTINEL",
+          acceptanceCriteria: ["first.txt exists"],
+        },
+        {
+          title: "peer",
+          instructions: "PEER_SENTINEL",
+          acceptanceCriteria: ["peer.txt exists"],
+        },
+      ]),
+      10_000,
+      "controller.start did not return while fake executor completion was still blocked behind the release gate",
+    );
     assert.equal(first.activeCount, 2);
     assert.equal(first.tasks.length, 2);
     assert.equal(first.scheduling.dispatchPending, 0);
@@ -101,7 +115,21 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.equal(first.scheduling.configuredWorkerLimit, 2);
     assert.equal(first.scheduling.configuredPoolCapacity, 2);
     assert.equal(first.scheduling.estimatedImmediatelyAvailableSlots, 0);
-    await waitFor(() => controller.inspect(first.executionId).tasks.every((task) => task.state === "landed"));
+    // The gate is still closed: both dispatched workers are running but
+    // provably not completed, so start genuinely returned before completion.
+    await waitFor(() => controller!.inspect(first.executionId).tasks.every((task) => task.state === "running"));
+    assert.ok(
+      controller.inspect(first.executionId).tasks.every((task) => task.state === "running"),
+      "gated workers remain running before the release gate is written",
+    );
+    await assert.rejects(readFile(join(root, "first.txt"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(root, "peer.txt"), "utf8"), /ENOENT/);
+    await writeFile(releaseGate, "release\n", "utf8");
+    // Keep the peer running until the first landing reports exactly one free
+    // slot; simultaneous worker completion need not produce that snapshot.
+    await waitFor(() => messages.some((message) => /Top-off opportunity: up to 1 additional task\(s\) may be submitted with SubtasksAdd/.test(message)));
+    await writeFile(`${releaseGate}-peer`, "release\n", "utf8");
+    await waitFor(() => controller!.inspect(first.executionId).tasks.every((task) => task.state === "landed"));
     assert.equal(await readFile(join(root, "first.txt"), "utf8"), "first landed\n");
     assert.equal(await readFile(join(root, "peer.txt"), "utf8"), "peer landed\n");
     await waitFor(() => messages.some((message) => /Landed paths: first\.txt/.test(message)));
@@ -110,7 +138,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.ok(messages.every((message) => !/Execution revision: \d+/.test(message)));
     assert.ok(messages.every((message) => !/Task timing \(ms\):/.test(message)));
     assert.ok(messages.every((message) => !/Post-settlement scheduler:/.test(message)));
-    assert.ok(messages.some((message) => /Top-off opportunity: up to 1 additional task\(s\) may be submitted with SubtasksAdd/.test(message)));
+    await waitFor(() => messages.some((message) => /Top-off opportunity: up to 1 additional task\(s\) may be submitted with SubtasksAdd/.test(message)));
 
     config.execution!.subtaskNotifications = "noisy";
     const toppedOff = await controller.add(first.executionId, [{
@@ -120,7 +148,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     }]);
     assert.equal(toppedOff.tasks.length, 3);
     assert.notEqual(toppedOff.tasks[0]?.taskId, toppedOff.tasks[2]?.taskId);
-    await waitFor(() => controller.inspect(first.executionId).tasks.every((task) => task.state === "landed"));
+    await waitFor(() => controller!.inspect(first.executionId).tasks.every((task) => task.state === "landed"));
     assert.equal(await readFile(join(root, "second.txt"), "utf8"), "saw first\n");
     assert.ok(messages.some((message) => message.includes(toppedOff.tasks[2]!.taskId) && /task is ACTIVE/s.test(message)));
     assert.ok(messages.some((message) => /landed independently/.test(message)));
@@ -134,15 +162,22 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     const associations = controller.associations();
     await controller.shutdown();
     await controller.detach();
-    const restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
+    restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
     await restored.restore(associations);
     const restoredAssociations = restored.associations();
     assert.deepEqual(restoredAssociations.waveRoots, []);
     assert.deepEqual(restoredAssociations.bundles, []);
     assert.deepEqual(restoredAssociations.groupRoots, []);
-    assert.throws(() => restored.inspect(first.executionId), /Unknown execution group/);
+    assert.throws(() => restored!.inspect(first.executionId), /Unknown execution group/);
     await restored.shutdown();
   } finally {
+    // Failure-safe teardown: release the gate so gated fake executors settle
+    // instead of being killed mid-turn, shut every controller down, and only
+    // then remove the temporary tree.
+    await writeFile(releaseGate, "release\n", "utf8").catch(() => undefined);
+    await writeFile(`${releaseGate}-peer`, "release\n", "utf8").catch(() => undefined);
+    await controller?.shutdown().catch(() => undefined);
+    await restored?.shutdown().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -3835,6 +3870,24 @@ async function waitForLandedDurableRecord(
       return false;
     }
   });
+}
+
+/** Await a promise that must settle within a finite deadline (e.g. a start call that must not block on worker completion). */
+async function awaitBounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  // If the deadline wins the race, keep the losing promise from surfacing as
+  // an unhandled rejection while the failure-path teardown runs.
+  void promise.catch(() => undefined);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {

@@ -411,13 +411,6 @@ function originalInput(context: unknown): string | undefined {
   if (!isRecord(args)) return undefined;
 
   if (typeof args.patch === "string") return args.patch;
-  if (Object.hasOwn(args, "operation")) {
-    try {
-      return JSON.stringify(args, null, 2);
-    } catch {
-      return undefined;
-    }
-  }
   // For invalid calls, retaining the actual argument object is more honest
   // than inventing a patch body.  Only the call args are considered; context
   // state, cwd, and other host metadata are intentionally ignored.

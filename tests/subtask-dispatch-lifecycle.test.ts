@@ -13,6 +13,7 @@ import {
   type SubtaskCardDispatchView,
 } from "../src/execution/background-controller";
 import { hasDispatchCardWatcher, notifyDispatchCards, resetDispatchCardsForTests, watchDispatchCards } from "../src/execution/dispatch-cards";
+import { SUBMITTED_INSTRUCTIONS_MARKER } from "../src/execution/subtask-result-expanded";
 import type { SubtaskDispatchRecord } from "../src/execution/types";
 import { runWaveWorker } from "../src/execution/wave-worker";
 import { captureWaveBase, type WaveCaptureResult } from "../src/execution/wave-repository";
@@ -751,9 +752,13 @@ test("expansion shows the full actual captured sent prompt (not a reconstruction
     assert.match(expanded, new RegExp(`Captured base commit: ${recordA.baseCommit}`));
     assert.match(expanded, new RegExp(`Worker worktree: ${recordA.worktreeRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 
-    // Actual vs reconstructed: the expanded block must equal the exact text
+    // Actual vs reconstructed: the expanded block must show the exact text
     // the executor transport received — never a reassembly from the submitted
-    // definition or later configuration.
+    // definition or later configuration — except the #121 rendering-only
+    // marker that abbreviates the submitted-instruction span already shown in
+    // full above it in the same expanded view. #121: the marker abbreviates
+    // presentation only; it never claims the marker text was sent, and the
+    // worker-specific framing around the span stays exactly as captured.
     const deadline = Date.now() + 20_000;
     let transportReceived = "";
     for (;;) {
@@ -766,7 +771,20 @@ test("expansion shows the full actual captured sent prompt (not a reconstruction
       if (Date.now() > deadline) throw new Error("timed out waiting for A's transport capture");
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
     }
-    assert.ok(expanded.includes(transportReceived), "the expanded view must contain the exact captured sent prompt");
+    // #121: the real capture embeds the path-free submitted instructions
+    // verbatim, so the e2e dedup path is exercised; assert that precondition
+    // instead of branching so a future non-verbatim capture fails loudly here
+    // rather than silently degrading to the full-prompt assertion.
+    const submittedInstructions = startedA.details.tasks[0].definition.instructions as string;
+    assert.ok(
+      recordA.sentPrompt.includes(submittedInstructions),
+      "the real capture must embed the path-free submitted instructions verbatim",
+    );
+    const abbreviatedCapture = recordA.sentPrompt.replace(submittedInstructions, SUBMITTED_INSTRUCTIONS_MARKER);
+    assert.ok(
+      expanded.includes(abbreviatedCapture),
+      "the expanded view must show the exact captured sent prompt with only the repeated submitted span marked",
+    );
     assert.notEqual(transportReceived, startedA.details.tasks[0].definition.instructions, "the sent prompt is a distinct actual message from the submitted instructions");
 
     // No I/O on toggle: expand/re-collapse of the retained result re-runs

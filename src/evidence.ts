@@ -271,8 +271,7 @@ export function extractCandidatePaths(
 
   if (normalizedName === APPLY_PATCH_TOOL) {
     // The canonical envelope carries every mutation target in its operation
-    // headers; the legacy structured argument uses operation.path and
-    // operation.moveTo. Both are pre-captured as mutation candidates.
+    // headers; they are pre-captured as mutation candidates.
     const addCandidate = (value: string, source: string): void => {
       // Normalize the leading '@' convention marker exactly like the tool
       // does, so candidates point at the files ApplyPatch actually mutates.
@@ -287,11 +286,6 @@ export function extractCandidatePaths(
       // the request later fails validation.
       for (const candidate of extractEnvelopeCandidatePaths(input.patch)) {
         addCandidate(candidate.path, `${toolName}:patch`);
-      }
-    } else if (isRecord(input.operation)) {
-      for (const key of ["path", "moveTo"]) {
-        const value = input.operation[key];
-        if (typeof value === "string" && value.trim()) addCandidate(value, `${toolName}:operation.${key}`);
       }
     }
   }

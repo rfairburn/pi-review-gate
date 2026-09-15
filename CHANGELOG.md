@@ -15,6 +15,50 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.48]
+
+### Changed
+
+- Make `/subtask-add <prompt>` submit one task in a new execution group using
+  existing routing and workspace defaults. All supplied text, including JSON and
+  execution-id-looking text, is treated as instructions; the former execution-ID
+  plus task-JSON slash-command syntax is removed.
+- With no arguments, `/subtask-add` collects task fields and new/existing-group
+  settings interactively, then asks for explicit confirmation before submission.
+  Cancellation creates no work. Structured model-facing Start/Add APIs and batch
+  support remain unchanged.
+
+## [0.1.0-dev.47]
+
+### Fixed
+
+- Make the background-submission regression test independent of host speed by
+  explicitly holding and releasing fake worker completion, while preserving
+  nonblocking submission, independent landing, and capacity-notification checks.
+  Production behavior is unchanged.
+- Attach worker lifecycle rejection handling before awaiting the task-start manifest
+  write, preventing unhandled rejections during early interruption while preserving
+  the original failure and cancellation reporting.
+
+## [0.1.0-dev.46]
+
+### Changed
+
+- Remove ApplyPatch's legacy structured `operation` input and compatibility-only
+  implementation. Only the canonical `patch` envelope is supported; legacy requests
+  are rejected before filesystem mutation. Canonical multi-file behavior, workspace
+  confinement, partial-failure reporting, and result presentation remain unchanged.
+
+## [0.1.0-dev.45]
+
+### Fixed
+
+- Show repeated submitted instructions only once in expanded SubtasksStart and
+  SubtasksAdd results when the captured worker prompt contains the exact text.
+  A rendering-only marker replaces the repeated span; differing instructions,
+  worker-specific content, and unavailable-prompt status remain visible. Collapsed
+  results and model-visible context are unchanged.
+
 ## [0.1.0-dev.44]
 
 ### Fixed

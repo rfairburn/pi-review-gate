@@ -24,7 +24,7 @@ import { after, before, test } from "node:test";
 import { normalizeConfig } from "../src/config";
 import type { BackgroundExecutionGroup } from "../src/execution/background-group-store";
 import { serializeGroupSnapshot, writeGroupSnapshot } from "../src/execution/background-group-store";
-import { renderSubtaskResultExpanded } from "../src/execution/subtask-result-expanded";
+import { renderSubtaskResultExpanded, SUBMITTED_INSTRUCTIONS_MARKER } from "../src/execution/subtask-result-expanded";
 import { newTask } from "../src/execution/task-state";
 import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
@@ -796,6 +796,202 @@ test("transport-acknowledged steering keeps the compliance disclaimer", () => {
   assert.match(text, /Delivery: transport acknowledged/);
   assert.match(text, /Instruction sent to the worker: yes/);
   assert.match(text, /Task compliance: not established by acknowledgment/);
+});
+
+// ---------------------------------------------------------------------------
+// #121: rendering-only deduplication of submitted instructions vs sent prompt
+// ---------------------------------------------------------------------------
+
+function dispatchRecordFixture(sentPrompt: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    provenance: "captured_at_dispatch",
+    delivery: "written_to_transport",
+    dispatchedAt: "2025-06-01T10:00:00.000Z",
+    sentPrompt,
+    worktreeRoot: "/work/wave-1/workers/task-dup",
+    baseCommit: "0123456789abcdef0123456789abcdef01234567",
+    executorTurn: 1,
+    ...extra,
+  };
+}
+
+test("a captured prompt containing the submitted instructions verbatim shows them once with a rendering-only marker", () => {
+  const instructions = "Implement the deduplicated rendering.\nSecond line of the same instruction block.";
+  const value = envelope("SubtasksStart accepted: execution exec-dup, 1 active task(s).", {
+    action: "start",
+    executionId: "exec-dup",
+    kind: "execute",
+    cwd: "/work/target",
+    tasks: [{
+      taskId: "task-dup",
+      state: "running",
+      definition: { title: "Dup work", instructions, acceptanceCriteria: ["overlapping text appears once"] },
+      dispatch: dispatchRecordFixture(instructions),
+    }],
+  });
+  const text = joined(value, { expanded: true }, 200);
+  // The identical overlapping instruction text appears exactly once in the
+  // whole expanded view: in the submitted block it belongs to.
+  assert.equal(text.split(instructions).length - 1, 1, "the identical overlapping instruction text must appear once");
+  assert.match(text, /Submitted instructions:/);
+  const promptLabel = text.indexOf("Prompt sent to worker:");
+  const marker = text.indexOf(SUBMITTED_INSTRUCTIONS_MARKER);
+  assert.ok(promptLabel >= 0 && marker > promptLabel, "the marker must appear inside the prompt-sent section");
+  // Truthful marker: it names the already-shown identical text and states that
+  // it is a rendering abbreviation, never a claim that the marker was sent.
+  assert.match(text, /identical text shown above; rendering abbreviation, not part of the sent prompt/);
+});
+
+test("worker-specific prompt content around the verbatim span stays fully visible", () => {
+  const instructions = "Rewrite the failing module carefully.";
+  const sentPrompt = [
+    "You are the isolated implementation executor for one bounded phase.",
+    "",
+    "Subtask: Dup work",
+    "",
+    instructions,
+    "",
+    "Acceptance criteria:",
+    "- overlapping text appears once",
+    "",
+    "Workspace isolation (authoritative):",
+    "All reads and writes stay under the worker root.",
+  ].join("\n");
+  const value = envelope("SubtasksStart accepted: execution exec-frame, 1 active task(s).", {
+    action: "start",
+    executionId: "exec-frame",
+    kind: "execute",
+    cwd: "/work/target",
+    tasks: [{
+      taskId: "task-frame",
+      state: "running",
+      definition: { title: "Dup work", instructions, acceptanceCriteria: ["overlapping text appears once"] },
+      dispatch: dispatchRecordFixture(sentPrompt),
+    }],
+  });
+  const text = joined(value, { expanded: true }, 200);
+  assert.equal(text.split(instructions).length - 1, 1, "the repeated instruction span must be marked, not repeated");
+  assert.ok(text.includes(SUBMITTED_INSTRUCTIONS_MARKER));
+  // Worker-specific framing before and after the span is never hidden.
+  assert.match(text, /Subtask: Dup work/);
+  assert.match(text, /Workspace isolation \(authoritative\):/);
+  assert.match(text, /All reads and writes stay under the worker root\./);
+});
+
+test("a transformed prompt that does not contain the submitted text renders in full with no marker", () => {
+  const instructions = "Edit /source/checkout/src/module.ts and finish the change.";
+  const sentPrompt = "Edit /workers/task-rewrite/src/module.ts and finish the change.\n\nAcceptance criteria:\n- done";
+  const value = envelope("SubtasksStart accepted: execution exec-rewrite, 1 active task(s).", {
+    action: "start",
+    executionId: "exec-rewrite",
+    kind: "execute",
+    cwd: "/source/checkout",
+    tasks: [{
+      taskId: "task-rewrite",
+      state: "running",
+      definition: { title: "Path-rewritten work", instructions, acceptanceCriteria: ["done"] },
+      dispatch: dispatchRecordFixture(sentPrompt),
+    }],
+  });
+  const text = joined(value, { expanded: true }, 200);
+  assert.match(text, /Submitted instructions:/);
+  assert.ok(text.includes(instructions), "the submitted instructions stay shown in full");
+  assert.ok(text.includes("/workers/task-rewrite/src/module.ts"), "the actually-sent transformed text stays shown in full");
+  assert.ok(!text.includes(SUBMITTED_INSTRUCTIONS_MARKER), "no marker may replace differing or transformed content");
+});
+
+test("an unavailable sent prompt stays truthful and a missing instruction never triggers dedup", () => {
+  const noCapture = envelope("SubtasksStart accepted: execution exec-nocap, 1 active task(s).", {
+    action: "start",
+    executionId: "exec-nocap",
+    kind: "execute",
+    tasks: [{
+      taskId: "task-nocap",
+      state: "running",
+      definition: { title: "No capture", instructions: "bounded work", acceptanceCriteria: ["done"] },
+      dispatch: {
+        provenance: "captured_at_dispatch",
+        delivery: "written_to_transport",
+        dispatchedAt: "2025-06-01T10:00:00.000Z",
+        worktreeRoot: "/w/workers/task-nocap",
+        baseCommit: "abc",
+        executorTurn: 1,
+      },
+    }],
+  });
+  const noCaptureText = joined(noCapture, { expanded: true }, 200);
+  assert.match(noCaptureText, /Prompt sent to worker:\n\(not recorded\)/);
+
+  const noInstructions = envelope("SubtasksStart accepted: execution exec-noinstr, 1 active task(s).", {
+    action: "start",
+    executionId: "exec-noinstr",
+    kind: "execute",
+    tasks: [{
+      taskId: "task-noinstr",
+      state: "running",
+      definition: { title: "No instructions in this record" },
+      dispatch: dispatchRecordFixture("You are the isolated implementation executor for one bounded phase."),
+    }],
+  });
+  const noInstructionsText = joined(noInstructions, { expanded: true }, 200);
+  assert.match(noInstructionsText, /Submitted instructions:\n\(not returned by this record\)/);
+  assert.ok(
+    noInstructionsText.includes("You are the isolated implementation executor for one bounded phase."),
+    "without submitted-instruction evidence the captured prompt renders in full",
+  );
+  assert.ok(!noInstructionsText.includes(SUBMITTED_INSTRUCTIONS_MARKER));
+});
+
+test("re-dispatched prompts are each deduplicated against the one submitted block", () => {
+  const instructions = "Recover and finish the bounded change.";
+  const initialPrompt = `${instructions}\n\nInitial framing from the actual transport capture.`;
+  const latestPrompt = `${instructions}\n\nLatest framing from the recovery re-dispatch capture.`;
+  const value = envelope("SubtasksStart accepted: execution exec-redup, 1 active task(s).", {
+    action: "start",
+    executionId: "exec-redup",
+    kind: "execute",
+    tasks: [{
+      taskId: "task-redup",
+      state: "running",
+      definition: { title: "Re-dispatched work", instructions, acceptanceCriteria: ["done"] },
+      initialDispatch: dispatchRecordFixture(initialPrompt, { executorTurn: 1 }),
+      dispatch: dispatchRecordFixture(latestPrompt, { executorTurn: 3 }),
+    }],
+  });
+  const text = joined(value, { expanded: true }, 200);
+  assert.equal(text.split(instructions).length - 1, 1, "both captured prompts deduplicate against the one submitted block");
+  assert.equal((text.match(/rendering abbreviation/g) ?? []).length, 2, "each deduplicated prompt body carries its own marker");
+  assert.match(text, /Initial framing from the actual transport capture\./);
+  assert.match(text, /Latest framing from the recovery re-dispatch capture\./);
+});
+
+test("the production start result keeps the duplication out of the model-visible context (#121 trace)", async () => {
+  const { tools, manager } = harness();
+  try {
+    const start = toolFor(tools, "SubtasksStart").execute as ExecuteTool;
+    const started = await start("model-context-start", {
+      tasks: [{
+        title: "MODEL-CONTEXT-SENTINEL",
+        instructions: "MODELCONTEXT-SENTINEL unique instruction body for the trace.",
+        acceptanceCriteria: ["done"],
+      }],
+    }, undefined, undefined, {});
+    // Model-visible trace (#121): the instruction body exists in the
+    // orchestrator's context once, through its own tool-call arguments; the
+    // result's model-visible content text carries neither the instruction body
+    // nor any captured sent prompt. The sent prompt is delivered to the
+    // worker's separate context at dispatch and recorded there, so the
+    // overlapping expanded-view blocks are a presentation-only duplication.
+    const content = (started.content as Array<Record<string, unknown>>)[0].text as string;
+    assert.ok(!content.includes("MODELCONTEXT-SENTINEL"), "the model-visible content text must not repeat the submitted instruction body");
+    assert.ok(!content.includes("sentPrompt"), "the model-visible content text must not carry a captured sent prompt");
+    // The renderer-only dispatch projection is attached at render time, never
+    // written into the returned result payload.
+    assert.equal(started.details.dispatchView, undefined, "the returned payload is untouched; the dispatch projection is renderer-only");
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
 });
 
 // ---------------------------------------------------------------------------

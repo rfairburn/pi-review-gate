@@ -281,7 +281,13 @@ All 37 registered extension-owned tools are covered by one shared mechanism in
   that are complete (the find query and every returned match, the requested range and
   every returned entry, the full returned chunk with its whitespace, and the actual
   call with its paired result or its not-yet-observed state); re-collapse restores the
-  unchanged collapsed card.
+  unchanged collapsed card. When a captured sent prompt contains the submitted
+  instructions verbatim, the expanded Start/Add view shows that overlapping block once:
+  the repeated span inside the rendered prompt is replaced by a rendering-only marker
+  that names the already-shown submitted text and states it is an abbreviation, not
+  prompt content, while worker-specific framing around the span still renders exactly;
+  a prompt that differs from the submitted instructions (path-rewritten or transformed)
+  renders in full, and unavailable captures keep their truthful not-recorded state.
 - The five `Shell*` tools (`src/background-shell/index.ts`, `result-view.ts`) are wired
   with per-tool collapsed and expanded detail callbacks. The collapsed card shows the
   actionable job/outcome summary — for `ShellLog` the tail of the returned range with a
@@ -347,4 +353,6 @@ re-collapse with their real renderers.
   envelope parser (`src/apply-patch/envelope.ts`) implements the publicly documented
   OpenAI/Codex apply_patch grammar so patches authored by OpenAI models apply unchanged;
   it is an independent implementation of the public format — no Codex source code is
-  copied.
+  copied. Only the headerless update application is retained from the upstream engine:
+  create-file mode was removed with the legacy structured `operation` argument because
+  canonical `*** Add File:` hunks carry their final content directly.

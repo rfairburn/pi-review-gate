@@ -186,6 +186,23 @@ completion; dirty or conflicted worktrees are preserved for diagnosis. This is w
 and instruction isolation, not an OS sandbox — see
 [Security model](security-model.md#isolation-limits).
 
+**Worker workspace contract**: Each managed worktree is a detached-HEAD worktree at a
+synthetic captured base commit whose tree already includes the target workspace's
+uncommitted content. The named issue branch belongs to the target capture/landing
+checkout: prepare it there, pass that checkout as the execution group's `workspace`,
+and reference the branch in worker task text as context only — never as a checkout or
+commit instruction, and never by handing workers the repository's own branch and commit
+conventions as working instructions. Workers must not check out, create, switch, or
+delete branches in their managed worktrees or alter Git worktree ownership metadata;
+the harness owns capture, checkpointing, and landing, and worker prompts carry this
+contract authoritatively. Checking out a branch whose commit differs from the current one
+inside a managed worktree resets its tree to that branch's committed state and can drop
+captured content that tree lacks, while conflicting local edits make the checkout refuse
+rather than discarding them (same-commit branch creation changes only HEAD attachment);
+checkpoint validation fails closed on such a worktree. Recovery steps for an already
+damaged worktree live in the shipped orchestrator skill's recovery runbook
+(`skills/orchestrator/references/recovery.md`).
+
 ## Conflicts and gates
 
 A clean accepted task lands immediately. On a three-way conflict, clean paths are

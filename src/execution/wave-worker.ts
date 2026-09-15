@@ -123,6 +123,9 @@ function isolationDirective(workerRoot: string): string {
     "The original source workspace is outside this boundary and must be treated as read-only.",
     "Absolute source-workspace paths in the request were mapped to this worker root.",
     "Never write outside the worker root, even if earlier task text names another absolute path.",
+    "This is a detached-HEAD managed worktree, not a branch checkout: never check out, create, switch, or delete Git branches, and never alter Git worktree or ownership metadata.",
+    "A named issue branch in the task belongs to the target capture/landing checkout; treat it as context, not a checkout instruction.",
+    "The harness owns capture, checkpointing, and landing.",
   ].join("\n");
 }
 
@@ -501,8 +504,10 @@ async function assertEffectiveCwdInsideWorktree(effectiveCwd: string, worktreeRo
  * Build the initial executor prompt for a wave worker turn.
  *
  * The prompt discloses that the isolated snapshot contains tracked and
- * non-ignored untracked files but no Git-ignored files, and tells the
- * model not to manage commits.
+ * non-ignored untracked files but no Git-ignored files, tells the model not
+ * to manage commits, and pins the detached-worktree ownership contract: the
+ * worker stays detached, never checks out or creates branches, and leaves
+ * checkpointing and landing to the harness.
  *
  * Absolute source-root paths in the task are rewritten to worker-root paths
  * to prevent the executor from writing directly to the source workspace.
@@ -529,6 +534,14 @@ export function buildWaveWorkerPrompt(
     research
       ? "The private worktree is containment only; any detected workspace change fails this research task and is never landed."
       : "Do not manage Git commits — the workspace will be committed automatically after your changes.",
+    "",
+    "Workspace ownership contract (authoritative):",
+    "This directory is a detached-HEAD managed worktree at a synthetic captured base commit; it is not the source/target checkout.",
+    "The synthetic captured base commits the target workspace's uncommitted content into its tree; checking out any other commit resets this tree to that commit and can drop captured content that tree lacks, while conflicting local edits make the checkout refuse rather than discarding them.",
+    "Creating a branch at the current commit only changes HEAD attachment, but no branch operation is permitted here either.",
+    "A named issue branch in the task belongs to the target capture/landing checkout, never to this worktree: treat branch mentions as context, not checkout instructions.",
+    "Never check out, create, switch, or delete Git branches here, and never alter Git worktree or ownership metadata.",
+    "The harness owns capture, checkpointing, and landing; leave HEAD detached and keep your output as ordinary working-tree files.",
     "",
     "Workspace snapshot disclosure:",
     "The isolated snapshot you are working from contains tracked files and non-ignored untracked files.",

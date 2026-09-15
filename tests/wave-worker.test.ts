@@ -195,6 +195,40 @@ test("wave-worker prompt discloses snapshot contents and enforces mapped isolati
     "prompt should tell model not to manage commits",
   );
 
+  // Prompt should pin the detached-worktree ownership contract.
+  assert.ok(
+    prompt.includes("Workspace ownership contract (authoritative)"),
+    "prompt should include the workspace ownership contract",
+  );
+  assert.ok(
+    prompt.includes("detached-HEAD managed worktree at a synthetic captured base commit"),
+    "prompt should distinguish the managed worktree from the source/target checkout",
+  );
+  assert.ok(
+    prompt.includes("synthetic captured base commits the target workspace's uncommitted content into its tree"),
+    "prompt should disclose that the base carries the target's uncommitted content",
+  );
+  assert.ok(
+    prompt.includes("checking out any other commit resets this tree to that commit"),
+    "prompt should describe the actual checkout risk without overclaiming",
+  );
+  assert.ok(
+    prompt.includes("Creating a branch at the current commit only changes HEAD attachment"),
+    "prompt should be accurate about same-commit branch creation",
+  );
+  assert.ok(
+    prompt.includes("belongs to the target capture/landing checkout"),
+    "prompt should place the named issue branch in the target checkout",
+  );
+  assert.ok(
+    prompt.includes("Never check out, create, switch, or delete Git branches"),
+    "prompt should forbid branch checkout and creation",
+  );
+  assert.ok(
+    prompt.includes("The harness owns capture, checkpointing, and landing"),
+    "prompt should assign checkpointing and landing to the harness",
+  );
+
   // Prompt should include task info.
   assert.ok(
     prompt.includes("Test wave worker task"),
@@ -211,6 +245,18 @@ test("wave-worker prompt discloses snapshot contents and enforces mapped isolati
     prompt.lastIndexOf("Workspace isolation (authoritative)") > prompt.lastIndexOf("Acceptance criteria:"),
     "the final isolation directive must follow task-controlled text",
   );
+  assert.ok(
+    prompt.lastIndexOf("Workspace isolation (authoritative)") > prompt.lastIndexOf("Workspace ownership contract (authoritative)"),
+    "the trailing isolation directive must carry the ownership rules after task text",
+  );
+  assert.ok(
+    prompt.includes("never check out, create, switch, or delete Git branches"),
+    "the trailing isolation directive must repeat the no-branch rule",
+  );
+  assert.ok(
+    prompt.includes("treat it as context, not a checkout instruction"),
+    "the trailing isolation directive must reframe branch mentions",
+  );
 });
 
 test("research worker prompt requests a portable bounded summary and direct sources", () => {
@@ -223,6 +269,8 @@ test("research worker prompt requests a portable bounded summary and direct sour
   assert.match(prompt, /Begin with one `Summary:` line of at most 240 characters/);
   assert.match(prompt, /Cite repository paths and external URLs directly/);
   assert.match(prompt, /Do not cite child-local evidence IDs/);
+  assert.match(prompt, /Workspace ownership contract \(authoritative\)/);
+  assert.match(prompt, /Never check out, create, switch, or delete Git branches/);
 });
 
 test("wave-worker runs one executor turn and normalizes to candidate", async () => {

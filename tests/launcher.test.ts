@@ -244,6 +244,10 @@ test("orchestrator prompt names the operation-specific tools and current steerin
   assert.doesNotMatch(prompt, /`dispatch`/);
   assert.match(prompt, /durably queued for the next executor handoff/);
   assert.doesNotMatch(prompt, /execute_subtasks/);
+  assert.match(prompt, /pass that checkout as the group's `workspace`/);
+  assert.match(prompt, /must never instruct the worker to check it out or commit on it/);
+  assert.match(prompt, /detached-HEAD managed worktrees at synthetic captured bases/);
+  assert.match(prompt, /the harness owns checkpointing and landing/);
   assert.doesNotMatch(prompt, /live-turn-only/);
   assert.doesNotMatch(prompt, /delegation overhead/);
   assert.doesNotMatch(prompt, /You may directly handle/);
@@ -257,6 +261,12 @@ test("orchestrator skill explains worktree isolation and three-way landing", asy
   assert.match(skill, /captured base, the current main workspace, and the accepted worker result/);
   assert.match(skill, /diff3 conflict markers/);
   assert.match(skill, /references\/recovery\.md/);
+  // Branch ownership stays with the target checkout; workers stay detached.
+  assert.match(skill, /prepare the task's named issue branch there/);
+  assert.match(skill, /Never instruct a worker to check out, create, or switch to that branch/);
+  assert.match(skill, /detached HEAD at a synthetic captured base/);
+  assert.match(skill, /the harness owns checkpointing and landing/);
+  assert.match(skill, /commits, checkpoints, and landings are harness-owned/);
 });
 
 test("orchestrator recovery reference covers recoverable execution states", async () => {
@@ -275,6 +285,31 @@ test("orchestrator recovery reference covers recoverable execution states", asyn
     "three-way",
     "diff3",
     "same session file",
+    // Detached-worktree branch-checkout damage: verified current-capability salvage.
+    "detached HEAD was replaced by a branch checkout",
+    "refs/pi-review-gate/waves/<waveId>/base",
+    "moves HEAD and the working tree to that commit's tree",
+    "Branch creation without a start point",
+    "update-ref refs/pi-review-gate/waves/<waveId>/salvage/<taskId>",
+    "salvage/<taskId>-stash <stashSha>",
+    "stash push --include-untracked",
+    "stash show --binary -p <stashSha>",
+    "the stash still records the index state in its second parent",
+    "diff --binary <stashSha>\\^1 <stashSha>\\^2",
+    "show --binary <stashSha>\\^3",
+    "diff --binary <runStartCommit> <runTipCommit>",
+    "fails with \"unknown revision\"",
+    "the only path for salvaged uncommitted content is the user-authorized manual application",
+    "bare form: detaches at the current commit; the working tree does not change",
+    "Never use `git checkout --detach <sha>` here",
+    "exporting alone has placed nothing anywhere",
+    "must never be applied into the target checkout",
+    "checkout --detach",
+    "does not create, verify, or revalidate any durable harness checkpoint",
+    "Manual mechanical salvage",
+    "user-authorized manual recovery",
+    "git merge-base HEAD <baseCommit>",
+    "Never run `git reset --hard`",
   ]) assert.match(recovery, new RegExp(phrase));
 });
 

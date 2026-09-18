@@ -269,6 +269,54 @@ test("orchestrator skill explains worktree isolation and three-way landing", asy
   assert.match(skill, /commits, checkpoints, and landings are harness-owned/);
 });
 
+test("orchestrator guidance favors beneficial parallelism and bounded tasks without forcing concurrency", async () => {
+  // Policy-presence check on the shipped orchestrator surfaces. These checks
+  // validate wording and wiring only; they are not evidence that a model
+  // consistently chooses beneficial parallelism.
+  const skill = await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8");
+  for (const phrase of [
+    "Shape concurrency from dependencies and benefit, not from available capacity",
+    "not a utilization target",
+    "no minimum task count",
+    "waiting or serial execution is correct when no useful independent work is ready",
+    "one concrete, coherent outcome per subtask",
+    "without assuming advance knowledge of which model will serve the worker",
+    "shared contracts are settled",
+    "not automatic cancellation or a rigid limit",
+  ]) {
+    assert.ok(skill.includes(phrase), `orchestrator skill missing: ${phrase}`);
+  }
+  const prompt = await readFile(resolve("scripts/orchestrator-system-prompt.md"), "utf8");
+  for (const phrase of [
+    "opportunity, not a utilization target",
+    "one concrete, coherent outcome",
+    "without assuming which model will serve the worker",
+    "shared contracts are settled",
+  ]) {
+    assert.ok(prompt.includes(phrase), `orchestrator prompt missing: ${phrase}`);
+  }
+  // Prose wraps at the column limit, so match on whitespace-normalized text.
+  const docs = (await readFile(resolve("docs/delegated-execution.md"), "utf8")).replace(/\s+/g, " ");
+  for (const phrase of [
+    "## Task construction and parallelism",
+    "there is no minimum task count",
+    "do not prove a model consistently chooses beneficial parallelism",
+    "declining slot-filling, redundant research, speculative artifacts",
+    "legitimate waiting when nothing useful is ready",
+  ]) {
+    assert.ok(docs.includes(phrase), `delegated-execution docs missing: ${phrase}`);
+  }
+  // The guidance must not introduce the anti-patterns it forbids: mandated
+  // task counts, mandatory research, or timeout-based cancellation.
+  for (const [name, text] of [["skill", skill], ["prompt", prompt]] as const) {
+    assert.doesNotMatch(text, /at least \d+ tasks|minimum of \d+ tasks/i, `${name} mandates a task count`);
+    assert.doesNotMatch(text, /mandatory research/i, `${name} mandates research`);
+    assert.doesNotMatch(text, /cancels? after \d+/i, `${name} introduces timeout cancellation`);
+  }
+  assert.doesNotMatch(docs, /at least \d+ tasks|minimum of \d+ tasks/i, "docs mandate a task count");
+  assert.doesNotMatch(docs, /mandatory research/i, "docs mandate research");
+});
+
 test("orchestrator recovery reference covers recoverable execution states", async () => {
   const recovery = await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8");
   for (const phrase of [

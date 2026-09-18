@@ -192,8 +192,9 @@ and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest
 POSIX launcher is unchanged.
 
 The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
-for each new run; the skill provides deeper guidance for decomposition, supervision,
-reviewer interpretation, integration, and synthesis. The launcher does not impose a separate orchestrator policy;
+for each new run; the skill provides deeper guidance for decomposition, beneficial
+parallelism and bounded task construction, supervision, reviewer interpretation,
+integration, and synthesis. The launcher does not impose a separate orchestrator policy;
 to limit the orchestrator, pass Pi's native allowlist through the wrapper, for example
 `./scripts/pi-review-gate.sh --tools read,bash,edit,write`.
 

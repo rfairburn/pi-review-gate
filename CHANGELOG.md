@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.54]
+
+### Fixed
+
+- Shell and Subtasks failure cards now correlate failed model-stream attempts
+  with bounded, sanitized diagnostics instead of attributing every displayed
+  error to tool execution. Missing evidence remains explicitly unknown.
+- Failed attempts can supply a concise diagnostic note to subsequent model
+  context without fabricating tool results. Notes track actual execution,
+  consumption, and session changes; retry and transport behavior are unchanged.
+- Preserve shutdown ordering so diagnostic hooks do not delay existing review
+  cancellation and executor cleanup.
+
 ## [0.1.0-dev.53]
 
 ### Changed

@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.53]
+
+### Changed
+
+- Make adherence to the existing contribution verification policy explicit in
+  `AGENTS.md`, including coordinated integration-owner full-suite checks for
+  process, Git, and filesystem phases, focused worker checks, truthful evidence,
+  and commands that preserve the live build. Test requirements and runtime
+  behavior are unchanged.
+
 ## [0.1.0-dev.52]
 
 ### Added

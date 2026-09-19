@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.52]
+
+### Added
+
+- Visible/headless selection for the managed interactive browser in Web settings.
+  Saving a changed mode immediately replaces an open browser, restoring intended
+  tab URLs and the active tab with best-effort memory-only cookies, local storage,
+  and IndexedDB transfer. Results disclose failed restoration, redirects, and state
+  limitations; old session, tab, and ref handles are invalid after replacement.
+
+### Changed
+
+- Browser idle expiry accepts `0` to disable idle closure. Detectable trusted
+  pointer, keyboard, and wheel input renews finite idle leases alongside model
+  activity; explicit close and session cleanup remain effective. Documentation
+  recommends `0` for hands-on browser use and explains detection limitations.
+- BrowserExtract remains an independent headless URL-rendering tool, with no managed
+  tab or authentication-state reuse. Interactive actions still target explicit tab
+  IDs; visibility does not change tool exposure or browser permissions.
+
 ## [0.1.0-dev.51]
 
 ### Changed

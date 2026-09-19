@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.57]
+
+### Fixed
+
+- Terminal settings menus retain the selected row after toggles and other staged
+  changes, using Pi's supported SelectList component and stable row identities.
+  All eleven redisplayed settings menus are covered, including Web permissions,
+  reviewers, worker resources/routes, and parent menus returning from pickers.
+- Preserve option ordering, confirmations, cancellation, and persistence behavior.
+  RPC and hosts without custom TUI support retain the existing plain selector;
+  selection position is local UI state, not a saved configuration setting.
+
 ## [0.1.0-dev.56]
 
 ### Added

@@ -40,6 +40,7 @@ import {
 import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { sendNotice } from "../pi";
 import { findOccupiedHostBindings } from "../host-keybindings";
+import { retainedSelect, type MenuCustomFactory } from "./menu";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
 
@@ -56,6 +57,10 @@ interface UiContext {
   input?(title: string, placeholder?: string): Promise<string | undefined>;
   confirm?(title: string, message: string): Promise<boolean>;
   notify?(message: string, type?: "info" | "warning" | "error"): void;
+  /** Host custom TUI component (Pi hosts only); guarded by `mode === "tui"`. */
+  custom?(factory: MenuCustomFactory): Promise<string | undefined>;
+  /** Host run mode ("tui" | "rpc" | ...); carried from the command context. */
+  mode?: string;
 }
 
 export function registerReviewSettings(input: RegisterSettingsInput): void {
@@ -111,6 +116,10 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   // so disabling restores them exactly as saved.
   let browserPermissions = { ...(input.config.web!.browserPermissions ?? DEFAULT_BROWSER_PERMISSIONS) };
 
+  // Caller-local last selection for this loop only: the highlighted row is
+  // re-shown after every staged change so a toggle can repeat without
+  // navigating back to the top (issue #140). UI-only state, never persisted.
+  let rootLastKey: string | undefined;
   while (true) {
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const reviewStatus = input.config.enabled
@@ -133,35 +142,42 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
       ["Web", `${formatByteSize(webMaxDownloadBytes)} max download · ${browserVisible ? "headed" : "headless"} browser${browserPermissions.yolo ? " · YOLO ON" : ""}`],
     ]);
-    const choice = await input.ui.select("Review settings", [
-      modeRow,
-      modeCycleRow,
-      resourcesRow,
-      executeRouteRow,
-      researchRouteRow,
-      reviewersRow,
-      timeoutsRow,
-      policyRow,
-      retentionRow,
-      workersRow,
-      retryRow,
-      notificationsRow,
-      deferredToolsRow,
-      subtasksViewRow,
-      webRow,
-      "Save changes",
-      "Cancel",
-    ]);
-    if (!choice || choice === "Cancel") return;
-    if (choice === modeRow) {
+    // Rows are keyed by stable section names: every label re-renders with the
+    // staged state, but the key never changes (issue #140).
+    const choice = await retainedSelect(input.ui, {
+      title: "Review settings",
+      rows: [
+        { key: "mode", label: modeRow },
+        { key: "modeCycle", label: modeCycleRow },
+        { key: "resources", label: resourcesRow },
+        { key: "route.execute", label: executeRouteRow },
+        { key: "route.research", label: researchRouteRow },
+        { key: "reviewers", label: reviewersRow },
+        { key: "timeouts", label: timeoutsRow },
+        { key: "policy", label: policyRow },
+        { key: "retention", label: retentionRow },
+        { key: "workers", label: workersRow },
+        { key: "retry", label: retryRow },
+        { key: "notifications", label: notificationsRow },
+        { key: "deferredTools", label: deferredToolsRow },
+        { key: "subtasksView", label: subtasksViewRow },
+        { key: "web", label: webRow },
+        { key: "save", label: "Save changes" },
+        { key: "cancel", label: "Cancel" },
+      ],
+      initialKey: rootLastKey,
+    });
+    if (!choice || choice === "cancel") return;
+    rootLastKey = choice;
+    if (choice === "mode") {
       operatingMode = await selectOperatingMode(input.ui, operatingMode);
       continue;
     }
-    if (choice === modeCycleRow) {
+    if (choice === "modeCycle") {
       modeCycleShortcut = await selectModeCycleShortcut(input.ui, modeCycleShortcut);
       continue;
     }
-    if (choice === resourcesRow) {
+    if (choice === "resources") {
       // Selection keys at the start of this visit. Reasoning re-pairing and
       // added-resource enrollment re-derivation run only for resources whose
       // model actually changed during this visit, so explicit per-route
@@ -226,11 +242,11 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       }
       continue;
     }
-    if (choice === executeRouteRow) {
+    if (choice === "route.execute") {
       executeRoute = await selectWorkerRoute(input.ui, "Execution priority", executeRoute, workerResources, input.config, input.scoped);
       continue;
     }
-    if (choice === researchRouteRow) {
+    if (choice === "route.research") {
       researchRoute = await selectWorkerRoute(
         input.ui,
         "Research priority",
@@ -241,11 +257,11 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       );
       continue;
     }
-    if (choice === reviewersRow) {
+    if (choice === "reviewers") {
       activeReviewers = await selectReviewers(input.ui, activeReviewers, agents, input.scoped);
       continue;
     }
-    if (choice === timeoutsRow) {
+    if (choice === "timeouts") {
       ({ reviewerTimeoutMs, executorTimeoutMs } = await selectTimeouts(
         input.ui,
         reviewerTimeoutMs,
@@ -253,7 +269,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ));
       continue;
     }
-    if (choice === policyRow) {
+    if (choice === "policy") {
       ({ maxCorrectionCycles, guidanceThreshold } = await selectReviewPolicy(
         input.ui,
         maxCorrectionCycles,
@@ -261,31 +277,31 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ));
       continue;
     }
-    if (choice === retentionRow) {
+    if (choice === "retention") {
       retainBundles = await selectBundleRetention(input.ui, retainBundles);
       continue;
     }
-    if (choice === workersRow) {
+    if (choice === "workers") {
       maxWorkers = await selectMaxWorkers(input.ui, maxWorkers);
       continue;
     }
-    if (choice === retryRow) {
+    if (choice === "retry") {
       retryPolicy = await selectRetryPolicy(input.ui, retryPolicy);
       continue;
     }
-    if (choice === notificationsRow) {
+    if (choice === "notifications") {
       subtaskNotifications = await selectSubtaskNotifications(input.ui, subtaskNotifications);
       continue;
     }
-    if (choice === deferredToolsRow) {
+    if (choice === "deferredTools") {
       deferredPiTools = !deferredPiTools;
       continue;
     }
-    if (choice === subtasksViewRow) {
+    if (choice === "subtasksView") {
       subtasksViewExpanded = !subtasksViewExpanded;
       continue;
     }
-    if (choice === webRow) {
+    if (choice === "web") {
       ({ maxDownloadBytes: webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions } = await selectWebSettings(
         input.ui, webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions,
       ));
@@ -356,6 +372,8 @@ async function selectWebSettings(
   let browserDownloadRetention = initialDownloadRetention;
   let browserVisible = initialVisible;
   let browserPermissions = { ...initialPermissions };
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
   while (true) {
     const [downloadRow, approvalRow, idleExpiryRow, retentionRow, visibilityRow, permissionsRow] = alignedSettingsRows([
       ["Maximum download", formatByteSize(maxDownloadBytes)],
@@ -365,20 +383,33 @@ async function selectWebSettings(
       ["Browser visibility", browserVisible ? "Headed · visible browser window" : "Headless · no window (default)"],
       ["Browser permissions", browserPermissionsSummary(browserPermissions)],
     ]);
-    const choice = await ui.select("Web settings", [downloadRow, approvalRow, idleExpiryRow, retentionRow, visibilityRow, permissionsRow, "Back"]);
-    if (!choice || choice === "Back") return { maxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions };
-    if (choice === visibilityRow) {
+    const choice = await retainedSelect(ui, {
+      title: "Web settings",
+      rows: [
+        { key: "download", label: downloadRow },
+        { key: "approval", label: approvalRow },
+        { key: "idleExpiry", label: idleExpiryRow },
+        { key: "retention", label: retentionRow },
+        { key: "visibility", label: visibilityRow },
+        { key: "permissions", label: permissionsRow },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return { maxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions };
+    lastKey = choice;
+    if (choice === "visibility") {
       await notify(ui, "Headless (default) keeps the QA browser without a window. Headed shows a real browser window with a native address bar. Saving a changed visibility applies it immediately to the live browser: the browser is replaced and its tabs, active page, and in-memory cookies/localStorage/IndexedDB are restored best-effort (never lossless; failures and redirects are reported). With no open browser it applies at the next BrowserOpen. The model's tools stay exactly the same either way.", "info");
       const selected = await ui.select("Browser visibility", ["Headless · no window (default)", "Headed · visible browser window"]);
       if (selected === "Headed · visible browser window") browserVisible = true;
       else if (selected === "Headless · no window (default)") browserVisible = false;
       continue;
     }
-    if (choice === permissionsRow) {
+    if (choice === "permissions") {
       browserPermissions = await selectBrowserPermissions(ui, browserPermissions);
       continue;
     }
-    if (choice === approvalRow) {
+    if (choice === "approval") {
       await notify(ui, "Only confirmation-required actions: Ask prompts (no UI rejects); Automatically Accept approves without UI; Automatically Deny rejects. Already-permitted observations/local actions stay permitted; hard safety and role restrictions remain. Saved changes apply locally now and to newly launched workers.", "info");
       const selected = await ui.select("Browser interaction approval", Object.values(BROWSER_APPROVAL_CHOICES));
       const entry = Object.entries(BROWSER_APPROVAL_CHOICES).find(([, label]) => label === selected);
@@ -389,7 +420,7 @@ async function selectWebSettings(
       await notify(ui, "This UI does not support numeric input.", "error");
       continue;
     }
-    if (choice === idleExpiryRow) {
+    if (choice === "idleExpiry") {
       const entered = await ui.input("Browser idle expiry in minutes (0 disables idle close)", String(browserIdleExpiryMinutes));
       if (entered === undefined) continue;
       // Empty input must stay rejected: Number("") would otherwise stage 0.
@@ -402,7 +433,7 @@ async function selectWebSettings(
       browserIdleExpiryMinutes = minutes;
       continue;
     }
-    if (choice === retentionRow) {
+    if (choice === "retention") {
       await notify(ui, "Maximum retained unsaved downloads per browser session. While the cap is reached, a new download cancels and releases the oldest retained one (after a live lowering, the next arrival may release more than one); saved files are never counted or affected. 0 disables count-based eviction entirely (normal save/close/revocation cleanup still applies). A lowered value takes effect when the next download arrives; editing this setting never deletes pending downloads.", "info");
       const entered = await ui.input("Maximum retained unsaved downloads per browser session (0 = unlimited)", String(browserDownloadRetention));
       if (entered === undefined) continue;
@@ -549,15 +580,27 @@ async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermis
     "These stage the issue #27 browser permissions, and every capability is enforced. Credential entry/submission, uploads, download saving, and clipboard read/write are enforced by interactive-browser tool actions; camera, microphone, and geolocation apply as per-origin device permission grants issued when a tab commits to an origin (and cleared from live sessions when disabled — an unconfirmable engine clear closes the affected browser session instead of being claimed applied, and a clear that does not settle within the cleanup deadline is reported as still in flight and the affected session is closed to contain any retained grants); service workers apply at browser launch, so a saved change replaces the live browser in a controlled way that restores tabs, storage state, and granted permissions best-effort; the popup restriction override lifts the four-tab limit for page-created popups while enabled; local networks (including YOLO's local-network effect) is enforced at the interactive egress broker. Saved changes apply to the live session immediately.",
     "info",
   );
+  // Caller-local last selection for this loop only: keys are the permission
+  // field names (plus yolo/back), stable across the On/Off label flips, so a
+  // toggled row stays highlighted on the re-show (issue #140).
+  let lastKey: string | undefined;
   while (true) {
-    const rows = alignedSettingsRows([
+    const rowLabels = alignedSettingsRows([
       ...BROWSER_PERMISSION_ROWS.map((row) => [row.label, permissions[row.field] ? "On" : "Off"] as const),
       [YOLO_PERMISSION_LABEL, permissions.yolo ? "On" : "Off"] as const,
     ]);
-    const yoloRow = rows[rows.length - 1]!;
-    const choice = await ui.select("Browser permissions", [...rows, "Back"]);
-    if (!choice || choice === "Back") return permissions;
-    if (choice === yoloRow) {
+    const choice = await retainedSelect(ui, {
+      title: "Browser permissions",
+      rows: [
+        ...BROWSER_PERMISSION_ROWS.map((row, index) => ({ key: row.field, label: rowLabels[index]! })),
+        { key: "yolo", label: rowLabels[rowLabels.length - 1]! },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return permissions;
+    lastKey = choice;
+    if (choice === "yolo") {
       if (permissions.yolo) {
         permissions.yolo = false;
         await notify(ui, "YOLO disabled; the saved individual browser permissions are effective again.", "info");
@@ -568,9 +611,8 @@ async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermis
       }
       continue;
     }
-    const index = rows.indexOf(choice);
-    if (index < 0) continue;
-    const row = BROWSER_PERMISSION_ROWS[index]!;
+    const row = BROWSER_PERMISSION_ROWS.find((candidate) => candidate.field === choice);
+    if (!row) continue;
     if (!permissions[row.field] && row.enableWarning) {
       await notify(ui, row.enableWarning, "warning");
     }
@@ -670,6 +712,8 @@ async function selectMaxWorkers(ui: UiContext, current: number): Promise<number>
 
 async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): Promise<ExecutionRetryPolicy> {
   let policy = { ...initial };
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
   while (true) {
     const [retriesRow, baseRow, maxRow, repeatsRow, jitterRow] = alignedSettingsRows([
       ["Retries after initial attempt", String(policy.maxRetries)],
@@ -678,9 +722,21 @@ async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): 
       ["Same-incident repeat limit", String(policy.maxSameIncidentRepeats)],
       ["Delay jitter", policy.jitter ? "Enabled" : "Disabled"],
     ]);
-    const choice = await ui.select("Executor retry policy", [retriesRow, baseRow, maxRow, repeatsRow, jitterRow, "Back"]);
-    if (!choice || choice === "Back") return policy;
-    if (choice === jitterRow) {
+    const choice = await retainedSelect(ui, {
+      title: "Executor retry policy",
+      rows: [
+        { key: "retries", label: retriesRow },
+        { key: "base", label: baseRow },
+        { key: "max", label: maxRow },
+        { key: "repeats", label: repeatsRow },
+        { key: "jitter", label: jitterRow },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return policy;
+    lastKey = choice;
+    if (choice === "jitter") {
       policy.jitter = !policy.jitter;
       continue;
     }
@@ -688,12 +744,12 @@ async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): 
       await notify(ui, "This UI does not support numeric input.", "error");
       continue;
     }
-    const isDelay = choice === baseRow || choice === maxRow;
-    const current = choice === retriesRow
+    const isDelay = choice === "base" || choice === "max";
+    const current = choice === "retries"
       ? policy.maxRetries
-      : choice === baseRow
+      : choice === "base"
         ? policy.baseDelayMs
-        : choice === maxRow
+        : choice === "max"
           ? policy.maxDelayMs
           : policy.maxSameIncidentRepeats;
     const entered = await ui.input(isDelay ? "Delay in milliseconds" : "Retry limit", String(current));
@@ -704,9 +760,9 @@ async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): 
       continue;
     }
     const next = { ...policy };
-    if (choice === retriesRow) next.maxRetries = parsed;
-    else if (choice === baseRow) next.baseDelayMs = parsed;
-    else if (choice === maxRow) next.maxDelayMs = parsed;
+    if (choice === "retries") next.maxRetries = parsed;
+    else if (choice === "base") next.baseDelayMs = parsed;
+    else if (choice === "max") next.maxDelayMs = parsed;
     else next.maxSameIncidentRepeats = parsed;
     if (next.maxDelayMs < next.baseDelayMs) {
       await notify(ui, "Maximum delay must be greater than or equal to base delay.", "error");
@@ -751,12 +807,25 @@ async function selectExecutorPool(
   onAdd?: (resourceId: string, value: WorkerResourceValue) => void,
 ): Promise<WorkerResourceCatalog> {
   let catalog = cloneWorkerCatalog(initial);
+  // Caller-local last selection for this loop only: entry keys are the stable
+  // resource ids, so a re-shown list after add/edit/re-sort keeps the same
+  // resource highlighted even when its label or position changed (issue #140).
+  let lastKey: string | undefined;
   while (true) {
     const keys = sortedCatalogKeys(catalog, config, scoped);
     const entryRows = keys.map((key, index) => `${index + 1}. ${executorPoolEntrySummary(catalog[key]!, config, scoped)}`);
-    const choice = await ui.select("Worker resources — shared capacity", [...entryRows, "Add worker resource", "Back"]);
-    if (!choice || choice === "Back") return catalog;
-    if (choice === "Add worker resource") {
+    const choice = await retainedSelect(ui, {
+      title: "Worker resources — shared capacity",
+      rows: [
+        ...keys.map((key, index) => ({ key, label: entryRows[index]! })),
+        { key: "add", label: "Add worker resource" },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return catalog;
+    lastKey = choice;
+    if (choice === "add") {
       const selection = await selectExecutorModel(ui, undefined, Object.values(catalog), agents, scoped);
       if (!selection) continue;
       const createdId = executorEntryId(selection);
@@ -773,9 +842,10 @@ async function selectExecutorPool(
       onAdd?.(createdId, createdValue);
       continue;
     }
-    const index = entryRows.indexOf(choice);
-    if (index < 0) continue;
-    catalog = await editExecutorPoolEntry(ui, catalog, keys[index]!, agents, config, scoped);
+    // Resource ids can never equal the action keys above (they are prefixed
+    // external-/pi-), so an unknown value is a no-op re-show as before.
+    if (!Object.prototype.hasOwnProperty.call(catalog, choice)) continue;
+    catalog = await editExecutorPoolEntry(ui, catalog, choice, agents, config, scoped);
   }
 }
 
@@ -849,11 +919,24 @@ async function selectWorkerRoute(
   scoped: ScopedModelChoice[],
 ): Promise<WorkerRouteEntry[]> {
   let route = reconcileWorkerRoute(initial.map((entry) => ({ ...entry })), resources);
+  // Caller-local last selection for this loop only: entry keys are the stable
+  // resource ids, so the edited entry stays highlighted when the list re-shows
+  // after an add, exclude, or move (issue #140).
+  let lastKey: string | undefined;
   while (true) {
     const rows = route.map((entry, index) => `${index + 1}. ${workerRouteEntrySummary(entry, resources, config, scoped)}`);
-    const choice = await ui.select(title, [...rows, "Add resource", "Back"]);
-    if (!choice || choice === "Back") return route;
-    if (choice === "Add resource") {
+    const choice = await retainedSelect(ui, {
+      title,
+      rows: [
+        ...route.map((entry, index) => ({ key: entry.resourceId, label: rows[index]! })),
+        { key: "add", label: "Add resource" },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return route;
+    lastKey = choice;
+    if (choice === "add") {
       const used = new Set(route.map((entry) => entry.resourceId));
       const availableKeys = sortedCatalogKeys(resources, config, scoped).filter((key) => !used.has(key));
       const labels = availableKeys.map((key) => executorSelectionLabel(resources[key]!.selection, config, scoped));
@@ -874,8 +957,12 @@ async function selectWorkerRoute(
       }
       continue;
     }
-    let index = rows.indexOf(choice);
+    let index = route.findIndex((candidate) => candidate.resourceId === choice);
     if (index < 0) continue;
+    // The per-entry editor re-shows after every action (Move up/down
+    // deliberately keeps editing the moved entry), so it retains its own last
+    // action by key (issue #140).
+    let editLastKey: string | undefined;
     while (route[index]) {
       const entry = route[index]!;
       const resource = Object.prototype.hasOwnProperty.call(resources, entry.resourceId)
@@ -885,16 +972,20 @@ async function selectWorkerRoute(
       const [thinkingRow] = alignedSettingsRows([
         ["Thinking", routeThinkingSummary(entry, resource, scoped)],
       ]);
-      const options = [
-        ...(resource.selection.source === "pi" ? [thinkingRow] : []),
-        ...(index > 0 ? ["Move up"] : []),
-        ...(index < route.length - 1 ? ["Move down"] : []),
-        "Exclude from this route",
-        "Back",
-      ];
-      const edit = await ui.select(`${title} — ${executorSelectionLabel(resource.selection, config, scoped)}`, options);
-      if (!edit || edit === "Back") break;
-      if (edit === thinkingRow && resource.selection.source === "pi") {
+      const edit = await retainedSelect(ui, {
+        title: `${title} — ${executorSelectionLabel(resource.selection, config, scoped)}`,
+        rows: [
+          ...(resource.selection.source === "pi" ? [{ key: "thinking", label: thinkingRow }] : []),
+          ...(index > 0 ? [{ key: "moveUp", label: "Move up" }] : []),
+          ...(index < route.length - 1 ? [{ key: "moveDown", label: "Move down" }] : []),
+          { key: "exclude", label: "Exclude from this route" },
+          { key: "back", label: "Back" },
+        ],
+        initialKey: editLastKey,
+      });
+      if (!edit || edit === "back") break;
+      editLastKey = edit;
+      if (edit === "thinking" && resource.selection.source === "pi") {
         const selection = resource.selection;
         const model = scoped.find((candidate) => candidate.model === selection.model);
         if (model) entry.thinkingLevel = await selectThinkingLevel(
@@ -902,13 +993,13 @@ async function selectWorkerRoute(
           model,
           effectiveThinkingLevel(entry.thinkingLevel ?? selection.thinkingLevel, model),
         );
-      } else if (edit === "Move up" && index > 0) {
+      } else if (edit === "moveUp" && index > 0) {
         [route[index - 1], route[index]] = [route[index]!, route[index - 1]!];
         index -= 1;
-      } else if (edit === "Move down" && index < route.length - 1) {
+      } else if (edit === "moveDown" && index < route.length - 1) {
         [route[index], route[index + 1]] = [route[index + 1]!, route[index]!];
         index += 1;
-      } else if (edit === "Exclude from this route") {
+      } else if (edit === "exclude") {
         route.splice(index, 1);
         break;
       }
@@ -929,21 +1020,27 @@ async function editExecutorPoolEntry(
   scoped: ScopedModelChoice[],
 ): Promise<WorkerResourceCatalog> {
   let catalog = cloneWorkerCatalog(initial);
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
   while (Object.prototype.hasOwnProperty.call(catalog, key)) {
     const entry = catalog[key]!;
     const [modelRow, capacityRow] = alignedSettingsRows([
       ["Model", executorSelectionLabel(entry.selection, config, scoped)],
       ["Maximum concurrency", String(entry.maxConcurrent)],
     ]);
-    const remove = "Remove";
-    const choice = await ui.select(`Worker resource ${key}`, [
-      modelRow,
-      capacityRow,
-      remove,
-      "Back",
-    ]);
-    if (!choice || choice === "Back") return catalog;
-    if (choice === modelRow) {
+    const choice = await retainedSelect(ui, {
+      title: `Worker resource ${key}`,
+      rows: [
+        { key: "model", label: modelRow },
+        { key: "capacity", label: capacityRow },
+        { key: "remove", label: "Remove" },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return catalog;
+    lastKey = choice;
+    if (choice === "model") {
       const others = Object.entries(catalog)
         .filter(([candidateKey]) => candidateKey !== key)
         .map(([, value]) => value);
@@ -951,11 +1048,11 @@ async function editExecutorPoolEntry(
       if (selection) setCatalogKey(catalog, key, { ...entry, selection });
       continue;
     }
-    if (choice === capacityRow) {
+    if (choice === "capacity") {
       setCatalogKey(catalog, key, { ...entry, maxConcurrent: await selectExecutorCapacity(ui, entry.maxConcurrent) });
       continue;
     }
-    if (choice === remove) {
+    if (choice === "remove") {
       delete catalog[key];
       return catalog;
     }
@@ -1009,6 +1106,10 @@ async function selectReviewers(
   scoped: ScopedModelChoice[],
 ): Promise<ActiveReviewerSelection[]> {
   let selected = initial.map(cloneReviewerSelection);
+  // Caller-local last selection for this loop only: keys are the reviewer
+  // keys (reasoning rows prefixed), stable across the ✓/✗ label flips, so a
+  // toggled row stays highlighted on the re-show (issue #140).
+  let lastKey: string | undefined;
   const availableRows = (): Array<{ key: string; value: ActiveReviewerSelection; label: string }> => [
     ...scoped.map((choice) => ({
       key: reviewerKey({ source: "pi", model: choice.model }),
@@ -1032,19 +1133,23 @@ async function selectReviewers(
       const choice = scoped.find((candidate) => candidate.model === model);
       if (!selection || selection.source !== "pi" || !choice) return [];
       const level = effectiveThinkingLevel(selection.thinkingLevel, choice);
-      return [{ label: `Reasoning · ${row.label}  ${thinkingLevelLabel(level)}`, selection, choice }];
+      return [{ key: row.key, label: `Reasoning · ${row.label}  ${thinkingLevelLabel(level)}`, selection, choice }];
     });
-    const options = [
-      ...rows.map((row) => `${row.label} ${hasReviewer(selected, row.value) ? "✓" : "✗"}`),
-      ...unavailable.map((selection) => `${reviewerSelectionLabel(selection)} [unavailable] ✓`),
-      ...reasoningRows.map((row) => row.label),
-      "Enable all",
-      "Clear all",
-      "Back",
-    ];
-    const choice = await ui.select(`Reviewers — Enter toggles — ${selected.length}/${rows.length} selected`, options);
-    if (!choice || choice === "Back") return selected;
-    if (choice === "Enable all") {
+    const choice = await retainedSelect(ui, {
+      title: `Reviewers — Enter toggles — ${selected.length}/${rows.length} selected`,
+      rows: [
+        ...rows.map((row) => ({ key: row.key, label: `${row.label} ${hasReviewer(selected, row.value) ? "✓" : "✗"}` })),
+        ...unavailable.map((selection) => ({ key: reviewerKey(selection), label: `${reviewerSelectionLabel(selection)} [unavailable] ✓` })),
+        ...reasoningRows.map((row) => ({ key: `reasoning:${row.key}`, label: row.label })),
+        { key: "enableAll", label: "Enable all" },
+        { key: "clearAll", label: "Clear all" },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return selected;
+    lastKey = choice;
+    if (choice === "enableAll") {
       selected = rows.map((row) => {
         if (row.value.source !== "pi") return cloneReviewerSelection(row.value);
         const model = row.value.model;
@@ -1055,13 +1160,13 @@ async function selectReviewers(
       });
       continue;
     }
-    if (choice === "Clear all") {
+    if (choice === "clearAll") {
       selected = [];
       continue;
     }
-    const row = rows.find((candidate) => choice === `${candidate.label} ${hasReviewer(selected, candidate.value) ? "✓" : "✗"}`);
-    const unavailableRow = unavailable.find((candidate) => choice === `${reviewerSelectionLabel(candidate)} [unavailable] ✓`);
-    const reasoningRow = reasoningRows.find((candidate) => choice === candidate.label);
+    const row = rows.find((candidate) => candidate.key === choice);
+    const unavailableRow = unavailable.find((candidate) => reviewerKey(candidate) === choice);
+    const reasoningRow = reasoningRows.find((candidate) => `reasoning:${candidate.key}` === choice);
     if (reasoningRow) {
       const thinkingLevel = await selectThinkingLevel(
         ui,
@@ -1111,20 +1216,31 @@ async function selectReviewPolicy(
 ): Promise<{ maxCorrectionCycles: number; guidanceThreshold: number }> {
   let maxCorrectionCycles = initialCycles;
   let guidanceThreshold = initialThreshold;
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
   while (true) {
     const [cyclesRow, guidanceRow] = alignedSettingsRows([
       ["Automatic correction attempts", String(maxCorrectionCycles)],
       ["Concrete guidance after", String(guidanceThreshold)],
     ]);
-    const choice = await ui.select("Review policy", [cyclesRow, guidanceRow, "Back"]);
-    if (!choice || choice === "Back") return { maxCorrectionCycles, guidanceThreshold };
+    const choice = await retainedSelect(ui, {
+      title: "Review policy",
+      rows: [
+        { key: "cycles", label: cyclesRow },
+        { key: "guidance", label: guidanceRow },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return { maxCorrectionCycles, guidanceThreshold };
+    lastKey = choice;
     if (!ui.input) {
       await notify(ui, "This UI does not support numeric input.", "error");
       continue;
     }
-    const current = choice === cyclesRow ? maxCorrectionCycles : guidanceThreshold;
+    const current = choice === "cycles" ? maxCorrectionCycles : guidanceThreshold;
     const entered = await ui.input(
-      choice === cyclesRow ? "Automatic correction attempts" : "Concrete guidance after correction attempts",
+      choice === "cycles" ? "Automatic correction attempts" : "Concrete guidance after correction attempts",
       String(current),
     );
     if (entered === undefined) continue;
@@ -1133,7 +1249,7 @@ async function selectReviewPolicy(
       await notify(ui, "Enter a non-negative whole number.", "error");
       continue;
     }
-    if (choice === cyclesRow) maxCorrectionCycles = parsed;
+    if (choice === "cycles") maxCorrectionCycles = parsed;
     else guidanceThreshold = parsed;
   }
 }
@@ -1145,20 +1261,31 @@ async function selectTimeouts(
 ): Promise<{ reviewerTimeoutMs: number; executorTimeoutMs: number }> {
   let reviewerTimeoutMs = initialReviewerTimeoutMs;
   let executorTimeoutMs = initialExecutorTimeoutMs;
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
   while (true) {
     const [reviewerRow, executorRow] = alignedSettingsRows([
       ["Reviewer timeout", formatDuration(reviewerTimeoutMs)],
       ["Executor timeout", formatDuration(executorTimeoutMs)],
     ]);
-    const choice = await ui.select("Timeouts", [reviewerRow, executorRow, "Back"]);
-    if (!choice || choice === "Back") return { reviewerTimeoutMs, executorTimeoutMs };
+    const choice = await retainedSelect(ui, {
+      title: "Timeouts",
+      rows: [
+        { key: "reviewer", label: reviewerRow },
+        { key: "executor", label: executorRow },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return { reviewerTimeoutMs, executorTimeoutMs };
+    lastKey = choice;
     if (!ui.input) {
       await notify(ui, "This UI does not support numeric input.", "error");
       continue;
     }
-    const currentMs = choice === reviewerRow ? reviewerTimeoutMs : executorTimeoutMs;
+    const currentMs = choice === "reviewer" ? reviewerTimeoutMs : executorTimeoutMs;
     const entered = await ui.input(
-      choice === reviewerRow ? "Reviewer timeout in minutes" : "Executor timeout in minutes",
+      choice === "reviewer" ? "Reviewer timeout in minutes" : "Executor timeout in minutes",
       String(currentMs / 60_000),
     );
     if (entered === undefined) continue;
@@ -1168,7 +1295,7 @@ async function selectTimeouts(
       continue;
     }
     const timeoutMs = Math.round(minutes * 60_000);
-    if (choice === reviewerRow) reviewerTimeoutMs = timeoutMs;
+    if (choice === "reviewer") reviewerTimeoutMs = timeoutMs;
     else executorTimeoutMs = timeoutMs;
   }
 }
@@ -1386,7 +1513,14 @@ function duplicate(values: string[]): string | undefined {
 }
 
 function extractUi(ctx: unknown): UiContext | undefined {
-  return isRecord(ctx) && isRecord(ctx.ui) && typeof ctx.ui.select === "function" ? ctx.ui as unknown as UiContext : undefined;
+  if (!isRecord(ctx) || !isRecord(ctx.ui) || typeof ctx.ui.select !== "function") return undefined;
+  // Delegate to the live host UI object (prototype chain) so members beyond
+  // this interface — e.g. setStatus, used after saving — keep working, and
+  // carry the command context's run mode for guarding terminal-only custom
+  // components (issue #140).
+  const ui = Object.create(ctx.ui) as UiContext;
+  if (typeof ctx.mode === "string") ui.mode = ctx.mode;
+  return ui;
 }
 
 async function notify(ui: UiContext, message: string, type: "info" | "warning" | "error"): Promise<void> {

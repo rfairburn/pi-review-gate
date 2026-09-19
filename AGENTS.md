@@ -25,10 +25,20 @@ public docs.
   full resolution; `Refs #N` for partial or related work with the remaining scope
   stated. Branches are `issue-N/short-slug`; focused commits; GitHub PR merges are
   squash-only. Full policy: [CONTRIBUTING.md](CONTRIBUTING.md).
-- Truthful verification: run and cite the checks that actually cover the change
-  (`npm run check:static`, targeted compiled tests, `npm run test:package` for package
-  layout); never fabricate results. Command details:
-  [docs/development.md](docs/development.md).
+- Verification compliance is mandatory, not background reading: follow
+  [CONTRIBUTING.md — Verification before opening a PR](CONTRIBUTING.md#verification-before-opening-a-pr).
+  Run and cite the checks that actually cover the change (`npm run check:static`,
+  targeted compiled tests, `npm run test:package` when package layout, shipped docs, or
+  scripts change); a phase touching process, Git, or filesystem behavior requires the
+  full suite. Command/tier reference: [docs/development.md](docs/development.md).
+- Coordinated verification: in orchestrated work, workers normally run focused checks
+  for their bounded changes; the orchestrator or designated integration owner runs the
+  required phase-level full suite once changes integrate (`npm run build:test` then
+  `npm run test:run` — never `npm test`, which rebuilds the live `dist/`), and repeats
+  broad validation only when later changes invalidate its coverage or the existing
+  contribution policy requires it. Do not multiply equivalent full-suite runs across
+  workers or reviewers; never present a review pass as a test result or imply that an
+  unrun check passed.
 - Preserve the working tree: leave unrelated and untracked files untouched; never modify
   or delete a live `dist/` in the primary checkout — build into scratch or staging trees
   instead.

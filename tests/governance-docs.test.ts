@@ -497,9 +497,13 @@ test("CONTRIBUTING.md states the public workflow and release summary", () => {
 
 test("AGENTS.md links structure and safety docs", () => {
   const a = read("AGENTS.md");
-  for (const token of ["docs/development.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", "fail-closed"]) {
+  for (const token of ["docs/development.md", "CONTRIBUTING.md", "CONTRIBUTING.md#verification-before-opening-a-pr", "npm run build:test", "npm run test:run", "full suite", "integration owner", "SECURITY.md", "CHANGELOG.md", "fail-closed"]) {
     assert.ok(a.includes(token), `AGENTS.md missing "${token}"`);
   }
+  assert.ok(
+    a.includes("never `npm test`"),
+    "AGENTS.md must state the live-dist protection (never run npm test in a working checkout)",
+  );
 });
 
 test("review guidance requires precise, actionable findings without fabrication or budgets", () => {

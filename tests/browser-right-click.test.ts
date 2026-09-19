@@ -418,9 +418,9 @@ test("hover remains observational and shared interaction schemas do not expose a
       assert.equal(tools.get(name).parameters.properties.button, undefined,
         `${name} must not accept a click button`);
     }
-    assert.deepEqual(Object.keys(tools.get("BrowserClick").parameters.properties), ["session", "tab", "ref", "button"]);
+    assert.deepEqual(Object.keys(tools.get("BrowserClick").parameters.properties), ["session", "tab", "ref", "button", "x", "y"]);
     assert.deepEqual(tools.get("BrowserClick").parameters.properties.button.enum, ["left", "right"]);
-    assert.deepEqual(tools.get("BrowserClick").parameters.required, ["session", "tab", "ref"], "button stays optional");
+    assert.deepEqual(tools.get("BrowserClick").parameters.required, ["session", "tab"], "button and target stay optional");
 
     const hover = await f.manager.hover(session, tab, await f.ref("Go next"));
     assert.equal(hover.operation, "hover");

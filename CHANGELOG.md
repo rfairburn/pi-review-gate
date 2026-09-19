@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.56]
+
+### Added
+
+- Optional viewport dimensions for BrowserScreenshot, retaining the 1280×720
+  default and restoring the prior viewport after capture for responsive testing.
+- BrowserClick coordinate targeting for visual elements without accessibility
+  refs. Coordinate clicks temporarily apply the targeted tab's last successful
+  viewport screenshot dimensions, then restore the prior viewport. Element
+  screenshots do not establish or replace this reference; without one, coordinate
+  clicks explicitly request a viewport screenshot while ref clicks remain usable.
+
+### Security
+
+- Coordinate clicks retain owned-tab targeting, structural safety checks and
+  configured interaction approvals. Snapshot refs remain the primary interaction
+  mechanism; completed interactions do not expire the stored viewport dimensions,
+  and current-target checks still apply. Drag/modifier gestures are not included.
+
 ## [0.1.0-dev.55]
 
 ### Added

@@ -341,6 +341,63 @@ boundaries — rather than only the module callbacks. The shared inventory also 
 registered web, discovery, shell, subtask, and patch tools through expansion and
 re-collapse with their real renderers.
 
+## Model-stream failure reporting (#84)
+
+When an assistant (model) message ends with `stopReason` `"error"` or `"aborted"`,
+the host assigns a synthetic error result to every still-pending tool card and never
+dispatches those tool calls. The extension reports this honestly through one shared
+bridge (`src/stream-failure-report.ts`), consumed by both tool families
+(Subtasks* and Shell*) in collapsed and expanded states:
+
+- Capture is bounded and in-memory only (no durable sidecar): the public
+  `message_end` event retains allowlisted diagnostics per `toolCallId` (diagnostic
+  type, bounded error name/code/message, `phase`, configured/recorded transport,
+  `eventsEmitted`, `requestBytes`, provider/model/api), with credential tokens,
+  URLs, and private paths redacted and every field length-bounded. Raw provider
+  payloads, headers, and stack traces are never retained. The displayed and
+  copied host error summary passes through the same redaction/bounding contract
+  before it is shown, so the card never carries the raw provider text. Records
+  are rebuilt from the session's active branch
+  on `session_start` (new/resume/fork) and `session_tree` (branch navigation,
+  which does not fire `session_start`) and cleared on `session_shutdown`.
+- "Not dispatched" is asserted only when the correlated errored assistant tool call
+  is retained AND the host render context explicitly reports
+  `executionStarted === false`. Anything else renders an honest unknown status —
+  never a fabricated execution result. A real dispatch (`tool_execution_start`)
+  deletes the record, and an actual toolResult in the session supersedes the stale
+  errored assistant message, so real execution always wins over stream-failure
+  uncertainty.
+- An aborted stream is reported as a cancellation, never a provider failure. A
+  recorded fallback transport is described as recorded only — never as a completed
+  switch, a performed retry, or a transient/retryable classification. Actual tool
+  errors after a real dispatch keep the existing error rendering unchanged.
+- The model receives one concise sanitized note per unresolved failed attempt
+  through the public `context` event
+  (`transformContext`) when the failure details would otherwise be invisible to the
+  provider payload (the host removes the failed assistant message from agent state
+  on auto-retry). The note is a plain user-role message — no tool-result message is
+  ever fabricated — it marks quoted diagnostics as untrusted data, states the
+  evidenced execution status (not dispatched, or unknown when evidence is missing),
+  and changes no retry/transport behavior. At most one note is appended per request
+  (never accumulated); an actual toolResult in the built context supersedes the
+  uncertain record entirely; a note is re-injected on later context builds only
+  until the successful response that followed its delivery consumes it
+  (`message_end` fires for every assistant message before `agent_end`), and a
+  request that consumed nothing from re-arms it; pending notes are never consumed
+  by an unrelated or earlier-turn success. Records excluded by the note's attempt
+  and character bounds stay pending and are described by a later build, or
+  described minimally when even one full section exceeds the note's character
+  bound (with every unresolved call still either described or counted by the
+  note's omission marker). The note
+  is contextual only — it is never persisted, never claimed durable, and never
+  injected for restored history.
+- Limitations: only providers whose pi-ai adapters emit assistant-message
+  diagnostics (for example the Codex websocket transport's
+  `provider_transport_failure`) produce transport detail; other failures report the
+  host error text with an explicit "cause not retained" disclosure. Model-visible
+  notes cover only failures captured live in the current session — restored history
+  and compacted-away attempts are not re-noted.
+
 ## Third-party code
 
 - The background-shell implementation and its tests are modified from Little Coder by

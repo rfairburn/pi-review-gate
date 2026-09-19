@@ -36,6 +36,7 @@ import {
 import { registerReviewSettings } from "./settings/command";
 import { scopedModelChoices } from "./settings/models";
 import { persistSubtasksViewPreference, replaceConfig } from "./settings/persistence";
+import { registerStreamFailureReporting } from "./stream-failure-report";
 import { ExecutionToolManager } from "./execution/tool";
 import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
@@ -119,7 +120,13 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   if (executorRole) {
     if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
     const deferredTools = new DeferredToolManager(pi);
-    if (!deferredTools.register()) return;
+    if (!deferredTools.register()) {
+      // #84 diagnostics stay available even on this reduced executor host:
+      // register the bridge after the background shell's own lifecycle hooks
+      // so its shutdown reset can never be dispatched ahead of the reaper.
+      registerStreamFailureReporting(pi);
+      return;
+    }
     const serializedToolCatalog = process.env[EXECUTOR_TOOL_CATALOG_ENV];
     const executorToolCatalog = executorBootstrapToolCatalog(serializedToolCatalog);
     registerHook(pi, "session_start", (...args) => {
@@ -178,6 +185,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       });
       await receiptPublication;
     });
+    // #84: bounded in-memory capture of errored assistant (model stream)
+    // failures, correlated per toolCallId so failed tool cards report honestly
+    // and the model receives a concise sanitized note when the failure details
+    // leave its active context. No durable sidecar exists; the store rebuilds
+    // from session entries on session_start/session_tree and never changes
+    // retry/transport behavior. Registered after every critical executor
+    // lifecycle hook so its session_shutdown reset can never be dispatched
+    // ahead of settlement retirement or the background shell's own reaper.
+    registerStreamFailureReporting(pi);
     return;
   }
 
@@ -478,6 +494,18 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     await persistSessionState();
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
   });
+
+  // #84: the same diagnostic bridge, registered after the critical review
+  // lifecycle hooks. Its synchronous session_shutdown reset must never be
+  // dispatched before the review shutdown handler: review cleanup starts by
+  // reading the still-live context (status cleanup and abort) synchronously,
+  // and once the diagnostic reset's microtask boundary has passed, the
+  // context can already be stale (host /new replacement). Registration order
+  // is the dispatch order the host uses, so placing this registration after
+  // session_shutdown/session_start guarantees review cleanup always runs
+  // first, while the bridge's message_end capture, session_start rebuild,
+  // and session_tree rebuild still see every event Pi emits.
+  registerStreamFailureReporting(pi);
 
   registerHook(pi, "input", async (...args) => {
     currentCwd = extractCwd(args, currentCwd);

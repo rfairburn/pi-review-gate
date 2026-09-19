@@ -2593,6 +2593,64 @@ review: { activeReviewers: [
   }
 });
 
+test("session_shutdown runs review cleanup before the #84 diagnostic reset", async () => {
+  // Regression for the #84 integration ordering: the stream-failure
+  // diagnostic bridge (message_end/context/tool_execution_start/agent_end/
+  // session_start/session_tree/session_shutdown) must be registered after the
+  // critical review lifecycle hooks, so the review session_shutdown handler
+  // is dispatched first. The behavioral /new test above already proves the
+  // observable contract; this test pins the registration-order invariant on
+  // both the review machinery and the newly expected reporting hooks.
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-shutdown-order-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify(indexTestConfig), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const registrationSequence = new Map<(...args: unknown[]) => unknown, number>();
+    let registrationCounter = 0;
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        registrationSequence.set(handler, registrationCounter);
+        registrationCounter += 1;
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      notify() {},
+    };
+    await activate(pi);
+
+    // The #84 reporting hooks must be registered by real activation.
+    for (const name of ["message_end", "context", "tool_execution_start", "agent_end", "session_start", "session_tree", "session_shutdown"]) {
+      assert.ok((hooks.get(name) ?? []).length > 0, `stream-failure reporting must register ${name}`);
+    }
+    const sequence = (handler: (...args: unknown[]) => unknown): number => {
+      const value = registrationSequence.get(handler);
+      assert.ok(value !== undefined, "handler must have been registered through pi.on");
+      return value;
+    };
+    const shutdownHandlers = hooks.get("session_shutdown")!;
+    const sessionStartHandlers = hooks.get("session_start")!;
+    // Pin the exact counts for this minimal host (no web tools, no background
+    // shell): review shutdown + diagnostic reset, review session_start +
+    // diagnostic rebuild. An earlier registration must fail loudly here
+    // instead of silently shifting the positional references below.
+    assert.equal(shutdownHandlers.length, 2, "review shutdown + diagnostic reset");
+    assert.equal(sessionStartHandlers.length, 2, "review session_start + diagnostic rebuild");
+    const reviewShutdown = sequence(shutdownHandlers[0]!);
+    const diagnosticShutdown = sequence(shutdownHandlers[shutdownHandlers.length - 1]!);
+    const mainSessionStart = sequence(sessionStartHandlers[0]!);
+    const diagnosticSessionStart = sequence(sessionStartHandlers[sessionStartHandlers.length - 1]!);
+    assert.ok(reviewShutdown < mainSessionStart, "review shutdown must be registered before the main session_start lifecycle hook");
+    assert.ok(mainSessionStart < diagnosticShutdown, "diagnostic bridge must register after the critical lifecycle hooks");
+    assert.ok(reviewShutdown < diagnosticShutdown, "review cleanup must be dispatched before the diagnostic shutdown reset");
+    assert.ok(diagnosticSessionStart < diagnosticShutdown, "diagnostic bridge registers its own hooks before its shutdown reset");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("escape terminal input aborts an active reviewer process", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-escape-review-"));
 

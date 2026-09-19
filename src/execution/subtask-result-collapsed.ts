@@ -26,6 +26,13 @@
  */
 import { isActiveTaskState, type BackgroundTaskState } from "./task-state";
 import { redactSensitiveText } from "../redaction";
+import {
+  streamFailureCollapsedLines,
+  streamFailureHeadline,
+  streamFailureReportFor,
+  type StreamFailureLine,
+  type StreamFailureReport,
+} from "../stream-failure-report";
 
 /** Theme contract shared with the family's expanded renderer. Structurally
  * identical to #57's `ToolResultTheme`. */
@@ -34,9 +41,14 @@ export interface SubtaskCollapsedRendererTheme {
   fg(color: string, text: string): string;
 }
 
-/** Native renderResult context subset: the actual recorded tool-call args. */
+/** Native renderResult context subset: the actual recorded tool-call args,
+ *  plus the #84 host render state (`isError`, `executionStarted`,
+ *  `toolCallId`) used to report model-stream failures honestly. */
 export interface SubtaskCollapsedRendererContext {
   readonly args?: unknown;
+  readonly isError?: unknown;
+  readonly executionStarted?: unknown;
+  readonly toolCallId?: unknown;
   readonly [key: string]: unknown;
 }
 
@@ -95,12 +107,23 @@ interface CardLine {
 export const renderSubtaskResultCollapsed: SubtaskCollapsedResultRenderer = (value, options, theme, context) => {
   const record = isRecord(value) ? value : undefined;
   const details = record && isRecord(record.details) ? record.details : undefined;
-  const isError = record?.isError === true;
+  // #84: the host strips `isError` from the renderer's result object and
+  // reports it as render context instead; the recorded flag is kept as a
+  // legacy fallback for pre-context hosts and restored records.
+  const isError = record?.isError === true || contextIsError(context);
   const summary = summaryText(record);
   const args = argsOf(context);
 
   if (isRecord(options) && options.isPartial === true) {
     return cardComponent([{ text: `${operationLabel(details)} …`, color: "warning" }], theme);
+  }
+
+  // #84: a model-stream failure that aborted this call before dispatch.
+  // Returns undefined for actual tool errors (host executionStarted) and real
+  // envelopes, which fall through to the established error rendering below.
+  const streamFailure = streamFailureReportFor(record, context);
+  if (streamFailure) {
+    return cardComponent(streamFailureCardLines(streamFailure), theme);
   }
 
   const action = details && typeof details.action === "string" ? details.action : undefined;
@@ -634,6 +657,25 @@ function matchingCommand(details: Record<string, any>, args: Record<string, any>
 
 function argsOf(context: unknown): Record<string, any> | undefined {
   return isRecord(context) && isRecord(context.args) ? context.args : undefined;
+}
+
+/** #84: the host render context reports error state; a missing context (older
+ *  hosts, tests) is never an error. */
+function contextIsError(context: unknown): boolean {
+  return isRecord(context) && context.isError === true;
+}
+
+/** #84 collapsed card lines for a model-stream failure: the shared bounded
+ *  reporting lines styled into the family card shape. No execution result is
+ *  fabricated; the shared module decides between the evidenced not-dispatched
+ *  card and the honest unknown-status card. */
+function streamFailureCardLines(report: StreamFailureReport): CardLine[] {
+  const toolName = report.toolName ?? "Subtasks tool";
+  const lines: CardLine[] = headerLines(toolName, streamFailureHeadline(report));
+  for (const line of streamFailureCollapsedLines(report) as StreamFailureLine[]) {
+    lines.push(...bodyLines([line.text], line.tone === "detail" ? "dim" : line.tone === "note" ? "dim" : "error", 2));
+  }
+  return lines;
 }
 
 function summaryText(record: Record<string, any> | undefined): string {

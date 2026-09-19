@@ -60,6 +60,13 @@
  * can exceed the terminal width.
  */
 import { truncateText } from "./jobs";
+import {
+  streamFailureCollapsedLines,
+  streamFailureDetailLines,
+  streamFailureHeadline,
+  streamFailureReportFor,
+  type StreamFailureLine,
+} from "../stream-failure-report";
 
 /** Names of the tools whose results this module renders. */
 export type ShellToolName = "ShellStart" | "ShellList" | "ShellLog" | "ShellSend" | "ShellStop";
@@ -151,8 +158,39 @@ function contentText(result: unknown): string {
   return isRecord(first) && typeof first.text === "string" ? first.text : "";
 }
 
-function isErrorResult(result: unknown): boolean {
-  return isRecord(result) && result.isError === true;
+function isErrorResult(result: unknown, context?: unknown): boolean {
+  // #84: the host strips `isError` from the renderer's result object and
+  // reports it as render context instead; the recorded flag stays as a legacy
+  // fallback for pre-context hosts and restored records.
+  return (isRecord(result) && result.isError === true)
+    || (isRecord(context) && context.isError === true);
+}
+
+
+/** #84 collapsed/expanded card for a model-stream failure that reached this
+ *  pending tool card before dispatch. The shared reporting module decides
+ *  between the evidenced not-dispatched card and the honest unknown-status
+ *  card; this view only styles and width-wraps the shared lines. Returns
+ *  undefined whenever the render context does not describe a stream failure,
+ *  leaving every existing view untouched. */
+function streamFailureView(
+  tool: ShellToolName,
+  result: unknown,
+  theme: ShellResultViewTheme,
+  context: unknown,
+  expanded: boolean,
+): ShellResultComponent | undefined {
+  const report = streamFailureReportFor(result, context);
+  if (!report) return undefined;
+  return viewComponent((width) => {
+    const lines = [...wrap(theme.fg("error", `${tool} · ${streamFailureHeadline(report)}`), width)];
+    const shared = expanded ? streamFailureDetailLines(report) : streamFailureCollapsedLines(report);
+    for (const spec of shared as StreamFailureLine[]) {
+      const color = spec.tone === "detail" ? "dim" : spec.tone === "note" ? "muted" : "error";
+      lines.push(...wrap(theme.fg(color, `  ${spec.text}`), width));
+    }
+    return lines;
+  });
 }
 
 /** Structured metadata on a Shell* result, when present and correctly tagged. */
@@ -658,10 +696,15 @@ export function shellStartCollapsedView(
   const details = shellDetails(result, "ShellStart");
   const expanded = isRecord(options) && options.expanded === true;
   if (!details) {
+    // #84: a model-stream failure that aborted this call before dispatch
+    // (the host synthetic result carries no details). Returns undefined
+    // whenever the context does not describe a stream failure.
+    const failure = streamFailureView("ShellStart", result, theme, context, expanded);
+    if (failure) return failure;
     return expanded ? legacyExpandedView("ShellStart", result, theme) : legacyPreviewView("ShellStart", result, theme);
   }
   if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
-  if (isErrorResult(result)) return errorView("ShellStart", result, theme);
+  if (isErrorResult(result, context)) return errorView("ShellStart", result, theme);
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const label = dString(details, "label", 80) ?? id;
@@ -714,8 +757,14 @@ export function renderShellStartResult(
   const details = shellDetails(result, "ShellStart");
   // Failed and legacy records keep the complete recorded call input visible,
   // labeled as submitted — a failed start never claims execution.
-  if (!details) return legacyExpandedView("ShellStart", result, theme, submittedCommand(undefined, context));
-  if (isErrorResult(result)) return errorView("ShellStart", result, theme, submittedCommand(details, context));
+  if (!details) {
+    // #84: model-stream failure detail view (expanded arm; the shared
+    // wrapper also re-enters here for its degraded fallback path).
+    const failure = streamFailureView("ShellStart", result, theme, context, true);
+    if (failure) return failure;
+    return legacyExpandedView("ShellStart", result, theme, submittedCommand(undefined, context));
+  }
+  if (isErrorResult(result, context)) return errorView("ShellStart", result, theme, submittedCommand(details, context));
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const label = dString(details, "label", 80) ?? id;
@@ -760,16 +809,21 @@ export function shellListCollapsedView(
   result: unknown,
   options: unknown,
   theme: ShellResultViewTheme,
-  _context?: unknown,
+  context?: unknown,
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellList", theme);
   const details = shellDetails(result, "ShellList");
   const expanded = isRecord(options) && options.expanded === true;
   if (!details) {
+    // #84: a model-stream failure that aborted this call before dispatch
+    // (the host synthetic result carries no details). Returns undefined
+    // whenever the context does not describe a stream failure.
+    const failure = streamFailureView("ShellList", result, theme, context, expanded);
+    if (failure) return failure;
     return expanded ? legacyExpandedView("ShellList", result, theme) : legacyPreviewView("ShellList", result, theme);
   }
   if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
-  if (isErrorResult(result)) return errorView("ShellList", result, theme);
+  if (isErrorResult(result, context)) return errorView("ShellList", result, theme);
   return viewComponent((width) => {
     const jobs = Array.isArray(details.jobs) ? details.jobs.filter(isRecord) : [];
     const lines = [
@@ -802,12 +856,18 @@ export function renderShellListResult(
   result: unknown,
   options: unknown,
   theme: ShellResultViewTheme,
-  _context?: unknown,
+  context?: unknown,
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellList", theme);
   const details = shellDetails(result, "ShellList");
-  if (!details) return legacyExpandedView("ShellList", result, theme);
-  if (isErrorResult(result)) return errorView("ShellList", result, theme);
+  if (!details) {
+    // #84: model-stream failure detail view (expanded arm; the shared
+    // wrapper also re-enters here for its degraded fallback path).
+    const failure = streamFailureView("ShellList", result, theme, context, true);
+    if (failure) return failure;
+    return legacyExpandedView("ShellList", result, theme);
+  }
+  if (isErrorResult(result, context)) return errorView("ShellList", result, theme);
   return viewComponent((width) => {
     const jobs = Array.isArray(details.jobs) ? details.jobs.filter(isRecord) : [];
     const lines = [
@@ -922,16 +982,21 @@ export function shellLogCollapsedView(
   result: unknown,
   options: unknown,
   theme: ShellResultViewTheme,
-  _context?: unknown,
+  context?: unknown,
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellLog", theme);
   const details = shellDetails(result, "ShellLog");
   const expanded = isRecord(options) && options.expanded === true;
   if (!details) {
+    // #84: a model-stream failure that aborted this call before dispatch
+    // (the host synthetic result carries no details). Returns undefined
+    // whenever the context does not describe a stream failure.
+    const failure = streamFailureView("ShellLog", result, theme, context, expanded);
+    if (failure) return failure;
     return expanded ? legacyExpandedView("ShellLog", result, theme) : legacyPreviewView("ShellLog", result, theme);
   }
   if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
-  if (isErrorResult(result)) return errorView("ShellLog", result, theme);
+  if (isErrorResult(result, context)) return errorView("ShellLog", result, theme);
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const label = dString(details, "label", 80) ?? id;
@@ -972,12 +1037,18 @@ export function renderShellLogResult(
   result: unknown,
   options: unknown,
   theme: ShellResultViewTheme,
-  _context?: unknown,
+  context?: unknown,
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellLog", theme);
   const details = shellDetails(result, "ShellLog");
-  if (!details) return legacyExpandedView("ShellLog", result, theme);
-  if (isErrorResult(result)) return errorView("ShellLog", result, theme);
+  if (!details) {
+    // #84: model-stream failure detail view (expanded arm; the shared
+    // wrapper also re-enters here for its degraded fallback path).
+    const failure = streamFailureView("ShellLog", result, theme, context, true);
+    if (failure) return failure;
+    return legacyExpandedView("ShellLog", result, theme);
+  }
+  if (isErrorResult(result, context)) return errorView("ShellLog", result, theme);
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const label = dString(details, "label", 80) ?? id;
@@ -1054,10 +1125,15 @@ export function shellSendCollapsedView(
   const details = shellDetails(result, "ShellSend");
   const expanded = isRecord(options) && options.expanded === true;
   if (!details) {
+    // #84: a model-stream failure that aborted this call before dispatch
+    // (the host synthetic result carries no details). Returns undefined
+    // whenever the context does not describe a stream failure.
+    const failure = streamFailureView("ShellSend", result, theme, context, expanded);
+    if (failure) return failure;
     return expanded ? legacyExpandedView("ShellSend", result, theme) : legacyPreviewView("ShellSend", result, theme);
   }
   if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
-  if (isErrorResult(result)) return errorView("ShellSend", result, theme);
+  if (isErrorResult(result, context)) return errorView("ShellSend", result, theme);
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const bytes = dNumber(details, "bytes");
@@ -1092,8 +1168,14 @@ export function renderShellSendResult(
   // Failed and legacy records keep the complete recorded call input visible,
   // labeled as submitted — a failed or unacknowledged write never claims
   // pipe acceptance or child processing.
-  if (!details) return legacyExpandedView("ShellSend", result, theme, submittedInput(undefined, context));
-  if (isErrorResult(result)) return errorView("ShellSend", result, theme, submittedInput(details, context));
+  if (!details) {
+    // #84: model-stream failure detail view (expanded arm; the shared
+    // wrapper also re-enters here for its degraded fallback path).
+    const failure = streamFailureView("ShellSend", result, theme, context, true);
+    if (failure) return failure;
+    return legacyExpandedView("ShellSend", result, theme, submittedInput(undefined, context));
+  }
+  if (isErrorResult(result, context)) return errorView("ShellSend", result, theme, submittedInput(details, context));
   return viewComponent((width) => {
     const id = dString(details, "id", 64) ?? "?";
     const bytes = dNumber(details, "bytes");
@@ -1129,16 +1211,21 @@ export function shellStopCollapsedView(
   result: unknown,
   options: unknown,
   theme: ShellResultViewTheme,
-  _context?: unknown,
+  context?: unknown,
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellStop", theme);
   const details = shellDetails(result, "ShellStop");
   const expanded = isRecord(options) && options.expanded === true;
   if (!details) {
+    // #84: a model-stream failure that aborted this call before dispatch
+    // (the host synthetic result carries no details). Returns undefined
+    // whenever the context does not describe a stream failure.
+    const failure = streamFailureView("ShellStop", result, theme, context, expanded);
+    if (failure) return failure;
     return expanded ? legacyExpandedView("ShellStop", result, theme) : legacyPreviewView("ShellStop", result, theme);
   }
   if (expanded) return fullContentView(result, theme); // degraded detail-renderer fallback
-  if (isErrorResult(result)) return errorView("ShellStop", result, theme);
+  if (isErrorResult(result, context)) return errorView("ShellStop", result, theme);
   return viewComponent((width) => {
     const target = dString(details, "target", 80) ?? "?";
     const outcome = dString(details, "outcome", 32);
@@ -1180,12 +1267,18 @@ export function renderShellStopResult(
   result: unknown,
   options: unknown,
   theme: ShellResultViewTheme,
-  _context?: unknown,
+  context?: unknown,
 ): ShellResultComponent {
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellStop", theme);
   const details = shellDetails(result, "ShellStop");
-  if (!details) return legacyExpandedView("ShellStop", result, theme);
-  if (isErrorResult(result)) return errorView("ShellStop", result, theme);
+  if (!details) {
+    // #84: model-stream failure detail view (expanded arm; the shared
+    // wrapper also re-enters here for its degraded fallback path).
+    const failure = streamFailureView("ShellStop", result, theme, context, true);
+    if (failure) return failure;
+    return legacyExpandedView("ShellStop", result, theme);
+  }
+  if (isErrorResult(result, context)) return errorView("ShellStop", result, theme);
   return viewComponent((width) => {
     const target = dString(details, "target", 80) ?? "?";
     const outcome = dString(details, "outcome", 32);

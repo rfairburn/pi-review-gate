@@ -157,17 +157,29 @@ test("executor role registers web tools and background shell without orchestrati
     for (const tool of executionToolNames) {
       assert.equal(captured.tools.has(tool), false, `executor child must not register ${tool}`);
     }
-    // Only the background shell's own lifecycle hooks may be present (its
-    // session hooks plus agent_start/agent_settled, which gate nonurgent wake
-    // coalescing); the review machinery (agent_end, before_agent_start,
-    // input, tool_call, tool_result) and command surface must stay out of
-    // executor children.
+    // Only the background shell's own lifecycle hooks (its session hooks plus
+    // agent_start/agent_settled, which gate nonurgent wake coalescing) and the
+    // #84 stream-failure diagnostic hooks (message_end, context,
+    // tool_execution_start, agent_end, session_start, session_tree, and its
+    // own session_shutdown — ShellStart failure diagnostics need these) may be
+    // present. The review machinery (before_agent_start, input, tool_call,
+    // tool_result) and command surface must stay out of executor children.
     assert.deepEqual([...captured.hooks.keys()].sort(), [
+      "agent_end",
       "agent_settled",
       "agent_start",
+      "context",
+      "message_end",
       "session_shutdown",
       "session_start",
+      "session_tree",
+      "tool_execution_start",
     ]);
+    // agent_end is the only name the #84 bridge shares with the orchestrator's
+    // review machinery; pin its count so provenance stays exact (web tools and
+    // the background shell register no agent_end).
+    assert.equal((captured.hooks.get("agent_end") as unknown[] | undefined)?.length, 1,
+      "executor agent_end must be the #84 reporting bridge only");
     assert.deepEqual(captured.commands, [], "executor child must not register review commands");
     assert.ok(!captured.notices.some((notice) => notice.includes("disabled")), "executor child must not report the gate disabled");
   } finally {
@@ -191,6 +203,10 @@ test("executor role defers to the durable initial subset and activates authorize
       execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
     };
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    // Registration-order probe: the full executor path must register the #84
+    // diagnostic bridge last, after the settlement retirement hooks.
+    const registrationSequence = new Map<(...args: unknown[]) => unknown, number>();
+    let registrationCounter = 0;
     const definitions = new Map<string, Tool>([
       ["read", { name: "read", description: "Read files." }],
       ["edit", { name: "edit", description: "Edit files." }],
@@ -198,6 +214,8 @@ test("executor role defers to the durable initial subset and activates authorize
     let active = ["read", "edit"];
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
+        registrationSequence.set(handler, registrationCounter);
+        registrationCounter += 1;
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
       registerTool(tool: Tool) {
@@ -211,6 +229,34 @@ test("executor role defers to the durable initial subset and activates authorize
     };
 
     await activate(pi);
+
+    // Full-executor-path ordering: web tools, the background shell, and the
+    // settlement retirement register their session_shutdown hooks before the
+    // #84 diagnostic bridge registers its reset, so the bridge's synchronous
+    // shutdown can never be dispatched ahead of them. The bridge is also the
+    // last thing the full executor branch registers.
+    {
+      const sequence = (handler: (...args: unknown[]) => unknown): number => {
+        const value = registrationSequence.get(handler);
+        assert.ok(value !== undefined, "handler must have been registered through pi.on");
+        return value;
+      };
+      const shutdownHandlers = hooks.get("session_shutdown")!;
+      assert.equal(shutdownHandlers.length, 4, "web tools + background shell reaper + settlement retirement + diagnostic reset");
+      // The bridge owns session_tree exclusively (only the #84 reporting
+      // registers it) and registers it immediately before its shutdown reset,
+      // so anchor the bridge's identity on that rather than assuming index 3.
+      const sessionTree = (hooks.get("session_tree") ?? []).at(-1);
+      assert.ok(sessionTree, "the #84 bridge must register session_tree");
+      const bridgeShutdown = shutdownHandlers.find((handler) => sequence(handler) === sequence(sessionTree!) + 1);
+      assert.ok(bridgeShutdown, "the bridge's session_shutdown must directly follow its session_tree registration");
+      const settlementShutdown = sequence(shutdownHandlers[2]!);
+      assert.ok(settlementShutdown < sequence(bridgeShutdown!), "diagnostic bridge must register after the settlement retirement shutdown");
+      assert.ok(sequence(shutdownHandlers[1]!) < settlementShutdown, "settlement retirement must register after the background shell reaper");
+      const latestSequence = Math.max(...[...hooks.values()].flat().map(sequence));
+      assert.equal(sequence(bridgeShutdown!), latestSequence, "the diagnostic bridge is the last thing the full executor branch registers");
+    }
+
     const ctx = { cwd: dir, ui: {}, sessionManager: {} };
     for (const hook of hooks.get("session_start") ?? []) await hook({ cwd: dir }, ctx);
     assert.equal(process.env[EXECUTOR_TOOL_CATALOG_ENV], undefined, "bootstrap catalog is removed before worker tools run");

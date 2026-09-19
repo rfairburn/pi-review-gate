@@ -66,6 +66,13 @@
  *   silently.
  */
 import { isActiveTaskState, type BackgroundTaskState } from "./task-state";
+import {
+  streamFailureDetailLines,
+  streamFailureHeadline,
+  streamFailureReportFor,
+  type StreamFailureLine,
+  type StreamFailureReport,
+} from "../stream-failure-report";
 
 /** Theme contract shared with the family's collapsed renderer. Structurally
  * identical to #57's `ToolResultTheme`. */
@@ -75,9 +82,14 @@ export interface SubtaskExpandedRendererTheme {
 }
 
 /** Native renderResult context subset: the actual recorded tool-call
- * arguments (`args`) drive the request-field sections of the expanded views. */
+ * arguments (`args`) drive the request-field sections of the expanded views;
+ * the #84 host render state (`isError`, `executionStarted`, `toolCallId`)
+ * drives the honest model-stream-failure detail view. */
 export interface SubtaskExpandedRendererContext {
   readonly args?: unknown;
+  readonly isError?: unknown;
+  readonly executionStarted?: unknown;
+  readonly toolCallId?: unknown;
   readonly [key: string]: unknown;
 }
 
@@ -249,7 +261,10 @@ function wrapByDisplayCells(value: string, cells: number): string[] {
 export const renderSubtaskResultExpanded: SubtaskExpandedResultRenderer = (value, options, theme, context) => {
   const lines = new LineBuilder();
   const record = isRecord(value) ? value : undefined;
-  const isError = record?.isError === true;
+  // #84: the host strips `isError` from the renderer's result object and
+  // reports it as render context instead; the recorded flag stays as a legacy
+  // fallback for pre-context hosts and restored records.
+  const isError = record?.isError === true || contextIsError(context);
   const summary = summaryText(record);
   const details = record && isRecord(record.details) ? record.details : undefined;
   const args = argsOf(context);
@@ -261,6 +276,14 @@ export const renderSubtaskResultExpanded: SubtaskExpandedResultRenderer = (value
     lines.add(summary, isError ? "error" : "warning");
     lines.add("Expanded detail becomes available once the operation returns.", "muted");
     return expandedComponent(lines.build(), theme);
+  }
+
+  // #84: a model-stream failure that aborted this call before dispatch. The
+  // shared module returns undefined for actual tool errors (host
+  // executionStarted) and real envelopes, which use the established paths.
+  const streamFailure = streamFailureReportFor(record, context);
+  if (streamFailure) {
+    return streamFailureExpandedComponent(streamFailure, theme);
   }
 
   if (!details) {
@@ -310,6 +333,29 @@ export const renderSubtaskResultExpanded: SubtaskExpandedResultRenderer = (value
 
 function argsOf(context: unknown): Record<string, any> | undefined {
   return isRecord(context) && isRecord(context.args) ? context.args : undefined;
+}
+
+/** #84: the host render context reports error state; a missing context (older
+ *  hosts, tests) is never an error. */
+function contextIsError(context: unknown): boolean {
+  return isRecord(context) && context.isError === true;
+}
+
+/** #84 expanded detail view for a model-stream failure: every shared bounded
+ *  diagnostic line, styled into the family's expanded view shape. The
+ *  correlation status (evidenced not-dispatched vs. honest unknown) is decided
+ *  entirely by the shared reporting module — nothing is invented here. */
+function streamFailureExpandedComponent(report: StreamFailureReport, theme: SubtaskExpandedRendererTheme) {
+  const expandedLines: ExpandedLine[] = [
+    { text: `${report.toolName ?? "Subtasks tool"} — ${streamFailureHeadline(report)}`, color: "toolTitle", bold: true },
+  ];
+  for (const line of streamFailureDetailLines(report) as StreamFailureLine[]) {
+    expandedLines.push({
+      text: `  ${line.text}`,
+      color: line.tone === "detail" ? "dim" : line.tone === "note" ? "muted" : "error",
+    });
+  }
+  return expandedComponent(expandedLines, theme);
 }
 
 function summaryText(record: Record<string, any> | undefined): string {

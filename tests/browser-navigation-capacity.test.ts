@@ -58,8 +58,8 @@ for (const control of ["recover", "security", "pending"] as const) test(`real na
     }
     await delay(50);
     let originalFailure: unknown;
+    const page = browser!.contexts()[0]!.pages()[0]!;
     {
-      const page = browser!.contexts()[0]!.pages()[0]!;
       const goto = page.goto.bind(page);
       page.goto = async (...args) => {
         try { return await goto(...args); } catch (error) {
@@ -104,7 +104,10 @@ for (const control of ["recover", "security", "pending"] as const) test(`real na
     assert.ok((await manager.network(opened.session, opened.tab)).brokerCapacityRefusals > 0);
     await assert.rejects(manager.inspect(opened.session, opened.tab, ref), /stale|snapshot|ref/i);
     for (const socket of sockets) socket.destroy();
-    await delay(100);
+    // The refused main-document request leaves Chromium's internal error-page
+    // navigation (chrome-error://chromewebdata/) racing the next goto; settle
+    // that commit deterministically instead of relying on a fixed delay.
+    await page.waitForURL(/^chrome-error:\/\//, { timeout: 5000 });
     const recovered = await manager.navigate(opened.session, opened.tab, "http://recovered.test/third");
     assert.equal(recovered.title, "Capacity fixture");
   } finally {

@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.58]
+
+### Fixed
+
+- Stabilize the browser-capacity recovery test by waiting for Chromium's internal
+  error-page navigation to settle before attempting recovery, instead of relying
+  on a fixed delay. Production behavior and recovery/safety assertions are unchanged.
+- Ship the retained settings-menu selection changes recorded under b57; that
+  candidate was not published because its main-branch full suite failed.
+
 ## [0.1.0-dev.57]
 
 ### Fixed

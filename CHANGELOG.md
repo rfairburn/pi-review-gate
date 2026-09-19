@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.59]
+
+### Fixed
+
+- Verify live browser download retention independently of click results' bounded
+  observation window, including a deliberately delayed download. Tests still
+  require actual default-off cancellation, approved exact-byte saving, and
+  retained-handle consistency; production behavior is unchanged.
+- Ship the retained settings-menu selection changes and capacity-recovery test
+  correction recorded under b57 and b58. Neither candidate was published because
+  its main-branch full suite failed.
+
 ## [0.1.0-dev.58]
 
 ### Fixed

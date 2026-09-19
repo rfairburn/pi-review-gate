@@ -165,10 +165,19 @@ and semantic:
   page's main JavaScript world; timeout or cancellation tears down the owning session
   before browser action serialization is released.
 - `BrowserScreenshot` is the visual fallback after semantic inspection. It returns a
-  PNG as native Pi image tool-result content for either the current 1280×720 viewport
-  or one visible element named by a ref from the latest successful `BrowserSnapshot`.
-  Element capture positions the ref, validates that it fits the viewport, and passes
-  those exact bounds as an immutable page clip; later layout or animation changes
+  PNG as native Pi image tool-result content for the current viewport or one visible
+  element named by a ref from the latest successful `BrowserSnapshot`. Optional
+  `viewportWidth`/`viewportHeight` (default 1280×720) temporarily apply the requested
+  viewport dimensions for a viewport-mode capture — responsive elements really render
+  at that size — and the prior viewport is restored afterwards, including on capture
+  failure and cancellation. A successful viewport capture (and only that) records those
+  dimensions as this tab's memory-only coordinate reference for `BrowserClick` x/y
+  targeting; element captures never replace it and failed captures never overwrite a
+  valid one. The reference records that capture's dimensions (with its generation and
+  origin as provenance) and stays usable across later interactions and navigation on
+  the same tab: it supplies viewport dimensions only, never an attestation that the
+  page still matches the capture. Element capture positions the ref, validates that it fits the viewport, and
+  passes those exact bounds as an immutable page clip; later layout or animation changes
   cannot enlarge the capture. It never returns a file path or textual base64. Full-page screenshots are not
   supported because an arbitrarily tall page cannot meet the allocation guarantee
   without unbounded capture or tiling.
@@ -210,11 +219,31 @@ and semantic:
   accepts no action options, and invalidates that tab's refs after a successful dispatch
   because hover-driven page changes can make prior evidence stale.
 - `BrowserClick` clicks exactly one current opaque semantic ref. It accepts an optional
-  `button` parameter limited to `left` (default) or `right`; no other button, modifier,
-  double-click, or coordinate form is exposed. A centralized policy
+  `button` parameter limited to `left` (default) or `right`. Refs are the primary
+  targeting form; when a visual target has no accessible ref (for example a canvas or
+  WebGL board), the caller may instead pass screenshot coordinates `x`/`y` in viewport
+  image (CSS) pixels (issue #141). Coordinates are accepted only together, never
+  together with a ref, and only against this exact tab's last successful viewport-mode
+  `BrowserScreenshot`: the recorded dimensions are temporarily re-applied before
+  classification, the click is dispatched as a real browser mouse event at that point,
+  and the prior viewport is restored afterwards (including on failure or cancellation).
+  There is no clamping, no auto-recapture, no crop-offset form, no coordinate
+  expiry policy, and no required retake after interactions or navigation: the
+  reference is this tab's last successful viewport capture and remains usable
+  across later interactions and navigation, because it supplies only the recorded
+  viewport dimensions — not an attestation that the page still matches the capture.
+  Every coordinate click revalidates the live document generation, origin, viewport,
+  and hit-tested target before dispatch exactly as described below. A missing
+  reference rejects only the coordinate click with an explicit request for a viewport
+  screenshot of that tab. Ref clicks are unchanged and never require a screenshot. A centralized policy
   inspects a freshly resolved target's structural properties and fingerprint; accessible
-  names, page claims, and model assertions never establish safety. Structurally proven
-  ordinary HTTP(S) links may proceed without a
+  names, page claims, and model assertions never establish safety. For coordinate clicks
+  the exact point is hit-tested in Playwright's isolated engine (never main-world
+  evaluation), descending open shadow trees so the hard gates apply to the element that
+  receives the click rather than its shadow host; embedded frames and unavailable structure fail closed, password and
+  file controls are hard-denied exactly as for ref clicks, and the coordinate target is
+  always consequential (unknown or mixed), so it never uses a silent shortcut. Structurally proven
+  ordinary HTTP(S) ref links may proceed without a
   prompt. Controlled links must target the current top-level browsing context;
   child-frame links and non-self base targets are rejected before navigation rather
   than silently redirected into the top page. Silent links preserve fragments and resolve
@@ -240,10 +269,11 @@ and semantic:
   **Ask**, a top-level interactive Pi session must approve one exact, short-lived click
   through Pi's confirmation UI. The permit is bound to the session,
   tab, document generation, origin and destination, operation, mouse button, target
-  fingerprint, and consequence; it is single-use, expires absolutely, and is consumed only after the
+  fingerprint, and consequence (coordinate clicks additionally bind the exact point and
+  the recorded viewport dimensions); it is single-use, expires absolutely, and is consumed only after the
   target is re-resolved and all fields still match, including with automatic approval.
   A permit issued for a left-click cannot be consumed for a right-click or vice versa.
-  Denial, cancellation, timeout, changed structure/origin, or stale refs prevents
+  Denial, cancellation, timeout, changed structure/origin/viewport, or stale refs prevents
   dispatch. Absent UI also rejects in **Ask**; authorized non-UI executor sessions may
   use **Automatically Accept** but never claim human confirmation.
 - `BrowserFill` replaces a supported text control's bounded value (including
@@ -358,8 +388,12 @@ model file transfer exists only as `BrowserUpload` and `BrowserDownloadSave`, an
 model clipboard access exists only as `BrowserClipboard`
 (see [Browser permissions](#browser-permissions-issue-27)); there is no
 filesystem-path input, caller-provided selector,
-XPath, coordinate action, caller-supplied JavaScript/evaluate, forced action,
-arbitrary action option, CDP, or permission API. Interactions
+XPath, caller-supplied JavaScript/evaluate, forced action,
+arbitrary action option, CDP, or permission API. The only coordinate form is the
+issue #141 BrowserClick screenshot-coordinate fallback: viewport-image pixels from this
+tab's last successful viewport-mode `BrowserScreenshot`, dispatched as one real mouse
+event through the same approval/permit/hard-gate machinery as ref clicks, with no
+crop-offset, drag, gesture, or raw-event input. Interactions
 resolve only extension-issued semantic refs internally. Navigation, popup, dialog, and download
 observers are armed before dispatch. Popup tabs stay in the same ownership/broker bound
 and are never auto-switched; overflow popups are closed, except that the model popup

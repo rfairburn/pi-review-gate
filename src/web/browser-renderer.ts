@@ -515,7 +515,10 @@ function collapsedResponse(view: BrowserView, response: RecordValue, result: Bro
       return [browserHeader("BrowserHover", `${target} · ${stringOrUnknown(response.effect)}`)];
     }
     case "click": {
-      const target = formatRequestedOrFallback(args, "ref", response.ref);
+      const coordinate = isRecord(response.coordinate) ? response.coordinate : undefined;
+      const target = coordinate
+        ? `${numberOrUnknown(coordinate.x)}, ${numberOrUnknown(coordinate.y)}`
+        : formatRequestedOrFallback(args, "ref", response.ref);
       const button = formatRequestedOrFallback(args, "button", response.button);
       return [browserHeader("BrowserClick", `${target} · ${button} · ${stringOrUnknown(response.effect)}`)];
     }
@@ -886,7 +889,13 @@ function renderInteraction(
     targetLine,
   ];
 
-  if (operation === "click") lines.push({ text: `Button: ${formatRequestedOrFallback(args, "button", response.button)}` });
+  if (operation === "click") {
+    lines.push({ text: `Button: ${formatRequestedOrFallback(args, "button", response.button)}` });
+    const coordinate = isRecord(response.coordinate) ? response.coordinate : undefined;
+    if (coordinate) {
+      lines.push({ text: `Coordinates: ${numberOrUnknown(coordinate.x)}, ${numberOrUnknown(coordinate.y)} (viewport image CSS pixels from this tab's last successful viewport screenshot).` });
+    }
+  }
   if (operation === "hover") lines.push({ text: "Operation: hover" });
   if (operation === "fill") {
     lines.push({ text: "Operation: replace field value" });

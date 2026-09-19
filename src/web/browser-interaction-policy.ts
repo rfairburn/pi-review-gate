@@ -239,6 +239,15 @@ export interface BrowserConfirmationBinding {
   destinationExisted?: boolean | null;
   /** Opaque pending-download handle bound to a download-save approval. */
   downloadHandle?: string | null;
+  /**
+   * Issue #141 coordinate-click targeting. `point` is the viewport-image
+   * (CSS pixel) position from the tab's last successful viewport-mode
+   * screenshot, and `viewport` records the exact viewport dimensions the
+   * capture was taken at; the click is temporarily re-applied to those
+   * dimensions before dispatch. Both are absent for ref clicks.
+   */
+  point?: { x: number; y: number } | null;
+  viewport?: { width: number; height: number } | null;
 }
 
 export interface BrowserConfirmationPermit {
@@ -300,6 +309,8 @@ function bindingDigest(binding: BrowserConfirmationBinding, expiresAt: number): 
     // Issue #27 file-transfer facts. Absent for pre-existing operations.
     binding.sourceFiles ?? null, binding.destinationPath ?? null,
     binding.destinationExisted ?? null, binding.downloadHandle ?? null,
+    // Issue #141 coordinate-click facts. Absent for ref clicks.
+    binding.point ?? null, binding.viewport ?? null,
     expiresAt,
   ])).digest();
 }

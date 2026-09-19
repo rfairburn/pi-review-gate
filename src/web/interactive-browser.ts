@@ -52,6 +52,7 @@ import {
   type BrowserClickButton,
   type BrowserConfirmationBinding,
   type BrowserConsequence,
+  type BrowserConsequenceDecision,
   type BrowserFormOperation,
   type BrowserTargetStructure,
 } from "./browser-interaction-policy";
@@ -252,6 +253,20 @@ export interface BrowserSnapshotResult {
 
 export type BrowserScreenshotMode = "viewport" | "element";
 
+/**
+ * Issue #141: per-tab memory-only reference from the last successful viewport-mode
+ * capture (element captures and failed captures never replace it). It supplies the
+ * recorded viewport dimensions for coordinate clicks only; generation and origin are
+ * provenance of the capture, never a currentness attestation — the page may change
+ * after capture and every coordinate click revalidates the live document itself.
+ */
+export interface ViewportScreenshotReference {
+  generation: string;
+  origin: string;
+  width: number;
+  height: number;
+}
+
 export interface BrowserScreenshotMetadata {
   session: string;
   tab: string;
@@ -449,6 +464,8 @@ export interface BrowserInteractionResult {
   operation: "hover" | "click" | BrowserFormOperation | "upload" | "download_save";
   /** Selected mouse button; present only for click operations, including controlled navigation. */
   button?: BrowserClickButton;
+  /** Coordinate clicks (issue #141): the dispatched viewport-image point. Absent for ref clicks. */
+  coordinate?: { x: number; y: number };
   consequence: BrowserConsequence | "observational";
   /** True only for interactive human confirmation, never automatic approval. */
   confirmed: boolean;
@@ -749,6 +766,19 @@ interface BrowserTab {
   networkDiagnostics: DiagnosticRing<BrowserNetworkEvent>;
   networkStartedAt: WeakMap<Request, number>;
   networkPolicy: WeakMap<Request, string>;
+  /**
+   * Issue #141 coordinate-click reference, established only by the last
+   * successful viewport-mode BrowserScreenshot of this exact tab (element-mode
+   * captures never replace it and failed captures never overwrite a valid
+   * one; a new tab starts without one). Memory-only: it dies with the process
+   * like every other browser state, and there is no expiry, age, or retake
+   * policy — later interactions and navigation on the same tab leave the
+   * reference in place, because it contributes only the recorded viewport
+   * dimensions. It never attests that the page still matches the capture:
+   * each coordinate click revalidates the live document generation, origin,
+   * viewport, and hit-tested target exactly like ref clicks do.
+   */
+  viewportScreenshot?: ViewportScreenshotReference;
 }
 
 interface InteractionCapture {
@@ -1756,22 +1786,42 @@ export class InteractiveBrowserManager {
     mode: BrowserScreenshotMode,
     ref: string | undefined,
     signal?: AbortSignal,
+    options?: { viewport?: { width: number; height: number } },
   ): Promise<BrowserScreenshotResult> {
     this.noteToolActivity(sessionHandle);
     if (mode !== "viewport" && mode !== "element") {
       throw new Error("BrowserScreenshot mode must be viewport or element.");
     }
+    if (mode === "element" && options?.viewport) {
+      throw new BrowserValidationError("BrowserScreenshot viewport dimensions apply only to viewport mode.");
+    }
     const { session, tab } = this.requireTab(sessionHandle, tabHandle);
     return this.operate(session, signal, async (operationSignal) => {
       const operation = new OperationDeadline("BrowserScreenshot", this.limits.actionMs, operationSignal);
+      let resized = false;
+      let restored = false;
+      let priorViewport: { width: number; height: number } | null | undefined;
       try {
         const capturedGeneration = tab.generation;
         let image: Buffer;
+        let requestedViewport: { width: number; height: number } | undefined;
         if (mode === "viewport") {
           if (ref !== undefined) throw new BrowserValidationError("BrowserScreenshot viewport mode does not accept ref.");
-          const viewport = tab.page.viewportSize();
-          if (!viewport) throw new Error("BrowserScreenshot could not determine the bounded browser viewport.");
-          assertScreenshotDimensions(viewport.width, viewport.height, this.limits, "viewport");
+          requestedViewport = options?.viewport ?? { width: DEFAULT_VIEWPORT_WIDTH, height: DEFAULT_VIEWPORT_HEIGHT };
+          assertViewportScreenshotDimensions(requestedViewport, this.limits);
+          priorViewport = tab.page.viewportSize();
+          if (!priorViewport) throw new Error("BrowserScreenshot could not determine the bounded browser viewport.");
+          if (priorViewport.width !== requestedViewport.width || priorViewport.height !== requestedViewport.height) {
+            // Issue #141: the requested dimensions are applied only for this
+            // capture. Responsive elements really render at this size, and
+            // the prior viewport is restored in every path below, including
+            // validation failures and cancellation.
+            await operation.run(
+              tab.page.setViewportSize({ width: requestedViewport.width, height: requestedViewport.height }),
+              "viewport resize for capture",
+            );
+            resized = true;
+          }
           image = await operation.run(tab.page.screenshot({
             type: "png",
             fullPage: false,
@@ -1819,6 +1869,29 @@ export class InteractiveBrowserManager {
         if (tab.generation !== capturedGeneration) {
           throw new BrowserCaptureInvalidatedError("Browser document changed during screenshot capture; screenshot rejected.");
         }
+        if (mode === "viewport" && requestedViewport) {
+          // Establish/replace the coordinate-click reference only after the
+          // capture, validation, and generation recheck all succeeded, and
+          // only after the prior viewport has been truthfully restored. The
+          // restore itself failing rejects the whole capture fail-closed.
+          if (resized) {
+            try {
+              await operation.run(
+                tab.page.setViewportSize({ width: priorViewport!.width, height: priorViewport!.height }),
+                "viewport restore after capture",
+              );
+            } catch {
+              throw new Error("BrowserScreenshot captured the viewport but could not restore the prior viewport; the capture is rejected and the session is contained.");
+            }
+            restored = true;
+          }
+          tab.viewportScreenshot = {
+            generation: capturedGeneration,
+            origin: interactionIdentityUrl(tab.page.url()),
+            width: requestedViewport.width,
+            height: requestedViewport.height,
+          };
+        }
         return {
           image,
           metadata: {
@@ -1843,6 +1916,26 @@ export class InteractiveBrowserManager {
           },
         };
       } finally {
+        // Failure/cancellation path: best-effort restore of the prior viewport.
+        // Cancellation and fatal containment close the page anyway, so a
+        // skipped restore there leaves no live state behind; a live failure
+        // still attempts the restore without claiming any rollback of the
+        // failed operation itself.
+        if (resized && !restored) {
+          try {
+            if (priorViewport && !operation.signal.aborted && !tab.page.isClosed()) {
+              await boundedCleanup(
+                tab.page.setViewportSize({ width: priorViewport.width, height: priorViewport.height }),
+                this.limits.cleanupMs,
+                "viewport restore after failed capture",
+              );
+            }
+          } catch {
+            // Restore failure after an already-failed capture cannot be acted
+            // on without claiming rollback; the operation's own error above
+            // remains authoritative.
+          }
+        }
         operation.dispose();
       }
     }, true);
@@ -1940,14 +2033,29 @@ export class InteractiveBrowserManager {
   async click(
     sessionHandle: string,
     tabHandle: string,
-    ref: string,
+    ref: string | undefined,
     confirmation?: BrowserClickConfirmation,
     signal?: AbortSignal,
-    options?: { button?: BrowserClickButton },
+    options?: { button?: BrowserClickButton; x?: number; y?: number },
   ): Promise<BrowserInteractionResult> {
     try {
       this.noteToolActivity(sessionHandle);
       const button = normalizeBrowserClickButton(options?.button);
+      if (options?.x !== undefined || options?.y !== undefined) {
+        if (ref !== undefined) {
+          throw new BrowserValidationError("not_started: BrowserClick accepts either a current ref or screenshot coordinates, not both.");
+        }
+        const x = options.x;
+        const y = options.y;
+        if ((x === undefined) !== (y === undefined)) {
+          throw new BrowserValidationError("not_started: BrowserClick coordinates require both x and y.");
+        }
+        assertCoordinateClickInput(x!, y!);
+        return await this.clickCoordinates(sessionHandle, tabHandle, x!, y!, this.privateConfirmation(confirmation), signal, button);
+      }
+      if (ref === undefined) {
+        throw new BrowserValidationError("not_started: BrowserClick requires ref, or x and y screenshot coordinates.");
+      }
       return await this.interact(sessionHandle, tabHandle, ref, "click", this.privateConfirmation(confirmation), signal, button);
     } catch (error) {
       throw normalizedInteractionFailure("BrowserClick", error);
@@ -2783,6 +2891,170 @@ export class InteractiveBrowserManager {
         throw new Error(`${failure.message} Session teardown is ${containment}.`);
       } finally {
         if (session.interactionCapture === capture) session.interactionCapture = undefined;
+        operation.dispose();
+      }
+    });
+  }
+
+  /**
+   * Issue #141 coordinate-click path for BrowserClick. The point targets the
+   * exact viewport-image (CSS) pixel of the viewport dimensions recorded by
+   * this tab's last successful viewport-mode screenshot; the page may have
+   * changed since that capture, so nothing about the reference attests the
+   * current document. The recorded dimensions are temporarily re-applied for
+   * the whole classify/approve/dispatch window and restored afterwards, even
+   * on failure or cancellation. A fresh hit-test read in Playwright's utility
+   * world applies the same hard credential/file gates as ref clicks; the
+   * coordinate target itself is always consequential (unknown or mixed), so
+   * it always follows the existing Ask/AutoAccept/Deny approval policy with
+   * the single-use permit binding coordinates, button, viewport, the current
+   * generation and origin, and the target fingerprint.
+   */
+  private async clickCoordinates(
+    sessionHandle: string,
+    tabHandle: string,
+    x: number,
+    y: number,
+    confirmation: BrowserClickConfirmation | undefined,
+    signal: AbortSignal | undefined,
+    button: BrowserClickButton = "left",
+  ): Promise<BrowserInteractionResult> {
+    const name = "BrowserClick";
+    this.noteToolActivity(sessionHandle);
+    assertBoundedInteractionCapability(sessionHandle, BROWSER_INTERACTION_SESSION_MAX_CHARS);
+    assertBoundedInteractionCapability(tabHandle, BROWSER_INTERACTION_TAB_MAX_CHARS);
+    const { session, tab } = this.requireTab(sessionHandle, tabHandle);
+    const reference = this.requireCoordinateReference(tab, x, y);
+    return this.operate(session, signal, async (operationSignal) => {
+      const operation = new OperationDeadline(name, this.limits.confirmationMs, operationSignal);
+      const capturedGeneration = tab.generation;
+      const capturedOrigin = interactionIdentityUrl(tab.page.url());
+      let started = false;
+      let capture: InteractionCapture | undefined;
+      let resized = false;
+      let restored = false;
+      const prior = tab.page.viewportSize();
+      if (!prior) throw new Error("BrowserClick could not determine the bounded browser viewport.");
+      try {
+        if (prior.width !== reference.width || prior.height !== reference.height) {
+          // The recorded dimensions are re-applied before classification so
+          // the approved view is the view that receives the click; they are
+          // restored in every path below, before any result is returned.
+          await operation.run(
+            tab.page.setViewportSize({ width: reference.width, height: reference.height }),
+            "viewport match for coordinate click",
+          );
+          resized = true;
+        }
+        const structure = await operation.run(readPointTargetStructure(tab.page, x, y), "point structural read");
+        assertCoordinatePointGate(structure);
+        // Coordinate targets are always consequential: a real mouse event can
+        // reach page-controlled handlers at or above the point, and absence
+        // of effects is not provable. Canvas and every other semantically
+        // unknown target therefore follow the existing approval policy.
+        const decision: BrowserConsequenceDecision = { consequence: "unknown_or_mixed", consequential: true, destination: null };
+        this.enforceCredentialCapabilities("click", undefined, structure);
+        const authorization = this.interactionAuthorization(name, confirmation);
+        const binding = this.coordinateConfirmationBinding(session, tab, capturedOrigin, structure, decision.consequence, button, x, y, reference);
+        const permit = this.confirmationPermits.issue(binding);
+        let approved = false;
+        try {
+          approved = await operation.run(
+            authorization.confirm(coordinateClickPrompt(capturedOrigin, button, x, y, reference)),
+            "interaction approval",
+          );
+        } catch {
+          this.confirmationPermits.revoke(permit);
+          throw new Error(`${name} not_started: interaction approval was unavailable or cancelled.`);
+        }
+        if (!approved) {
+          this.confirmationPermits.revoke(permit);
+          throw new Error(`${name} not_started: interactive confirmation was denied.`);
+        }
+        let approval: BrowserInteractionResult["approval"];
+        try {
+          throwIfAborted(operation.signal);
+          if (session.teardown || session.fatalError || tab.page.isClosed()) {
+            throw new Error(`${name} not_started: the browser session changed or closed after approval.`);
+          }
+          if (tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin) {
+            this.invalidateInteractionRefs(tab, capturedGeneration);
+            throw new Error(`${name} not_started: the document or origin changed after approval; retry the coordinate click. Retaking a viewport screenshot is optional.`);
+          }
+          const currentViewport = tab.page.viewportSize();
+          if (!currentViewport || currentViewport.width !== reference.width || currentViewport.height !== reference.height) {
+            throw new Error(`${name} not_started: the browser viewport changed after approval; the coordinate click was not dispatched.`);
+          }
+          const revalidatedStructure = await operation.run(readPointTargetStructure(tab.page, x, y), "post-approval point revalidation");
+          assertCoordinatePointGate(revalidatedStructure);
+          this.enforceCredentialCapabilities("click", undefined, revalidatedStructure);
+          const rebound = this.coordinateConfirmationBinding(session, tab, capturedOrigin, revalidatedStructure, decision.consequence, button, x, y, reference);
+          if (!this.confirmationPermits.consume(permit, rebound)) {
+            this.invalidateInteractionRefs(tab, capturedGeneration);
+            throw new Error(`${name} not_started: the approved target or consequence changed; retry the coordinate click. Retaking a viewport screenshot is optional.`);
+          }
+          approval = authorization.source;
+        } finally {
+          // Also revoke on failed re-resolution or cancellation: every
+          // approval path stays single-use exactly as for ref clicks.
+          this.confirmationPermits.revoke(permit);
+        }
+        capture = newInteractionCapture();
+        session.interactionCapture = capture;
+        started = true;
+        await operation.run(tab.page.mouse.click(x, y, { button }), "approved coordinate click dispatch");
+        const accounting = await accountInteractionEffects(capture, operation);
+        if (session.fatalError) throw session.fatalError;
+        if (resized) {
+          try {
+            await operation.run(tab.page.setViewportSize({ width: prior.width, height: prior.height }), "viewport restore after coordinate click");
+          } catch {
+            throw new Error(`${name} dispatched the approved coordinate click but could not restore the prior viewport; no rollback is claimed and the session is contained.`);
+          }
+          restored = true;
+        }
+        const navigated = tab.generation !== capturedGeneration || interactionIdentityUrl(tab.page.url()) !== capturedOrigin;
+        this.invalidateInteractionRefs(tab, capturedGeneration);
+        return {
+          session: session.handle,
+          tab: tab.handle,
+          generation: tab.generation,
+          operation: "click",
+          button,
+          coordinate: { x, y },
+          consequence: decision.consequence,
+          confirmed: approval === "human",
+          approval,
+          effect: "completed",
+          effects: interactionEffects(capture, navigated, accounting),
+          url: redactedInteractionUrl(tab.page.url()),
+        };
+      } catch (error) {
+        if (!started) throw error;
+        this.invalidateInteractionRefs(tab, capturedGeneration);
+        const failure = new Error(`${name} failed after dispatch; effect status is unknown and no rollback is claimed.`);
+        let containment = "confirmed";
+        try { await this.failAndWait(session, failure); }
+        catch { containment = "unconfirmed"; }
+        throw new Error(`${failure.message} Session teardown is ${containment}.`);
+      } finally {
+        if (session.interactionCapture === capture) session.interactionCapture = undefined;
+        if (resized && !restored) {
+          // Failure/cancellation path: best-effort restore. Cancellation and
+          // post-dispatch containment close the page anyway; a live failure
+          // still attempts the restore without claiming any rollback.
+          try {
+            if (!operation.signal.aborted && !tab.page.isClosed()) {
+              await boundedCleanup(
+                tab.page.setViewportSize({ width: prior.width, height: prior.height }),
+                this.limits.cleanupMs,
+                "viewport restore after failed coordinate click",
+              );
+            }
+          } catch {
+            // The already-propagating failure remains authoritative.
+          }
+        }
         operation.dispose();
       }
     });
@@ -4277,6 +4549,32 @@ export class InteractiveBrowserManager {
     return tab.page.locator(`aria-ref=${semanticRef.playwrightRef}`);
   }
 
+  /**
+   * Issue #141: validate that this exact tab holds a coordinate-click reference
+   * established by a successful viewport-mode screenshot (the last successful
+   * one) and that the requested point falls within the recorded image
+   * dimensions. Out-of-bounds coordinates are rejected, never clamped. The
+   * reference supplies viewport dimensions only — it is not an attestation
+   * that the page still matches the capture — so no generation or origin
+   * comparison happens here and no interaction or navigation invalidates the
+   * reference; the click itself revalidates the live document, origin,
+   * viewport, and hit-tested target before dispatch.
+   */
+  private requireCoordinateReference(tab: BrowserTab, x: number, y: number): ViewportScreenshotReference {
+    const reference = tab.viewportScreenshot;
+    if (!reference) {
+      throw new BrowserValidationError(
+        'not_started: BrowserClick coordinates require a successful BrowserScreenshot with mode="viewport" of this exact session and tab; no current viewport reference exists. Take a fresh BrowserScreenshot with mode="viewport" of this tab and retry.',
+      );
+    }
+    if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < 0 || y < 0 || x >= reference.width || y >= reference.height) {
+      throw new BrowserValidationError(
+        `not_started: BrowserClick coordinates must be non-negative integers within the recorded viewport screenshot dimensions ${reference.width}x${reference.height}.`,
+      );
+    }
+    return reference;
+  }
+
   private confirmationBinding(
     session: Session,
     tab: BrowserTab,
@@ -4301,6 +4599,38 @@ export class InteractiveBrowserManager {
       valueLengths: [],
       key: null,
       button,
+    };
+  }
+
+  /** Issue #141 permit binding for coordinate clicks: the exact point, button,
+   * recorded viewport dimensions, generation, origin, and target fingerprint. */
+  private coordinateConfirmationBinding(
+    session: Session,
+    tab: BrowserTab,
+    origin: string,
+    structure: BrowserTargetStructure,
+    consequence: BrowserConsequence,
+    button: BrowserClickButton,
+    x: number,
+    y: number,
+    reference: ViewportScreenshotReference,
+  ): BrowserConfirmationBinding {
+    return {
+      session: session.handle,
+      tab: tab.handle,
+      generation: tab.generation,
+      operation: "click",
+      ref: "coordinates",
+      origin,
+      destination: null,
+      targetFingerprint: this.consequencePolicy.fingerprint(structure),
+      consequence,
+      valueDigest: null,
+      valueLengths: [],
+      key: null,
+      button,
+      point: { x, y },
+      viewport: { width: reference.width, height: reference.height },
     };
   }
 
@@ -5749,6 +6079,276 @@ function boundedTargetStructure(target: BrowserTargetStructure): boolean {
     && (target.ariaHasPopup === null || target.ariaHasPopup.length <= 32)
     && (target.autocomplete === undefined || target.autocomplete === null || target.autocomplete.length <= 128)
     && target.domPath.length <= 512;
+}
+
+/**
+ * Raw structural facts of one hit-tested point target, produced inside the
+ * page's Playwright utility world (issue #141). domPathParts carries the exact
+ * raw attribute tuple the ref-mode domPath digests; the digest is computed in
+ * the manager so no hashing exists inside the page.
+ */
+interface IsolatedPointFacts {
+  tagName: string;
+  domPathParts: readonly (string | null)[];
+  role: string | null;
+  href: string | null;
+  target: string | null;
+  download: boolean;
+  inputType: string | null;
+  formAssociated: boolean;
+  formAction: string | null;
+  formMethod: string | null;
+  ariaHasPopup: string | null;
+  autocomplete: string | null;
+  contentEditable: boolean;
+  disabled: boolean;
+  inlineEventHandler: boolean;
+  summaryForDetails: boolean;
+  formHasCredentialField: boolean;
+}
+
+/** Fail-closed validation of the utility-world facts before any policy use. */
+function isIsolatedPointFacts(value: unknown): value is IsolatedPointFacts {
+  if (typeof value !== "object" || value === null) return false;
+  const facts = value as Record<string, unknown>;
+  const isBoundedString = (v: unknown): v is string => typeof v === "string" && v.length <= 8_192;
+  const nullableString = (v: unknown): boolean => v === null || isBoundedString(v);
+  return typeof facts.tagName === "string" && facts.tagName.length <= 128
+    && Array.isArray(facts.domPathParts) && facts.domPathParts.length === 5
+    && facts.domPathParts.every((part) => part === null || isBoundedString(part))
+    && nullableString(facts.role) && nullableString(facts.href) && nullableString(facts.target)
+    && nullableString(facts.inputType) && nullableString(facts.formAction) && nullableString(facts.formMethod)
+    && nullableString(facts.ariaHasPopup) && nullableString(facts.autocomplete)
+    && typeof facts.download === "boolean"
+    && typeof facts.formAssociated === "boolean"
+    && typeof facts.contentEditable === "boolean" && typeof facts.disabled === "boolean"
+    && typeof facts.inlineEventHandler === "boolean" && typeof facts.summaryForDetails === "boolean"
+    && typeof facts.formHasCredentialField === "boolean";
+}
+
+async function readPointTargetStructure(page: Page, x: number, y: number): Promise<BrowserTargetStructure> {
+  // The exact point is hit-tested in the page's Playwright utility world via
+  // the same isolated selector-engine bridge the owning-form reader requires.
+  // The page's main JavaScript world is never evaluated; unsupported runtimes
+  // fail closed.
+  const frame = page.mainFrame() as unknown as {
+    _connection?: { toImpl?: (frame: unknown) => {
+      selectors?: { callOnSelector?: (
+        selector: string,
+        options: { strict: boolean; mainWorld: boolean },
+        callback: (args: { elements: Element[] }, point: { x: number; y: number }) => IsolatedPointFacts,
+        arg: { x: number; y: number },
+      ) => Promise<{ result: IsolatedPointFacts } | null> };
+    } };
+  };
+  const selectors = frame._connection?.toImpl?.(frame)?.selectors;
+  if (!selectors?.callOnSelector) {
+    throw new BrowserValidationError("not_started: BrowserClick coordinates require the isolated selector engine; no coordinate dispatch is available.");
+  }
+  let resolved: { result: IsolatedPointFacts } | null;
+  try {
+    resolved = await selectors.callOnSelector("html", { strict: true, mainWorld: false }, (args, point) => {
+      // Serialized into the utility world: only this body runs there, and the
+      // shared DOM wrappers of that isolated world cannot be tampered with by
+      // page script. Native prototype getters only.
+      const root = args?.elements?.[0];
+      if (!root || args.elements.length !== 1 || root.tagName !== "HTML") {
+        throw new Error("utility world document unavailable");
+      }
+      // Descend through open shadow roots so the structural facts — and the
+      // hard password/file/credential gates below — apply to the element that
+      // will actually receive the click, not to its shadow host (mirrors
+      // Playwright's own deep element-from-point). Closed shadow roots are
+      // not descendable from script; the host is reported there, matching the
+      // owning-form reader's closed-root limitation.
+      const deepElementFromPoint = (px: number, py: number): Element | null => {
+        let candidate = document.elementFromPoint(px, py);
+        while (candidate && candidate.shadowRoot) {
+          const inner = candidate.shadowRoot.elementFromPoint(px, py);
+          if (!inner || inner === candidate) break;
+          candidate = inner;
+        }
+        return candidate;
+      };
+      const element = deepElementFromPoint(point.x, point.y);
+      if (!element) throw new Error("no element at the requested point");
+      const nativeGetAttribute = Element.prototype.getAttribute;
+      const attr = (name: string): string | null => {
+        const value = nativeGetAttribute.call(element, name);
+        return value === null ? null : String(value);
+      };
+      const token = (name: string): string | null => attr(name)?.trim().toLocaleLowerCase("en-US") ?? null;
+      const tagName = element.tagName.toLocaleLowerCase("en-US");
+      // Cross-frame coordinate dispatch would leave the structural read unable
+      // to establish the inner document's gates; fail closed there.
+      if (tagName === "iframe" || tagName === "frame" || tagName === "object" || tagName === "embed") {
+        throw new Error("point target is an embedded frame; bounded coordinate clicks do not dispatch into frames");
+      }
+      const control = element as HTMLInputElement | HTMLButtonElement | HTMLSelectElement | HTMLTextAreaElement;
+      const form = control.form ?? null;
+      const formFacts = ["input", "button", "select", "textarea"].includes(tagName) && form ? (() => {
+        const submitterPrototype = control instanceof HTMLInputElement ? HTMLInputElement.prototype
+          : control instanceof HTMLButtonElement ? HTMLButtonElement.prototype : null;
+        return {
+          formAssociated: true,
+          formAction: submitterPrototype && control.hasAttribute("formaction")
+            ? Object.getOwnPropertyDescriptor(submitterPrototype, "formAction")!.get!.call(control) as string : Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "action")!.get!.call(form) as string,
+          formMethod: submitterPrototype && control.hasAttribute("formmethod")
+            ? Object.getOwnPropertyDescriptor(submitterPrototype, "formMethod")!.get!.call(control) as string : Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "method")!.get!.call(form) as string,
+        };
+      })() : { formAssociated: false, formAction: null, formMethod: null };
+      // Structural credential-field presence only: no value is ever read.
+      // Same fixed selector and form="id" coverage as the owning-form reader.
+      const credentialFieldSelector = 'input[type="password" i], [autocomplete~="current-password" i], [autocomplete~="new-password" i]';
+      let credentialField = form ? form.querySelector(credentialFieldSelector) : null;
+      if (!credentialField && form && form.id) {
+        const escapedId = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(form.id)
+          : /^[a-zA-Z0-9_-]+$/.test(form.id) ? form.id : null;
+        if (escapedId) {
+          credentialField = document.querySelector(
+            `input[type="password" i][form="${escapedId}"], [autocomplete~="current-password" i][form="${escapedId}"], [autocomplete~="new-password" i][form="${escapedId}"]`,
+          );
+        }
+      }
+      const contentEditable = (() => {
+        let candidate: Element | null = element;
+        while (candidate) {
+          const value = nativeGetAttribute.call(candidate, "contenteditable");
+          if (value !== null && value.toLocaleLowerCase("en-US") !== "false") return true;
+          candidate = candidate.parentElement;
+        }
+        return false;
+      })();
+      const inputType = tagName === "input" || tagName === "button"
+        ? token("type") || (tagName === "button" ? "submit" : "text")
+        : null;
+      const rawHref = attr("href");
+      const href = (tagName === "a" || tagName === "area") && rawHref !== null
+        ? new URL(rawHref, document.baseURI).href : null;
+      return {
+        tagName,
+        domPathParts: [tagName, attr("id"), attr("name"), attr("form"), rawHref],
+        role: token("role"),
+        href,
+        target: token("target"),
+        download: attr("download") !== null,
+        inputType,
+        formAssociated: formFacts.formAssociated,
+        formAction: formFacts.formAction,
+        formMethod: formFacts.formMethod,
+        ariaHasPopup: token("aria-haspopup"),
+        autocomplete: (attr("autocomplete") ?? (form ? nativeGetAttribute.call(form, "autocomplete") : null))?.trim().toLocaleLowerCase("en-US") ?? null,
+        contentEditable,
+        disabled: element.matches(":disabled"),
+        inlineEventHandler: ["onclick", "onmousedown", "onmouseup", "onpointerdown", "onpointerup"].some((name) => attr(name) !== null),
+        summaryForDetails: tagName === "summary" && element.matches("details > summary"),
+        formHasCredentialField: Boolean(credentialField),
+      };
+    }, { x, y });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new BrowserValidationError(`not_started: BrowserClick coordinate target could not be structurally inspected: ${message}.`);
+  }
+  if (!resolved?.result || !isIsolatedPointFacts(resolved.result)) {
+    throw new BrowserValidationError("not_started: BrowserClick coordinate target structure was unavailable.");
+  }
+  const facts = resolved.result;
+  const structure: BrowserTargetStructure = {
+    tagName: facts.tagName,
+    role: facts.role,
+    href: facts.href,
+    target: facts.target,
+    download: facts.download,
+    inputType: facts.inputType,
+    formAssociated: facts.formAssociated,
+    formAction: facts.formAction,
+    formMethod: facts.formMethod,
+    ariaHasPopup: facts.ariaHasPopup,
+    contentEditable: facts.contentEditable,
+    disabled: facts.disabled,
+    inlineEventHandler: facts.inlineEventHandler,
+    summaryForDetails: facts.summaryForDetails,
+    autocomplete: facts.autocomplete,
+    formHasCredentialField: facts.formHasCredentialField,
+    explicitChangeHandler: false,
+    explicitSubmitHandler: false,
+    pageControlledEventsAbsent: false,
+    domPath: createHash("sha256").update(JSON.stringify([facts.domPathParts[0], facts.domPathParts[1], facts.domPathParts[2], facts.domPathParts[3], facts.domPathParts[4]])).digest("hex"),
+  };
+  if (!isBrowserTargetStructure(structure) || !boundedTargetStructure(structure)) {
+    throw new Error("BrowserClick coordinate target structure could not be safely inspected within policy bounds.");
+  }
+  return structure;
+}
+
+/** Issue #141 viewport-mode screenshot defaults; matches the context's fixed viewport. */
+export const DEFAULT_VIEWPORT_WIDTH = 1_280;
+export const DEFAULT_VIEWPORT_HEIGHT = 720;
+
+/**
+ * Issue #141: validate requested viewport-mode screenshot dimensions. Integer
+ * bounds and the existing screenshot image/allocation limits apply exactly as
+ * for the fixed viewport; out-of-range requests are rejected before any
+ * capture or resize happens as recoverable caller-input validation errors
+ * (BrowserValidationError never contains the operation fail-closed).
+ */
+function assertViewportScreenshotDimensions(
+  viewport: { width: number; height: number },
+  limits: InteractiveBrowserLimits,
+): void {
+  if (!Number.isSafeInteger(viewport.width) || !Number.isSafeInteger(viewport.height)
+    || viewport.width < 1 || viewport.height < 1) {
+    throw new BrowserValidationError("BrowserScreenshot viewport dimensions must be positive integers.");
+  }
+  try {
+    assertScreenshotDimensions(viewport.width, viewport.height, limits, "viewport");
+  } catch (error) {
+    throw new BrowserValidationError(asError(error).message);
+  }
+}
+
+/**
+ * Issue #141: bounded input validation for requested coordinate clicks. The
+ * bounds against the recorded screenshot dimensions are checked with the
+ * reference at click time; this validates plain numeric sanity only.
+ */
+function assertCoordinateClickInput(x: number, y: number): void {
+  if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < 0 || y < 0) {
+    throw new BrowserValidationError("not_started: BrowserClick coordinates must be non-negative integers in viewport image (CSS) pixels.");
+  }
+}
+
+/**
+ * Issue #141: hard credential/file gates for the exact hit-tested point
+ * target, mirroring the ref-click preflight texts. Coordinate clicks never
+ * bypass these gates merely because no ref was used.
+ */
+function assertCoordinatePointGate(structure: BrowserTargetStructure): void {
+  if (structure.inputType === "file") {
+    throw new Error("not_started: file controls require the dedicated BrowserUpload tool; bounded click and form actions do not dispatch them.");
+  }
+  if (structure.inputType === "password") {
+    throw new Error("not_started: password controls are not supported by bounded browser click or hover actions.");
+  }
+}
+
+function coordinateClickPrompt(
+  origin: string,
+  button: BrowserClickButton,
+  x: number,
+  y: number,
+  reference: ViewportScreenshotReference,
+): BrowserInteractionConfirmationRequest {
+  return {
+    title: "Confirm consequential browser click",
+    message: [
+      `The ${button}-click at screenshot coordinates ${x}, ${y} (viewport ${reference.width}x${reference.height}) is classified as unknown or mixed.`,
+      `Current site: ${redactedInteractionUrl(origin)}.`,
+      "A coordinate target cannot prove absent page-controlled effects.",
+      "Approve this one exact click? The page can have external effects; cancellation does not imply rollback.",
+    ].join(" "),
+  };
 }
 
 function confirmationPrompt(

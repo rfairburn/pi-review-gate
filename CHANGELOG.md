@@ -15,6 +15,34 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.55]
+
+### Added
+
+- Independent managed-browser permissions for model credential entry/submission,
+  uploads, download saving, clipboard text, camera, microphone, geolocation,
+  service workers, popup restrictions, and local networks. Controls default off;
+  acknowledged, persistent YOLO overrides these controls and per-action approvals.
+- `BrowserUpload`, `BrowserDownloadSave`, and `BrowserClipboard` with explicit
+  owned-tab targeting and configured interaction approvals. Download destinations
+  follow model write authority; unsaved-download retention is configurable in Web
+  settings, defaults to eight per session, and accepts zero for unlimited retention.
+- Opt-in local-network access includes loopback, private networks, and link-local
+  cloud metadata endpoints, with explicit warnings. BrowserExtract and WebFetch
+  remain isolated from managed-browser permission changes and public-only.
+
+### Changed
+
+- Human credential/form submission and uploads remain independent of model-only
+  controls. Device access remains subject to actual browser, hardware, and OS
+  availability; clipboard results distinguish headless and headed scope.
+- Service-worker policy changes use controlled browser replacement with best-effort
+  in-memory state restoration. Previously admitted popup tabs survive replacement
+  beyond the ordinary new-tab limit without granting unrelated tab admission.
+- Live permission revocation reports its actual outcome; failed or timed-out
+  revocation triggers owned-browser containment and reports unconfirmed cleanup
+  rather than claiming permissions were removed or closure succeeded.
+
 ## [0.1.0-dev.54]
 
 ### Fixed

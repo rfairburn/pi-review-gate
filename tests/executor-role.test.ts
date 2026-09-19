@@ -93,7 +93,7 @@ test("worker browser approval is launch-scoped and never widens research authori
   const updates: string[] = [];
   InteractiveBrowserManager.prototype.updateConfig = function (config, policy) {
     updates.push(policy ?? "ask");
-    originalUpdate.call(this, config, policy);
+    return originalUpdate.call(this, config, policy);
   };
   try {
     const configPath = join(dir, "config.json");

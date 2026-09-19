@@ -457,6 +457,68 @@ test("visibility replacement carries still-enabled manager-issued clipboard gran
   }
 });
 
+test("a failed revocation clear during replacement grant re-application fails the new session truthfully", async () => {
+  const harness = visibilityHarness();
+  try {
+    harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, { ...DEFAULT_BROWSER_PERMISSIONS, modelClipboard: true });
+    const opened = await harness.manager.open("https://example.com/a");
+    const page = harness.browsers[0]!.context.pages()[0];
+    page.onEvaluate = () => Promise.resolve({ ok: true, text: "restore-race-clipboard" });
+    const read = await harness.manager.clipboard(opened.session, opened.tab, "clipboard_read", undefined, async () => true);
+    assert.equal(read.text, "restore-race-clipboard");
+
+    // A second save lands while the replacement is re-applying the carried
+    // clipboard grant: it revokes clipboard for the NEW session, and the new
+    // context's clear fails. The first (old) context stays untouched so its
+    // baseline clear and teardown remain clean.
+    const firstContext = harness.browsers[0]!.context;
+    let flipped = false;
+    const realGrant = FakeContext.prototype.grantPermissions;
+    const realClear = FakeContext.prototype.clearPermissions;
+    FakeContext.prototype.grantPermissions = async function (this: FakeContext, permissions: string[], options?: { origin?: string }) {
+      if (!flipped && this !== firstContext) {
+        flipped = true;
+        void harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS);
+      }
+      return realGrant.call(this, permissions, options);
+    };
+    FakeContext.prototype.clearPermissions = async function (this: FakeContext) {
+      if (flipped && this !== firstContext) throw new Error("fixture CDP clear failure");
+      return realClear.call(this);
+    };
+    try {
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelClipboard: true } } }),
+        undefined,
+        undefined,
+        harness.manager,
+      );
+      // The save flips visibility (replacing the context) while keeping
+      // clipboard enabled; the mid-restore second save revokes it.
+      const pendingApply = boundary.applySavedSettings(normalizeConfig({ web: { browserVisible: true, browserPermissions: { modelClipboard: true } } }));
+      await assert.rejects(pendingApply, /permission revocation could not be confirmed/);
+
+      // The replacement's owned context is closed by containment teardown.
+      assert.equal(harness.browsers.length, 2);
+      assert.equal(harness.browsers[1]!.context.closed, true, "the new owned context is closed");
+      assert.equal(harness.browsers[1]!.connected, false, "the new browser process close is confirmed");
+      assert.equal(harness.manager.activeSessionCount(), 0);
+
+      // The original session's tombstone keeps its visibility-reconfigure
+      // closure (its own teardown was clean).
+      const closed = await harness.manager.close(opened.session);
+      assert.equal(closed.alreadyClosed, true);
+      assert.equal(closed.closure?.kind, "visibility_reconfigure");
+    } finally {
+      FakeContext.prototype.grantPermissions = realGrant;
+      FakeContext.prototype.clearPermissions = realClear;
+    }
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
 test("applyVisibility serializes behind an in-flight BrowserOpen instead of orphaning a browser", async () => {
   const harness = visibilityHarness();
   harness.setLaunchDelayMs(150);

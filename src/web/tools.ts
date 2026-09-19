@@ -27,6 +27,7 @@ import {
   normalizeBrowserPressKey,
   type BrowserClipboardOperation,
   type BrowserClipboardResult,
+  type BrowserPermissionRevocationReport,
   type BrowserDownloadListResult,
   type BrowserHistoryOperation,
   type BrowserHistoryResult,
@@ -911,11 +912,17 @@ export class WebToolManager {
     this.registered = true;
   }
 
-  sync(config: ReviewGateConfig): void {
+  /** Rebind the live tooling to a saved config. Returns the interactive
+   * browser's permission-revocation report so the caller can surface a clear
+   * that could not be confirmed (with its containment status) instead of
+   * claiming the settings applied successfully. */
+  sync(config: ReviewGateConfig): Promise<BrowserPermissionRevocationReport> {
     this.webConfig = config.web ?? DEFAULT_CONFIG.web!;
     this.cache.updateConfig(this.webConfig.fetch);
     this.browserCache.updateConfig(this.webConfig.fetch);
-    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes, this.webConfig.browserPermissions, this.webConfig.browserVisible, this.webConfig.browserDownloadRetention);
+    const report = this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes, this.webConfig.browserPermissions, this.webConfig.browserVisible, this.webConfig.browserDownloadRetention);
+    // A stubbed manager may return nothing; normalize to the contract.
+    return Promise.resolve(report ?? { entries: [] });
   }
 
   /** Apply a just-saved settings selection to the live tooling. The saved web
@@ -925,11 +932,37 @@ export class WebToolManager {
    * nothing had to change. Failures throw truthfully — they are never
    * silently queued nor reported as visible. */
   async applySavedSettings(config: ReviewGateConfig): Promise<string | null> {
-    this.sync(config);
+    // Start the live permission revocations, then settle them alongside the
+    // visibility outcome so a clear that could not be confirmed is reported
+    // with its containment status — never as a silent successful apply, and
+    // never dropped when the visibility apply fails too.
+    const revocation = this.sync(config);
+    // Attach handlers immediately: neither operation may surface as an
+    // unhandled rejection before the final settle.
+    let revocationFailure: unknown;
+    revocation.catch((error: unknown) => { revocationFailure = error; });
     const visible = this.webConfig.browserVisible ?? false;
-    const outcome = await this.interactiveBrowser.applyVisibility(visible);
-    if (!outcome) return null;
-    return formatVisibilityOutcome(outcome);
+    const visibility = this.interactiveBrowser.applyVisibility(visible);
+    let visibilityFailure: unknown;
+    visibility.catch((error: unknown) => { visibilityFailure = error; });
+
+    await Promise.allSettled([visibility, revocation]);
+    if (revocationFailure !== undefined && visibilityFailure === undefined) throw revocationFailure;
+    const report = revocationFailure === undefined ? await revocation : null;
+    const revocationNotice = report ? formatPermissionRevocationReport(report) : null;
+    if (visibilityFailure !== undefined) {
+      // Both failed: the visibility error must not stand alone while an
+      // unconfirmed containment is also in flight.
+      const base = visibilityFailure instanceof Error ? visibilityFailure : new Error(String(visibilityFailure));
+      if (!revocationNotice) throw base;
+      throw new Error(`${base.message} ${revocationNotice}`);
+    }
+    const outcome = await visibility;
+    if (!outcome && !revocationNotice) return null;
+    const lines: string[] = [];
+    if (outcome) lines.push(formatVisibilityOutcome(outcome));
+    if (revocationNotice) lines.push(revocationNotice);
+    return lines.join("\n");
   }
 
   async cleanup(): Promise<void> {
@@ -1060,7 +1093,7 @@ function browserInteractionGuidelines(): string[] {
     ...browserObservationGuidelines(),
     "Never claim a click is safe. The extension classifies the freshly resolved target from structural facts; accessible names and model assertions cannot authorize it.",
     "Unknown, mixed, form, download, authentication, terms, permission, destructive, publish, send, purchase, and account consequences require one-use approval under the user's Browser interaction approval setting: Ask (UI required), Automatically Accept, or Automatically Deny. Role restrictions and all safety checks still apply.",
-    "Model credential entry (fill/type into password or credential fields) and model credential submission (activating a form that structurally contains credentials) are additionally gated by web.browserPermissions.modelCredentialEntry and .modelCredentialSubmission; while disabled, the action is denied before any approval prompt with a precise error naming the disabled permission. Local-network permission (web.browserPermissions.localNetworks, or YOLO's master override) is enforced live at the egress broker and navigation preflight: while disabled, loopback, private, link-local, and cloud-metadata destinations are refused before any request or dial, and saved changes apply to the running session without a restart. Model uploads (web.browserPermissions.modelUploads), model download saving (web.browserPermissions.modelDownloadSaving), and model clipboard read/write (web.browserPermissions.modelClipboard) are enforced by BrowserUpload, BrowserDownloadSave, and BrowserClipboard: while disabled, those actions are denied before any approval prompt with a precise error naming the disabled permission, and YOLO overrides all three. Every remaining capability is enforced at runtime: camera, microphone, and geolocation as per-origin permission grants issued when a tab commits a top-level HTTP(S) navigation to an origin (default off; revoked live when disabled), service workers by the launch-pinned context mode (a live toggle performs a controlled browser replacement), the popup restriction override by adopting over-limit page-created popups as owned tabs, and local networks at the egress broker.",
+    "Model credential entry (fill/type into password or credential fields) and model credential submission (activating a form that structurally contains credentials) are additionally gated by web.browserPermissions.modelCredentialEntry and .modelCredentialSubmission; while disabled, the action is denied before any approval prompt with a precise error naming the disabled permission. Local-network permission (web.browserPermissions.localNetworks, or YOLO's master override) is enforced live at the egress broker and navigation preflight: while disabled, loopback, private, link-local, and cloud-metadata destinations are refused before any request or dial, and saved changes apply to the running session without a restart. Model uploads (web.browserPermissions.modelUploads), model download saving (web.browserPermissions.modelDownloadSaving), and model clipboard read/write (web.browserPermissions.modelClipboard) are enforced by BrowserUpload, BrowserDownloadSave, and BrowserClipboard: while disabled, those actions are denied before any approval prompt with a precise error naming the disabled permission, and YOLO overrides all three. Every remaining capability is enforced at runtime: camera, microphone, and geolocation as per-origin permission grants issued when a tab commits a top-level HTTP(S) navigation to an origin (default off; cleared live when disabled — an unconfirmable engine clear fails the affected session closed instead of being claimed applied, and a clear that does not settle within the cleanup deadline is reported as still in flight and the affected session is closed to contain any retained grants), service workers by the launch-pinned context mode (a live toggle performs a controlled browser replacement), the popup restriction override by adopting over-limit page-created popups as owned tabs, and local networks at the egress broker.",
     "Cancellation and failure report effect uncertainty and never claim rollback. Popups remain owned without auto-switching; while model download saving is disabled, downloads are canceled as they occur (when enabled they are retained as opaque pending handles, bounded by web.browserDownloadRetention; 0 means unlimited), and dialogs default-dismissed.",
   ];
 }
@@ -1306,6 +1339,44 @@ function formatVisibilityOutcome(value: BrowserVisibilityResult): string {
   if (value.overflowPopups > 0) lines.push(`${value.overflowPopups} context page(s) beyond the tab cap were not restorable.`);
   for (const note of value.notes) lines.push(note);
   return lines.join("\n");
+}
+
+/** Bounded human-facing notice for live permission revocations that did not
+ * complete cleanly. A confirmed clear with every surviving grant re-issued is
+ * silent; an unconfirmed clear (session closed to contain the retained grants)
+ * and a safe re-grant loss are both reported truthfully. */
+function formatPermissionRevocationReport(report: BrowserPermissionRevocationReport): string | null {
+  const lines: string[] = [];
+  for (const entry of report.entries) {
+    if (entry.outcome.status === "unconfirmed") {
+      lines.push(
+        `Browser permission revocation could not be confirmed on the live browser (${entry.outcome.reason}); the affected session was closed to contain the retained grants. Closure status: ${entry.closure ?? "unconfirmed"}. Use BrowserOpen to start a new browser.`,
+      );
+    } else if (entry.outcome.status === "in_flight") {
+      const closure = entry.closure ? ` Session closure status: ${entry.closure}.` : "";
+      // The save starts this containment teardown itself when no concurrent
+      // one exists, so a timed-out wait always reports a closure status: a
+      // confirmed close contains the grants; an unconfirmed one means the
+      // teardown ran and failed (the session is now a failed tombstone, so
+      // BrowserClose can only echo that failure — point at the real recovery
+      // instead).
+      const advice = entry.closure === "confirmed"
+        ? " That session's browser context is already closed, so the retained grants are contained."
+        : " That session's teardown could not be confirmed, so containment is unconfirmed; recover by restarting the Pi session (terminal restart or reload).";
+      lines.push(
+        `Browser permission revocation is still in flight${entry.closure === "confirmed" ? "" : " on the live browser"} (${entry.outcome.reason}); it has not been confirmed applied.${closure}${advice}`,
+      );
+    } else if (entry.outcome.status === "superseded" && entry.closure === "unconfirmed") {
+      lines.push(
+        `Browser permission revocation was superseded by an in-progress session teardown (${entry.outcome.reason}); that teardown's closure could not be confirmed. Use BrowserOpen to start a new browser.`,
+      );
+    } else if (entry.outcome.status === "revoked" && entry.outcome.regrantFailures.length > 0) {
+      lines.push(
+        `Browser permission revocation cleared the revoked grants, but ${entry.outcome.regrantFailures.length} still-enabled grant(s) could not be re-issued (${entry.outcome.regrantFailures.map((failure) => failure.origin).join(", ")}); those capabilities are off until their next applicable action or navigation.`,
+      );
+    }
+  }
+  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 function formatBrowserTabs(value: BrowserTabsResult): string {

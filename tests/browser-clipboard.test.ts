@@ -228,7 +228,7 @@ test("an unavailable or denied clipboard API is reported precisely without teari
   } finally { await manager.shutdown(); }
 });
 
-test("a failed engine clear keeps the bookkeeping so the next revocation retries the clear", async () => {
+test("a failed engine clear on a live disable is contained and reported, never claimed applied", async () => {
   const fixture = managerFixture();
   const { manager } = fixture;
   try {
@@ -241,22 +241,33 @@ test("a failed engine clear keeps the bookkeeping so the next revocation retries
     assert.equal(first.text, "");
     const context = fixture.browser.context;
     const originalClear = context.clearPermissions.bind(context);
-    let failNextClear = true;
-    context.clearPermissions = async () => {
-      if (failNextClear) throw new Error("transient CDP failure");
-      return originalClear();
-    };
+    context.clearPermissions = async () => { throw new Error("fixture CDP clear failure"); };
     try {
-      // A revocation whose engine clear fails transiently: the bookkeeping
-      // must survive so a later settings save can retry the clear.
-      manager.updateConfig(config.web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS);
-      await delay(50); // let the voided (failed) revocation settle
-      assert.equal(context.clearPermissionCalls, 1, "the failed clear was never confirmed");
-      // The next save with the capability still off retries and confirms.
-      failNextClear = false;
-      manager.updateConfig(config.web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS);
-      await untilCleared(() => context.clearPermissionCalls, 1);
-      assert.equal(context.clearPermissionCalls, 2, "the retry confirmed the engine clear");
+      // A live disable whose engine clear fails: the settings apply must not
+      // be claimed. The report names the unconfirmed revocation and awaits
+      // the confirmed containment teardown instead of voiding the error.
+      const report = await manager.updateConfig(config.web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS);
+      assert.equal(report.entries.length, 1);
+      const entry = report.entries[0]!;
+      if (entry.outcome.status !== "unconfirmed") throw new Error(`expected unconfirmed, got ${JSON.stringify(entry.outcome)}`);
+      assert.match(entry.outcome.reason, /fixture CDP clear failure/);
+      assert.equal(entry.closure, "confirmed");
+      // No confirmed clear: the engine grant record survives until the owned
+      // context close, which containment now confirms.
+      assert.equal(context.clearPermissionCalls, 1, "only the launch baseline clear was ever confirmed");
+      assert.ok(context.grantedPermissions.length >= 1, "the issued grant is not faked away from the engine log");
+      assert.equal(context.closed, true, "the owned context is closed by containment teardown");
+      assert.equal(fixture.browser.connected, false, "the browser process close is confirmed");
+      // Model tools are denied with the truthful fatal reason.
+      await assert.rejects(
+        manager.snapshot(opened.session, opened.tab, 1_000),
+        /Browser session is closed \(fatal_error: .*permission revocation could not be confirmed/,
+      );
+      // The cleanup status is retained for BrowserClose, not lost.
+      const closed = await manager.close(opened.session);
+      assert.equal(closed.alreadyClosed, true);
+      assert.equal(closed.closure?.kind, "fatal_error");
+      assert.match(closed.closure!.message, /permission revocation could not be confirmed/);
     } finally {
       context.clearPermissions = originalClear;
     }

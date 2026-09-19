@@ -365,8 +365,12 @@ unrestricted level ladder and no role scheme.
 - `modelCamera`, `modelMicrophone`, and `modelGeolocation` are enforced as real
 per-origin device permission grants issued when a session tab commits a top-level
 HTTP(S) navigation to an origin; while disabled (the default) no device grant is
-issued for any origin, and disabling revokes the capability's grants from live
-sessions immediately. They grant capability, not forced activation, and actual
+issued for any origin, and disabling clears the capability's grants from live
+sessions (an unconfirmable engine clear fails the affected session closed and
+is reported through the save rather than claimed applied; a clear that does
+not settle within the browser cleanup deadline is likewise reported as still
+in flight — never confirmed applied — and its session is closed to contain any
+retained grants, with the closure status reported through the save). They grant capability, not forced activation, and actual
 capture still depends on host hardware, operating-system privacy prompts, and
 position sources.
 - `modelServiceWorkers` and `modelPopupRestrictionOverride` grant capability
@@ -429,17 +433,26 @@ enabled, they proceed through the ordinary interaction-approval flow with
 one-use revalidated permits and a real per-origin browser permission grant for
 the approved operation's origin (headless Chromium uses its per-instance
 virtual clipboard; headed desktop Chromium reaches the host system
-clipboard). Saved changes apply to the live session; revoking it immediately
-removes every issued clipboard permission grant. Camera (`modelCamera`),
+clipboard). Saved changes apply to the live session; revoking it clears every
+issued clipboard permission grant, and an unconfirmable engine clear fails the
+affected session closed (reported through the save) instead of being claimed
+applied; a clear that does not settle within the browser cleanup deadline is
+likewise reported as still in flight — never confirmed applied — and its
+session is closed to contain any retained grants, with the closure status
+reported through the save. Camera (`modelCamera`),
 microphone (`modelMicrophone`), and geolocation (`modelGeolocation`) are
 enforced as real per-origin device permission grants: while disabled, no
 device grant is issued for any origin; while enabled, a grant scoped to that
 origin only is issued when one of the session's tabs commits a top-level
 HTTP(S) navigation there, re-evaluating the current effective policy at every
-commit. Saved changes apply to the live session immediately: disabling revokes
+commit. Saved changes apply to the live session immediately: disabling clears
 every issued grant for that capability at once while leaving the other enabled
-capabilities' grants intact, and enabling takes effect from the next
-applicable navigation commit. Actual capture still depends on host hardware,
+capabilities' grants intact (an unconfirmable engine clear fails the affected
+session closed and is reported through the save rather than claimed applied; a
+clear that does not settle within the browser cleanup deadline is likewise
+reported as still in flight — never confirmed applied — and its session is
+closed to contain any retained grants, with the closure status reported
+through the save), and enabling takes effect from the next applicable navigation commit. Actual capture still depends on host hardware,
 operating-system privacy prompts, and position sources; the manager grants
 permission state only and reports failures truthfully. Service workers
 (`modelServiceWorkers`) are enforced at context creation — blocked by default,
@@ -521,7 +534,8 @@ boundaries are owned by [Web tools](web-tools.md) and
   enforced: credential entry and submission, uploads, download saving, and
   clipboard read/write by the interactive-browser tool actions; camera,
   microphone, and geolocation as per-origin device permission grants issued on
-  navigation commits and revoked live on disable; service workers at browser
+  navigation commits and cleared live on disable (an unconfirmable engine clear
+  fails the affected session closed); service workers at browser
   launch, with a controlled replacement of the live browser when the saved
   policy changes; the popup restriction override while enabled; and local
   networks at the interactive egress broker. Saved changes apply to the live

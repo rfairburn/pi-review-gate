@@ -2480,7 +2480,7 @@ test("completed turns never invoke terminal browser cleanup", async () => {
     await activate(pi, {
       webTools: {
         register() {},
-        sync() {},
+        sync() { return Promise.resolve({ entries: [] }); },
         async applySavedSettings() { return null; },
         async cleanup() {
           cleanupCalls += 1;

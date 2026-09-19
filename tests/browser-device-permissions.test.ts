@@ -16,7 +16,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import type { Browser, BrowserContext, Page } from "playwright";
 import { DEFAULT_BROWSER_PERMISSIONS, normalizeConfig, type WebBrowserPermissions } from "../src/config";
-import { InteractiveBrowserManager, type BrowserVisibilityResult } from "../src/web/interactive-browser";
+import { InteractiveBrowserManager, type BrowserPermissionRevocationReport, type BrowserVisibilityResult } from "../src/web/interactive-browser";
+import { WebToolManager } from "../src/web/tools";
 
 // ---------------------------------------------------------------------------
 // Fixtures: minimal fake browser family (mirrors tests/browser-visibility.test.ts)
@@ -171,10 +172,10 @@ class FakeBrowser extends EventEmitter {
 interface DeviceHarness {
   manager: InteractiveBrowserManager;
   browsers: FakeBrowser[];
-  setPermissions(permissions: WebBrowserPermissions, visible?: boolean): void;
+  setPermissions(permissions: WebBrowserPermissions, visible?: boolean): Promise<BrowserPermissionRevocationReport>;
 }
 
-function harness(): DeviceHarness {
+function harness(options: { cleanupMs?: number } = {}): DeviceHarness {
   const browsers: FakeBrowser[] = [];
   let serial = 0;
   const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
@@ -185,12 +186,13 @@ function harness(): DeviceHarness {
       return browser as unknown as Browser;
     },
     randomHandle: (kind: string) => `${kind}_${++serial}_${"x".repeat(32)}`,
+    ...(options.cleanupMs === undefined ? {} : { limits: { cleanupMs: options.cleanupMs } }),
   });
   return {
     manager,
     browsers,
     setPermissions(permissions: WebBrowserPermissions, visible = false) {
-      manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, permissions, visible);
+      return manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, permissions, visible);
     },
   };
 }
@@ -340,6 +342,488 @@ test("a failed device grant fails closed: no bookkeeping claim, session stays us
     FakeContext.prototype.grantPermissions = realGrant;
     await h.manager.shutdown();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Failed revocation containment: an engine clear that cannot be confirmed
+// must fail the affected owned session closed (grants retained until the
+// context close is confirmed), report through the settings channel with its
+// closure status, and deny model tools — never claim the disable applied.
+// ---------------------------------------------------------------------------
+
+test("failed engine clear on a live disable: contained by teardown, reported through the settings channel, tools denied", async () => {
+  const h = harness();
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://devices.example.com/");
+    await settle();
+    // Mixed clipboard + device grants for the same origin.
+    const context = lastContext(h);
+    context.pages()[0]!.onEvaluate = () => Promise.resolve({ ok: true, text: "mixed-grant-clipboard" });
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true, modelClipboard: true });
+    const read = await h.manager.clipboard(opened.session, opened.tab, "clipboard_read", undefined, async () => true);
+    assert.equal(read.text, "mixed-grant-clipboard");
+    assert.deepEqual(
+      [...context.finalPermissionState().get("https://devices.example.com")!].sort(),
+      ["camera", "clipboard-read", "microphone"],
+    );
+
+    // The live disable's engine clear fails.
+    const originalClear = context.clearPermissions.bind(context);
+    context.clearPermissions = async () => { throw new Error("fixture CDP clear failure"); };
+    try {
+      // The real settings-activation path: the save must report the failed
+      // revocation with its containment status, never a successful apply.
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelCamera: true, modelMicrophone: true, modelClipboard: true } } }),
+        undefined,
+        undefined,
+        h.manager,
+      );
+      const notice = await boundary.applySavedSettings(normalizeConfig({}));
+      assert.ok(notice, "the failed revocation is reported through the settings channel, not voided");
+      assert.match(notice!, /revocation could not be confirmed/);
+      assert.match(notice!, /closed to contain the retained grants/);
+      assert.match(notice!, /Closure status: confirmed/);
+
+      // The engine grant was never cleared: it persists in the engine log
+      // until the owned context close, which containment now confirms.
+      const state = context.finalPermissionState().get("https://devices.example.com");
+      assert.ok(
+        state && [...state].includes("camera") && [...state].includes("clipboard-read") && [...state].includes("microphone"),
+        "no confirmed clear: the engine still holds the revoked grants",
+      );
+      assert.equal(context.closed, true, "the owned context is closed by containment teardown");
+      assert.equal(h.browsers[0]!.connected, false, "the browser process close is confirmed");
+      assert.equal(h.manager.activeSessionCount(), 0);
+
+      // Model tools are denied with the truthful fatal reason.
+      await assert.rejects(
+        h.manager.snapshot(opened.session, opened.tab, 1_000),
+        /Browser session is closed \(fatal_error: .*permission revocation could not be confirmed/,
+      );
+      // The cleanup status is retained for BrowserClose, not lost.
+      const closed = await h.manager.close(opened.session);
+      assert.equal(closed.alreadyClosed, true);
+      assert.equal(closed.closure?.kind, "fatal_error");
+      assert.match(closed.closure!.message, /permission revocation could not be confirmed/);
+    } finally {
+      context.clearPermissions = originalClear;
+    }
+  } finally { await h.manager.shutdown(); }
+});
+
+test("a failed context close during revocation containment is reported unconfirmed, never success", async () => {
+  const h = harness({ cleanupMs: 25 });
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://devices.example.com/");
+    await settle();
+    const context = lastContext(h);
+    const originalClear = context.clearPermissions.bind(context);
+    const originalClose = context.close.bind(context);
+    context.clearPermissions = async () => { throw new Error("fixture CDP clear failure"); };
+    // The containment close itself hangs past the bounded cleanup deadline.
+    context.close = () => new Promise<void>(() => undefined);
+    try {
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelCamera: true, modelMicrophone: true } } }),
+        undefined,
+        undefined,
+        h.manager,
+      );
+      const notice = await boundary.applySavedSettings(normalizeConfig({}));
+      assert.ok(notice);
+      assert.match(notice!, /revocation could not be confirmed/);
+      assert.match(notice!, /Closure status: unconfirmed/);
+
+      // BrowserClose reports the unconfirmed teardown — never a success.
+      await assert.rejects(h.manager.close(opened.session), /Browser closure is unconfirmed/);
+    } finally {
+      context.clearPermissions = originalClear;
+      context.close = originalClose;
+    }
+  } finally {
+    // The unconfirmed teardown fails closed for the remainder of the runtime.
+    await h.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("a save landing mid-teardown reports the superseded revocation with that teardown's closure status", async () => {
+  const h = harness({ cleanupMs: 25 });
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://devices.example.com/");
+    await settle();
+    const context = lastContext(h);
+    // Make the explicit close hang past the bounded cleanup deadline so the
+    // in-flight teardown ends unconfirmed.
+    const originalClose = context.close.bind(context);
+    context.close = () => new Promise<void>(() => undefined);
+    try {
+      // beginTeardown is synchronous, so this save lands strictly mid-teardown:
+      // the revocation is superseded by it and must still observe its closure.
+      const closing = h.manager.close(opened.session);
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelCamera: true, modelMicrophone: true } } }),
+        undefined,
+        undefined,
+        h.manager,
+      );
+      const notice = await boundary.applySavedSettings(normalizeConfig({}));
+      assert.ok(notice, "the superseded revocation with an unconfirmed closure is reported, not dropped");
+      assert.match(notice!, /superseded by an in-progress session teardown/);
+      assert.match(notice!, /closure could not be confirmed/);
+      await assert.rejects(closing, /Browser closure is unconfirmed/);
+    } finally {
+      context.close = originalClose;
+    }
+  } finally {
+    await h.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("a failed visibility apply does not drop an unconfirmed revocation report", async () => {
+  const h = harness();
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://devices.example.com/");
+    await settle();
+    const context = lastContext(h);
+    const originalClear = context.clearPermissions.bind(context);
+    const originalVisibility = h.manager.applyVisibility.bind(h.manager);
+    context.clearPermissions = async () => { throw new Error("fixture CDP clear failure"); };
+    h.manager.applyVisibility = async () => { throw new Error("fixture visibility failure"); };
+    try {
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelCamera: true, modelMicrophone: true } } }),
+        undefined,
+        undefined,
+        h.manager,
+      );
+      // Both the visibility apply and the revocation containment fail: the
+      // thrown error must carry both, not just the visibility one.
+      await assert.rejects(
+        boundary.applySavedSettings(normalizeConfig({})),
+        (error: Error) => {
+          assert.match(error.message, /fixture visibility failure/);
+          assert.match(error.message, /revocation could not be confirmed/);
+          assert.match(error.message, /Closure status: confirmed/);
+          return true;
+        },
+      );
+      // The containment still happened and is confirmed.
+      assert.equal(context.closed, true);
+      assert.equal(h.manager.activeSessionCount(), 0);
+    } finally {
+      context.clearPermissions = originalClear;
+      h.manager.applyVisibility = originalVisibility;
+    }
+  } finally { await h.manager.shutdown(); }
+});
+
+test("a wedged permission clear delays the save at most the cleanup deadline, then reports in-flight with confirmed containment", async () => {
+  const h = harness({ cleanupMs: 25 });
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://devices.example.com/");
+    await settle();
+    const context = lastContext(h);
+    // The engine clear never settles: a wedged-but-connected driver.
+    const originalClear = context.clearPermissions.bind(context);
+    context.clearPermissions = () => new Promise<void>(() => undefined);
+    try {
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelCamera: true, modelMicrophone: true } } }),
+        undefined,
+        undefined,
+        h.manager,
+      );
+      // The save must settle at the bounded deadline — not block on the wedged
+      // driver — and report the revocation as in flight, not applied.
+      const started = Date.now();
+      const notice = await boundary.applySavedSettings(normalizeConfig({}));
+      assert.ok(Date.now() - started < 2_000, "the save is not blocked past the bounded cleanup deadline");
+      assert.ok(notice, "the in-flight revocation is reported through the settings channel");
+      assert.match(notice!, /still in flight/);
+      assert.match(notice!, /not been confirmed applied/);
+      assert.match(notice!, /exceeded its 25ms deadline/);
+      // The save itself started containment: no manual BrowserClose is needed,
+      // the owned context and process are closed (engine grants contained),
+      // and the closure is reported confirmed — while the engine clear itself
+      // stays unconfirmed.
+      assert.match(notice!, /Session closure status: confirmed/);
+      assert.match(notice!, /already closed, so the retained grants are contained/);
+      assert.doesNotMatch(notice!, /Use BrowserClose/);
+      assert.equal(h.manager.activeSessionCount(), 0);
+      assert.equal(context.closed, true, "the owned context is closed by containment teardown");
+      assert.equal(h.browsers[0]!.connected, false, "the browser process close is confirmed");
+
+      // Model tools fail closed with the truthful fatal reason.
+      await assert.rejects(
+        h.manager.snapshot(opened.session, opened.tab, 1_000),
+        /Browser session is closed \(fatal_error: .*permission revocation did not settle/,
+      );
+      // The closure status is retained for BrowserClose, not lost.
+      const closed = await h.manager.close(opened.session);
+      assert.equal(closed.alreadyClosed, true);
+      assert.equal(closed.closure?.kind, "fatal_error");
+    } finally {
+      context.clearPermissions = originalClear;
+    }
+  } finally { await h.manager.shutdown(); }
+});
+
+test("a wedged permission clear whose containment close fails reports in-flight with unconfirmed closure, never success", async () => {
+  const h = harness({ cleanupMs: 25 });
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://devices.example.com/");
+    await settle();
+    const context = lastContext(h);
+    // The engine clear never settles (a wedged driver), and the containment
+    // close hangs past the bounded cleanup deadline, so the save-started
+    // teardown ends unconfirmed and the session becomes a failed tombstone.
+    const originalClear = context.clearPermissions.bind(context);
+    const originalClose = context.close.bind(context);
+    context.clearPermissions = () => new Promise<void>(() => undefined);
+    context.close = () => new Promise<void>(() => undefined);
+    try {
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelCamera: true, modelMicrophone: true } } }),
+        undefined,
+        undefined,
+        h.manager,
+      );
+      // The save must still settle at its bounded deadline and report both the
+      // unconfirmed clear and the unconfirmed containment — never success.
+      const started = Date.now();
+      const notice = await boundary.applySavedSettings(normalizeConfig({}));
+      assert.ok(Date.now() - started < 2_000, "the save is not blocked past the bounded cleanup deadline");
+      assert.ok(notice, "the in-flight revocation is reported through the settings channel");
+      assert.match(notice!, /still in flight/);
+      assert.match(notice!, /not been confirmed applied/);
+      assert.match(notice!, /exceeded its 25ms deadline/);
+      assert.match(notice!, /Session closure status: unconfirmed/);
+      assert.match(notice!, /teardown could not be confirmed, so containment is unconfirmed/);
+      assert.match(notice!, /recover by restarting the Pi session/);
+      // The save-started teardown failed; BrowserClose can only echo the same
+      // failure, so the notice must not point at it.
+      assert.doesNotMatch(notice!, /Use BrowserClose/);
+      await assert.rejects(h.manager.close(opened.session), /Browser closure is unconfirmed/);
+    } finally {
+      context.clearPermissions = originalClear;
+      context.close = originalClose;
+    }
+  } finally {
+    // The unconfirmed teardown fails closed for the remainder of the runtime.
+    await h.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("an in-flight revocation whose session closes meanwhile reports the confirmed closure", async () => {
+  const h = harness({ cleanupMs: 300 });
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://devices.example.com/");
+    await settle();
+    const context = lastContext(h);
+    // The engine clear never settles: a wedged-but-connected driver.
+    const originalClear = context.clearPermissions.bind(context);
+    let clearCalls = 0;
+    context.clearPermissions = () => {
+      clearCalls += 1;
+      return new Promise<void>(() => undefined);
+    };
+    try {
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelCamera: true, modelMicrophone: true } } }),
+        undefined,
+        undefined,
+        h.manager,
+      );
+      const saving = boundary.applySavedSettings(normalizeConfig({}));
+      // Let the wedged clear get in flight, then close the session. The
+      // teardown does not await the mutation tail, so it confirms
+      // independently of the wedged clear; the save must report that
+      // confirmed closure rather than stale live-browser advice.
+      for (let i = 0; i < 400 && clearCalls === 0; i += 1) await delay(5);
+      assert.ok(clearCalls > 0, "the revocation reached the engine clear");
+      const closing = h.manager.close(opened.session);
+      const notice = await saving;
+      assert.ok(notice, "the in-flight revocation is reported through the settings channel");
+      assert.match(notice!, /still in flight/);
+      assert.match(notice!, /not been confirmed applied/);
+      assert.match(notice!, /Session closure status: confirmed/);
+      assert.match(notice!, /already closed, so the retained grants are contained/);
+      assert.doesNotMatch(notice!, /on the live browser/);
+      assert.doesNotMatch(notice!, /Use BrowserClose/);
+      const closed = await closing;
+      assert.equal(closed.closed, true);
+    } finally {
+      context.clearPermissions = originalClear;
+    }
+  } finally { await h.manager.shutdown(); }
+});
+
+test("an in-flight revocation whose concurrent teardown fails reports unconfirmed containment without BrowserClose advice", async () => {
+  const h = harness({ cleanupMs: 25 });
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://devices.example.com/");
+    await settle();
+    const context = lastContext(h);
+    // The engine clear never settles (a wedged driver), and the concurrent
+    // containment close hangs past the bounded cleanup deadline, so the
+    // teardown ends unconfirmed and the session becomes a failed tombstone.
+    const originalClear = context.clearPermissions.bind(context);
+    const originalClose = context.close.bind(context);
+    let clearCalls = 0;
+    context.clearPermissions = () => {
+      clearCalls += 1;
+      return new Promise<void>(() => undefined);
+    };
+    context.close = () => new Promise<void>(() => undefined);
+    try {
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelCamera: true, modelMicrophone: true } } }),
+        undefined,
+        undefined,
+        h.manager,
+      );
+      const saving = boundary.applySavedSettings(normalizeConfig({}));
+      // Let the wedged clear get in flight, then start a close whose containment
+      // cannot be confirmed.
+      for (let i = 0; i < 400 && clearCalls === 0; i += 1) await delay(5);
+      assert.ok(clearCalls > 0, "the revocation reached the engine clear");
+      const closing = h.manager.close(opened.session);
+      // Attach a handler immediately: the teardown rejects at the cleanup
+      // deadline, long before the final assertion would observe it.
+      void closing.catch(() => undefined);
+      const notice = await saving;
+      assert.ok(notice, "the in-flight revocation is reported through the settings channel");
+      assert.match(notice!, /still in flight/);
+      assert.match(notice!, /not been confirmed applied/);
+      assert.match(notice!, /Session closure status: unconfirmed/);
+      assert.match(notice!, /teardown could not be confirmed, so containment is unconfirmed/);
+      assert.match(notice!, /recover by restarting the Pi session/);
+      // The session is a failed tombstone now; BrowserClose can only echo the
+      // same failure, so the notice must not point at it.
+      assert.doesNotMatch(notice!, /Use BrowserClose/);
+      await assert.rejects(closing, /Browser closure is unconfirmed/);
+    } finally {
+      context.clearPermissions = originalClear;
+      context.close = originalClose;
+    }
+  } finally {
+    // The unconfirmed teardown fails closed for the remainder of the runtime.
+    await h.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("a post-grant revocation race whose clear fails is contained, not claimed", async () => {
+  const h = harness();
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true, modelClipboard: true });
+    const opened = await h.manager.open("https://race.example.com/");
+    await settle();
+    const context = lastContext(h);
+    context.pages()[0]!.onEvaluate = () => Promise.resolve({ ok: true, text: "race-clipboard" });
+    // The save revokes everything exactly while the clipboard grant round-trip
+    // is in flight; updateConfig's own revocation queues behind the in-flight
+    // grant and its clear fails.
+    const originalGrant = context.grantPermissions.bind(context);
+    let reportPromise: Promise<BrowserPermissionRevocationReport> | undefined;
+    let revoked = false;
+    context.grantPermissions = async (permissions: string[], options?: { origin?: string }) => {
+      if (!revoked) {
+        revoked = true;
+        reportPromise = h.setPermissions(DEFAULT_BROWSER_PERMISSIONS);
+      }
+      return originalGrant(permissions, options);
+    };
+    const originalClear = context.clearPermissions.bind(context);
+    context.clearPermissions = async () => { throw new Error("fixture CDP clear failure"); };
+    try {
+      await assert.rejects(
+        h.manager.clipboard(opened.session, opened.tab, "clipboard_read", undefined, async () => true),
+        /not_started: model clipboard read\/write is disabled.*revocation could not be confirmed.*Session teardown is confirmed/,
+      );
+      const report = await reportPromise!;
+      assert.equal(report.entries.length, 1);
+      const entry = report.entries[0]!;
+      if (entry.outcome.status !== "unconfirmed") throw new Error(`expected unconfirmed, got ${JSON.stringify(entry.outcome)}`);
+      assert.equal(entry.closure, "confirmed");
+      // No confirmed clear: the mixed engine grants persist until the owned
+      // context close.
+      const state = context.finalPermissionState().get("https://race.example.com");
+      assert.ok(
+        state && [...state].includes("camera") && [...state].includes("clipboard-read"),
+        "the engine still holds the revoked grants",
+      );
+      assert.equal(context.closed, true);
+      assert.equal(h.manager.activeSessionCount(), 0);
+      await assert.rejects(
+        h.manager.snapshot(opened.session, opened.tab, 1_000),
+        /Browser session is closed \(fatal_error: .*permission revocation could not be confirmed/,
+      );
+    } finally {
+      context.grantPermissions = originalGrant;
+      context.clearPermissions = originalClear;
+    }
+  } finally { await h.manager.shutdown(); }
+});
+
+test("a failed re-grant after a confirmed clear is a reported safe loss, not retained forbidden authority", async () => {
+  const h = harness();
+  try {
+    h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true, modelMicrophone: true });
+    const opened = await h.manager.open("https://one.example.com/");
+    await settle();
+    await h.manager.navigate(opened.session, opened.tab, "https://two.example.org/");
+    await settle();
+    const context = lastContext(h);
+    assert.deepEqual([...context.finalPermissionState().get("https://one.example.com")!].sort(), ["camera", "microphone"]);
+    assert.deepEqual([...context.finalPermissionState().get("https://two.example.org")!].sort(), ["camera", "microphone"]);
+
+    // Disable the microphone; the second origin's re-grant fails after the clear.
+    const originalGrant = context.grantPermissions.bind(context);
+    context.grantPermissions = async (permissions: string[], options?: { origin?: string }) => {
+      if (options?.origin === "https://two.example.org") throw new Error("fixture re-grant failure");
+      return originalGrant(permissions, options);
+    };
+    try {
+      const report = await h.setPermissions({ ...DEFAULT_BROWSER_PERMISSIONS, modelCamera: true });
+      assert.equal(report.entries.length, 1);
+      const outcome = report.entries[0]!.outcome;
+      if (outcome.status !== "revoked") throw new Error(`expected revoked, got ${JSON.stringify(outcome)}`);
+      assert.deepEqual(outcome.regrantFailures.map((failure) => failure.origin), ["https://two.example.org"]);
+
+      // Safe direction: the cleared origin holds nothing (no forbidden grant
+      // retained), and the surviving enabled group is intact elsewhere.
+      const stateOne = context.finalPermissionState().get("https://one.example.com");
+      const stateTwo = context.finalPermissionState().get("https://two.example.org");
+      assert.deepEqual([...(stateOne ?? [])].sort(), ["camera"], "the surviving enabled group is re-issued");
+      assert.ok(
+        stateTwo === undefined || ![...stateTwo].includes("microphone"),
+        "no forbidden grant is retained for the failed origin",
+      );
+
+      // The session remains usable: a safe loss is reported, not contained.
+      const navigated = await h.manager.navigate(opened.session, opened.tab, "https://one.example.com/again/");
+      assert.equal(navigated.status, 200);
+    } finally {
+      context.grantPermissions = originalGrant;
+    }
+  } finally { await h.manager.shutdown(); }
 });
 
 // ---------------------------------------------------------------------------

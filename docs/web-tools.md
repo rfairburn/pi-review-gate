@@ -316,8 +316,15 @@ and semantic:
   denied before any approval prompt with a precise error naming the disabled
   permission. The manager issues a real per-origin Playwright permission grant
   for the exact origin of the approved operation — never a context-wide or
-  cross-session capability — re-checks the live permission after approval, and
-  revokes every issued grant immediately when the permission is turned off.
+  cross-session capability — re-checks the live permission after approval.
+  When the permission is turned off, the manager clears every issued grant from
+  live sessions; if that engine clear cannot be confirmed, it fails the affected
+  session closed (tearing down its owned browser context so no retained grant
+  survives) and reports the unconfirmed revocation through the settings save
+  instead of claiming it applied. A clear that does not settle within the
+  browser cleanup deadline is likewise reported to the save as still in flight
+  (not confirmed applied), and the affected session is closed to contain any
+  retained grants, with the closure status reported through the save.
   Untrusted page content cannot grant or toggle this capability. Headless
   Chromium operates on its per-instance virtual clipboard (writes do not reach
   the host pasteboard); headed desktop Chromium reaches the host system
@@ -695,9 +702,16 @@ operation, and — for writes — a digest and length of the exact text; YOLO
 approves them automatically and never as human-confirmed. The manager issues a
 real Playwright permission grant for the approved operation's origin only —
 the capability is per-origin, never context-wide or cross-session — re-checks
-the live permission after approval, and revokes every issued grant immediately
-when the permission is turned off (the running browser keeps all of its other
-behavior). Headless Chromium operates on its per-instance virtual clipboard;
+the live permission after approval. When the permission is turned off, the
+manager clears every issued clipboard grant from live sessions (the running
+browser keeps all of its other behavior); if that engine clear cannot be
+confirmed, it fails the affected session closed and tears down its owned browser
+context so no retained grant survives, and the settings save reports the
+unconfirmed revocation with its closure status instead of claiming the disable
+applied. A clear that does not settle within the browser cleanup deadline is
+likewise reported to the save as still in flight (not confirmed applied), and
+the affected session is closed to contain any retained grants, with the
+closure status reported through the save. Headless Chromium operates on its per-instance virtual clipboard;
 headed desktop Chromium reaches the host system clipboard, and each result
 reports which scope was used.
 
@@ -710,8 +724,18 @@ when one of its tabs commits a top-level HTTP(S) navigation there — model
 navigation, adopted popups, and page-initiated navigation alike — re-evaluating
 the current effective policy at every commit. The grants compose with clipboard
 grants (enabling one never clears the others), YOLO enables all three,
-and disabling any of them immediately revokes its per-origin grants from
-every live session while leaving the other enabled grants intact. These
+and disabling any of them clears its per-origin grants from every live session
+while leaving the other enabled grants intact. A confirmed clear re-issues each
+still-enabled group for the affected origins; if a re-issue fails, that
+capability is reported off until the next applicable action or navigation
+rather than retained as forbidden authority. If an engine clear cannot be
+confirmed, the manager fails the affected session closed and tears down its
+owned browser context so no retained grant survives, and the settings save
+reports the unconfirmed revocation with its closure status instead of claiming
+the disable applied. A clear that does not settle within the browser cleanup
+deadline is likewise reported to the save as still in flight (not confirmed
+applied), and the affected session is closed to contain any retained grants,
+with the closure status reported through the save. These
 toggles grant capability, not forced activation: a page must still request the
 device or location API itself, and no browser tool invokes these APIs on the
 model's behalf — what a page does with granted access is page behavior,

@@ -827,6 +827,37 @@ function permissionGroupEnabled(group: BrowserPermissionGroup, policy: Effective
   return entry ? entry.enabled(policy) : false;
 }
 
+/** Outcome of one live session's permission revocation (issue #27).
+ * Every path is reported truthfully: an engine clear that cannot be confirmed
+ * never resolves as success — the affected session is failed and torn down to
+ * contain the retained grants, and that containment (with its confirmation
+ * status) is what gets reported. */
+export type BrowserPermissionRevocationOutcome =
+  | { status: "no_grant" }
+  /** A concurrent teardown already contains this context; its close kills the engine grants. */
+  | { status: "superseded"; reason: string }
+  /** The clear was confirmed; surviving enabled groups were re-issued, except the listed safe losses. */
+  | { status: "revoked"; regrantFailures: Array<{ origin: string; reason: string }> }
+  /** The clear could not be confirmed; the session was closed to contain the retained grants. */
+  | { status: "unconfirmed"; reason: string }
+  /** The mutation tail did not settle within the cleanup deadline (a wedged driver): the revocation is still in flight and unconfirmed; the affected session was closed to contain any retained grants. */
+  | { status: "in_flight"; reason: string };
+
+/** One live session's revocation outcome, plus — when a containment teardown
+ * is involved (an unconfirmed clear or a timed-out in-flight wait started one,
+ * or a superseded revocation observed an in-progress one) — whether that
+ * teardown itself was confirmed. */
+export interface BrowserPermissionRevocationEntry {
+  session: string;
+  outcome: BrowserPermissionRevocationOutcome;
+  closure?: "confirmed" | "unconfirmed";
+}
+
+/** The revocation report returned by updateConfig for one settings save. */
+export interface BrowserPermissionRevocationReport {
+  entries: BrowserPermissionRevocationEntry[];
+}
+
 interface Session {
   handle: string;
   activeTab: string;
@@ -1102,6 +1133,15 @@ export class InteractiveBrowserManager {
     });
   }
 
+  /**
+   * Rebind the live policy. The synchronous part (policy, caps, broker local-
+   * network switches, pending-download revocation) applies immediately; the
+   * engine-side permission revocations run against each live context and are
+   * reported through the returned promise instead of being voided, so a clear
+   * that cannot be confirmed — which fails the affected session to contain
+   * the retained grants — surfaces to the settings channel with its closure
+   * status rather than as a successful apply. The promise never rejects.
+   */
   updateConfig(
     config: WebFetchConfig,
     interactionApproval: BrowserInteractionApproval = "ask",
@@ -1109,7 +1149,7 @@ export class InteractiveBrowserManager {
     browserPermissions: WebBrowserPermissions = DEFAULT_BROWSER_PERMISSIONS,
     browserVisible: boolean = false,
     downloadRetention: number = DEFAULT_BROWSER_DOWNLOAD_RETENTION,
-  ): void {
+  ): Promise<BrowserPermissionRevocationReport> {
     validateIdleExpiryMinutes(idleExpiryMinutes);
     validateDownloadRetention(downloadRetention);
     this.config = config;
@@ -1139,20 +1179,56 @@ export class InteractiveBrowserManager {
     // Issue #27 live permission policy: revoking model clipboard read/write or
     // a device capability (camera/microphone/geolocation, including via YOLO
     // off) removes exactly those manager-issued groups from every live context
-    // immediately (fail closed). The composable group map clears only the
-    // revoked groups; every other enabled grant stays in force. Session close
-    // and controlled replacement discard grants together with their context.
+    // (fail closed). The composable group map clears only the revoked groups;
+    // every other enabled grant stays in force. Session close and controlled
+    // replacement discard grants together with their context.
     const revokedGroups: BrowserPermissionGroup[] = [
       ...(this.effectivePolicy.modelClipboard ? [] : [...CLIPBOARD_PERMISSION_GROUPS]),
       ...DEVICE_PERMISSION_GROUPS.filter((entry) => !entry.enabled(this.effectivePolicy)).map((entry) => entry.group),
     ];
-    if (revokedGroups.length > 0) {
-      for (const session of this.sessions.values()) {
-        if (!session.teardown) void this.revokePermissionGrants(session, revokedGroups).catch(() => undefined);
-      }
-    }
     this.idleExpiryMinutes = idleExpiryMinutes;
     for (const lease of this.idleLeases.values()) lease.update(idleExpiryMinutes);
+    if (revokedGroups.length === 0) return Promise.resolve({ entries: [] });
+    const affected = [...this.sessions.values()];
+    return Promise.all(affected.map(async (session): Promise<BrowserPermissionRevocationEntry> => {
+      // The mutation tail has no driver-visible timeout of its own (Playwright's
+      // permission calls expose none), so bound the wait with the cleanup
+      // deadline: a wedged-but-connected browser must delay this save at most
+      // that long, and is then reported explicitly — never awaited forever.
+      let outcome: BrowserPermissionRevocationOutcome;
+      try {
+        outcome = await boundedCleanup(
+          this.revokePermissionGrants(session, revokedGroups),
+          this.limits.cleanupMs,
+          "permission revocation",
+        );
+      } catch (error) {
+        // The bounded wait expired while the clear was still in flight: the
+        // engine may still hold the revoked groups, so contain them exactly
+        // like an unconfirmed clear — fail the owned session through the
+        // ordinary teardown machinery instead of leaving a live context with
+        // retained authority awaiting manual BrowserClose. The wedged
+        // mutation tail itself is never awaited (it could never settle); the
+        // bounded closure await below confirms or reports the containment
+        // truthfully.
+        const reason = bounded(asError(error).message, 200);
+        if (!session.teardown && !session.fatalError) {
+          this.failSession(session, new Error(`Browser permission revocation did not settle within its deadline (${reason}); the browser session was closed to contain any retained grants.`));
+        }
+        outcome = { status: "in_flight", reason };
+      }
+      // An unconfirmed clear or a timed-out wait started its own containment
+      // teardown; a superseded revocation observes an in-progress one. Await
+      // that bounded confirmation so the save reports the closure status
+      // truthfully instead of standing silent over a possibly-unconfirmed
+      // cleanup.
+      const teardown = session.teardown;
+      if (!teardown) return { session: session.handle, outcome };
+      let closure: "confirmed" | "unconfirmed";
+      try { await teardown; closure = "confirmed"; }
+      catch { closure = "unconfirmed"; }
+      return { session: session.handle, outcome, closure };
+    })).then((entries) => ({ entries }));
   }
 
   /** Select policy at the approval-required branch, after target restrictions.
@@ -2168,8 +2244,20 @@ export class InteractiveBrowserManager {
           try {
             this.enforceClipboardCapability();
           } catch (error) {
-            try { await this.revokePermissionGrants(session, CLIPBOARD_PERMISSION_GROUPS); }
-            catch { /* best effort: the capability is off and session close clears the context */ }
+            const outcome = await this.revokePermissionGrants(session, CLIPBOARD_PERMISSION_GROUPS);
+            // A failed engine clear fails the session to contain the retained
+            // grants; whether this call's revocation or a queued one hit it,
+            // the denial must carry the containment status instead of looking
+            // like an ordinary capability denial on a live session.
+            if (outcome.status === "unconfirmed" || session.fatalError) {
+              let containment = "confirmed";
+              try { await this.failAndWait(session, session.fatalError!); }
+              catch { containment = "unconfirmed"; }
+              const detail = outcome.status === "unconfirmed"
+                ? `Browser permission revocation could not be confirmed on the live context (${outcome.reason}), so the session was closed to contain the retained grants.`
+                : `The browser session failed while its permission revocation was being applied (${bounded(asError(session.fatalError!).message, 300)}).`;
+              throw new Error(`${name} not_started: ${asError(error).message} ${detail} Session teardown is ${containment}.`);
+            }
             throw error;
           }
           started = true;
@@ -3391,6 +3479,11 @@ export class InteractiveBrowserManager {
     // dropped (never re-issued); a failed engine grant drops that origin's
     // bookkeeping so the map never claims authority the context lacks.
     await this.reapplyCarriedPermissionGrants(session, restore);
+    // A revocation that could not be confirmed on the replacement context
+    // failed the new session to contain the retained grant; report it through
+    // the ordinary open-failure path instead of returning a usable-looking
+    // result for a dying session.
+    if (session.fatalError) throw session.fatalError;
     session.operationActive = false;
     this.renewIdleLease(session);
     return this.protectOutput({
@@ -4490,10 +4583,17 @@ export class InteractiveBrowserManager {
         return;
       }
       // Reconcile after the round-trip exactly like the clipboard path: a
-      // revocation can queue its clear before this grant commits.
+      // revocation can queue its clear before this grant commits. A clear
+      // that cannot be confirmed fails the session (contained by teardown);
+      // disclose it in the broker ledger because this chain is fire-and-
+      // forget — the settings save that caused the revocation reports the
+      // outcome through its own channel, and later operations see the fatal
+      // error.
       if (!permissionGroupEnabled(group, this.effectivePolicy)) {
-        try { await this.revokePermissionGrants(session, [group]); }
-        catch { /* best effort: session close clears the context */ }
+        const outcome = await this.revokePermissionGrants(session, [group]);
+        if (outcome.status === "unconfirmed") {
+          session.broker.note(`device permission revocation for ${bounded(origin, 200)} could not be confirmed (${outcome.reason}); the session was closed to contain the retained grant.`);
+        }
         return;
       }
     }
@@ -4530,8 +4630,15 @@ export class InteractiveBrowserManager {
           break;
         }
         if (!permissionGroupEnabled(group, this.effectivePolicy)) {
-          try { await this.revokePermissionGrants(session, [group]); }
-          catch { /* best effort: session close clears the context */ }
+          const outcome = await this.revokePermissionGrants(session, [group]);
+          if (outcome.status === "unconfirmed") {
+            // The replacement context retained a just-revoked grant and its
+            // clear could not be confirmed: the new session was failed and
+            // torn down to contain it. Disclose; the caller reports the
+            // failure through the ordinary open-failure path.
+            restore.notes.push(`Permission revocation for ${bounded(origin, 200)} could not be confirmed on the replacement browser (${outcome.reason}); the replacement session was closed to contain the retained grant.`);
+            return;
+          }
         }
       }
       if (failedAt !== undefined) {
@@ -4544,8 +4651,14 @@ export class InteractiveBrowserManager {
    * confirmed engine clear. The context is launched with no permissions and
    * this manager is its only grantor, so afterwards the engine matches the
    * bookkeeping map by construction; each re-grant carries the full union
-   * because Chromium replaces the origin's allowed set. */
-  private async regrantPermissionGrants(session: Session): Promise<void> {
+   * because Chromium replaces the origin's allowed set. A failed re-grant is
+   * a SAFE loss (the confirmed clear means the engine holds no permission for
+   * that origin): its record is dropped so bookkeeping never claims authority
+   * the context lacks, and the failure is returned for honest reporting
+   * instead of being claimed. Origins are independent in Chromium, so one
+   * failure does not withhold the other origins' surviving grants. */
+  private async regrantPermissionGrants(session: Session): Promise<Array<{ origin: string; reason: string }>> {
+    const failures: Array<{ origin: string; reason: string }> = [];
     for (const [origin, granted] of [...session.permissionGrants]) {
       if (granted.size === 0) {
         session.permissionGrants.delete(origin);
@@ -4555,33 +4668,85 @@ export class InteractiveBrowserManager {
       for (const held of granted) {
         for (const descriptor of BROWSER_PERMISSION_GROUP_GRANTS[held]) descriptors.add(descriptor);
       }
-      await session.context.grantPermissions([...descriptors], { origin });
+      try {
+        await session.context.grantPermissions([...descriptors], { origin });
+      } catch (error) {
+        // Drop the record: the cleared context holds nothing for this origin
+        // now, and the group is off until its next natural trigger — an
+        // approved clipboard operation or a navigation commit.
+        session.permissionGrants.delete(origin);
+        failures.push({ origin, reason: bounded(asError(error).message, 200) });
+      }
     }
+    return failures;
   }
 
   /** Remove the named groups' grants from every origin in a live context.
-   * The engine clear is confirmed before the bookkeeping forgets the groups,
-   * so a failed clear retries on the next revocation instead of stranding
-   * the engine grant until the context dies. The post-grant re-check in
-   * clipboard() forces a second revocation after any in-flight grant commits,
-   * so this ordering keeps that race closed. */
-  private async revokePermissionGrants(session: Session, groups: readonly BrowserPermissionGroup[]): Promise<void> {
-    await this.serializePermissionMutation(session, async () => {
-      const groupSet = new Set<BrowserPermissionGroup>(groups);
-      let holdsGroup = false;
-      for (const granted of session.permissionGrants.values()) {
-        for (const held of granted) {
-          if (groupSet.has(held)) { holdsGroup = true; break; }
-        }
-        if (holdsGroup) break;
+   * The engine clear is confirmed before the bookkeeping forgets the groups.
+   * A clear that cannot be confirmed is fail-closed: the bookkeeping records
+   * survive (the engine may still hold the revoked groups) and the affected
+   * session is failed through the ordinary teardown machinery, so the
+   * retained grants die with a confirmed context close — never reported as
+   * successfully revoked. The post-grant re-check in clipboard() forces a
+   * second revocation after any in-flight grant commits, so that race stays
+   * closed. This method never rejects: every failure mode resolves to a
+   * structured outcome with containment already applied. */
+  private async revokePermissionGrants(session: Session, groups: readonly BrowserPermissionGroup[]): Promise<BrowserPermissionRevocationOutcome> {
+    try {
+      return await this.serializePermissionMutation(session, () => this.revokePermissionGrantBody(session, groups));
+    } catch (error) {
+      // An unexpected manager failure inside the serialized mutation is
+      // contained exactly like an unconfirmed clear: a revoked capability
+      // must never leave its grants live without containment or reporting.
+      const reason = bounded(asError(error).message, 200);
+      if (!session.teardown && !session.fatalError) {
+        this.failSession(session, new Error(`Browser permission revocation failed (${reason}); the browser session was closed to contain any retained grants.`));
       }
-      if (!holdsGroup) return;
+      return { status: "unconfirmed", reason };
+    }
+  }
+
+  private async revokePermissionGrantBody(session: Session, groups: readonly BrowserPermissionGroup[]): Promise<BrowserPermissionRevocationOutcome> {
+    const groupSet = new Set<BrowserPermissionGroup>(groups);
+    let holdsGroup = false;
+    for (const granted of session.permissionGrants.values()) {
+      for (const held of granted) {
+        if (groupSet.has(held)) { holdsGroup = true; break; }
+      }
+      if (holdsGroup) break;
+    }
+    if (!holdsGroup) return { status: "no_grant" };
+    // A concurrent teardown (visibility replacement, idle expiry, explicit
+    // close, or an earlier failure) already contains this context: its close
+    // kills the engine grants, so no new containment is started or claimed.
+    if (session.teardown || session.fatalError) {
+      return { status: "superseded", reason: bounded((session.fatalError ?? new Error("teardown in progress")).message, 200) };
+    }
+
+    try {
       await session.context.clearPermissions();
-      for (const granted of session.permissionGrants.values()) {
-        for (const group of groups) granted.delete(group);
+    } catch (error) {
+      // The engine may still hold the revoked groups. The bookkeeping is
+      // deliberately untouched so the unresolved records survive until the
+      // context close is confirmed; contain by failing the owned session, and
+      // report the unconfirmed state instead of claiming the clear.
+      if (session.teardown || session.fatalError) {
+        return { status: "superseded", reason: bounded((session.fatalError ?? new Error("teardown in progress")).message, 200) };
       }
-      await this.regrantPermissionGrants(session);
-    });
+      const reason = bounded(asError(error).message, 200);
+      this.failSession(session, new Error(`Browser permission revocation could not be confirmed (${reason}); the browser session was closed to contain the retained grants.`));
+      return { status: "unconfirmed", reason };
+    }
+    // Confirmed clear: forget exactly the revoked groups, then re-issue the
+    // surviving union for every origin (Chromium replaces per-origin sets).
+    for (const granted of session.permissionGrants.values()) {
+      for (const group of groups) granted.delete(group);
+    }
+    const regrantFailures = await this.regrantPermissionGrants(session);
+    if (regrantFailures.length > 0) {
+      session.broker.note(`permission re-grant after a revocation clear failed for ${regrantFailures.length} origin(s) (${regrantFailures.map((entry) => bounded(entry.origin, 120)).join(", ")}); those grants are off until their next applicable action or navigation.`);
+    }
+    return { status: "revoked", regrantFailures };
   }
 
   /** Bounded wait for an in-progress retained download to settle. */

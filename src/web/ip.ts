@@ -187,6 +187,37 @@ function zeroBytes(bytes: Uint8Array, start: number, end: number): boolean {
 }
 
 /**
+ * IPv4 local-network ranges admitted ONLY by the explicit `allowLocalNetworks`
+ * opt-in: loopback 127/8, RFC1918 private 10/8 + 172.16/12 + 192.168/16, and
+ * link-local 169.254/16 (including the 169.254.169.254 cloud-metadata
+ * endpoint). CGNAT, this-network, multicast/broadcast, and every other
+ * special-purpose range are never local admissions.
+ */
+function isLocalIPv4(bytes: Uint8Array): boolean {
+  const [a, b] = [bytes[0], bytes[1]];
+  if (a === 127) return true;
+  if (a === 10) return true;
+  if (a === 172 && b !== undefined && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 169 && b === 254) return true;
+  return false;
+}
+
+/**
+ * IPv6 local-network ranges admitted ONLY by the explicit `allowLocalNetworks`
+ * opt-in: loopback ::1, unique-local fc00::/7, link-local fe80::/10, deprecated
+ * site-local fec0::/10, and the local-use NAT64 prefix 64:ff9b:1::/48.
+ */
+function isLocalIPv6(bytes: Uint8Array): boolean {
+  if (zeroBytes(bytes, 0, 15) && bytes[15] === 1) return true; // ::1
+  if (prefixMatches(bytes, [0xfc], 7)) return true;
+  if (prefixMatches(bytes, [0xfe, 0x80], 10)) return true;
+  if (prefixMatches(bytes, [0xfe, 0xc0], 10)) return true;
+  if (prefixMatches(bytes, [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01], 48)) return true;
+  return false;
+}
+
+/**
  * IPv4 special-purpose ranges that must never be fetched:
  * 0.0.0.0/8 (this network), 10.0.0.0/8, 100.64.0.0/10 (CGNAT), 127.0.0.0/8,
  * 169.254.0.0/16 (link-local incl. cloud metadata), 172.16.0.0/12,
@@ -194,9 +225,14 @@ function zeroBytes(bytes: Uint8Array, start: number, end: number): boolean {
  * 192.88.99.0/24 (6to4 relay anycast), 192.168.0.0/16, 198.18.0.0/15
  * (benchmarking), 198.51.100.0/24 (TEST-NET-2), 203.0.113.0/24 (TEST-NET-3),
  * 224.0.0.0/4 (multicast), 240.0.0.0/4 (reserved) incl. 255.255.255.255.
+ *
+ * `allowLocal` (the explicit opt-in only) exempts the local-network ranges
+ * above; everything else — notably multicast, broadcast, reserved, this-network,
+ * CGNAT, and the documentation/benchmarking blocks — stays blocked regardless.
  */
-function isBlockedIPv4(bytes: Uint8Array): boolean {
+function isBlockedIPv4(bytes: Uint8Array, allowLocal: boolean): boolean {
   const [a, b, c] = [bytes[0], bytes[1], bytes[2]];
+  if (allowLocal && isLocalIPv4(bytes)) return false;
   if (a === 0) return true;
   if (a === 10) return true;
   if (a === 100 && b !== undefined && b >= 64 && b <= 127) return true;
@@ -219,18 +255,45 @@ function isUnspecifiedIPv6(bytes: Uint8Array): boolean {
 }
 
 /**
+ * Admission options for the canonical range check. The default (absent or
+ * `allowLocalNetworks: false`) is unchanged public-only behavior.
+ */
+export interface AddressAdmission {
+  /**
+   * Explicit opt-in (browser broker/network admission only): also admit
+   * local-network destinations — IPv4 loopback 127/8, RFC1918 private 10/8 +
+   * 172.16/12 + 192.168/16, IPv4 link-local 169.254/16 (including the
+   * 169.254.169.254 cloud-metadata endpoint), IPv6 loopback ::1, unique-local
+   * fc00::/7, link-local fe80::/10, deprecated site-local fec0::/10, and the
+   * local-use NAT64 prefix 64:ff9b:1::/48. Multicast (224/4, ff00::/8),
+   * broadcast/reserved (240/4), the unspecified address, 0.0.0.0/8, and every
+   * other special-purpose range stay blocked regardless — they are
+   * protocol/connection limitations, not local networks. IPv4 embedded in IPv6
+   * (mapped, compatible, NAT64, 6to4) runs through the SAME relaxed IPv4
+   * table, so hex/dotted spellings behave identically in both modes.
+   */
+  allowLocalNetworks?: boolean;
+}
+
+/**
  * Canonical SSRF range check. Fails closed: unparseable input is blocked.
  * For IPv4-embedded IPv6 forms (mapped `::ffff:0:0/96`, compatible `::/96`,
  * NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) the embedded 32-bit IPv4 is
  * extracted and run through the IPv4 blocklist so hex/dotted spellings
  * behave identically.
+ *
+ * The explicit `allowLocalNetworks` opt-in (browser broker/network admission
+ * only) exempts only the local-network ranges documented on
+ * {@link AddressAdmission}; the default behavior is byte-for-byte unchanged.
  */
-export function isBlockedAddress(address: string): boolean {
+export function isBlockedAddress(address: string, admission?: AddressAdmission): boolean {
+  const allowLocal = admission?.allowLocalNetworks === true;
   const parsed = parseIp(address.trim().toLowerCase());
   if (!parsed) return true;
 
-  if (parsed.version === 4) return isBlockedIPv4(parsed.bytes);
+  if (parsed.version === 4) return isBlockedIPv4(parsed.bytes, allowLocal);
   const bytes = parsed.bytes;
+  if (allowLocal && isLocalIPv6(bytes)) return false;
 
   // IPv4-embedded forms live in the low 32 bits (bytes 12–15):
   // - mapped ::ffff:0:0/96 — bytes 10–11 are 0xff,0xff (the WHATWG URL parser
@@ -239,22 +302,23 @@ export function isBlockedAddress(address: string): boolean {
   // - compatible ::/96 — bytes 0–11 all zero.
   // The unspecified address `::` and loopback `::1` are covered here too.
   if (zeroBytes(bytes, 0, 10) && bytes[10] === 0xff && bytes[11] === 0xff) {
-    return isBlockedIPv4(bytes.subarray(12));
+    return isBlockedIPv4(bytes.subarray(12), allowLocal);
   }
   if (zeroBytes(bytes, 0, 12)) {
     if (isUnspecifiedIPv6(bytes)) return true;
     if (zeroBytes(bytes, 12, 16)) return true; // all-zero low bits
-    return isBlockedIPv4(bytes.subarray(12));
+    return isBlockedIPv4(bytes.subarray(12), allowLocal);
   }
   // NAT64 well-known prefix 64:ff9b::/96 embeds IPv4 in the low 32 bits.
   if (prefixMatches(bytes, [0x00, 0x64, 0xff, 0x9b], 32) && zeroBytes(bytes, 4, 12)) {
-    return isBlockedIPv4(bytes.subarray(12));
+    return isBlockedIPv4(bytes.subarray(12), allowLocal);
   }
-  // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215) is non-public outright.
-  if (prefixMatches(bytes, [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01], 48)) return true;
+  // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215) is non-public outright;
+  // it is a local-use range, so only the explicit opt-in admits it.
+  if (prefixMatches(bytes, [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01], 48)) return !allowLocal;
   // 6to4 2002::/16 embeds IPv4 in the next 32 bits.
   if (prefixMatches(bytes, [0x20, 0x02], 16)) {
-    return isBlockedIPv4(bytes.subarray(2, 6));
+    return isBlockedIPv4(bytes.subarray(2, 6), allowLocal);
   }
   // Teredo 2001::/32 (deprecated, embedded obfuscated IPv4).
   if (prefixMatches(bytes, [0x20, 0x01, 0x00, 0x00], 32)) return true;

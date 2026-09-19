@@ -33,7 +33,8 @@ receipts of exactly what the model was told.
   semantic browser (`BrowserOpen`, `BrowserNavigate`, `BrowserSnapshot`,
   bounded `BrowserConsole`, `BrowserNetwork`, and `BrowserInspect` diagnostics,
   `BrowserScreenshot`, `BrowserScroll`, `BrowserHover`, policy-bound `BrowserClick`,
-  `BrowserFill`, `BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserWait`, `BrowserHistory`, `BrowserTabs`, `BrowserClose`), all with
+  `BrowserFill`, `BrowserType`, `BrowserSelect`, `BrowserPress`, permission-gated
+  `BrowserUpload` and `BrowserDownloadSave`, `BrowserWait`, `BrowserHistory`, `BrowserTabs`, `BrowserClose`), all with
   DNS-rebinding-hardened, validated egress
   ([Web tools](docs/web-tools.md),
   [Security model](docs/security-model.md#web-egress-hardening)).

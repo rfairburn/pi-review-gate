@@ -63,7 +63,10 @@ path:
 For every destination — including cross-hostname resources and redirects — the broker
 canonicalizes the request or CONNECT authority, rejects credentials and non-HTTP(S)
 schemes, resolves the hostname exactly once, requires every resolved address to be
-public, and dials only that validated address set, with no fallback to system DNS.
+public (unless the interactive session's explicit `localNetworks` opt-in is in
+effect, which additionally admits loopback, private, link-local, and cloud-metadata
+addresses; one-shot renders and WebFetch stay public-only), and dials only that
+validated address set, with no fallback to system DNS.
 Original hostname semantics are preserved: the browser keeps its `Host` header for plain
 HTTP, and HTTPS traffic stays end-to-end through the CONNECT tunnel, so TLS SNI and
 certificate verification remain between Chromium and the origin (the broker never
@@ -71,13 +74,16 @@ decrypts it). In one-shot `BrowserExtract` renders WebSockets are always closed;
 interactive sessions page-created `ws:`/`wss:` connections use Chromium's native
 WebSocket stack through the same authenticated loopback broker (the context proxy
 credentials carry the authentication): before the browser is allowed to connect, each
-requested destination is validated against the public-URL policy (every address public,
-no URL credentials, no harness retry or replay). The broker independently revalidates
+requested destination is validated against the public-URL policy (every address
+public unless the session's `localNetworks` opt-in is in effect, no URL credentials,
+no harness retry or replay). The broker independently revalidates
 and pins each actual connection. Chromium can tunnel both `ws:` and `wss:` through
 CONNECT; the broker also supports authenticated plain HTTP WebSocket upgrades for
 opted-in clients. WSS stays end-to-end TLS inside CONNECT. Neither the manager nor
-broker parses WebSocket frames or retains payloads in diagnostics. Service workers are
-blocked in both modes, and every outbound connection is recorded in a broker-owned
+broker parses WebSocket frames or retains payloads in diagnostics. `BrowserExtract`
+blocks service workers unconditionally; interactive sessions block them by default
+and allow them only under the model service-worker permission (below). Every
+outbound connection is recorded in a broker-owned
 connection ledger that is audited before a `BrowserExtract` render result is returned;
 that one-shot browser and its broker sockets quiesce before extraction is exposed.
 Interactive browsers instead remain live across turns and reviews until explicit close
@@ -89,13 +95,22 @@ connections. Background page traffic does not renew the tool-activity lease.
 
 `BrowserExtract` aborts images, media, and fonts before any connection. Interactive
 sessions instead allow images, downloadable fonts, media, SSE and HTTP beacons through
-the same protected broker. Dedicated/shared workers retain broker-only egress; service
-workers remain blocked. CSP, CORS, TLS validation, nonproxied-WebRTC restrictions,
-default-deny DNS, and no-QUIC/proxy-bypass defenses are unchanged. `BrowserScreenshot` captures only the already-rendered viewport
+the same protected broker. Dedicated/shared workers retain broker-only egress.
+Service workers are blocked in interactive sessions by default; when the model
+service-worker permission (or YOLO) is enabled they may register, but their script
+loads and worker-initiated requests still traverse only the authenticated broker under
+the same public-URL, DNS-pinning, and local-network policy. One verified limitation:
+Playwright's per-tab WebSocket admission does not observe sockets created inside a
+service worker; those connections are still validated and pinned by the broker before
+dial, but they skip the manager-side admission record. CSP, CORS, TLS validation,
+nonproxied-WebRTC restrictions, default-deny DNS, and no-QUIC/proxy-bypass defenses
+are unchanged. `BrowserScreenshot` captures only the already-rendered viewport
 or an element addressed by a current opaque semantic ref; it does not admit a new
 network path. Bounded scroll/wait/history/form controls and every owned tab or admitted
 popup stay inside the same context and authenticated broker; the four-tab cap closes
-excess popups before they can become unowned. Element bounds must fit the viewport and become an immutable screenshot
+excess popups before they can become unowned, except that the model popup restriction
+override (or YOLO) adopts over-limit page-created popups as owned tabs with the full
+guard set instead of closing them. Element bounds must fit the viewport and become an immutable screenshot
 clip; the capture leaves finite animations running rather than fast-forwarding them
 after preflight, so a page resize cannot enlarge the requested image. Before native Pi
 image delivery, both pre-capture and decoded final PNG dimensions/pixels are bounded,

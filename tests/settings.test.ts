@@ -569,6 +569,50 @@ test("browser idle expiry validates, stages, cancels and reloads through Web set
   assert.equal(saved.web.future, true);
 });
 
+test("download retention validates, stages, cancels and reloads through Web settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-retention-"));
+  const configPath = join(dir, "review-gate.json");
+  const original = JSON.stringify({ enabled: false, review: { activeReviewers: [] }, web: { future: true } });
+  await writeFile(configPath, original);
+  const config = normalizeConfig(JSON.parse(original));
+  const registered = commandHarness();
+  const reloaded: number[] = [];
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: (next) => { reloaded.push(next.web!.browserDownloadRetention); } });
+  const webRow = rootSettingsRow("Web", "50 MiB max download · headless browser");
+  const retentionRow = webSettingsRow("Download retention", "8 unsaved per session");
+
+  // Cancel: staging a value and backing out never persists it.
+  await registered.handler("", contextWithSelections([webRow, retentionRow, "Back", "Cancel"], [], ["3"]));
+  assert.equal(await readFile(configPath, "utf8"), original);
+  assert.equal(config.web!.browserDownloadRetention, 8);
+  assert.deepEqual(reloaded, []);
+
+  // Invalid input is rejected with a precise error and never staged.
+  const invalid = ["-1", "1.5", "NaN", "Infinity", "9007199254740992", "", "abc"];
+  const errors: string[] = [];
+  const ctx = contextWithSelections([
+    webRow, ...invalid.map(() => retentionRow), retentionRow, retentionRow,
+    webSettingsRow("Download retention", "3 unsaved per session"), "Back", "Save changes",
+  ], [], [...invalid, undefined, "3", undefined]) as { ui: { notify: (message: string, type?: string) => void } };
+  ctx.ui.notify = (message, type) => { if (type === "error") errors.push(message); };
+  await registered.handler("", ctx);
+  assert.equal(errors.length, invalid.length);
+  assert.ok(errors.every((message) => message.includes("Enter 0 for unlimited")));
+  assert.equal(config.web!.browserDownloadRetention, 3);
+  assert.deepEqual(reloaded, [3]);
+  let saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserDownloadRetention, 3);
+  assert.equal(saved.web.future, true);
+
+  // Entering 0 stages the unlimited display and persists it on save.
+  const zeroRow = webSettingsRow("Download retention", "0 · unlimited unsaved downloads");
+  await registered.handler("", contextWithSelections([webRow, webSettingsRow("Download retention", "3 unsaved per session"), zeroRow, "Back", "Save changes"], [], ["0"]));
+  assert.equal(config.web!.browserDownloadRetention, 0);
+  assert.deepEqual(reloaded, [3, 0]);
+  saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserDownloadRetention, 0);
+});
+
 test("web settings stage and save the maximum download size in MiB", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-web-"));
   const configPath = join(dir, "review-gate.json");
@@ -787,6 +831,196 @@ test("browser visibility stages, cancels, persists, and applies immediately thro
   assert.equal(config.web!.browserVisible, false);
   assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")).web.browserVisible, false);
   assert.deepEqual(savedValues, [true, false]);
+});
+
+test("browser permissions submenu stages independent toggles and saves or cancels them", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-browser-permissions-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({ enabled: false, review: { activeReviewers: [] } }));
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  // Stage two toggles and cancel: nothing is persisted.
+  const before = await readFile(configPath, "utf8");
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    webSettingsRow("Browser permissions", "0 of 11 enabled"),
+    browserPermissionsRow("Model uploads", "Off"),
+    browserPermissionsRow("Local networks (human and model)", "Off"),
+    "Back",
+    "Back",
+    "Cancel",
+  ]));
+  assert.equal(await readFile(configPath, "utf8"), before);
+
+  // Stage one toggle and save: only that capability changes.
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    webSettingsRow("Browser permissions", "0 of 11 enabled"),
+    browserPermissionsRow("Model uploads", "Off"),
+    "Back",
+    "Back",
+    "Save changes",
+  ]));
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserPermissions.modelUploads, true);
+  assert.equal(saved.web.browserPermissions.yolo, false);
+  assert.equal(saved.web.browserPermissions.localNetworks, false);
+  assert.equal(config.web!.browserPermissions.modelUploads, true);
+});
+
+test("enabling browser permissions presents risk-appropriate warnings; disabling does not", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-browser-permissions-warn-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({ enabled: false, review: { activeReviewers: [] } }));
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  const notices: Array<{ message: string; type?: string }> = [];
+  const ctx = contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    webSettingsRow("Browser permissions", "0 of 11 enabled"),
+    browserPermissionsRow("Model credential entry", "Off"),
+    browserPermissionsRow("Local networks (human and model)", "Off"),
+    browserPermissionsRow("Model uploads", "Off"),
+    browserPermissionsRow("Model uploads", "On"), // disabling: no warning
+    "Back",
+    "Back",
+    "Save changes",
+  ]) as { ui: { notify: (message: string, type?: string) => void } };
+  ctx.ui.notify = (message, type) => notices.push({ message, type });
+
+  await registered.handler("", ctx);
+
+  const warnings = notices.filter((notice) => notice.type === "warning");
+  assert.equal(warnings.length, 3);
+  assert.ok(warnings.some((notice) => notice.message.includes("masking alone does not protect secrets")));
+  assert.ok(warnings.some((notice) => notice.message.includes("cloud metadata endpoints")));
+  assert.ok(warnings.some((notice) => notice.message.includes("arbitrary host files")));
+  // The submenu discloses where every capability is enforced (issue #27
+  // runtime enforcement has landed: no capability stays pending).
+  assert.ok(notices.some((notice) => notice.type === "info"
+    && notice.message.includes("every capability is enforced")
+    && notice.message.includes("per-origin device permission grants")
+    && notice.message.includes("interactive egress broker")));
+  assert.ok(notices.every((notice) => notice.type !== "error"));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserPermissions.modelCredentialEntry, true);
+  assert.equal(saved.web.browserPermissions.localNetworks, true);
+  assert.equal(saved.web.browserPermissions.modelUploads, false); // toggled on, then off
+});
+
+test("YOLO stays Off without an interactive confirmation dialog or when the human declines", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-yolo-declined-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({ enabled: false, review: { activeReviewers: [] } }));
+
+  // No confirm UI at all: enabling must fail closed and leave it Off.
+  let config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  let registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const errors: string[] = [];
+  const noConfirmCtx = contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    webSettingsRow("Browser permissions", "0 of 11 enabled"),
+    browserPermissionsRow("YOLO / allow everything", "Off"),
+    "Back",
+    "Back",
+    "Save changes",
+  ]) as { ui: { confirm?: unknown; notify: (message: string, type?: string) => void } };
+  delete noConfirmCtx.ui.confirm;
+  noConfirmCtx.ui.notify = (message, type) => { if (type === "error") errors.push(message); };
+  await registered.handler("", noConfirmCtx);
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0]!.includes("interactive confirmation dialog"));
+  let saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserPermissions.yolo, false);
+
+  // Confirm UI present but the human declines: it stays Off and cancels clean.
+  config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const before = await readFile(configPath, "utf8");
+  const declinedNotices: string[] = [];
+  const declinedCtx = contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    webSettingsRow("Browser permissions", "0 of 11 enabled"),
+    browserPermissionsRow("YOLO / allow everything", "Off"),
+    "Back",
+    "Back",
+    "Cancel",
+  ], [], [], [false]) as { ui: { notify: (message: string, type?: string) => void } };
+  declinedCtx.ui.notify = (message) => declinedNotices.push(message);
+  await registered.handler("", declinedCtx);
+  assert.equal(await readFile(configPath, "utf8"), before);
+  assert.ok(declinedNotices.includes("YOLO stays Off."));
+});
+
+test("YOLO requires confirmation to enable, persists with saved values beneath it, and disables straightforwardly", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-yolo-enable-"));
+  const configPath = join(dir, "review-gate.json");
+  // A pre-saved individual value that YOLO must preserve beneath the override.
+  await writeFile(configPath, JSON.stringify({
+    enabled: false,
+    review: { activeReviewers: [] },
+    web: { browserPermissions: { modelUploads: true } },
+  }));
+
+  // Enable with explicit confirmation.
+  let config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  let registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const notices: Array<{ message: string; type?: string }> = [];
+  let confirmTitle: string | undefined;
+  const enableCtx = contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    webSettingsRow("Browser permissions", "1 of 11 enabled"),
+    browserPermissionsRow("YOLO / allow everything", "Off"),
+    "Back",
+    "Back",
+    "Save changes",
+  ], [], [], [true]) as { ui: { confirm: (title: string, message: string) => Promise<boolean>; notify: (message: string, type?: string) => void } };
+  enableCtx.ui.confirm = async (title) => { confirmTitle = title; return true; };
+  enableCtx.ui.notify = (message, type) => notices.push({ message, type });
+  await registered.handler("", enableCtx);
+
+  assert.equal(confirmTitle, "Enable YOLO / allow everything?");
+  const warnings = notices.filter((notice) => notice.type === "warning");
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0]!.message.includes("cloud metadata addresses"));
+  assert.ok(warnings[0]!.message.includes("bypasses per-action approval prompts"));
+  let saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserPermissions.yolo, true);
+  assert.equal(saved.web.browserPermissions.modelUploads, true); // preserved beneath YOLO
+  assert.equal(config.web!.browserPermissions.yolo, true);
+
+  // Disable: straightforward — no confirmation dialog may be required, and the
+  // saved individual value becomes effective again exactly as stored.
+  config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  let confirmCalls = 0;
+  const disableNotices: string[] = [];
+  const disableCtx = contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download · headless browser · YOLO ON"),
+    webSettingsRow("Browser permissions", "YOLO on"),
+    browserPermissionsRow("YOLO / allow everything", "On"),
+    "Back",
+    "Back",
+    "Save changes",
+  ]) as { ui: { confirm: (title: string, message: string) => Promise<boolean>; notify: (message: string, type?: string) => void } };
+  disableCtx.ui.confirm = async () => { confirmCalls++; throw new Error("disabling YOLO must not require confirmation"); };
+  disableCtx.ui.notify = (message) => disableNotices.push(message);
+  await registered.handler("", disableCtx);
+
+  assert.equal(confirmCalls, 0);
+  assert.ok(disableNotices.includes("YOLO disabled; the saved individual browser permissions are effective again."));
+  saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserPermissions.yolo, false);
+  assert.equal(saved.web.browserPermissions.modelUploads, true);
 });
 
 test("/review-settings aligns every settings value column from the full label set", async () => {
@@ -1638,7 +1872,22 @@ const RETRY_SETTING_LABELS = [
   "Delay jitter",
 ] as const;
 
-const WEB_SETTING_LABELS = ["Maximum download", "Browser interaction approval", "Browser idle expiry", "Browser visibility"] as const;
+const WEB_SETTING_LABELS = ["Maximum download", "Browser interaction approval", "Browser idle expiry", "Download retention", "Browser visibility", "Browser permissions"] as const;
+
+const BROWSER_PERMISSION_LABELS = [
+  "Model credential entry",
+  "Model credential submission",
+  "Model uploads",
+  "Model download saving",
+  "Model clipboard read/write",
+  "Model camera",
+  "Model microphone",
+  "Model geolocation",
+  "Model service workers",
+  "Model popup restriction override",
+  "Local networks (human and model)",
+  "YOLO / allow everything",
+] as const;
 
 function rootSettingsRow(label: typeof ROOT_SETTING_LABELS[number], value: string): string {
   return alignedTestRow(label, value, ROOT_SETTING_LABELS);
@@ -1650,6 +1899,10 @@ function retrySettingsRow(label: typeof RETRY_SETTING_LABELS[number], value: str
 
 function webSettingsRow(label: typeof WEB_SETTING_LABELS[number], value: string): string {
   return alignedTestRow(label, value, WEB_SETTING_LABELS);
+}
+
+function browserPermissionsRow(label: typeof BROWSER_PERMISSION_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, BROWSER_PERMISSION_LABELS);
 }
 
 function alignedTestRow(label: string, value: string, labels: readonly string[]): string {
@@ -1689,9 +1942,11 @@ function contextWithSelections(
   values: Array<string | undefined>,
   scopedModels: unknown[] = [],
   inputs: Array<string | undefined> = [],
+  confirms: Array<boolean> = [],
 ): unknown {
   let index = 0;
   let inputIndex = 0;
+  let confirmIndex = 0;
   return {
     scopedModels,
     ui: {
@@ -1702,6 +1957,9 @@ function contextWithSelections(
       },
       async input() {
         return inputs[inputIndex++];
+      },
+      async confirm(_title: string, _message: string) {
+        return confirms[confirmIndex++] ?? false;
       },
       notify() {},
     },

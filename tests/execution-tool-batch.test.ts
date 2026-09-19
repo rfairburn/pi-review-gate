@@ -571,7 +571,7 @@ test("SubtasksStart creates immutable research groups without child-local eviden
       "read", "WebSearch", "WebFetch", "BrowserExtract",
       "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
       "BrowserScroll", "BrowserHover", "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
-      "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "EvidenceAdd", "EvidenceGet", "EvidenceList",
+      "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard", "EvidenceAdd", "EvidenceGet", "EvidenceList",
     ],
   });
   const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
@@ -596,7 +596,7 @@ test("SubtasksStart creates immutable research groups without child-local eviden
     allowedToolCatalog: researchCatalog,
     initialActiveTools: ["read"],
   });
-  for (const forbidden of ["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress"]) {
+  for (const forbidden of ["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard"]) {
     assert.equal(started.details.tasks[0].definition.executorToolCatalog?.allowedToolCatalog.includes(forbidden), false);
   }
   assert.equal(started.details.tasks[0].definition.backgroundKind, "research");

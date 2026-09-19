@@ -3,6 +3,9 @@ import test from "node:test";
 import {
   BrowserConfirmationPermits,
   BrowserConsequencePolicy,
+  isCredentialFieldTarget,
+  modelActionRequiresCredentialEntry,
+  modelActionSubmitsCredentialForm,
   type BrowserConfirmationBinding,
   type BrowserTargetStructure,
 } from "../src/web/browser-interaction-policy";
@@ -122,4 +125,90 @@ test("confirmation permits bind every action field, expire absolutely, and canno
   const expired = permits.issue(binding);
   now = expired.expiresAt;
   assert.equal(permits.consume(expired, binding), false);
+});
+
+// Issue #27 model credential capability predicates: structural, value-free,
+// and scoped to entry/activation so ordinary forms stay unaffected.
+test("credential field detection is structural and never reads values", () => {
+  const editable: BrowserTargetStructure = {
+    ...baseTarget, tagName: "input", role: "textbox", inputType: "text",
+    formAssociated: true, autocomplete: null,
+  };
+  assert.equal(isCredentialFieldTarget({ ...editable, inputType: "password" }), true);
+  assert.equal(isCredentialFieldTarget({ ...editable, autocomplete: "current-password" }), true);
+  assert.equal(isCredentialFieldTarget({ ...editable, autocomplete: "new-password" }), true);
+  // Tokens are matched case-insensitively within space-separated lists.
+  assert.equal(isCredentialFieldTarget({ ...editable, autocomplete: "  NEW-PASSWORD username " }), true);
+  assert.equal(isCredentialFieldTarget({ ...editable, autocomplete: "username" }), false);
+  assert.equal(isCredentialFieldTarget({ ...editable, autocomplete: "one-time-code" }), false);
+  assert.equal(isCredentialFieldTarget({ ...editable, autocomplete: null }), false);
+});
+
+test("credential entry gate covers value entry only, never activation", () => {
+  const password: BrowserTargetStructure = {
+    ...baseTarget, tagName: "input", role: "textbox", inputType: "password",
+    formAssociated: true, autocomplete: null, formHasCredentialField: true,
+  };
+  assert.equal(modelActionRequiresCredentialEntry("fill", undefined, password), true);
+  assert.equal(modelActionRequiresCredentialEntry("type", undefined, password), true);
+  // Non-activation keys type characters into the credential field.
+  assert.equal(modelActionRequiresCredentialEntry("press", "a", password), true);
+  assert.equal(modelActionRequiresCredentialEntry("press", "ArrowDown", password), true);
+  assert.equal(modelActionRequiresCredentialEntry("press", "Space", password), true, "space in a text control types a character");
+  // Activation keys are the submission gate's domain.
+  assert.equal(modelActionRequiresCredentialEntry("press", "Enter", password), false);
+  const submit: BrowserTargetStructure = {
+    ...baseTarget, tagName: "button", role: "button", inputType: "submit",
+    formAssociated: true, autocomplete: null, formHasCredentialField: true,
+  };
+  assert.equal(modelActionRequiresCredentialEntry("press", "Space", submit), false);
+  // Click and select never enter field values.
+  assert.equal(modelActionRequiresCredentialEntry("click", undefined, password), false);
+  assert.equal(modelActionRequiresCredentialEntry("select", undefined, password), false);
+  // Ordinary fields are outside the entry gate even in credential forms.
+  const ordinary: BrowserTargetStructure = {
+    ...baseTarget, tagName: "input", role: "textbox", inputType: "text",
+    formAssociated: true, autocomplete: null, formHasCredentialField: true,
+  };
+  assert.equal(modelActionRequiresCredentialEntry("fill", undefined, ordinary), false);
+  assert.equal(modelActionRequiresCredentialEntry("press", "a", ordinary), false);
+});
+
+test("credential submission gate covers real activations of credential forms only", () => {
+  const submit: BrowserTargetStructure = {
+    ...baseTarget, tagName: "button", role: "button", inputType: "submit",
+    formAssociated: true, autocomplete: null, formHasCredentialField: true,
+  };
+  assert.equal(modelActionSubmitsCredentialForm("click", undefined, submit), true);
+  assert.equal(modelActionSubmitsCredentialForm("press", "Enter", submit), true);
+  assert.equal(modelActionSubmitsCredentialForm("press", "Space", submit), true);
+  // Non-credential forms are never gated: the toggle cannot deny ordinary forms.
+  const plainSubmit = { ...submit, formHasCredentialField: false };
+  assert.equal(modelActionSubmitsCredentialForm("click", undefined, plainSubmit), false);
+  assert.equal(modelActionSubmitsCredentialForm("press", "Enter", plainSubmit), false);
+  // type=button is not a submit control.
+  const cancelButton = { ...submit, inputType: "button" };
+  assert.equal(modelActionSubmitsCredentialForm("click", undefined, cancelButton), false);
+  // Invalid button type values are still submit buttons in browsers.
+  assert.equal(modelActionSubmitsCredentialForm("click", undefined, { ...submit, inputType: "foo" }), true);
+  // Activation press in a credential form context (implicit submission).
+  const field: BrowserTargetStructure = {
+    ...baseTarget, tagName: "input", role: "textbox", inputType: "text",
+    formAssociated: true, autocomplete: null, formHasCredentialField: true,
+  };
+  assert.equal(modelActionSubmitsCredentialForm("press", "Enter", field), true);
+  assert.equal(modelActionSubmitsCredentialForm("press", "a", field), false);
+  // A non-form control never submits a form.
+  const link: BrowserTargetStructure = {
+    ...baseTarget, tagName: "a", role: "link", href: "https://example.com/",
+    inputType: null, formAssociated: false, formHasCredentialField: true,
+  };
+  assert.equal(modelActionSubmitsCredentialForm("click", undefined, link), false);
+  // Activation on a proven credential control is gated even when the owning
+  // form's credential membership was not proven from descendant structure.
+  const orphanPassword = { ...field, inputType: "password", formHasCredentialField: false };
+  assert.equal(modelActionSubmitsCredentialForm("press", "Enter", orphanPassword), true);
+  // Filling and selecting never submit.
+  assert.equal(modelActionSubmitsCredentialForm("fill", undefined, field), false);
+  assert.equal(modelActionSubmitsCredentialForm("select", undefined, field), false);
 });

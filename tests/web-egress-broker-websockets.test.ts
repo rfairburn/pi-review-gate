@@ -635,6 +635,59 @@ test("opted-in plain ws upgrades handshake and echo bidirectionally through the 
   }
 });
 
+test("opted-in ws upgrades reach local-network destinations under the local admission opt-in", async () => {
+  const origin = await echoOrigin();
+  const { auth, credentials } = testAuth();
+  // Synthetic DNS only: literals answer themselves; one name answers multicast.
+  const localResolver: HostResolver = (hostname) => {
+    if (hostname === "multicast.test") return Promise.resolve(["224.0.0.1"]);
+    return Promise.resolve([hostname]);
+  };
+  const harness = await startBroker(localResolver, {
+    auth,
+    budgets: { allowLocalNetworks: true },
+    websockets: { enabled: true },
+  });
+  const client = new TestWsClient(harness.port);
+  try {
+    // Loopback destination is admitted and pinned end to end.
+    const handshake = await client.handshake("127.0.0.1", origin.port, credentials);
+    assert.equal(handshake.status, 101, "an opted-in local ws upgrade reaches the loopback origin");
+    client.send("local-echo-probe");
+    const echoed = await client.receive();
+    assert.equal(echoed.payload.toString("utf8"), "local-echo-probe");
+    assert.deepEqual(harness.dials, [{ hostname: "127.0.0.1", port: origin.port, address: "127.0.0.1" }]);
+    const entry = harness.broker.summary().ledger[0];
+    assert.equal(entry?.kind, "ws");
+    assert.equal(entry?.address, "127.0.0.1");
+    client.destroy();
+    await client.closedWithin(2_000);
+  } finally {
+    client.destroy();
+    await harness.stop();
+    await close(origin.server);
+  }
+
+  // Purpose-invalid destinations stay refused on the ws path too, before any dial.
+  const strictOrigin = await echoOrigin();
+  const strictHarness = await startBroker(localResolver, {
+    auth,
+    budgets: { allowLocalNetworks: true },
+    websockets: { enabled: true },
+  });
+  const strictClient = new TestWsClient(strictHarness.port);
+  try {
+    const refused = await strictClient.handshake("multicast.test", strictOrigin.port, credentials);
+    assert.equal(refused.status, 403, "multicast stays a protocol/connection limitation under the opt-in");
+    assert.equal(strictHarness.dials.length, 0, "refused ws destinations are never dialed");
+    assert.equal(strictOrigin.connections, 0);
+  } finally {
+    strictClient.destroy();
+    await strictHarness.stop();
+    await close(strictOrigin.server);
+  }
+});
+
 test("malformed and non-websocket upgrades are refused without dialing", async () => {
   const origin = await echoOrigin();
   const { auth, credentials } = testAuth();

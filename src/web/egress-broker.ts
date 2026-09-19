@@ -13,9 +13,14 @@
  * - Plain HTTP proxy requests must arrive in absolute form with the `http:`
  *   scheme; CONNECT tunnels carry the `host:port` authority. Both are
  *   canonicalized, capped in length, resolved exactly once through the caller
- *   supplied resolver, and every resolved address must be public before a
- *   single socket is dialed. There is no fallback to system DNS: the dial only
- *   uses the validated address set produced immediately above.
+ *   supplied resolver, and every resolved address must be admitted before a
+ *   single socket is dialed. Admission is public-only by default;
+ *   local-network destinations (loopback/private/link-local/cloud-metadata)
+ *   are admitted only when the broker instance was explicitly constructed with
+ *   `allowLocalNetworks` enabled in its budgets (default false;
+ *   multicast/broadcast/reserved stay refused either way). There is no
+ *   fallback to system DNS: the dial only uses the validated address set
+ *   produced immediately above.
  * - Original hostname semantics are preserved end to end: the browser keeps
  *   the original `Host` header for plain HTTP, and HTTPS CONNECT tunnels are
  *   opaque byte pipes, so TLS SNI and certificate verification remain
@@ -23,7 +28,8 @@
  * - Every successful outbound dial is recorded in a connection ledger (the
  *   replacement for Playwright `Response.serverAddr()` verification, which
  *   only sees the local proxy). Each ledger entry names the validated hostname
- *   and the validated public address that was dialed.
+ *   and the validated admitted address that was dialed (public-only by
+ *   default; local-network destinations only under the explicit opt-in).
  * - Budgets are explicit and fail closed: distinct hostnames, connections,
  *   per-connection and aggregate bytes, authority/header lengths, diagnostics,
  *   idle socket time, and the render's own total time bound the broker. Budget
@@ -58,7 +64,8 @@ import * as http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as net from "node:net";
 import type { AddressInfo } from "node:net";
-import { classifyPublicUrlError, validatePublicUrl, type HostResolver, type ValidatedUrl } from "./network";
+import { isBlockedAddress } from "./ip";
+import { classifyPublicUrlError, PublicUrlValidationError, validatePublicUrl, type HostResolver, type ValidatedUrl } from "./network";
 
 /** Interactive removes lifetime and established-transport idle quotas only.
  * Authentication, public resolution/pinning, header limits, pre-auth and WS
@@ -105,6 +112,17 @@ export interface EgressBudgets {
   maxDiagnostics: number;
   /** Idle time (no bytes) after which a connection is destroyed. */
   idleSocketMs: number;
+  /**
+   * Explicit per-instance opt-in (default false): also admit local-network
+   * destinations — loopback, RFC1918 private, IPv4 link-local incl. the
+   * 169.254.169.254 cloud-metadata endpoint, IPv6 unique-local/link-local.
+   * Enabling this relaxes ONLY address admission: budgets, per-render broker
+   * authentication, resolve-once/pinned dialing, protocol and URL validation,
+   * loopback-only binding, and per-session ownership are all unchanged, and
+   * multicast/broadcast/reserved destinations stay refused either way. No
+   * separate network tiers exist: this is one boolean on the canonical check.
+   */
+  allowLocalNetworks?: boolean;
 }
 
 export const DEFAULT_EGRESS_BUDGETS: EgressBudgets = {
@@ -119,6 +137,7 @@ export const DEFAULT_EGRESS_BUDGETS: EgressBudgets = {
   maxHeaderChars: 32_768,
   maxDiagnostics: 32,
   idleSocketMs: 20_000,
+  allowLocalNetworks: false,
   maxTotalMs: 60_000,
   maxCleanupMs: 5_000,
 };
@@ -127,7 +146,7 @@ export const DEFAULT_EGRESS_BUDGETS: EgressBudgets = {
 export interface BrokerLedgerEntry {
   hostname: string;
   port: number;
-  /** The validated public address chosen for this dial. */
+  /** The validated admitted address chosen for this dial. */
   address: string;
   /** "ws" is an opted-in plain WebSocket upgrade; wss rides inside "connect". */
   kind: "http" | "connect" | "ws";
@@ -332,6 +351,7 @@ export class EgressBroker {
 
   private recordEntry(entry: BrokerLedgerEntry, socket: net.Socket): void {
     this.ledger.push(entry);
+    this.entrySockets.set(entry, socket);
     if (!this.interactive) return;
     this.activeEntries.add(entry);
     socket.once("close", () => {
@@ -354,6 +374,13 @@ export class EgressBroker {
   private readonly expectedAuthorization?: string;
   /** Set only when live WebSocket transport was explicitly opted in. */
   private readonly websocketPolicy?: EgressBrokerWebSocketPolicy;
+  /** True once this instance admitted local-network destinations at any point.
+   * Persistent-session teardown audits must use it so historically valid
+   * local entries stay truthful after a later live revocation. */
+  private localNetworksEverAllowedFlag: boolean;
+  /** Destination socket per recorded ledger entry (interactive pruning and
+   * live local-network revocation); weak so closed sockets are collectable. */
+  private readonly entrySockets = new WeakMap<BrokerLedgerEntry, net.Socket>();
 
   constructor(
     private readonly resolve: HostResolver,
@@ -364,6 +391,7 @@ export class EgressBroker {
     websockets?: EgressBrokerWebSocketPolicy,
   ) {
     this.websocketPolicy = websockets?.enabled === true ? websockets : undefined;
+    this.localNetworksEverAllowedFlag = budgets.allowLocalNetworks === true;
     if (auth) {
       this.expectedAuthorization = `Basic ${Buffer.from(`${auth.username}:${auth.password}`, "utf8").toString("base64")}`;
     }
@@ -514,6 +542,63 @@ export class EgressBroker {
     return !this.startupPending && this.server === undefined && this.sockets.size === 0 && this.clientSockets.size === 0;
   }
 
+  /**
+   * True once this instance admitted local-network destinations at any point
+   * in its lifetime. Persistent interactive sessions must audit their final
+   * ledger with this admission (not the latest setting) so connections that
+   * were validly admitted while the opt-in was on remain truthful after a
+   * later revocation; public-only entries pass either way.
+   */
+  get localNetworksEverAllowed(): boolean {
+    return this.localNetworksEverAllowedFlag;
+  }
+
+  /**
+   * Live update of the explicit local-network opt-in for a persistent
+   * interactive session (issue #27). No restart: subsequent admissions
+   * (redirects, subresources, WebSocket upgrades) read the new value at their
+   * own validation point. When the opt-in turns off, established upstream
+   * connections whose dialed address is no longer admissible are closed
+   * narrowly — only those sockets, with one bounded diagnostic — while public
+   * connections keep running and every historical ledger entry is retained
+   * unchanged (a revocation is not an attack and never reclassifies past
+   * admissions). Returns the number of revoked connections.
+   */
+  setLocalNetworksAllowed(allowed: boolean): number {
+    const previous = this.budgets.allowLocalNetworks === true;
+    this.budgets.allowLocalNetworks = allowed;
+    if (allowed) this.localNetworksEverAllowedFlag = true;
+    if (!previous || allowed) return 0;
+    let revoked = 0;
+    for (const entry of [...this.activeEntries]) {
+      if (!isBlockedAddress(entry.address, { allowLocalNetworks: false })) continue;
+      const socket = this.entrySockets.get(entry);
+      if (socket && !socket.destroyed) socket.destroy();
+      revoked += 1;
+    }
+    if (revoked > 0) {
+      this.note(`local-network permission was revoked: closed ${revoked} established connection(s) to previously admitted local destination(s).`);
+    }
+    return revoked;
+  }
+
+  /** True when the CURRENT policy still admits this dialed address. Closes the
+   * window between an admission validated under the previous policy and the
+   * socket actually connecting: a live revocation landing while the dial is in
+   * flight must not leave an established local connection behind. */
+  private destinationStillAdmitted(address: string): boolean {
+    return this.budgets.allowLocalNetworks === true || !isBlockedAddress(address, { allowLocalNetworks: false });
+  }
+
+  /** Tear down a connection that completed after its admission was revoked.
+   * Mirrors setLocalNetworksAllowed: narrow socket teardown plus one bounded
+   * diagnostic — the admission was valid when made, so this is never a policy
+   * failure (and therefore never session-fatal). */
+  private revokeInFlightDestination(entry: BrokerLedgerEntry, sockets: readonly net.Socket[]): void {
+    for (const socket of sockets) if (!socket.destroyed) socket.destroy();
+    this.note(`local-network permission was revoked before the connection to ${entry.hostname} could be established; it was closed.`);
+  }
+
   /** Reject when `operation` does not settle within the cleanup deadline. */
   private async boundedWait(operation: Promise<unknown>, what: string): Promise<void> {
     let timer: NodeJS.Timeout | undefined;
@@ -636,8 +721,10 @@ export class EgressBroker {
   /**
    * Validate one destination BEFORE any socket is dialed: budgets are checked,
    * the hostname is resolved exactly once, and every resolved address must be
-   * public. Returns undefined (and records a refusal) when the destination is
-   * not admissible; the caller then responds with an error and dials nothing.
+   * admitted (public-only by default; local-network destinations only under
+   * the instance's explicit `allowLocalNetworks` opt-in). Returns undefined
+   * (and records a refusal) when the destination is not admissible; the caller
+   * then responds with an error and dials nothing.
    */
   /**
    * Validate one destination and atomically reserve its host/connection
@@ -710,7 +797,22 @@ export class EgressBroker {
     };
     this.connectionCount += 1;
     try {
-      const validated = await validatePublicUrl(url.href, this.resolve);
+      // Address admission follows the instance's explicit local-network opt-in
+      // (default public-only). Everything else about validation — resolve
+      // exactly once, validate every answer, canonical URL rules — is shared.
+      const validated = await validatePublicUrl(url.href, this.resolve, {
+        allowLocalNetworks: this.budgets.allowLocalNetworks === true,
+      });
+      // A live revocation can land while DNS was in flight: re-check the
+      // validated addresses against the CURRENT policy so a pending admission
+      // can never dial a destination that is no longer permitted.
+      const allowLocalNow = this.budgets.allowLocalNetworks === true;
+      if (!validated.addresses.every((address) => !isBlockedAddress(address, { allowLocalNetworks: allowLocalNow }))) {
+        throw new PublicUrlValidationError(
+          "destination no longer permitted after the local-network permission changed",
+          "non_public_address_denied",
+        );
+      }
       if (this.interactive) this.reservations.set(validated, release);
       return validated;
     } catch (error) {
@@ -794,6 +896,11 @@ export class EgressBroker {
       if (this.closed) {
         destination.destroy();
         finish(502, "Egress broker is closing.");
+        return;
+      }
+      if (!this.destinationStillAdmitted(entry.address)) {
+        finish(403, "Egress broker refused the requested destination.");
+        this.revokeInFlightDestination(entry, [destination, clientSocket]);
         return;
       }
       this.recordEntry(entry, destination);
@@ -985,6 +1092,12 @@ export class EgressBroker {
         destination.destroy();
         return;
       }
+      if (!this.destinationStillAdmitted(entry.address)) {
+        // No 200 was sent yet: the client observes a dropped CONNECT, never an
+        // established tunnel to a now-disallowed destination.
+        this.revokeInFlightDestination(entry, [socket, destination]);
+        return;
+      }
       this.recordEntry(entry, destination);
       // Bytes pipelined after the CONNECT header arrive in `head`; they are
       // counted and budget-enforced BEFORE they reach the destination, so
@@ -1112,6 +1225,11 @@ export class EgressBroker {
       if (this.closed || socket.destroyed || socket.readableEnded || socket.readyState === "closed") {
         socket.destroy();
         destination.destroy();
+        return;
+      }
+      socket.removeListener("close", onClientGone);
+      if (!this.destinationStillAdmitted(entry.address)) {
+        this.revokeInFlightDestination(entry, [socket, destination]);
         return;
       }
       this.recordEntry(entry, destination);

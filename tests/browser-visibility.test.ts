@@ -5,7 +5,7 @@ import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";import test from "node:test";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
-import { normalizeConfig } from "../src/config";
+import { DEFAULT_BROWSER_PERMISSIONS, normalizeConfig } from "../src/config";
 import { BrowserSessionClosedError, InteractiveBrowserManager, type BrowserVisibilityResult } from "../src/web/interactive-browser";
 import { WebToolManager } from "../src/web/tools";
 
@@ -43,7 +43,14 @@ class FakePage extends EventEmitter {
   isClosed() { return this.closed; }
   async routeWebSocket() {}
   async title() { return "Untrusted fixture title"; }
-  async evaluate() { return this.visibilityState; }
+  /** Issue #27: fixed-protocol page-code hook for manager tests (e.g. the
+   * clipboard scripts). Absent by default so existing behavior — returning
+   * the visibility state — is unchanged. */
+  onEvaluate?: (source: unknown, arg?: unknown) => unknown;
+  async evaluate(source?: unknown, ...args: unknown[]) {
+    if (this.onEvaluate) return this.onEvaluate(source, args[0]);
+    return this.visibilityState;
+  }
   async bringToFront() { this.broughtToFront += 1; }
   async waitForLoadState() {}
   async ariaSnapshot() { return "- heading \"Fixture\" [level=1]\n- link \"Next\" [ref=e7]\n"; }
@@ -109,6 +116,11 @@ class FakeContext extends EventEmitter {
   /** When set, storageState() waits before returning (busy-lock race fixture). */
   storageStateDelayMs = 0;
   storageStateCalls = 0;
+  /** Issue #27: manager-issued permission grants, recorded for assertions. */
+  readonly grantedPermissions: Array<{ permissions: string[]; origin: string }> = [];
+  async grantPermissions(permissions: string[], options?: { origin?: string }) {
+    this.grantedPermissions.push({ permissions: [...permissions], origin: options?.origin ?? "" });
+  }
   closed = false;
   readonly cdpSessions: FakeCdpSession[] = [];
   setDefaultTimeout() {}
@@ -214,13 +226,13 @@ function lastContext(harness: VisibilityHarness): FakeContext {
 test("applyVisibility with no live browser returns null and the preference applies at the next open", async () => {
   const harness = visibilityHarness();
   try {
-    harness.manager.updateConfig(normalizeConfig({ web: { browserVisible: true } }).web!.fetch, "ask", 15, true);
+    harness.manager.updateConfig(normalizeConfig({ web: { browserVisible: true } }).web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS, true);
     assert.equal(await harness.manager.applyVisibility(true), null);
     assert.equal(harness.browsers.length, 0, "no browser may be launched for a visibility save with no live browser");
     const opened = await harness.manager.open("https://example.com/");
     assert.equal(harness.launchOptions[0]!.headless, false, "saved headed preference applies at the next open");
     await harness.manager.close(opened.session);
-    harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, false);
+    harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS, false);
     const second = await harness.manager.open("https://example.com/");
     assert.equal(harness.launchOptions[1]!.headless, true, "saved headless preference applies at the next open");
     await harness.manager.close(second.session);
@@ -414,6 +426,99 @@ test("when no recorded tab URL passes the egress policy the browser is left unch
   }
 });
 
+test("visibility replacement carries still-enabled manager-issued clipboard grants into the new context", async () => {
+  const harness = visibilityHarness();
+  try {
+    harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, { ...DEFAULT_BROWSER_PERMISSIONS, modelClipboard: true });
+    const opened = await harness.manager.open("https://example.com/a");
+    // Emulate the fixed clipboard read script protocol on the owned tab.
+    const page = harness.browsers[0]!.context.pages()[0];
+    page.onEvaluate = () => Promise.resolve({ ok: true, text: "visibility-clipboard" });
+    const read = await harness.manager.clipboard(opened.session, opened.tab, "clipboard_read", undefined, async () => true);
+    assert.equal(read.text, "visibility-clipboard");
+    assert.deepEqual(harness.browsers[0]!.context.grantedPermissions, [
+      { permissions: ["clipboard-read"], origin: "https://example.com" },
+    ]);
+    const result = await harness.manager.applyVisibility(true) as BrowserVisibilityResult;
+    assert.ok(result);
+    // Issue #27: a manager-issued grant that still passes the current
+    // effective policy is re-applied to the replacement context, so a
+    // settings-driven replacement never silently drops granted authority.
+    assert.deepEqual(harness.browsers[1]!.context.grantedPermissions, [
+      { permissions: ["clipboard-read"], origin: "https://example.com" },
+    ]);
+    // The old handle is rejected, so the old context's grant cannot be replayed.
+    await assert.rejects(
+      harness.manager.clipboard(opened.session, opened.tab, "clipboard_read", undefined, async () => true),
+      /Browser session is closed/,
+    );
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("a failed revocation clear during replacement grant re-application fails the new session truthfully", async () => {
+  const harness = visibilityHarness();
+  try {
+    harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, { ...DEFAULT_BROWSER_PERMISSIONS, modelClipboard: true });
+    const opened = await harness.manager.open("https://example.com/a");
+    const page = harness.browsers[0]!.context.pages()[0];
+    page.onEvaluate = () => Promise.resolve({ ok: true, text: "restore-race-clipboard" });
+    const read = await harness.manager.clipboard(opened.session, opened.tab, "clipboard_read", undefined, async () => true);
+    assert.equal(read.text, "restore-race-clipboard");
+
+    // A second save lands while the replacement is re-applying the carried
+    // clipboard grant: it revokes clipboard for the NEW session, and the new
+    // context's clear fails. The first (old) context stays untouched so its
+    // baseline clear and teardown remain clean.
+    const firstContext = harness.browsers[0]!.context;
+    let flipped = false;
+    const realGrant = FakeContext.prototype.grantPermissions;
+    const realClear = FakeContext.prototype.clearPermissions;
+    FakeContext.prototype.grantPermissions = async function (this: FakeContext, permissions: string[], options?: { origin?: string }) {
+      if (!flipped && this !== firstContext) {
+        flipped = true;
+        void harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS);
+      }
+      return realGrant.call(this, permissions, options);
+    };
+    FakeContext.prototype.clearPermissions = async function (this: FakeContext) {
+      if (flipped && this !== firstContext) throw new Error("fixture CDP clear failure");
+      return realClear.call(this);
+    };
+    try {
+      const boundary = new WebToolManager(
+        { registerTool: () => undefined },
+        normalizeConfig({ web: { browserPermissions: { modelClipboard: true } } }),
+        undefined,
+        undefined,
+        harness.manager,
+      );
+      // The save flips visibility (replacing the context) while keeping
+      // clipboard enabled; the mid-restore second save revokes it.
+      const pendingApply = boundary.applySavedSettings(normalizeConfig({ web: { browserVisible: true, browserPermissions: { modelClipboard: true } } }));
+      await assert.rejects(pendingApply, /permission revocation could not be confirmed/);
+
+      // The replacement's owned context is closed by containment teardown.
+      assert.equal(harness.browsers.length, 2);
+      assert.equal(harness.browsers[1]!.context.closed, true, "the new owned context is closed");
+      assert.equal(harness.browsers[1]!.connected, false, "the new browser process close is confirmed");
+      assert.equal(harness.manager.activeSessionCount(), 0);
+
+      // The original session's tombstone keeps its visibility-reconfigure
+      // closure (its own teardown was clean).
+      const closed = await harness.manager.close(opened.session);
+      assert.equal(closed.alreadyClosed, true);
+      assert.equal(closed.closure?.kind, "visibility_reconfigure");
+    } finally {
+      FakeContext.prototype.grantPermissions = realGrant;
+      FakeContext.prototype.clearPermissions = realClear;
+    }
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
 test("applyVisibility serializes behind an in-flight BrowserOpen instead of orphaning a browser", async () => {
   const harness = visibilityHarness();
   harness.setLaunchDelayMs(150);
@@ -421,7 +526,7 @@ test("applyVisibility serializes behind an in-flight BrowserOpen instead of orph
     // The open starts headless; the headed preference is saved while it is
     // still in flight.
     const pendingOpen = harness.manager.open("https://example.com/");
-    harness.manager.updateConfig(normalizeConfig({ web: { browserVisible: true } }).web!.fetch, "ask", 15, true);
+    harness.manager.updateConfig(normalizeConfig({ web: { browserVisible: true } }).web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS, true);
     const pendingApply = harness.manager.applyVisibility(true);
     const opened = await pendingOpen;
     const result = await pendingApply as BrowserVisibilityResult;
@@ -630,6 +735,354 @@ test("a browser operation arriving mid-replacement is rejected as busy, not star
     await assert.rejects(harness.manager.snapshot(opened.session, opened.tab, 1000), BrowserSessionClosedError);
     const listed = await harness.manager.tabs(result.session!, "list");
     assert.equal(listed.tabs.length, 1);
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("a session that dies during the visibility capture window is disclosed in the result", async () => {
+  const harness = visibilityHarness();
+  try {
+    await harness.manager.open("https://example.com/");
+    const context = harness.browsers[0]!.context;
+    const page = context.pages()[0]!;
+    context.storageStateDelayMs = 300;
+    const pendingApply = harness.manager.applyVisibility(true);
+    const captureStarted = Date.now() + 2_000;
+    while (context.storageStateCalls === 0 && Date.now() < captureStarted) await delay(5);
+    assert.ok(context.storageStateCalls > 0, "the replacement's state capture was in flight");
+    // A session-fatal condition lands while the busy lock is held (a tab crash
+    // here; a broker policy refusal from background page traffic is the same
+    // class). The old session's teardown runs under its own reason.
+    page.emit("crash");
+    const result = await pendingApply as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.equal(result.relaunched, true, "the replacement still completes after the old session died");
+    assert.ok(
+      result.notes.some((note) => note.includes("had already ended during the visibility change")),
+      "a mid-capture death must be disclosed instead of a clean in-place replacement",
+    );
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #27 integration: the visibility replacement validates and restores
+// against the CURRENT effective egress policy, so user-authorized local tabs
+// are neither dropped by a public-only validator nor admitted after their
+// permission is revoked.
+// ---------------------------------------------------------------------------
+
+test("a user-authorized local tab survives the visibility replacement; the broker inherits the permission", async () => {
+  const harness = visibilityHarness();
+  try {
+    // An explicit local-networks opt-in admits loopback destinations (issue #27).
+    harness.manager.updateConfig(
+      normalizeConfig({}).web!.fetch, "ask", 15,
+      { ...DEFAULT_BROWSER_PERMISSIONS, localNetworks: true },
+    );
+    const opened = await harness.manager.open("http://127.0.0.1:9/private");
+    await harness.manager.tabs(opened.session, "open", undefined, "https://example.com/public");
+
+    const result = await harness.manager.applyVisibility(true) as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.equal(result.relaunched, true);
+    assert.equal(result.restoredTabs, 2, "the user-authorized local tab must not be dropped by a public-only validator");
+    assert.equal(result.unrestoredTabs, 0);
+    const byUrl = new Map(result.tabs.map((tab) => [tab.requestedUrl, tab]));
+    assert.equal(byUrl.get("http://127.0.0.1:9/private")!.restored, true);
+    assert.equal(byUrl.get("http://127.0.0.1:9/private")!.finalUrl, "http://127.0.0.1:9/private");
+    assert.equal(byUrl.get("https://example.com/public")!.restored, true);
+    // The replacement session's broker inherits the current effective
+    // permission at construction: a further local navigation is admitted in
+    // the new browser without any additional save.
+    const again = await harness.manager.tabs(result.session!, "open", undefined, "http://127.0.0.1:9/other");
+    assert.equal(again.tabs.find((tab) => tab.url === "http://127.0.0.1:9/other") !== undefined, true);
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("a local-networks revocation saved before a visibility switch is honored before any browser is destroyed", async () => {
+  const harness = visibilityHarness();
+  try {
+    harness.manager.updateConfig(
+      normalizeConfig({}).web!.fetch, "ask", 15,
+      { ...DEFAULT_BROWSER_PERMISSIONS, localNetworks: true },
+    );
+    const opened = await harness.manager.open("http://127.0.0.1:9/private");
+    // The user revokes the local-networks permission in settings; the change
+    // is pending until applied to the live browser.
+    harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15);
+
+    const result = await harness.manager.applyVisibility(true) as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.equal(result.relaunched, false, "no recorded tab passes the current public-only policy: the browser must not be destroyed for an empty replacement");
+    assert.equal(result.session, opened.session, "the live browser is kept in its current mode");
+    assert.equal(harness.browsers.length, 1, "no replacement browser was launched");
+    assert.ok(result.notes.some((note) => note.includes("left unchanged")));
+    // The unchanged session remains usable.
+    const listed = await harness.manager.tabs(opened.session, "list");
+    assert.equal(listed.tabs.length, 1);
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("YOLO-enabled local tabs persist through the visibility replacement with inherited caps", async () => {
+  const harness = visibilityHarness();
+  try {
+    // YOLO is the master override: its effective policy admits local networks.
+    harness.manager.updateConfig(
+      normalizeConfig({}).web!.fetch, "ask", 15,
+      { ...DEFAULT_BROWSER_PERMISSIONS, yolo: true },
+    );
+    const opened = await harness.manager.open("http://127.0.0.1:9/yolo-local");
+
+    const result = await harness.manager.applyVisibility(true) as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.equal(result.relaunched, true);
+    assert.equal(result.restoredTabs, 1, "the YOLO-admitted local tab is restored by the replacement");
+    assert.equal(result.tabs[0]!.finalUrl, "http://127.0.0.1:9/yolo-local");
+    // The replacement broker inherits the YOLO effective caps: a further
+    // local navigation in the new browser is admitted without any re-save.
+    const again = await harness.manager.tabs(result.session!, "open", undefined, "http://127.0.0.1:9/yolo-other");
+    assert.equal(again.tabs.find((tab) => tab.url === "http://127.0.0.1:9/yolo-other") !== undefined, true);
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #27 integration (bounded correction): a visibility/service-worker
+// replacement re-adopts the replaced session's previously owned tabs —
+// including popup tabs admitted beyond the ordinary four-tab cap under the
+// model popup restriction override — without admitting any new over-limit
+// popups and without lifting the ordinary cap for model-initiated opens.
+// ---------------------------------------------------------------------------
+
+async function waitForPageClose(page: FakePage): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!page.isClosed()) {
+    if (Date.now() >= deadline) throw new Error("refused popup page did not close");
+    await delay(10);
+  }
+}
+
+/** Fill the four-tab cap with ordinary opens, then admit one page-created
+ * popup beyond it (the override must be enabled for this to work) and
+ * navigate it to a restorable URL. Returns nothing; callers assert on the
+ * resulting five-tab session. */
+async function fillSessionWithAdmittedPopup(
+  harness: VisibilityHarness,
+  session: string,
+  base: string,
+  popupUrl: string,
+): Promise<void> {
+  for (const path of ["/t1", "/t2", "/t3"]) {
+    await harness.manager.tabs(session, "open", undefined, `${base}${path}`);
+  }
+  const popup = (await lastContext(harness).newPage()) as unknown as FakePage;
+  assert.equal(popup.isClosed(), false, "the over-limit popup is adopted while the override is enabled");
+  const listed = await harness.manager.tabs(session, "list");
+  assert.equal(listed.tabs.length, 5, "the adopted popup is an owned explicit tab handle");
+  const popupTab = listed.tabs.find((tab) => tab.url === "[navigation pending]");
+  assert.ok(popupTab, "the adopted popup tab is still on about:blank before its navigation");
+  await harness.manager.navigate(session, popupTab!.tab, popupUrl);
+}
+
+test("visibility replacement restores YOLO-admitted popup tabs beyond the ordinary cap after YOLO is off", async () => {
+  const harness = visibilityHarness();
+  try {
+    harness.manager.updateConfig(
+      normalizeConfig({}).web!.fetch, "ask", 15,
+      { ...DEFAULT_BROWSER_PERMISSIONS, yolo: true },
+    );
+    const opened = await harness.manager.open("https://popups.example.com/a");
+    await fillSessionWithAdmittedPopup(harness, opened.session, "https://popups.example.com", "https://popups.example.com/popup-e");
+    // A snapshot page without owned-tab membership: reported, never restored.
+    const unowned = new FakePage();
+    unowned.currentUrl = "https://popups.example.com/unowned";
+    harness.browsers[0]!.context.pages().push(unowned);
+    // Disable YOLO before the replacement: previously admitted popup tabs must
+    // still be restored, and no new over-limit admission may follow.
+    harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15);
+
+    const result = await harness.manager.applyVisibility(true) as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.equal(result.relaunched, true);
+    assert.equal(result.headless, false);
+    assert.equal(result.restoredTabs, 5, "every previously owned tab — including the override-admitted popup — is restored");
+    assert.equal(result.unrestoredTabs, 1, "only the unowned snapshot page is unrestorable");
+    assert.equal(result.overflowPopups, 1);
+    const expected = [
+      "https://popups.example.com/a",
+      "https://popups.example.com/t1",
+      "https://popups.example.com/t2",
+      "https://popups.example.com/t3",
+      "https://popups.example.com/popup-e",
+    ];
+    assert.deepEqual(result.tabs.slice(0, 5).map((tab) => tab.requestedUrl), expected, "the ordered owned tabs are restored in the original order");
+    assert.deepEqual(result.tabs.slice(0, 5).map((tab) => tab.finalUrl), expected);
+    const activeRow = result.tabs.find((tab) => tab.active);
+    assert.equal(activeRow?.requestedUrl, "https://popups.example.com/t3", "the recorded active tab is restored as active");
+    const unownedRow = result.tabs.find((tab) => tab.requestedUrl === "https://popups.example.com/unowned");
+    assert.equal(unownedRow?.restored, false);
+    assert.match(unownedRow?.reason ?? "", /beyond the owned-tab limit/);
+
+    // The replacement session really owns all five tabs...
+    const listed = await harness.manager.tabs(result.session!, "list");
+    assert.equal(listed.tabs.length, 5);
+    assert.equal(listed.activeTab, result.activeTab);
+    // ...but the restore re-grants no new-tab authority: the ordinary model
+    // cap still applies.
+    await assert.rejects(
+      harness.manager.tabs(result.session!, "open", undefined, "https://popups.example.com/f"),
+      /Browser tab limit \(4\) reached/,
+    );
+    // A new over-limit popup after the replacement (override off) is refused.
+    const next = (await lastContext(harness).newPage()) as unknown as FakePage;
+    await waitForPageClose(next);
+    const after = await harness.manager.tabs(result.session!, "list");
+    assert.equal(after.tabs.length, 5, "no sixth tab is admitted without the override");
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("service-worker replacement restores override-admitted popup tabs with the override already disabled", async () => {
+  const harness = visibilityHarness();
+  try {
+    harness.manager.updateConfig(
+      normalizeConfig({}).web!.fetch, "ask", 15,
+      { ...DEFAULT_BROWSER_PERMISSIONS, modelPopupRestrictionOverride: true },
+    );
+    const opened = await harness.manager.open("https://swpopups.example.com/a");
+    await fillSessionWithAdmittedPopup(harness, opened.session, "https://swpopups.example.com", "https://swpopups.example.com/popup-e");
+    // The save that triggers the replacement (service workers on) leaves the
+    // popup override disabled: restoring previously owned tabs must not
+    // depend on it.
+    harness.manager.updateConfig(
+      normalizeConfig({}).web!.fetch, "ask", 15,
+      { ...DEFAULT_BROWSER_PERMISSIONS, modelServiceWorkers: true },
+    );
+
+    const result = await harness.manager.applyVisibility(false) as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.equal(result.relaunched, true);
+    assert.equal(result.serviceWorkers, "allow", "the replacement context enforces the new service-worker policy");
+    assert.equal(result.headless, true, "visibility is unchanged by a service-worker save");
+    assert.equal(result.restoredTabs, 5, "every previously owned tab — including the override-admitted popup — is restored");
+    assert.equal(result.unrestoredTabs, 0);
+    assert.deepEqual(
+      result.tabs.map((tab) => tab.requestedUrl),
+      [
+        "https://swpopups.example.com/a",
+        "https://swpopups.example.com/t1",
+        "https://swpopups.example.com/t2",
+        "https://swpopups.example.com/t3",
+        "https://swpopups.example.com/popup-e",
+      ],
+    );
+    assert.equal(harness.browsers[1]!.contextOptions?.serviceWorkers, "allow");
+    const listed = await harness.manager.tabs(result.session!, "list");
+    assert.equal(listed.tabs.length, 5);
+    // No new over-limit popup is admitted in the replacement session either.
+    const next = (await lastContext(harness).newPage()) as unknown as FakePage;
+    await waitForPageClose(next);
+    assert.equal((await harness.manager.tabs(result.session!, "list")).tabs.length, 5);
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("a page-created popup racing a restore creation is refused at the cap, not admitted", async () => {
+  const harness = visibilityHarness();
+  try {
+    harness.manager.updateConfig(
+      normalizeConfig({}).web!.fetch, "ask", 15,
+      { ...DEFAULT_BROWSER_PERMISSIONS, modelPopupRestrictionOverride: true },
+    );
+    const opened = await harness.manager.open("https://race.example.com/a");
+    await fillSessionWithAdmittedPopup(harness, opened.session, "https://race.example.com", "https://race.example.com/popup-e");
+    // Revoke the override before the replacement.
+    harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15);
+    // Slot 0 is the replacement's primary page; slots 1-2 are the first two
+    // restore creations. Slot 3 (the third restore creation) emits a stray
+    // page-created popup inside the armed creation window — at that moment
+    // four owned tabs exist, so the ordinary policy must refuse it even
+    // though a restore admission is in flight.
+    harness.pendingPageConfigs.push(() => undefined);
+    harness.pendingPageConfigs.push(() => undefined);
+    harness.pendingPageConfigs.push(() => undefined);
+    let stray: FakePage | undefined;
+    harness.pendingPageConfigs.push((page) => {
+      void page;
+      const context = lastContext(harness);
+      stray = new FakePage();
+      stray.currentUrl = "https://race.example.com/stray-popup";
+      context.pages().push(stray!);
+      context.emit("page", stray!);
+    });
+
+    const result = await harness.manager.applyVisibility(true) as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.ok(stray, "the racing popup was created during the replacement");
+    assert.equal(result.restoredTabs, 5, "the previously owned tabs are restored in full");
+    assert.equal(result.unrestoredTabs, 0);
+    await waitForPageClose(stray!);
+    const listed = await harness.manager.tabs(result.session!, "list");
+    assert.equal(listed.tabs.length, 5, "the racing over-limit popup is refused and closed, not adopted");
+    assert.ok(!listed.tabs.some((tab) => tab.url === "https://race.example.com/stray-popup"));
+  } finally {
+    await harness.manager.shutdown().catch(() => undefined);
+  }
+});
+
+test("a popup-override revocation landing mid-replacement keeps restoring owned tabs and admits no new popups", async () => {
+  const harness = visibilityHarness();
+  try {
+    harness.manager.updateConfig(
+      normalizeConfig({}).web!.fetch, "ask", 15,
+      { ...DEFAULT_BROWSER_PERMISSIONS, modelPopupRestrictionOverride: true },
+    );
+    const opened = await harness.manager.open("https://midrev.example.com/a");
+    await fillSessionWithAdmittedPopup(harness, opened.session, "https://midrev.example.com", "https://midrev.example.com/popup-e");
+    // Slot 0 is the replacement's primary page; slot 1 is the first restore
+    // creation. The revocation lands while its navigation dispatches —
+    // mid-replacement, with three owned tabs still to be re-adopted beyond
+    // the ordinary cap.
+    harness.pendingPageConfigs.push(() => undefined);
+    let revoked = false;
+    harness.pendingPageConfigs.push((page) => {
+      page.onGoto = () => {
+        if (!revoked) {
+          revoked = true;
+          harness.manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15);
+        }
+      };
+    });
+
+    const result = await harness.manager.applyVisibility(true) as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.equal(revoked, true, "the revocation really landed mid-replacement");
+    assert.equal(result.restoredTabs, 5, "previously owned tabs are restored even though the override is now off");
+    assert.equal(result.unrestoredTabs, 0);
+    assert.deepEqual(
+      result.tabs.map((tab) => tab.requestedUrl),
+      [
+        "https://midrev.example.com/a",
+        "https://midrev.example.com/t1",
+        "https://midrev.example.com/t2",
+        "https://midrev.example.com/t3",
+        "https://midrev.example.com/popup-e",
+      ],
+    );
+    // No new over-limit popup is admitted after the revocation.
+    const next = (await lastContext(harness).newPage()) as unknown as FakePage;
+    await waitForPageClose(next);
+    assert.equal((await harness.manager.tabs(result.session!, "list")).tabs.length, 5);
   } finally {
     await harness.manager.shutdown().catch(() => undefined);
   }

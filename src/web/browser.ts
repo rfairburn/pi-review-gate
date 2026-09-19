@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Response } from "playwright";
-import { isBlockedAddress } from "./ip";
+import { isBlockedAddress, type AddressAdmission } from "./ip";
 import {
   DEFAULT_EGRESS_BUDGETS,
   EgressBroker,
@@ -458,15 +458,20 @@ async function boundedTeardown<T>(operation: Promise<T>, deadlineMs: number, wha
 
 /**
  * Final broker-owned audit replacing per-response serverAddr verification:
- * every ledger entry must name a non-empty validated destination with a public
- * address. Anything else fails the render closed.
+ * every ledger entry must name a non-empty validated destination with an
+ * admitted address. Anything else fails the render closed. The default (no
+ * admission argument) is public-only; a caller whose broker instance was
+ * explicitly constructed with the local-network opt-in must pass the SAME
+ * admission here (the interactive session's teardown audit does so via the
+ * broker's localNetworksEverAllowed flag) so admitted local connections audit
+ * consistently with the broker that dialed them.
  */
-export function auditEgressLedger(ledger: readonly BrokerLedgerEntry[]): void {
+export function auditEgressLedger(ledger: readonly BrokerLedgerEntry[], admission?: AddressAdmission): void {
   for (const entry of ledger) {
     if (!entry.hostname || !entry.address) {
       throw new Error("Browser egress ledger recorded a connection without a validated destination; render aborted.");
     }
-    if (isBlockedAddress(entry.address)) {
+    if (isBlockedAddress(entry.address, admission)) {
       throw new Error(
         `Browser egress ledger recorded a connection to non-public address ${entry.address} (${entry.hostname}); render aborted.`,
       );

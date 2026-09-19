@@ -149,6 +149,128 @@ test("canonical parser expands compressed IPv6 forms consistently", () => {
   assert.equal(parseIp("not-an-address"), undefined);
 });
 
+const localNetworkAddresses = [
+  // IPv4 loopback.
+  "127.0.0.1",
+  "127.255.255.254",
+  // RFC1918 private.
+  "10.1.2.3",
+  "172.16.0.1",
+  "172.31.255.255",
+  "192.168.1.1",
+  // IPv4 link-local incl. the cloud-metadata endpoint.
+  "169.254.169.254",
+  "169.254.0.1",
+  // IPv6 loopback, unique-local, link-local, deprecated site-local, and the
+  // local-use NAT64 prefix.
+  "::1",
+  "fc00::1",
+  "fd12:3456::1",
+  "fe80::1",
+  "febf::ffff:ffff:ffff:ffff:ffff:ffff",
+  "fec0::1",
+  "feff::1",
+  "64:ff9b:1::",
+  // IPv4 embedded in IPv6 runs through the SAME relaxed table.
+  "::ffff:127.0.0.1",
+  "::ffff:169.254.169.254",
+  "::a9fe:a9fe",
+  "64:ff9b::a9fe:a9fe",
+  "2002:7f00:1::",
+  "2002:a9fe:a9fe::",
+];
+
+test("isBlockedAddress admits local-network destinations only under the explicit opt-in", () => {
+  for (const address of localNetworkAddresses) {
+    assert.equal(
+      isBlockedAddress(address, { allowLocalNetworks: true }),
+      false,
+      `expected ${JSON.stringify(address)} to be admitted under the local opt-in`,
+    );
+    // Default stays public-only: the same address is blocked without the opt-in.
+    assert.equal(isBlockedAddress(address), true, `expected ${JSON.stringify(address)} to stay blocked by the public-only default`);
+  }
+});
+
+test("local-network opt-in still blocks purpose-invalid and non-local special ranges", () => {
+  const stillBlocked = [
+    "0.0.0.0",          // this-network: purpose-invalid
+    "100.64.0.1",       // CGNAT: shared address space, not in the agreed local set
+    "192.0.2.1",        // TEST-NET-1
+    "198.18.0.1",       // benchmarking
+    "224.0.0.1",        // IPv4 multicast: protocol/connection limitation
+    "255.255.255.255",  // broadcast
+    "::",               // unspecified
+    "::ffff:224.0.0.1", // embedded multicast via mapped wrapper
+    "64:ff9b::e000:1",  // embedded multicast via NAT64 well-known prefix
+    "2002:e000:1::",    // embedded multicast via 6to4
+    "2001::1",          // Teredo
+    "100::1",           // discard-only
+    "2001:db8::1",      // documentation
+    "ff02::1",          // IPv6 multicast
+    "not-an-address",   // unparseable input fails closed in both modes
+  ];
+  for (const address of stillBlocked) {
+    assert.equal(
+      isBlockedAddress(address, { allowLocalNetworks: true }),
+      true,
+      `expected ${JSON.stringify(address)} to stay blocked even under the local opt-in`,
+    );
+  }
+});
+
+test("validatePublicUrl admits local-network destinations only under the explicit opt-in", async () => {
+  // Default regression: synthetic DNS answering a loopback address still fails
+  // closed with the established category and message.
+  await assert.rejects(
+    validatePublicUrl("http://local.test/", async () => ["127.0.0.1"]),
+    (error: unknown) => error instanceof PublicUrlValidationError
+      && error.category === "non_public_address_denied"
+      && /non-public address/.test(error.message),
+  );
+
+  // Opted in: loopback, private, link-local (cloud metadata), and IPv6 local
+  // answers are admitted and the full pinned answer set is returned.
+  const admitted: Array<[string, string[]]> = [
+    ["http://Loopback.test:8080/path", ["127.0.0.1"]],
+    ["http://private.test/", ["10.0.0.5", "fd00::1"]],
+    ["http://metadata.test/", ["169.254.169.254"]],
+    ["http://v6local.test/", ["fe80::1"]],
+  ];
+  for (const [value, addresses] of admitted) {
+    const validated = await validatePublicUrl(value, async () => addresses, { allowLocalNetworks: true });
+    assert.deepEqual([...validated.addresses], addresses, `expected ${value} to admit ${JSON.stringify(addresses)}`);
+    assert.equal(validated.hostname, new URL(value).hostname);
+    assert.equal(validated.href, new URL(value).href);
+  }
+  // Mixed public + private answers are admitted wholesale under the opt-in.
+  const mixed = await validatePublicUrl("http://mixed.test/", async () => ["203.0.114.1", "192.168.0.9"], { allowLocalNetworks: true });
+  assert.deepEqual([...mixed.addresses], ["203.0.114.1", "192.168.0.9"]);
+
+  // Purpose-invalid answers stay denied even under the opt-in (multicast is a
+  // protocol/connection limitation, not a local network).
+  await assert.rejects(
+    validatePublicUrl("http://multicast.test/", async () => ["224.0.0.1"], { allowLocalNetworks: true }),
+    (error: unknown) => error instanceof PublicUrlValidationError
+      && error.category === "non_public_address_denied"
+      && /blocked special-purpose address/.test(error.message),
+  );
+
+  // Malformed input still fails truthfully under the opt-in.
+  await assert.rejects(
+    validatePublicUrl("ftp://local.test/", async () => ["127.0.0.1"], { allowLocalNetworks: true }),
+    /Only http and https/,
+  );
+  await assert.rejects(
+    validatePublicUrl("http://user:pass@local.test/", async () => ["127.0.0.1"], { allowLocalNetworks: true }),
+    /credentials/,
+  );
+  await assert.rejects(
+    validatePublicUrl("http://unresolved.test/", async () => [], { allowLocalNetworks: true }),
+    /did not resolve/,
+  );
+});
+
 test("validatedPublicUrl rejects WHATWG-normalized mapped literals without DNS or network", async () => {
   // The WHATWG URL parser serializes IPv6 literals in hex, so dotted input is
   // normalized before validation; both spellings must be rejected.

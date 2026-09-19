@@ -495,6 +495,7 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
     "WebSearch", "WebFetch", "BrowserExtract",
     "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
     "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress",
+    "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard",
     "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ]);
   assert.deepEqual(Object.keys(tools.get("BrowserOpen").parameters.properties), ["url"]);
@@ -519,6 +520,16 @@ test("WebFetch reuses its session cache, exposes table indexes, and removes the 
   assert.deepEqual(Object.keys(tools.get("BrowserType").parameters.properties), ["session", "tab", "ref", "text", "delayMs"]);
   assert.deepEqual(Object.keys(tools.get("BrowserSelect").parameters.properties), ["session", "tab", "ref", "values"]);
   assert.deepEqual(Object.keys(tools.get("BrowserPress").parameters.properties), ["session", "tab", "ref", "key"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserUpload").parameters.properties), ["session", "tab", "ref", "files"]);
+  assert.deepEqual(tools.get("BrowserUpload").parameters.required, ["session", "tab", "ref", "files"]);
+  assert.equal(tools.get("BrowserUpload").parameters.properties.files.minItems, 1);
+  assert.equal(tools.get("BrowserUpload").parameters.properties.files.maxItems, 32);
+  assert.deepEqual(Object.keys(tools.get("BrowserDownloadSave").parameters.properties), ["session", "tab", "download", "destination"]);
+  assert.deepEqual(tools.get("BrowserDownloadSave").parameters.required, ["session", "tab"]);
+  assert.deepEqual(Object.keys(tools.get("BrowserClipboard").parameters.properties), ["session", "tab", "operation", "text"]);
+  assert.deepEqual(tools.get("BrowserClipboard").parameters.required, ["session", "tab", "operation"]);
+  assert.deepEqual(tools.get("BrowserClipboard").parameters.properties.operation.enum, ["clipboard_read", "clipboard_write"]);
+  assert.equal(tools.get("BrowserClipboard").parameters.properties.text.maxLength, 4_096);
   assert.equal(tools.get("BrowserFill").parameters.additionalProperties, false);
   assert.equal(tools.get("BrowserType").parameters.properties.text.maxLength, 1_000);
   assert.equal(tools.get("BrowserType").parameters.properties.delayMs.maximum, 5);

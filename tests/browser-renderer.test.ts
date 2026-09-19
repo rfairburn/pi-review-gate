@@ -313,6 +313,17 @@ test("pending, failed, empty, and generic paths remain bounded and side-effect f
   assert.match(hostFailed, /^BrowserSnapshot$/m);
   assert.doesNotMatch(hostFailed, /must-not-render/);
 
+  // A clipboard read packet without any tool identity (partial/error row)
+  // must classify by its operation value, not fall into the tabs heuristic.
+  const clipRead = render(
+    { content: [{ type: "text", text: "BrowserClipboard not_started: model clipboard read/write is disabled by the managed-browser permissions; nothing was read from or written to the clipboard." }], isError: true },
+    {},
+    { args: { session: "session_safe", tab: "tab_safe", operation: "clipboard_read" }, isError: true },
+  );
+  assert.match(clipRead, /^BrowserClipboard$/m);
+  assert.doesNotMatch(clipRead, /BrowserTabs/);
+  assert.match(clipRead, /Requested operation: clipboard_read/);
+
   const empty = render({ content: [] });
   assert.match(empty, /no retained output|No retained browser output/);
 

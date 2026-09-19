@@ -185,6 +185,70 @@ Worker routes and reviewers are independent:
 | selected | empty | automatic parent review only |
 | none | empty | settings remain available; both behaviors are off |
 
+## Task construction and parallelism
+
+The orchestrator role favors beneficial parallelism and bounded, coherent subtasks
+without making worker utilization a goal or assuming which model will be assigned to
+a task. The shipped orchestrator skill (`skills/orchestrator/SKILL.md`) carries the
+full policy; this page summarizes the decision points that apply to every execution
+or research group.
+
+**Deciding on parallelism.** At the start of substantive work, identify actual
+dependencies and independent ready work. While work runs or a dependency clears, ask
+whether another already-authorized task with a concrete useful output and known
+consumer can proceed independently. Parallelize when the expected time or
+primary-context benefit outweighs dispatch, review, and integration costs; independent
+evidence gathering is useful when it answers a concrete unresolved question, and
+duplicating an active investigation or reviewing a tree that will be replaced is not.
+Available capacity is an opportunity, not a utilization target: there is no minimum
+task count, required research companion, or obligation to manufacture work to avoid
+idleness, and waiting or serial execution is correct when no useful independent work
+is ready. Prefer non-overlapping ownership, but justified controlled overlap with
+distinct responsibilities and an explicit integration order is acceptable; ordinary
+conflicts are an integration responsibility — resolve both accepted intents and
+validate the combined result rather than force-merging blindly.
+
+**Bounded task construction.** Default to one concrete, coherent outcome per subtask
+with explicit boundaries, necessary context, invariants, and observable acceptance
+criteria. Minimize simultaneous unresolved decisions without assuming advance
+knowledge of worker model assignment; a smaller-model success should follow from good
+task construction, not from model selection or routing changes. Resolve architectural
+uncertainty before dispatching implementation slices that depend on it, keep each
+change with the focused tests and documentation necessary to establish its coherent
+outcome, keep genuinely dependent source-writing slices sequential, and parallelize
+independent slices only when their shared contracts are settled. Do not fragment
+tightly coupled work merely to create more tasks.
+
+**Reassessment from observation.** Use observed progress, expanding scope, and
+repeated review cycles to decide whether to inspect, clarify, or split remaining
+work. Prolonged work without a verifiable result is a reason to reassess — not an
+automatic cancellation or a rigid elapsed-time or task-size limit — and rescoping
+preserves completed work and accepted invariants.
+
+**Representative scenarios.** The deterministic checks in this repository validate
+that the policy is present on the shipped surfaces and that the applicable mechanics
+(independent capture and landing, top-off, one-shot watch) behave as described; they
+do not prove a model consistently chooses beneficial parallelism. Representative
+evaluations of the intended behavior:
+
+1. *Positive:* independent accepted implementation or concrete research launched
+   concurrently when worthwhile.
+2. *Positive:* dependent edits kept sequential while useful independent work proceeds.
+3. *Positive:* continuation onto the next ready accepted item after an intermediate
+   landing, without expanding accepted scope or inventing follow-ups.
+4. *Negative:* declining slot-filling, redundant research, speculative artifacts, and
+   premature review of changing work.
+5. *Positive:* a broad assignment decomposed into coherent outcomes after shared
+   contracts are established, without relying on worker model identity.
+6. *Positive:* keeping a tightly coupled small change and its tests in one task
+   rather than over-fragmenting it.
+7. *Positive:* justified controlled overlap with an integration order, resolved so
+   both accepted intents survive and the combined result is validated.
+8. *Positive:* reassessment based on observed lack of progress or review churn,
+   without polling loops or automatic time-limit cancellation.
+9. *Positive:* legitimate waiting when nothing useful is ready or user authority or
+   answers are required.
+
 ## Capture and ignore policy
 
 Each dispatched task captures the source workspace independently. Non-ignored untracked

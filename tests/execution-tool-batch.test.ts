@@ -158,6 +158,27 @@ test("operation-specific execution tools expose exact durable schemas", () => {
   }
 });
 
+test("dispatch guidance carries the beneficial-parallelism and bounded-task policy", () => {
+  // Policy-presence check on the model-facing dispatch surface: it validates
+  // that the shipped wording is wired into the tools, not that any model
+  // consistently chooses beneficial parallelism.
+  const { tools } = harness();
+  for (const name of ["SubtasksStart", "SubtasksAdd"]) {
+    const guidelines = executionTool(tools, name).promptGuidelines as string[];
+    assert.ok(guidelines.some((guideline) => /opportunity, not a utilization target/.test(guideline)), name);
+    assert.ok(guidelines.some((guideline) => /one concrete, coherent outcome per subtask/.test(guideline)), name);
+    assert.ok(guidelines.some((guideline) => /shared contracts are settled/.test(guideline)), name);
+    assert.ok(guidelines.some((guideline) => /without assuming which model serves the worker/.test(guideline)), name);
+    // The policy never mandates concurrency volume, research companions, or
+    // timeout-based cancellation.
+    for (const guideline of guidelines) {
+      assert.doesNotMatch(guideline, /at least \d+ tasks|minimum of \d+ tasks/i, name);
+      assert.doesNotMatch(guideline, /mandatory research/i, name);
+      assert.doesNotMatch(guideline, /cancels? after \d+/i, name);
+    }
+  }
+});
+
 test("runtime synchronization never widens the orchestrator's native --tools allowlist", () => {
   const { active } = harness({ activeTools: ["read", "bash"] });
   assert.deepEqual(active, executionToolNames.map((name) => ({ name, enabled: false })));

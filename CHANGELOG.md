@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.51]
+
+### Changed
+
+- Strengthen orchestrator prompts, tool guidance, and the shipped skill to prefer
+  useful independent ready work over slot-filling, with legitimate waiting and
+  sequential execution when parallel work would not help.
+- Encourage bounded, coherent subtasks with explicit invariants and acceptance
+  criteria without assuming worker model identity. Keep dependent edits sequential,
+  preserve coupled changes and their focused tests, and reassess from observed
+  progress rather than automatic time limits.
+- Add representative orchestration evaluation scenarios and policy-wiring tests,
+  explicitly distinguishing guidance checks from evidence of model judgment.
+  Scheduler, routing, review gates, and recovery behavior remain unchanged.
+
 ## [0.1.0-dev.50]
 
 ### Changed

@@ -22,6 +22,22 @@ export class FakePage extends EventEmitter {
     url: () => this.url(),
     locator: (_selector: string) => ({ first: () => ({ count: async () => 0 }) }),
     parentFrame: () => null,
+    // Issue #141: the point-read bridge hangs off the main frame's selector
+    // engine, mirroring how real Playwright exposes the utility world.
+    _connection: { toImpl: () => ({ selectors: {
+      callOnSelector: async (
+        selector: string,
+        options: { strict: boolean; mainWorld: boolean },
+        _callback: unknown,
+        point: { x: number; y: number },
+      ) => {
+        assert.equal(selector, "html");
+        assert.deepEqual(options, { strict: true, mainWorld: false });
+        assert.ok(point && Number.isFinite(point.x) && Number.isFinite(point.y));
+        if (this.pointFacts instanceof Error) throw this.pointFacts;
+        return { result: this.pointFacts ?? null };
+      },
+    } }) },
   };
   evaluateCalls = 0;
   hoverCalls = 0;
@@ -34,6 +50,25 @@ export class FakePage extends EventEmitter {
   onSetInputFiles?: (paths: string[]) => void | Promise<void>;
   onClick?: () => void | Promise<void>;
   onStructureRead?: () => void;
+  /** Issue #141 viewport plumbing: the fake starts at the bounded default and
+   * records every setViewportSize call. */
+  viewportCalls: Array<{ width: number; height: number }> = [];
+  private currentViewport = { width: 1280, height: 720 };
+  setViewportSizeFailure?: Error;
+  /** Issue #141 coordinate clicks: recorded page.mouse.click dispatches. */
+  mouseClicks: Array<{ x: number; y: number; button: string }> = [];
+  onMouseClick?: (point: { x: number; y: number; button: string }) => void | Promise<void>;
+  /** Issue #141 point-read bridge result: raw utility-world facts (domPath is
+   * computed by the manager) or an Error to fail the hit test. The default
+   * matches a semantically unknown element at the point (e.g. a canvas). */
+  pointFacts: Record<string, unknown> | Error = {
+    tagName: "canvas",
+    domPathParts: ["canvas", null, null, null, null],
+    role: null, href: null, target: null, download: false, inputType: null,
+    formAssociated: false, formAction: null, formMethod: null, ariaHasPopup: null,
+    autocomplete: null, contentEditable: false, disabled: false,
+    inlineEventHandler: false, summaryForDetails: false, formHasCredentialField: false,
+  };
   targetStructure: BrowserTargetStructure = {
     tagName: "a", role: "link", href: "https://example.com/next", target: null,
     download: false, inputType: null, formAssociated: false, formAction: null,
@@ -49,7 +84,19 @@ export class FakePage extends EventEmitter {
   isClosed() { return this.closed; }
   async routeWebSocket() {}
   async title() { return "Untrusted fixture title"; }
-  viewportSize() { return { width: 1280, height: 720 }; }
+  viewportSize() { return { ...this.currentViewport }; }
+  async setViewportSize(viewport: { width: number; height: number }) {
+    this.viewportCalls.push({ ...viewport });
+    if (this.setViewportSizeFailure) throw this.setViewportSizeFailure;
+    this.currentViewport = { ...viewport };
+  }
+  readonly mouse = {
+    click: async (x: number, y: number, options?: { button?: string }) => {
+      const point = { x, y, button: options?.button ?? "left" };
+      this.mouseClicks.push(point);
+      await this.onMouseClick?.(point);
+    },
+  };
   async ariaSnapshot() { return '- heading "Fixture" [level=1]\n- link "Next" [ref=e7]\n'; }
   async screenshot(_options?: Record<string, any>) { return ONE_PIXEL_PNG; }
   /** Issue #27: fixed-protocol page-code hook for manager tests (e.g. the

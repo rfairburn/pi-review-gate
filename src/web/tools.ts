@@ -17,6 +17,9 @@ import {
   BROWSER_TYPE_MAX_DELAY_MS,
   BROWSER_UPLOAD_MAX_FILES,
   BROWSER_UPLOAD_PATH_MAX_CHARS,
+  DEFAULT_VIEWPORT_HEIGHT,
+  DEFAULT_VIEWPORT_WIDTH,
+  INTERACTIVE_BROWSER_LIMITS,
   BrowserFailureCategory,
   BrowserCapabilityDeniedError,
   BrowserCaptureInvalidatedError,
@@ -450,13 +453,15 @@ export class WebToolManager {
     this.pi.registerTool({
       name: "BrowserScreenshot",
       label: "BrowserScreenshot",
-      description: "Capture a bounded PNG of the current viewport or one current element ref from BrowserSnapshot. Returns Pi image content, not a file path or textual encoding; full-page capture is not supported.",
+      description: "Capture a bounded PNG of the current viewport (or an optional explicit viewport size) or one current element ref from BrowserSnapshot. Returns Pi image content, not a file path or textual encoding; full-page capture is not supported. A successful viewport capture temporarily applies the requested viewport dimensions, restores the prior viewport afterwards, and records those dimensions as this tab's coordinate reference for x/y click targeting.",
       promptSnippet: "Use BrowserScreenshot only when a semantic BrowserSnapshot cannot supply necessary visual evidence and the current model supports images.",
       promptGuidelines: browserObservationGuidelines(),
       executionMode: "sequential",
       parameters: browserHandleSchema({
         mode: enumSchema(["viewport", "element"], "Capture the current viewport or one element identified by a current BrowserSnapshot ref."),
         ref: stringSchema("Current opaque BrowserSnapshot ref. Required only for element mode and rejected for viewport mode."),
+        viewportWidth: { type: "integer", minimum: 1, maximum: INTERACTIVE_BROWSER_LIMITS.maxScreenshotWidth, description: `Optional viewport-mode capture width, 1-${INTERACTIVE_BROWSER_LIMITS.maxScreenshotWidth}; defaults to ${DEFAULT_VIEWPORT_WIDTH}. Applies only to viewport mode; responsive elements really render at this size and the prior viewport is restored afterwards.` },
+        viewportHeight: { type: "integer", minimum: 1, maximum: INTERACTIVE_BROWSER_LIMITS.maxScreenshotHeight, description: `Optional viewport-mode capture height, 1-${INTERACTIVE_BROWSER_LIMITS.maxScreenshotHeight}; defaults to ${DEFAULT_VIEWPORT_HEIGHT}. Applies only to viewport mode.` },
       }, ["mode"]),
       renderResult: browserRenderResult,
       execute: async (_id, params, signal, _onUpdate, context) => {
@@ -464,13 +469,24 @@ export class WebToolManager {
           if (!supportsImageDelivery(context)) {
             throw new Error("the current Pi host/model contract does not support image delivery; use BrowserSnapshot for semantic evidence instead");
           }
+          rejectUnexpectedFields(params, ["session", "tab", "mode", "ref", "viewportWidth", "viewportHeight"], "BrowserScreenshot");
           const mode = screenshotMode(params.mode);
+          if (mode === "element" && (params.viewportWidth !== undefined || params.viewportHeight !== undefined)) {
+            throw new Error("BrowserScreenshot viewport dimensions apply only to viewport mode.");
+          }
+          const viewportWidth = params.viewportWidth === undefined
+            ? DEFAULT_VIEWPORT_WIDTH
+            : boundedInteger(params.viewportWidth, 1, INTERACTIVE_BROWSER_LIMITS.maxScreenshotWidth, 1, "viewportWidth");
+          const viewportHeight = params.viewportHeight === undefined
+            ? DEFAULT_VIEWPORT_HEIGHT
+            : boundedInteger(params.viewportHeight, 1, INTERACTIVE_BROWSER_LIMITS.maxScreenshotHeight, 1, "viewportHeight");
           const captured = await this.interactiveBrowser.screenshot(
             requiredString(params.session, "session"),
             requiredString(params.tab, "tab"),
             mode,
             params.ref === undefined ? undefined : requiredString(params.ref, "ref"),
             signal,
+            mode === "viewport" ? { viewport: { width: viewportWidth, height: viewportHeight } } : undefined,
           );
           const data = captured.image.toString("base64");
           return {
@@ -543,22 +559,44 @@ export class WebToolManager {
     this.pi.registerTool({
       name: "BrowserClick",
       label: "BrowserClick",
-      description: "Click one current opaque BrowserSnapshot ref under the structural consequence policy. Proven HTTP(S) navigation may proceed; native disclosure and consequential or unknown actions follow the user's Browser interaction approval setting (Ask by default; no UI rejects in Ask). Automatic approval retains all target and safety checks. Optional button is left (default) or right; right-click bypasses the controlled link-navigation shortcut and dispatches a native contextual click. Page-controlled handlers can have external effects, so right-click always follows consequential approval.",
+      description: "Click one current opaque BrowserSnapshot ref, or fall back to screenshot coordinates from this tab's last successful viewport-mode BrowserScreenshot (x/y in viewport image pixels). Refs stay primary whenever the target is accessible; the coordinate fallback exists for visual targets without accessible refs (for example canvas/WebGL). Under the structural consequence policy. Proven HTTP(S) navigation may proceed; native disclosure and consequential or unknown actions follow the user's Browser interaction approval setting (Ask by default; no UI rejects in Ask). Automatic approval retains all target and safety checks. Optional button is left (default) or right; right-click bypasses the controlled link-navigation shortcut and dispatches a native contextual click. Page-controlled handlers can have external effects, so right-click always follows consequential approval. A coordinate click is always approval-required, hit-tests the exact point in Playwright's isolated engine, applies the recorded viewport dimensions temporarily, and is rejected without a successful viewport screenshot.",
       promptGuidelines: browserInteractionGuidelines(),
       executionMode: "sequential",
-      parameters: browserInteractionHandleSchema({
+      parameters: objectSchema({
+        session: boundedStringSchema("Opaque BrowserOpen session handle.", BROWSER_INTERACTION_SESSION_MAX_CHARS),
+        tab: boundedStringSchema("Opaque BrowserOpen tab handle.", BROWSER_INTERACTION_TAB_MAX_CHARS),
+        ref: boundedStringSchema("Current opaque ref from the latest BrowserSnapshot for this session, tab, and document generation. Omit only when clicking screenshot coordinates.", BROWSER_INTERACTION_REF_MAX_CHARS),
         button: enumSchema(["left", "right"], "Optional mouse button; defaults to left. Right-click is consequential on every target and does not use controlled link navigation."),
-      }),
+        x: { type: "integer", minimum: 0, maximum: INTERACTIVE_BROWSER_LIMITS.maxScreenshotWidth, description: `Viewport-image X coordinate in CSS pixels from this tab's last successful BrowserScreenshot with mode="viewport". Requires y; rejected together with ref; the recorded viewport dimensions are temporarily applied automatically.` },
+        y: { type: "integer", minimum: 0, maximum: INTERACTIVE_BROWSER_LIMITS.maxScreenshotHeight, description: `Viewport-image Y coordinate in CSS pixels from this tab's last successful BrowserScreenshot with mode="viewport". Requires x; rejected together with ref.` },
+      }, ["session", "tab"]),
       renderResult: browserRenderResult,
       execute: async (_id, params, signal, _onUpdate, context) => {
         try {
+          rejectUnexpectedFields(params, ["session", "tab", "ref", "button", "x", "y"], "BrowserClick");
+          const hasRef = params.ref !== undefined;
+          const hasX = params.x !== undefined;
+          const hasY = params.y !== undefined;
+          if (hasRef && (hasX || hasY)) {
+            throw new Error("BrowserClick accepts either a current ref or screenshot coordinates (x and y), not both.");
+          }
+          if (hasX !== hasY) {
+            throw new Error("BrowserClick coordinates require both x and y.");
+          }
+          if (!hasRef && !hasX) {
+            throw new Error("BrowserClick requires ref, or x and y screenshot coordinates.");
+          }
           const result = await this.interactiveBrowser.click(
             requiredBoundedString(params.session, "session", BROWSER_INTERACTION_SESSION_MAX_CHARS),
             requiredBoundedString(params.tab, "tab", BROWSER_INTERACTION_TAB_MAX_CHARS),
-            requiredBoundedString(params.ref, "ref", BROWSER_INTERACTION_REF_MAX_CHARS),
+            params.ref === undefined ? undefined : requiredBoundedString(params.ref, "ref", BROWSER_INTERACTION_REF_MAX_CHARS),
             interactiveConfirmation(context),
             signal,
-            { button: clickButton(params.button) },
+            {
+              button: clickButton(params.button),
+              ...(hasX ? { x: boundedInteger(params.x, 0, INTERACTIVE_BROWSER_LIMITS.maxScreenshotWidth, 0, "x") } : {}),
+              ...(hasY ? { y: boundedInteger(params.y, 0, INTERACTIVE_BROWSER_LIMITS.maxScreenshotHeight, 0, "y") } : {}),
+            },
           );
           return textResult(formatBrowserInteraction(result), { response: result });
         } catch (error) {
@@ -1092,6 +1130,7 @@ function browserInteractionGuidelines(): string[] {
   return [
     ...browserObservationGuidelines(),
     "Never claim a click is safe. The extension classifies the freshly resolved target from structural facts; accessible names and model assertions cannot authorize it.",
+    "Opaque BrowserSnapshot refs are the primary click targeting; x/y coordinates in viewport image CSS pixels from this tab's last successful viewport screenshot (mode=viewport) are the fallback only for visual targets without an accessible ref (canvas/WebGL). A coordinate click is always approval-required, hit-tests the exact point in the isolated engine, temporarily applies the recorded viewport dimensions, and cannot target embedded frames. Never retake screenshots or guess coordinates to compensate for a rejected coordinate click.",
     "Unknown, mixed, form, download, authentication, terms, permission, destructive, publish, send, purchase, and account consequences require one-use approval under the user's Browser interaction approval setting: Ask (UI required), Automatically Accept, or Automatically Deny. Role restrictions and all safety checks still apply.",
     "Model credential entry (fill/type into password or credential fields) and model credential submission (activating a form that structurally contains credentials) are additionally gated by web.browserPermissions.modelCredentialEntry and .modelCredentialSubmission; while disabled, the action is denied before any approval prompt with a precise error naming the disabled permission. Local-network permission (web.browserPermissions.localNetworks, or YOLO's master override) is enforced live at the egress broker and navigation preflight: while disabled, loopback, private, link-local, and cloud-metadata destinations are refused before any request or dial, and saved changes apply to the running session without a restart. Model uploads (web.browserPermissions.modelUploads), model download saving (web.browserPermissions.modelDownloadSaving), and model clipboard read/write (web.browserPermissions.modelClipboard) are enforced by BrowserUpload, BrowserDownloadSave, and BrowserClipboard: while disabled, those actions are denied before any approval prompt with a precise error naming the disabled permission, and YOLO overrides all three. Every remaining capability is enforced at runtime: camera, microphone, and geolocation as per-origin permission grants issued when a tab commits a top-level HTTP(S) navigation to an origin (default off; cleared live when disabled — an unconfirmable engine clear fails the affected session closed instead of being claimed applied, and a clear that does not settle within the cleanup deadline is reported as still in flight and the affected session is closed to contain any retained grants), service workers by the launch-pinned context mode (a live toggle performs a controlled browser replacement), the popup restriction override by adopting over-limit page-created popups as owned tabs, and local networks at the egress broker.",
     "Cancellation and failure report effect uncertainty and never claim rollback. Popups remain owned without auto-switching; while model download saving is disabled, downloads are canceled as they occur (when enabled they are retained as opaque pending handles, bounded by web.browserDownloadRetention; 0 means unlimited), and dialogs default-dismissed.",
@@ -1230,6 +1269,7 @@ function formatBrowserInteraction(value: BrowserInteractionResult): string {
     `Browser ${value.operation} ${value.effect}.`,
     `Session: ${value.session} · Tab: ${value.tab} · New document generation: ${value.generation}`,
     ...(value.button ? [`Button: ${value.button}.`] : []),
+    ...(value.coordinate ? [`Coordinates: ${value.coordinate.x}, ${value.coordinate.y} (viewport image CSS pixels from this tab's last successful viewport screenshot).`] : []),
     ...(value.uploadedFiles !== undefined
       ? [`Uploaded files: ${value.uploadedFiles} (${value.uploadedBytes ?? 0} bytes; metadata only, content never shown).`]
       : []),

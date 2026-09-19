@@ -1455,7 +1455,7 @@ test("screenshot validates final encoded bytes, decoded dimensions, and allocati
   });
   const allocationOpened = await allocationManager.open("https://example.com/allocation");
   await assert.rejects(
-    allocationManager.screenshot(allocationOpened.session, allocationOpened.tab, "viewport", undefined),
+    allocationManager.screenshot(allocationOpened.session, allocationOpened.tab, "viewport", undefined, undefined, { viewport: { width: 100, height: 100 } }),
     /allocation limit/,
   );
   assert.equal(allocationManager.activeSessionCount(), 0);

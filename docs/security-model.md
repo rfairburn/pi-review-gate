@@ -105,7 +105,8 @@ service worker; those connections are still validated and pinned by the broker b
 dial, but they skip the manager-side admission record. CSP, CORS, TLS validation,
 nonproxied-WebRTC restrictions, default-deny DNS, and no-QUIC/proxy-bypass defenses
 are unchanged. `BrowserScreenshot` captures only the already-rendered viewport
-or an element addressed by a current opaque semantic ref; it does not admit a new
+(temporarily applying and restoring the requested viewport dimensions for a viewport
+capture) or an element addressed by a current opaque semantic ref; it does not admit a new
 network path. Bounded scroll/wait/history/form controls and every owned tab or admitted
 popup stay inside the same context and authenticated broker; the four-tab cap closes
 excess popups before they can become unowned, except that the model popup restriction

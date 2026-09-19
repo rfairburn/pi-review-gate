@@ -432,6 +432,9 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
     tool("BrowserType", "Append bounded text under policy."),
     tool("BrowserSelect", "Select exact options under policy."),
     tool("BrowserPress", "Press one bounded key under policy."),
+    tool("BrowserUpload", "Upload explicitly chosen host files into a file input under policy."),
+    tool("BrowserDownloadSave", "Save retained pending downloads to explicitly chosen destinations under policy."),
+    tool("BrowserClipboard", "Read or replace bounded browser clipboard text under policy."),
     tool("BrowserWait", "Wait for bounded observational conditions."),
     tool("BrowserHistory", "Inspect bounded session history."),
     tool("BrowserTabs", "Manage bounded owned browser tabs."),
@@ -446,6 +449,7 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
   const browserNames = [
     "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
     "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress",
+    "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard",
     "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
   ];
   for (const name of browserNames) {
@@ -465,7 +469,7 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
   assert.deepEqual((screenshot.details as { activated: string[] }).activated, ["BrowserScreenshot"]);
   assert.ok(fixture.active().includes("BrowserScreenshot"));
 
-  for (const name of ["BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserWait", "BrowserHistory", "BrowserTabs"]) {
+  for (const name of ["BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard", "BrowserWait", "BrowserHistory", "BrowserTabs"]) {
     const loaded = await fixture.search()(`load-${name}`, { query: name });
     assert.deepEqual((loaded.details as { matched: string[] }).matched, [name]);
     assert.deepEqual((loaded.details as { activated: string[] }).activated, [name]);

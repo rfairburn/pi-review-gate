@@ -442,6 +442,98 @@ test("broker refuses loopback, private, and unresolvable destinations with zero 
   }
 });
 
+test("broker local-network opt-in admits loopback, private, and metadata destinations while the default stays public-only", async () => {
+  const origin = countingServer();
+  const originPort = await listen(origin);
+  const echo = net.createServer((socket) => socket.pipe(socket));
+  const echoPort = await listen(echo);
+  // Synthetic DNS only: literals answer themselves, one name answers multicast.
+  const resolveLocal: HostResolver = (hostname) => {
+    if (hostname === "multicast.test") return Promise.resolve(["224.0.0.1"]);
+    return Promise.resolve([hostname]);
+  };
+  try {
+    // Default posture regression: the same local destinations are refused with
+    // zero dials when the instance did not opt in.
+    const strict = await startBroker(resolveLocal);
+    try {
+      assert.equal((await proxyGet(strict.port, `http://127.0.0.1:${originPort}/`)).status, 403);
+      assert.equal((await proxyGet(strict.port, `http://169.254.169.254:${originPort}/`)).status, 403);
+      assert.equal((await proxyConnect(strict.port, `10.0.0.9:${echoPort}`)).status, 403);
+      assert.equal(strict.dials.length, 0, "the public-only default must never dial a local destination");
+    } finally { await strict.stop(); }
+
+    // Explicit per-instance opt-in: the same destinations are admitted with
+    // validation, pinning, budgets, and auth all unchanged.
+    const optedIn = await startBroker(resolveLocal, { allowLocalNetworks: true });
+    try {
+      const loopbackGet = await proxyGet(optedIn.port, `http://127.0.0.1:${originPort}/local-ok`);
+      assert.equal(loopbackGet.status, 200);
+      assert.equal(loopbackGet.body, "origin-ok");
+      const metadataGet = await proxyGet(optedIn.port, `http://169.254.169.254:${originPort}/metadata`);
+      assert.equal(metadataGet.status, 200, "the cloud-metadata endpoint is an agreed local destination");
+      const privateGet = await proxyGet(optedIn.port, `http://10.0.0.5:${originPort}/private`);
+      assert.equal(privateGet.status, 200);
+      // CONNECT tunnels to private authorities are admitted and pinned too.
+      const tunnel = await proxyConnect(optedIn.port, `10.0.0.9:${echoPort}`);
+      assert.equal(tunnel.status, 200);
+      tunnel.socket.write("ping");
+      const [pong] = await once(tunnel.socket, "data");
+      assert.equal(pong.toString(), "ping");
+      tunnel.socket.destroy();
+      // Purpose-invalid destinations stay refused even under the opt-in.
+      assert.equal((await proxyGet(optedIn.port, "http://multicast.test:80/")).status, 403);
+      assert.equal((await proxyGet(optedIn.port, "http://255.255.255.255:80/")).status, 403);
+      // Every dial went to exactly the validated address set (literal hostnames
+      // answer themselves, so hostname == pinned address); multicast never dialed.
+      const dialed = optedIn.dials.map((entry) => `${entry.hostname}=${entry.address}`);
+      assert.ok(dialed.includes(`127.0.0.1=127.0.0.1`), dialed.join(", "));
+      assert.ok(dialed.includes(`169.254.169.254=169.254.169.254`), dialed.join(", "));
+      assert.ok(dialed.includes(`10.0.0.5=10.0.0.5`), dialed.join(", "));
+      assert.ok(dialed.includes(`10.0.0.9=10.0.0.9`), dialed.join(", "));
+      assert.equal(optedIn.dials.length, 4);
+      const summary = optedIn.broker.summary();
+      assert.equal(summary.refusals, 2, "only multicast and broadcast are refused");
+      const kinds = summary.ledger.map((entry) => entry.kind).sort();
+      assert.deepEqual(kinds, ["connect", "http", "http", "http"]);
+      for (const entry of summary.ledger) {
+        assert.ok(entry.address, "every ledger entry keeps its validated destination address");
+      }
+    } finally { await optedIn.stop(); }
+  } finally {
+    await close(origin);
+    await close(echo);
+  }
+});
+
+test("broker local-network opt-in never relaxes budgets defaults or per-render authentication", async () => {
+  // The extraction/default budget surface keeps the public-only default.
+  assert.equal(DEFAULT_EGRESS_BUDGETS.allowLocalNetworks, false);
+  assert.equal(egressBudgetsFor(1024, 60_000).allowLocalNetworks, false);
+
+  const origin = countingServer();
+  const originPort = await listen(origin);
+  const auth: BrokerAuth = { username: "pi-review-gate", password: randomBytes(24).toString("base64url") };
+  const credentials = `Basic ${Buffer.from(`${auth.username}:${auth.password}`, "utf8").toString("base64")}`;
+  const broker = new EgressBroker(
+    async () => ["127.0.0.1"],
+    loopbackDial(),
+    { ...DEFAULT_EGRESS_BUDGETS, allowLocalNetworks: true },
+    auth,
+  );
+  const brokerPort = await broker.start();
+  try {
+    const unauthenticated = await proxyGet(brokerPort, `http://127.0.0.1:${originPort}/`);
+    assert.equal(unauthenticated.status, 407, "local admission never relaxes broker authentication");
+    const authenticated = await proxyGet(brokerPort, `http://127.0.0.1:${originPort}/`, { "proxy-authorization": credentials });
+    assert.equal(authenticated.status, 200);
+    assert.equal(authenticated.body, "origin-ok");
+  } finally {
+    await broker.close();
+    await close(origin);
+  }
+});
+
 test("broker re-resolves per connection: a host public at first dial and private at the next is refused", async () => {
   const privateTarget = countingServer();
   await listen(privateTarget);
@@ -1009,6 +1101,20 @@ test("ledger audit accepts validated public entries and rejects non-public ones"
   assert.throws(() => auditEgressLedger([{ ...entry, address: "" }]), /without a validated destination/);
   assert.throws(() => auditEgressLedger([{ ...entry, hostname: "" }]), /without a validated destination/);
   assert.throws(() => auditEgressLedger([{ ...entry, address: "10.0.0.1" }]), /non-public address/);
+});
+
+test("ledger audit admission defaults public-only and honors the explicit local opt-in", () => {
+  const localEntry: BrokerLedgerEntry = { hostname: "metadata.test", port: 80, address: "169.254.169.254", kind: "http", bytesSent: 1, bytesReceived: 1, completed: true };
+  // Default (no admission argument): public-only, matching the extraction broker.
+  assert.throws(() => auditEgressLedger([localEntry]), /non-public address/);
+  // The same admission the broker was constructed with audits consistently.
+  assert.doesNotThrow(() => auditEgressLedger([localEntry], { allowLocalNetworks: true }));
+  // The opt-in does not exempt purpose-invalid destinations from the audit.
+  const multicastEntry: BrokerLedgerEntry = { ...localEntry, address: "224.0.0.1" };
+  assert.throws(() => auditEgressLedger([multicastEntry], { allowLocalNetworks: true }), /non-public address/);
+  // A still-blocked special-purpose address (CGNAT is not in the local set)
+  // is refused by the audit in both modes.
+  assert.throws(() => auditEgressLedger([{ ...localEntry, address: "100.64.0.1" }], { allowLocalNetworks: true }), /non-public address/);
 });
 
 test("finalizeBrowserRender quiesces the network before honoring the result", async () => {

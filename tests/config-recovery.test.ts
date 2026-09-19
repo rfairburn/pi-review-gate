@@ -38,6 +38,20 @@ test("invalid scalar and nested web value preserve configured reviewers, workers
   assert.equal(JSON.stringify(input), before);
 });
 
+test("invalid browser permission fields are dropped individually without granting capabilities", () => {
+  const input = { web: { browserPermissions: { yolo: "yes", modelUploads: true, localNetworks: 1 } } };
+  const before = JSON.stringify(input);
+  const { config, warnings } = recoverConfig(input);
+  assert.equal(config.web?.browserPermissions.yolo, false);
+  assert.equal(config.web?.browserPermissions.modelUploads, true);
+  assert.equal(config.web?.browserPermissions.localNetworks, false);
+  assert.deepEqual(warnings, [
+    "web.browserPermissions.yolo is invalid or unsupported; using its default.",
+    "web.browserPermissions.localNetworks is invalid or unsupported; using its default.",
+  ]);
+  assert.equal(JSON.stringify(input), before);
+});
+
 test("invalid execution setting preserves resources and routes regardless of input key order", () => {
   const { config } = recoverConfig({ execution: {
     routes: configured.execution.routes,

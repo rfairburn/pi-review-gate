@@ -6,6 +6,7 @@ import {
   normalizeConfig,
   type ActiveReviewerSelection,
   type BrowserInteractionApproval,
+  type WebBrowserPermissions,
   type WorkerResourceCatalog,
   type WorkerRouteEntry,
   type ExecutionRetryPolicy,
@@ -37,6 +38,12 @@ export interface ReviewSettingsSelection {
   webMaxDownloadBytes?: number;
   browserInteractionApproval?: BrowserInteractionApproval;
   browserIdleExpiryMinutes?: number;
+  /** Retained-unsaved-download cap per browser session; 0 disables count-based eviction. */
+  browserDownloadRetention?: number;
+  /** Interactive browser window visibility; applied to a live browser on save. */
+  browserVisible?: boolean;
+  /** Complete a-la-carte browser permission object (issue #27); persisted as a whole. */
+  webBrowserPermissions?: WebBrowserPermissions;
 }
 
 const configUpdateTails = new Map<string, Promise<void>>();
@@ -77,7 +84,7 @@ export async function persistReviewSettings(
     const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
     ui.subtasksViewExpanded = selection.subtasksViewExpanded;
     parsed.ui = ui;
-    if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined) {
+    if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined || selection.browserDownloadRetention !== undefined || selection.browserVisible !== undefined || selection.webBrowserPermissions !== undefined) {
       const web = isRecord(parsed.web) ? { ...parsed.web } : {};
       if (selection.webMaxDownloadBytes !== undefined) {
         const fetch = isRecord(web.fetch) ? { ...web.fetch } : {};
@@ -89,6 +96,18 @@ export async function persistReviewSettings(
       }
       if (selection.browserIdleExpiryMinutes !== undefined) {
         web.browserIdleExpiryMinutes = selection.browserIdleExpiryMinutes;
+      }
+      if (selection.browserDownloadRetention !== undefined) {
+        web.browserDownloadRetention = selection.browserDownloadRetention;
+      }
+      if (selection.browserVisible !== undefined) {
+        web.browserVisible = selection.browserVisible;
+      }
+      if (selection.webBrowserPermissions !== undefined) {
+        // Persist the complete object: YOLO is a master override that preserves
+        // the individual values beneath it, so no field is dropped or invented.
+        // Strict validation runs in normalizeConfig before the atomic write.
+        web.browserPermissions = { ...selection.webBrowserPermissions };
       }
       parsed.web = web;
     }

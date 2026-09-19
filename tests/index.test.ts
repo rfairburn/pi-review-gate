@@ -22,6 +22,7 @@ const webToolNames = [
   "WebSearch", "WebFetch", "BrowserExtract",
   "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
   "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress",
+  "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard",
   "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
 ];
 
@@ -2480,6 +2481,7 @@ test("completed turns never invoke terminal browser cleanup", async () => {
       webTools: {
         register() {},
         sync() {},
+        async applySavedSettings() { return null; },
         async cleanup() {
           cleanupCalls += 1;
           throw new Error("terminal cleanup must not run at turn settlement");

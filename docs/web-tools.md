@@ -196,7 +196,10 @@ and semantic:
 - `BrowserTabs` lists, opens, switches, and closes session-owned tabs using opaque
   handles. A session has at most four tabs. Script-created popups are immediately
   adopted into that same ownership/broker boundary when capacity exists, or closed at
-  the limit. Refused popups remain tracked until closure is confirmed, and a tab whose
+  the limit — except while the model popup restriction override is enabled, which
+  adopts over-limit page-created popups as owned tabs instead, or when a visibility
+  or service-worker replacement re-adopts the previously owned tab set it replaced
+  (see [Browser permissions](#browser-permissions-issue-27)). Refused popups remain tracked until closure is confirmed, and a tab whose
   creation resolves after its deadline is contained during teardown. Switching does
   not change a document generation. Closing the active tab chooses the oldest remaining
   owned tab deterministically; closing the last tab tears down the complete session and
@@ -250,7 +253,9 @@ and semantic:
   `BrowserPress` accepts one named key or short editing chord under a strict grammar;
   clipboard chords, arbitrary sequences, and raw event objects are rejected. All four
   require a fresh owned semantic ref and invalidate refs after a successful action.
-  Password and file controls are rejected. A structurally proven unsent local edit may
+  File controls are rejected; password/credential fields are gated by the
+  `modelCredentialEntry` permission for Fill/Type and non-activation Press (see
+  [Browser permissions](#browser-permissions-issue-27)). A structurally proven unsent local edit may
   proceed as ephemeral state only when relevant page-controlled events are proven
   absent; ordinary web pages can hide direct or delegated `addEventListener` handlers,
   so event-dispatching form actions conservatively require configured approval rather than
@@ -270,6 +275,56 @@ and semantic:
   This is not a page information-flow secrecy guarantee; see the limits below.
   Pi/provider-native conversation and session-history retention is outside this
   protection; do not enter secrets or other credentials.
+- `BrowserUpload` uploads one to 32 explicitly chosen host files into one file
+  input identified by a fresh opaque semantic ref. Source paths are absolute, or
+  relative to the session working directory, and must resolve to regular files;
+  they are verified (real path, size, mtime) before approval, bound into the
+  single-use permit digest, and re-verified after approval. The page supplies only
+  the file-input target — it never sees or chooses source paths — and file content
+  never appears in results, prompts, logs, or snapshots (counts and byte sizes
+  only). It requires `web.browserPermissions.modelUploads` (default off; YOLO
+  overrides) and always follows the Browser interaction approval policy: an upload
+  is always consequential because host bytes leave the machine. Human file input in
+  a visible browser is unaffected by the permission.
+- `BrowserDownloadSave` lists this tab's retained pending downloads, or saves one
+  to an explicitly chosen destination (absolute, or relative to the session working
+  directory), wherever the model's existing host write authority reaches — the
+  browser adds no workspace fence of its own:
+  omitting both `download` and `destination` lists; providing exactly one is
+  rejected. While `web.browserPermissions.modelDownloadSaving` (default off; YOLO
+  overrides) is enabled, a download triggered by an approved action is retained
+  under an opaque handle bound to the session and tab (at most
+  `web.browserDownloadRetention` per session, default **8**; **0** disables
+  count-based eviction entirely; at a finite cap the oldest is canceled and
+  released when a new download arrives — after a live lowering, several at
+  once) instead of canceled — its bytes stay in
+  Playwright's private temporary storage until saved or released. Saving requires
+  a completed download, destination verification against the real path (so a
+  symlinked destination is approved at its true location) before and after
+  approval, and the interaction-approval policy; replacing an existing file is
+  stated in the prompt and created overwrite-race-safely. Actual platform/role
+  write restrictions are enforced by the host filesystem at save time and reported
+  honestly; no destination is assumed writable. Page-suggested filenames are
+  untrusted metadata and never choose or authorize a destination. While the
+  permission is off, downloads are canceled as they occur exactly as before and
+  nothing is retained.
+- `BrowserClipboard` reads or replaces the text on the browser clipboard of one
+  owned tab (text only — no binary or image formats, no file paste, and no
+  arbitrary native clipboard command). It requires
+  `web.browserPermissions.modelClipboard` (default off; YOLO overrides) and
+  always follows the Browser interaction approval policy: while disabled it is
+  denied before any approval prompt with a precise error naming the disabled
+  permission. The manager issues a real per-origin Playwright permission grant
+  for the exact origin of the approved operation — never a context-wide or
+  cross-session capability — re-checks the live permission after approval, and
+  revokes every issued grant immediately when the permission is turned off.
+  Untrusted page content cannot grant or toggle this capability. Headless
+  Chromium operates on its per-instance virtual clipboard (writes do not reach
+  the host pasteboard); headed desktop Chromium reaches the host system
+  clipboard; each result reports which scope was used. Read text is bounded,
+  returned as untrusted evidence, and becomes model-visible content; write
+  values are bound to approval by digest and length only and are never echoed
+  in results or prompts.
 - `BrowserClose` is idempotent. It reports closure only after the page, context,
   Chromium connection, broker listener, and every tracked broker socket are confirmed
   quiescent. Recent closes retain bounded broker diagnostics; older confirmed closes
@@ -291,20 +346,73 @@ shutdown drain operations and close all browser/broker resources. Unrecoverable 
 failures may also close the browser. Unconfirmed teardown fails closed for the remainder
 of that runtime. Browser state is process-local and never survives a restart.
 
-There is no password/file entry, upload, download saving, clipboard, filesystem-path
-input, caller-provided selector, XPath, coordinate action, caller-supplied JavaScript/
-evaluate, forced action, arbitrary action option, CDP, or permission API. Interactions
+Model credential entry exists only under the `modelCredentialEntry` permission,
+model file transfer exists only as `BrowserUpload` and `BrowserDownloadSave`, and
+model clipboard access exists only as `BrowserClipboard`
+(see [Browser permissions](#browser-permissions-issue-27)); there is no
+filesystem-path input, caller-provided selector,
+XPath, coordinate action, caller-supplied JavaScript/evaluate, forced action,
+arbitrary action option, CDP, or permission API. Interactions
 resolve only extension-issued semantic refs internally. Navigation, popup, dialog, and download
 observers are armed before dispatch. Popup tabs stay in the same ownership/broker bound
-and are never auto-switched; overflow popups are closed. Unexpected downloads are
-canceled, and confirm/prompt/beforeunload dialogs are default-dismissed so they cannot
-hang an action. Service workers, external protocols, permissions, direct QUIC/WebRTC,
+and are never auto-switched; overflow popups are closed, except that the model popup
+restriction override adopts over-limit page-created popups as owned tabs (see
+[Browser permissions](#browser-permissions-issue-27)). While model download saving is
+disabled (the default) unexpected downloads are canceled; with it enabled they are
+retained under opaque handles for `BrowserDownloadSave` instead. Confirm/prompt/beforeunload
+dialogs are default-dismissed so they cannot
+hang an action. Service workers are blocked by default and allowed only under the
+model service-worker permission; external protocols, direct QUIC/WebRTC,
 and proxy bypass remain disabled. Interactive images, downloaded fonts, media, SSE,
 and HTTP beacons use protected broker networking. Local `data:`/`blob:` rendering is
-allowed; those URLs do not themselves open network connections. Dedicated and shared
-workers retain broker-only egress. Site CSP, CORS, TLS checks and user-gesture media
-playback policy remain in force. This is a headless QA browser, not unrestricted
-computer use; visibility and password/upload overrides are separate future work.
+allowed; those URLs do not themselves open network connections. Dedicated, shared,
+and (when enabled) service workers retain broker-only egress. Site CSP, CORS, TLS
+checks and user-gesture media playback policy remain in force. This is a QA browser,
+not unrestricted computer use; window visibility is a user-side setting (below),
+and camera/microphone/geolocation access under their permissions follows the same
+broker boundary.
+
+### Browser visibility
+
+`/review-settings` → **Web** → **Browser visibility** selects **Headless** (default,
+no window) or **Headed** (a real browser window with a native address bar). The model's
+tool set and exposure are identical in both modes, and there is no model-facing
+visibility control.
+
+Saving a changed visibility applies it **immediately to the live browser**; the pinned
+Playwright runtime selects the headless-shell or headed binary at launch, so a running
+browser cannot switch modes in place. The save therefore performs a controlled
+replacement through the ordinary ownership path: in-flight browser operations are
+cancelled and settled, the old browser is closed and torn down quiescently with fresh
+per-session egress-broker credentials in the replacement, and no duplicate or orphan
+browser is created. Saving with no open browser applies the preference at the next
+`BrowserOpen`; saving the already-active mode is idempotent and restarts nothing.
+A saved service-worker policy change takes this same path, because Chromium pins
+that mode at context creation too: a live browser is replaced when either launch-
+pinned setting differs from the saved policy, and only then. **Cancel** in the
+settings menu never relaunches anything.
+
+The replacement restores, best-effort and in the original order, every actual context
+tab (including human-opened popups and popup tabs adopted under the model popup
+restriction override) by re-navigating its recorded
+URL through the same effective egress policy, re-applies the manager-issued per-origin
+permission grants that still pass the current effective policy, and it makes the intended tab active again — when
+the real window's foregrounded tab can be detected and differs from the model's
+recorded active tab, the foregrounded tab wins. Cookies, localStorage, and IndexedDB
+are replayed from memory via the context storage-state object; nothing touches disk,
+no persistent profile is created, and state values never appear in results, logs, or
+diagnostics (only counts). This replay is **memory-only and best-effort: there is no
+lossless guarantee**. Auth-dependent pages can still redirect to a login page; each
+tab reports its requested and final URL, mismatches, unrestorable URLs (including
+intended-tab information for URLs that no longer pass the current egress policy —
+public-only by default, with local-network destinations only under the `localNetworks`
+or YOLO permission — which are never re-navigated), failed restores, and pages beyond the tab cap. Old
+session/tab/ref handles are invalidated and rejected; the save notice reports the
+replacement session and tab handles for the model's next operation. Irreversible form
+submissions are not replayed, and no DOM or history state is fabricated. Setting the
+idle expiry to `0` is recommended when working hands-on in a headed window so the
+browser cannot disappear mid-interaction. See
+[Configuration](configuration.md#web-fields).
 
 Everything returned from a page — snapshot text, accessible names, title, URL, and
 pixels — is labeled **untrusted evidence**. It must never be treated as an instruction
@@ -366,9 +474,27 @@ beyond the action deadline. Unsettled work reports unknown effects, never rollba
 Ordinary invalid/stale capability validation and harmless screenshot mode/ref argument
 mistakes do not themselves retire a healthy session.
 Browser tool inactivity expires the session after `web.browserIdleExpiryMinutes`
-(default 15, configurable under `/review-settings` → Web). Background scripts,
-requests and WebSockets do not renew expiry, and active operations/approval waits are
-protected. Expired handles explicitly require `BrowserOpen`; state is not recreated.
+(default 15; configurable under `/review-settings` → Web, where 0 disables idle close
+so only explicit close, shutdown, replacement, or unrecoverable failure ends the
+session). Detectable genuine human input in the live page — browser-trusted pointer
+presses, keyboard input, and wheel scrolling — also resets a nonzero timer, through
+a manager-owned bridge that reports only events Chromium marks trusted (`isTrusted`)
+and authenticates each signal with a single-use HMAC token; page script cannot mint
+or replay tokens, so script alone can never keep the lease alive. Page-script
+`dispatchEvent`, fabricated trusted clicks such as `element.click()`, programmatic
+scrolling, DOM mutations, timers, animation, and background requests/WebSockets are
+never treated as human input. No input values, keys, or element contents are
+collected. Detection is per tab and per document: an adopted popup or newly opened
+tab is covered from its next navigation, and documents in cross-origin (out-of-process)
+iframes are not covered; both gaps fail toward less renewal, never toward spoofing.
+Detection is deliberately partial and never claimed otherwise: input
+outside the page surface (address bar, window controls, scrollbar drags, OS-level
+activity) and navigation by itself are not attributed, and model-driven Playwright
+input travels the same trusted pipeline, renewing like model tool activity always
+has. For hands-on human use, set the timeout to `0` so the browser cannot disappear
+mid-interaction. Background scripts, requests and WebSockets do not renew expiry, and
+active operations/approval waits are protected. Expired handles explicitly require
+`BrowserOpen`; state is not recreated.
 There is no elapsed browser-lifetime deadline or established-stream idle eviction.
 Pre-authentication connection deadlines and concurrent capacity still apply, and new
 connections undergo fresh DNS validation and pinned dialing. No page action is
@@ -432,7 +558,8 @@ provide a model capability contract), it returns a clear error and directs the c
 back to `BrowserSnapshot` rather than creating bytes Pi cannot deliver. Top-level and
 execute Pi roles receive `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`,
 `BrowserHover`, `BrowserClick`, `BrowserFill`, `BrowserType`,
-`BrowserSelect`, and `BrowserPress`; research Pi roles receive observational
+`BrowserSelect`, `BrowserPress`, `BrowserUpload`, `BrowserDownloadSave`, and
+`BrowserClipboard`; research Pi roles receive observational
 `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`, and `BrowserHover` but none of the click/form-action tools. Authorized names appear in each
 role's deterministic names-only system-prompt inventory while schemas
 remain deferred. The generic deferred matcher, ranking, limits, and guidance are shared
@@ -443,7 +570,8 @@ External Claude and Codex adapters retain their existing native web-tool policie
 
 `/review-settings` → **Web** → **Browser interaction approval** controls only the
 existing confirmation-required branch for authorized `BrowserClick`, `BrowserFill`,
-`BrowserType`, `BrowserSelect`, and `BrowserPress`:
+`BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserUpload`,
+`BrowserDownloadSave`, and `BrowserClipboard`:
 
 - **Ask** (default) uses Pi's interactive confirmation prompt. Denial, cancellation,
   unavailable UI, or no-UI/background execution rejects that branch.
@@ -468,7 +596,170 @@ revisit in-flight approval requests or actions already dispatched. Native worker
 settings once at extension startup:
 new launches use the saved policy, while running worker sessions keep their launch
 values. The setting does not change external adapters' native browser policies.
-Invalid config values reject loading; see [Configuration](configuration.md#web-fields).
+Invalid config values reject loading; see [Configuration](configuration.md#web-fields). The separate **Browser permissions** submenu (#27) adds independently selectable capabilities and the YOLO master override on top of this per-action policy; see [Browser permissions](#browser-permissions-issue-27).
+
+### Browser permissions (issue #27)
+
+`/review-settings` → **Web** → **Browser permissions** exposes the independently
+selectable capability toggles from
+[#27](https://github.com/rfairburn/pi-review-gate/issues/27): model credential
+entry, credential submission, uploads, download saving, clipboard read/write,
+camera, microphone, geolocation, service workers, popup restriction override,
+local networks (human and model), and the **YOLO / allow everything** master
+override. They are a-la-carte booleans — there is no security-level ladder or
+role scheme — and every one defaults off, so current behavior is unchanged until
+a capability is explicitly enabled.
+
+The pure effective policy (`effectiveBrowserPolicy` in
+`src/web/browser-capabilities.ts`) computes what each stored setting means:
+
+- **YOLO** enables the complete agreed capability set and bypasses per-action
+  approval prompts, including an otherwise configured Ask or Automatically Deny
+  policy; it never silently leaves a supposedly disabled restriction in force.
+  YOLO-approved actions are automatic approvals and must never be reported as
+  human-confirmed. Enabling requires the explicit interactive confirmation
+  described in [Configuration](configuration.md#web-fields); disabling is
+  straightforward and restores the saved individual values as effective.
+- **Model-only toggles** constrain model actions only. Human credential/form
+  submission and file uploads remain allowed regardless of them, and browser
+  visibility stays independent of tool availability/exposure.
+- **Upload/download selection and side effects** follow the existing Ask /
+  Automatically Accept / Automatically Deny interaction-approval policy; no
+  mandatory human file picker is introduced.
+- **Local networks** applies to human and model navigation alike and covers
+  loopback, private, and link-local addresses including cloud metadata endpoints;
+  enabling it presents a prominent warning about SSRF-style access to local
+  services and instance metadata.
+- **Service workers and popup override** grant capability only: they do not force
+  registration, activation, or new popups. With both off (the default),
+  service workers are blocked at context creation and page-created popups stay
+  inside the four-tab session limit.
+
+Browser host/session ownership and the authenticated control transport are
+preserved: these settings grant no cross-session or arbitrary host-command
+authority, and unsupported capabilities require real implementation before any
+runtime claims them.
+
+**Enforced today:** `modelCredentialEntry` and `modelCredentialSubmission` gate
+the interactive-browser tool actions. While disabled (the default), a model
+Fill/Type into a password-type field — or an explicit current/new-password
+autocomplete field — is denied before any approval prompt, as is a model click
+on a native submit control or activation-key press on a form that structurally
+contains credentials; each denial names the disabled permission and notes that
+human browser input is unaffected. Detection is structural only: no field value
+is read, echoed, or compared, so a human-entered password is gated exactly like
+a model-entered one. Non-credential forms and navigation to authenticated
+routes are not gated by these capabilities; they follow the ordinary interaction
+approval policy, and there is no blanket denial of authenticated browsing. With
+the permissions enabled, the same actions proceed through the existing Ask /
+Automatically Accept / Automatically Deny flow with one-use revalidated permits;
+YOLO approves them automatically and never as human-confirmed. Settings saved
+through `/review-settings` apply to the live session for these two capabilities.
+
+`localNetworks` (and YOLO, which enables it) is enforced at the interactive
+egress broker and navigation preflight: while disabled (the default), loopback,
+private, link-local, and cloud-metadata destinations are refused before any
+request or dial — for initial navigation, model and human address-bar
+navigation, page-initiated requests, main-document redirects, adopted popups,
+and page-created WebSockets alike. While enabled, the same admissions proceed
+with the identical resolve-once-and-pin validation applied to every resolved
+address. Settings saved through `/review-settings` apply to live sessions
+without a restart; disabling revokes only the established local connections
+(the browser keeps running) and refuses subsequent local admissions.
+`WebFetch` and `BrowserExtract` remain public-only regardless of this setting.
+
+`modelUploads` and `modelDownloadSaving` are enforced by `BrowserUpload` and
+`BrowserDownloadSave`: while disabled (the default), those tools are denied
+before any approval prompt with a precise error naming the disabled permission,
+and no file is read, sent, staged, or written; human file input and downloads in
+a visible browser are unaffected. With the permissions enabled, uploads and
+saves proceed through the existing Ask / Automatically Accept /
+Automatically Deny flow with one-use revalidated permits bound to the exact
+source files, or the download handle and verified destination; YOLO approves
+them automatically and never as human-confirmed. Download saving resolves
+destinations against the model's existing host write authority (relative paths
+resolve to the session working directory; absolute paths are not fenced by the
+browser), binds the exact real destination into the one-use approval, and releases
+retained staged artifacts on save, capability revocation, or session teardown.
+Settings saved through `/review-settings` apply to the live session for these
+capabilities; revoking download saving cancels and drops every retained pending
+download immediately.
+
+`modelClipboard` is enforced by `BrowserClipboard`: while disabled (the
+default), both clipboard operations are denied before any approval prompt with
+a precise error naming the disabled permission, and no per-origin browser
+permission grant is issued. With it enabled, reads and writes proceed through
+the existing Ask / Automatically Accept / Automatically Deny flow with one-use
+revalidated permits bound to the exact session, tab, generation, origin,
+operation, and — for writes — a digest and length of the exact text; YOLO
+approves them automatically and never as human-confirmed. The manager issues a
+real Playwright permission grant for the approved operation's origin only —
+the capability is per-origin, never context-wide or cross-session — re-checks
+the live permission after approval, and revokes every issued grant immediately
+when the permission is turned off (the running browser keeps all of its other
+behavior). Headless Chromium operates on its per-instance virtual clipboard;
+headed desktop Chromium reaches the host system clipboard, and each result
+reports which scope was used.
+
+`modelCamera`, `modelMicrophone`, and `modelGeolocation` are enforced as real
+per-origin device permission grants on the owned browser context. While
+disabled (the default), no device grant is issued for any origin, so page
+requests for camera, microphone, or location are denied by Chromium itself.
+While enabled, the manager issues a Playwright grant scoped to that origin only
+when one of its tabs commits a top-level HTTP(S) navigation there — model
+navigation, adopted popups, and page-initiated navigation alike — re-evaluating
+the current effective policy at every commit. The grants compose with clipboard
+grants (enabling one never clears the others), YOLO enables all three,
+and disabling any of them immediately revokes its per-origin grants from
+every live session while leaving the other enabled grants intact. These
+toggles grant capability, not forced activation: a page must still request the
+device or location API itself, and no browser tool invokes these APIs on the
+model's behalf — what a page does with granted access is page behavior,
+bounded only by the egress policy. Whether capture actually succeeds also
+depends on the host (hardware presence, operating-system privacy prompts such
+as macOS camera/microphone access, and an available position source); the
+manager grants permission state only, reports failures truthfully, and never
+fabricates media or coordinates.
+
+`modelServiceWorkers` is enforced at context creation: while disabled (the
+default), every managed browser context is created with service workers
+blocked, so registration never completes; enabling it allows registration and
+activation. Chromium pins this mode at launch, so a saved change to the setting
+(or to YOLO) cannot flip a live browser in place — applying the save performs
+the same controlled replacement as a visibility change: the session is closed
+through the ordinary ownership path and relaunched under the new policy,
+restoring ordered tabs, the active page, storage state, and manager-issued
+permission grants best-effort, with every loss reported. Service-worker network
+traffic stays inside the existing egress boundary: worker script loads and
+worker-initiated requests traverse the authenticated broker exactly like other
+page traffic, under the same public-URL, DNS-pinning, and local-network
+policy. One truthful limitation: Playwright's per-tab WebSocket admission,
+which validates and records each socket before connect, does not observe
+sockets created inside a service worker; those still egress only through the
+authenticated broker, whose own pre-dial validation enforces the same
+destination policy, but they do not receive the manager-side admission record.
+
+`modelPopupRestrictionOverride` lifts the four-tab session limit for
+page-created popups while enabled: a popup created by page script beyond the
+limit is adopted as an owned explicit-tab handle with the full guard set
+(routes, WebSocket admission, navigation policy, and broker egress) instead of
+being refused and closed. Model-initiated opens remain subject to the four-tab
+limit; no separate or higher popup cap is introduced. Disabling the override
+does not close already-adopted popup tabs — it only refuses further over-limit
+adoptions from that point on. A later visibility or service-worker replacement
+still restores those previously owned tabs: the replacement re-adopts exactly
+the replaced session's owned tab set (beyond the ordinary limit when the
+override had admitted extra popups) and admits no new over-limit popups of its
+own.
+
+**Exfiltration boundary (truthful):** these gates constrain model-initiated
+tool actions only. They do not make the managed browser a secret safe: page
+scripts can read field values, submit forms through their own handlers, and use
+every network channel still available to the page. The bounded memory-only
+redaction registry protects literal echoes in extension result text and
+diagnostics; it is not a page information-flow secrecy guarantee, and Pi/provider
+conversation and session-history retention are outside its protection. Do not
+enter secrets into pages that do not deserve them.
 
 ## Page cache
 

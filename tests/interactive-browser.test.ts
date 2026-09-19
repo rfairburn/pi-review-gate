@@ -1,25 +1,106 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
-import { normalizeConfig, type BrowserInteractionApproval } from "../src/config";
+import { chromium, type Browser } from "playwright";
+import { DEFAULT_BROWSER_PERMISSIONS, normalizeConfig, type BrowserInteractionApproval } from "../src/config";
+import { FakeBrowser, FakePage, managerFixture, ONE_PIXEL_PNG } from "./browser-fakes";
 import { WebToolManager } from "../src/web/tools";
 import { BrowserConfirmationPermits, type BrowserTargetStructure } from "../src/web/browser-interaction-policy";
 import {
   BrowserFailureError,
   InteractiveBrowserManager,
+  type BrowserVisibilityResult,
   interactiveChromiumArgs,
   interactiveRouteDecision,
 } from "../src/web/interactive-browser";
+import { humanInputToken } from "../src/web/browser-human-input";
 
-const ONE_PIXEL_PNG = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-  "base64",
-);
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function until(body: () => void, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { body(); return; } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await delay(5);
+    }
+  }
+}
+
+test("a genuine human-input token renews the finite idle lease; close detaches it", async () => {
+  let now = 0;
+  const browsers: FakeBrowser[] = [];
+  const config = normalizeConfig({}).web!.fetch;
+  const manager = new InteractiveBrowserManager(config, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => {
+      const browser = new FakeBrowser();
+      browsers.push(browser);
+      return browser as unknown as Browser;
+    },
+    now: () => now,
+  });
+  try {
+    const opened = await manager.open("https://example.com/");
+    // The detector is installed per tab on its own CDP session in a browser-
+    // owned isolated world; the token travels only as a console payload.
+    const context = browsers[0]!.context;
+    const bridge = context.cdpSessions.find((session) =>
+      session.sent.some((call) => call.method === "Page.addScriptToEvaluateOnNewDocument"));
+    assert.ok(bridge, "the human input bridge must be installed on the tab's CDP session");
+    assert.ok(bridge.sent.some((call) => call.method === "Page.enable"));
+    assert.ok(bridge.sent.some((call) => call.method === "Runtime.enable"));
+    const scriptCall = bridge.sent.find((call) => call.method === "Page.addScriptToEvaluateOnNewDocument")!;
+    assert.equal((scriptCall.params as { worldName?: string }).worldName, "pi-review-gate-human-input");
+    const source = (scriptCall.params as { source?: string }).source ?? "";
+    const secret = /var SECRET = "([0-9a-f]{64})";/.exec(source)?.[1];
+    assert.ok(secret, "detector script carries the per-session secret");
+    const signal = (kind: string, counter: number) => bridge.emitConsoleCall("debug", humanInputToken(secret, "0123456789abcdef", kind, counter));
+
+    // 30 simulated minutes pass; a genuine human press renews at that moment.
+    now = 30_000;
+    signal("pointerdown", 1);
+    // A replay of the same token must not move the renewal point again.
+    signal("pointerdown", 1);
+    // Renewal is observable through the expiry edge driven by live re-arm.
+    now = 89_999; // renewal + 59_999ms < 60_000ms window
+    manager.updateConfig(config, "ask", 1);
+    await delay(30);
+    assert.equal(manager.activeSessionCount(), 1, "trusted human input renewed the lease");
+    now = 90_000; // renewal + exactly 60_000ms
+    manager.updateConfig(config, "ask", 1);
+    await until(() => assert.equal(manager.activeSessionCount(), 0, "lease expires on schedule after the last genuine input"));
+    // Teardown detached the callbacks: late tokens cannot resurrect anything.
+    now = 120_000;
+    signal("keydown", 2);
+    manager.updateConfig(config, "ask", 1);
+    await delay(30);
+    assert.equal(manager.activeSessionCount(), 0);
+
+    // Explicit close also detaches: a fresh session, closed, ignores its token.
+    const second = await manager.open("https://example.com/");
+    const secondBridge = browsers[1]!.context.cdpSessions.find((session) =>
+      session.sent.some((call) => call.method === "Page.addScriptToEvaluateOnNewDocument"));
+    assert.ok(secondBridge);
+    const secondSecret = /var SECRET = "([0-9a-f]{64})";/.exec(
+      (secondBridge.sent.find((call) => call.method === "Page.addScriptToEvaluateOnNewDocument")!.params as { source?: string }).source ?? "",
+    )?.[1];
+    assert.ok(secondSecret);
+    await manager.close(second.session);
+    secondBridge.emitConsoleCall("debug", humanInputToken(secondSecret, "0123456789abcdef", "pointerdown", 1));
+    manager.updateConfig(config, "ask", 1);
+    await delay(30);
+    assert.equal(manager.activeSessionCount(), 0, "closed sessions cannot be resurrected by late tokens");
+    // The bridge's own CDP session is detached by teardown.
+    assert.equal(bridge.detached, true);
+    assert.equal(secondBridge.detached, true);
+  } finally {
+    await manager.shutdown().catch(() => undefined);
+  }
+});
 
 test("WebToolManager constructor and sync apply idle expiry and tool activity renews it", async () => {
   let now = 0;
@@ -57,277 +138,48 @@ test("WebToolManager constructor and sync apply idle expiry and tool activity re
   } finally { await boundary.cleanup(); }
 });
 
+test("zero idle expiry disables idle close and finite settings still apply live both ways", async () => {
+  let now = 0;
+  const browser = new FakeBrowser();
+  const config = normalizeConfig({ web: { browserIdleExpiryMinutes: 1 } });
+  const manager = new InteractiveBrowserManager(config.web!.fetch, {
+    now: () => now,
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => browser as unknown as Browser,
+  });
+  const tools: Array<{ name: string; execute(id: string, params: Record<string, unknown>): Promise<any> }> = [];
+  const boundary = new WebToolManager({ registerTool: tool => tools.push(tool as never) }, config, undefined, undefined, manager);
+  boundary.register();
+  const call = (name: string, params: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("idle-zero-test", params);
+  try {
+    const result = await call("BrowserOpen", { url: "https://example.com/" });
+    const { session, tab } = result.details.response;
+    await call("BrowserSnapshot", { session, tab });
+    // Disabled: no idle expiry even after far more than the previous limit.
+    boundary.sync(normalizeConfig({ web: { browserIdleExpiryMinutes: 0 } }));
+    now = 900_000;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(manager.activeSessionCount(), 1);
+    await call("BrowserSnapshot", { session, tab });
+    // Back to finite: reschedules from last tool activity. Sync near the end of
+    // the 60s window (matching the real-timer pattern of the test above).
+    now = 959_999;
+    boundary.sync(normalizeConfig({ web: { browserIdleExpiryMinutes: 1 } }));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(manager.activeSessionCount(), 1);
+    now = 960_000;
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await assert.rejects(call("BrowserSnapshot", { session, tab }), /expired.*BrowserOpen/s);
+    assert.equal(manager.activeSessionCount(), 0);
+  } finally { await boundary.cleanup(); }
+});
+
 function pngWithDimensions(width: number, height: number, bytes = ONE_PIXEL_PNG.byteLength) {
   const image = Buffer.alloc(Math.max(bytes, 24));
   ONE_PIXEL_PNG.subarray(0, Math.min(ONE_PIXEL_PNG.byteLength, image.byteLength)).copy(image);
   image.writeUInt32BE(width, 16);
   image.writeUInt32BE(height, 20);
   return image;
-}
-
-class FakePage extends EventEmitter {
-  private currentUrl = "about:blank";
-  private closed = false;
-  private visited: string[] = [];
-  private visitedIndex = -1;
-  readonly frame = {
-    url: () => this.url(),
-    locator: (_selector: string) => ({ first: () => ({ count: async () => 0 }) }),
-    parentFrame: () => null,
-  };
-  evaluateCalls = 0;
-  hoverCalls = 0;
-  clickCalls = 0;
-  fillCalls: string[] = [];
-  typeCalls: Array<{ text: string; delay: number }> = [];
-  selectCalls: Array<Array<{ value?: string; label?: string }>> = [];
-  pressCalls: string[] = [];
-  onClick?: () => void | Promise<void>;
-  onStructureRead?: () => void;
-  targetStructure: BrowserTargetStructure = {
-    tagName: "a", role: "link", href: "https://example.com/next", target: null,
-    download: false, inputType: null, formAssociated: false, formAction: null,
-    formMethod: null, ariaHasPopup: null, contentEditable: false, disabled: false,
-    inlineEventHandler: false, summaryForDetails: false,
-    domPath: "html:nth-of-type(1)> body:nth-of-type(1)> a:nth-of-type(1)",
-  };
-  readonly visibleTextMatches = new Map<string, number>();
-  inspectDelayMs = 0;
-
-  mainFrame() { return this.frame; }
-  url() { return this.currentUrl; }
-  isClosed() { return this.closed; }
-  async routeWebSocket() {}
-  async title() { return "Untrusted fixture title"; }
-  viewportSize() { return { width: 1280, height: 720 }; }
-  async ariaSnapshot() { return '- heading "Fixture" [level=1]\n- link "Next" [ref=e7]\n'; }
-  async screenshot(_options?: Record<string, any>) { return ONE_PIXEL_PNG; }
-  async evaluate() { this.evaluateCalls += 1; }
-  async bringToFront() {}
-  getByRole(role: string, options: { name?: string } = {}) {
-    return { fixtureRole: role, fixtureName: options.name ?? "" };
-  }
-  getByText(text: string) {
-    return {
-      filter: ({ visible }: { visible: boolean }) => {
-        assert.equal(visible, true);
-        return {
-          first: () => ({
-            waitFor: async ({ state }: { state: string }) => {
-              const visibleCount = this.visibleTextMatches.has(text)
-                ? this.visibleTextMatches.get(text)!
-                : text === "Missing" ? 0 : 1;
-              if (state === "attached" && visibleCount === 0) throw new Error("no visible text match");
-              if (state === "hidden" && visibleCount > 0) throw new Error("visible text match remains");
-            },
-          }),
-        };
-      },
-    };
-  }
-  async waitForURL(predicate: (url: URL) => boolean) {
-    if (!predicate(new URL(this.currentUrl))) throw new Error("fixture URL condition not satisfied");
-  }
-  async waitForNavigation() {}
-  async waitForTimeout(durationMs: number) { await new Promise<void>((resolve) => setTimeout(resolve, durationMs)); }
-  locator(selector: string): any {
-    if (selector !== "aria-ref=e7") return { fixtureTag: selector };
-    const page = this;
-    return {
-      _selector: selector,
-      _frame: { _connection: { toImpl: () => ({ selectors: {
-        callOnSelector: async (ownedSelector: string, options: { strict: boolean; mainWorld: boolean }) => {
-          assert.equal(ownedSelector, "aria-ref=e7");
-          assert.deepEqual(options, { strict: true, mainWorld: false });
-          return { result: {
-            formAssociated: page.targetStructure.formAssociated, formAction: page.targetStructure.formAction,
-            formMethod: page.targetStructure.formMethod, autocomplete: page.targetStructure.autocomplete ?? null,
-            baseUrl: page.url(), topLevel: true, target: null,
-          } };
-        },
-      } }) } },
-      elementHandle: async () => { throw new Error("Preflight must not create page-world element previews."); },
-      _expect: async () => ({ received: { value: "Fixture description" } }),
-      scrollIntoViewIfNeeded: async () => undefined,
-      waitFor: async () => undefined,
-      getAttribute: async (name: string) => name === "type"
-        ? (page.onStructureRead?.(), page.targetStructure.inputType)
-        : name === "role" ? page.targetStructure.role
-          : name === "href" ? page.targetStructure.href
-            : name === "aria-description" ? "Fixture description"
-              : name === "id" ? page.targetStructure.domPath
-                : name === "multiple" ? (page.targetStructure.multiple ? "" : null)
-                  : name === "autocomplete" ? page.targetStructure.autocomplete ?? null
-                    : name === "readonly" ? (page.targetStructure.readOnly ? "" : null) : null,
-      locator: (selector: string) => {
-        if (selector === "xpath=ancestor-or-self::*[@contenteditable][1]") return { count: async () => 0 };
-        assert.equal(selector, "option");
-        const labels = ["Private A", "Private B", "private-approval-value", "private"];
-        return { count: async () => labels.length, nth: (index: number) => ({
-          getAttribute: async (name: string) => name === "value" ? labels[index] : null,
-          textContent: async () => labels[index],
-        }) };
-      },
-      ariaSnapshot: async () => {
-        if (page.inspectDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, page.inspectDelayMs));
-        const role = page.targetStructure.role ?? (page.targetStructure.tagName === "input" ? "textbox" : "generic");
-        return `- ${role} "Next"${page.targetStructure.disabled ? " [disabled]" : ""} [ref=e7]`;
-      },
-      isDisabled: async () => page.targetStructure.disabled,
-      isEditable: async () => !page.targetStructure.disabled && !page.targetStructure.readOnly
-        && (page.targetStructure.contentEditable || ["input", "textarea", "select"].includes(page.targetStructure.tagName)),
-      isChecked: async () => { throw new Error("not checkable"); },
-      innerText: async () => {
-        if (page.inspectDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, page.inspectDelayMs));
-        return "Visible fixture text";
-      },
-      and: (other: { fixtureTag?: string; fixtureRole?: string; fixtureName?: string }) => ({
-        count: async () => {
-          if (other.fixtureRole) {
-            const role = page.targetStructure.role ?? (page.targetStructure.tagName === "input" ? "textbox" : "generic");
-            return other.fixtureRole === role && other.fixtureName === "Next" ? 1 : 0;
-          }
-          const selector = other.fixtureTag;
-          if (selector === "details > summary") return page.targetStructure.summaryForDetails ? 1 : 0;
-          if (selector === "form input, form button, form select, form textarea") return page.targetStructure.formAssociated ? 1 : 0;
-          if (selector?.startsWith("[contenteditable]")) return page.targetStructure.contentEditable ? 1 : 0;
-          if (selector?.startsWith("[onclick]")) return page.targetStructure.inlineEventHandler ? 1 : 0;
-          return selector === page.targetStructure.tagName ? 1 : 0;
-        },
-      }),
-      evaluate: async (_callback: unknown, ...args: unknown[]) => {
-        if (Array.isArray(args[0])) return args[0].map(() => "value");
-        if (args[0] === "append") return true;
-        if (args.length > 0) return undefined;
-        page.onStructureRead?.();
-        return { ...page.targetStructure };
-      },
-      hover: async () => { this.hoverCalls += 1; },
-      click: async () => { this.clickCalls += 1; await this.onClick?.(); },
-      fill: async (value: string) => { this.fillCalls.push(value); },
-      pressSequentially: async (text: string, options: { delay?: number }) => {
-        this.typeCalls.push({ text, delay: options.delay ?? 0 });
-      },
-      selectOption: async (options: Array<{ value?: string; label?: string }>) => {
-        this.selectCalls.push(options);
-      },
-      press: async (key: string) => { this.pressCalls.push(key); },
-      boundingBox: async () => ({ x: 1, y: 2, width: 50, height: 20 }),
-      screenshot: async () => { throw new Error("element screenshot must use a prevalidated page clip"); },
-    };
-  }
-  private commit(url: string, addHistory: boolean) {
-    const request = {
-      isNavigationRequest: () => true,
-      frame: () => this.frame,
-      redirectedFrom: () => null,
-    };
-    this.emit("request", request);
-    this.currentUrl = url;
-    if (addHistory) {
-      this.visited.splice(this.visitedIndex + 1);
-      this.visited.push(url);
-      this.visitedIndex = this.visited.length - 1;
-    }
-    const response = { status: () => 200, request: () => request };
-    this.emit("response", response);
-    this.emit("framenavigated", this.frame);
-    return response;
-  }
-  navigationHistory() {
-    return { currentIndex: this.visitedIndex, entries: this.visited.map((url, index) => ({ id: index + 1, url })) };
-  }
-  async navigateToHistoryEntry(id: number) {
-    if (id === this.visitedIndex) await this.goBack();
-    else if (id === this.visitedIndex + 2) await this.goForward();
-    else throw new Error("unexpected fixture history target");
-  }
-  async goto(url: string) { return this.commit(url, true); }
-  async goBack() {
-    if (this.visitedIndex <= 0) return null;
-    this.visitedIndex -= 1;
-    return this.commit(this.visited[this.visitedIndex]!, false);
-  }
-  async goForward() {
-    if (this.visitedIndex >= this.visited.length - 1) return null;
-    this.visitedIndex += 1;
-    return this.commit(this.visited[this.visitedIndex]!, false);
-  }
-  async reload() { return this.commit(this.currentUrl, false); }
-  async waitForLoadState() {}
-  async close() {
-    if (this.closed) return;
-    this.closed = true;
-    this.emit("close");
-  }
-}
-
-class FakeContext extends EventEmitter {
-  readonly page = new FakePage();
-  readonly pages = [this.page];
-  private created = 0;
-  configureNextPage?: (page: FakePage) => void;
-  routeHandler?: (route: any) => Promise<void>;
-  nextPageDelayMs = 0;
-  closed = false;
-  setDefaultTimeout() {}
-  setDefaultNavigationTimeout() {}
-  async newCDPSession(page: FakePage) {
-    return {
-      send: async (method: string, params?: { entryId: number }) => {
-        if (method === "Page.getNavigationHistory") return page.navigationHistory();
-        if (method === "Page.navigateToHistoryEntry") return page.navigateToHistoryEntry(params!.entryId);
-        throw new Error(`Unexpected internal protocol method ${method}`);
-      },
-      detach: async () => undefined,
-    };
-  }
-  async clearPermissions() {}
-  async routeWebSocket() {}
-  async route(_pattern: string, handler: (route: any) => Promise<void>) { this.routeHandler = handler; }
-  async newPage() {
-    const delayMs = this.created > 0 ? this.nextPageDelayMs : 0;
-    this.nextPageDelayMs = 0;
-    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
-    const page = this.created++ === 0 ? this.page : new FakePage();
-    if (!this.pages.includes(page)) this.pages.push(page);
-    const configure = this.configureNextPage;
-    this.configureNextPage = undefined;
-    configure?.(page);
-    this.emit("page", page);
-    return page as unknown as Page;
-  }
-  async close() {
-    this.closed = true;
-    await Promise.all(this.pages.map((page) => page.close()));
-  }
-}
-
-class FakeBrowser extends EventEmitter {
-  readonly context = new FakeContext();
-  connected = true;
-  async newContext() { return this.context as unknown as BrowserContext; }
-  contexts() { return this.context.closed ? [] : [this.context as unknown as BrowserContext]; }
-  isConnected() { return this.connected; }
-  async close() {
-    this.connected = false;
-    this.emit("disconnected");
-  }
-}
-
-function managerFixture(options: { cleanupMs?: number; hangingContextClose?: boolean; limits?: Record<string, number>; confirmationPermits?: BrowserConfirmationPermits } = {}) {
-  const browser = new FakeBrowser();
-  if (options.hangingContextClose) browser.context.close = async () => new Promise<void>(() => undefined);
-  const config = normalizeConfig({}).web!.fetch;
-  let serial = 0;
-  const manager = new InteractiveBrowserManager(config, {
-    resolveHostname: async (hostname: string) => net.isIP(hostname) ? [hostname] : ["93.184.216.34"],
-    launch: async () => browser as unknown as Browser,
-    randomHandle: (kind: string) => `${kind}_${++serial}_${"x".repeat(32)}`,
-    limits: { ...(options.limits ?? {}), ...(options.cleanupMs === undefined ? {} : { cleanupMs: options.cleanupMs }) },
-    confirmationPermits: options.confirmationPermits,
-  });
-  return { manager, browser };
 }
 
 test("child navigation invalidates old refs and approval-time targets; capture failure remains typed through tools", async () => {
@@ -1084,7 +936,13 @@ for (const family of approvalFamilies) {
         page.onStructureRead = undefined;
         if (family !== "click") {
           for (const inputType of ["password", "file"]) {
-            page.targetStructure = { ...page.targetStructure, tagName: "input", role: "textbox", inputType };
+            // The password case simulates a credential-bearing form so the
+            // issue #27 entry/submission gates (default off) deny before any
+            // approval; file controls are hard-denied by structure alone.
+            page.targetStructure = {
+              ...page.targetStructure, tagName: "input", role: "textbox", inputType,
+              formHasCredentialField: inputType === "password",
+            };
             await assert.rejects(action(await freshRef()), /not_started/);
           }
         }
@@ -1327,7 +1185,7 @@ test("BrowserTabs contains rejected and hung excess-popup closes before retiring
     await new Promise<void>((resolve) => setTimeout(resolve, 80));
     assert.equal(manager.activeSessionCount(), 0, `${mode} containment failure must retire the session`);
     assert.equal(refusedPage?.isClosed(), true);
-    assert.ok(browser.context.pages.every((page) => page.isClosed()));
+    assert.ok(browser.context.pages().every((page) => page.isClosed()));
     assert.equal(browser.isConnected(), false);
     assert.equal((await manager.close(opened.session)).alreadyClosed, true);
   }
@@ -1348,8 +1206,8 @@ test("BrowserTabs contains a page that resolves after its creation deadline", as
     /could not confirm whether a new page was created.*teardown started/i,
   );
   assert.equal(manager.activeSessionCount(), 0);
-  assert.equal(browser.context.pages.length, 2, "the fixture produced a page after the operation deadline");
-  assert.ok(browser.context.pages.every((page) => page.isClosed()), "every late page is contained before rejection returns");
+  assert.equal(browser.context.pages().length, 2, "the fixture produced a page after the operation deadline");
+  assert.ok(browser.context.pages().every((page) => page.isClosed()), "every late page is contained before rejection returns");
   assert.equal(browser.isConnected(), false);
   assert.equal((await manager.close(opened.session)).alreadyClosed, true);
 });
@@ -1414,7 +1272,7 @@ test("BrowserTabs close rejection and delayed close fail into confirmed session 
     const added = await manager.tabs(opened.session, "open", undefined, "https://example.com/secondary");
     const tabHandle = added.openedTab;
     assert.ok(tabHandle);
-    const page = browser.context.pages[1]!;
+    const page = browser.context.pages()[1]!;
     const closeNormally = page.close.bind(page);
     let attempts = 0;
     page.close = async () => {
@@ -1869,6 +1727,31 @@ test("real browser form listeners require confirmation before any background dis
   }
 });
 
+test("real credential-form detection matches autocomplete tokens case-insensitively", async () => {
+  const origin = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(`<!doctype html><title>Mixed-case credential form</title>
+      <form action="/login" method="post">
+        <input type="text" name="user" autocomplete="Current-Password">
+        <button type="submit">Sign in</button>
+      </form>`);
+  });
+  await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const port = (origin.address() as AddressInfo).port;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async () => ["93.184.216.34"],
+    brokerDial: (_validated, destinationPort) => net.connect({ host: "127.0.0.1", port: destinationPort }),
+  });
+  try {
+    const opened = await manager.open(`http://public.test:${port}/`);
+    const ref = (await manager.snapshot(opened.session, opened.tab, 2_000)).snapshot.match(/button "Sign in"[^\n]*\[ref=([^\]]+)\]/)![1];
+    await assert.rejects(manager.click(opened.session, opened.tab, ref, async () => true), /model credential submission is disabled/);
+  } finally {
+    await manager.shutdown();
+    await new Promise<void>((resolve, reject) => origin.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("real BrowserType appends despite an existing caret at the start", async () => {
   const origin = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -2298,8 +2181,8 @@ test("browser diagnostics stay tab-local and cancellation tears down the owning 
   const opened = await manager.open("https://example.com/one");
   const second = await manager.tabs(opened.session, "open", undefined, "https://example.com/two");
   assert.ok(second.openedTab);
-  const firstPage = browser.context.pages[0]!;
-  const secondPage = browser.context.pages[1]!;
+  const firstPage = browser.context.pages()[0]!;
+  const secondPage = browser.context.pages()[1]!;
   const message = (text: string) => ({
     text: () => text,
     type: () => "info",
@@ -2335,4 +2218,331 @@ test("a timed-out BrowserInspect is contained before action serialization is rel
   await assert.rejects(manager.inspect(opened.session, opened.tab, ref), /15ms total deadline/);
   assert.equal(manager.activeSessionCount(), 0, "timeout teardown completes before BrowserInspect rejects");
   assert.equal(browser.context.page.isClosed(), true);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #27 model credential capability gates: entry and submission are
+// enforced on the tool-action path with structural (value-free) detection,
+// fail fast before any approval prompt, revalidate after settings changes,
+// and leave human input, non-credential forms, and authenticated navigation
+// on the ordinary paths.
+// ---------------------------------------------------------------------------
+
+const CREDENTIAL_ENTRY_PERMISSIONS = { ...DEFAULT_BROWSER_PERMISSIONS, modelCredentialEntry: true };
+
+function credentialFormStructure(page: FakePage, overrides: Partial<BrowserTargetStructure> = {}): void {
+  page.targetStructure = {
+    ...page.targetStructure,
+    tagName: "input", role: "textbox", inputType: "password", href: null,
+    formAssociated: true, formHasCredentialField: true, autocomplete: null,
+    domPath: "html:nth-of-type(1)> body:nth-of-type(1)> form> input#secret",
+    ...overrides,
+  };
+}
+
+test("disabled credential entry denies model fill/type/press on password fields before any approval", async () => {
+  const { manager, browser } = managerFixture();
+  const opened = await manager.open("https://example.com/login");
+  const page = browser.context.page;
+  credentialFormStructure(page);
+  let prompts = 0;
+  const confirmation = async () => { prompts += 1; return true; };
+  const freshRef = async () => (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1];
+  try {
+    await assert.rejects(manager.fill(opened.session, opened.tab, await freshRef(), "hunter2-secret", confirmation), /model credential entry is disabled/);
+    await assert.rejects(manager.type(opened.session, opened.tab, await freshRef(), "hunter2-secret", 0, confirmation), /model credential entry is disabled/);
+    await assert.rejects(manager.press(opened.session, opened.tab, await freshRef(), "ArrowDown", confirmation), /model credential entry is disabled/);
+    assert.equal(prompts, 0, "a disabled capability is not an approval question");
+    assert.equal(page.fillCalls.length + page.typeCalls.length + page.pressCalls.length, 0);
+    // An explicit credential autocomplete token on a text field is the same structural class.
+    credentialFormStructure(page, { inputType: "text", autocomplete: "current-password" });
+    let error: Error;
+    try {
+      await manager.fill(opened.session, opened.tab, await freshRef(), "hunter2-secret", confirmation);
+      throw new Error("expected the credential entry denial");
+    } catch (e) {
+      error = e instanceof Error ? e : new Error(String(e));
+    }
+    assert.match(error.message, /model credential entry is disabled/);
+    assert.doesNotMatch(error.message, /hunter2-secret/, "denial text never echoes the entered value");
+    assert.equal(prompts, 0);
+    assert.equal(page.fillCalls.length, 0);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("enabled credential entry routes password fill through normal approval as human", async () => {
+  const { manager, browser } = managerFixture();
+  manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, CREDENTIAL_ENTRY_PERMISSIONS);
+  const opened = await manager.open("https://example.com/login");
+  const page = browser.context.page;
+  credentialFormStructure(page);
+  try {
+    let promptMessage = "";
+    const result = await manager.fill(opened.session, opened.tab,
+      (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1],
+      "hunter2-secret", async (request) => {
+        promptMessage = request.message;
+        return true;
+      });
+    assert.equal(result.approval, "human");
+    assert.equal(result.confirmed, true);
+    assert.equal(page.fillCalls.length, 1);
+    assert.doesNotMatch(promptMessage, /hunter2-secret/, "approval prompts stay value-free");
+    assert.doesNotMatch(JSON.stringify(result), /hunter2-secret/, "results redact literal echoes");
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("enabled credential entry with automatic approval dispatches without prompting", async () => {
+  const { manager, browser } = managerFixture();
+  manager.updateConfig(normalizeConfig({}).web!.fetch, "automatically-accept", 15, CREDENTIAL_ENTRY_PERMISSIONS);
+  const opened = await manager.open("https://example.com/login");
+  const page = browser.context.page;
+  credentialFormStructure(page);
+  let prompts = 0;
+  try {
+    const result = await manager.fill(opened.session, opened.tab,
+      (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1],
+      "hunter2-secret", async () => { prompts += 1; return true; });
+    assert.equal(result.approval, "automatic");
+    assert.equal(prompts, 0);
+    assert.equal(page.fillCalls.length, 1);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("disabled credential submission denies submit activations on credential forms before any approval", async () => {
+  const { manager, browser } = managerFixture();
+  const opened = await manager.open("https://example.com/login");
+  const page = browser.context.page;
+  let prompts = 0;
+  const confirmation = async () => { prompts += 1; return true; };
+  const freshRef = async () => (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1];
+  try {
+    // Native submit button in a form that structurally contains credentials.
+    credentialFormStructure(page, { tagName: "button", role: "button", inputType: "submit" });
+    await assert.rejects(manager.click(opened.session, opened.tab, await freshRef(), confirmation), /model credential submission is disabled/);
+    // A button with an invalid type value is still in the HTML Submit Button
+    // state; the gate must not fail open for it under automatic approval.
+    manager.updateConfig(normalizeConfig({}).web!.fetch, "automatically-accept", 15, DEFAULT_BROWSER_PERMISSIONS);
+    credentialFormStructure(page, { tagName: "button", role: "button", inputType: "foo" });
+    await assert.rejects(manager.click(opened.session, opened.tab, await freshRef(), confirmation), /model credential submission is disabled/);
+    manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS);
+    // Enter on a form-associated field of the same credential form.
+    credentialFormStructure(page, { tagName: "input", role: "textbox", inputType: "text", autocomplete: null });
+    await assert.rejects(manager.press(opened.session, opened.tab, await freshRef(), "Enter", confirmation), /model credential submission is disabled/);
+    // Enter on the credential control itself is gated even when the owning
+    // form's membership was not proven from descendant structure (form="id").
+    credentialFormStructure(page, { formHasCredentialField: false });
+    await assert.rejects(manager.press(opened.session, opened.tab, await freshRef(), "Enter", confirmation), /model credential submission is disabled/);
+    assert.equal(prompts, 0);
+    assert.equal(page.clickCalls + page.pressCalls.length, 0);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("credential gates leave non-credential forms and ordinary activation on the approval path", async () => {
+  const { manager, browser } = managerFixture();
+  // Default permissions: both credential gates off. A password-free form must
+  // still reach normal approval and dispatch — no blanket denial.
+  const opened = await manager.open("https://example.com/search");
+  const page = browser.context.page;
+  try {
+    page.targetStructure = {
+      ...page.targetStructure,
+      tagName: "button", role: "button", inputType: "submit", href: null,
+      formAssociated: true, formHasCredentialField: false, autocomplete: null,
+    };
+    const clicked = await manager.click(opened.session, opened.tab,
+      (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1], async () => true);
+    assert.equal(clicked.approval, "human");
+    assert.equal(page.clickCalls, 1);
+    page.targetStructure = {
+      ...page.targetStructure,
+      tagName: "input", role: "textbox", inputType: "text", autocomplete: null,
+    };
+    const pressed = await manager.press(opened.session, opened.tab,
+      (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1], "Enter", async () => true);
+    assert.equal(pressed.approval, "human");
+    assert.equal(page.pressCalls.length, 1);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("YOLO overrides disabled credential gates and prompts with automatic approval", async () => {
+  const { manager, browser } = managerFixture();
+  // Stored policy denies everything; YOLO forces capabilities on and
+  // automatic approval, never human confirmation.
+  manager.updateConfig(normalizeConfig({}).web!.fetch, "automatically-deny", 15, { ...DEFAULT_BROWSER_PERMISSIONS, yolo: true });
+  const opened = await manager.open("https://example.com/login");
+  const page = browser.context.page;
+  credentialFormStructure(page);
+  let prompts = 0;
+  const confirmation = async () => { prompts += 1; return true; };
+  try {
+    const filled = await manager.fill(opened.session, opened.tab,
+      (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1],
+      "hunter2-secret", confirmation);
+    assert.equal(filled.approval, "automatic");
+    assert.equal(filled.confirmed, false);
+    assert.equal(page.fillCalls.length, 1);
+    credentialFormStructure(page, { tagName: "button", role: "button", inputType: "submit" });
+    const clicked = await manager.click(opened.session, opened.tab,
+      (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1], confirmation);
+    assert.equal(clicked.approval, "automatic");
+    assert.equal(clicked.confirmed, false);
+    assert.equal(page.clickCalls, 1);
+    assert.equal(prompts, 0, "YOLO never prompts and never claims human confirmation");
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("automatically-deny still rejects credential actions when the capability is enabled", async () => {
+  const { manager, browser } = managerFixture();
+  manager.updateConfig(normalizeConfig({}).web!.fetch, "automatically-deny", 15, CREDENTIAL_ENTRY_PERMISSIONS);
+  const opened = await manager.open("https://example.com/login");
+  const page = browser.context.page;
+  credentialFormStructure(page);
+  let prompts = 0;
+  try {
+    await assert.rejects(manager.fill(opened.session, opened.tab,
+      (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1],
+      "hunter2-secret", async () => { prompts += 1; return true; }), /automatically denied/);
+    assert.equal(prompts, 0);
+    assert.equal(page.fillCalls.length, 0);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("revoking the credential permission during approval denies the pending permit", async () => {
+  const { manager, browser } = managerFixture();
+  manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, CREDENTIAL_ENTRY_PERMISSIONS);
+  const opened = await manager.open("https://example.com/login");
+  const page = browser.context.page;
+  credentialFormStructure(page);
+  try {
+    await assert.rejects(
+      manager.fill(opened.session, opened.tab,
+        (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1],
+        "hunter2-secret", async () => {
+          // Settings change during the approval prompt: entry disabled again.
+          manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS);
+          return true;
+        }),
+      /model credential entry is disabled/,
+    );
+    assert.equal(page.fillCalls.length, 0, "no stale permission survives a settings change");
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("password click/hover and file form actions remain hard-denied", async () => {
+  const { manager, browser } = managerFixture();
+  const opened = await manager.open("https://example.com/login");
+  const page = browser.context.page;
+  try {
+    credentialFormStructure(page);
+    await assert.rejects(
+      manager.click(opened.session, opened.tab,
+        (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1], async () => true),
+      /password controls are not supported by bounded browser click or hover/,
+    );
+    credentialFormStructure(page, { inputType: "file" });
+    await assert.rejects(
+      manager.fill(opened.session, opened.tab,
+        (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1], "/tmp/x", async () => true),
+      /file controls require the dedicated BrowserUpload tool/,
+    );
+    assert.equal(page.clickCalls + page.fillCalls.length, 0);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("registered browser tools surface precise credential denials and sync live permissions", async () => {
+  const { manager, browser } = managerFixture();
+  const config = normalizeConfig({ web: { browserPermissions: { modelCredentialEntry: true } } });
+  const tools: Array<{ name: string; execute(id: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, context?: any): Promise<any> }> = [];
+  const boundary = new WebToolManager({ registerTool: tool => tools.push(tool as never) }, config, undefined, undefined, manager);
+  boundary.register();
+  const confirmations: Array<{ title: string; message: string }> = [];
+  const uiContext = { hasUI: true, ui: { confirm: async (title: string, message: string) => {
+    confirmations.push({ title, message });
+    return true;
+  } } };
+  const call = (name: string, params: Record<string, unknown>, context?: any) =>
+    tools.find(tool => tool.name === name)!.execute("credential-gate", params, new AbortController().signal, undefined, context);
+  try {
+    const opened = await manager.open("https://example.com/login");
+    const page = browser.context.page;
+    credentialFormStructure(page);
+    // Enabled entry: the registered tool prompts through the UI and dispatches.
+    let ref = (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1];
+    const filled = await call("BrowserFill", { session: opened.session, tab: opened.tab, ref, value: "hunter2-secret" }, uiContext);
+    assert.equal(filled.details.response.approval, "human");
+    assert.doesNotMatch(JSON.stringify(filled), /hunter2-secret/);
+    assert.ok(confirmations.length >= 1);
+    assert.ok(confirmations.every(entry => !entry.message.includes("hunter2-secret")));
+    // Sync a config with the capability disabled: the same action is denied
+    // with the precise fixed text naming the permission.
+    boundary.sync(normalizeConfig({}));
+    ref = (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1];
+    const fillError = await call("BrowserFill", { session: opened.session, tab: opened.tab, ref, value: "hunter2-secret" }, uiContext).catch((e: Error) => e);
+    assert.match(fillError.message, /BrowserFill failed: not_started: this target is a password or credential field and model credential entry is disabled by web\.browserPermissions\.modelCredentialEntry/);
+    assert.doesNotMatch(fillError.message, /hunter2-secret/);
+    // Submit click denial through the registered tool.
+    credentialFormStructure(page, { tagName: "button", role: "button", inputType: "submit" });
+    ref = (await manager.snapshot(opened.session, opened.tab, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1];
+    const clickError = await call("BrowserClick", { session: opened.session, tab: opened.tab, ref }, uiContext).catch((e: Error) => e);
+    assert.match(clickError.message, /model credential submission is disabled by web\.browserPermissions\.modelCredentialSubmission/);
+  } finally {
+    await manager.shutdown();
+    await boundary.cleanup();
+  }
+});
+
+test("credential permission state persists through a visibility replacement", async () => {
+  // A fresh browser per launch, like real Playwright: the replaced session's
+  // stale context "page" listener must never observe the replacement's pages,
+  // so the shared-context managerFixture() cannot model this flow.
+  let launched: FakeBrowser | undefined;
+  let serial = 0;
+  const manager = new InteractiveBrowserManager(normalizeConfig({}).web!.fetch, {
+    resolveHostname: async (hostname: string) => net.isIP(hostname) ? [hostname] : ["93.184.216.34"],
+    launch: async () => (launched = new FakeBrowser()) as unknown as Browser,
+    randomHandle: (kind: string) => `${kind}_${++serial}_${"x".repeat(32)}`,
+  });
+  try {
+    // Model credential entry is enabled before the switch; it must survive the
+    // replacement (the effective policy is manager-level, not session-level).
+    manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, CREDENTIAL_ENTRY_PERMISSIONS);
+    await manager.open("https://example.com/login");
+    const result = await manager.applyVisibility(true) as BrowserVisibilityResult;
+    assert.ok(result);
+    assert.equal(result.relaunched, true);
+    // The single intended tab is restored into the replacement's primary page.
+    const page = launched!.context.page;
+    credentialFormStructure(page);
+    const filled = await manager.fill(result.session!, result.activeTab!,
+      (await manager.snapshot(result.session!, result.activeTab!, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1],
+      "hunter2-secret", async () => true);
+    assert.equal(filled.approval, "human", "the enabled credential-entry permission survives the visibility switch");
+    assert.equal(page.fillCalls.length, 1);
+    // And a revocation saved after the switch is honored in the replacement.
+    manager.updateConfig(normalizeConfig({}).web!.fetch, "ask", 15, DEFAULT_BROWSER_PERMISSIONS);
+    await assert.rejects(manager.fill(result.session!, result.activeTab!,
+      (await manager.snapshot(result.session!, result.activeTab!, 1_000)).snapshot.match(/\[ref=([^\]]+)\]/)![1],
+      "hunter2-secret", async () => true), /model credential entry is disabled/);
+  } finally {
+    await manager.shutdown();
+  }
 });

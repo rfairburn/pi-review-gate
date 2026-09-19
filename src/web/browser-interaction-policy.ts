@@ -16,7 +16,15 @@ export type BrowserConsequence =
   | "purchase"
   | "account_change"
   | "form_submission"
-  | "unknown_or_mixed";
+  | "unknown_or_mixed"
+  // Produced only by the manager's issue #27 file-transfer operations
+  // (BrowserUpload / BrowserDownloadSave), never by structural classification.
+  | "file_upload"
+  | "file_download_save"
+  // Produced only by the manager's issue #27 model clipboard operations
+  // (BrowserClipboard), never by structural classification.
+  | "clipboard_read"
+  | "clipboard_write";
 
 /** Structural facts read from the exact semantic-ref target. Accessible text is intentionally absent. */
 export interface BrowserTargetStructure {
@@ -42,6 +50,14 @@ export interface BrowserTargetStructure {
   explicitSubmitHandler?: boolean;
   /** True only when the caller can prove relevant page listeners are absent. */
   pageControlledEventsAbsent?: boolean;
+  /**
+   * True when the target's owning form structurally contains a
+   * password/credential field (password-type input or an explicit
+   * current/new-password autocomplete token). Computed from structure only:
+   * no field value is ever read, so human-entered content is detected the
+   * same way as model-entered content.
+   */
+  formHasCredentialField?: boolean;
   domPath: string;
 }
 
@@ -178,7 +194,8 @@ export class BrowserConsequencePolicy {
       target.ariaHasPopup, target.contentEditable, target.disabled,
       target.inlineEventHandler, target.summaryForDetails, target.autocomplete,
       target.readOnly, target.multiple, target.explicitChangeHandler,
-      target.explicitSubmitHandler, target.pageControlledEventsAbsent, target.domPath,
+      target.explicitSubmitHandler, target.pageControlledEventsAbsent,
+      target.formHasCredentialField, target.domPath,
     ])).digest("base64url");
   }
 }
@@ -187,7 +204,18 @@ export interface BrowserConfirmationBinding {
   session: string;
   tab: string;
   generation: string;
-  operation: "click" | BrowserFormOperation;
+  operation:
+    | "click"
+    | BrowserFormOperation
+    // Issue #27 model file-transfer operations (BrowserUpload /
+    // BrowserDownloadSave). They reuse the same single-use, digest-bound
+    // permit flow as consequential page interactions.
+    | "upload"
+    | "download_save"
+    // Issue #27 model clipboard operations (BrowserClipboard, text only).
+    // Writes bind the exact value by digest and length; reads bind none.
+    | "clipboard_read"
+    | "clipboard_write";
   ref: string;
   origin: string;
   destination: string | null;
@@ -199,6 +227,18 @@ export interface BrowserConfirmationBinding {
   key: string | null;
   /** Exact mouse button for click operations; null for non-click operations. */
   button: BrowserClickButton | null;
+  /**
+   * Verified real source paths for an upload operation (issue #27). The page
+   * never sees or chooses these; they are bound into the permit digest and
+   * re-verified against size/mtime before dispatch.
+   */
+  sourceFiles?: readonly string[] | null;
+  /** Verified real destination path for a download-save operation (issue #27). */
+  destinationPath?: string | null;
+  /** Whether the verified destination file already existed at classification time. */
+  destinationExisted?: boolean | null;
+  /** Opaque pending-download handle bound to a download-save approval. */
+  downloadHandle?: string | null;
 }
 
 export interface BrowserConfirmationPermit {
@@ -256,11 +296,15 @@ function bindingDigest(binding: BrowserConfirmationBinding, expiresAt: number): 
   return createHash("sha256").update(JSON.stringify([
     binding.session, binding.tab, binding.generation, binding.operation, binding.ref,
     binding.origin, binding.destination, binding.targetFingerprint, binding.consequence,
-    binding.valueDigest, binding.valueLengths, binding.key, binding.button, expiresAt,
+    binding.valueDigest, binding.valueLengths, binding.key, binding.button,
+    // Issue #27 file-transfer facts. Absent for pre-existing operations.
+    binding.sourceFiles ?? null, binding.destinationPath ?? null,
+    binding.destinationExisted ?? null, binding.downloadHandle ?? null,
+    expiresAt,
   ])).digest();
 }
 
-function isActivationKey(key: string | undefined): boolean {
+export function isActivationKey(key: string | undefined): boolean {
   if (!key) return false;
   const base = key.split("+").at(-1);
   return base === "Enter" || base === "Space";
@@ -300,9 +344,84 @@ function isProvenLocalEditingTarget(target: BrowserTargetStructure, operation: B
   return operation === "press" && (editable || nativeSelect);
 }
 
-function isSubmitControl(target: BrowserTargetStructure): boolean {
-  if (target.tagName === "button") return target.inputType === null || target.inputType === "submit";
+export function isSubmitControl(target: BrowserTargetStructure): boolean {
+  // Per HTML, a button's missing or invalid type value is in the Submit Button
+  // state (HTMLButtonElement.type reflects "submit"), so only the explicit
+  // reset/button states do not submit the form on activation.
+  if (target.tagName === "button") return target.inputType !== "reset" && target.inputType !== "button";
   return target.tagName === "input" && (target.inputType === "submit" || target.inputType === "image");
+}
+
+/**
+ * Structural definition of a password/credential field: a password-type input
+ * or an explicit current/new-password autocomplete token. It never reads, is
+ * given, or compares any field value, so the model cannot detect a human's
+ * password by echoing it; presence is proven from the DOM structure alone.
+ */
+export function isCredentialFieldTarget(target: BrowserTargetStructure): boolean {
+  if (target.inputType === "password") return true;
+  const tokens = target.autocomplete?.trim().toLocaleLowerCase("en-US").split(/\s+/) ?? [];
+  return tokens.includes("current-password") || tokens.includes("new-password");
+}
+
+/**
+ * True when a key press on this target activates form submission: Enter from
+ * any form-associated control (implicit submission), or Space on a non-text
+ * control (button/select activation). Space inside a text control types a
+ * character, so it is entry rather than activation.
+ */
+function pressActivatesSubmission(key: string | undefined, target: BrowserTargetStructure): boolean {
+  if (!key) return false;
+  const base = key.split("+").at(-1);
+  if (base === "Enter") return true;
+  if (base !== "Space") return false;
+  return target.tagName !== "input" && target.tagName !== "textarea" && !target.contentEditable;
+}
+
+/**
+ * Issue #27 credential-entry gate: which model form actions enter values into
+ * a password/credential field. Fill and type always do; a press does so only
+ * when it is not the activation that submits the form (that case is governed
+ * by the submission gate, including for human-entered passwords). Click, hover,
+ * and select never enter field values.
+ */
+export function modelActionRequiresCredentialEntry(
+  operation: "click" | BrowserFormOperation,
+  key: string | undefined,
+  target: BrowserTargetStructure,
+): boolean {
+  if (!isCredentialFieldTarget(target)) return false;
+  if (operation === "fill" || operation === "type") return true;
+  if (operation === "press") return !pressActivatesSubmission(key, target);
+  return false;
+}
+
+/**
+ * Issue #27 credential-submission gate: which model actions submit a form that
+ * structurally contains credentials. Only real submission activations qualify:
+ * a click on a native submit control, or an activation-key press in a form
+ * context. Filling, selecting, and ordinary navigation (including to
+ * authenticated routes) never do, so non-credential forms and post-login
+ * browsing are unaffected by the gate.
+ */
+export function modelActionSubmitsCredentialForm(
+  operation: "click" | BrowserFormOperation,
+  key: string | undefined,
+  target: BrowserTargetStructure,
+): boolean {
+  const credentialForm = target.formHasCredentialField === true;
+  if (operation === "click") return credentialForm && isSubmitControl(target);
+  if (operation === "press") {
+    if (!pressActivatesSubmission(key, target)) return false;
+    // An activation press on a credential control itself always activates the
+    // submission of its associated form, even when the owning form's credential
+    // membership could not be proven from descendant structure (for example a
+    // form="id" association outside the form element). Shadow-root-internal
+    // controls remain outside that structural proof; this rule still covers an
+    // activation press on the credential control itself.
+    return isCredentialFieldTarget(target) || (credentialForm && (target.formAssociated || isSubmitControl(target)));
+  }
+  return false;
 }
 
 function consequenceFromDestination(raw: string | null): BrowserConsequence | undefined {

@@ -413,16 +413,21 @@ export interface ValidatedUrl {
   href: string;
   /** Lowercase hostname without IPv6 brackets. */
   hostname: string;
-  /** Every address the validation-time DNS answer contained, all pre-validated public. */
+  /**
+   * Every address the validation-time DNS answer contained, all pre-validated
+   * (public by default; local-network destinations only under the explicit
+   * `allowLocalNetworks` opt-in).
+   */
   addresses: readonly string[];
 }
 
 /**
  * SSRF gate for one exact URL/hop: validates the URL and resolves the hostname
- * once, returning the canonical href, hostname, and every validated public
- * address. Callers must dial only the returned addresses (see
- * `createPinnedLookup` / `createPinnedAgent`); re-resolving later would reopen
- * the DNS rebinding window.
+ * once, returning the canonical href, hostname, and every validated address
+ * (public-only by default; local-network destinations only under the explicit
+ * `allowLocalNetworks` opt-in). Callers must dial only the returned addresses
+ * (see `createPinnedLookup` / `createPinnedAgent`); re-resolving later would
+ * reopen the DNS rebinding window.
  */
 /** A failed public-URL validation whose safe category is assigned at the
  * failure site. The message may embed caller-controlled input; the category
@@ -434,7 +439,26 @@ export class PublicUrlValidationError extends Error {
   }
 }
 
-export async function validatePublicUrl(value: string, resolve: HostResolver = defaultHostResolver): Promise<ValidatedUrl> {
+/**
+ * Options for one canonical URL validation. The default (absent or
+ * `allowLocalNetworks: false`) is unchanged public-only admission; WebFetch and
+ * every other acquisition caller must keep that default.
+ */
+export interface UrlValidationOptions {
+  /**
+   * Explicit opt-in (browser broker/network admission only): also admit
+   * local-network destinations (see `isBlockedAddress` in ./ip). DNS is still
+   * resolved exactly once, every returned address is still validated, and
+   * multicast/broadcast/reserved destinations stay denied.
+   */
+  allowLocalNetworks?: boolean;
+}
+
+export async function validatePublicUrl(
+  value: string,
+  resolve: HostResolver = defaultHostResolver,
+  options?: UrlValidationOptions,
+): Promise<ValidatedUrl> {
   let url: URL;
   try {
     url = new URL(value);
@@ -448,7 +472,19 @@ export async function validatePublicUrl(value: string, resolve: HostResolver = d
   const addresses = await resolve(hostname);
   if (addresses.length === 0) throw new PublicUrlValidationError(`Hostname did not resolve: ${hostname}`, "dns_resolution_failed");
   for (const address of addresses) {
-    if (isBlockedAddress(address)) throw new PublicUrlValidationError(`URL resolves to a non-public address: ${address}`, "non_public_address_denied");
+    if (isBlockedAddress(address, { allowLocalNetworks: options?.allowLocalNetworks === true })) {
+      // Default posture keeps the established "non-public" message; under the
+      // explicit local opt-in the residual denials are other unadmitted
+      // special-purpose ranges (this-network, CGNAT, documentation/benchmarking,
+      // Teredo/discard-only, multicast/broadcast/reserved), so name the refusal
+      // without over-claiming a reason.
+      throw new PublicUrlValidationError(
+        options?.allowLocalNetworks === true
+          ? `URL resolves to a blocked special-purpose address (not permitted by the local-network opt-in): ${address}`
+          : `URL resolves to a non-public address: ${address}`,
+        "non_public_address_denied",
+      );
+    }
   }
   url.hash = "";
   return { href: url.href, hostname, addresses: [...addresses] };

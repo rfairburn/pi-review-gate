@@ -34,10 +34,91 @@ export interface WebFetchConfig {
 
 export type BrowserInteractionApproval = "ask" | "automatically-accept" | "automatically-deny";
 
+/**
+ * Independently selectable managed-browser permission toggles (issue #27).
+ *
+ * The `model*` fields constrain model-driven browser actions only: human
+ * credential/form submission and file uploads remain allowed regardless of
+ * them. `localNetworks` applies to human and model navigation alike. `yolo`
+ * is the master override that enables every capability and bypasses per-action
+ * approval prompts. Every field defaults to false, so default browser behavior
+ * is unchanged unless a capability is explicitly enabled. Unknown keys in this
+ * object are ignored and never grant capabilities.
+ */
+export interface WebBrowserPermissions {
+  /** Model may enter values into password/credential fields. */
+  modelCredentialEntry: boolean;
+  /** Model may submit forms containing credentials. Human submission is unaffected. */
+  modelCredentialSubmission: boolean;
+  /** Model may upload files; selection and side effects follow the interaction-approval policy. */
+  modelUploads: boolean;
+  /** Model may save downloads to disk; selection and side effects follow the interaction-approval policy. */
+  modelDownloadSaving: boolean;
+  /** Model may read from and write to the host clipboard. */
+  modelClipboard: boolean;
+  /** Model-driven browser sessions may use the camera. Grants capability, not forced activation. */
+  modelCamera: boolean;
+  /** Model-driven browser sessions may use the microphone. Grants capability, not forced activation. */
+  modelMicrophone: boolean;
+  /** Model-driven browser sessions may request geolocation. */
+  modelGeolocation: boolean;
+  /** Service workers are allowed in the managed browser. Grants capability, not forced registration. */
+  modelServiceWorkers: boolean;
+  /** The current popup restriction is lifted for the managed browser. Grants capability, not forced activation. */
+  modelPopupRestrictionOverride: boolean;
+  /** Human and model navigation may reach loopback, private, and link-local addresses (including cloud metadata endpoints). */
+  localNetworks: boolean;
+  /** Master override: enables every browser capability and bypasses per-action approval prompts. */
+  yolo: boolean;
+}
+
+/** Stable field order of the a-la-carte browser permission toggles. */
+export const BROWSER_PERMISSION_FIELDS = [
+  "modelCredentialEntry",
+  "modelCredentialSubmission",
+  "modelUploads",
+  "modelDownloadSaving",
+  "modelClipboard",
+  "modelCamera",
+  "modelMicrophone",
+  "modelGeolocation",
+  "modelServiceWorkers",
+  "modelPopupRestrictionOverride",
+  "localNetworks",
+  "yolo",
+] as const;
+export type BrowserPermissionField = (typeof BROWSER_PERMISSION_FIELDS)[number];
+
+/** All browser permission toggles off: default behavior is unchanged. */
+export const DEFAULT_BROWSER_PERMISSIONS: WebBrowserPermissions = {
+  modelCredentialEntry: false,
+  modelCredentialSubmission: false,
+  modelUploads: false,
+  modelDownloadSaving: false,
+  modelClipboard: false,
+  modelCamera: false,
+  modelMicrophone: false,
+  modelGeolocation: false,
+  modelServiceWorkers: false,
+  modelPopupRestrictionOverride: false,
+  localNetworks: false,
+  yolo: false,
+};
+
 export interface WebConfig {
   enabled: boolean;
   browserInteractionApproval: BrowserInteractionApproval;
   browserIdleExpiryMinutes: number;
+  /**
+   * Maximum retained unsaved downloads per interactive-browser session
+   * (issue #27); 0 disables count-based eviction entirely. Saved files are
+   * never counted or affected.
+   */
+  browserDownloadRetention: number;
+  /** Interactive browser window visibility; false (default) keeps the headless QA browser. */
+  browserVisible: boolean;
+  /** Independently selectable managed-browser permissions (issue #27); all off by default. */
+  browserPermissions: WebBrowserPermissions;
   search: WebSearchConfig;
   fetch: WebFetchConfig;
 }
@@ -277,7 +358,10 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   web: {
     enabled: true,
     browserInteractionApproval: "ask",
+    browserVisible: false,
     browserIdleExpiryMinutes: 15,
+    browserDownloadRetention: 8,
+    browserPermissions: { ...DEFAULT_BROWSER_PERMISSIONS },
     search: { provider: "ddgs", timeoutMs: 20_000, maxResults: 10 },
     fetch: {
       timeoutMs: 30_000,
@@ -347,7 +431,7 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
   // Only these objects contain independently defaultable settings. Selections,
   // agent definitions and route/resource entries remain atomic: never invent
   // a model, reasoning pair, command or authorization reference to repair one.
-  const containers = new Set(["web", "web.search", "web.fetch", "ui", "review",
+  const containers = new Set(["web", "web.search", "web.fetch", "web.browserPermissions", "ui", "review",
     "execution", "execution.retryPolicy", "execution.routes",
     "execution.workerResources", "externalAgents"]);
   const recover = (parent: Record<string, unknown>, key: string, input: unknown, path: string): void => {
@@ -502,6 +586,7 @@ function normalizeWeb(value: unknown): WebConfig {
   if (value === undefined) return structuredClone(defaults);
   if (!isRecord(value)) throw new Error("web must be an object");
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error("web.enabled must be a boolean");
+  if (value.browserVisible !== undefined && typeof value.browserVisible !== "boolean") throw new Error("web.browserVisible must be a boolean");
   const browserInteractionApproval = value.browserInteractionApproval === undefined
     ? defaults.browserInteractionApproval : value.browserInteractionApproval;
   if (!["ask", "automatically-accept", "automatically-deny"].includes(browserInteractionApproval as string)) {
@@ -519,9 +604,16 @@ function normalizeWeb(value: unknown): WebConfig {
   return {
     enabled: value.enabled ?? defaults.enabled,
     browserInteractionApproval: browserInteractionApproval as BrowserInteractionApproval,
-    browserIdleExpiryMinutes: positiveIntegerOrDefault(
+    browserVisible: value.browserVisible === undefined ? defaults.browserVisible : value.browserVisible,
+    browserIdleExpiryMinutes: nonNegativeIntegerOrDefault(
       value.browserIdleExpiryMinutes, defaults.browserIdleExpiryMinutes, "web.browserIdleExpiryMinutes",
     ),
+    browserDownloadRetention: nonNegativeIntegerOrDefault(
+      value.browserDownloadRetention, defaults.browserDownloadRetention, "web.browserDownloadRetention",
+    ),
+    browserPermissions: value.browserPermissions === undefined
+      ? { ...DEFAULT_BROWSER_PERMISSIONS }
+      : normalizeBrowserPermissions(value.browserPermissions),
     search: {
       provider,
       timeoutMs: positiveIntegerOrDefault(search.timeoutMs, defaults.search.timeoutMs, "web.search.timeoutMs"),
@@ -556,6 +648,26 @@ function normalizeWeb(value: unknown): WebConfig {
       userAgent: userAgent.trim(),
     },
   };
+}
+
+/**
+ * Strict per-field validation for the a-la-carte browser permission toggles.
+ * Every known field must be an explicit boolean when present; anything else
+ * rejects loading rather than silently granting (or dropping) authority. Keys
+ * outside the stable field list are ignored: unknown config can never enable a
+ * capability, and no acknowledgment token is invented for file-level values.
+ */
+function normalizeBrowserPermissions(value: unknown): WebBrowserPermissions {
+  if (!isRecord(value)) throw new Error("web.browserPermissions must be an object");
+  const permissions = {} as WebBrowserPermissions;
+  for (const field of BROWSER_PERMISSION_FIELDS) {
+    const raw = value[field];
+    if (raw !== undefined && typeof raw !== "boolean") {
+      throw new Error(`web.browserPermissions.${field} must be a boolean`);
+    }
+    permissions[field] = raw === true;
+  }
+  return permissions;
 }
 
 function normalizeUi(value: unknown): ReviewGateUiConfig {

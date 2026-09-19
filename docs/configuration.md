@@ -251,7 +251,23 @@ defaults to `true`. The default retry policy is
   "web": {
     "enabled": true,
     "browserInteractionApproval": "ask",
+    "browserVisible": false,
     "browserIdleExpiryMinutes": 15,
+    "browserDownloadRetention": 8,
+    "browserPermissions": {
+      "modelCredentialEntry": false,
+      "modelCredentialSubmission": false,
+      "modelUploads": false,
+      "modelDownloadSaving": false,
+      "modelClipboard": false,
+      "modelCamera": false,
+      "modelMicrophone": false,
+      "modelGeolocation": false,
+      "modelServiceWorkers": false,
+      "modelPopupRestrictionOverride": false,
+      "localNetworks": false,
+      "yolo": false
+    },
     "search": { "provider": "ddgs", "timeoutMs": 20000, "maxResults": 10 },
     "fetch": {
       "timeoutMs": 30000,
@@ -265,23 +281,179 @@ defaults to `true`. The default retry policy is
 }
 ```
 
-`web.browserIdleExpiryMinutes` is a positive safe integer number of minutes
+`web.browserIdleExpiryMinutes` is a non-negative safe integer number of minutes
 (default **15**). Edit it through `/review-settings` → **Web** → **Browser idle
-expiry**, then **Save changes**. Zero, fractions, and nonfinite values are rejected;
-there is no disabled option. The browser lifecycle contract is renewed by browser-tool
-activity, not background page requests, scripts, or WebSockets, and does not expire
-during an active browser operation. Both initial tool registration and live settings
-updates apply this persisted value to the managed browser. Expired handles explicitly
-require `BrowserOpen`; no lost state is silently recreated.
+expiry**, then **Save changes**. **0 disables idle close**: the session never closes
+for inactivity and stays open until an explicit `BrowserClose`, shutdown, replacement,
+or unrecoverable failure. Fractions, negative, and nonfinite values are rejected.
+The browser lifecycle contract is renewed by browser-tool activity and by detectable
+genuine human input in the live page (browser-trusted pointer presses, keyboard input,
+and wheel scrolling, authenticated so page script cannot forge it), not by background
+page requests, scripts, or WebSockets, and does not expire during an active browser
+operation. For hands-on human use of a visible browser, prefer setting the timeout to
+`0` so it cannot disappear mid-interaction. Both initial tool registration and live
+settings updates apply this persisted value to the managed browser in both directions
+(timed ↔ disabled). Expired handles explicitly require `BrowserOpen`; no lost state is
+silently recreated.
+
+`web.browserDownloadRetention` is a non-negative safe integer (default
+**8**). Edit it through `/review-settings` → **Web** → **Download retention**,
+then **Save changes**. It is the maximum number of unsaved downloads retained per
+interactive-browser session: while the cap is reached, a new download cancels and
+releases the oldest retained one (after a live lowering, the next arrival drains
+down to the new cap and may release more than one). Saved files are never
+counted or affected, and
+the ordinary save, tab/session-close, and capability-revocation cleanups always
+apply. **0 disables count-based eviction entirely**: every pending download stays
+retained until it is saved, its tab or session closes, or the capability is
+revoked. Fractions, negative, and nonfinite values are rejected. A changed value
+takes effect when the next download arrives — a live lowering never deletes
+already-retained pending downloads merely because the setting was edited — and
+both initial tool registration and live settings updates apply this persisted
+value to the managed browser.
+
+`web.browserVisible` is a boolean (default **false**). Edit it through
+`/review-settings` → **Web** → **Browser visibility**, then **Save changes**. **false**
+keeps the default headless QA browser (no window); **true** launches the interactive
+browser headed — a real browser window with a native address bar the human can use
+directly. The model's tool set and exposure are identical in both modes; there is no
+model-facing visibility control, no persistent profile, and no remote-control port in
+either mode. Saving a changed value applies it immediately to the live browser through
+a controlled close/reopen replacement (tabs, active page, and memory-only session
+state restored best-effort with truthful loss/redirect reporting; the model-facing
+handles are replaced and the old ones are rejected). With no open browser it applies
+at the next `BrowserOpen`, and saving the already-active value restarts nothing.
+Cancel in the settings menu never relaunches. For hands-on human use of a headed
+window, prefer also setting `browserIdleExpiryMinutes` to `0`. See
+[Web tools](web-tools.md#browser-visibility) for the full replacement semantics and
+their limits.
 
 `web.browserInteractionApproval` accepts exactly `"ask"` (default),
 `"automatically-accept"`, or `"automatically-deny"`. Omission uses Ask; invalid values
 (including `null`, booleans, and display labels such as `"Ask"`) reject configuration
 loading rather than silently granting approval. This policy applies only to the
 confirmation-required branch of authorized native `BrowserClick`, `BrowserFill`,
-`BrowserType`, `BrowserSelect`, and `BrowserPress`; it does not turn off hard-denied
+`BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserUpload`, `BrowserDownloadSave`,
+and `BrowserClipboard`; it does not turn off hard-denied
 actions, role authorization, SSRF controls, ref/target/value-digest revalidation, or
 value-secrecy protections. See [approval behavior](web-tools.md#browser-interaction-approval).
+
+`web.browserPermissions` holds the independently selectable managed-browser
+permission toggles from
+[#27](https://github.com/rfairburn/pi-review-gate/issues/27). Every field is a
+boolean that defaults to **false**, so default browser behavior is unchanged
+unless a capability is explicitly enabled; there is no restricted/intermediate/
+unrestricted level ladder and no role scheme.
+
+- `modelCredentialEntry` lets the model enter values into password/credential fields.
+- `modelCredentialSubmission` lets the model submit forms containing credentials.
+- `modelUploads` lets the model upload explicitly chosen host files through
+  `BrowserUpload`; `modelDownloadSaving` lets it save retained pending downloads
+  through `BrowserDownloadSave`, wherever the model's existing host write
+  authority reaches (relative paths resolve to the session working directory;
+  absolute paths are not fenced by the browser). File selection and side effects
+  follow the configured `web.browserInteractionApproval` policy, and no mandatory
+  human picker is introduced; while either is disabled (the default) the
+  corresponding tool is denied before any approval prompt.
+- `modelClipboard` lets the model read or replace text on the browser
+  clipboard of an owned tab through `BrowserClipboard`. It is text-only — no
+  binary or image formats and no file paste — and always follows the configured
+  `web.browserInteractionApproval` policy; while disabled (the default) the
+  tool is denied before any approval prompt. Headless Chromium uses its
+  per-instance virtual clipboard; headed desktop Chromium reaches the host
+  system clipboard, and each result reports which scope was used.
+- `modelCamera`, `modelMicrophone`, and `modelGeolocation` are enforced as real
+per-origin device permission grants issued when a session tab commits a top-level
+HTTP(S) navigation to an origin; while disabled (the default) no device grant is
+issued for any origin, and disabling revokes the capability's grants from live
+sessions immediately. They grant capability, not forced activation, and actual
+capture still depends on host hardware, operating-system privacy prompts, and
+position sources.
+- `modelServiceWorkers` and `modelPopupRestrictionOverride` grant capability
+only: they do not force service-worker registration or popup activation. Service
+workers are blocked at context creation by default and allowed when enabled;
+because the mode is pinned at launch, a saved change replaces a live browser in a
+controlled way (tabs, storage state, and granted permissions restored
+best-effort with every loss reported). The popup override lifts the four-tab
+session limit for page-created popups while enabled; disabling it closes nothing
+already adopted.
+- `localNetworks` applies to **human and model** navigation alike: it allows
+loopback, private, and link-local addresses including cloud metadata endpoints,
+for intentional local-service and machine-role debugging.
+- `yolo` is the master override: it enables every capability above and bypasses
+per-action approval prompts, including an otherwise configured Ask or
+Automatically Deny policy.
+
+The `model*` fields constrain model actions only: human credential/form
+submission and file uploads remain allowed regardless of them. Unknown keys
+inside `web.browserPermissions` are ignored and never grant capabilities; a
+non-boolean value for any known field rejects configuration loading rather than
+silently granting or dropping authority (startup recovery drops only the invalid
+fields, with warnings).
+
+**Enablement semantics.** In `/review-settings`, every YOLO off → on transition
+requires a prominent warning plus explicit interactive human confirmation;
+cancellation, an unavailable confirm dialog, or a failed save leaves it off. It
+persists until explicitly disabled (disabling is straightforward and needs no
+confirmation), the enabled state is shown prominently, and the individual values
+saved beneath the override are preserved so disabling restores them as the
+effective policy. Enabling YOLO in the configuration file follows the existing
+loading philosophy: a strict, valid value takes effect on next load — editing
+the file is itself the explicit human act — and no acknowledgment token is
+stored or invented for it.
+
+**Status.** Model credential entry (`modelCredentialEntry`) and model credential
+submission (`modelCredentialSubmission`) are enforced by the interactive-browser
+tool actions: while disabled, the gated action is denied before any approval
+prompt with a precise error naming the disabled permission; while enabled, it
+proceeds through the ordinary interaction-approval flow. Settings saved through
+`/review-settings` apply to the live session for these two capabilities.
+`localNetworks` (and YOLO) is enforced by the interactive egress broker and
+navigation preflight: while disabled, loopback, private, link-local, and
+cloud-metadata destinations are refused before any request or dial; while
+enabled, they are admitted with the same resolve-once-and-pin validation as
+public addresses. Saved changes apply to live sessions without a restart;
+disabling revokes only established local connections and refuses subsequent
+local admissions. `WebFetch` and `BrowserExtract` remain public-only.
+Model uploads (`modelUploads`) and model download saving
+(`modelDownloadSaving`) are enforced by `BrowserUpload` and
+`BrowserDownloadSave`: while disabled, those tools are denied before any
+approval prompt with a precise error naming the disabled permission; while
+enabled, they proceed through the ordinary interaction-approval flow with
+one-use revalidated permits. Saved changes apply to the live session;
+revoking download saving cancels and drops every retained pending download
+immediately. Model clipboard read/write (`modelClipboard`) is enforced by
+`BrowserClipboard`: while disabled, both operations are denied before any
+approval prompt with a precise error naming the disabled permission; while
+enabled, they proceed through the ordinary interaction-approval flow with
+one-use revalidated permits and a real per-origin browser permission grant for
+the approved operation's origin (headless Chromium uses its per-instance
+virtual clipboard; headed desktop Chromium reaches the host system
+clipboard). Saved changes apply to the live session; revoking it immediately
+removes every issued clipboard permission grant. Camera (`modelCamera`),
+microphone (`modelMicrophone`), and geolocation (`modelGeolocation`) are
+enforced as real per-origin device permission grants: while disabled, no
+device grant is issued for any origin; while enabled, a grant scoped to that
+origin only is issued when one of the session's tabs commits a top-level
+HTTP(S) navigation there, re-evaluating the current effective policy at every
+commit. Saved changes apply to the live session immediately: disabling revokes
+every issued grant for that capability at once while leaving the other enabled
+capabilities' grants intact, and enabling takes effect from the next
+applicable navigation commit. Actual capture still depends on host hardware,
+operating-system privacy prompts, and position sources; the manager grants
+permission state only and reports failures truthfully. Service workers
+(`modelServiceWorkers`) are enforced at context creation — blocked by default,
+allowed when enabled — and because Chromium pins that mode at launch, a saved
+change replaces a live browser in a controlled way (tabs, storage state, and
+granted permissions restored best-effort with every loss reported) while all
+service-worker traffic still egresses only through the authenticated broker.
+The popup restriction override (`modelPopupRestrictionOverride`) lifts the
+four-tab session limit for page-created popups while enabled; disabling it
+closes nothing already adopted and only refuses further over-limit adoptions.
+Full semantics, including the service-worker WebSocket admission limitation,
+are documented in [Web tools](web-tools.md#browser-permissions-issue-27).
+The effective policy is computed by `effectiveBrowserPolicy` in `src/web/browser-capabilities.ts`;
+YOLO-approved actions are automatic approvals and must never be reported as human-confirmed.
 
 These are the defaults; every value can be overridden under `web`. The Python bridge for
 `WebSearch` is deliberately not configurable. Tool behavior and the trusted environment
@@ -336,7 +508,24 @@ boundaries are owned by [Web tools](web-tools.md) and
   Saves apply immediately to subsequent local approval decisions and acquisitions
   without restarting. Newly launched Pi workers load the saved policy; running workers
   keep the configuration loaded at launch. Research roles still cannot click or use
-  form-action tools.
+  form-action tools. It also opens the **Browser permissions** submenu (#27) with
+  the independently selectable capability toggles — model credential entry and
+  submission, uploads, download saving, clipboard read/write, camera, microphone,
+  geolocation, service workers, popup restriction override, local networks (human
+  and model), and **YOLO / allow everything** — each staged like every other
+  section until **Save changes**. Enabling a capability presents its risk-appropriate
+  notice; enabling YOLO additionally requires an explicit interactive confirmation
+  after a prominent warning (cancellation or an unavailable dialog leaves it off),
+  shows the enabled state prominently on the Web row, and disables straightforwardly
+  with the saved individual values restored as effective. Every capability is
+  enforced: credential entry and submission, uploads, download saving, and
+  clipboard read/write by the interactive-browser tool actions; camera,
+  microphone, and geolocation as per-origin device permission grants issued on
+  navigation commits and revoked live on disable; service workers at browser
+  launch, with a controlled replacement of the live browser when the saved
+  policy changes; the popup restriction override while enabled; and local
+  networks at the interactive egress broker. Saved changes apply to the live
+  session without a restart; see [Web fields](#web-fields).
 
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the root
 discards all staged changes; **Save changes** atomically persists every section while

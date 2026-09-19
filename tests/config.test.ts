@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  BROWSER_PERMISSION_FIELDS,
   activeExternalExecutor,
   automaticReviewEnabled,
   deferredPiToolsEnabled,
@@ -83,16 +84,59 @@ test("browser interaction approval defaults to Ask and rejects every invalid con
   }
 });
 
-test("browser idle expiry defaults to 15 positive integer minutes", () => {
+test("browser idle expiry defaults to 15 and accepts 0 to disable", () => {
   for (const input of [{}, { web: {} }, { web: { browserIdleExpiryMinutes: undefined } }]) {
     assert.equal(normalizeConfig(input).web!.browserIdleExpiryMinutes, 15);
   }
-  for (const minutes of [1, 30, Number.MAX_SAFE_INTEGER]) {
+  for (const minutes of [0, 1, 30, Number.MAX_SAFE_INTEGER]) {
     assert.equal(normalizeConfig({ web: { browserIdleExpiryMinutes: minutes } }).web!.browserIdleExpiryMinutes, minutes);
   }
-  for (const minutes of [0, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, null, "15", false]) {
-    assert.throws(() => normalizeConfig({ web: { browserIdleExpiryMinutes: minutes } }), /web.browserIdleExpiryMinutes must be a positive safe integer/);
+  for (const minutes of [-1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, null, "15", "0", false]) {
+    assert.throws(() => normalizeConfig({ web: { browserIdleExpiryMinutes: minutes } }), /web.browserIdleExpiryMinutes must be a non-negative safe integer/);
   }
+});
+
+test("browser download retention defaults to 8 and accepts 0 to disable count-based eviction", () => {
+  for (const input of [{}, { web: {} }, { web: { browserDownloadRetention: undefined } }]) {
+    assert.equal(normalizeConfig(input).web!.browserDownloadRetention, 8);
+  }
+  for (const retention of [0, 1, 8, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(normalizeConfig({ web: { browserDownloadRetention: retention } }).web!.browserDownloadRetention, retention);
+  }
+  for (const value of [-1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, null, "8", "0", false]) {
+    assert.throws(() => normalizeConfig({ web: { browserDownloadRetention: value } }), /web.browserDownloadRetention must be a non-negative safe integer/);
+  }
+});
+
+test("browser permissions default fully off and validate every field strictly", () => {
+  const defaults = normalizeConfig({}).web!.browserPermissions;
+  for (const field of BROWSER_PERMISSION_FIELDS) assert.equal(defaults[field], false);
+  for (const field of BROWSER_PERMISSION_FIELDS) {
+    const config = normalizeConfig({ web: { browserPermissions: { [field]: true } } });
+    assert.equal(config.web!.browserPermissions[field], true);
+    for (const other of BROWSER_PERMISSION_FIELDS) {
+      if (other !== field) assert.equal(config.web!.browserPermissions[other], false);
+    }
+  }
+  for (const value of [null, 0, 1, "true", "on", [], {}]) {
+    assert.throws(
+      () => normalizeConfig({ web: { browserPermissions: { yolo: value } } }),
+      /web.browserPermissions.yolo must be a boolean/,
+    );
+  }
+  assert.throws(
+    () => normalizeConfig({ web: { browserPermissions: "yolo" } }),
+    /web.browserPermissions must be an object/,
+  );
+});
+
+test("unknown browser permission keys are ignored and never grant capabilities", () => {
+  const config = normalizeConfig({
+    web: { browserPermissions: { unrestricted: true, modelUploads: true } },
+  });
+  assert.equal(config.web!.browserPermissions.modelUploads, true);
+  assert.equal(config.web!.browserPermissions.yolo, false);
+  assert.equal((config.web!.browserPermissions as unknown as Record<string, unknown>).unrestricted, undefined);
 });
 
 test("native web tooling has bounded defaults and validates overrides", () => {

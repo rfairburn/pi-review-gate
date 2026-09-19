@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { normalizeConfig } from "../src/config";
+import { DEFAULT_BROWSER_PERMISSIONS, normalizeConfig } from "../src/config";
 import { persistReviewSettings, persistSubtasksViewPreference, updateReviewGateConfig, type ReviewSettingsSelection } from "../src/settings/persistence";
 
 const selection: ReviewSettingsSelection = {
@@ -48,6 +48,57 @@ test("browser approval persistence round-trips every mode and preserves unrelate
   }
 });
 
+test("browser permissions persist as a complete object and survive unrelated saves", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-browser-permissions-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ web: { enabled: false, future: "keep", browserPermissions: { modelUploads: true } } }));
+    const normalized = await persistReviewSettings(configPath, {
+      ...selection,
+      webBrowserPermissions: { ...DEFAULT_BROWSER_PERMISSIONS, modelCredentialEntry: true, yolo: true },
+    });
+    assert.equal(normalized.web!.browserPermissions.yolo, true);
+    assert.equal(normalized.web!.browserPermissions.modelCredentialEntry, true);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.deepEqual(saved.web.browserPermissions, { ...DEFAULT_BROWSER_PERMISSIONS, modelCredentialEntry: true, yolo: true });
+    assert.equal(saved.web.future, "keep");
+
+    // A save that omits the permissions object preserves the stored values.
+    const unchanged = await persistReviewSettings(configPath, selection);
+    assert.deepEqual(unchanged.web!.browserPermissions, { ...DEFAULT_BROWSER_PERMISSIONS, modelCredentialEntry: true, yolo: true });
+
+    // YOLO off with preserved individual values round-trips too.
+    const restored = await persistReviewSettings(configPath, {
+      ...selection,
+      webBrowserPermissions: { ...DEFAULT_BROWSER_PERMISSIONS, modelUploads: true },
+    });
+    assert.equal(restored.web!.browserPermissions.yolo, false);
+    assert.equal(restored.web!.browserPermissions.modelUploads, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("invalid browser permission values reject the save before any write", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-browser-permissions-invalid-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ web: { browserPermissions: { modelUploads: true } } }));
+    const before = await readFile(configPath, "utf8");
+    await assert.rejects(
+      persistReviewSettings(configPath, {
+        ...selection,
+        webBrowserPermissions: { ...DEFAULT_BROWSER_PERMISSIONS, yolo: "yes" } as never,
+      }),
+      /web.browserPermissions.yolo must be a boolean/,
+    );
+    assert.equal(await readFile(configPath, "utf8"), before);
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("idle expiry persists safely and omitted or invalid updates preserve existing settings", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-idle-expiry-"));
   const configPath = join(dir, "config.json");
@@ -60,9 +111,41 @@ test("idle expiry persists safely and omitted or invalid updates preserve existi
     assert.equal(saved.futureRoot, true);
     assert.deepEqual(saved.web, { ...web, browserIdleExpiryMinutes: 42 });
     assert.equal((await persistReviewSettings(configPath, selection)).web!.browserIdleExpiryMinutes, 42);
+    const disabled = await persistReviewSettings(configPath, { ...selection, browserIdleExpiryMinutes: 0 });
+    assert.equal(disabled.web!.browserIdleExpiryMinutes, 0);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).web.browserIdleExpiryMinutes, 0);
     const before = await readFile(configPath, "utf8");
-    for (const minutes of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    for (const minutes of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
       await assert.rejects(persistReviewSettings(configPath, { ...selection, browserIdleExpiryMinutes: minutes }), /web.browserIdleExpiryMinutes/);
+      assert.equal(await readFile(configPath, "utf8"), before);
+    }
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("download retention persists safely and omitted or invalid updates preserve existing settings", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-download-retention-"));
+  const configPath = join(dir, "config.json");
+  try {
+    const web = { enabled: false, future: { keep: true }, browserIdleExpiryMinutes: 0, fetch: { timeoutMs: 12345 } };
+    await writeFile(configPath, JSON.stringify({ futureRoot: true, web }));
+    const normalized = await persistReviewSettings(configPath, { ...selection, browserDownloadRetention: 3 });
+    assert.equal(normalized.web!.browserDownloadRetention, 3);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.futureRoot, true);
+    assert.deepEqual(saved.web, { ...web, browserDownloadRetention: 3 });
+    // A save that omits the retention preserves the stored value.
+    assert.equal((await persistReviewSettings(configPath, selection)).web!.browserDownloadRetention, 3);
+    // 0 (unlimited) round-trips.
+    const unlimited = await persistReviewSettings(configPath, { ...selection, browserDownloadRetention: 0 });
+    assert.equal(unlimited.web!.browserDownloadRetention, 0);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).web.browserDownloadRetention, 0);
+    // Invalid values reject the save before any write.
+    const before = await readFile(configPath, "utf8");
+    for (const value of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(persistReviewSettings(configPath, { ...selection, browserDownloadRetention: value }), /web.browserDownloadRetention/);
       assert.equal(await readFile(configPath, "utf8"), before);
     }
     assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);

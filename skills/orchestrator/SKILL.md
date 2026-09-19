@@ -13,19 +13,24 @@ Treat delegation as an execution strategy, not a transfer of responsibility. Kee
 - Use read-only research subtasks for deeper independent investigation whose detailed exploration would consume the primary context. Consume their reports and sources instead of repeating the investigation.
 - Use execution subtasks for substantive workspace-writing phases. Every execution task receives a separate, isolated Git worktree at its captured base. Siblings do not share a working directory and cannot see or build on one another's unlanded edits. A cohesive deliverable can be one bounded worker task; parallelism is useful but is not required for delegation.
 - Keep branch ownership with the target checkout: prepare the task's named issue branch there, pass that checkout as the execution group's workspace, and reference the branch as context only. Never instruct a worker to check out, create, or switch to that branch: the worker's managed worktree stays on a detached HEAD at a synthetic captured base that already includes the target's uncommitted content, checking out a different commit there would reset the tree and can drop that content, and the harness owns checkpointing and landing. Do not hand workers the repository's own branch/commit conventions as working instructions — commits, checkpoints, and landings are harness-owned.
-- Parallelize work with genuinely independent outputs or ownership. Do not manufacture concurrency by splitting tightly coupled changes across workers that must continuously coordinate.
+- Shape concurrency from dependencies and benefit, not from available capacity. At the start of substantive work, identify actual dependencies and independent ready work; while work runs or a dependency clears, ask whether another already-authorized task with a concrete useful output and known consumer can proceed independently. Parallelize when the expected time or primary-context benefit outweighs dispatch, review, and integration costs: independent evidence gathering is useful when it answers a concrete unresolved question, not when it duplicates an active investigation or reviews a tree that will be replaced.
+- Capacity is an opportunity, not a utilization target. There is no minimum task count, required research companion, or obligation to manufacture work to avoid idleness; waiting or serial execution is correct when no useful independent work is ready. Do not fragment tightly coupled changes across workers that must continuously coordinate merely to create more tasks.
+- Prefer non-overlapping ownership, but permit justified controlled overlap with distinct responsibilities and an explicit integration order. Ordinary conflicts are an integration responsibility, not a reason to serialize everything: resolve both accepted intents and validate the combined result rather than force-merging blindly.
+- After an intermediate landing, continue onto meaningful ready accepted work instead of stopping because one task landed; do not expand accepted scope or invent follow-ups to stay busy.
 - Keep making useful decisions or performing independent discovery while workers run. Rely on event notifications; do not create polling loops, sleeps, or background wait jobs.
 
 ## Write worker contracts
 
 Give each worker a self-contained contract containing:
 
-- the desired outcome and relevant context;
-- explicit constraints, non-goals, and dependencies;
+- the desired outcome, relevant context, and explicit boundaries;
+- constraints, non-goals, dependencies, and invariants;
 - clear ownership boundaries when siblings run concurrently;
 - observable acceptance criteria such as final behavior, file contents, targeted test results, or a source-linked research report.
 
 Describe what must be true without over-prescribing incidental implementation details. A later steer is authoritative when the task changes.
+
+Default to one concrete, coherent outcome per subtask. Minimize simultaneous unresolved decisions without assuming advance knowledge of which model will serve the worker: a smaller-model success should follow from good task construction, not from model selection or routing changes. Resolve architectural uncertainty before dispatching implementation slices that depend on it; do not bundle broad investigation, a large implementation, documentation, and broad validation into one assignment, and keep each change with the focused tests and documentation necessary to establish its coherent outcome. Keep genuinely dependent source-writing slices sequential, and parallelize independent slices only when their shared contracts are settled.
 
 ## Supervise deliberately
 
@@ -33,6 +38,7 @@ Describe what must be true without over-prescribing incidental implementation de
 - When a long-running execution warrants one deliberate future checkpoint, use `SubtasksWatch`. It returns immediately, replaces the execution's prior watch, cancels on an earlier completion/failure/conflict/recovery event, and fires at most once; explicitly rearm it only when another checkpoint remains useful. Never turn it into a recurring heartbeat.
 - Steer promptly when new information changes direction. Steering supersedes an in-flight review and remains queued when live delivery is temporarily unavailable.
 - Add work to an existing execution when completed tasks free capacity and more planned work remains.
+- Reassess from observed progress, expanding scope, and repeated review cycles rather than elapsed time or task size: prolonged work without a verifiable result justifies inspection, clarification, or splitting the remaining work — not automatic cancellation or a rigid limit. Preserve completed work and accepted invariants when rescoping.
 - For a stopped task, diagnose its failure packet and prefer continuation from its verified checkpoint over recreating work. Retry infrastructure failures without pretending they are implementation verdicts.
 - Treat reviewer feedback as a technical diagnosis to evaluate against the effective request and current workspace. Blocking findings require correction before ordinary landing; passing and non-blocking observations are information, not mandatory scope expansion.
 - When a task is conflicted, interrupted, failed, `paused_recoverable`, `stopped_for_application_exit`, or otherwise reports recovery-required state, read [references/recovery.md](references/recovery.md) before acting.

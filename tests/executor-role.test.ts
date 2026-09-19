@@ -23,6 +23,7 @@ const webToolNames = [
   "WebSearch", "WebFetch", "BrowserExtract",
   "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
   "BrowserScroll", "BrowserHover", "BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress",
+  "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard",
   "BrowserWait", "BrowserHistory", "BrowserTabs", "BrowserClose",
 ];
 
@@ -106,7 +107,7 @@ test("worker browser approval is launch-scoped and never widens research authori
       let active = ["read"];
       // Research catalog narrowing itself is covered by execution-tool tests;
       // this fixture checks the child's consumption cannot widen that boundary.
-      const allowed = ["read", ...webToolNames.filter((name) => !["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress"].includes(name))];
+      const allowed = ["read", ...webToolNames.filter((name) => !["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard"].includes(name))];
       process.env[EXECUTOR_TOOL_CATALOG_ENV] = JSON.stringify({ allowedToolCatalog: allowed, initialActiveTools: ["read"] });
       await activate({
         registerTool(tool: any) { definitions.set(tool.name, tool); active.push(tool.name); },
@@ -123,7 +124,7 @@ test("worker browser approval is launch-scoped and never widens research authori
       for (const hook of hooks.get("session_start") ?? []) await hook({ cwd: dir }, ctx);
       for (const hook of hooks.get("before_agent_start") ?? []) await hook({ cwd: dir }, ctx);
       assert.equal(updates.length, updateCount, "already-running worker does not reload changed policy");
-      for (const name of ["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress"]) {
+      for (const name of ["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard"]) {
         const result = await definitions.get("search_tools").execute("restricted", { query: name });
         assert.deepEqual(result.details.activated, []);
         assert.equal(active.includes(name), false, `${mode} cannot grant research ${name}`);

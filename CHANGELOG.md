@@ -15,6 +15,41 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.52]
+
+### Added
+
+- Visible/headless selection for the managed interactive browser in Web settings.
+  Saving a changed mode immediately replaces an open browser, restoring intended
+  tab URLs and the active tab with best-effort memory-only cookies, local storage,
+  and IndexedDB transfer. Results disclose failed restoration, redirects, and state
+  limitations; old session, tab, and ref handles are invalid after replacement.
+
+### Changed
+
+- Browser idle expiry accepts `0` to disable idle closure. Detectable trusted
+  pointer, keyboard, and wheel input renews finite idle leases alongside model
+  activity; explicit close and session cleanup remain effective. Documentation
+  recommends `0` for hands-on browser use and explains detection limitations.
+- BrowserExtract remains an independent headless URL-rendering tool, with no managed
+  tab or authentication-state reuse. Interactive actions still target explicit tab
+  IDs; visibility does not change tool exposure or browser permissions.
+
+## [0.1.0-dev.51]
+
+### Changed
+
+- Strengthen orchestrator prompts, tool guidance, and the shipped skill to prefer
+  useful independent ready work over slot-filling, with legitimate waiting and
+  sequential execution when parallel work would not help.
+- Encourage bounded, coherent subtasks with explicit invariants and acceptance
+  criteria without assuming worker model identity. Keep dependent edits sequential,
+  preserve coupled changes and their focused tests, and reassess from observed
+  progress rather than automatic time limits.
+- Add representative orchestration evaluation scenarios and policy-wiring tests,
+  explicitly distinguishing guidance checks from evidence of model judgment.
+  Scheduler, routing, review gates, and recovery behavior remain unchanged.
+
 ## [0.1.0-dev.50]
 
 ### Changed

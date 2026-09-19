@@ -33,6 +33,7 @@ import {
   type BrowserScrollTarget,
   type BrowserTabsOperation,
   type BrowserTabsResult,
+  type BrowserVisibilityResult,
   type BrowserWaitRequest,
 } from "./interactive-browser";
 import { WebPageCache, type WebFetchResult } from "./cache";
@@ -111,7 +112,7 @@ export class WebToolManager {
     this.cache = cache ?? new WebPageCache(this.webConfig.fetch);
     this.browserCache = browserCache ?? new WebPageCache(this.webConfig.fetch, renderWithChromium);
     this.interactiveBrowser = interactiveBrowser ?? new InteractiveBrowserManager(this.webConfig.fetch);
-    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes);
+    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes, this.webConfig.browserVisible);
     registerProcessExitCleanup(this.cache);
     registerProcessExitCleanup(this.browserCache);
   }
@@ -787,7 +788,21 @@ export class WebToolManager {
     this.webConfig = config.web ?? DEFAULT_CONFIG.web!;
     this.cache.updateConfig(this.webConfig.fetch);
     this.browserCache.updateConfig(this.webConfig.fetch);
-    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes);
+    this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes, this.webConfig.browserVisible);
+  }
+
+  /** Apply a just-saved settings selection to the live tooling. The saved web
+   * visibility is applied to a live interactive browser immediately through a
+   * controlled replacement; with no live browser the preference applies at
+   * the next open. Returns a bounded human-facing notice, or null when
+   * nothing had to change. Failures throw truthfully — they are never
+   * silently queued nor reported as visible. */
+  async applySavedSettings(config: ReviewGateConfig): Promise<string | null> {
+    this.sync(config);
+    const visible = this.webConfig.browserVisible ?? false;
+    const outcome = await this.interactiveBrowser.applyVisibility(visible);
+    if (!outcome) return null;
+    return formatVisibilityOutcome(outcome);
   }
 
   async cleanup(): Promise<void> {
@@ -1055,6 +1070,40 @@ function formatBrowserHistory(value: BrowserHistoryResult): string {
     `Session-local entries: ${value.entries.length}${value.truncated ? " (older entries omitted)" : ""}.`,
   ];
   for (const entry of value.entries) lines.push(`${entry.current ? "*" : "-"} ${entry.index}: ${entry.url} · generation ${entry.generation}`);
+  return lines.join("\n");
+}
+
+/** Human-facing notice for a settings-driven visibility replacement. Session
+ * and tab handles let the human paste them into follow-up model instructions;
+ * state is described count-only, never by value. */
+function formatVisibilityOutcome(value: BrowserVisibilityResult): string {
+  const mode = value.headless ? "headless" : "headed (visible window)";
+  const lines: string[] = [];
+  if (!value.relaunched) {
+    lines.push(`Browser visibility change could not complete; the browser was left unchanged in ${value.headless ? "headless" : "headed"} mode.`, `Session: ${value.session} · Active tab: ${value.activeTab ?? "[none]"}`);
+  } else {
+    lines.push(
+      `Browser visibility applied immediately: previous session replaced with a ${mode} browser.`,
+      `New session: ${value.session} · Active tab: ${value.activeTab ?? "[none]"} — old session/tab/ref handles are stale; give these new handles to the model for its next browser operation.`,
+      `Tabs restored: ${value.restoredTabs}; not restored: ${value.unrestoredTabs}.`,
+    );
+    if (value.stateReapplied) {
+      lines.push(`Session state replayed from memory (${value.stateCookies ?? 0} cookie(s), ${value.stateOrigins ?? 0} origin(s)); memory-only and best-effort — there is no lossless guarantee.`);
+    } else {
+      lines.push("Session state was not captured; restored tabs are not signed in.");
+    }
+  }
+  for (const tab of value.tabs) {
+    const marker = tab.active ? "*" : "-";
+    if (tab.restored) {
+      const mismatch = tab.finalUrl !== null && tab.finalUrl !== tab.requestedUrl ? ` — ended at ${tab.finalUrl}` : "";
+      lines.push(`${marker} ${tab.requestedUrl}${mismatch}${tab.reason ? ` — ${tab.reason}` : ""}`);
+    } else {
+      lines.push(`${marker} ${tab.requestedUrl} — not restored${tab.reason ? `: ${tab.reason}` : ""}`);
+    }
+  }
+  if (value.overflowPopups > 0) lines.push(`${value.overflowPopups} context page(s) beyond the tab cap were not restorable.`);
+  for (const note of value.notes) lines.push(note);
   return lines.join("\n");
 }
 

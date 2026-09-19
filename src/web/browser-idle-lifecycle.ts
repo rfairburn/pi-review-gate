@@ -1,4 +1,8 @@
-/** Tool-activity lease only: page events must never call renew(). */
+/** Tool-activity lease. Page events must never call renew() directly; only the
+ * manager-authenticated human-input bridge (browser-trusted input, HMAC-verified
+ * tokens; see browser-human-input.ts) may renew from the page side. A 0-minute
+ * lease disables idle expiry entirely: no timer is ever armed and only stop()
+ * (explicit close, shutdown, replacement, or unrecoverable failure) ends it. */
 export class BrowserIdleLease {
   private timer?: ReturnType<typeof setTimeout>;
   private lastActivity: number;
@@ -37,6 +41,9 @@ export class BrowserIdleLease {
 
   private arm(): void {
     if (this.timer !== undefined) this.cancel(this.timer);
+    this.timer = undefined;
+    // 0 minutes disables idle expiry: never schedule a timer.
+    if (this.minutes <= 0) return;
     // Multiplication is finite even for MAX_SAFE_INTEGER minutes. Never pass
     // an overflowing delay to Node (which would turn it into a 1ms timeout).
     const remaining = this.minutes * 60_000 - Math.max(0, this.now() - this.lastActivity);
@@ -58,7 +65,7 @@ export class BrowserIdleLease {
 }
 
 export function validateIdleExpiryMinutes(minutes: number): void {
-  if (!Number.isSafeInteger(minutes) || minutes <= 0) {
-    throw new Error("Browser idle expiry must be a positive safe integer number of minutes.");
+  if (!Number.isSafeInteger(minutes) || minutes < 0) {
+    throw new Error("Browser idle expiry must be a non-negative safe integer number of minutes (0 disables idle close).");
   }
 }

@@ -67,11 +67,39 @@ test("close cancels expiry; later settings and activity cannot resurrect", () =>
   f.advance(900_000); assert.equal(f.expired, 0); assert.equal(f.timers.size, 0);
 });
 
+test("zero-minute lease never arms a timer or expires", () => {
+  const f = fixture(0);
+  assert.equal(f.timers.size, 0);
+  f.advance(Number.MAX_SAFE_INTEGER); assert.equal(f.expired, 0);
+  f.lease.renew(); f.advance(Number.MAX_SAFE_INTEGER); assert.equal(f.expired, 0);
+  assert.equal(f.timers.size, 0);
+});
+
+test("live update transitions between timed and disabled in both directions", () => {
+  // finite → 0 cancels the pending timer and never expires.
+  const f = fixture(1);
+  f.advance(30_000); f.lease.update(0);
+  assert.equal(f.timers.size, 0);
+  f.advance(Number.MAX_SAFE_INTEGER); assert.equal(f.expired, 0);
+  // 0 → finite reschedules from last tool activity (existing semantics): a
+  // session already idle past the new limit expires promptly, while a renewed
+  // session gets a fresh full window.
+  f.lease.update(1);
+  assert.equal(f.timers.size, 1);
+  f.advance(1); assert.equal(f.expired, 1);
+  const g = fixture(0);
+  g.advance(3_600_000); g.lease.renew(); g.lease.update(1);
+  assert.equal(g.timers.size, 1);
+  g.advance(59_999); assert.equal(g.expired, 0);
+  g.advance(1); assert.equal(g.expired, 1);
+});
+
 test("large safe integer minutes use bounded timer chunks", () => {
   const f = fixture(Number.MAX_SAFE_INTEGER);
   f.advance(2_147_483_647 * 3); assert.equal(f.expired, 0);
   assert.equal(f.timers.size, 1); f.lease.stop();
-  for (const invalid of [0, -1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
-    assert.throws(() => validateIdleExpiryMinutes(invalid), /positive safe integer/);
+  for (const invalid of [-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => validateIdleExpiryMinutes(invalid), /non-negative safe integer/);
   }
+  assert.doesNotThrow(() => validateIdleExpiryMinutes(0));
 });

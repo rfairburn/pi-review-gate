@@ -15,11 +15,96 @@ import {
   interactiveChromiumArgs,
   interactiveRouteDecision,
 } from "../src/web/interactive-browser";
+import { humanInputToken } from "../src/web/browser-human-input";
 
 const ONE_PIXEL_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
 );
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function until(body: () => void, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { body(); return; } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await delay(5);
+    }
+  }
+}
+
+test("a genuine human-input token renews the finite idle lease; close detaches it", async () => {
+  let now = 0;
+  const browsers: FakeBrowser[] = [];
+  const config = normalizeConfig({}).web!.fetch;
+  const manager = new InteractiveBrowserManager(config, {
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => {
+      const browser = new FakeBrowser();
+      browsers.push(browser);
+      return browser as unknown as Browser;
+    },
+    now: () => now,
+  });
+  try {
+    const opened = await manager.open("https://example.com/");
+    // The detector is installed per tab on its own CDP session in a browser-
+    // owned isolated world; the token travels only as a console payload.
+    const context = browsers[0]!.context;
+    const bridge = context.cdpSessions.find((session) =>
+      session.sent.some((call) => call.method === "Page.addScriptToEvaluateOnNewDocument"));
+    assert.ok(bridge, "the human input bridge must be installed on the tab's CDP session");
+    assert.ok(bridge.sent.some((call) => call.method === "Page.enable"));
+    assert.ok(bridge.sent.some((call) => call.method === "Runtime.enable"));
+    const scriptCall = bridge.sent.find((call) => call.method === "Page.addScriptToEvaluateOnNewDocument")!;
+    assert.equal((scriptCall.params as { worldName?: string }).worldName, "pi-review-gate-human-input");
+    const source = (scriptCall.params as { source?: string }).source ?? "";
+    const secret = /var SECRET = "([0-9a-f]{64})";/.exec(source)?.[1];
+    assert.ok(secret, "detector script carries the per-session secret");
+    const signal = (kind: string, counter: number) => bridge.emitConsoleCall("debug", humanInputToken(secret, "0123456789abcdef", kind, counter));
+
+    // 30 simulated minutes pass; a genuine human press renews at that moment.
+    now = 30_000;
+    signal("pointerdown", 1);
+    // A replay of the same token must not move the renewal point again.
+    signal("pointerdown", 1);
+    // Renewal is observable through the expiry edge driven by live re-arm.
+    now = 89_999; // renewal + 59_999ms < 60_000ms window
+    manager.updateConfig(config, "ask", 1);
+    await delay(30);
+    assert.equal(manager.activeSessionCount(), 1, "trusted human input renewed the lease");
+    now = 90_000; // renewal + exactly 60_000ms
+    manager.updateConfig(config, "ask", 1);
+    await until(() => assert.equal(manager.activeSessionCount(), 0, "lease expires on schedule after the last genuine input"));
+    // Teardown detached the callbacks: late tokens cannot resurrect anything.
+    now = 120_000;
+    signal("keydown", 2);
+    manager.updateConfig(config, "ask", 1);
+    await delay(30);
+    assert.equal(manager.activeSessionCount(), 0);
+
+    // Explicit close also detaches: a fresh session, closed, ignores its token.
+    const second = await manager.open("https://example.com/");
+    const secondBridge = browsers[1]!.context.cdpSessions.find((session) =>
+      session.sent.some((call) => call.method === "Page.addScriptToEvaluateOnNewDocument"));
+    assert.ok(secondBridge);
+    const secondSecret = /var SECRET = "([0-9a-f]{64})";/.exec(
+      (secondBridge.sent.find((call) => call.method === "Page.addScriptToEvaluateOnNewDocument")!.params as { source?: string }).source ?? "",
+    )?.[1];
+    assert.ok(secondSecret);
+    await manager.close(second.session);
+    secondBridge.emitConsoleCall("debug", humanInputToken(secondSecret, "0123456789abcdef", "pointerdown", 1));
+    manager.updateConfig(config, "ask", 1);
+    await delay(30);
+    assert.equal(manager.activeSessionCount(), 0, "closed sessions cannot be resurrected by late tokens");
+    // The bridge's own CDP session is detached by teardown.
+    assert.equal(bridge.detached, true);
+    assert.equal(secondBridge.detached, true);
+  } finally {
+    await manager.shutdown().catch(() => undefined);
+  }
+});
 
 test("WebToolManager constructor and sync apply idle expiry and tool activity renews it", async () => {
   let now = 0;
@@ -51,6 +136,42 @@ test("WebToolManager constructor and sync apply idle expiry and tool activity re
     assert.equal(manager.activeSessionCount(), 1);
     now = 179_000;
     boundary.sync(normalizeConfig({ web: { browserIdleExpiryMinutes: 2 } }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await assert.rejects(call("BrowserSnapshot", { session, tab }), /expired.*BrowserOpen/s);
+    assert.equal(manager.activeSessionCount(), 0);
+  } finally { await boundary.cleanup(); }
+});
+
+test("zero idle expiry disables idle close and finite settings still apply live both ways", async () => {
+  let now = 0;
+  const browser = new FakeBrowser();
+  const config = normalizeConfig({ web: { browserIdleExpiryMinutes: 1 } });
+  const manager = new InteractiveBrowserManager(config.web!.fetch, {
+    now: () => now,
+    resolveHostname: async () => ["93.184.216.34"],
+    launch: async () => browser as unknown as Browser,
+  });
+  const tools: Array<{ name: string; execute(id: string, params: Record<string, unknown>): Promise<any> }> = [];
+  const boundary = new WebToolManager({ registerTool: tool => tools.push(tool as never) }, config, undefined, undefined, manager);
+  boundary.register();
+  const call = (name: string, params: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("idle-zero-test", params);
+  try {
+    const result = await call("BrowserOpen", { url: "https://example.com/" });
+    const { session, tab } = result.details.response;
+    await call("BrowserSnapshot", { session, tab });
+    // Disabled: no idle expiry even after far more than the previous limit.
+    boundary.sync(normalizeConfig({ web: { browserIdleExpiryMinutes: 0 } }));
+    now = 900_000;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(manager.activeSessionCount(), 1);
+    await call("BrowserSnapshot", { session, tab });
+    // Back to finite: reschedules from last tool activity. Sync near the end of
+    // the 60s window (matching the real-timer pattern of the test above).
+    now = 959_999;
+    boundary.sync(normalizeConfig({ web: { browserIdleExpiryMinutes: 1 } }));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(manager.activeSessionCount(), 1);
+    now = 960_000;
     await new Promise(resolve => setTimeout(resolve, 20));
     await assert.rejects(call("BrowserSnapshot", { session, tab }), /expired.*BrowserOpen/s);
     assert.equal(manager.activeSessionCount(), 0);
@@ -262,6 +383,29 @@ class FakePage extends EventEmitter {
   }
 }
 
+class FakeCdpSession {
+  readonly sent: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  private readonly handlers = new Map<string, Array<(payload: any) => void>>();
+  detached = false;
+  constructor(private readonly page: FakePage) {}
+  async send(method: string, params?: Record<string, unknown>) {
+    this.sent.push({ method, params });
+    if (method === "Page.getNavigationHistory") return this.page.navigationHistory();
+    if (method === "Page.navigateToHistoryEntry") return this.page.navigateToHistoryEntry((params as { entryId: number }).entryId);
+    if (method === "Page.enable" || method === "Runtime.enable" || method === "Page.addScriptToEvaluateOnNewDocument") return {};
+    throw new Error(`Unexpected internal protocol method ${method}`);
+  }
+  on(event: string, handler: (payload: any) => void) {
+    this.handlers.set(event, [...(this.handlers.get(event) ?? []), handler]);
+  }
+  emitConsoleCall(type: string, value: unknown) {
+    for (const handler of this.handlers.get("Runtime.consoleAPICalled") ?? []) {
+      handler({ type, args: [{ type: "string", value }] });
+    }
+  }
+  async detach() { this.detached = true; }
+}
+
 class FakeContext extends EventEmitter {
   readonly page = new FakePage();
   readonly pages = [this.page];
@@ -270,17 +414,13 @@ class FakeContext extends EventEmitter {
   routeHandler?: (route: any) => Promise<void>;
   nextPageDelayMs = 0;
   closed = false;
+  readonly cdpSessions: FakeCdpSession[] = [];
   setDefaultTimeout() {}
   setDefaultNavigationTimeout() {}
   async newCDPSession(page: FakePage) {
-    return {
-      send: async (method: string, params?: { entryId: number }) => {
-        if (method === "Page.getNavigationHistory") return page.navigationHistory();
-        if (method === "Page.navigateToHistoryEntry") return page.navigateToHistoryEntry(params!.entryId);
-        throw new Error(`Unexpected internal protocol method ${method}`);
-      },
-      detach: async () => undefined,
-    };
+    const session = new FakeCdpSession(page);
+    this.cdpSessions.push(session);
+    return session;
   }
   async clearPermissions() {}
   async routeWebSocket() {}

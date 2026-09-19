@@ -303,8 +303,45 @@ and proxy bypass remain disabled. Interactive images, downloaded fonts, media, S
 and HTTP beacons use protected broker networking. Local `data:`/`blob:` rendering is
 allowed; those URLs do not themselves open network connections. Dedicated and shared
 workers retain broker-only egress. Site CSP, CORS, TLS checks and user-gesture media
-playback policy remain in force. This is a headless QA browser, not unrestricted
-computer use; visibility and password/upload overrides are separate future work.
+playback policy remain in force. This is a QA browser, not unrestricted computer use;
+window visibility is a user-side setting (below), while password/upload overrides are
+separate future work.
+
+### Browser visibility
+
+`/review-settings` → **Web** → **Browser visibility** selects **Headless** (default,
+no window) or **Headed** (a real browser window with a native address bar). The model's
+tool set and exposure are identical in both modes, and there is no model-facing
+visibility control.
+
+Saving a changed visibility applies it **immediately to the live browser**; the pinned
+Playwright runtime selects the headless-shell or headed binary at launch, so a running
+browser cannot switch modes in place. The save therefore performs a controlled
+replacement through the ordinary ownership path: in-flight browser operations are
+cancelled and settled, the old browser is closed and torn down quiescently with fresh
+per-session egress-broker credentials in the replacement, and no duplicate or orphan
+browser is created. Saving with no open browser applies the preference at the next
+`BrowserOpen`; saving the already-active mode is idempotent and restarts nothing.
+**Cancel** in the settings menu never relaunches anything.
+
+The replacement restores, best-effort and in the original order, every actual context
+tab (including human-opened popups within the tab cap) by re-navigating its recorded
+URL through the same egress policy, and it makes the intended tab active again — when
+the real window's foregrounded tab can be detected and differs from the model's
+recorded active tab, the foregrounded tab wins. Cookies, localStorage, and IndexedDB
+are replayed from memory via the context storage-state object; nothing touches disk,
+no persistent profile is created, and state values never appear in results, logs, or
+diagnostics (only counts). This replay is **memory-only and best-effort: there is no
+lossless guarantee**. Auth-dependent pages can still redirect to a login page; each
+tab reports its requested and final URL, mismatches, unrestorable URLs (including
+intended-tab information for URLs that no longer pass the public-URL egress policy,
+which are never re-navigated), failed restores, and pages beyond the tab cap. Old
+session/tab/ref handles are invalidated and rejected; the save notice reports the
+replacement session and tab handles for the model's next operation. Irreversible form
+submissions are not replayed, and no DOM or history state is fabricated. Setting the
+idle expiry to `0` is recommended when working hands-on in a headed window so the
+browser cannot disappear mid-interaction. See
+[Configuration](configuration.md#web-fields).
 
 Everything returned from a page — snapshot text, accessible names, title, URL, and
 pixels — is labeled **untrusted evidence**. It must never be treated as an instruction
@@ -366,9 +403,27 @@ beyond the action deadline. Unsettled work reports unknown effects, never rollba
 Ordinary invalid/stale capability validation and harmless screenshot mode/ref argument
 mistakes do not themselves retire a healthy session.
 Browser tool inactivity expires the session after `web.browserIdleExpiryMinutes`
-(default 15, configurable under `/review-settings` → Web). Background scripts,
-requests and WebSockets do not renew expiry, and active operations/approval waits are
-protected. Expired handles explicitly require `BrowserOpen`; state is not recreated.
+(default 15; configurable under `/review-settings` → Web, where 0 disables idle close
+so only explicit close, shutdown, replacement, or unrecoverable failure ends the
+session). Detectable genuine human input in the live page — browser-trusted pointer
+presses, keyboard input, and wheel scrolling — also resets a nonzero timer, through
+a manager-owned bridge that reports only events Chromium marks trusted (`isTrusted`)
+and authenticates each signal with a single-use HMAC token; page script cannot mint
+or replay tokens, so script alone can never keep the lease alive. Page-script
+`dispatchEvent`, fabricated trusted clicks such as `element.click()`, programmatic
+scrolling, DOM mutations, timers, animation, and background requests/WebSockets are
+never treated as human input. No input values, keys, or element contents are
+collected. Detection is per tab and per document: an adopted popup or newly opened
+tab is covered from its next navigation, and documents in cross-origin (out-of-process)
+iframes are not covered; both gaps fail toward less renewal, never toward spoofing.
+Detection is deliberately partial and never claimed otherwise: input
+outside the page surface (address bar, window controls, scrollbar drags, OS-level
+activity) and navigation by itself are not attributed, and model-driven Playwright
+input travels the same trusted pipeline, renewing like model tool activity always
+has. For hands-on human use, set the timeout to `0` so the browser cannot disappear
+mid-interaction. Background scripts, requests and WebSockets do not renew expiry, and
+active operations/approval waits are protected. Expired handles explicitly require
+`BrowserOpen`; state is not recreated.
 There is no elapsed browser-lifetime deadline or established-stream idle eviction.
 Pre-authentication connection deadlines and concurrent capacity still apply, and new
 connections undergo fresh DNS validation and pinned dialing. No page action is

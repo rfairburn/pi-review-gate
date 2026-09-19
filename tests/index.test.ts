@@ -2480,6 +2480,7 @@ test("completed turns never invoke terminal browser cleanup", async () => {
       webTools: {
         register() {},
         sync() {},
+        async applySavedSettings() { return null; },
         async cleanup() {
           cleanupCalls += 1;
           throw new Error("terminal cleanup must not run at turn settlement");

@@ -79,8 +79,9 @@ underlying behavior.
   remain fatal. See [Security model](security-model.md#egress-broker-containment) and
   [Web tools](web-tools.md).
 - **Browser handles report tool-inactivity expiry.** Reopen with `BrowserOpen`; prior
-  page state is lost. Configure the positive minute value under `/review-settings` →
-  Web → Browser idle expiry. Background page traffic cannot keep the session alive.
+  page state is lost. Configure the minute value under `/review-settings` →
+  Web → Browser idle expiry (0 disables idle close). Background page traffic cannot
+  keep a timed session alive.
 - **A dynamic site's capture fails with `phase=capture; category=document_changed`.**
   A main or child-frame navigation changes the capability generation; stale evidence
   is rejected and the session is closed, not returned or automatically replayed.

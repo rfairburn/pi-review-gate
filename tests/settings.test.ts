@@ -534,14 +534,14 @@ test("browser idle expiry validates, stages, cancels and reloads through Web set
   const registered = commandHarness();
   const reloaded: number[] = [];
   registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: (next) => { reloaded.push(next.web!.browserIdleExpiryMinutes); } });
-  const webRow = rootSettingsRow("Web", "50 MiB max download");
+  const webRow = rootSettingsRow("Web", "50 MiB max download · headless browser");
   const idleRow = webSettingsRow("Browser idle expiry", "15 minutes");
   await registered.handler("", contextWithSelections([webRow, idleRow, "Back", "Cancel"], [], ["30"]));
   assert.equal(await readFile(configPath, "utf8"), original);
   assert.equal(config.web!.browserIdleExpiryMinutes, 15);
   assert.deepEqual(reloaded, []);
 
-  const invalid = ["0", "-1", "1.5", "NaN", "Infinity", "9007199254740992", "", "abc"];
+  const invalid = ["-1", "1.5", "NaN", "Infinity", "9007199254740992", "", "abc"];
   const errors: string[] = [];
   const ctx = contextWithSelections([
     webRow, ...invalid.map(() => idleRow), idleRow, idleRow,
@@ -550,14 +550,23 @@ test("browser idle expiry validates, stages, cancels and reloads through Web set
   ctx.ui.notify = (message, type) => { if (type === "error") errors.push(message); };
   await registered.handler("", ctx);
   assert.equal(errors.length, invalid.length);
-  assert.ok(errors.every((message) => message.includes("positive safe whole number of minutes")));
+  assert.ok(errors.every((message) => message.includes("Enter 0 to disable idle close")));
   assert.equal(config.web!.browserIdleExpiryMinutes, 30);
   assert.deepEqual(reloaded, [30]);
-  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  let saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(saved.web.browserIdleExpiryMinutes, 30);
   assert.equal(saved.web.future, true);
   assert.equal(saved.web.browserInteractionApproval, "ask");
   assert.equal(saved.web.fetch.maxDownloadBytes, 50 * 1024 * 1024);
+
+  // Entering 0 stages the disabled display and persists it on save.
+  const zeroRow = webSettingsRow("Browser idle expiry", "0 · idle close disabled");
+  await registered.handler("", contextWithSelections([webRow, webSettingsRow("Browser idle expiry", "30 minutes"), zeroRow, "Back", "Save changes"], [], ["0"]));
+  assert.equal(config.web!.browserIdleExpiryMinutes, 0);
+  assert.deepEqual(reloaded, [30, 0]);
+  saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserIdleExpiryMinutes, 0);
+  assert.equal(saved.web.future, true);
 });
 
 test("web settings stage and save the maximum download size in MiB", async () => {
@@ -573,7 +582,7 @@ test("web settings stage and save the maximum download size in MiB", async () =>
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download"),
+    rootSettingsRow("Web", "50 MiB max download · headless browser"),
     webSettingsRow("Maximum download", "50 MiB"),
     "Back",
     "Save changes",
@@ -721,7 +730,7 @@ test("Web approval choices stage, cancel, persist, and immediately notify the lo
   let currentLabel = "Ask";
   for (const [label, policy] of [["Automatically Accept", "automatically-accept"], ["Automatically Deny", "automatically-deny"], ["Ask", "ask"]]) {
     const choices = [
-      rootSettingsRow("Web", "50 MiB max download"),
+      rootSettingsRow("Web", "50 MiB max download · headless browser"),
       webSettingsRow("Browser interaction approval", currentLabel),
       label, "Back",
     ];
@@ -735,6 +744,49 @@ test("Web approval choices stage, cancel, persist, and immediately notify the lo
     currentLabel = label;
   }
   assert.deepEqual(savedPolicies, ["automatically-accept", "automatically-deny", "ask"]);
+});
+
+test("browser visibility stages, cancels, persists, and applies immediately through the local sync hook", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-visibility-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({ enabled: true, review: { activeReviewers: [] } }));
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  const savedValues: boolean[] = [];
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: (next) => { savedValues.push(next.web!.browserVisible); } });
+  const headlessRow = rootSettingsRow("Web", "50 MiB max download · headless browser");
+  const visibilityRow = webSettingsRow("Browser visibility", "Headless · no window (default)");
+
+  // Stage headed, then Cancel: nothing persists, nothing relaunches.
+  const before = await readFile(configPath, "utf8");
+  await registered.handler("", contextWithSelections([
+    headlessRow, visibilityRow, "Headed · visible browser window", "Back", "Cancel",
+  ]));
+  assert.equal(await readFile(configPath, "utf8"), before);
+  assert.equal(config.web!.browserVisible, false);
+  assert.deepEqual(savedValues, []);
+
+  // Stage headed again and save: persisted and delivered to onSaved, where
+  // the live-browser application happens.
+  await registered.handler("", contextWithSelections([
+    headlessRow, visibilityRow, "Headed · visible browser window", "Back", "Save changes",
+  ]));
+  assert.equal(config.web!.browserVisible, true);
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.web.browserVisible, true);
+  assert.deepEqual(savedValues, [true]);
+
+  // Saving again from the headed summary back to headless persists the
+  // reverse value through the same staged menu.
+  const headedRow = webSettingsRow("Browser visibility", "Headed · visible browser window");
+  const headedContext = contextWithSelections([
+    rootSettingsRow("Web", "50 MiB max download · headed browser"),
+    headedRow, "Headless · no window (default)", "Back", "Save changes",
+  ]);
+  await registered.handler("", headedContext);
+  assert.equal(config.web!.browserVisible, false);
+  assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")).web.browserVisible, false);
+  assert.deepEqual(savedValues, [true, false]);
 });
 
 test("/review-settings aligns every settings value column from the full label set", async () => {
@@ -760,7 +812,7 @@ test("/review-settings aligns every settings value column from the full label se
             rootRows = options.slice(0, ROOT_SETTING_LABELS.length);
             return rootSettingsRow("Retry policy", "2 retries · 1s base");
           }
-          if (rootSelection === 1) return rootSettingsRow("Web", "50 MiB max download");
+          if (rootSelection === 1) return rootSettingsRow("Web", "50 MiB max download · headless browser");
           return undefined;
         }
         if (title === "Executor retry policy") {
@@ -1586,7 +1638,7 @@ const RETRY_SETTING_LABELS = [
   "Delay jitter",
 ] as const;
 
-const WEB_SETTING_LABELS = ["Maximum download", "Browser interaction approval", "Browser idle expiry"] as const;
+const WEB_SETTING_LABELS = ["Maximum download", "Browser interaction approval", "Browser idle expiry", "Browser visibility"] as const;
 
 function rootSettingsRow(label: typeof ROOT_SETTING_LABELS[number], value: string): string {
   return alignedTestRow(label, value, ROOT_SETTING_LABELS);

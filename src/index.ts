@@ -78,7 +78,7 @@ const orchestratorBackgroundCompletionPrompt = [
 
 interface ActivationDependencies {
   /** Narrow injection seam used by lifecycle tests; production constructs it. */
-  webTools?: Pick<WebToolManager, "register" | "cleanup" | "sync">;
+  webTools?: Pick<WebToolManager, "register" | "cleanup" | "sync" | "applySavedSettings">;
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
@@ -1031,7 +1031,19 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     onSaved: async (_saved, previousMode, context) => {
       executionTools.sync();
       deferredTools.setDeferredEnabled(deferredPiToolsEnabled(config));
-      webTools?.sync(config);
+      // The saved web visibility applies to a live interactive browser
+      // immediately (controlled replacement); the callback awaits it so the
+      // outcome is visibly reported, never queued or silently postponed.
+      let visibilityNotice: string | undefined;
+      if (webTools) {
+        try {
+          visibilityNotice = await webTools.applySavedSettings(config) ?? undefined;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await sendNotice(pi, `review gate: browser visibility change failed — ${message.slice(0, 500)}; if the message above says the browser was left unchanged its handles remain valid, otherwise treat previous handles as stale and use BrowserOpen.`);
+        }
+      }
+      if (visibilityNotice) await sendNotice(pi, `review gate: ${visibilityNotice}`);
       await applyOperatingModeTransition(previousMode, context);
       // Reconcile existing review windows to the new reviewer selection
       // immediately. The swap replaces each window's frozen config object

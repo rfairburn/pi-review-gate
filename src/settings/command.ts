@@ -99,6 +99,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
   let browserInteractionApproval = input.config.web!.browserInteractionApproval ?? "ask";
   let browserIdleExpiryMinutes = input.config.web!.browserIdleExpiryMinutes ?? DEFAULT_CONFIG.web!.browserIdleExpiryMinutes;
+  let browserVisible = input.config.web!.browserVisible ?? DEFAULT_CONFIG.web!.browserVisible;
 
   while (true) {
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
@@ -120,7 +121,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ["Subtask notifications", subtaskNotifications === "quiet" ? "Quiet" : "Noisy"],
       ["Deferred Pi tools", `${deferredPiTools ? "On" : "Off"} · local now, new subtasks`],
       ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
-      ["Web", `${formatByteSize(webMaxDownloadBytes)} max download`],
+      ["Web", `${formatByteSize(webMaxDownloadBytes)} max download · ${browserVisible ? "headed browser" : "headless browser"}`],
     ]);
     const choice = await input.ui.select("Review settings", [
       modeRow,
@@ -275,8 +276,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       continue;
     }
     if (choice === webRow) {
-      ({ maxDownloadBytes: webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes } = await selectWebSettings(
-        input.ui, webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes,
+      ({ maxDownloadBytes: webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserVisible } = await selectWebSettings(
+        input.ui, webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserVisible,
       ));
       continue;
     }
@@ -305,6 +306,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       webMaxDownloadBytes,
       browserInteractionApproval,
       browserIdleExpiryMinutes,
+      browserVisible,
     });
     const previousMode = input.config.operatingMode;
     const previousModeCycleShortcut = input.config.modeCycleShortcut;
@@ -332,18 +334,21 @@ async function selectWebSettings(
   initialMaxDownloadBytes: number,
   initialApproval: BrowserInteractionApproval,
   initialIdleExpiryMinutes: number,
-): Promise<{ maxDownloadBytes: number; browserInteractionApproval: BrowserInteractionApproval; browserIdleExpiryMinutes: number }> {
+  initialVisible: boolean,
+): Promise<{ maxDownloadBytes: number; browserInteractionApproval: BrowserInteractionApproval; browserIdleExpiryMinutes: number; browserVisible: boolean }> {
   let maxDownloadBytes = initialMaxDownloadBytes;
   let browserInteractionApproval = initialApproval;
   let browserIdleExpiryMinutes = initialIdleExpiryMinutes;
+  let browserVisible = initialVisible;
   while (true) {
-    const [downloadRow, approvalRow, idleExpiryRow] = alignedSettingsRows([
+    const [downloadRow, approvalRow, idleExpiryRow, visibilityRow] = alignedSettingsRows([
       ["Maximum download", formatByteSize(maxDownloadBytes)],
       ["Browser interaction approval", BROWSER_APPROVAL_CHOICES[browserInteractionApproval]],
-      ["Browser idle expiry", `${browserIdleExpiryMinutes} minutes`],
+      ["Browser idle expiry", browserIdleExpiryMinutes === 0 ? "0 · idle close disabled" : `${browserIdleExpiryMinutes} minutes`],
+      ["Browser visibility", browserVisible ? "Headed · visible browser window" : "Headless · no window (default)"],
     ]);
-    const choice = await ui.select("Web settings", [downloadRow, approvalRow, idleExpiryRow, "Back"]);
-    if (!choice || choice === "Back") return { maxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes };
+    const choice = await ui.select("Web settings", [downloadRow, approvalRow, idleExpiryRow, visibilityRow, "Back"]);
+    if (!choice || choice === "Back") return { maxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserVisible };
     if (choice === approvalRow) {
       await notify(ui, "Only confirmation-required actions: Ask prompts (no UI rejects); Automatically Accept approves without UI; Automatically Deny rejects. Already-permitted observations/local actions stay permitted; hard safety and role restrictions remain. Saved changes apply locally now and to newly launched workers.", "info");
       const selected = await ui.select("Browser interaction approval", Object.values(BROWSER_APPROVAL_CHOICES));
@@ -351,16 +356,25 @@ async function selectWebSettings(
       if (entry) browserInteractionApproval = entry[0] as BrowserInteractionApproval;
       continue;
     }
+    if (choice === visibilityRow) {
+      await notify(ui, "Headless (default) keeps the QA browser without a window. Headed shows a real browser window with a native address bar. Saving a changed visibility applies it immediately to the live browser: the browser is replaced and its tabs, active page, and in-memory cookies/localStorage/IndexedDB are restored best-effort (never lossless; failures and redirects are reported). With no open browser it applies at the next BrowserOpen. The model's tools stay exactly the same either way.", "info");
+      const selected = await ui.select("Browser visibility", ["Headless · no window (default)", "Headed · visible browser window"]);
+      if (selected === "Headed · visible browser window") browserVisible = true;
+      else if (selected === "Headless · no window (default)") browserVisible = false;
+      continue;
+    }
     if (!ui.input) {
       await notify(ui, "This UI does not support numeric input.", "error");
       continue;
     }
     if (choice === idleExpiryRow) {
-      const entered = await ui.input("Browser idle expiry in minutes", String(browserIdleExpiryMinutes));
+      const entered = await ui.input("Browser idle expiry in minutes (0 disables idle close)", String(browserIdleExpiryMinutes));
       if (entered === undefined) continue;
-      const minutes = Number(entered.trim());
-      if (!Number.isSafeInteger(minutes) || minutes <= 0) {
-        await notify(ui, "Enter a positive safe whole number of minutes (at least 1); idle expiry cannot be disabled.", "error");
+      // Empty input must stay rejected: Number("") would otherwise stage 0.
+      const trimmed = entered.trim();
+      const minutes = trimmed.length === 0 ? NaN : Number(trimmed);
+      if (!Number.isSafeInteger(minutes) || minutes < 0) {
+        await notify(ui, "Enter 0 to disable idle close, or a positive safe whole number of minutes.", "error");
         continue;
       }
       browserIdleExpiryMinutes = minutes;

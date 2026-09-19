@@ -94,10 +94,13 @@ class FakeContext extends EventEmitter {
   async route(_pattern: string, _handler: (route: unknown) => Promise<void>) {}
   async newCDPSession(page: FakePage) {
     return {
+      sent: [] as Array<{ method: string }>,
       send: async (method: string) => {
         if (method === "Page.getNavigationHistory") return page.navigationHistory();
+        if (method === "Page.enable" || method === "Runtime.enable" || method === "Page.addScriptToEvaluateOnNewDocument") return {};
         throw new Error(`Unexpected internal protocol method ${method}`);
       },
+      on: () => undefined,
       detach: async () => undefined,
     };
   }

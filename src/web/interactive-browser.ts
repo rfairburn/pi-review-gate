@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { BROWSER_HUMAN_INPUT_WORLD, createHumanInputInitScript, HumanInputVerifier } from "./browser-human-input.js";
 import { BrowserIdleLease, validateIdleExpiryMinutes } from "./browser-idle-lifecycle.js";
 import { BrowserOwnershipError, browserCleanupDeadline, ownedBrowserQuiescent, prepareOwnedBrowser } from "./browser-owned-process";
 import {
@@ -157,6 +158,47 @@ export interface BrowserOpenResult {
   title: string;
   status: number;
   limits: Readonly<InteractiveBrowserLimits>;
+}
+
+/** Structural type of a captured Playwright storage-state object; values
+ * stay inside the manager and only counts are ever reported. */
+type CapturedStorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
+
+/** One intended tab of a visibility replacement, in original capture order. */
+export interface BrowserVisibilityTabOutcome {
+  /** Recorded source URL captured before the old context closed. */
+  requestedUrl: string;
+  /** Actual URL after the restore navigation; null when the tab was not restored. */
+  finalUrl: string | null;
+  restored: boolean;
+  /** True only for the tab restored as the replacement's active tab. */
+  active?: boolean;
+  /** Fixed bounded reason when not restored, redirected away, or demoted from active. */
+  reason?: string;
+}
+
+/** Structured outcome of a settings-driven browser visibility replacement.
+ * State counts only: cookie/localStorage values never leave the manager. */
+export interface BrowserVisibilityResult {
+  previousSession: string;
+  /** New session handle; the unchanged session handle when the browser was
+   * left in its current mode because no tab was restorable. */
+  session: string | null;
+  activeTab: string | null;
+  headless: boolean;
+  relaunched: boolean;
+  tabs: BrowserVisibilityTabOutcome[];
+  restoredTabs: number;
+  unrestoredTabs: number;
+  /** Restored tabs whose final URL differs from the requested URL. */
+  urlMismatches: number;
+  stateReapplied: boolean;
+  /** Count-only state metadata; null when no state was captured. */
+  stateCookies: number | null;
+  stateOrigins: number | null;
+  /** Context pages that could not be owned/restored (beyond the tab cap). */
+  overflowPopups: number;
+  notes: string[];
 }
 
 export interface BrowserNavigateResult {
@@ -401,7 +443,7 @@ export type BrowserInteractionConfirmation = (request: BrowserInteractionConfirm
 export type BrowserClickConfirmation = BrowserInteractionConfirmation;
 
 export interface BrowserClosureReason {
-  kind: "explicit_close" | "session_shutdown" | "fatal_error" | "idle_expiry";
+  kind: "explicit_close" | "session_shutdown" | "fatal_error" | "idle_expiry" | "visibility_reconfigure";
   message: string;
 }
 
@@ -526,6 +568,29 @@ interface OpeningOperation {
   teardownFailure?: Error;
 }
 
+/** Internal launch plan: a plain BrowserOpen or a settings-driven visibility replacement. */
+type SessionLaunchPlan =
+  | { kind: "open"; url: string; headless: boolean }
+  | { kind: "visibility"; headless: boolean; restore: VisibilityRestorePlan };
+
+/** Memory-only restoration plan for a visibility replacement. Cookie and
+ * localStorage values stay inside the manager; only counts are reported. */
+interface VisibilityRestorePlan {
+  previousSession: string;
+  storageState?: CapturedStorageState;
+  /** One row per intended tab (including unrestorable pages), in original order. */
+  outcomes: BrowserVisibilityTabOutcome[];
+  /** Indices into `outcomes` to restore, in order, with validated hrefs. */
+  restoreOrder: Array<{ index: number; href: string }>;
+  /** Index into `outcomes` of the intended active tab; -1 when unknown. */
+  intendedActiveIndex: number;
+  overflowPopups: number;
+  stateReapplied: boolean;
+  stateCookies: number | null;
+  stateOrigins: number | null;
+  notes: string[];
+}
+
 interface ActiveBrowserOperation {
   session: Session;
   controller: AbortController;
@@ -555,6 +620,8 @@ interface BrowserTab {
   documentRequestPending: boolean;
   closing: boolean;
   diagnosticsActive: boolean;
+  /** Per-tab CDP session carrying the isolated-world human-input detector. */
+  humanInputCdp?: CDPSession;
   consoleDiagnostics: DiagnosticRing<BrowserConsoleEvent>;
   networkDiagnostics: DiagnosticRing<BrowserNetworkEvent>;
   networkStartedAt: WeakMap<Request, number>;
@@ -593,6 +660,10 @@ interface Session {
   interactionCapture?: InteractionCapture;
   fatalError?: Error;
   teardown?: Promise<BrowserCloseResult>;
+  /** Window mode this session was launched with; drives visibility idempotence. */
+  visible: boolean;
+  /** Authenticates human-input renewal signals from the isolated world. */
+  humanInputVerifier?: HumanInputVerifier;
 }
 
 const MAX_TOMBSTONES = 32;
@@ -601,8 +672,9 @@ const SAFE_LOCAL_PROTOCOLS = new Set(["about:", "blob:", "data:"]);
 /** Fixed manager-owned cancellation reasons; never caller-controlled text. */
 const BROWSER_CLOSE_CANCEL_REASON = "Browser operation cancelled by BrowserClose.";
 const SESSION_SHUTDOWN_CANCEL_REASON = "Browser operation cancelled by Pi session shutdown/replacement/reload.";
+const VISIBILITY_CANCEL_REASON = "Browser operation cancelled by a browser visibility settings change; the browser is being replaced.";
 
-type BrowserCancellationKind = "close" | "shutdown" | "caller";
+type BrowserCancellationKind = "close" | "shutdown" | "caller" | "visibility";
 
 type DiagnosticEvent = { sequence: number; textTruncated?: boolean };
 
@@ -769,6 +841,8 @@ export class InteractiveBrowserManager {
   private readonly consequencePolicy: BrowserConsequencePolicy;
   private readonly confirmationPermits: BrowserConfirmationPermits;
   private interactionApproval: BrowserInteractionApproval = "ask";
+  /** Window mode for the next launch; the running session records its own mode. */
+  private browserVisible = false;
   readonly limits: Readonly<InteractiveBrowserLimits>;
 
   constructor(
@@ -803,11 +877,12 @@ export class InteractiveBrowserManager {
     });
   }
 
-  updateConfig(config: WebFetchConfig, interactionApproval: BrowserInteractionApproval = "ask", idleExpiryMinutes: number = 15): void {
+  updateConfig(config: WebFetchConfig, interactionApproval: BrowserInteractionApproval = "ask", idleExpiryMinutes: number = 15, browserVisible: boolean = false): void {
     validateIdleExpiryMinutes(idleExpiryMinutes);
     this.config = config;
     this.interactionApproval = interactionApproval;
     this.idleExpiryMinutes = idleExpiryMinutes;
+    this.browserVisible = browserVisible;
     for (const lease of this.idleLeases.values()) lease.update(idleExpiryMinutes);
   }
 
@@ -831,6 +906,12 @@ export class InteractiveBrowserManager {
   }
 
   async open(url: string, signal?: AbortSignal): Promise<BrowserOpenResult> {
+    const result = await this.launchSession({ kind: "open", url, headless: !this.browserVisible }, signal);
+    // launchSession returns only BrowserOpenResult for an open plan.
+    return result as BrowserOpenResult;
+  }
+
+  async launchSession(plan: SessionLaunchPlan, signal?: AbortSignal): Promise<BrowserOpenResult | BrowserVisibilityResult> {
     this.assertAcceptingOperations();
     const existing = this.sessions.values().next().value as Session | undefined;
     if (existing) {
@@ -855,7 +936,7 @@ export class InteractiveBrowserManager {
     };
     this.openings.add(opening);
     const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-    const operation = new OperationDeadline("BrowserOpen", this.limits.navigationMs, operationSignal);
+    const operation = new OperationDeadline(plan.kind === "open" ? "BrowserOpen" : "BrowserVisibility", this.limits.navigationMs, operationSignal);
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
     let broker: EgressBroker | undefined;
@@ -869,7 +950,11 @@ export class InteractiveBrowserManager {
     try {
       // This is a no-dial preflight. The broker independently validates and
       // pins the actual browser request before opening its destination socket.
-      const requested = await operation.run(validateNavigationUrl(url, this.resolveHostname), "URL validation");
+      // A visibility replacement was already validated per tab before the old
+      // browser closed, so no upfront URL validation happens here.
+      const requested = plan.kind === "open"
+        ? await operation.run(validateNavigationUrl(plan.url, this.resolveHostname), "URL validation")
+        : undefined;
       stage = "chromium_startup";
       assertChromiumAvailable();
       const auth = {
@@ -908,7 +993,7 @@ export class InteractiveBrowserManager {
       const port = await operation.run(broker.start(), "egress broker startup");
       stage = "chromium_startup";
       launchPromise = this.launch({
-        headless: true,
+        headless: plan.headless,
         timeout: operation.remainingMs(),
         args: interactiveChromiumArgs(port),
         proxy: { server: `http://127.0.0.1:${port}`, username: auth.username, password: auth.password },
@@ -923,6 +1008,9 @@ export class InteractiveBrowserManager {
         serviceWorkers: "block",
         permissions: [],
         userAgent: this.config.userAgent,
+        // Memory-only session state replay for a visibility replacement: the
+        // captured object never touches disk and dies with this process.
+        ...(plan.kind === "visibility" && plan.restore.storageState ? { storageState: plan.restore.storageState } : {}),
       });
       context = await operation.run(contextPromise, "browser context creation");
       context.setDefaultTimeout(this.limits.actionMs);
@@ -931,6 +1019,12 @@ export class InteractiveBrowserManager {
       await operation.run(installRoutePolicy(context, broker, (request, reason) => {
         if (pendingSession) this.recordNetworkPolicy(pendingSession, request, reason);
       }), "network route policy installation");
+
+      // Detectable genuine human input renews the idle lease (issue #22):
+      // each tab gets a browser-owned isolated-world detector whose trusted
+      // pointer/key/wheel signals are HMAC-authenticated manager-side. See
+      // browser-human-input.ts.
+      const humanInputVerifier = new HumanInputVerifier(randomBytes(32).toString("hex"));
 
       const page = await operation.run(context.newPage(), "browser tab creation");
       const primaryTab: BrowserTab = {
@@ -965,6 +1059,8 @@ export class InteractiveBrowserManager {
         actions: 0,
         mainDocumentRequests: 0,
         operationActive: true,
+        visible: !plan.headless,
+        humanInputVerifier,
       };
       pendingSession = session;
       pendingFatal = (error) => this.failSession(session, error);
@@ -992,12 +1088,17 @@ export class InteractiveBrowserManager {
       this.startIdleLease(session);
       resourcesTransferredToSession = true;
       try {
-        const navigation = await this.navigateSession(session, primaryTab, requested.href, operation, true, () => {
+        if (plan.kind === "open") {
+          const navigation = await this.navigateSession(session, primaryTab, requested!.href, operation, true, () => {
+            navigationDispatched = true;
+          });
+          session.operationActive = false;
+          this.renewIdleLease(session);
+          return this.protectOutput({ ...navigation, limits: this.limits });
+        }
+        return await this.restoreVisibilityTabs(session, primaryTab, plan.restore, operationSignal, () => {
           navigationDispatched = true;
         });
-        session.operationActive = false;
-        this.renewIdleLease(session);
-        return this.protectOutput({ ...navigation, limits: this.limits });
       } catch (error) {
         session.operationActive = false;
         try {
@@ -2158,6 +2259,319 @@ export class InteractiveBrowserManager {
   }
 
   /**
+   * Settings-driven immediate visibility switch (issue #22). Playwright pins
+   * the window mode at launch (separate headless-shell and headed binaries),
+   * so applying a saved visibility change to a live browser means a controlled
+   * close/reopen through the ordinary ownership path: ordered intended tabs,
+   * the active page, and the memory-only session state are restored
+   * best-effort and every loss or redirect is reported. Returns null when no
+   * live browser exists (the preference applies at the next open) or when the
+   * requested mode already matches (idempotent, no restart).
+   */
+  async applyVisibility(visible: boolean): Promise<BrowserVisibilityResult | null> {
+    this.assertAcceptingOperations();
+    if (this.opening > 0 || this.openings.size > 0) {
+      // Serialize behind an in-flight BrowserOpen instead of replacing it;
+      // a bounded wait that does not settle is reported, never silently queued.
+      try {
+        await boundedCleanup(
+          Promise.all([...this.openings].map((opening) => opening.settled)),
+          this.limits.navigationMs + this.limits.cleanupMs,
+          "browser visibility change waiting for in-flight BrowserOpen",
+        );
+      } catch (error) {
+        throw new Error(`Browser visibility change not applied: BrowserOpen is still in flight (${bounded(asError(error).message, 200)}); retry after it completes.`);
+      }
+    }
+    const existing = this.sessions.values().next().value as Session | undefined;
+    if (!existing) return null; // No live browser: the preference applies at the next open.
+    if (existing.visible === visible) return null; // Same mode: idempotent, no restart.
+
+    // Serialize behind in-flight browser operations: wait for them to settle
+    // (bounded) instead of tearing the session down underneath them. Only if
+    // they overrun the bound are they cancelled, and a cancellation that
+    // closed the browser is reported truthfully instead of replaced blindly.
+    const operations = [...this.activeOperations].filter((operation) => operation.session === existing);
+    if (operations.length > 0) {
+      try {
+        await boundedCleanup(
+          Promise.all(operations.map((operation) => operation.settled)),
+          this.limits.navigationMs + this.limits.actionMs + this.limits.cleanupMs,
+          "browser visibility change waiting for in-flight browser operations",
+        );
+      } catch (waitError) {
+        for (const operation of operations) operation.controller.abort(new Error(VISIBILITY_CANCEL_REASON));
+        await Promise.allSettled(operations.map((operation) => operation.settled));
+        this.assertAcceptingOperations();
+        if (!this.sessions.has(existing.handle) || existing.teardown || existing.fatalError) {
+          throw new Error("Browser visibility change not applied: in-flight browser operations could not settle in bounded time and their cancellation closed the browser; the saved preference applies at the next BrowserOpen.");
+        }
+        throw new Error(`Browser visibility change not applied: in-flight browser operations did not settle in bounded time (${bounded(asError(waitError).message, 200)}).`);
+      }
+    }
+    this.assertAcceptingOperations();
+    this.assertUsable(existing);
+
+    const notes: string[] = [];
+    const outcomes: BrowserVisibilityTabOutcome[] = [];
+    const intended: Array<{ index: number; rawUrl: string; tabHandle: string }> = [];
+    let intendedActiveIndex = -1;
+    let overflowPopups = 0;
+    let storageState: CapturedStorageState | undefined;
+    let stateCookies: number | null = null;
+    let stateOrigins: number | null = null;
+    const restoreOrder: Array<{ index: number; href: string }> = [];
+
+    // Hold the session's busy lock across capture and validation so a browser
+    // operation that arrives during the replacement window is rejected as
+    // busy up front instead of starting against a session that is about to be
+    // closed. Released before beginTeardown below, which publishes
+    // session.teardown synchronously and rejects later operations anyway; the
+    // try/finally guarantees the lock is never stranded on an unexpected throw.
+    existing.operationActive = true;
+    try {
+      const captureDeadline = new OperationDeadline("BrowserVisibility capture", this.limits.navigationMs);
+      try {
+        // Enumerate the ACTUAL context pages, including human-opened popups.
+        // Pages without owned-tab membership were contained at the tab cap and
+        // are reported, never silently dropped.
+        for (const page of existing.context.pages()) {
+          const tab = this.tabForPage(existing, page);
+          const reportedUrl = boundedVisibilityUrl(page.url());
+          if (!tab) {
+            overflowPopups += 1;
+            outcomes.push({ requestedUrl: reportedUrl, finalUrl: null, restored: false, reason: "context page beyond the owned-tab limit; it was contained and cannot be restored" });
+            continue;
+          }
+          intended.push({ index: outcomes.length, rawUrl: page.url(), tabHandle: tab.handle });
+          outcomes.push({ requestedUrl: reportedUrl, finalUrl: null, restored: false });
+        }
+        // Human-selected tab awareness (best effort): in a real window exactly
+        // one tab reports document.visibilityState === "visible" — the one the
+        // human is actually looking at. When that differs from the model's
+        // recorded active tab, the foregrounded tab is restored as active so a
+        // follow-up model operation acts on the real current page. Unobservable
+        // states (headless, multiple, read failure) fall back to the recorded
+        // active tab.
+        const foreground: string[] = [];
+        for (const tab of existing.tabs.values()) {
+          if (tab.page.isClosed()) continue;
+          try {
+            const state = await boundedCleanup(
+              tab.page.evaluate(() => document.visibilityState),
+              Math.min(1_000, this.limits.actionMs),
+              "foreground tab detection",
+            );
+            if (state === "visible") foreground.push(tab.handle);
+          } catch {
+            // Foreground state unobservable for this tab; recorded active stays the fallback.
+          }
+        }
+        let intendedHandle = existing.activeTab;
+        if (foreground.length === 1 && foreground[0] !== existing.activeTab) {
+          intendedHandle = foreground[0];
+          notes.push("The tab currently foregrounded in the browser window differs from the model's recorded active tab; the foregrounded tab is restored as active.");
+        }
+        intendedActiveIndex = intended.findIndex((entry) => entry.tabHandle === intendedHandle);
+        // Capture the session state object in memory only: cookies, localStorage,
+        // and IndexedDB ride back into the replacement context as a plain object.
+        // IndexedDB is captured explicitly (pinned Playwright omits it by default)
+        // because IndexedDB-backed sessions are common. Nothing is written to
+        // disk and values never leave the manager; only counts are reported.
+        // This is best-effort, never lossless.
+        try {
+          storageState = await captureDeadline.run(existing.context.storageState({ indexedDB: true }), "browser state capture");
+          stateCookies = storageState.cookies.length;
+          stateOrigins = storageState.origins.length;
+        } catch (error) {
+          notes.push(`Session state capture failed (${bounded(asError(error).message, 200)}); the replacement restores tabs without stored cookies/localStorage.`);
+        }
+      } finally {
+        captureDeadline.dispose();
+      }
+
+      // Validate every intended URL against the same public-URL egress policy
+      // BEFORE closing, so a browser whose tabs are all unrestorable is left
+      // intact instead of being destroyed for an empty replacement.
+      const validationDeadline = new OperationDeadline("BrowserVisibility URL validation", this.limits.navigationMs);
+      try {
+        for (const entry of intended) {
+          try {
+            const validated = await validationDeadline.run(validateNavigationUrl(entry.rawUrl, this.resolveHostname), "URL validation");
+            restoreOrder.push({ index: entry.index, href: validated.href });
+          } catch (error) {
+            outcomes[entry.index]!.reason = `recorded URL no longer passes the public-URL egress policy (${bounded(asError(error).message, 200)}); the intended tab is preserved here but cannot be restored`;
+          }
+        }
+      } finally {
+        validationDeadline.dispose();
+      }
+    } finally {
+      existing.operationActive = false;
+    }
+
+    if (restoreOrder.length === 0) {
+      notes.push("No recorded tab URL passes the public-URL egress policy, so the browser was left unchanged in its current mode; use BrowserTabs/BrowserNavigate to reach restorable pages, or BrowserClose and BrowserOpen.");
+      return {
+        previousSession: existing.handle,
+        session: existing.handle,
+        activeTab: existing.activeTab,
+        headless: !existing.visible,
+        relaunched: false,
+        tabs: outcomes,
+        restoredTabs: 0,
+        unrestoredTabs: outcomes.length,
+        urlMismatches: 0,
+        stateReapplied: false,
+        stateCookies,
+        stateOrigins,
+        overflowPopups,
+        notes,
+      };
+    }
+
+    // Close the old browser with a truthful closure reason, then relaunch
+    // through the ordinary ownership path: fresh per-session broker
+    // credentials, no persistent profile, no remote-control port.
+    await this.beginTeardown(existing, undefined, {
+      kind: "visibility_reconfigure",
+      message: `Browser visibility settings change: replaced with a ${visible ? "headed" : "headless"} browser.`,
+    });
+
+    const restore: VisibilityRestorePlan = {
+      previousSession: existing.handle,
+      storageState,
+      outcomes,
+      restoreOrder,
+      intendedActiveIndex,
+      overflowPopups,
+      stateReapplied: storageState !== undefined,
+      stateCookies,
+      stateOrigins,
+      notes,
+    };
+    return await this.launchSession({ kind: "visibility", headless: !visible, restore }) as BrowserVisibilityResult;
+  }
+
+  /** Restore the validated ordered tabs of a visibility replacement into a
+   * freshly launched session, recording requested/final URLs and failures
+   * per tab. Per-tab failures never abort the relaunch unless the session
+   * itself became fatal. */
+  private async restoreVisibilityTabs(
+    session: Session,
+    primaryTab: BrowserTab,
+    restore: VisibilityRestorePlan,
+    operationSignal: AbortSignal,
+    onDispatch?: () => void,
+  ): Promise<BrowserVisibilityResult> {
+    const restoredHandles = new Map<number, string>();
+    let primaryUsed = false;
+    for (const entry of restore.restoreOrder) {
+      const outcome = restore.outcomes[entry.index]!;
+      const deadline = new OperationDeadline("BrowserVisibility restore", this.limits.navigationMs, operationSignal);
+      let tab: BrowserTab | undefined;
+      try {
+        if (!primaryUsed) {
+          tab = primaryTab;
+          primaryUsed = true;
+        } else {
+          const creation = session.context.newPage();
+          let page: Page;
+          try {
+            page = await deadline.run(creation, "browser tab creation");
+          } catch (error) {
+            this.trackLatePageCreation(session, creation, "late visibility restore page creation");
+            throw asError(error);
+          }
+          const adopted = this.tabForPage(session, page) ?? this.adoptPage(session, page, false);
+          if (!adopted) {
+            await this.containRefusedPage(session, page, "refused visibility restore page");
+            throw new Error("visibility restore tab could not be owned within the session tab limit.");
+          }
+          tab = adopted;
+        }
+        const navigation = await this.navigateSession(session, tab, entry.href, deadline, tab === primaryTab, onDispatch);
+        outcome.restored = true;
+        outcome.finalUrl = navigation.url;
+        restoredHandles.set(entry.index, tab.handle);
+      } catch (error) {
+        const failure = asError(error);
+        outcome.restored = false;
+        outcome.finalUrl = optionalPublicPageUrl(tab?.page.url());
+        outcome.reason = bounded(failure.message, 300);
+        // A session-fatal failure (broker refusal, process loss) aborts the
+        // relaunch truthfully through the ordinary open failure path. An
+        // aborted opening signal (Pi shutdown/reload mid-restore) is equally
+        // fatal for the restore: it must surface as the structured open
+        // cancellation, never as a successful immediate switch.
+        if (session.fatalError || operationSignal.aborted) throw failure;
+      } finally {
+        deadline.dispose();
+      }
+    }
+
+    // Active tab: the intended one when it was restored, otherwise the last
+    // successfully restored tab, disclosed when that differs.
+    const intendedActive = restore.intendedActiveIndex >= 0 ? restore.outcomes[restore.intendedActiveIndex] : undefined;
+    let activeIndex = -1;
+    if (intendedActive?.restored && restoredHandles.has(restore.intendedActiveIndex)) {
+      activeIndex = restore.intendedActiveIndex;
+    } else {
+      for (const entry of restore.restoreOrder) {
+        if (restore.outcomes[entry.index]!.restored) activeIndex = entry.index;
+      }
+    }
+    if (activeIndex >= 0) {
+      const activeHandle = restoredHandles.get(activeIndex)!;
+      session.activeTab = activeHandle;
+      restore.outcomes[activeIndex]!.active = true;
+      // Best-effort foreground: in a headed window this makes the restored
+      // active tab the tab the human sees. Bounded and non-fatal.
+      try {
+        await boundedCleanup(session.tabs.get(activeHandle)!.page.bringToFront(), this.limits.actionMs, "active tab foreground");
+      } catch (error) {
+        restore.notes.push(`Restored active tab could not be brought to the foreground: ${bounded(asError(error).message, 200)}.`);
+      }
+    } else if (intendedActive && !intendedActive.restored) {
+      intendedActive.reason ??= "intended active tab could not be restored";
+      restore.notes.push("The intended active tab could not be restored; the last successfully restored tab is active.");
+    }
+
+    const restoredTabs = restore.outcomes.filter((outcome) => outcome.restored).length;
+    let urlMismatches = 0;
+    for (const entry of restore.restoreOrder) {
+      const outcome = restore.outcomes[entry.index]!;
+      if (!outcome.restored) continue;
+      const expectedUrl = optionalPublicPageUrl(entry.href) ?? entry.href;
+      if (outcome.finalUrl !== expectedUrl) {
+        urlMismatches += 1;
+        outcome.reason = "restored to a different final URL than requested; the server redirected the page (session-state loss or a site redirect) — the requested URL is recorded above";
+      }
+    }
+    if (urlMismatches > 0) {
+      restore.notes.push(`${urlMismatches} restored tab(s) ended at a different URL than requested; memory-only session state is best-effort and any resulting redirect is disclosed per tab.`);
+    }
+    session.operationActive = false;
+    this.renewIdleLease(session);
+    return this.protectOutput({
+      previousSession: restore.previousSession,
+      session: session.handle,
+      activeTab: session.activeTab,
+      headless: !session.visible,
+      relaunched: true,
+      tabs: restore.outcomes,
+      restoredTabs,
+      unrestoredTabs: restore.outcomes.length - restoredTabs,
+      urlMismatches,
+      stateReapplied: restore.stateReapplied,
+      stateCookies: restore.stateCookies,
+      stateOrigins: restore.stateOrigins,
+      overflowPopups: restore.overflowPopups,
+      notes: restore.notes,
+    });
+  }
+
+  /**
    * Abort and drain every operation which could still acquire browser-owned
    * resources, then tear down and independently verify every known session.
    * Terminal cleanup only: never called at turn or review boundaries. Any
@@ -2313,7 +2727,19 @@ export class InteractiveBrowserManager {
    * resolves, this tab's WebSockets fall through to the context backstop
    * (fail closed), never to an unvalidated direct connection.
    */
-  private installPageGuards(session: Session, tab: BrowserTab): Promise<void> {
+  private async installPageGuards(session: Session, tab: BrowserTab): Promise<void> {
+    // Detectable genuine human input renewal (issue #22), best-effort: a
+    // browser-owned isolated world reports browser-trusted pointer/key/wheel
+    // input as HMAC-authenticated console debug signals that only this
+    // manager's verifier accepts. Page script cannot reach that world, patch
+    // isTrusted/Date/typed arrays there, or mint tokens. If installation
+    // fails the lease simply expires normally (fail-closed); out-of-process
+    // iframes are separate CDP targets and are not covered.
+    try {
+      await this.installHumanInputBridge(session, tab);
+    } catch (error) {
+      this.recordBridgeInstallNote(session, error);
+    }
     tab.page.on("request", (request: Request) => {
       this.recordNetworkRequest(session, tab, request);
       if (session.interactionCapture) {
@@ -2388,6 +2814,33 @@ export class InteractiveBrowserManager {
       if (session.activeTab === tab.handle) session.activeTab = session.tabs.keys().next().value!;
     });
     return webSocketRoute;
+  }
+
+  /** Per-tab human-input renewal bridge: a browser-owned isolated world
+   * (inaccessible to page script) reports browser-trusted input as console
+   * debug payloads on this tab's own CDP session; the session verifier alone
+   * decides renewal. */
+  private async installHumanInputBridge(session: Session, tab: BrowserTab): Promise<void> {
+    const verifier = session.humanInputVerifier;
+    if (!verifier || tab.humanInputCdp) return;
+    const cdp = await session.context.newCDPSession(tab.page);
+    tab.humanInputCdp = cdp;
+    await cdp.send("Page.enable");
+    await cdp.send("Runtime.enable");
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+      worldName: BROWSER_HUMAN_INPUT_WORLD,
+      source: createHumanInputInitScript(verifier.secret),
+    });
+    cdp.on("Runtime.consoleAPICalled", (payload: { type?: string; args?: Array<{ value?: unknown }> }) => {
+      if (session.teardown || session.fatalError) return;
+      if (payload?.type !== "debug" || payload.args?.length !== 1) return;
+      if (!verifier.accept(payload.args[0]?.value)) return;
+      this.renewIdleLease(session);
+    });
+  }
+
+  private recordBridgeInstallNote(session: Session, error: unknown): void {
+    session.broker.note(`human input renewal bridge unavailable: ${bounded(asError(error).message, 200)}`);
   }
 
   private recordConsoleMessage(session: Session, tab: BrowserTab, message: ConsoleMessage): void {
@@ -2776,15 +3229,17 @@ export class InteractiveBrowserManager {
     }
   }
 
-  private beginTeardown(session: Session, cause?: Error): Promise<BrowserCloseResult> {
+  private beginTeardown(session: Session, cause?: Error, closureOverride?: BrowserClosureReason): Promise<BrowserCloseResult> {
     if (session.teardown) return session.teardown;
     this.idleLeases.get(session)?.stop();
     this.idleLeases.delete(session);
-    const closure: BrowserClosureReason = session.fatalError
-      ? { kind: session.fatalError instanceof BrowserIdleExpiredError ? "idle_expiry" : "fatal_error", message: bounded(session.fatalError.message, 500) }
-      : cause
-        ? { kind: "session_shutdown", message: "Pi session shutdown, replacement, or reload." }
-        : { kind: "explicit_close", message: "BrowserClose was called." };
+    const closure: BrowserClosureReason = closureOverride
+      ? closureOverride
+      : session.fatalError
+        ? { kind: session.fatalError instanceof BrowserIdleExpiredError ? "idle_expiry" : "fatal_error", message: bounded(session.fatalError.message, 500) }
+        : cause
+          ? { kind: "session_shutdown", message: "Pi session shutdown, replacement, or reload." }
+          : { kind: "explicit_close", message: "BrowserClose was called." };
     for (const tab of session.tabs.values()) this.clearTabDiagnostics(tab);
     // Publish the in-progress promise before invoking any Playwright close.
     // Browser/page close events may fire synchronously and must observe this
@@ -3255,6 +3710,23 @@ async function cleanupSession(session: Session, deadlineMs: number): Promise<Egr
   const pendingContainments = [...session.pendingPageClosures.values()];
   const pendingCreations = [...session.pendingPageCreations];
   for (const tab of session.tabs.values()) tab.closing = true;
+  // Detach every per-tab human-input bridge session BEFORE the close batch: an
+  // attached, Runtime-enabled DevTools session can delay Chromium's renderer
+  // exit, so the detach must complete before the browser close is requested.
+  // A hung detach is bounded and never fails the whole cleanup (the browser
+  // close below still tears the connection down); this only ever fails toward
+  // less renewal, never toward spoofing.
+  for (const cdp of [...session.tabs.values()].map((tab) => tab.humanInputCdp)) {
+    if (!cdp) continue;
+    try {
+      await boundedCleanup(cdp.detach().catch(() => undefined), deadlineMs, "human input bridge detach");
+    } catch {
+      // A bounded detach failure must not fail the whole session cleanup: the
+      // browser close below still tears the underlying connection down, and
+      // the only consequence is that this tab stops renewing from human input
+      // (fail-closed toward less renewal, never toward spoofing).
+    }
+  }
   const pageCloses = pages.map((page) => boundedCleanup(
     page.isClosed() ? Promise.resolve() : page.close({ runBeforeUnload: false }),
     deadlineMs,
@@ -3906,6 +4378,20 @@ function safePublicPageUrl(rawUrl: string): string {
   catch { return "[navigation pending]"; }
 }
 
+/** Reported requested URL for a visibility replacement: public URLs bounded
+ * as usual; non-public actual page URLs (about:blank, file://) are reported
+ * bounded as-is so the intended tab information is never silently dropped. */
+function boundedVisibilityUrl(rawUrl: string): string {
+  try { return publicPageUrl(rawUrl); }
+  catch { return bounded(rawUrl, 2_048); }
+}
+
+function optionalPublicPageUrl(rawUrl: string | undefined): string | null {
+  if (!rawUrl) return null;
+  try { return publicPageUrl(rawUrl); }
+  catch { return null; }
+}
+
 function publicPageUrl(rawUrl: string): string {
   let url: URL;
   try { url = new URL(rawUrl); } catch { throw new Error("Browser ended at an invalid URL."); }
@@ -3962,7 +4448,8 @@ function duplicateOpenError(existing: Session): BrowserRecoveryError {
 function openCancellationError(cancellation: BrowserCancellationKind, dispatched: boolean): BrowserRecoveryError {
   const by = cancellation === "shutdown"
     ? " by Pi session shutdown/replacement/reload"
-    : cancellation === "close" ? " by BrowserClose" : "";
+    : cancellation === "close" ? " by BrowserClose"
+    : cancellation === "visibility" ? " by a browser visibility settings change" : "";
   if (!dispatched) {
     return new BrowserRecoveryError(
       `BrowserOpen was cancelled${by} before navigation dispatch; no page effects occurred and cleanup was confirmed. It is safe to retry BrowserOpen.`,
@@ -4040,6 +4527,15 @@ function operationCancellationError(cancellation: BrowserCancellationKind, phase
   const by = cancellation === "close"
     ? " by BrowserClose"
     : cancellation === "shutdown" ? " by Pi session shutdown/replacement/reload" : "";
+  if (cancellation === "visibility") {
+    const effect = phase === "not_started"
+      ? "No page effects occurred."
+      : "Page or network effects may have occurred, effect status is unknown, and no rollback is claimed.";
+    return new BrowserRecoveryError(
+      `Browser operation was cancelled by a browser visibility settings change; the live browser is being replaced and every old session/tab/ref handle is invalidated. ${effect} A replacement browser with new handles is issued by the settings save when restoration succeeds; otherwise use BrowserOpen.`,
+      { kind: "cancelled", phase, cleanup: "confirmed", recovery: "reopen" },
+    );
+  }
   if (phase === "not_started") {
     return new BrowserRecoveryError(
       `Browser operation was cancelled${by} before dispatch; effect status is not_started and no page effects occurred. Session teardown was confirmed; use BrowserOpen to start a new browser session.`,
@@ -4348,6 +4844,7 @@ function cancellationKind(signal: AbortSignal): BrowserCancellationKind | undefi
   const reasonMessage = signal.reason instanceof Error ? signal.reason.message : "";
   if (reasonMessage === BROWSER_CLOSE_CANCEL_REASON) return "close";
   if (reasonMessage === SESSION_SHUTDOWN_CANCEL_REASON) return "shutdown";
+  if (reasonMessage === VISIBILITY_CANCEL_REASON) return "visibility";
   return "caller";
 }
 

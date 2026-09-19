@@ -251,6 +251,7 @@ defaults to `true`. The default retry policy is
   "web": {
     "enabled": true,
     "browserInteractionApproval": "ask",
+    "browserVisible": false,
     "browserIdleExpiryMinutes": 15,
     "search": { "provider": "ddgs", "timeoutMs": 20000, "maxResults": 10 },
     "fetch": {
@@ -265,14 +266,36 @@ defaults to `true`. The default retry policy is
 }
 ```
 
-`web.browserIdleExpiryMinutes` is a positive safe integer number of minutes
+`web.browserIdleExpiryMinutes` is a non-negative safe integer number of minutes
 (default **15**). Edit it through `/review-settings` → **Web** → **Browser idle
-expiry**, then **Save changes**. Zero, fractions, and nonfinite values are rejected;
-there is no disabled option. The browser lifecycle contract is renewed by browser-tool
-activity, not background page requests, scripts, or WebSockets, and does not expire
-during an active browser operation. Both initial tool registration and live settings
-updates apply this persisted value to the managed browser. Expired handles explicitly
-require `BrowserOpen`; no lost state is silently recreated.
+expiry**, then **Save changes**. **0 disables idle close**: the session never closes
+for inactivity and stays open until an explicit `BrowserClose`, shutdown, replacement,
+or unrecoverable failure. Fractions, negative, and nonfinite values are rejected.
+The browser lifecycle contract is renewed by browser-tool activity and by detectable
+genuine human input in the live page (browser-trusted pointer presses, keyboard input,
+and wheel scrolling, authenticated so page script cannot forge it), not by background
+page requests, scripts, or WebSockets, and does not expire during an active browser
+operation. For hands-on human use of a visible browser, prefer setting the timeout to
+`0` so it cannot disappear mid-interaction. Both initial tool registration and live
+settings updates apply this persisted value to the managed browser in both directions
+(timed ↔ disabled). Expired handles explicitly require `BrowserOpen`; no lost state is
+silently recreated.
+
+`web.browserVisible` is a boolean (default **false**). Edit it through
+`/review-settings` → **Web** → **Browser visibility**, then **Save changes**. **false**
+keeps the default headless QA browser (no window); **true** launches the interactive
+browser headed — a real browser window with a native address bar the human can use
+directly. The model's tool set and exposure are identical in both modes; there is no
+model-facing visibility control, no persistent profile, and no remote-control port in
+either mode. Saving a changed value applies it immediately to the live browser through
+a controlled close/reopen replacement (tabs, active page, and memory-only session
+state restored best-effort with truthful loss/redirect reporting; the model-facing
+handles are replaced and the old ones are rejected). With no open browser it applies
+at the next `BrowserOpen`, and saving the already-active value restarts nothing.
+Cancel in the settings menu never relaunches. For hands-on human use of a headed
+window, prefer also setting `browserIdleExpiryMinutes` to `0`. See
+[Web tools](web-tools.md#browser-visibility) for the full replacement semantics and
+their limits.
 
 `web.browserInteractionApproval` accepts exactly `"ask"` (default),
 `"automatically-accept"`, or `"automatically-deny"`. Omission uses Ask; invalid values

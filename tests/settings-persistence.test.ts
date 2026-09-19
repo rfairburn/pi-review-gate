@@ -60,8 +60,11 @@ test("idle expiry persists safely and omitted or invalid updates preserve existi
     assert.equal(saved.futureRoot, true);
     assert.deepEqual(saved.web, { ...web, browserIdleExpiryMinutes: 42 });
     assert.equal((await persistReviewSettings(configPath, selection)).web!.browserIdleExpiryMinutes, 42);
+    const disabled = await persistReviewSettings(configPath, { ...selection, browserIdleExpiryMinutes: 0 });
+    assert.equal(disabled.web!.browserIdleExpiryMinutes, 0);
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).web.browserIdleExpiryMinutes, 0);
     const before = await readFile(configPath, "utf8");
-    for (const minutes of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    for (const minutes of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
       await assert.rejects(persistReviewSettings(configPath, { ...selection, browserIdleExpiryMinutes: minutes }), /web.browserIdleExpiryMinutes/);
       assert.equal(await readFile(configPath, "utf8"), before);
     }

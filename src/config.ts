@@ -38,6 +38,8 @@ export interface WebConfig {
   enabled: boolean;
   browserInteractionApproval: BrowserInteractionApproval;
   browserIdleExpiryMinutes: number;
+  /** Interactive browser window visibility; false (default) keeps the headless QA browser. */
+  browserVisible: boolean;
   search: WebSearchConfig;
   fetch: WebFetchConfig;
 }
@@ -277,6 +279,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   web: {
     enabled: true,
     browserInteractionApproval: "ask",
+    browserVisible: false,
     browserIdleExpiryMinutes: 15,
     search: { provider: "ddgs", timeoutMs: 20_000, maxResults: 10 },
     fetch: {
@@ -502,6 +505,7 @@ function normalizeWeb(value: unknown): WebConfig {
   if (value === undefined) return structuredClone(defaults);
   if (!isRecord(value)) throw new Error("web must be an object");
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error("web.enabled must be a boolean");
+  if (value.browserVisible !== undefined && typeof value.browserVisible !== "boolean") throw new Error("web.browserVisible must be a boolean");
   const browserInteractionApproval = value.browserInteractionApproval === undefined
     ? defaults.browserInteractionApproval : value.browserInteractionApproval;
   if (!["ask", "automatically-accept", "automatically-deny"].includes(browserInteractionApproval as string)) {
@@ -519,7 +523,8 @@ function normalizeWeb(value: unknown): WebConfig {
   return {
     enabled: value.enabled ?? defaults.enabled,
     browserInteractionApproval: browserInteractionApproval as BrowserInteractionApproval,
-    browserIdleExpiryMinutes: positiveIntegerOrDefault(
+    browserVisible: value.browserVisible === undefined ? defaults.browserVisible : value.browserVisible,
+    browserIdleExpiryMinutes: nonNegativeIntegerOrDefault(
       value.browserIdleExpiryMinutes, defaults.browserIdleExpiryMinutes, "web.browserIdleExpiryMinutes",
     ),
     search: {

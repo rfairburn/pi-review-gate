@@ -12,6 +12,11 @@ import { InteractiveBrowserManager, type BrowserDownloadListResult } from "../sr
 
 const LIVE_REPORT_BYTES = Buffer.from("live-download-bytes-0123456789-abcdef");
 const GATED_REPORT_BYTES = Buffer.from("gated-download-bytes-9876543210-fedcba");
+// The default-off case needs its own artifact: a tiny response can fully
+// complete before the manager's cancel reaches Chromium, which is a
+// legitimate completed transfer (failure() === null) that cannot prove an
+// active cancellation. Holding EOF on this route makes in-progress certain.
+const DEFAULTOFF_REPORT_BYTES = Buffer.from("defaultoff-download-bytes-0123456789-abcdef");
 
 /**
  * Bounded budget for observing actual download retention or cancellation that
@@ -62,6 +67,19 @@ async function fixture() {
   let releaseGatedFile: (() => void) | undefined;
   const gatedFileHeld = new Promise<void>((resolve) => { releaseGatedFile = resolve; });
   let gatedResponse: ServerResponse | undefined;
+  // Deliberately held response for the default-off case: headers and initial
+  // bytes are sent immediately, then EOF is withheld until the download is
+  // canceled or teardown releases it. The real browser download is therefore
+  // guaranteed to still be in progress when the manager cancels it, so the
+  // observed failure is deterministically "canceled".
+  let releaseDefaultOffFile: (() => void) | undefined;
+  const defaultOffFileHeld = new Promise<void>((resolve) => { releaseDefaultOffFile = resolve; });
+  let defaultOffResponse: ServerResponse | undefined;
+  // Records that the request was actually served by the held route: the
+  // determinism of the cancellation proof depends on it, so a later edit that
+  // repoints the link (or ends this response immediately) must fail loudly
+  // instead of silently restoring the completion-before-cancel race.
+  let defaultOffServed = false;
   const server = createServer(async (request: IncomingMessage, response: ServerResponse) => {
     if (request.method === "GET" && request.url === "/") {
       response.writeHead(200, { "content-type": "text/html" });
@@ -71,6 +89,7 @@ async function fixture() {
         </form>
         <a href="/file" download aria-label="Get report">Report</a>
         <a href="/gated-file" download aria-label="Get gated report">Gated report</a>
+        <a href="/defaultoff-file" download aria-label="Get default-off report">Default-off report</a>
         <script>
           document.querySelector('input[type="file"]').addEventListener('change', (event) => {
             const file = event.target.files[0];
@@ -99,6 +118,28 @@ async function fixture() {
         "content-disposition": 'attachment; filename="gated-report.bin"',
       });
       response.end(GATED_REPORT_BYTES);
+      return;
+    }
+    if (request.method === "GET" && request.url === "/defaultoff-file") {
+      defaultOffServed = true;
+      defaultOffResponse = response;
+      // Bounded cleanup: a client abort (the manager's cancel) or teardown
+      // must never leave this handler holding the socket. The response's
+      // close event only fires once the transfer has ended or been aborted,
+      // never while EOF is still withheld.
+      const releaseHold = () => { releaseDefaultOffFile?.(); };
+      response.on("close", releaseHold);
+      response.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-disposition": 'attachment; filename="defaultoff-report.bin"',
+      });
+      // Initial bytes are in flight while EOF is withheld: the download
+      // cannot complete before the manager's cancel, so the cancellation is
+      // of a genuinely in-progress transfer with real bytes already sent.
+      response.write(DEFAULTOFF_REPORT_BYTES.subarray(0, 16));
+      await defaultOffFileHeld;
+      if (response.destroyed) return;
+      response.end(DEFAULTOFF_REPORT_BYTES.subarray(16));
       return;
     }
     if (request.method === "POST" && request.url === "/upload") {
@@ -132,6 +173,7 @@ async function fixture() {
   const opened = await manager.open(`${origin}/`);
   return {
     manager, browser, opened, origin, receipts, uploadSource, uploadBytes, workspaceRoot, LIVE_REPORT_BYTES, GATED_REPORT_BYTES,
+    get defaultOffServed() { return defaultOffServed; },
     releaseGatedFile: () => { releaseGatedFile?.(); },
     async ref(label: string) {
       const snapshot = await manager.snapshot(opened.session, opened.tab, 10_000);
@@ -141,10 +183,13 @@ async function fixture() {
       return ref;
     },
     async close() {
-      // Release and drop the deliberately held download so teardown cannot
-      // hang on an in-flight response.
+      // Release and drop the deliberately held downloads so teardown cannot
+      // hang on an in-flight response, even when a test fails before its own
+      // assertions would have released them.
       releaseGatedFile?.();
       gatedResponse?.destroy();
+      releaseDefaultOffFile?.();
+      defaultOffResponse?.destroy();
       await manager.shutdown();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await rm(workspaceRoot, { recursive: true, force: true });
@@ -158,13 +203,17 @@ test("live browser: default-off file transfer stays denied while human uploads a
     const page = f.browser.contexts()[0]!.pages()[0]!;
     // Model download saving is off by default: the approved click still
     // triggers a real download, but the manager cancels it and retains nothing.
-    // Observe the real browser download directly so the actual cancellation can
-    // be awaited independent of the click's bounded accounting window (a late
+    // The dedicated /defaultoff-file route holds EOF after headers and initial
+    // bytes, so the download is guaranteed to still be in progress when the
+    // manager cancels it (a tiny artifact could otherwise complete first, a
+    // legitimate completed transfer that reports failure() === null). Observe
+    // the real browser download directly so the actual cancellation can be
+    // awaited independent of the click's bounded accounting window (a late
     // event truthfully reports not_observed).
     let observedDownload: Download | undefined;
     page.on("download", (download) => { observedDownload ??= download; });
     const before = f.receipts.length;
-    const clicked = await f.manager.click(f.opened.session, f.opened.tab, await f.ref("Get report"), async () => true);
+    const clicked = await f.manager.click(f.opened.session, f.opened.tab, await f.ref("Get default-off report"), async () => true);
     // Truthful in-window classification: canceled when the event landed inside
     // the bounded window, not_observed when it did not; capability off must
     // never retain.
@@ -180,7 +229,26 @@ test("live browser: default-off file transfer stays denied while human uploads a
       if (Date.now() >= deadline) throw new Error("the real browser download was not observed within the bounded window");
       await sleep(25);
     }
-    assert.equal(await observedDownload.failure(), "canceled", "the default-off policy must actually cancel the real download");
+    // The browser only started a download after receiving this fixture's
+    // response headers, so the held route must have served it: without that,
+    // the in-progress guarantee below no longer holds.
+    assert.ok(f.defaultOffServed, "the default-off download must be served by the held route");
+    // Bounded observation of the terminal state: a cancel that never reaches
+    // a terminal downloadProgress (a future engine regression) must fail with
+    // a diagnosis instead of hanging until the CI job timeout. The strict
+    // expectation stays "canceled"; the deadline only labels a missing state.
+    let failureTimer: ReturnType<typeof setTimeout> | undefined;
+    const failureDeadline = new Promise<never>((_, reject) => {
+      failureTimer = setTimeout(
+        () => reject(new Error("the canceled download did not reach a terminal state within the bounded window")),
+        RETENTION_OBSERVE_TIMEOUT_MS,
+      );
+    });
+    try {
+      assert.equal(await Promise.race([observedDownload.failure(), failureDeadline]), "canceled", "the default-off policy must actually cancel the real download");
+    } finally {
+      clearTimeout(failureTimer);
+    }
     assert.deepEqual((await f.manager.listDownloads(f.opened.session, f.opened.tab)).downloads, []);
     // Model uploads are off by default: the precise capability denial names
     // the permission and no file is read or sent.

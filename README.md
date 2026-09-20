@@ -48,6 +48,11 @@ receipts of exactly what the model was told.
 - **Background shell tools** — `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
   `ShellStop` with detached process groups and lifecycle wakes
   ([Delegated execution](docs/delegated-execution.md#background-shell-tools)).
+- **User questions** — the `AskUserQuestion` tool: async by default (pending handle,
+  no deadlines or fabricated answers) or explicit sync waits, answered from a
+  session-local pending-question list (Ctrl+Alt+Up / Ctrl+Option+Up on macOS)
+  with choices, free text, and an explicit decline that terminates question-only
+  batches ([User questions](docs/user-questions.md)).
 
 ## Non-goals
 
@@ -239,6 +244,7 @@ later landings until `SubtasksMarkClean` verifies the resolution. Details live i
 | Review lifecycle, commands, cancellation | [docs/review-workflow.md](docs/review-workflow.md) |
 | Subtask workers, capture/landing, shell tools | [docs/delegated-execution.md](docs/delegated-execution.md) |
 | WebSearch / WebFetch / BrowserExtract | [docs/web-tools.md](docs/web-tools.md) |
+| AskUserQuestion, pending list, decline semantics | [docs/user-questions.md](docs/user-questions.md) |
 | Trust boundaries, egress hardening, read-only enforcement | [docs/security-model.md](docs/security-model.md) |
 | Crash recovery, restart, retry/failover | [docs/recovery.md](docs/recovery.md) |
 | Build, tests, static checks, launcher internals | [docs/development.md](docs/development.md) |

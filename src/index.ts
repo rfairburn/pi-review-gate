@@ -215,7 +215,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // Pending questions (issue #95): AskUserQuestion registers before
   // session_start so it enters the deferred-tool authorization boundary like
   // every other top-level tool; the pending-question list shortcut and the
-  // compact indicator are registered here as well. Top level only — executor
+  // persistent panel widget are registered here as well. Top level only — executor
   // runtimes have no question UI surface.
   const userQuestions = registerUserQuestions(pi);
 
@@ -445,6 +445,13 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // surface stays fail-closed everywhere else.
     userQuestionsBeginSession(userQuestions?.controller, deferredSessionIdentity);
     userQuestions?.setInteractiveUi(contextIsInteractiveTui(context));
+    // The panel renders through the event context's widget surface (the
+    // installed host does not expose it on the extension API object), so
+    // note this session's live context before reconciling. A new session
+    // never inherits another session's panel, and an unusable identity must
+    // clear any stale one (beginSession does not notify in that case).
+    userQuestions?.noteContext(context);
+    userQuestions?.syncPanel();
     const identity = sessionPersistenceIdentity(context, currentCwd);
     const appendEntry = typeof pi === "object" && pi !== null && "appendEntry" in pi && typeof pi.appendEntry === "function"
       ? pi.appendEntry.bind(pi) as (customType: string, data: unknown) => void

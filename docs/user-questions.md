@@ -18,9 +18,9 @@ The model calls `AskUserQuestion` with:
 ### Async mode (default)
 
 The call returns immediately with a pending handle (for example `q1`). The
-question stays discoverable two ways: the tool result itself and the compact
-pending indicator in the status line (`2 pending questions · Ctrl+Alt+Up`,
-with the platform's chord label). There is no
+question stays discoverable two ways: the tool result itself and the
+persistent pending-question panel above the chat editor (`Pending questions ·
+Press Ctrl+Alt+Up`, with the platform's chord label). There is no
 deadline, reminder, or timeout — the question simply waits until you answer
 or decline it. The model is told not to assume an answer; it continues other
 work while the question is pending.
@@ -45,9 +45,11 @@ answer.
 
 ## Answering from the question list
 
-A compact indicator appears in the status line while questions are pending.
-Press **Ctrl+Alt+Up** (**Ctrl+Option+Up** on macOS) to open the
-pending-question list:
+While questions are pending, a persistent panel stays visible above the chat
+editor — through chat output as well. It never takes focus and shows only
+`Pending questions · Press Ctrl+Alt+Up` (**Ctrl+Option+Up** on macOS): no
+question text is ever shown while it is collapsed. Press **Ctrl+Alt+Up** to
+open the pending-question list:
 
 ```
 Pending questions (2) · Ctrl+Alt+Up to close
@@ -82,7 +84,8 @@ arrows select · Enter confirm · Esc back
 - While the list is open it has input focus: all keys, including Escape, are
   handled by the list, so nothing triggers Pi's abort. Your editor draft is
   saved while the list is open and restored when it closes. Pressing the
-  shortcut again closes the list.
+  shortcut again (or Esc) closes the list and collapses back to the pending
+  panel.
 - The list reads live state: a question that becomes pending (or waiting)
   while the list is open appears without re-opening, and a question you just
   resolved disappears; when the last one is resolved the list closes itself.
@@ -102,8 +105,9 @@ arrows select · Enter confirm · Esc back
 Questions are bound to the session that asked them. After a session switch,
 `/new`, or fork, the previous session's questions are not presented in the
 new session and cannot be answered into it; stale list callbacks after such a
-replacement are rejected without touching the model. The pending indicator
-reflects only the current session.
+replacement are rejected without touching the model. The pending panel
+reflects only the current session: it is removed when no questions remain and
+is cleared when the session ends or is replaced.
 
 ## Availability and limits
 
@@ -117,8 +121,8 @@ reflects only the current session.
 - **Terminal key support.** The chord requires a terminal that can report
   Ctrl+Alt on an arrow key (Pi's Kitty keyboard protocol; most modern
   terminals negotiate it automatically). On terminals without that support
-  the chord does not fire — questions remain pending and visible in the
-  indicator until you answer them from a supported environment.
+  the chord does not fire — questions remain pending and visible in the panel
+  until you answer them from a supported environment.
 - **Operating modes.** Like other non-read-only tools, `AskUserQuestion`
   follows the standard tool visibility policy: it is hidden in plan/research
   mode and appears again in write-capable modes.

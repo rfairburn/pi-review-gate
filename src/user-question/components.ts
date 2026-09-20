@@ -21,6 +21,11 @@
  * user keybindings.json overrides are honored. The extension's own shortcut
  * chord (Ctrl+Alt+Up) is matched with the host pi-tui's matchesKey when
  * loadable; without it, Escape still closes the list.
+ *
+ * The free-text editor inserts only ordinary printable text: the approved
+ * chord collapses it like every other mode (the question stays pending), and
+ * unrecognized terminal escape sequences are rejected rather than leaking
+ * their printable tails into the draft.
  */
 
 import type { QuestionTuiHost } from "./pi-tui-host";
@@ -238,6 +243,13 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       invalidate();
       return;
     }
+    // The approved collapse chord works in editing mode just like in list and
+    // answer modes: it closes the UI without submitting; the question stays
+    // pending.
+    if (matchesShortcut(data)) {
+      close();
+      return;
+    }
     const printable = printableText(data);
     if (printable.length === 0) return;
     if (buffer.length >= MAX_FREE_TEXT_CHARS) return;
@@ -414,6 +426,11 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     // The host forwards bracketed-paste markers verbatim to the focused
     // component; drop them so a paste inserts its payload, not escape text.
     const cleaned = data.replace(/\x1b\[20[01]~/g, "");
+    // Unrecognized terminal escape sequences (arrows, Home/End/Delete,
+    // PageUp/PageDown, modifier chords) must never leak their printable tails
+    // — e.g. "[A" from Up — into the draft; reject any input where an ESC
+    // survives the marker strip.
+    if (cleaned.includes("\x1b")) return "";
     let out = "";
     for (const char of cleaned) {
       const code = char.codePointAt(0)!;

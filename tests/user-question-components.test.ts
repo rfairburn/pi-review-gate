@@ -208,6 +208,52 @@ test("bracketed paste inserts its payload without escape-marker residue", async 
   assert.ok(!/200~|201~/.test(fixture.sent[0]!.message), "no paste markers reach the model");
 });
 
+test("unrecognized terminal sequences never insert printable tails into the draft", async () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
+  fixture.component.handleInput(ENTER); // open answer view
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // start editing
+  for (const char of "yes") fixture.component.handleInput(char);
+  const unknown = [
+    "\x1b[A", // Up
+    "\x1b[B", // Down
+    "\x1b[H", // Home
+    "\x1b[1~", // Home (numeric)
+    "\x1b[F", // End
+    "\x1b[4~", // End (numeric)
+    "\x1b[3~", // Delete
+    "\x1b[5~", // PageUp
+    "\x1b[6~", // PageDown
+    "\x1b[1;2A", // unrecognized modifier chord (Ctrl+Up)
+  ];
+  for (const sequence of unknown) fixture.component.handleInput(sequence);
+  const rendered = fixture.component.render(80).join("\n");
+  assert.match(rendered, /Your answer: yes/, "the draft is unchanged by unknown sequences");
+  assert.ok(!/\[A|\[B|\[H|\[F|\[1~|\[4~|\[3~|\[5~|\[6~|;2A/.test(rendered), "no printable tails reach the draft");
+  // Ordinary text and bracketed paste remain usable after rejected sequences.
+  fixture.component.handleInput(" ");
+  fixture.component.handleInput("\x1b[200~and no\x1b[201~");
+  fixture.component.handleInput(ENTER); // submit
+  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /Which database\?": yes and no$/);
+});
+
+test("the shortcut chord collapses from free-text editing without submitting", () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
+  fixture.component.handleInput(ENTER); // open answer view
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // start editing
+  for (const char of "partial") fixture.component.handleInput(char);
+  fixture.component.handleInput(CHORD); // approved collapse chord
+  assert.deepEqual(fixture.done, [{ kind: "closed" }]);
+  assert.equal(fixture.controller.listPending().length, 1, "the question stays pending");
+  assert.equal(fixture.sent.length, 0, "no answer was submitted");
+});
+
 test("decline is an explicit two-step action with no second confirmation", async () => {
   const fixture = makeFixture();
   register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });

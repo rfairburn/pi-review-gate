@@ -314,7 +314,7 @@ export class UserQuestionController {
       if (signal) {
         if (signal.aborted) {
           // The model already gets the interrupted result; drop the record so
-          // the list and indicator cannot present a dead [waiting] row whose
+          // the list and panel cannot present a dead [waiting] row whose
           // answer could never reach the model.
           this.remove(id);
           settleWaiter(waiter, { outcome: "interrupted" });

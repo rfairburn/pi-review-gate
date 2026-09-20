@@ -49,10 +49,11 @@ receipts of exactly what the model was told.
   `ShellStop` with detached process groups and lifecycle wakes
   ([Delegated execution](docs/delegated-execution.md#background-shell-tools)).
 - **User questions** — the `AskUserQuestion` tool: async by default (pending handle,
-  no deadlines or fabricated answers) or explicit sync waits, answered from a
-  session-local pending-question list (Ctrl+Alt+Up / Ctrl+Option+Up on macOS)
-  with choices, free text, and an explicit decline that terminates question-only
-  batches ([User questions](docs/user-questions.md)).
+  no deadlines or fabricated answers) or explicit sync waits; a persistent panel
+  above the editor marks pending questions without taking focus (never showing
+  their text), and the session-local question list (Ctrl+Alt+Up /
+  Ctrl+Option+Up on macOS) offers choices, free text, and an explicit decline
+  that terminates question-only batches ([User questions](docs/user-questions.md)).
 
 ## Non-goals
 

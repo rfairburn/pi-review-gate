@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
 import { setHostKeybindingLoader } from "../src/host-keybindings";
-import { USER_QUESTION_STATUS_KEY, questionShortcutLabel } from "../src/user-question";
+import { USER_QUESTION_PANEL_KEY, pendingQuestionPanelLine, questionShortcutLabel } from "../src/user-question";
 
 const indexTestConfig = {
   enabled: true,
@@ -46,9 +46,22 @@ interface EntrypointFixture {
   tools: Map<string, any>;
   shortcuts: Map<string, { description?: string; handler: (ctx: unknown) => unknown }>;
   statuses: Array<{ key: string; text: string | undefined }>;
+  widgets: Array<{
+    key: string;
+    lines: string[] | undefined;
+    options?: { placement?: string };
+  }>;
   notices: string[];
   sent: Array<{ message: string; options?: unknown }>;
   sessionManager: object;
+}
+
+/** The most recent setWidget call for a key (undefined when never called). */
+function lastWidget(
+  fixture: EntrypointFixture,
+  key: string,
+): EntrypointFixture["widgets"][number] | undefined {
+  return [...fixture.widgets].reverse().find((entry) => entry.key === key);
 }
 
 async function makeFixture(options: { withShortcutApi?: boolean } = {}): Promise<EntrypointFixture> {
@@ -62,6 +75,7 @@ async function makeFixture(options: { withShortcutApi?: boolean } = {}): Promise
   const tools = new Map<string, any>();
   const shortcuts = new Map<string, { description?: string; handler: (ctx: unknown) => unknown }>();
   const statuses: EntrypointFixture["statuses"] = [];
+  const widgets: EntrypointFixture["widgets"] = [];
   const notices: string[] = [];
   const sent: EntrypointFixture["sent"] = [];
   const sessionManager = { id: "entrypoint-session" };
@@ -75,6 +89,9 @@ async function makeFixture(options: { withShortcutApi?: boolean } = {}): Promise
     registerCommand() {},
     notify(message: string) { notices.push(message); },
     sendUserMessage(message: string, options?: unknown) { sent.push({ message, options }); return Promise.resolve(); },
+    // Faithful to the installed host: the extension API object carries no ui
+    // surface (only ctx.ui does), so setWidget is deliberately absent here —
+    // any code path that targets the API object leaves nothing recorded.
     ui: {
       setStatus(key: string, text: string | undefined) { statuses.push({ key, text }); },
     },
@@ -85,7 +102,7 @@ async function makeFixture(options: { withShortcutApi?: boolean } = {}): Promise
     };
   }
   await activate(pi);
-  return { dir, hooks, tools, shortcuts, statuses, notices, sent, sessionManager };
+  return { dir, hooks, tools, shortcuts, statuses, widgets, notices, sent, sessionManager };
 }
 
 async function trigger(hooks: Map<string, Array<(...args: unknown[]) => unknown>>, name: string, ...args: unknown[]): Promise<void> {
@@ -96,7 +113,16 @@ async function trigger(hooks: Map<string, Array<(...args: unknown[]) => unknown>
 
 /** The interactive TUI host's session context — the only mode that accepts questions. */
 function tuiContext(fixture: EntrypointFixture): Record<string, unknown> {
-  return { cwd: fixture.dir, ui: {}, sessionManager: fixture.sessionManager, mode: "tui" };
+  return {
+    cwd: fixture.dir,
+    ui: {
+      setWidget(key: string, lines: string[] | undefined, options?: { placement?: string }) {
+        fixture.widgets.push({ key, lines, options });
+      },
+    },
+    sessionManager: fixture.sessionManager,
+    mode: "tui",
+  };
 }
 
 test("activate registers AskUserQuestion and the pending-question shortcut", async () => {
@@ -110,16 +136,93 @@ test("activate registers AskUserQuestion and the pending-question shortcut", asy
 
     await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
 
-    // A registered question updates the compact indicator.
+    // A registered question shows the persistent collapsed panel above the
+    // editor — notification and platform chord only, never question text.
     const result = await tool.execute("c1", { question: "Which database?" }, undefined, undefined, { sessionManager: fixture.sessionManager });
     assert.equal((result.details as { status: string }).status, "pending");
-    const indicator = [...fixture.statuses].reverse().find((entry) => entry.key === USER_QUESTION_STATUS_KEY);
-    assert.ok(indicator, "the compact indicator is set");
-    assert.match(indicator!.text ?? "", /1 pending question/);
-    assert.ok(
-      (indicator!.text ?? "").includes(questionShortcutLabel()),
-      `the indicator names the approved chord: ${indicator!.text}`,
+    const panel = lastWidget(fixture, USER_QUESTION_PANEL_KEY);
+    assert.ok(panel, "the pending-question panel is set through the event context's widget surface");
+    assert.equal(panel!.options?.placement, "aboveEditor", "the panel is pinned above the chat editor");
+    assert.deepEqual(panel!.lines, [pendingQuestionPanelLine()]);
+    assert.equal(
+      panel!.lines![0],
+      `Pending questions · Press ${questionShortcutLabel()}`,
+      "the collapsed line names the approved chord",
     );
+    assert.ok(!panel!.lines!.join("\n").includes("database"), "no question text while collapsed");
+    // The old status-line indicator is replaced, not duplicated.
+    assert.ok(
+      !fixture.statuses.some((entry) => /pending question/i.test(entry.text ?? "")),
+      "no status-line pending indicator remains",
+    );
+  } finally {
+    await rm(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the collapsed panel stays a single notification line for many questions", async () => {
+  const fixture = await makeFixture();
+  try {
+    await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
+    const tool = fixture.tools.get("AskUserQuestion");
+    await tool.execute("c1", { question: "Which database should the migration target?" }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    await tool.execute("c2", { question: "Should the report include raw counts?" }, undefined, undefined, { sessionManager: fixture.sessionManager });
+
+    const panel = lastWidget(fixture, USER_QUESTION_PANEL_KEY);
+    assert.ok(panel, "the panel is set while questions are pending");
+    assert.equal(panel!.options?.placement, "aboveEditor", "reconciles stay above the editor");
+    assert.deepEqual(panel!.lines, [pendingQuestionPanelLine()], "one line regardless of the pending count");
+    const collapsed = panel!.lines!.join("\n");
+    assert.ok(!collapsed.includes("database"), "never shows question text (1)");
+    assert.ok(!collapsed.includes("counts"), "never shows question text (2)");
+  } finally {
+    await rm(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("resolving every pending question removes the panel", async () => {
+  const fixture = await makeFixture();
+  try {
+    await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
+    const tool = fixture.tools.get("AskUserQuestion");
+    await tool.execute("c1", { question: "Which database?", choices: ["SQLite", "Postgres"] }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    assert.ok(lastWidget(fixture, USER_QUESTION_PANEL_KEY)?.lines, "panel visible while pending");
+
+    let openedComponent: any;
+    const custom = (factory: (...args: unknown[]) => unknown) => {
+      openedComponent = factory({}, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, fakeKeybindings(), () => undefined);
+      return Promise.resolve();
+    };
+    const handler = fixture.shortcuts.get("ctrl+alt+up")!.handler;
+    await handler({ ui: { custom }, sessionManager: fixture.sessionManager, isIdle: () => true });
+    assert.ok(openedComponent, "the shortcut opens the question list over the persistent panel");
+
+    openedComponent.handleInput("\r"); // open answer view (first question selected)
+    openedComponent.handleInput("\x1b[B"); // row 2: Postgres
+    openedComponent.handleInput("\r"); // confirm the choice
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    assert.equal(fixture.sent.length, 1, "the answer is delivered through the host path");
+    const panel = lastWidget(fixture, USER_QUESTION_PANEL_KEY);
+    assert.ok(panel, "a widget update follows the resolution");
+    assert.equal(panel!.lines, undefined, "the panel is removed when no questions remain");
+  } finally {
+    await rm(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a new session clears a stale panel even when its identity is unusable", async () => {
+  const fixture = await makeFixture();
+  try {
+    await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
+    const tool = fixture.tools.get("AskUserQuestion");
+    await tool.execute("c1", { question: "Which database?" }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    assert.ok(lastWidget(fixture, USER_QUESTION_PANEL_KEY)?.lines, "panel visible for the first session");
+
+    // A session_start without a usable session identity cannot bind the
+    // controller; the stale panel must be cleared rather than carried over.
+    await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, { cwd: fixture.dir, ui: {}, mode: "tui" });
+    const panel = lastWidget(fixture, USER_QUESTION_PANEL_KEY);
+    assert.equal(panel?.lines, undefined, "no other session's questions are presented in the new one");
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }
@@ -224,18 +327,20 @@ test("non-TUI host modes fail closed for every question, sync included", async (
   }
 });
 
-test("session shutdown settles a pending sync question and clears the indicator", async () => {
+test("session shutdown settles a pending sync question and clears the panel", async () => {
   const fixture = await makeFixture();
   try {
     await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
     const tool = fixture.tools.get("AskUserQuestion");
     const running = tool.execute("c1", { question: "Which database?", mode: "sync" }, undefined, undefined, { sessionManager: fixture.sessionManager });
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+    assert.ok(lastWidget(fixture, USER_QUESTION_PANEL_KEY)?.lines, "panel visible while the sync wait is open");
     await trigger(fixture.hooks, "session_shutdown", { cwd: fixture.dir }, tuiContext(fixture));
     const result = await running;
     assert.equal((result.details as { status: string }).status, "interrupted");
-    const lastIndicator = [...fixture.statuses].reverse().find((entry) => entry.key === USER_QUESTION_STATUS_KEY);
-    assert.equal(lastIndicator?.text, undefined, "the indicator is cleared for the settled session");
+    const panel = lastWidget(fixture, USER_QUESTION_PANEL_KEY);
+    assert.ok(panel, "the panel is reconciled on shutdown");
+    assert.equal(panel!.lines, undefined, "the panel is cleared for the settled session");
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }

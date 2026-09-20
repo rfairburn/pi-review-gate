@@ -545,7 +545,9 @@ Re-shown menus keep your position: after a staged change (a toggle, an add, a mo
 the next display of the same menu highlights the row you last selected — even when its
 label or position changed. In the interactive Pi TUI this renders as the host's native
 selector list, preselected through its public component API, so arrow keys, Enter, and
-Esc behave exactly like Pi's own selectors. Hosts without a terminal UI (RPC/print)
+Esc use Pi's supplied live keybindings manager, including configured selection-key
+remaps. Compiled extension builds resolve these TUI components from the running Pi
+installation when ordinary package-name loading is unavailable. Hosts without a terminal UI (RPC/print)
 keep the plain selector that opens at the first row; retention is TUI-only, with no GUI
 planned.
 

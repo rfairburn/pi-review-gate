@@ -25,6 +25,7 @@ import {
   KEY_ESCAPE,
   KEY_UP,
   loadRealMenuTuiHost,
+  loadRealPiTuiModule,
   type TuiSettingsHarness,
 } from "./menu-tui-fakes";
 
@@ -198,6 +199,85 @@ test("real pi-tui SelectList honors the initial selected row, input, and cancel"
   // The real component rendered the title and every row label.
   const frame = harness.frames[0]!.join("\n");
   for (const text of ["Pick", "Alpha", "Beta", "Gamma"]) assert.ok(frame.includes(text), `missing ${text} in:\n${frame}`);
+});
+
+test("retainedSelect points the loaded module at the injected live keybindings manager", async () => {
+  const manager = { matches: (_data: string, _keybinding: string): boolean => false };
+  const harness = createTuiSettingsContext([[KEY_ENTER]], { keybindings: manager });
+  setMenuTuiHost(harness.host);
+  const result = await retainedSelect(tuiUi(harness), {
+    title: "Pick",
+    rows: [{ key: "a", label: "Alpha" }],
+  });
+  assert.equal(result, "a");
+  // The adapter handed the host's live manager to the module's setKeybindings.
+  assert.deepEqual(harness.setKeybindingsCalls, [manager]);
+});
+
+test("retainedSelect leaves module keybindings untouched when no manager is injected", async () => {
+  const harness = createTuiSettingsContext([[KEY_ENTER]]); // keybindings: null
+  setMenuTuiHost(harness.host);
+  const result = await retainedSelect(tuiUi(harness), {
+    title: "Pick",
+    rows: [{ key: "a", label: "Alpha" }],
+  });
+  assert.equal(result, "a");
+  assert.equal(harness.setKeybindingsCalls.length, 0);
+});
+
+test("real pi-tui SelectList honors user tui.select.* remaps through the injected live manager", async (t) => {
+  const host = await loadRealMenuTuiHost();
+  const tuiModule = await loadRealPiTuiModule();
+  if (!host || !tuiModule) {
+    t.skip("no installed pi-tui resolvable in this environment");
+    return;
+  }
+  const KeybindingsManager = tuiModule.KeybindingsManager as new (
+    definitions: unknown,
+    userBindings?: Record<string, string | string[]>,
+  ) => { matches(data: string, keybinding: string): boolean };
+  if (typeof KeybindingsManager !== "function" || typeof tuiModule.getKeybindings !== "function") {
+    t.skip("installed pi-tui lacks the keybinding manager exports");
+    return;
+  }
+  setMenuTuiHost(host);
+  // User remap: vim-style navigation; confirm and cancel keep their defaults.
+  const manager = new KeybindingsManager(tuiModule.TUI_KEYBINDINGS, {
+    "tui.select.up": "k",
+    "tui.select.down": "j",
+  });
+  // The adapter points the module's global at the injected live manager;
+  // restore the previous state afterwards so later tests see defaults.
+  const previousGlobal = tuiModule.getKeybindings();
+  t.after(() => {
+    (tuiModule.setKeybindings as (manager: unknown) => void)(previousGlobal);
+  });
+
+  const harness = createTuiSettingsContext(
+    [
+      ["k", KEY_UP, "j", KEY_ENTER], // k up, stale up arrow inert, j down, enter confirms
+      [KEY_DOWN, KEY_ENTER], // stale down arrow inert: first row confirms
+      ["j", KEY_ESCAPE], // j navigates, escape cancels
+    ],
+    { keybindings: manager },
+  );
+  const ui = tuiUi(harness);
+  const rows = [
+    { key: "a", label: "Alpha" },
+    { key: "b", label: "Beta" },
+    { key: "c", label: "Gamma" },
+  ];
+
+  // Menu 1: preselect Beta; k moves to Alpha, the old default up arrow no
+  // longer navigates (remapped away), j moves back to Beta, Enter confirms.
+  assert.equal(await retainedSelect(ui, { title: "Pick", rows, initialKey: "b" }), "b");
+  // Menu 2: the old default down arrow is inert; first row confirms.
+  assert.equal(await retainedSelect(ui, { title: "Pick", rows }), "a");
+  // Menu 3: j navigates, escape cancels without selecting.
+  assert.equal(await retainedSelect(ui, { title: "Pick", rows }), undefined);
+
+  // The module's global keybinding state is now the injected live manager.
+  assert.equal(tuiModule.getKeybindings(), manager);
 });
 
 test("web permissions menu keeps the toggled row highlighted across repeated On/Off flips", async () => {

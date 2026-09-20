@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.60]
+
+### Fixed
+
+- Restore retained settings-menu selection in real Pi sessions loading the
+  compiled CommonJS extension. Resolve host-provided TUI peers from the running
+  Pi installation when package-name loading cannot use the host's aliases,
+  instead of silently falling back to the position-resetting plain selector.
+- Connect the custom selector to Pi's supplied live keybindings manager so
+  configured selection keys are honored. Preserve stable menu-row identities,
+  submenu return positions, Save/Cancel behavior, and non-TUI fallback.
+
 ## [0.1.0-dev.59]
 
 ### Fixed

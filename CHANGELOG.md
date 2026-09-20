@@ -15,6 +15,24 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.61]
+
+### Added
+
+- AskUserQuestion provides session-local questions with suggested choices and
+  free-text answers. Async questions let work continue; later answers arrive
+  without interrupting the active run. Explicit synchronous questions wait for
+  an answer or decline, with no acknowledgement-only turn for a declined
+  question-only batch.
+- Keep pending questions discoverable in a persistent, non-focus-taking panel
+  above the chat editor. Ctrl+Alt+Up (Ctrl+Option+Up on macOS), displayed in the
+  panel, opens or collapses the question UI without showing question text while
+  collapsed. Preserve editor drafts, existing message-restoration bindings, and
+  session boundaries; reject unavailable interactive hosts and binding conflicts.
+- Handle the collapse shortcut in free-text answers and prevent unrecognized
+  terminal key sequences from corrupting answer text while preserving ordinary
+  typing and bracketed paste.
+
 ## [0.1.0-dev.60]
 
 ### Fixed

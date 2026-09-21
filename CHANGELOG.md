@@ -15,6 +15,14 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.67]
+
+### Changed
+
+- Extract conflict-gate storage, root identity and validation into a focused
+  module while preserving the controller's public type export and existing
+  conflict/lease checks. Task orchestration and force-merge behavior are unchanged.
+
 ## [0.1.0-dev.66]
 
 ### Tests

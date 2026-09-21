@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.65]
+
+### Changed
+
+- Extract browser diagnostics, error types and classifiers, operation/deadline
+  primitives, and URL-policy helpers into focused modules. Preserve the
+  interactive browser's existing exports, error identities, safety checks and
+  runtime behavior while reducing mixed responsibilities in its manager.
+
 ## [0.1.0-dev.64]
 
 ### Changed

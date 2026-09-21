@@ -24,9 +24,7 @@ import {
 import { nearestRealPath } from "../apply-patch/paths";
 import { DEFAULT_BROWSER_PERMISSIONS, type BrowserInteractionApproval, type WebBrowserPermissions, type WebFetchConfig } from "../config";
 import { effectiveBrowserPolicy, type EffectiveBrowserPolicy } from "./browser-capabilities.js";
-import { redactSensitiveText } from "../redaction";
 import { BrowserOutputPrivacy } from "./browser-output-privacy";
-import { AsyncLocalStorage } from "node:async_hooks";
 import {
   CLEANUP_DEADLINE_MS,
   MAX_MAIN_DOCUMENT_REDIRECTS,
@@ -43,7 +41,7 @@ import {
   type EgressSummary,
 } from "./egress-broker";
 import type { HostResolver } from "./network";
-import { classifyPublicUrlError, defaultHostResolver, PublicUrlValidationError, validatePublicUrl, type UrlValidationOptions } from "./network";
+import { classifyPublicUrlError, defaultHostResolver, PublicUrlValidationError, validatePublicUrl } from "./network";
 import {
   BrowserConfirmationPermits,
   BrowserConsequencePolicy,
@@ -56,6 +54,91 @@ import {
   type BrowserFormOperation,
   type BrowserTargetStructure,
 } from "./browser-interaction-policy";
+import {
+  BROWSER_CLOSE_CANCEL_REASON,
+  SESSION_SHUTDOWN_CANCEL_REASON,
+  VISIBILITY_CANCEL_REASON,
+  BrowserCapabilityDeniedError,
+  BrowserCaptureInvalidatedError,
+  BrowserClipboardOutcomeError,
+  BrowserFailureError,
+  BrowserIdleExpiredError,
+  BrowserRecoveryError,
+  BrowserSessionClosedError,
+  BrowserValidationError,
+  DEADLINE_ERROR_PATTERN,
+  browserFailure,
+  cancellationKind,
+  classifyFatalSessionError,
+  classifyNavigationError,
+  classifySetupFailure,
+  duplicateOpenError,
+  invalidRefError,
+  invalidSessionHandleError,
+  invalidTabHandleError,
+  normalizedInteractionFailure,
+  operationCancellationError,
+  operationTeardownUncertainError,
+  openCancellationError,
+  unconfirmedOpenCleanupError,
+  type BrowserClosureReason,
+  type BrowserFailureCategory,
+  type BrowserFailurePhase,
+  type BrowserFileTransferCapability,
+} from "./browser-errors.js";
+import {
+  BrowserDiagnosticQuota,
+  DiagnosticRing,
+  boundedHttpStatus,
+  boundedNonnegativeInteger,
+  boundedUntrustedText,
+  boundedWsCloseCode,
+  boundedWsCloseReason,
+  consoleLevel,
+  diagnosticElapsed,
+  diagnosticMethod,
+  diagnosticNetworkFailure,
+  diagnosticOrigin,
+  diagnosticPublicOrigin,
+  diagnosticResourceKind,
+  diagnosticWsOrigin,
+} from "./browser-diagnostics.js";
+import { OperationDeadline, boundedCleanup, operationWork, settleBrowserReads, within } from "./browser-operations.js";
+import {
+  boundedVisibilityUrl,
+  interactionIdentityUrl,
+  interactiveRouteDecision,
+  optionalPublicPageUrl,
+  publicPageUrl,
+  redactedInteractionUrl,
+  safePublicPageUrl,
+  urlWaitMatcher,
+  validateNavigationUrl,
+} from "./browser-url-policy.js";
+import { asError, bounded, throwIfAborted } from "./browser-primitives.js";
+
+// Issue #153: cohesive helper families extracted from this manager module.
+// These re-exports preserve the historical public surface and error
+// identities; the authoritative definitions live in the sibling modules.
+export {
+  BrowserCaptureInvalidatedError,
+  BrowserCapabilityDeniedError,
+  BrowserFailureError,
+  BrowserRecoveryError,
+  BrowserSessionClosedError,
+} from "./browser-errors.js";
+export type {
+  BrowserClipboardCapability,
+  BrowserClosureReason,
+  BrowserCredentialCapability,
+  BrowserFailureCategory,
+  BrowserFailurePhase,
+  BrowserFileTransferCapability,
+  BrowserRecoveryKind,
+  BrowserRecoveryMetadata,
+} from "./browser-errors.js";
+export { BrowserDiagnosticQuota, DiagnosticRing } from "./browser-diagnostics.js";
+export { interactiveRouteDecision } from "./browser-url-policy.js";
 
 export const BROWSER_INTERACTION_SESSION_MAX_CHARS = 256;
 export const BROWSER_INTERACTION_TAB_MAX_CHARS = 256;
@@ -543,134 +626,6 @@ export type BrowserInteractionConfirmation = (request: BrowserInteractionConfirm
 /** Compatibility alias for the original click API. */
 export type BrowserClickConfirmation = BrowserInteractionConfirmation;
 
-export interface BrowserClosureReason {
-  kind: "explicit_close" | "session_shutdown" | "fatal_error" | "idle_expiry" | "visibility_reconfigure";
-  message: string;
-}
-
-/** Typed capture rejection; page text cannot manufacture this classification. */
-export class BrowserCaptureInvalidatedError extends Error {}
-
-class BrowserIdleExpiredError extends Error {
-  constructor() { super("Browser session expired from tool inactivity. Use BrowserOpen to reopen; previous state is lost."); }
-}
-
-/** Only issued for a handle authenticated by this manager, never guesses. */
-export class BrowserSessionClosedError extends Error {
-  constructor(readonly closure: BrowserClosureReason | undefined) {
-    super(`Browser session is closed${closure ? ` (${closure.kind}: ${closure.message})` : ""}. Use BrowserOpen to start a new browser; do not replay uncertain actions automatically.`);
-    this.name = "BrowserSessionClosedError";
-  }
-}
-
-export type BrowserRecoveryKind =
-  | "duplicate_open"
-  | "session_unknown"
-  | "tabs"
-  | "cancelled"
-  | "unconfirmed_cleanup";
-
-export interface BrowserRecoveryMetadata {
-  kind: BrowserRecoveryKind;
-  /** Dispatch phase at cancellation: no page effect, page effect possible, or unknowable. */
-  phase?: "not_started" | "dispatched" | "unknown";
-  /** Whether the manager proved resource cleanup; never claimed without proof. */
-  cleanup?: "confirmed" | "unconfirmed";
-  /** Authenticated live session revealed by a duplicate open after a lost result. */
-  existingSession?: string;
-  existingTab?: string;
-  /** Authenticated session owning the listed tabs. */
-  session?: string;
-  /** Real owned tab handles, never generated placeholders. */
-  ownedTabs?: readonly string[];
-  /** Whether the caller may retry the same tool or must reopen via BrowserOpen. */
-  recovery?: "retry" | "reopen";
-}
-
-/**
- * Structured, manager-authored recovery state for cancellation, stale-handle,
- * duplicate-open, and teardown outcomes. The message is fixed owned guidance;
- * public sanitization classifies from these fields instead of parsing
- * arbitrary exception text.
- */
-export class BrowserRecoveryError extends Error {
-  constructor(message: string, readonly recovery: BrowserRecoveryMetadata) {
-    super(message);
-    this.name = "BrowserRecoveryError";
-  }
-}
-
-/** Bounded failure phase for structured browser tool errors. */
-export type BrowserFailurePhase =
-  | "url_validation"
-  | "broker_admission"
-  | "broker_startup"
-  | "chromium_startup"
-  | "context_creation"
-  | "navigation"
-  | "teardown";
-
-/** Safe error category: fixed codes only, never raw network or page text. */
-export type BrowserFailureCategory =
-  | "invalid_url"
-  | "dns_resolution_failed"
-  | "non_public_address_denied"
-  | "policy_refused"
-  | "budget_exhausted"
-  | "browser_network_failure"
-  | "browser_process_failure"
-  | "timeout"
-  | "internal_error";
-
-/**
- * Structured, manager-owned failure state for browser tool errors. Phase and
- * category are the public contract: sanitization emits fixed bounded text
- * from them and never parses arbitrary exception text. The original error
- * stays internally attributable through the cause chain; no rollback or
- * cleanup is ever claimed from it.
- */
-export class BrowserFailureError extends Error {
-  constructor(
-    message: string,
-    readonly phase: BrowserFailurePhase,
-    readonly category: BrowserFailureCategory,
-    options?: { cause?: unknown },
-  ) {
-    super(message, options);
-    this.name = "BrowserFailureError";
-  }
-}
-
-/** Issue #27 model credential capabilities enforced on the tool-action path. */
-export type BrowserCredentialCapability = "model_credential_entry" | "model_credential_submission";
-
-/** Issue #27 model file-transfer capabilities enforced on the tool-action path. */
-export type BrowserFileTransferCapability = "model_uploads" | "model_download_saving";
-
-/** Issue #27 model clipboard capability enforced on the tool-action path. */
-export type BrowserClipboardCapability = "model_clipboard";
-
-/**
- * Typed denial of a disabled model capability (issue #27). The message is
- * fixed manager-owned text: it names no target, value, URL, or page content,
- * and the tool boundary renders one fixed sentence per capability. Human
- * browser input never passes through this path.
- */
-export class BrowserCapabilityDeniedError extends Error {
-  constructor(readonly capability: BrowserCredentialCapability | BrowserFileTransferCapability | BrowserClipboardCapability) {
-    super(capability === "model_credential_entry"
-      ? "not_started: this target is a password or credential field and model credential entry is disabled by the managed-browser permissions; nothing was entered."
-      : capability === "model_credential_submission"
-        ? "not_started: this action submits a form that contains credentials and model credential submission is disabled by the managed-browser permissions; nothing was submitted."
-        : capability === "model_uploads"
-          ? "not_started: model file uploads are disabled by the managed-browser permissions; no file was read or sent."
-          : capability === "model_clipboard"
-            ? "not_started: model clipboard read/write is disabled by the managed-browser permissions; nothing was read from or written to the clipboard."
-            : "not_started: model download saving is disabled by the managed-browser permissions; no file was written.");
-    this.name = "BrowserCapabilityDeniedError";
-  }
-}
-
 export interface BrowserCloseResult {
   session: string;
   closed: true;
@@ -941,115 +896,6 @@ interface Session {
 }
 
 const MAX_TOMBSTONES = 32;
-const SAFE_LOCAL_PROTOCOLS = new Set(["about:", "blob:", "data:"]);
-
-/** Fixed manager-owned cancellation reasons; never caller-controlled text. */
-const BROWSER_CLOSE_CANCEL_REASON = "Browser operation cancelled by BrowserClose.";
-const SESSION_SHUTDOWN_CANCEL_REASON = "Browser operation cancelled by Pi session shutdown/replacement/reload.";
-const VISIBILITY_CANCEL_REASON = "Browser operation cancelled by a browser visibility settings change; the browser is being replaced.";
-
-type BrowserCancellationKind = "close" | "shutdown" | "caller" | "visibility";
-
-type DiagnosticEvent = { sequence: number; textTruncated?: boolean };
-
-/** Shared capture quota: tabs cannot multiply the session retention allowance. */
-export class BrowserDiagnosticQuota {
-  private retained: { owner: object; bytes: number; evict: () => void }[] = [];
-  private bytes = 0;
-
-  constructor(readonly capacity = 256, readonly maxBytes = 1024 * 1024) {}
-
-  retain(owner: object, bytes: number, evict: () => void): void {
-    this.retained.push({ owner, bytes, evict });
-    this.bytes += bytes;
-    while (this.retained.length > this.capacity || this.bytes > this.maxBytes) {
-      const oldest = this.retained.shift()!;
-      this.bytes -= oldest.bytes;
-      oldest.evict();
-    }
-  }
-
-  release(owner: object): void {
-    this.retained = this.retained.filter((entry) => {
-      if (entry.owner !== owner) return true;
-      this.bytes -= entry.bytes;
-      return false;
-    });
-  }
-}
-
-/** A capture-time-bounded, memory-only ring with a never-reused tab-local cursor. */
-export class DiagnosticRing<T extends DiagnosticEvent> {
-  private events: T[] = [];
-  private nextSequence = 1;
-  private dropped = 0;
-  private captureTruncated = 0;
-
-  constructor(readonly capacity: number, private readonly quota = new BrowserDiagnosticQuota(capacity)) {}
-
-  push(event: Omit<T, "sequence">): void {
-    const captured = { ...event, sequence: this.nextSequence++ } as T;
-    if (captured.textTruncated) this.captureTruncated += 1;
-    if (this.events.length >= this.capacity) {
-      const oldest = this.events.shift()!;
-      this.quota.release(oldest);
-      this.dropped += 1;
-    }
-    this.events.push(captured);
-    // Count the UTF-8 serialized safe capture, including metadata, not raw page
-    // strings or UTF-16 code units. No bodies/headers are captured here.
-    this.quota.retain(captured, Buffer.byteLength(JSON.stringify(captured), "utf8"), () => {
-      const index = this.events.indexOf(captured);
-      if (index >= 0) {
-        this.events.splice(index, 1);
-        this.dropped += 1;
-      }
-    });
-  }
-
-  read(after: number, maximum: number): {
-    events: T[];
-    requested: number;
-    next: number;
-    latest: number;
-    oldestRetained: number;
-    dropped: number;
-    totalDropped: number;
-    truncated: number;
-    captureTruncated: number;
-    totalCaptureTruncated: number;
-  } {
-    const latest = this.nextSequence - 1;
-    if (!Number.isSafeInteger(after) || after < 0 || after > latest) {
-      throw new Error(`Browser diagnostic cursor must be an integer from 0 through ${latest}.`);
-    }
-    const oldestRetained = this.events[0]?.sequence ?? this.nextSequence;
-    const dropped = Math.max(0, oldestRetained - 1 - after);
-    const eligible = this.events.filter((event) => event.sequence > after);
-    const events = eligible.slice(0, maximum).map((event) => ({ ...event }));
-    const next = events.at(-1)?.sequence ?? Math.max(after, oldestRetained - 1);
-    return {
-      events,
-      requested: after,
-      next,
-      latest,
-      oldestRetained,
-      dropped,
-      totalDropped: this.dropped,
-      truncated: eligible.length - events.length,
-      captureTruncated: events.filter((event) => event.textTruncated).length,
-      totalCaptureTruncated: this.captureTruncated,
-    };
-  }
-
-  clear(): void {
-    for (const event of this.events) this.quota.release(event);
-    this.events = [];
-    this.nextSequence = 1;
-    this.dropped = 0;
-    this.captureTruncated = 0;
-  }
-}
 
 /**
  * Process-local owner for isolated interactive browser sessions. Nothing is
@@ -5595,21 +5441,6 @@ async function installRoutePolicy(
   });
 }
 
-export function interactiveRouteDecision(resourceType: string, rawUrl: string): { allowed: boolean; reason?: string } {
-  let url: URL;
-  try { url = new URL(rawUrl); } catch { return { allowed: false, reason: "unparseable browser request blocked" }; }
-  // WebSockets use the separately validated per-tab native transport. Ordinary
-  // rendering, SSE and beacon HTTP traffic use the authenticated broker.
-  if (resourceType === "websocket") {
-    return { allowed: false, reason: `${resourceType} resource blocked` };
-  }
-  if (SAFE_LOCAL_PROTOCOLS.has(url.protocol)) return { allowed: true };
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    return { allowed: false, reason: `external protocol ${url.protocol} blocked` };
-  }
-  return { allowed: true };
-}
-
 async function cleanupSession(session: Session, deadlineMs: number): Promise<EgressSummary> {
   // Native page WebSockets die with the context close below; the broker
   // drains its own sockets on client disconnect. Diagnostics were already
@@ -5718,10 +5549,6 @@ async function cleanupPartial(
   if (failures.length > 0) throw new AggregateError(failures.map((failure) => failure.reason), "partial BrowserOpen teardown failed");
 }
 
-async function boundedCleanup<T>(operation: Promise<T>, deadlineMs: number, label: string): Promise<T> {
-  return within(operation, deadlineMs, label);
-}
-
 const INTERACTION_ACCOUNTING_MIN_MS = 200;
 const INTERACTION_ACCOUNTING_MAX_MS = 250;
 const INTERACTION_ACCOUNTING_QUIET_MS = 50;
@@ -5767,139 +5594,6 @@ async function accountInteractionEffects(
     const delayMs = Math.max(1, Math.min(25, accountingDeadline - now));
     await operation.run(new Promise<void>((resolve) => setTimeout(resolve, delayMs)), "interaction effect observation");
   }
-}
-
-// Async-local tracking keeps concurrent, separately owned sessions isolated.
-const operationWork = new AsyncLocalStorage<Set<Promise<unknown>>>();
-
-/** Do not let a rejected child hide still-running sibling browser commands
- * from OperationDeadline's composite-promise tracking. The outer deadline can
- * still contain the browser and drain this group if a sibling never settles.
- */
-async function settleBrowserReads<const T extends readonly unknown[]>(operations: T): Promise<{ -readonly [P in keyof T]: Awaited<T[P]> }> {
-  const results = await Promise.allSettled(operations);
-  const failure = results.find((result) => result.status === "rejected");
-  if (failure?.status === "rejected") throw failure.reason;
-  return results.map((result) => (result as PromiseFulfilledResult<unknown>).value) as { -readonly [P in keyof T]: Awaited<T[P]> };
-}
-
-class OperationDeadline {
-  readonly signal: AbortSignal;
-  private readonly controller = new AbortController();
-  private readonly deadlineAt: number;
-  private readonly timer: NodeJS.Timeout;
-  private readonly externalSignal?: AbortSignal;
-  private readonly onExternalAbort?: () => void;
-
-  constructor(private readonly name: string, private readonly durationMs: number, externalSignal?: AbortSignal) {
-    this.signal = this.controller.signal;
-    this.deadlineAt = Date.now() + durationMs;
-    this.timer = setTimeout(() => {
-      this.controller.abort(new Error(`${name} exceeded its ${durationMs}ms total deadline.`));
-    }, durationMs);
-    this.timer.unref?.();
-    if (externalSignal) {
-      this.externalSignal = externalSignal;
-      this.onExternalAbort = () => this.controller.abort(externalSignal.reason ?? new Error(`${name} cancelled.`));
-      if (externalSignal.aborted) this.onExternalAbort();
-      else externalSignal.addEventListener("abort", this.onExternalAbort, { once: true });
-    }
-  }
-
-  remainingMs(): number {
-    if (this.signal.aborted) throw asError(this.signal.reason);
-    const remaining = this.deadlineAt - Date.now();
-    if (remaining <= 0) {
-      const error = new Error(`${this.name} exceeded its ${this.durationMs}ms total deadline.`);
-      this.controller.abort(error);
-      throw error;
-    }
-    return remaining;
-  }
-
-  run<T>(operation: Promise<T>, phase: string): Promise<T> {
-    // An expired approval prompt cannot dispatch: its permit is revoked by
-    // the caller. It is not an in-flight browser command to drain.
-    const pending = phase === "interactive confirmation" ? undefined : operationWork.getStore();
-    pending?.add(operation);
-    // Attach before checking the deadline: arguments are evaluated before run,
-    // so a command may already have started even when remainingMs throws.
-    void operation.then(() => pending?.delete(operation), () => pending?.delete(operation));
-    this.remainingMs();
-    return abortableOperation(operation, this.signal);
-  }
-
-  dispose(): void {
-    clearTimeout(this.timer);
-    if (this.externalSignal && this.onExternalAbort) {
-      this.externalSignal.removeEventListener("abort", this.onExternalAbort);
-    }
-  }
-}
-
-async function abortableOperation<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  throwIfAborted(signal);
-  let onAbort: (() => void) | undefined;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    onAbort = () => reject(asError(signal.reason));
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-  operation.catch(() => undefined);
-  aborted.catch(() => undefined);
-  try { return await Promise.race([operation, aborted]); }
-  finally { if (onAbort) signal.removeEventListener("abort", onAbort); }
-}
-
-async function within<T>(operation: Promise<T>, timeoutMs: number, label: string, signal?: AbortSignal): Promise<T> {
-  throwIfAborted(signal);
-  let timer: NodeJS.Timeout | undefined;
-  let abortListener: (() => void) | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} exceeded its ${timeoutMs}ms deadline.`)), timeoutMs);
-    timer.unref?.();
-    if (signal) {
-      abortListener = () => reject(asError(signal.reason ?? new Error(`${label} cancelled.`)));
-      signal.addEventListener("abort", abortListener, { once: true });
-    }
-  });
-  operation.catch(() => undefined);
-  deadline.catch(() => undefined);
-  try { return await Promise.race([operation, deadline]); }
-  finally {
-    if (timer) clearTimeout(timer);
-    if (signal && abortListener) signal.removeEventListener("abort", abortListener);
-  }
-}
-
-type Re2Matcher = { test(value: string): boolean };
-type Re2Constructor = new (pattern: string, flags?: string) => Re2Matcher;
-let SafeRE2: Re2Constructor | null = null;
-try {
-  SafeRE2 = (require("re2-wasm") as { RE2: Re2Constructor }).RE2;
-} catch {
-  SafeRE2 = null;
-}
-
-function urlWaitMatcher(kind: "exact" | "prefix" | "pattern", value: string): (url: string) => boolean {
-  if (kind === "exact" || kind === "prefix") {
-    let parsed: URL;
-    try { parsed = new URL(value); } catch { throw new Error(`BrowserWait URL ${kind} value must be an absolute HTTP(S) URL.`); }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error(`BrowserWait URL ${kind} value must use HTTP(S).`);
-    const expected = parsed.href;
-    return kind === "exact" ? (url) => url === expected : (url) => url.startsWith(expected);
-  }
-  if (kind !== "pattern") throw new Error("BrowserWait URL match must be exact, prefix, or pattern.");
-  if (!SafeRE2) throw new Error("BrowserWait safe RE2 matching is unavailable in this runtime.");
-  let matcher: Re2Matcher;
-  try {
-    matcher = new SafeRE2(value, "u");
-  } catch {
-    throw new Error("BrowserWait URL pattern is invalid or unsupported by safe RE2.");
-  }
-  return (url) => {
-    try { return matcher.test(url); }
-    catch { throw new Error("BrowserWait URL pattern could not safely inspect the current URL."); }
-  };
 }
 
 type IsolatedFormFacts = Pick<BrowserTargetStructure, "formAssociated" | "formAction" | "formMethod" | "autocomplete"> & {
@@ -6579,11 +6273,6 @@ function assertUploadTarget(target: BrowserTargetStructure, fileCount: number): 
   }
 }
 
-/** Internal marker: the page completed and reported an effect-free clipboard
- * outcome. It is rethrown precisely without session containment because the
- * browser proved no read/write happened. */
-class BrowserClipboardOutcomeError extends Error {}
-
 /** Fixed manager-owned read script; the only page code a clipboard read runs.
  * Playwright serializes it, so it must stay self-contained. */
 const CLIPBOARD_READ_SCRIPT = async (): Promise<{ ok: true; text: string } | { ok: false; reason: "unavailable" | "denied" | "failed" }> => {
@@ -6826,64 +6515,6 @@ function assertBoundedInteractionCapability(value: string, maxChars: number): vo
   }
 }
 
-function interactionIdentityUrl(rawUrl: string): string {
-  if (rawUrl.length > 4_096) throw new Error("Browser interaction URL exceeds the bounded policy limit.");
-  const parsed = new URL(rawUrl);
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("Browser interaction URL is not HTTP(S).");
-  }
-  return rawUrl;
-}
-
-function redactedInteractionUrl(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "[redacted URL]";
-    return bounded(parsed.origin, 300);
-  } catch {
-    return "[redacted URL]";
-  }
-}
-
-function safePublicPageUrl(rawUrl: string): string {
-  try { return publicPageUrl(rawUrl); }
-  catch { return "[navigation pending]"; }
-}
-
-/** Reported requested URL for a visibility replacement: public URLs bounded
- * as usual; non-public actual page URLs (about:blank, file://) are reported
- * bounded as-is so the intended tab information is never silently dropped. */
-function boundedVisibilityUrl(rawUrl: string): string {
-  try { return publicPageUrl(rawUrl); }
-  catch { return bounded(rawUrl, 2_048); }
-}
-
-function optionalPublicPageUrl(rawUrl: string | undefined): string | null {
-  if (!rawUrl) return null;
-  try { return publicPageUrl(rawUrl); }
-  catch { return null; }
-}
-
-function publicPageUrl(rawUrl: string): string {
-  let url: URL;
-  try { url = new URL(rawUrl); } catch { throw new Error("Browser ended at an invalid URL."); }
-  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error(`Browser ended at blocked protocol ${url.protocol}.`);
-  return bounded(url.href, 2_048);
-}
-
-async function validateNavigationUrl(
-  rawUrl: string,
-  resolveHostname: HostResolver,
-  options?: UrlValidationOptions,
-): Promise<URL> {
-  // Shared fetch/cache validation deliberately canonicalizes away fragments.
-  // Restore only the hash; authority validation and broker egress are unchanged.
-  const validated = await validatePublicUrl(rawUrl, resolveHostname, options);
-  const navigation = new URL(validated.href);
-  navigation.hash = new URL(rawUrl).hash;
-  return navigation;
-}
-
 async function assertControlledTopNavigation(locator: Locator, _page: Page): Promise<void> {
   const facts = await readIsolatedNavigationFacts(locator);
   if (!facts.topLevel) {
@@ -6892,153 +6523,6 @@ async function assertControlledTopNavigation(locator: Locator, _page: Page): Pro
   if (facts.target && facts.target.toLowerCase() !== "_self") {
     throw new Error("BrowserClick not_started: controlled navigation requires the current frame as its effective target.");
   }
-}
-
-class BrowserValidationError extends Error {}
-
-function invalidSessionHandleError(): BrowserRecoveryError {
-  return new BrowserRecoveryError(
-    "Invalid or stale browser session handle: it was not issued by this manager, or a different owner holds it. Use BrowserOpen to start a browser for this Pi session; BrowserSnapshot cannot recover an unknown session.",
-    { kind: "session_unknown" },
-  );
-}
-
-function invalidTabHandleError(session: Session): BrowserRecoveryError {
-  const ownedTabs = [...session.tabs.keys()];
-  const listing = ownedTabs.length > 0
-    ? `Current owned tabs: ${ownedTabs.join(", ")}.`
-    : "No other tabs are currently owned by this session.";
-  return new BrowserRecoveryError(
-    `Invalid or stale browser tab handle for this session. ${listing} Take a fresh BrowserSnapshot on an owned tab, or switch with BrowserTabs.`,
-    { kind: "tabs", session: session.handle, ownedTabs },
-  );
-}
-
-function duplicateOpenError(existing: Session): BrowserRecoveryError {
-  return new BrowserRecoveryError(
-    `A live browser is already open for this Pi session: session=${existing.handle} with active tab=${existing.activeTab}. An earlier successful BrowserOpen result may have been lost to a rewind or Escape. Use BrowserTabs operation=list on that session to recover its handles, then BrowserNavigate or BrowserClose; this BrowserOpen preserved the live session and opened no new browser.`,
-    { kind: "duplicate_open", existingSession: existing.handle, existingTab: existing.activeTab },
-  );
-}
-
-function openCancellationError(cancellation: BrowserCancellationKind, dispatched: boolean): BrowserRecoveryError {
-  const by = cancellation === "shutdown"
-    ? " by Pi session shutdown/replacement/reload"
-    : cancellation === "close" ? " by BrowserClose"
-    : cancellation === "visibility" ? " by a browser visibility settings change" : "";
-  if (!dispatched) {
-    return new BrowserRecoveryError(
-      `BrowserOpen was cancelled${by} before navigation dispatch; no page effects occurred and cleanup was confirmed. It is safe to retry BrowserOpen.`,
-      { kind: "cancelled", phase: "not_started", cleanup: "confirmed", recovery: "retry" },
-    );
-  }
-  return new BrowserRecoveryError(
-    `BrowserOpen was cancelled${by} after navigation dispatch; network effects may have occurred, effect status is unknown, and no rollback is claimed. Cleanup was confirmed; use BrowserOpen to start a new browser session.`,
-    { kind: "cancelled", phase: "dispatched", cleanup: "confirmed", recovery: "reopen" },
-  );
-}
-
-function unconfirmedOpenCleanupError(): BrowserRecoveryError {
-  return new BrowserRecoveryError(
-    "BrowserOpen failed and teardown could not be confirmed; browser resources may remain. This browser manager is fail-closed: recover by restarting the Pi session (terminal restart or reload) before further browser use. Effect status is unknown; no rollback is claimed.",
-    { kind: "unconfirmed_cleanup", phase: "unknown", cleanup: "unconfirmed" },
-  );
-}
-
-/** Fixed owned text plus structured fields; the original stays in the cause. */
-function browserFailure(cause: Error, phase: BrowserFailurePhase, category: BrowserFailureCategory): BrowserFailureError {
-  return new BrowserFailureError(bounded(cause.message, 500), phase, category, { cause });
-}
-
-const DEADLINE_ERROR_PATTERN = /exceeded its \d{1,8}ms total deadline/;
-
-/** Classify one failed BrowserOpen startup stage; the outcome is unchanged. */
-function classifySetupFailure(error: Error, stage: BrowserFailurePhase): BrowserFailureError {
-  if (error instanceof BrowserFailureError) return error;
-  let category: BrowserFailureCategory;
-  // Site-assigned typed categories are authoritative and cannot be shadowed
-  // by caller-controlled text in the message.
-  if (error instanceof PublicUrlValidationError) category = error.category;
-  else if (DEADLINE_ERROR_PATTERN.test(error.message)) category = "timeout";
-  else if (stage === "url_validation") category = classifyPublicUrlError(error);
-  else category = "internal_error";
-  return browserFailure(error, stage, category);
-}
-
-/**
- * Classify manager-owned session-fatal errors from their fixed strings. These
- * messages are owned constants, not page or network content; the original
- * error remains internally attributable through the cause chain.
- */
-function classifyFatalSessionError(error: Error): Error {
-  if (error instanceof BrowserFailureError || error instanceof BrowserRecoveryError) return error;
-  let category: BrowserFailureCategory = "internal_error";
-  if (/disconnected unexpectedly|tab crashed|Last browser tab closed unexpectedly/i.test(error.message)) {
-    category = "browser_process_failure";
-  } else if (/redirect hops|main-document request limit/i.test(error.message)) {
-    category = "budget_exhausted";
-  }
-  return browserFailure(error, "navigation", category);
-}
-
-/** Safe category for one failed Chromium navigation (fixed net tokens only).
- * The leading Chromium token is checked first: it precedes any URL in the
- * message, so caller-controlled text cannot shadow it. */
-function classifyNavigationError(error: Error): BrowserFailureCategory {
-  const token = /\bnet::ERR_[A-Z0-9_]{1,64}\b/u.exec(error.message)?.[0];
-  switch (token) {
-    case "net::ERR_NAME_NOT_RESOLVED":
-    case "net::ERR_NAME_RESOLUTION_FAILED":
-      return "dns_resolution_failed";
-    case "net::ERR_TIMED_OUT":
-      return "timeout";
-    default:
-      break;
-  }
-  if (DEADLINE_ERROR_PATTERN.test(error.message)) return "timeout";
-  return "browser_network_failure";
-}
-
-function operationCancellationError(cancellation: BrowserCancellationKind, phase: "not_started" | "dispatched" | "unknown"): BrowserRecoveryError {
-  const by = cancellation === "close"
-    ? " by BrowserClose"
-    : cancellation === "shutdown" ? " by Pi session shutdown/replacement/reload" : "";
-  if (cancellation === "visibility") {
-    const effect = phase === "not_started"
-      ? "No page effects occurred."
-      : "Page or network effects may have occurred, effect status is unknown, and no rollback is claimed.";
-    return new BrowserRecoveryError(
-      `Browser operation was cancelled by a browser visibility settings change; the live browser is being replaced and every old session/tab/ref handle is invalidated. ${effect} A replacement browser with new handles is issued by the settings save when restoration succeeds; otherwise use BrowserOpen.`,
-      { kind: "cancelled", phase, cleanup: "confirmed", recovery: "reopen" },
-    );
-  }
-  if (phase === "not_started") {
-    return new BrowserRecoveryError(
-      `Browser operation was cancelled${by} before dispatch; effect status is not_started and no page effects occurred. Session teardown was confirmed; use BrowserOpen to start a new browser session.`,
-      { kind: "cancelled", phase: "not_started", cleanup: "confirmed", recovery: "reopen" },
-    );
-  }
-  if (phase === "dispatched") {
-    return new BrowserRecoveryError(
-      `Browser operation was cancelled${by} after dispatch; page or network effects may have occurred, effect status is unknown, and no rollback is claimed. Cleanup was confirmed; use BrowserOpen to start a new browser session.`,
-      { kind: "cancelled", phase: "dispatched", cleanup: "confirmed", recovery: "reopen" },
-    );
-  }
-  return new BrowserRecoveryError(
-    `Browser operation was cancelled${by}; effect status is unknown and no rollback is claimed. Session teardown was confirmed; use BrowserOpen to start a new browser session.`,
-    { kind: "cancelled", phase: "unknown", cleanup: "confirmed", recovery: "reopen" },
-  );
-}
-
-function operationTeardownUncertainError(): BrowserRecoveryError {
-  return new BrowserRecoveryError(
-    "Browser operation failed and teardown could not be confirmed; browser resources may remain. This browser manager is fail-closed: recover by restarting the Pi session (terminal restart or reload) before further browser use. Effect status is unknown; no rollback is claimed.",
-    { kind: "unconfirmed_cleanup", phase: "unknown", cleanup: "unconfirmed" },
-  );
-}
-
-function invalidRefError(): Error {
-  return new BrowserValidationError("Invalid or stale browser semantic ref; take a fresh BrowserSnapshot for the current session, tab, and document.");
 }
 
 function boundedElementClip(
@@ -7126,108 +6610,8 @@ function validatePngScreenshot(
   return { width, height };
 }
 
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw asError(signal.reason ?? new Error("Browser operation cancelled."));
-}
-
 function clampedTestLimit(value: number, hardMaximum: number): number {
   return Number.isFinite(value) ? Math.min(hardMaximum, Math.max(1, Math.floor(value))) : hardMaximum;
-}
-
-function bounded(value: string, maxChars: number): string {
-  return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 1))}…`;
-}
-
-function boundedUntrustedText(raw: unknown, maxChars: number): { value: string; truncated: boolean } {
-  const original = typeof raw === "string" ? raw : String(raw ?? "");
-  // Strip terminal/control framing and bidi overrides before generic secret
-  // redaction. The returned string is page-controlled evidence, never markup.
-  const captured = original.slice(0, maxChars);
-  const structural = captured
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, " ")
-    .replace(/[\u202a-\u202e\u2066-\u2069]/gu, "");
-  const redacted = redactSensitiveText(structural);
-  return {
-    value: redacted.slice(0, maxChars),
-    truncated: original.length > maxChars || redacted.length > maxChars,
-  };
-}
-
-function consoleLevel(raw: string): BrowserConsoleEvent["level"] {
-  const normalized = raw.toLocaleLowerCase("en-US");
-  if (normalized === "debug" || normalized === "info" || normalized === "log" || normalized === "error") return normalized;
-  if (normalized === "warning" || normalized === "warn") return "warning";
-  return "other";
-}
-
-function diagnosticElapsed(now: number, createdAt: number): number {
-  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(now - createdAt)));
-}
-
-function boundedNonnegativeInteger(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(value)))
-    : 0;
-}
-
-function boundedHttpStatus(value: unknown): number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 999 ? value : 0;
-}
-
-function diagnosticMethod(raw: string): string {
-  const upper = raw.toLocaleUpperCase("en-US");
-  return /^[A-Z]{1,16}$/.test(upper) ? upper : "OTHER";
-}
-
-function diagnosticResourceKind(raw: string): string {
-  const normalized = raw.toLocaleLowerCase("en-US");
-  const allowed = new Set([
-    "document", "stylesheet", "script", "xhr", "fetch", "image", "font", "media",
-    "websocket", "eventsource", "manifest", "texttrack", "other",
-  ]);
-  return allowed.has(normalized) ? normalized : "other";
-}
-
-function diagnosticNetworkFailure(raw: string): string {
-  // Browser failure strings occasionally embed the complete request URL.
-  // Retain only Chromium's fixed error token, never free-form failure text.
-  const code = /\b(?:net::)?ERR_[A-Z0-9_]{1,64}\b/u.exec(raw)?.[0];
-  return code ? code.slice(0, 64) : "request_failed";
-}
-
-function diagnosticOrigin(rawUrl: string, maxChars: number): string {
-  const origin = diagnosticPublicOrigin(rawUrl);
-  return bounded(origin ?? "[non-public or redacted origin]", maxChars);
-}
-
-function diagnosticPublicOrigin(rawUrl: string): string | null {
-  try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    return bounded(parsed.origin, 300);
-  } catch {
-    return null;
-  }
-}
-
-/** Bounded origin for WebSocket diagnostics: scheme+host+port only. */
-function diagnosticWsOrigin(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return "[non-public or redacted origin]";
-    return bounded(parsed.origin, 300);
-  } catch {
-    return "[non-public or redacted origin]";
-  }
-}
-
-function boundedWsCloseCode(code: unknown): number | undefined {
-  return typeof code === "number" && Number.isInteger(code) && code >= 1000 && code <= 4999 ? code : undefined;
-}
-
-/** Close reasons are page-channel data; bound them before they re-enter a route. */
-function boundedWsCloseReason(reason: unknown): string | undefined {
-  return typeof reason === "string" && reason.length > 0 ? reason.slice(0, 123) : undefined;
 }
 
 /** Synchronous admission checks for one page-created WebSocket URL. */
@@ -7292,43 +6676,6 @@ function normalizeBrowserClickButton(value: unknown): BrowserClickButton {
     throw new Error("BrowserClick not_started: button must be exactly left or right.");
   }
   return value;
-}
-
-function normalizedInteractionFailure(
-  name: "BrowserHover" | "BrowserClick" | "BrowserFill" | "BrowserType" | "BrowserSelect" | "BrowserPress" | "BrowserUpload" | "BrowserDownloadSave" | "BrowserClipboard",
-  error: unknown,
-): Error {
-  if (error instanceof BrowserSessionClosedError) return error;
-  const message = error instanceof Error ? error.message : "";
-  if (/\b(?:not_started|effect status is (?:started|completed|unknown))\b/i.test(message)) return asError(error);
-  if (/Invalid or stale browser session handle|Browser session is closed/.test(message)) {
-    return new Error(`${name} not_started: browser session is closed or unknown; use BrowserOpen to start a browser for this Pi session (BrowserSnapshot cannot recover it).`);
-  }
-  if (/Invalid or stale browser tab handle/.test(message)) {
-    return new Error(`${name} not_started: invalid or stale owned tab capability; list owned tabs with BrowserTabs and take a fresh BrowserSnapshot.`);
-  }
-  if (/Invalid or stale browser semantic ref/.test(message)) {
-    return new Error(`${name} not_started: invalid or stale owned semantic capability; take a fresh BrowserSnapshot.`);
-  }
-  if (/Invalid or stale browser download handle/.test(message)) {
-    return new Error(`${name} not_started: invalid or stale owned download capability; list this tab's pending downloads with BrowserDownloadSave (no destination) and retry with a current handle.`);
-  }
-  return new Error(`${name} failed before dispatch; effect status is not_started.`);
-}
-
-function cancellationKind(signal: AbortSignal): BrowserCancellationKind | undefined {
-  if (!signal.aborted) return undefined;
-  // Classify only against fixed manager-owned reason strings; arbitrary
-  // caller or page exception text is never parsed for meaning.
-  const reasonMessage = signal.reason instanceof Error ? signal.reason.message : "";
-  if (reasonMessage === BROWSER_CLOSE_CANCEL_REASON) return "close";
-  if (reasonMessage === SESSION_SHUTDOWN_CANCEL_REASON) return "shutdown";
-  if (reasonMessage === VISIBILITY_CANCEL_REASON) return "visibility";
-  return "caller";
-}
-
-function asError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
 }
 
 interface RawSemanticDetail {

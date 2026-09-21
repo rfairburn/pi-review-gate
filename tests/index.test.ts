@@ -28,10 +28,15 @@ const webToolNames = [
 
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
+let previousRuntimeRole: string | undefined;
 
 beforeEach(() => {
   previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+  // Hermetic top-level surface: an inherited executor role would divert
+  // activate() to the executor runtime branch (orchestrated workers set it).
+  previousRuntimeRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
 });
 
 afterEach(() => {
@@ -39,6 +44,8 @@ afterEach(() => {
   else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
   if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;
   else process.env.PI_REVIEW_GATE_DISABLED = previousDisabled;
+  if (previousRuntimeRole === undefined) delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  else process.env.PI_REVIEW_GATE_RUNTIME_ROLE = previousRuntimeRole;
 });
 
 const indexTestConfig = {
@@ -643,14 +650,14 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
 
     await activate(pi);
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools",
+      ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools", "AskUserQuestion",
     ]);
 
     runtimeInitialized = true;
     const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
     await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools", ...executionToolNames,
+      ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools", "AskUserQuestion", ...executionToolNames,
     ]);
     const deferredActive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"];
     assert.deepEqual(activeTools, deferredActive);
@@ -659,7 +666,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     // discovery set — authorized minus baseline-loaded — comma-delimited.
     const searchDefinition = registeredTools.find((tool) => tool.name === "search_tools");
     const expectedDiscovery = [
-      ...webToolNames, ...backgroundShellToolNames,
+      "AskUserQuestion", ...webToolNames, ...backgroundShellToolNames,
       ...executionToolNames.filter((name) => name !== "SubtasksStart"),
     ].sort();
     assert.match(searchDefinition?.description ?? "", new RegExp(`Authorized tool names: ${expectedDiscovery.map(escapeRegExp).join(", ")}\\.$`));
@@ -685,7 +692,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     await toggleDeferredTools();
     const fullAuthorized = [
       "read", "bash", "edit", ...webToolNames, "ApplyPatch", ...backgroundShellToolNames,
-      ...executionToolNames,
+      "AskUserQuestion", ...executionToolNames,
     ];
     assert.deepEqual(activeTools, [...fullAuthorized, "search_tools"], "saving Off immediately activates the complete local catalog");
     await toggleDeferredTools();
@@ -702,7 +709,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     // search_tools itself are omitted, every deferred discovery tool is
     // listed with its compact canonical purpose.
     const discoveryNames = [
-      ...webToolNames, ...backgroundShellToolNames,
+      "AskUserQuestion", ...webToolNames, ...backgroundShellToolNames,
       ...executionToolNames.filter((name) => name !== "SubtasksStart"),
     ];
     for (const name of discoveryNames) {

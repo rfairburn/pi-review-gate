@@ -53,6 +53,7 @@ import { WebToolManager, type PiWebHost } from "./web/tools";
 import { DeferredToolManager } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
 import { registerModeCycleShortcut } from "./mode-cycle";
+import { contextIsInteractiveTui, registerUserQuestions, userQuestionsBeginSession, userQuestionsEndSession } from "./user-question";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
   createExecutorToolCatalog,
@@ -210,6 +211,13 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // reconciled every legitimately available top-level execution tool.
   const deferredTools = new DeferredToolManager(pi, () => config.operatingMode);
   deferredTools.register();
+
+  // Pending questions (issue #95): AskUserQuestion registers before
+  // session_start so it enters the deferred-tool authorization boundary like
+  // every other top-level tool; the pending-question list shortcut and the
+  // persistent panel widget are registered here as well. Top level only — executor
+  // runtimes have no question UI surface.
+  const userQuestions = registerUserQuestions(pi);
 
   const state = createState();
   let currentCwd = process.cwd();
@@ -383,6 +391,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
     setStatus(extractContext(args) ?? pi, "review-gate-mode", undefined);
     sessionAbortController.abort();
+    // Settle every pending question and sync waiter for the dying session so
+    // nothing can outlive it; the abort above already interrupted active runs.
+    userQuestionsEndSession(userQuestions?.controller);
     const reviewSettled = activeReviewSettled;
     activeReviewAbort?.shutdown();
     activeReviewAbort = undefined;
@@ -427,6 +438,20 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     const deferredSessionIdentity = typeof context === "object" && context !== null
       ? (context as { sessionManager?: unknown }).sessionManager
       : undefined;
+    // Bind the pending-question controller to this session's identity; every
+    // registration, presentation, and submission rechecks it, so questions
+    // never cross switch/new/fork. Only an interactive TUI session can ever
+    // answer or decline a question (RPC/print/JSON have no key input), so the
+    // surface stays fail-closed everywhere else.
+    userQuestionsBeginSession(userQuestions?.controller, deferredSessionIdentity);
+    userQuestions?.setInteractiveUi(contextIsInteractiveTui(context));
+    // The panel renders through the event context's widget surface (the
+    // installed host does not expose it on the extension API object), so
+    // note this session's live context before reconciling. A new session
+    // never inherits another session's panel, and an unusable identity must
+    // clear any stale one (beginSession does not notify in that case).
+    userQuestions?.noteContext(context);
+    userQuestions?.syncPanel();
     const identity = sessionPersistenceIdentity(context, currentCwd);
     const appendEntry = typeof pi === "object" && pi !== null && "appendEntry" in pi && typeof pi.appendEntry === "function"
       ? pi.appendEntry.bind(pi) as (customType: string, data: unknown) => void

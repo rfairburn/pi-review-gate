@@ -118,10 +118,13 @@ export class FakeDynamicBorder {
 export interface FakeMenuTuiHostOptions {
   /** Collects every FakeSelectList created, in construction order. */
   lists?: FakeSelectList[];
+  /** Collects every manager passed to the fake setKeybindings(). */
+  setKeybindingsCalls?: unknown[];
 }
 
 export function createFakeMenuTuiHost(options: FakeMenuTuiHostOptions = {}): MenuTuiHost {
   const lists = options.lists ?? [];
+  const setKeybindingsCalls = options.setKeybindingsCalls ?? [];
   return {
     SelectList: class extends FakeSelectList {
       constructor(items: MenuSelectItem[], maxVisible: number, theme: MenuSelectListTheme) {
@@ -132,6 +135,9 @@ export function createFakeMenuTuiHost(options: FakeMenuTuiHostOptions = {}): Men
     Container: FakeContainer,
     Text: FakeText,
     DynamicBorder: FakeDynamicBorder,
+    setKeybindings: (keybindings: unknown): void => {
+      setKeybindingsCalls.push(keybindings);
+    },
   };
 }
 
@@ -155,6 +161,8 @@ export interface TuiSettingsHarness {
   initialIndexes: number[];
   /** Every FakeSelectList created by the adapter, in show order. */
   lists: FakeSelectList[];
+  /** Every manager the adapter passed to the host's setKeybindings(). */
+  setKeybindingsCalls: unknown[];
   /** Plain ui.select calls (one-shot pickers and fallback only). */
   selectCalls: Array<{ title: string; options: string[] }>;
   inputCalls: Array<{ title: string; placeholder?: string }>;
@@ -177,10 +185,13 @@ export function createTuiSettingsContext(
     selectScript?: Array<string | undefined>;
     inputs?: Array<string | undefined>;
     confirms?: boolean[];
+    /** The keybindings manager the host injects into custom() (null = none). */
+    keybindings?: unknown;
   } = {},
 ): TuiSettingsHarness {
   const lists: FakeSelectList[] = [];
-  const host = createFakeMenuTuiHost({ lists });
+  const setKeybindingsCalls: unknown[] = [];
+  const host = createFakeMenuTuiHost({ lists, setKeybindingsCalls });
   const frames: string[][] = [];
   const initialIndexes: number[] = [];
   const selectCalls: TuiSettingsHarness["selectCalls"] = [];
@@ -199,7 +210,7 @@ export function createTuiSettingsContext(
         // Simulate the host showExtensionCustom: run the factory with the
         // real done() as resolver, render one initial frame (so the
         // preselection is observable), then feed this menu's scripted keys.
-        const component = factory(FAKE_TUI, IDENTITY_THEME, null, resolve) as {
+        const component = factory(FAKE_TUI, IDENTITY_THEME, options.keybindings ?? null, resolve) as {
           render?(width: number): string[];
           handleInput?(data: string): void;
         };
@@ -242,6 +253,7 @@ export function createTuiSettingsContext(
     frames,
     initialIndexes,
     lists,
+    setKeybindingsCalls,
     selectCalls,
     inputCalls,
     confirmCalls: () => confirmCount,
@@ -250,56 +262,57 @@ export function createTuiSettingsContext(
   };
 }
 
+const TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
+const AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+
+interface RealPiModules {
+  tui: Record<string, unknown>;
+  agent?: Record<string, unknown>;
+}
+
+function isModuleRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
- * Best-effort loader for the actually installed pi packages so one test can
- * drive the real SelectList. Resolution order: direct package resolution
- * (host alias or dependency), then the global pi install next to the node
- * binary. Returns undefined when nothing is resolvable (test skips).
+ * Resolves the actually installed pi packages. Resolution order: direct
+ * package resolution (host alias or dependency), then the global pi install
+ * next to the node binary, plus the common macOS Homebrew and /usr/local
+ * prefixes where a separately installed pi may live. Returns undefined when
+ * nothing is resolvable (test skips).
  */
-export async function loadRealMenuTuiHost(): Promise<MenuTuiHost | undefined> {
-  const fromModules = async (agentDir: string): Promise<MenuTuiHost | undefined> => {
+async function resolveRealPiModules(): Promise<RealPiModules | undefined> {
+  const fromModules = async (agentDir: string): Promise<RealPiModules | undefined> => {
     try {
       const requireFromAgent = createRequire(join(agentDir, "package.json"));
-      const tui = requireFromAgent("@earendil-works/pi-tui") as Record<string, unknown>;
+      const tui = requireFromAgent(TUI_PACKAGE_NAME) as Record<string, unknown>;
       if (typeof tui?.SelectList !== "function" || typeof tui?.Container !== "function" || typeof tui?.Text !== "function") {
         return undefined;
       }
-      const host: MenuTuiHost = {
-        SelectList: tui.SelectList as MenuTuiHost["SelectList"],
-        Container: tui.Container as MenuTuiHost["Container"],
-        Text: tui.Text as MenuTuiHost["Text"],
-      };
+      let agent: Record<string, unknown> | undefined;
       try {
-        const agent = requireFromAgent("@earendil-works/pi-coding-agent") as Record<string, unknown>;
-        if (typeof agent?.DynamicBorder === "function") host.DynamicBorder = agent.DynamicBorder as MenuTuiHost["DynamicBorder"];
-        if (typeof agent?.getSelectListTheme === "function") host.getSelectListTheme = agent.getSelectListTheme as MenuTuiHost["getSelectListTheme"];
+        const loaded = requireFromAgent(AGENT_PACKAGE_NAME) as Record<string, unknown>;
+        if (isModuleRecord(loaded)) agent = loaded;
       } catch {
         // Borders and themes are cosmetic; the real SelectList is the point.
       }
-      return host;
+      return { tui, agent };
     } catch {
       return undefined;
     }
   };
 
-  const tuiName = "@earendil-works/pi-tui";
-  const agentName = "@earendil-works/pi-coding-agent";
   try {
-    const tui = (await import(tuiName)) as Record<string, unknown>;
+    const tui = (await import(TUI_PACKAGE_NAME)) as Record<string, unknown>;
     if (typeof tui?.SelectList === "function" && typeof tui?.Container === "function" && typeof tui?.Text === "function") {
-      const host: MenuTuiHost = {
-        SelectList: tui.SelectList as MenuTuiHost["SelectList"],
-        Container: tui.Container as MenuTuiHost["Container"],
-        Text: tui.Text as MenuTuiHost["Text"],
-      };
+      let agent: Record<string, unknown> | undefined;
       try {
-        const agent = (await import(agentName)) as Record<string, unknown>;
-        if (typeof agent?.DynamicBorder === "function") host.DynamicBorder = agent.DynamicBorder as MenuTuiHost["DynamicBorder"];
-        if (typeof agent?.getSelectListTheme === "function") host.getSelectListTheme = agent.getSelectListTheme as MenuTuiHost["getSelectListTheme"];
+        const loaded = (await import(AGENT_PACKAGE_NAME)) as Record<string, unknown>;
+        if (isModuleRecord(loaded)) agent = loaded;
       } catch {
         // Cosmetic.
       }
-      return host;
+      return { tui, agent };
     }
   } catch {
     // Not resolvable from this tree; try the global install below.
@@ -320,8 +333,41 @@ export async function loadRealMenuTuiHost(): Promise<MenuTuiHost | undefined> {
   for (const root of roots) {
     const agentDir = join(root, "@earendil-works", "pi-coding-agent");
     if (!existsSync(join(agentDir, "package.json"))) continue;
-    const host = await fromModules(agentDir);
-    if (host) return host;
+    const modules = await fromModules(agentDir);
+    if (modules) return modules;
   }
   return undefined;
+}
+
+/**
+ * Best-effort loader for the actually installed pi-tui module so tests can
+ * drive the real SelectList and its keybinding exports. Returns undefined
+ * when nothing is resolvable (test skips).
+ */
+export async function loadRealPiTuiModule(): Promise<Record<string, unknown> | undefined> {
+  return (await resolveRealPiModules())?.tui;
+}
+
+/**
+ * Best-effort loader for the actually installed pi packages so one test can
+ * drive the real SelectList. Returns undefined when nothing is resolvable
+ * (test skips).
+ */
+export async function loadRealMenuTuiHost(): Promise<MenuTuiHost | undefined> {
+  const modules = await resolveRealPiModules();
+  if (!modules) return undefined;
+  const { tui, agent } = modules;
+  const host: MenuTuiHost = {
+    SelectList: tui.SelectList as MenuTuiHost["SelectList"],
+    Container: tui.Container as MenuTuiHost["Container"],
+    Text: tui.Text as MenuTuiHost["Text"],
+  };
+  if (typeof tui.setKeybindings === "function") {
+    host.setKeybindings = tui.setKeybindings as MenuTuiHost["setKeybindings"];
+  }
+  if (agent) {
+    if (typeof agent.DynamicBorder === "function") host.DynamicBorder = agent.DynamicBorder as MenuTuiHost["DynamicBorder"];
+    if (typeof agent.getSelectListTheme === "function") host.getSelectListTheme = agent.getSelectListTheme as MenuTuiHost["getSelectListTheme"];
+  }
+  return host;
 }

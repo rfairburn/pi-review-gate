@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.63]
+
+### Changed
+
+- Split extension-entrypoint tests into focused readiness, deferred-discovery,
+  restoration, review-lifecycle, and uncertain-transmission suites with shared
+  fixture setup. Preserve all 55 scenarios and their production entrypoints;
+  runtime behavior is unchanged.
+
 ## [0.1.0-dev.62]
 
 ### Added

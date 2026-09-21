@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.62]
+
+### Added
+
+- Both launcher paths now install and refresh execution and research skills
+  alongside orchestrator and its recovery reference, preserving unrelated
+  custom skills. Ship capability-aware role guidance and concise startup cues
+  while keeping detailed instructions in the skills rather than system prompts.
+- Explain capability-based delegation, background-job lifecycles, and diagnostic
+  execution that returns evidence without fabricated source changes. Research
+  remains read-only and delegation never expands the parent's permissions.
+
+### Changed
+
+- Expose authorized deferred-tool names in the tool-search description and
+  compact names with purposes in startup guidance. Exclude role-baseline tools,
+  keep inventories stable across ordinary deferred activation, and recompute
+  them when actual mode or permission boundaries change. Full schemas remain
+  deferred; unauthorized tools remain unavailable.
+
 ## [0.1.0-dev.61]
 
 ### Added

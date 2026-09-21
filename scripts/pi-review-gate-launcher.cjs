@@ -37,10 +37,11 @@
  *   check, binary-only install) with the Windows venv layout
  *   Scripts\python.exe and a python3 -> python interpreter probe, then
  *   exports PI_REVIEW_GATE_DDGS_PYTHON for the extension.
- * - Refreshes the discoverable orchestrator skill at
- *   ~/.agents/skills/orchestrator/SKILL.md (and its recovery runbook) from
- *   the packaged sources, staged to a temporary file and published with an
- *   atomic rename so concurrent launches replace whole files only. On
+ * - Refreshes the discoverable shipped skills under
+ *   ~/.agents/skills/ (orchestrator with its recovery runbook, execution, and
+ *   research) from the packaged sources, staged to temporary files and
+ *   published with atomic renames so concurrent launches replace whole files
+ *   only. On
  *   Windows the rename-replace can transiently fail with EPERM/EACCES/EBUSY
  *   while an external holder (an antivirus or indexing filter scanning
  *   freshly closed files) keeps the staged file or destination open, so the
@@ -648,8 +649,25 @@ function findPythonInterpreter() {
 }
 
 /**
- * Publish one orchestrator skill file atomically, mirroring
- * publish_orchestrator_skill_file in scripts/pi-review-gate.sh: the content is
+ * Skill provisioning manifest (issue 23): every shipped skill file with its
+ * installed destination relative to ~/.agents/skills/<name>. Keep in sync with
+ * SKILL_PUBLISH_PLAN in scripts/pi-review-gate.sh.
+ */
+const SKILL_PUBLISH_PLAN = [
+  {
+    name: "orchestrator",
+    files: [
+      { source: ["skills", "orchestrator", "SKILL.md"], destination: ["SKILL.md"] },
+      { source: ["skills", "orchestrator", "references", "recovery.md"], destination: ["references", "recovery.md"] },
+    ],
+  },
+  { name: "execution", files: [{ source: ["skills", "execution", "SKILL.md"], destination: ["SKILL.md"] }] },
+  { name: "research", files: [{ source: ["skills", "research", "SKILL.md"], destination: ["SKILL.md"] }] },
+];
+
+/**
+ * Publish one shipped skill file atomically, mirroring
+ * publish_skill_file in scripts/pi-review-gate.sh: the content is
  * staged in a temporary file inside the destination directory and moved into
  * place with an atomic rename (fs.renameSync). rename() replaces an existing
  * regular destination in a single step, so concurrent launches publishing the
@@ -662,14 +680,14 @@ function findPythonInterpreter() {
  * staging, permission, and unexpected failure still fails closed with the
  * underlying filesystem error reported.
  */
-function publishOrchestratorSkillFile(skillSource, skillDestination) {
+function publishSkillFile(skillSource, skillDestination) {
   const dir = path.dirname(skillDestination);
   const tmp = path.join(dir, `.skill-publish.${crypto.randomBytes(8).toString("hex")}`);
   let fd;
   try {
     fd = fs.openSync(tmp, "wx", 0o644);
   } catch {
-    note(`pi-review-gate: could not create a temporary file in ${dir} (permission denied?); the orchestrator skill cannot be published to ${skillDestination}\n`);
+    note(`pi-review-gate: could not create a temporary file in ${dir} (permission denied?); the skill file cannot be published to ${skillDestination}\n`);
     return false;
   }
   try {
@@ -687,7 +705,7 @@ function publishOrchestratorSkillFile(skillSource, skillDestination) {
     fs.chmodSync(tmp, 0o644);
   } catch {
     removeQuietly(tmp);
-    note(`pi-review-gate: could not set permissions on the staged orchestrator skill file in ${dir}; refusing to continue\n`);
+    note(`pi-review-gate: could not set permissions on the staged skill file in ${dir}; refusing to continue\n`);
     return false;
   }
   // Atomic rename with exact whole-file replacement semantics: rename()
@@ -704,7 +722,7 @@ function publishOrchestratorSkillFile(skillSource, skillDestination) {
   );
   if (outcome.published) {
     if (outcome.attempts > 1) {
-      note(`pi-review-gate: publishing the orchestrator skill to ${skillDestination} was contended (${outcome.lastError.code}: ${outcome.lastError.message}); published whole after ${outcome.attempts} attempts\n`);
+      note(`pi-review-gate: publishing the skill file to ${skillDestination} was contended (${outcome.lastError.code}: ${outcome.lastError.message}); published whole after ${outcome.attempts} attempts\n`);
     }
     return true;
   }
@@ -715,23 +733,23 @@ function publishOrchestratorSkillFile(skillSource, skillDestination) {
     const detail = outcome.lastError && typeof outcome.lastError === "object" && outcome.lastError.code
       ? ` (${outcome.lastError.code}: ${outcome.lastError.message})`
       : "";
-    note(`pi-review-gate: unexpected failure publishing the orchestrator skill to ${skillDestination}${detail}; re-run the launcher\n`);
+    note(`pi-review-gate: unexpected failure publishing the skill file to ${skillDestination}${detail}; re-run the launcher\n`);
   }
   return false;
 }
 
 /**
- * Refresh the orchestrator skill only when the installed file is missing or
+ * Refresh a shipped skill file only when the installed file is missing or
  * differs from the source (cmp -s parity).
  */
-function refreshOrchestratorSkillFile(skillSource, skillDestination) {
+function refreshSkillFile(skillSource, skillDestination) {
   try {
     const installed = fs.readFileSync(skillDestination);
     if (installed.equals(fs.readFileSync(skillSource))) return true;
   } catch {
     // Missing or unreadable destination: republish below.
   }
-  return publishOrchestratorSkillFile(skillSource, skillDestination);
+  return publishSkillFile(skillSource, skillDestination);
 }
 
 /**
@@ -784,32 +802,31 @@ function main(argv) {
   if (!ddgs.ok) return ddgs.exitCode;
   process.env.PI_REVIEW_GATE_DDGS_PYTHON = ddgs.python;
 
-  const orchestratorSkillSource = joinForPlatform(process.platform, root, "skills", "orchestrator", "SKILL.md");
-  const orchestratorRecoverySource = joinForPlatform(
-    process.platform, root, "skills", "orchestrator", "references", "recovery.md",
-  );
-  const orchestratorSkillDir = joinForPlatform(resolution.platform, resolution.homeDir, ".agents", "skills", "orchestrator");
-  if (!isUsableRegularFile(orchestratorSkillSource)) {
-    note(`pi-review-gate: packaged orchestrator skill is missing: ${orchestratorSkillSource}\n`);
-    return 2;
+  // Fail closed before any publication when a packaged skill file is missing.
+  for (const skill of SKILL_PUBLISH_PLAN) {
+    for (const file of skill.files) {
+      const source = joinForPlatform(process.platform, root, ...file.source);
+      if (!isUsableRegularFile(source)) {
+        note(`pi-review-gate: packaged skill file is missing: ${source}\n`);
+        return 2;
+      }
+    }
   }
-  if (!isUsableRegularFile(orchestratorRecoverySource)) {
-    note(`pi-review-gate: packaged orchestrator recovery reference is missing: ${orchestratorRecoverySource}\n`);
-    return 2;
-  }
-  try {
-    fs.mkdirSync(joinForPlatform(process.platform, orchestratorSkillDir, "references"), { recursive: true });
-  } catch {
-    return 2;
-  }
-  if (!refreshOrchestratorSkillFile(orchestratorSkillSource, joinForPlatform(process.platform, orchestratorSkillDir, "SKILL.md"))) {
-    return 2;
-  }
-  if (!refreshOrchestratorSkillFile(
-    orchestratorRecoverySource,
-    joinForPlatform(process.platform, orchestratorSkillDir, "references", "recovery.md"),
-  )) {
-    return 2;
+  for (const skill of SKILL_PUBLISH_PLAN) {
+    const skillDir = joinForPlatform(resolution.platform, resolution.homeDir, ".agents", "skills", skill.name);
+    for (const file of skill.files) {
+      const source = joinForPlatform(process.platform, root, ...file.source);
+      const destination = joinForPlatform(process.platform, skillDir, ...file.destination);
+      try {
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+      } catch {
+        return 2;
+      }
+      if (!refreshSkillFile(source, destination)) {
+        return 2;
+      }
+    }
+    out(`pi-review-gate ${skill.name} skill: ${joinForPlatform(resolution.platform, skillDir, "SKILL.md")}\n`);
   }
 
   // The exported path is already the native Windows form (the helper runs on
@@ -826,7 +843,6 @@ function main(argv) {
 
   out(`pi-review-gate config: ${selected}\n`);
   out(`pi-review-gate extension: ${extensionPath}\n`);
-  out(`pi-review-gate orchestrator skill: ${joinForPlatform(process.platform, orchestratorSkillDir, "SKILL.md")}\n`);
 
   // Execute pi with the extension and the forwarded arguments, inheriting the
   // sanitized environment and stdio; the helper's exit status is pi's. pi is

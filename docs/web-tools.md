@@ -602,9 +602,14 @@ execute Pi roles receive `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`,
 `BrowserSelect`, `BrowserPress`, `BrowserUpload`, `BrowserDownloadSave`, and
 `BrowserClipboard`; research Pi roles receive observational
 `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`, and `BrowserHover` but none of the click/form-action tools. Authorized names appear in each
-role's deterministic names-only system-prompt inventory while schemas
-remain deferred. The generic deferred matcher, ranking, limits, and guidance are shared
-unchanged with all other tools.
+role's startup system-prompt inventory — each deferred-authorized name with a tiny
+purpose summary — and in the `search_tools` tool description at live permissions,
+while schemas remain deferred until activation. The discovery set is each role's
+authorized names minus the tools that role loads automatically at baseline; those
+baseline-loaded tools are omitted from both surfaces. The startup inventory is a
+stable role summary, not a remaining-inactive list, so it stays byte-identical as
+deferred tools activate. The generic deferred matcher, ranking,
+limits, and guidance are shared unchanged with all other tools.
 External Claude and Codex adapters retain their existing native web-tool policies.
 
 ### Browser interaction approval

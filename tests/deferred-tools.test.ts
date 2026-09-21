@@ -194,13 +194,16 @@ test("configured worker catalogs use the durable initial subset without narrowin
   }), true);
   assert.deepEqual(fixture.active(), ["read", "search_tools"]);
   assert.deepEqual(manager.authorizedToolNames(), ["read", "write", "WebSearch"]);
+  // Stable discovery set: authorized catalog minus baseline-loaded role tools
+  // ("read" and search_tools itself). Baseline omission keeps the inventory
+  // byte-stable while deferred tools activate.
   const inventory = manager.startupGuidance() ?? "";
-  for (const name of ["read", "write", "WebSearch", "search_tools"]) {
-    assert.match(inventory, new RegExp(`"${name}"`));
-  }
+  assert.match(inventory, /"write" \(Create or overwrite a file\)/);
+  assert.match(inventory, /"WebSearch" \(Search the public web for current sources\)/);
+  assert.doesNotMatch(inventory, /"read"|"search_tools"/);
   assert.match(inventory, /exact name/);
   assert.match(inventory, /next turn/);
-  assert.doesNotMatch(inventory, /Read file contents|Create or overwrite|Search the public web|parameters|properties/);
+  assert.doesNotMatch(inventory, /parameters|properties|Supports images/);
 
   const reloaded = new DeferredToolManager(fixture.pi);
   reloaded.register();
@@ -216,7 +219,7 @@ test("configured worker catalogs use the durable initial subset without narrowin
   assert.deepEqual(fixture.active(), ["read", "search_tools", "WebSearch"]);
 });
 
-test("role-filtered research inventory names every authorized tool without mutation tools or schemas", () => {
+test("role-filtered research inventory lists only deferred discovery names without mutation tools or schemas", () => {
   const fixture = hostFixture();
   const browserNames = [
     "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",
@@ -232,11 +235,22 @@ test("role-filtered research inventory names every authorized tool without mutat
   });
 
   const inventory = manager.startupGuidance() ?? "";
-  for (const name of ["read", "WebSearch", ...browserNames, "search_tools"]) {
-    assert.match(inventory, new RegExp(`"${name}"`));
+  // "read" is baseline-loaded for this role and search_tools is baseline:
+  // neither may appear; every deferred discovery tool does.
+  assert.doesNotMatch(inventory, /"read"|"search_tools"/);
+  for (const name of ["WebSearch", ...browserNames]) {
+    assert.match(inventory, new RegExp(`"${name}" \\(`));
   }
   assert.doesNotMatch(inventory, /"(?:bash|edit|write|ApplyPatch|BrowserClick)"/);
-  assert.doesNotMatch(inventory, /Read file contents|Search the public web|Private schema description|Excluded interaction|parameters|properties/);
+  // Compact purposes come from canonical catalog metadata only, bounded, and
+  // never include excluded tools, schema text, or second copies of the list.
+  for (const [, purpose] of inventory.matchAll(/"[^"]+" \(([^)]*)\)/g)) {
+    assert.ok(purpose.length <= 60, `purpose too long (${purpose.length})`);
+  }
+  assert.doesNotMatch(inventory, /Excluded interaction|parameters|properties/);
+  for (const name of browserNames) {
+    assert.equal([...inventory.matchAll(new RegExp(`"${name}"`, "g"))].length, 1, `${name} is listed exactly once`);
+  }
 });
 
 test("configured worker boundaries reject unavailable and unauthorized tools", async () => {
@@ -455,9 +469,10 @@ test("browser interaction tools are role-authorized, deferred, and discoverable 
   for (const name of browserNames) {
     assert.ok(manager.authorizedToolNames()?.includes(name));
     assert.equal(fixture.active().includes(name), false, `${name} must not be initially active`);
-    assert.match(manager.startupGuidance() ?? "", new RegExp(`"${name}"`));
+    assert.match(manager.startupGuidance() ?? "", new RegExp(`"${name}" \\(`));
   }
-  assert.doesNotMatch(manager.startupGuidance() ?? "", /isolated observational|bounded semantic|visual browser evidence|parameters|properties/);
+  // Compact purposes from canonical metadata are expected; schemas are not.
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /parameters|properties/);
   const result = await fixture.search()("browser", { query: "BrowserSnapshot" });
   assert.deepEqual((result.details as { matched: string[] }).matched, ["BrowserSnapshot"]);
   assert.deepEqual((result.details as { activated: string[] }).activated, ["BrowserSnapshot"]);
@@ -654,7 +669,9 @@ test("launch-authorized native discovery is active from the first request in eve
   for (const name of ["grep", "find", "ls"]) {
     assert.ok(authorized.includes(name), `${name} stays authorized for delegated research`);
   }
-  assert.match(manager.startupGuidance() ?? "", /"grep"/);
+  // Baseline-loaded discovery is deliberately omitted from the startup
+  // inventory (stable discovery set), while staying authorized and active.
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /"grep"|"find"|"ls"/);
 
   // Plan/research keeps read-only discovery while unloading write-capable tools.
   mode = "plan-research";
@@ -688,7 +705,8 @@ test("registered-but-inactive native discovery becomes active by default in ever
   for (const name of ["grep", "find", "ls"]) {
     assert.ok(fixture.active().includes(name), `${name} is active without discovery`);
     assert.equal(manager.authorizedToolNames()?.includes(name), true);
-    assert.match(manager.startupGuidance() ?? "", new RegExp(`"${name}"`));
+    // Active-by-default discovery is baseline: absent from the inventory.
+    assert.doesNotMatch(manager.startupGuidance() ?? "", new RegExp(`"${name}"`));
   }
   for (const next of ["orchestrate", "plan-research", "execute"] as const) {
     mode = next;
@@ -822,3 +840,132 @@ test("synthetic nested repository: discovery tools are active and callable witho
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("search_tools description tracks the stable discovery set across mode and permission changes only", async () => {
+  const fixture = hostFixture();
+  fixture.pi.registerTool(tool("grep", "Search file contents for a pattern."));
+  let registerCalls = 0;
+  const originalRegister = fixture.pi.registerTool.bind(fixture.pi);
+  fixture.pi.registerTool = (definition: RegisteredTool) => {
+    if (definition.name === "search_tools") registerCalls++;
+    return originalRegister(definition);
+  };
+  let mode: OperatingMode = "orchestrate";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  manager.register();
+
+  // Before a boundary is captured the description lists no names.
+  const preStart = searchDescription(fixture);
+  assert.doesNotMatch(preStart, /Authorized tool names:/);
+  assert.equal(registerCalls, 1, "initial registration only");
+
+  assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
+  const writeMode = searchDescription(fixture);
+  assert.match(writeMode, /Activate authorized tools\. If names are known, query only exact tool names/);
+  // Discovery set = authorized minus baseline-loaded (read/bash/edit/write/
+  // ApplyPatch/SubtasksStart) minus search_tools itself.
+  assert.match(writeMode, /Authorized tool names: SubtasksAdd, SubtasksInspect, WebSearch./);
+  assert.doesNotMatch(writeMode, /read, bash|search_tools\./);
+  assert.equal(registerCalls, 2, "exactly one refresh after boundary capture");
+  // Names only: no per-name purposes or schema text in the description.
+  assert.doesNotMatch(writeMode, /Execute a shell command|Read file contents|parameters|properties/);
+
+  // Activation must not change the description or startup guidance (byte-equal
+  // stability; no needless prompt-cache invalidation) and only one refresh
+  // happens despite the no-change reapply.
+  const guidanceBefore = manager.startupGuidance() ?? "";
+  await fixture.search()("activate", { query: "public web" });
+  assert.ok(fixture.active().includes("WebSearch"), "activation happened");
+  assert.equal(searchDescription(fixture), writeMode, "description is byte-identical after activation");
+  assert.equal(manager.startupGuidance(), guidanceBefore, "startup guidance is byte-identical after activation");
+  assert.equal(registerCalls, 2);
+
+  // The activated deferred tool REMAINS listed in both surfaces.
+  assert.match(searchDescription(fixture), /WebSearch/);
+  assert.match(manager.startupGuidance() ?? "", /"WebSearch" \(/);
+
+  // An exact-name search of an already-active tool reports already-active —
+  // activation state, never new permission or an inventory change.
+  const already = await fixture.search()("already", { query: "WebSearch" });
+  assert.equal((already.details as { outcome: string }).outcome, "already-active");
+  assert.equal(searchDescription(fixture), writeMode);
+
+  // A no-change reapply does not re-register.
+  manager.reapply();
+  assert.equal(registerCalls, 2);
+
+  // Plan/research drops write-capable and execution-control names live.
+  mode = "plan-research";
+  manager.reapply();
+  const researchMode = searchDescription(fixture);
+  assert.match(researchMode, /Authorized tool names: SubtasksInspect, WebSearch./);
+  assert.doesNotMatch(researchMode, /bash|edit|write|ApplyPatch|SubtasksStart|SubtasksAdd/);
+  assert.doesNotMatch(researchMode, /disabled_private/);
+  // The research guidance rebuilt from the switched permission boundary;
+  // baseline-loaded grep stays excluded from the discovery inventory too.
+  assert.match(manager.startupGuidance() ?? "", /"SubtasksInspect" \(/);
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /"write"|"bash"|"grep"|"read"/);
+
+  // Switching back restores the write-mode baseline byte-for-byte.
+  mode = "orchestrate";
+  manager.reapply();
+  assert.equal(searchDescription(fixture), writeMode);
+  assert.equal(manager.startupGuidance(), guidanceBefore);
+
+  // Late and disabled tools never enter the description.
+  fixture.pi.registerTool(tool("late_private", "Registered after capture."));
+  manager.reapply();
+  assert.doesNotMatch(searchDescription(fixture), /late_private/);
+
+  // Startup guidance keeps exactly one list: deferred discovery names with
+  // compact purposes, never the description's comma-delimited raw list.
+  const guidance = manager.startupGuidance() ?? "";
+  assert.match(guidance, /"SubtasksAdd" \(/);
+  assert.doesNotMatch(guidance, /Authorized tool names:/);
+  assert.doesNotMatch(guidance, /"search_tools"|"read"|"bash"/);
+});
+
+test("deferred-disabled sessions render no redundant inventory and the description lists no names", () => {
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity, undefined, false, false);
+
+  // Everything authorized is baseline-loaded; logically no inventory remains.
+  assert.equal(manager.startupGuidance(), undefined);
+  assert.doesNotMatch(searchDescription(fixture), /Authorized tool names:/);
+  // The promptSnippet must not promise a system-prompt inventory that is not
+  // injected; the exact-name rule is preserved either way.
+  const offSnippet = searchSnippet(fixture);
+  assert.match(offSnippet, /No system-prompt inventory is provided/);
+  assert.doesNotMatch(offSnippet, /Authorized names are listed in the system prompt/);
+  assert.match(offSnippet, /Search only exact tool names when known/);
+
+  // Re-enabling deferred mode is a legitimate boundary change: the stable
+  // discovery set reappears without any activation event, and the snippet
+  // restores the inventory claim with the exact-name rule intact.
+  assert.equal(manager.setDeferredEnabled(true), true);
+  assert.match(searchDescription(fixture), /Authorized tool names: SubtasksAdd, SubtasksInspect, WebSearch\./);
+  assert.match(manager.startupGuidance() ?? "", /"SubtasksAdd" \(/);
+  const onSnippet = searchSnippet(fixture);
+  assert.match(onSnippet, /Authorized names are listed in the system prompt/);
+  assert.doesNotMatch(onSnippet, /No system-prompt inventory/);
+  assert.match(onSnippet, /only exact tool names when known, without descriptive words/);
+
+  assert.equal(manager.setDeferredEnabled(false), true);
+  assert.equal(manager.startupGuidance(), undefined);
+  assert.doesNotMatch(searchDescription(fixture), /Authorized tool names:/);
+  assert.equal(searchSnippet(fixture), offSnippet);
+});
+
+function searchDescription(fixture: ReturnType<typeof hostFixture>): string {
+  const registered = fixture.definitions.find((definition) => definition.name === "search_tools");
+  assert.ok(registered);
+  return registered.description ?? "";
+}
+
+function searchSnippet(fixture: ReturnType<typeof hostFixture>): string {
+  const registered = fixture.definitions.find((definition) => definition.name === "search_tools");
+  assert.ok(registered);
+  return registered.promptSnippet ?? "";
+}

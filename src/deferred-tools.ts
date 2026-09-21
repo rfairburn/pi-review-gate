@@ -67,6 +67,8 @@ export class DeferredToolManager {
   private activeSetEstablished = false;
   private sessionDeferred = true;
   private registered = false;
+  private lastSearchDescription: string | undefined;
+  private lastSearchSnippet: string | undefined;
   constructor(
     private readonly pi: unknown,
     private readonly getOperatingMode: () => OperatingMode = () => DEFAULT_OPERATING_MODE,
@@ -74,28 +76,10 @@ export class DeferredToolManager {
 
   register(): boolean {
     if (this.registered || !isDeferredToolHost(this.pi)) return false;
-    this.pi.registerTool({
-      name: DEFERRED_TOOL_SEARCH_NAME,
-      label: DEFERRED_TOOL_SEARCH_NAME,
-      description: "Activate authorized tools. If names are known, query only exact tool names; otherwise use capability terms. Loading never performs the operation.",
-      promptSnippet: "Authorized names are listed in the system prompt. Search only exact tool names when known, without descriptive words; use capability terms only for unknown names. Call the loaded tool next turn.",
-      executionMode: "sequential",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            minLength: 1,
-            maxLength: MAX_QUERY_CHARS,
-            description: "Known: exact tool name(s) only. Unknown: capability terms. Never mix known names with descriptive words.",
-          },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
-      renderResult: deferredToolSearchRenderResult,
-      execute: async (_toolCallId: string, params: unknown) => this.search(params),
-    });
+    const definition = this.buildSearchToolDefinition();
+    this.lastSearchDescription = definition.description;
+    this.lastSearchSnippet = definition.promptSnippet;
+    this.pi.registerTool(definition);
     this.registered = true;
     return true;
   }
@@ -144,13 +128,12 @@ export class DeferredToolManager {
 
   startupGuidance(): string | undefined {
     if (!this.boundary) return undefined;
-    const authorized = this.getOperatingMode() === "plan-research"
-      ? [...this.boundary.authorizedNames].filter((name) => planningToolVisible(name))
-      : [...this.boundary.authorizedNames];
-    return renderAuthorizedToolInventory(
-      [...authorized, DEFERRED_TOOL_SEARCH_NAME],
-      { deferred: this.sessionDeferred },
-    );
+    const discovery = this.deferredDiscoveryNames();
+    if (discovery.size === 0) return undefined;
+    const entries = this.boundary.catalog
+      .filter((tool) => discovery.has(tool.name))
+      .map((tool) => ({ name: tool.name, description: tool.description }));
+    return renderAuthorizedToolInventory(entries, { deferred: this.sessionDeferred });
   }
 
   /** Apply a local settings change immediately within the captured boundary. */
@@ -176,9 +159,102 @@ export class DeferredToolManager {
   /** Reassert the manager-owned active set after another component syncs. */
   reapply(): void {
     if (!this.activeSetEstablished || !isDeferredToolHost(this.pi)) return;
+    this.syncSearchToolDescription();
     this.pi.setActiveTools(this.getOperatingMode() === "plan-research"
       ? this.desiredActiveNames.filter(planningToolVisible)
       : [...this.desiredActiveNames]);
+  }
+
+  /** Names visible at the live mode ceiling (authority boundary, not activation). */
+  private modeVisibleAuthorizedNames(): ReadonlySet<string> {
+    if (!this.boundary) return new Set<string>();
+    return this.getOperatingMode() === "plan-research"
+      ? new Set([...this.boundary.authorizedNames].filter((name) => planningToolVisible(name)))
+      : new Set(this.boundary.authorizedNames);
+  }
+
+  /**
+   * Stable deferred discovery set: the authorized catalog at the live
+   * permission ceiling minus the role's baseline automatically-loaded tools
+   * (search_tools itself is baseline and excluded). Derived from the captured
+   * boundary's frozen initialActiveNames — never from mutable activation
+   * state — so search activations cannot change startup guidance or the
+   * search_tools description (no needless prompt-cache invalidation). Only
+   * role/mode/permission boundary changes recompute this set.
+   */
+  private deferredDiscoveryNames(): ReadonlySet<string> {
+    if (!this.boundary || !this.sessionDeferred) return new Set<string>();
+    const baseline = new Set(this.boundary.initialActiveNames);
+    return new Set([...this.modeVisibleAuthorizedNames()].filter((name) => !baseline.has(name)));
+  }
+
+  /**
+   * The search_tools description must itself disclose the deferred discovery
+   * set — compact comma-delimited names only, never per-name usage prose —
+   * filtered by the live operating-mode permission and excluding the
+   * baseline-loaded tools. It is byte-identical across search activations;
+   * before a boundary is captured (or when startup failed closed) it lists
+   * no names, so it can never disclose an unauthorized or stale set.
+   */
+  private renderSearchToolDescription(): string {
+    const base = "Activate authorized tools. If names are known, query only exact tool names; otherwise use capability terms. Loading never performs the operation.";
+    if (!this.boundary) return base;
+    const names = [...this.deferredDiscoveryNames()].sort(compareToolNames);
+    return names.length === 0 ? base : `${base} Authorized tool names: ${names.join(", ")}.`;
+  }
+
+  private renderSearchToolSnippet(): string {
+    const rules = "Search only exact tool names when known, without descriptive words; use capability terms only for unknown names. Call the loaded tool next turn.";
+    // The system-prompt inventory exists only when a boundary is captured and
+    // a stable discovery set remains after baseline exclusion. Deferred-off
+    // and fail-closed sessions must not be promised an inventory that is not
+    // injected.
+    if (!this.boundary || this.deferredDiscoveryNames().size === 0) {
+      return `No system-prompt inventory is provided; search_tools only activates authorized tools. ${rules}`;
+    }
+    return `Authorized names are listed in the system prompt. ${rules}`;
+  }
+
+  private buildSearchToolDefinition() {
+    return {
+      name: DEFERRED_TOOL_SEARCH_NAME,
+      label: DEFERRED_TOOL_SEARCH_NAME,
+      description: this.renderSearchToolDescription(),
+      promptSnippet: this.renderSearchToolSnippet(),
+      executionMode: "sequential" as const,
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            minLength: 1,
+            maxLength: MAX_QUERY_CHARS,
+            description: "Known: exact tool name(s) only. Unknown: capability terms. Never mix known names with descriptive words.",
+          },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+      renderResult: deferredToolSearchRenderResult,
+      execute: async (_toolCallId: string, params: unknown) => this.search(params),
+    };
+  }
+
+  /**
+   * Re-register search_tools only when the rendered description or snippet
+   * changed (mode switch, deferred toggle, or first boundary capture).
+   * Same-name registerTool replacement is the documented Pi override path; no
+   * invented host API. Registration is metadata only — authority stays with
+   * reapply's active-set write.
+   */
+  private syncSearchToolDescription(): void {
+    if (!this.registered || !isDeferredToolHost(this.pi)) return;
+    const description = this.renderSearchToolDescription();
+    const snippet = this.renderSearchToolSnippet();
+    if (this.lastSearchDescription === description && this.lastSearchSnippet === snippet) return;
+    this.lastSearchDescription = description;
+    this.lastSearchSnippet = snippet;
+    this.pi.registerTool(this.buildSearchToolDefinition());
   }
 
   /** Full launch-authorized parent catalog; worker activation remains unchanged. */
@@ -470,6 +546,10 @@ function searchTerms(query: string): string[] {
 
 function textResult(text: string, isError: boolean, details: Record<string, unknown> = {}): Record<string, unknown> {
   return { content: [{ type: "text", text }], details, isError };
+}
+
+function compareToolNames(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isDeferredToolHost(value: unknown): value is DeferredToolHost {

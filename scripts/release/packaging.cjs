@@ -142,6 +142,9 @@ function verifyTarball({ tarballPath, extractDir }) {
     "scripts/pi-review-gate.cmd",
     "scripts/pi-review-gate-launcher.cjs",
     "skills/orchestrator/SKILL.md",
+    "skills/orchestrator/references/recovery.md",
+    "skills/execution/SKILL.md",
+    "skills/research/SKILL.md",
   ]) {
     if (!entries.includes(required)) problems.push(`required tarball entry missing: ${required}`);
   }

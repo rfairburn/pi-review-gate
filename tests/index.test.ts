@@ -539,8 +539,12 @@ test("session_start keeps launch-authorized native discovery active in the conse
       },
       registerCommand() {},
       registerTool(tool: { name: string; description?: string }) {
-        registeredTools.push(tool);
-        activeTools.push(tool.name);
+        // Pi replaces a same-name registration in place (documented override
+        // path); an already-active tool is not re-activated.
+        const existing = registeredTools.findIndex((candidate) => candidate.name === tool.name);
+        if (existing >= 0) registeredTools.splice(existing, 1, tool);
+        else registeredTools.push(tool);
+        if (!activeTools.includes(tool.name)) activeTools.push(tool.name);
       },
       getActiveTools() {
         assertRuntime();
@@ -617,8 +621,12 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
         if (name === "review-settings") reviewSettingsHandler = options.handler;
       },
       registerTool(tool: { name: string; description?: string }) {
-        registeredTools.push(tool);
-        activeTools.push(tool.name);
+        // Pi replaces a same-name registration in place (documented override
+        // path), so a description refresh keeps the original position.
+        const existing = registeredTools.findIndex((candidate) => candidate.name === tool.name);
+        if (existing >= 0) registeredTools.splice(existing, 1, tool);
+        else registeredTools.push(tool);
+        if (!activeTools.includes(tool.name)) activeTools.push(tool.name);
       },
       getActiveTools() {
         assertRuntime();
@@ -654,6 +662,16 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     const deferredActive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"];
     assert.deepEqual(activeTools, deferredActive);
 
+    // The registered search_tools description itself discloses the deferred
+    // discovery set — authorized minus baseline-loaded — comma-delimited.
+    const searchDefinition = registeredTools.find((tool) => tool.name === "search_tools");
+    const expectedDiscovery = [
+      "AskUserQuestion", ...webToolNames, ...backgroundShellToolNames,
+      ...executionToolNames.filter((name) => name !== "SubtasksStart"),
+    ].sort();
+    assert.match(searchDefinition?.description ?? "", new RegExp(`Authorized tool names: ${expectedDiscovery.map(escapeRegExp).join(", ")}\\.$`));
+    assert.doesNotMatch(searchDefinition?.description ?? "", /parameters|properties/);
+
     const toggleDeferredTools = async () => {
       assert.ok(reviewSettingsHandler);
       let selectedToggle = false;
@@ -686,15 +704,26 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.ok(beforeStart.some((value) => typeof (value as { systemPrompt?: unknown }).systemPrompt === "string"));
     const inventory = JSON.stringify(beforeStart);
     assert.match(inventory, /native orchestrator prompt/);
-    for (const name of [
-      "read", "bash", "edit", ...webToolNames, "ApplyPatch", ...backgroundShellToolNames,
-      "search_tools", "AskUserQuestion", ...executionToolNames,
-    ]) {
+    // The startup inventory is the stable deferred discovery set only:
+    // baseline-loaded tools (read/bash/edit/ApplyPatch/SubtasksStart) and
+    // search_tools itself are omitted, every deferred discovery tool is
+    // listed with its compact canonical purpose.
+    const discoveryNames = [
+      "AskUserQuestion", ...webToolNames, ...backgroundShellToolNames,
+      ...executionToolNames.filter((name) => name !== "SubtasksStart"),
+    ];
+    for (const name of discoveryNames) {
       assert.match(inventory, new RegExp(escapeRegExp(`\\"${name}\\"`)));
+    }
+    for (const baselineName of ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"]) {
+      assert.doesNotMatch(inventory, new RegExp(escapeRegExp(`\\"${baselineName}\\"`)));
     }
     assert.match(inventory, /exact name/);
     assert.match(inventory, /next turn/);
-    assert.doesNotMatch(inventory, /LateIdleTool|Read files|Run shell commands|Edit files|parameters|properties/);
+    // Compact canonical purposes are part of the inventory; schemas and
+    // unauthorized late registrations never appear.
+    assert.match(inventory, /Search the public web/);
+    assert.doesNotMatch(inventory, /LateIdleTool|parameters|properties/);
     assert.equal(activeTools.includes("LateIdleTool"), false, "request boundary removes an unauthorized idle registration");
 
     pi.registerTool({ name: "LateToolResultTool", description: "Registered during a tool execution." });
@@ -710,6 +739,45 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.equal(result.isError, false);
     assert.deepEqual((result.details as { activated: string[] }).activated, ["SubtasksAdd"]);
     assert.deepEqual(activeTools, ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools", "SubtasksAdd"]);
+
+    // A mode switch is a legitimate permission-boundary change: both discovery
+    // surfaces rebuild from the live mode ceiling (write-capable and
+    // execution-control names disappear), and switching back restores the
+    // execute baseline byte-for-byte despite the SubtasksAdd activation.
+    const executeDescription = searchDefinition?.description ?? "";
+    const selectOperatingMode = async (label: string) => {
+      assert.ok(reviewSettingsHandler);
+      let rootVisits = 0;
+      await reviewSettingsHandler("", {
+        ui: {
+          select: async (title: string, options: string[]) => {
+            if (title === "Review settings") return rootVisits++ === 0
+              ? options.find((option) => option.startsWith("Operating mode"))
+              : "Save changes";
+            if (title === "Operating mode") return options.find((option) => option.startsWith(label));
+            throw new Error(`Unexpected menu: ${title}`);
+          },
+          notify() {},
+        },
+      });
+    };
+    await selectOperatingMode("Plan/research");
+    const researchInventory = JSON.stringify(await triggerResults(hooks, "before_agent_start", { cwd: dir }));
+    // Scope to the inventory segment: the mode prompt prose legitimately
+    // names tools; only the discovery list must drop them.
+    const researchSegment = researchInventory.match(/Authorized tool names with purpose:.*?If an authorized/)?.[0] ?? "";
+    assert.match(researchSegment, new RegExp(escapeRegExp(`\\"SubtasksInspect\\" (`)));
+    assert.match(researchSegment, new RegExp(escapeRegExp(`\\"WebSearch\\" (`)));
+    assert.doesNotMatch(researchSegment, /SubtasksAdd|ShellStart|BrowserClick|SubtasksSteer/);
+    const researchSearch = registeredTools.find((tool) => tool.name === "search_tools");
+    assert.doesNotMatch(researchSearch?.description ?? "", /SubtasksAdd|ShellStart|BrowserClick/);
+    assert.match(researchSearch?.description ?? "", /SubtasksInspect, SubtasksWatch, WebFetch, WebSearch\.$/);
+
+    await selectOperatingMode("Prefer orchestration");
+    const restoredInventory = JSON.stringify(await triggerResults(hooks, "before_agent_start", { cwd: dir }));
+    const restoredSegment = restoredInventory.match(/Authorized tool names with purpose:.*?If an authorized/)?.[0] ?? "";
+    assert.match(restoredSegment, new RegExp(escapeRegExp(`\\"SubtasksAdd\\" (`)));
+    assert.equal(registeredTools.find((tool) => tool.name === "search_tools")?.description, executeDescription);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

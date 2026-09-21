@@ -149,7 +149,7 @@ that mirrors the POSIX launcher end to end: the same configuration discovery and
 first-launch initialization (deliberately ignoring an inherited `PI_REVIEW_GATE_CONFIG`),
 development rebuilds versus the packaged artifact, the pinned DDGS web-search dependency
 (provisioned natively in a `Scripts\python.exe` virtual environment — no `.sh` execution),
-the orchestrator skill refresh, launch diagnostics, argument forwarding, and exit codes.
+the shipped-skill refresh, launch diagnostics, argument forwarding, and exit codes.
 The helper requires Node.js 20+ and Python 3 for web-search provisioning on PATH;
 Pi's own Node.js requirement still applies (see [Prerequisites](#prerequisites)).
 
@@ -173,8 +173,9 @@ A minimal config using Codex as the reviewer:
 ```
 
 The launcher builds the extension when sources are present, selects the first existing
-persistent config, refreshes the orchestrator skill at
-`~/.agents/skills/orchestrator/SKILL.md`, and forwards all remaining arguments to `pi`.
+persistent config, refreshes the shipped skills under
+`~/.agents/skills/` (orchestrator, execution, and research), and forwards all remaining
+arguments to `pi`.
 For development you can load the built extension directly instead; in that path
 `PI_REVIEW_GATE_CONFIG` is honored because it reaches the extension itself rather than
 goes through the launcher:

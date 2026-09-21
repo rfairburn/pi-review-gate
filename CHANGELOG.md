@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.64]
+
+### Changed
+
+- Split background-controller tests into seven suites organized by lifecycle,
+  steering, interruption/merge, persistence, notifications, watch/widget, and
+  subtask-command behavior. Reuse shared fixture setup and update the execution
+  test command while preserving all 71 scenarios and their assertions. Runtime
+  behavior is unchanged.
+
 ## [0.1.0-dev.63]
 
 ### Changed

@@ -7,7 +7,8 @@ import { resolvedWorkerResources, resolvedWorkerRoute } from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
-import { materializeLandingConflicts, unresolvedConflictMarkers } from "./conflict-materialization";
+import { materializeLandingConflicts } from "./conflict-materialization";
+import { ConflictGateStore, cloneConflictGate, type ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
 import {
   GROUP_VERSION,
   INLINE_SETTLED_TASK_LIMIT,
@@ -133,6 +134,9 @@ export type {
   BackgroundTaskTimingSummary,
 } from "./task-state";
 export type { BackgroundExecutionGroup } from "./background-group-store";
+// #154: conflict-gate storage/validation moved to ./conflict-gate-store; the
+// original public surface of this module is preserved via the re-export below.
+export type { ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
 
 const RECENT_ACTIVITY_LIMIT = 10;
 
@@ -182,24 +186,6 @@ interface RecentBackgroundActivity {
   taskId: string;
   title: string;
   event: BackgroundActivityEvent;
-}
-
-export interface BackgroundConflictGate {
-  executionId: string;
-  taskId: string;
-  sourceRoot: string;
-  paths: string[];
-  activatedAt: string;
-  manifestPath: string;
-  reason: string;
-  /** #126 approved (explicit force-merge only): conflicted paths whose content
-   * could not carry text markers and was preserved instead. Entries with a
-   * `sidecarPath` keep the worker version alongside the intact target — the
-   * conflict stays unresolved while that file still exists and markClean
-   * validates it. Entries without one record a worker-side deletion: no bytes
-   * were fabricated, so resolution is the orchestrator's explicit act after
-   * inspecting the gate and its manifest. */
-  sidecars?: Array<{ path: string; sidecarPath?: string }>;
 }
 
 interface RuntimeTask {
@@ -431,8 +417,12 @@ export class BackgroundExecutionController {
    * conflicts on separate repositories cannot overwrite, early-release, or
    * leak each other's block; landings into an already-gated root serialize
    * behind that root's block in the coordinator instead.
+   * #154: the map, its root-keyed identity/lookups, lease blocking, and
+   * unresolved-marker/sidecar validation live in ./conflict-gate-store; this
+   * controller keeps the lifecycle orchestration (transitions, saves,
+   * notifications, force-merge) and sequences the store.
    */
-  private readonly conflictGates = new Map<string, { gate: BackgroundConflictGate; release: () => void }>();
+  private readonly conflictGates = new ConflictGateStore();
   private uiContext: unknown;
   private expandedView = false;
   private readonly watches = new Map<string, { timer: ReturnType<typeof setTimeout>; subscription: BackgroundWatchSubscription }>();
@@ -497,7 +487,7 @@ export class BackgroundExecutionController {
     // The legacy singular field is no longer written (restored readers recover
     // it from conflictGates) and conflictGates stays absent when no gate is
     // active so the zero-gate snapshot keeps its exact prior shape.
-    const gates = [...this.conflictGates.values()].map(({ gate }) => ({ ...gate, paths: [...gate.paths] }));
+    const gates = this.conflictGates.list().map(cloneConflictGate);
     return {
       waveRoots: [...new Set(waveRoots)],
       bundles,
@@ -999,7 +989,7 @@ export class BackgroundExecutionController {
       archivedCount: group.settledArchivedCount ?? 0,
       scheduling: this.schedulingSnapshot(group),
       conflictGate: conflictGate
-        ? { ...conflictGate, paths: [...conflictGate.paths] }
+        ? cloneConflictGate(conflictGate)
         : undefined,
       tasks: selected.map((task) => ({
         ...cloneTask(task),
@@ -2148,51 +2138,20 @@ export class BackgroundExecutionController {
    */
   async markClean(input?: { actor?: SubtaskWakeActor }): Promise<BackgroundMarkCleanResult> {
     const actor: SubtaskWakeActor = input?.actor ?? "user";
-    const entries = [...this.conflictGates.entries()];
+    const entries = this.conflictGates.entries();
     if (entries.length === 0) return { cleared: false, paths: [] };
     // #25 multi-target: validate every outstanding gate before releasing any —
     // one unresolved target must never clear another target's block. The
     // single-gate message and behavior are unchanged; with several gates each
-    // dirty root is named so the remaining work stays actionable.
-    const dirty: string[] = [];
-    for (const [, { gate }] of entries) {
-      // #126 approved force-only fallback: preserved non-text conflicts
-      // (symlink/type change, oversized side, worker-side deletion) never carry
-      // diff3 markers, and their destination may be a symlink or a large/special
-      // file. Reading them adds no verification value and could follow an unsafe
-      // symlink or allocate unboundedly, so they are excluded from the marker
-      // scan; their resolution is governed by the sidecar check below plus the
-      // explicit markClean attestation.
-      const preserved = new Set((gate.sidecars ?? []).map((sidecar) => sidecar.path));
-      const unresolved = await unresolvedConflictMarkers(
-        gate.sourceRoot,
-        gate.paths.filter((path) => !preserved.has(path)),
-      );
-      if (unresolved.length > 0) {
-        dirty.push(entries.length === 1 ? unresolved.join(", ") : `${gate.sourceRoot}: ${unresolved.join(", ")}`);
-      }
-      // #126 approved (explicit force-merge only): a preserved conflict is
-      // resolved only once the worker version saved alongside has been handled
-      // (chosen or discarded). While it still exists, the gate stays
-      // unresolved. Record-only entries (worker-side deletion) have no file to
-      // check; their resolution is the orchestrator's explicit act attested by
-      // markClean.
-      for (const sidecar of gate.sidecars ?? []) {
-        if (!sidecar.sidecarPath) continue;
-        const present = await stat(sidecar.sidecarPath).catch(() => undefined);
-        if (present) {
-          dirty.push(entries.length === 1
-            ? `preserved conflict ${sidecar.path} still has its worker version saved alongside at ${sidecar.sidecarPath}; choose a side and remove the other file`
-            : `${gate.sourceRoot}: preserved conflict ${sidecar.path} still has its worker version saved alongside at ${sidecar.sidecarPath}`);
-        }
-      }
-    }
+    // dirty root is named so the remaining work stays actionable. #154: the
+    // unresolved-marker/sidecar scan itself lives in ./conflict-gate-store.
+    const dirty = await this.conflictGates.unresolvedReasons();
     if (dirty.length > 0) {
       throw new Error(`Conflict markers remain in: ${dirty.join("; ")}`);
     }
     const baseline = activeExchangeBaseline(this.input.state);
     const clearedPaths: string[] = [];
-    for (const [key, { gate, release }] of entries) {
+    for (const { key, gate, release } of entries) {
       const group = this.groups.get(gate.executionId);
       const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
       if (task) {
@@ -2218,7 +2177,7 @@ export class BackgroundExecutionController {
     }
     await this.publishAssociations();
     const completionAggregates: BackgroundMarkCleanAggregate[] = [];
-    for (const [, { gate }] of entries) {
+    for (const { gate } of entries) {
       const group = this.groups.get(gate.executionId);
       const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
       if (task) {
@@ -2268,7 +2227,7 @@ export class BackgroundExecutionController {
    * that task's target, which names its own source root.
    */
   criticalPrompt(gate?: BackgroundConflictGate): string | undefined {
-    const gates = gate ? [gate] : [...this.conflictGates.values()].map(({ gate }) => gate);
+    const gates = gate ? [gate] : this.conflictGates.list();
     if (gates.length === 0) return undefined;
     return [
       "CRITICAL REVIEW-GATE WORKSPACE CONFLICT:",
@@ -2431,7 +2390,6 @@ export class BackgroundExecutionController {
         this.pumpRequested = false;
         // #25 multi-target: release every outstanding root's block; the
         // persisted snapshot re-blocks each gate on restore.
-        for (const { release } of this.conflictGates.values()) release();
         this.conflictGates.clear();
         this.updateIndicator();
       });
@@ -3195,33 +3153,23 @@ export class BackgroundExecutionController {
   }
 
   /**
-   * #25 multi-target: install one target's conflict gate and its lease block,
-   * keyed by resolved source root. A same-root successor releases only that
-   * root's prior block — a different target's gate and block stay untouched.
+   * #25 multi-target: install one target's conflict gate and its lease block.
+   * #154: the storage mechanics live in ./conflict-gate-store; this delegate
+   * stays so every in-controller activation path (and the existing fixture
+   * entry point) keeps a single install boundary.
    */
   private setConflictGate(gate: BackgroundConflictGate): void {
-    const key = resolve(gate.sourceRoot);
-    this.conflictGates.get(key)?.release();
-    this.conflictGates.set(key, {
-      gate,
-      release: sourceMutationCoordinator.block(gate.sourceRoot, gate.reason),
-    });
+    this.conflictGates.install(gate);
   }
 
   /** The outstanding gate for one execution group, if any (at most one per group). */
   private gateForGroup(group: BackgroundExecutionGroup): BackgroundConflictGate | undefined {
-    for (const { gate } of this.conflictGates.values()) {
-      if (gate.executionId === group.executionId) return gate;
-    }
-    return undefined;
+    return this.conflictGates.forExecution(group.executionId);
   }
 
   /** The outstanding gate for one exact task, if any. */
   private gateForTask(executionId: string, taskId: string): BackgroundConflictGate | undefined {
-    for (const { gate } of this.conflictGates.values()) {
-      if (gate.executionId === executionId && gate.taskId === taskId) return gate;
-    }
-    return undefined;
+    return this.conflictGates.forTask(executionId, taskId);
   }
 
   /**
@@ -3954,7 +3902,7 @@ export class BackgroundExecutionController {
         // #25 multi-target: the indicator flattens every active gate's paths;
         // per-target ownership stays in inspect and the persisted snapshot.
         conflictPaths: this.conflictGates.size > 0
-          ? [...this.conflictGates.values()].flatMap(({ gate }) => [...gate.paths])
+          ? this.conflictGates.list().flatMap((gate) => [...gate.paths])
           : undefined,
         tasks,
         recent: this.recentActivity.map((entry) => ({ title: entry.title, event: entry.event })),

@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.66]
+
+### Tests
+
+- Make suppressed-completion watch regressions deterministic by controlling the
+  watch deadline and delivery window instead of racing real-time sleeps. Cover
+  cancellation, queued-checkpoint cleanup, legitimate earlier delivery, and a
+  negative control without changing production behavior.
+
 ## [0.1.0-dev.65]
 
 ### Changed

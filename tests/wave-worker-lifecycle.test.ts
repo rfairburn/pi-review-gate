@@ -830,6 +830,20 @@ test("lifecycle: no_changes executor returns no_changes", async () => {
     assert.equal(result.status, "no_changes", `expected no_changes, got ${result.status}`);
     assert.equal(result.reviewCycles.length, 0, "should have no review cycles");
     assert.ok(!result.acceptedRef, "should not have acceptedRef for no_changes");
+    // Report-only success contract: the executor's diagnosis summary is the
+    // authoritative report and must stay retrievable (durable artifacts),
+    // with no candidate commit and no fabricated review evidence.
+    assert.equal(result.summary, "No changes needed.", "the executor's report summary must be retained on the result");
+    const completion = JSON.parse(await readFile(join(artifactDir, "completion.json"), "utf8"));
+    assert.equal(completion.status, "no_changes");
+    assert.equal(completion.summary, "No changes needed.");
+    assert.equal(completion.differsFromBase, false, "no file commit may be fabricated for a report-only task");
+    const durable = JSON.parse(await readFile(join(artifactDir, "result.json"), "utf8"));
+    assert.equal(durable.status, "no_changes");
+    assert.equal(durable.summary, "No changes needed.");
+    assert.equal(durable.reviewCycles.length, 0, "no review cycle is fabricated for a skipped review");
+    assert.equal(durable.reviewReport ?? undefined, undefined, "no review report is fabricated for a skipped review");
+    assert.ok(result.artifactDir, "artifactDir stays user-inspectable");
 
     await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
   } finally {

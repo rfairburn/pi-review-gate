@@ -197,8 +197,9 @@ location remains selected unchanged. It builds the extension when sources are pr
 creates and validates the pinned `WebSearch` environment with `scripts/ensure-ddgs.sh`
 on macOS/Linux or the native Node helper on Windows (see
 [Prerequisites](#prerequisites)), then
-refreshes the discoverable orchestration skill at
-`~/.agents/skills/orchestrator/SKILL.md` (including its recovery runbook), and then
+refreshes the shipped skills under
+`~/.agents/skills/` (orchestrator — including its recovery runbook — execution, and
+research), and then
 executes the installed `pi` with the extension. On macOS/Linux the persistent launcher
 is a Bash script; on Windows the native entry point
 (`scripts\pi-review-gate.cmd`, or `pi-review-gate-cmd` from an npm installation) mirrors

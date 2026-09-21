@@ -217,7 +217,7 @@ test("persistent launcher refreshes a stale installed orchestrator skill", async
   await writeFile(installedSkill, "stale\n", "utf8");
   await writeFile(installedRecovery, "stale recovery\n", "utf8");
 
-  await runLauncher([], launcherEnv(fixture));
+  const result = await runLauncher([], launcherEnv(fixture));
 
   assert.equal(
     await readFile(installedSkill, "utf8"),
@@ -227,6 +227,46 @@ test("persistent launcher refreshes a stale installed orchestrator skill", async
     await readFile(installedRecovery, "utf8"),
     await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
   );
+  for (const name of ["execution", "research"]) {
+    assert.equal(
+      await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
+      await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
+      `the ${name} skill must be provisioned alongside the orchestrator skill`,
+    );
+  }
+  assert.match(result.stdout, /pi-review-gate orchestrator skill: /);
+  assert.match(result.stdout, /pi-review-gate execution skill: /);
+  assert.match(result.stdout, /pi-review-gate research skill: /);
+});
+
+test("persistent launcher preserves unrelated custom skills under ~/.agents/skills", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-custom-skill-");
+  const customSkill = join(fixture.home, ".agents", "skills", "my-custom-skill", "SKILL.md");
+  const customContent = "---\nname: my-custom-skill\ndescription: user-owned skill\n---\nuser-owned\n";
+  await Promise.all([
+    mkdir(join(customSkill, ".."), { recursive: true }),
+    mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true }),
+  ]);
+  await writeFile(customSkill, customContent, "utf8");
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  assert.equal(
+    await readFile(customSkill, "utf8"),
+    customContent,
+    "unrelated custom skills must be preserved untouched by provisioning",
+  );
+  for (const name of ["orchestrator", "execution", "research"]) {
+    assert.equal(
+      await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
+      await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
+      `the ${name} skill must still be provisioned alongside the custom skill`,
+    );
+  }
+  assert.match(result.stdout, /pi-review-gate orchestrator skill: /);
+  assert.match(result.stdout, /pi-review-gate execution skill: /);
+  assert.match(result.stdout, /pi-review-gate research skill: /);
 });
 
 test("orchestrator prompt names the operation-specific tools and current steering contract", async () => {
@@ -982,14 +1022,29 @@ test("persistent launcher publishes skills over a concurrently published destina
     );
   }
   assert.deepEqual(await readdir(join(skillDir, "references")), ["recovery.md"]);
+  // Every shipped skill shares the publication seam, so every destination must
+  // have been planted and atomically replaced (manifest order).
+  for (const name of ["execution", "research"]) {
+    const dir = join(fixture.home, ".agents", "skills", name);
+    assert.equal(
+      await readFile(join(dir, "SKILL.md"), "utf8"),
+      await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
+      `the ${name} skill must be complete and current, not the stale planted content`,
+    );
+    assert.equal((await stat(join(dir, "SKILL.md"))).mode & 0o777, 0o644);
+    const entries = await readdir(dir);
+    assert.ok(!entries.some((entry) => entry.startsWith(".skill-publish.")));
+  }
 
-  // The seam must have actually intercepted both publications; without this
+  // The seam must have actually intercepted every publication; without this
   // the stale-destination precondition would never be in effect.
   const planted = (await readFile(plantedLog, "utf8")).split("\n").filter((line) => line.length > 0);
   assert.deepEqual(planted, [
     join(skillDir, "SKILL.md"),
     join(skillDir, "references", "recovery.md"),
-  ], "the seam must have planted both skill destinations before publication");
+    join(fixture.home, ".agents", "skills", "execution", "SKILL.md"),
+    join(fixture.home, ".agents", "skills", "research", "SKILL.md"),
+  ], "the seam must have planted every shipped skill destination before publication");
 });
 
 test("persistent launcher fails closed when a directory appears at a skill path before publication (#97)", async () => {

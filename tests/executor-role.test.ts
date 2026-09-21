@@ -270,13 +270,17 @@ test("executor role defers to the durable initial subset and activates authorize
       (value as { systemPrompt?: string } | undefined)?.systemPrompt ?? ""
     ).join("\n");
     assert.match(guidance, /native Pi prompt/);
-    for (const name of ["read", "edit", ...webToolNames, "ShellList", "search_tools"]) {
+    for (const name of [...webToolNames, "ShellList"]) {
       assert.match(guidance, new RegExp(`"${name}"`));
+    }
+    for (const name of ["read", "edit", "search_tools"]) {
+      assert.doesNotMatch(guidance, new RegExp(`"${name}"`), "baseline-loaded tools must not be redundantly listed");
     }
     assert.doesNotMatch(guidance, /SubtasksStart|SubtasksInspect/);
     assert.match(guidance, /exact name/i);
     assert.match(guidance, /next turn/i);
-    assert.doesNotMatch(guidance, /Read files|Edit files|Search the public web|parameters|properties/);
+    assert.match(guidance, /"WebSearch" \(Search the public web\)/);
+    assert.doesNotMatch(guidance, /Read files|Edit files|parameters|properties/);
 
     const search = definitions.get("search_tools");
     assert.ok(search?.execute);
@@ -285,7 +289,13 @@ test("executor role defers to the durable initial subset and activates authorize
     assert.deepEqual(active, ["read", "edit", "search_tools", "WebSearch"]);
 
     for (const hook of hooks.get("tool_result") ?? []) await hook({ toolName: "search_tools" }, ctx);
-    for (const hook of hooks.get("before_agent_start") ?? []) await hook({ cwd: dir }, ctx);
+    const after = await Promise.all((hooks.get("before_agent_start") ?? []).map((hook) =>
+      hook({ cwd: dir, systemPrompt: "native Pi prompt" }, ctx)
+    ));
+    const guidanceAfterActivation = after.map((value) =>
+      (value as { systemPrompt?: string } | undefined)?.systemPrompt ?? ""
+    ).join("\n");
+    assert.equal(guidanceAfterActivation, guidance, "activation must not churn the stable discovery summary");
     assert.deepEqual(active, ["read", "edit", "search_tools", "WebSearch"], "activation remains additive on the next model turn");
 
     const unmatched = await search.execute("load-unmatched", { query: "nonexistent-capability-token" });

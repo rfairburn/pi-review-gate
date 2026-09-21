@@ -87,6 +87,8 @@ try {
     "scripts/check-docs.cjs",
     "skills/orchestrator/SKILL.md",
     "skills/orchestrator/references/recovery.md",
+    "skills/execution/SKILL.md",
+    "skills/research/SKILL.md",
     "scripts/fake-reviewer.cjs",
     "LICENSES/Apache-2.0.txt",
     "NOTICE",

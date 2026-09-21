@@ -41,8 +41,10 @@ each other instead of duplicating detail.
   delegated execution, and a deterministic fake reviewer for testing).
 - Attribution and license texts: [NOTICE](../NOTICE), [LICENSE](../LICENSE),
   and [LICENSES/](../LICENSES).
-- The persistent orchestrator skill shipped with the package:
-  [skills/orchestrator/SKILL.md](../skills/orchestrator/SKILL.md).
+- The shipped skills provisioned with the package:
+  [skills/orchestrator/SKILL.md](../skills/orchestrator/SKILL.md),
+  [skills/execution/SKILL.md](../skills/execution/SKILL.md), and
+  [skills/research/SKILL.md](../skills/research/SKILL.md).
 
 ## Governance and contribution
 

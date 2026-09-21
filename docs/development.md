@@ -11,8 +11,10 @@ the checkout, not shipped in the npm package).
   `src/apply-patch/` (V4A engine), `src/settings/`, `src/background-shell/`.
 - `tests/` — Node test files compiled to `dist-test/`.
 - `scripts/` — launcher, web CLI wrapper, DDGS provisioning, Playwright provisioning,
-  package smoke, docs validation, fake reviewer, orchestrator prompt.
-- `skills/orchestrator/` — the orchestrator skill refreshed by the launcher.
+  package smoke, docs validation, fake reviewer, and the operating-mode prompt segments.
+- `skills/orchestrator/`, `skills/execution/`, `skills/research/` — the shipped skills
+  refreshed by the launcher (orchestration with its recovery runbook, direct/delegated
+  execution, and read-only research).
 - `examples/` — runnable JSON configs ([Getting started](getting-started.md#minimal-configuration)).
 - `docs/` — this documentation tree.
 - Root policy docs: `AGENTS.md` (agent orientation), [CONTRIBUTING](../CONTRIBUTING.md),
@@ -156,8 +158,9 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
 - Runs `scripts/ensure-ddgs.sh` to create, validate, and repair the pinned web-search
   venv (creating or repairing it requires a `python3` interpreter on `PATH`; fails
   closed when the environment cannot be established).
-- Refreshes the discoverable orchestration skill at
-  `~/.agents/skills/orchestrator/SKILL.md` (and its recovery runbook) from the packaged
+- Refreshes the discoverable shipped skills under
+  `~/.agents/skills/` — orchestrator (including its recovery runbook), execution, and
+  research — from the packaged
   sources, then executes the installed `pi` with the extension, forwarding all
   remaining arguments unchanged.
 
@@ -192,9 +195,12 @@ and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest
 POSIX launcher is unchanged.
 
 The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
-for each new run; the skill provides deeper guidance for decomposition, beneficial
+for each new run; each prompt opens with a startup cue to read the matching shipped
+skill, which provides deeper guidance — decomposition, beneficial
 parallelism and bounded task construction, supervision, reviewer interpretation,
-integration, and synthesis. The launcher does not impose a separate orchestrator policy;
+integration, and synthesis for orchestration; direct and delegated execution
+capabilities and the worker workspace contract for execution; the enforced read-only
+boundary for plan/research. The launcher does not impose a separate orchestrator policy;
 to limit the orchestrator, pass Pi's native allowlist through the wrapper, for example
 `./scripts/pi-review-gate.sh --tools read,bash,edit,write`.
 

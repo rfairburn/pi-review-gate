@@ -9,9 +9,20 @@ esac
 
 REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
-ORCHESTRATOR_SKILL_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/SKILL.md"
-ORCHESTRATOR_RECOVERY_SOURCE="$REVIEW_GATE_ROOT/skills/orchestrator/references/recovery.md"
-ORCHESTRATOR_SKILL_DIR="$HOME/.agents/skills/orchestrator"
+SKILLS_DIR="$HOME/.agents/skills"
+ORCHESTRATOR_SKILL_DIR="$SKILLS_DIR/orchestrator"
+EXECUTION_SKILL_DIR="$SKILLS_DIR/execution"
+RESEARCH_SKILL_DIR="$SKILLS_DIR/research"
+
+# Skill provisioning manifest (issue 23): packaged source path and installed
+# destination path, tab-separated, one entry per shipped skill file. Keep in
+# sync with SKILL_PUBLISH_PLAN in scripts/pi-review-gate-launcher.cjs.
+SKILL_PUBLISH_PLAN=(
+  "$REVIEW_GATE_ROOT/skills/orchestrator/SKILL.md"$'\t'"$ORCHESTRATOR_SKILL_DIR/SKILL.md"
+  "$REVIEW_GATE_ROOT/skills/orchestrator/references/recovery.md"$'\t'"$ORCHESTRATOR_SKILL_DIR/references/recovery.md"
+  "$REVIEW_GATE_ROOT/skills/execution/SKILL.md"$'\t'"$EXECUTION_SKILL_DIR/SKILL.md"
+  "$REVIEW_GATE_ROOT/skills/research/SKILL.md"$'\t'"$RESEARCH_SKILL_DIR/SKILL.md"
+)
 
 # Deliberate environment sanitization: the persistent config is re-resolved
 # below and re-exported, so an inherited PI_REVIEW_GATE_CONFIG (e.g. from a
@@ -355,16 +366,25 @@ fi
 
 source "$REVIEW_GATE_ROOT/scripts/ensure-ddgs.sh"
 
-if [[ ! -f "$ORCHESTRATOR_SKILL_SOURCE" ]]; then
-  echo "pi-review-gate: packaged orchestrator skill is missing: $ORCHESTRATOR_SKILL_SOURCE" >&2
-  exit 2
-fi
-if [[ ! -f "$ORCHESTRATOR_RECOVERY_SOURCE" ]]; then
-  echo "pi-review-gate: packaged orchestrator recovery reference is missing: $ORCHESTRATOR_RECOVERY_SOURCE" >&2
-  exit 2
-fi
+# Fail closed before any publication when a packaged skill file is missing.
+for entry in "${SKILL_PUBLISH_PLAN[@]}"; do
+  skill_source="${entry%%$'\t'*}"
+  if [[ ! -f "$skill_source" ]]; then
+    echo "pi-review-gate: packaged skill file is missing: $skill_source" >&2
+    exit 2
+  fi
+done
 
-# Publish one orchestrator skill file atomically (issue 97). The content is
+# Create every destination directory before publishing into it.
+for entry in "${SKILL_PUBLISH_PLAN[@]}"; do
+  skill_destination="${entry#*$'\t'}"
+  mkdir -p "$(dirname "$skill_destination")" || exit 2
+done
+
+# Publish each shipped skill file only when the installed copy is missing or
+# differs from the source (cmp -s parity).
+
+# Publish one shipped skill file atomically (issue 97). The content is
 # staged in a private temporary file inside the destination directory and then
 # moved into place with an atomic rename(2) (Node's fs.renameSync), mirroring
 # the default-config publication above. rename() replaces an existing regular
@@ -378,15 +398,15 @@ fi
 # symlink is replaced atomically as well (the link itself, never followed),
 # but if the destination is a directory rename fails and the launcher refuses
 # to continue instead of publishing somewhere else.
-publish_orchestrator_skill_file() {
+publish_skill_file() {
   local skill_source="$1" skill_destination="$2" dir tmp
   dir="$(dirname "$skill_destination")"
   if ! command -v node >/dev/null 2>&1; then
-    echo "pi-review-gate: the node runtime is required to publish the orchestrator skill (install Node.js 20 or newer)" >&2
+    echo "pi-review-gate: the node runtime is required to publish the skill files (install Node.js 20 or newer)" >&2
     return 1
   fi
   tmp="$(mktemp "$dir/.skill-publish.XXXXXXXX")" || {
-    echo "pi-review-gate: could not create a temporary file in $dir (permission denied?); the orchestrator skill cannot be published to $skill_destination" >&2
+    echo "pi-review-gate: could not create a temporary file in $dir (permission denied?); the skill file cannot be published to $skill_destination" >&2
     return 1
   }
   if ! cp -f "$skill_source" "$tmp"; then
@@ -398,7 +418,7 @@ publish_orchestrator_skill_file() {
   # any other state (mktemp creates 0600; the skill files are 0644).
   if ! chmod 644 "$tmp"; then
     rm -f "$tmp"
-    echo "pi-review-gate: could not set permissions on the staged orchestrator skill file in $dir; refusing to continue" >&2
+    echo "pi-review-gate: could not set permissions on the staged skill file in $dir; refusing to continue" >&2
     return 1
   fi
   if node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2]);' "$tmp" "$skill_destination" 2>/dev/null; then
@@ -408,18 +428,21 @@ publish_orchestrator_skill_file() {
   if [[ -d "$skill_destination" ]]; then
     echo "pi-review-gate: $skill_destination exists but is not a replaceable regular file (a directory appeared there?); move or rename that path and re-run the launcher" >&2
   else
-    echo "pi-review-gate: unexpected failure publishing the orchestrator skill to $skill_destination; re-run the launcher" >&2
+    echo "pi-review-gate: unexpected failure publishing the skill file to $skill_destination; re-run the launcher" >&2
   fi
   return 1
 }
 
-mkdir -p "$ORCHESTRATOR_SKILL_DIR/references" || exit 2
-if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/SKILL.md" ]] || ! cmp -s "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md"; then
-  publish_orchestrator_skill_file "$ORCHESTRATOR_SKILL_SOURCE" "$ORCHESTRATOR_SKILL_DIR/SKILL.md" || exit 2
-fi
-if [[ ! -f "$ORCHESTRATOR_SKILL_DIR/references/recovery.md" ]] || ! cmp -s "$ORCHESTRATOR_RECOVERY_SOURCE" "$ORCHESTRATOR_SKILL_DIR/references/recovery.md"; then
-  publish_orchestrator_skill_file "$ORCHESTRATOR_RECOVERY_SOURCE" "$ORCHESTRATOR_SKILL_DIR/references/recovery.md" || exit 2
-fi
+plan_index=0
+while [[ "$plan_index" -lt "${#SKILL_PUBLISH_PLAN[@]}" ]]; do
+  entry="${SKILL_PUBLISH_PLAN[$plan_index]}"
+  skill_source="${entry%%$'\t'*}"
+  skill_destination="${entry#*$'\t'}"
+  if [[ ! -f "$skill_destination" ]] || ! cmp -s "$skill_source" "$skill_destination"; then
+    publish_skill_file "$skill_source" "$skill_destination" || exit 2
+  fi
+  plan_index=$((plan_index + 1))
+done
 
 # The exported path must be in the native Windows form: MSYS never converts
 # environment variables, and Node cannot open /c/... paths on Windows. Off
@@ -439,6 +462,8 @@ esac
 echo "pi-review-gate config: $REVIEW_GATE_CONFIG"
 echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"
 echo "pi-review-gate orchestrator skill: $ORCHESTRATOR_SKILL_DIR/SKILL.md"
+echo "pi-review-gate execution skill: $EXECUTION_SKILL_DIR/SKILL.md"
+echo "pi-review-gate research skill: $RESEARCH_SKILL_DIR/SKILL.md"
 
 # The extension owns the operating-mode system prompt segment (issue 19); the
 # launcher no longer passes a permanent --append-system-prompt, so mode

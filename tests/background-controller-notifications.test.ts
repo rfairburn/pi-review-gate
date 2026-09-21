@@ -6,7 +6,7 @@ import test from "node:test";
 import {
   BackgroundExecutionController,
 } from "../src/execution/background-controller";
-import type { BackgroundConflictGate, BackgroundExecutionGroup, BackgroundInspection, BackgroundTaskRecord } from "../src/execution/background-controller";
+import type { BackgroundConflictGate, BackgroundExecutionGroup, BackgroundInspection, BackgroundTaskRecord, BackgroundWatchSubscription } from "../src/execution/background-controller";
 import { normalizeConfig } from "../src/config";
 import { createState } from "../src/state";
 import {
@@ -566,7 +566,10 @@ async function setupConflictedLanding(
  * interrupts A once its checkpoint file is visible so A becomes
  * force-mergeable while B remains active.
  */
-async function setupInterruptedSiblingPair(unique: string): Promise<{
+async function setupInterruptedSiblingPair(
+  unique: string,
+  options?: { siblingDelayMs?: number },
+): Promise<{
   root: string;
   controller: BackgroundExecutionController;
   started: BackgroundInspection;
@@ -585,9 +588,11 @@ async function setupInterruptedSiblingPair(unique: string): Promise<{
     "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
     "process.stdin.on('end',()=>{",
     `if(prompt.includes('${sentinelA}')){fs.writeFileSync('a.txt','a landed\\n');setTimeout(()=>console.log(JSON.stringify({type:'assistant',text:'late completion'})),30000);return;}`,
-    // B lands on its own a few seconds after dispatch so it is still active
-    // well past any checkpoint deadline armed during the test.
-    `if(prompt.includes('${sentinelB}')){fs.writeFileSync('b.txt','b landed\\n');setTimeout(()=>{console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));},3000);return;}`,
+    // B lands on its own after `siblingDelayMs` (default 3000) following its
+    // dispatch so it is still active well past any checkpoint deadline armed
+    // during the test. A larger delay keeps the sibling active even through
+    // slow merges in tests that never wait for B.
+    `if(prompt.includes('${sentinelB}')){fs.writeFileSync('b.txt','b landed\\n');setTimeout(()=>{console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));console.log(JSON.stringify({type:'assistant',text:'completed requested edit'}));},${options?.siblingDelayMs ?? 3000});return;}`,
     "});",
   ].join("\n"), "utf8");
   await chmod(executor, 0o755);
@@ -646,6 +651,141 @@ async function setupInterruptedSiblingPair(unique: string): Promise<{
       await rm(root, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * #160: deterministic armed-watch seam for the suppressed-completion
+ * regressions. Arming a real 1200 ms timer before an arbitrarily slow
+ * production force-merge/mark-clean races the deadline against the completion:
+ * under load the deadline can legitimately fire pre-completion, which makes
+ * "zero total watch events" assertions vacuous or flaky. Instead the
+ * production `controller.watch(...)` call is armed through a narrowly scoped
+ * timer registration: the single deadline callback armed by this one watch
+ * call is captured and never enters the real event loop, the test itself
+ * advances the would-be deadline after the production completion has run the
+ * real cancellation, and a clearTimeout interception observes the production
+ * cancelWatch clearing the controlled handle (a pass-through for every other
+ * timer in the process — nothing unrelated is frozen or mocked).
+ *
+ * With `captureDeliveryTimers`, the interception window additionally stays
+ * open across the deadline fire, so the 25 ms delivery timer armed inside the
+ * production `queueWatchDelivery` callback is captured too; tests can then
+ * prove that a genuinely queued checkpoint snapshot was retired by the real
+ * cancelWatch before its delivery window ran.
+ *
+ * The capture window between arming and firing the deadline must stay fully
+ * synchronous (no awaits): an awaited step inside that window would silently
+ * capture unrelated process timers and they would never fire. A timer-polling
+ * await (e.g. waitFor) would capture its own poll timer and hang before
+ * `fireDeadline` runs, so this synchronous-window rule — not the guard below —
+ * is the binding constraint; the guard's assertion additionally fails fast
+ * when an awaited step inside the window completed on its own and captured an
+ * unrelated timer.
+ */
+interface ControlledWatchArm {
+  armed: BackgroundWatchSubscription;
+  /** `true` once production code cleared the controlled deadline handle (cancelWatch / clearWatches). */
+  wasCleared(): boolean;
+  /** Advance/release the would-be deadline by running the armed production delivery callback. */
+  fireDeadline(): void;
+  /** Timers captured after the deadline (e.g. the 25 ms delivery window), in capture order. */
+  deliveryTimers: Array<{ handle: unknown; fire(): void }>;
+  /** Restore the global timer functions. */
+  release(): void;
+}
+
+function armControlledWatch(
+  controller: BackgroundExecutionController,
+  executionId: string,
+  afterMs: number,
+  options?: { captureDeliveryTimers?: boolean },
+): ControlledWatchArm {
+  const captureDeliveryTimers = options?.captureDeliveryTimers === true;
+  const scope = globalThis as { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
+  const originalSetTimeout = scope.setTimeout;
+  const originalClearTimeout = scope.clearTimeout;
+  let deadlineCallback: (() => void) | undefined;
+  let released = false;
+  let captureActive = true;
+  const capturedTimers: Array<{ handle: NodeJS.Timeout; callback: () => void; cleared: boolean }> = [];
+  // Deliberately not a real Timeout: captured deadlines must never enter the
+  // event loop before the test advances them.
+  const release = () => {
+    if (released) return;
+    released = true;
+    captureActive = false;
+    scope.setTimeout = originalSetTimeout;
+    scope.clearTimeout = originalClearTimeout;
+  };
+  // The interception window only covers timers armed by controller code: the
+  // watch() deadline, plus (in capture mode) the delivery window armed inside
+  // the fired deadline callback. Every other timer stays real.
+  const endCapture = () => {
+    captureActive = false;
+    scope.setTimeout = originalSetTimeout;
+  };
+  const fireDeadline = () => {
+    assert.ok(deadlineCallback, "the controlled watch never armed a deadline callback");
+    // Guard against a future edit awaiting inside the capture window: any
+    // unrelated process timer captured there would never fire and the test
+    // would hang. Exactly the one watch deadline must have been captured.
+    // (This guard only catches awaits whose work completes on its own; a
+    // timer-polling await would hang before reaching it, so the
+    // synchronous-window rule documented above remains binding.)
+    assert.equal(capturedTimers.length, 1, "an unrelated timer entered the capture window; the window between arming and firing must stay synchronous");
+    // Fired unconditionally, even after cancellation: this is exactly what a
+    // timer implementation would run at the deadline, so the production
+    // queueWatchDelivery armed-subscription guard — not test speed — must
+    // suppress the stale delivery.
+    deadlineCallback();
+    if (captureDeliveryTimers) endCapture();
+  };
+  scope.setTimeout = ((callback: () => void, ms?: number, ...rest: unknown[]) => {
+    if (!captureActive) return originalSetTimeout(callback, ms, ...rest);
+    const entry = { handle: { controlledWatchTimer: true } as unknown as NodeJS.Timeout, callback, cleared: false };
+    // The first captured timer is the watch deadline armed by controller.watch().
+    deadlineCallback ??= callback;
+    capturedTimers.push(entry);
+    return entry.handle;
+  }) as unknown as typeof setTimeout;
+  scope.clearTimeout = ((timer?: NodeJS.Timeout) => {
+    for (const entry of capturedTimers) {
+      if (timer === entry.handle) {
+        entry.cleared = true;
+        return undefined;
+      }
+    }
+    return originalClearTimeout(timer);
+  }) as unknown as typeof clearTimeout;
+  try {
+    const armed = controller.watch(executionId, afterMs);
+    assert.ok(deadlineCallback, "controller.watch did not arm a delivery timer");
+    if (!captureDeliveryTimers) endCapture();
+    return {
+      armed,
+      wasCleared: () => capturedTimers[0]?.cleared === true,
+      fireDeadline,
+      // Computed lazily: in capture mode the delivery timers are captured when
+      // the deadline is fired, after this object was returned.
+      get deliveryTimers() {
+        return capturedTimers.slice(1).map((entry) => ({
+          handle: entry.handle,
+          // Fired unconditionally, like a real delivery timer would be; with
+          // the queued snapshot retired by production code this delivers
+          // nothing.
+          fire: () => {
+            assert.equal(entry.cleared, false, "the captured delivery window was already cleared");
+            entry.callback();
+          },
+        }));
+      },
+      release,
+    };
+  } catch (error) {
+    scope.setTimeout = originalSetTimeout;
+    scope.clearTimeout = originalClearTimeout;
+    throw error;
+  }
 }
 
 test("#117 model-actor mark-clean suppresses the completion wake and folds in the group aggregate", async () => {
@@ -845,40 +985,51 @@ test("#117 a suppressed model force-merge cancels the group's armed watch instea
   const scenario = await setupInterruptedSiblingPair("watch-force");
   try {
     const { controller, started, taskA, taskB, messages } = scenario;
-    // Arm the one-shot checkpoint while B keeps the group active. The
-    // deadline lands well after the force-merge completes, so without the
-    // cancellation it would fire as a stale checkpoint after A's landing was
-    // already confirmed by the direct tool result.
-    const armed = controller.watch(started.executionId, 1_200);
-    assert.equal(armed.replaced, false);
+    // #160: arm the one-shot checkpoint with a controlled deadline so it is
+    // genuinely armed across the production completion no matter how slow the
+    // merge is, and the test — not timer/completion speed — advances the
+    // deadline afterwards. The deadline is released only after the real
+    // cancellation has run, so the suppression cannot be masked by a deadline
+    // that fired before the landing.
+    const arm = armControlledWatch(controller, started.executionId, 1_200);
+    try {
+      // Inside the try so arm.release() always runs on failure; an early
+      // throw would otherwise leave the global timer shims installed.
+      assert.equal(arm.armed.replaced, false);
+      const landed = await controller.forceMerge({
+        executionId: started.executionId,
+        taskId: taskA,
+        mergeAnyhow: false,
+        instructionId: "dedupe-watch-force",
+        actor: "model",
+      });
+      assert.equal(landed.tasks[0]?.state, "landed");
+      assert.ok(landed.completionAggregate?.includes(taskB), "the direct result still names the outstanding sibling");
+      assert.equal(completionEvents(messages).length, 0, "no completion notification follows the suppressed landing");
 
-    const landed = await controller.forceMerge({
-      executionId: started.executionId,
-      taskId: taskA,
-      mergeAnyhow: false,
-      instructionId: "dedupe-watch-force",
-      actor: "model",
-    });
-    assert.equal(landed.tasks[0]?.state, "landed");
-    assert.ok(landed.completionAggregate?.includes(taskB), "the direct result still names the outstanding sibling");
-    assert.equal(completionEvents(messages).length, 0, "no completion notification follows the suppressed landing");
+      // The real cancelWatch retired both watch representations: the armed
+      // timer handle was cleared and the subscription plus any queued
+      // checkpoint snapshot are gone.
+      assert.equal(arm.wasCleared(), true, "production cancelWatch cleared the armed timer handle");
+      const internals = controller as unknown as {
+        watches: Map<string, unknown>;
+        pendingWatchInspections: Array<{ executionId: string }>;
+        watchDeliveryTimer?: unknown;
+      };
+      assert.equal(internals.watches.has(started.executionId), false, "the armed watch subscription was retired");
+      assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
 
-    // Both watch representations are retired by the suppressed completion:
-    // the armed timer and any queued checkpoint snapshot. (The undelivered
-    // 25 ms delivery window has no deterministic seam with real timers, so
-    // the armed-timer case above carries the observable regression and this
-    // pins both representations through the shared cancelWatch path.)
-    const internals = controller as unknown as {
-      watches: Map<string, unknown>;
-      pendingWatchInspections: Array<{ executionId: string }>;
-    };
-    assert.equal(internals.watches.has(started.executionId), false, "the armed watch timer was cancelled");
-    assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
-
-    // Past the original deadline: without the cancellation a stale
-    // checkpoint would have fired here while B was still active.
-    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_500));
-    assert.equal(watchEvents(messages).length, 0, "no stale checkpoint fires after the direct-result-confirmed landing");
+      // Advance/release the would-be deadline past its original schedule.
+      // Even a firing deadline cannot deliver: the queueWatchDelivery
+      // armed-subscription guard finds nothing to inspect, so no delivery
+      // timer is scheduled and no stale checkpoint event arrives while B is
+      // still active.
+      arm.fireDeadline();
+      assert.equal(internals.watchDeliveryTimer, undefined, "no delivery timer is scheduled for a retired watch");
+      assert.equal(watchEvents(messages).length, 0, "no stale checkpoint fires after the direct-result-confirmed landing");
+    } finally {
+      arm.release();
+    }
 
     // B's own executor-driven completion is a distinct event and still wakes.
     await waitFor(() => controller.inspect(started.executionId).tasks.every((task) => task.state === "landed"));
@@ -897,31 +1048,46 @@ test("#117 a suppressed model mark-clean cancels the group's armed watch instead
     const { controller, started, taskId, siblingTaskId, messages } = scenario;
     assert.ok(siblingTaskId, "the active sibling started");
     // B keeps the group active after A's conflicted landing (whose failure
-    // wake already delivered), so the one-shot checkpoint can be armed. The
-    // deadline lands well after markClean completes.
-    const armed = controller.watch(started.executionId, 1_200);
-    assert.equal(armed.replaced, false);
+    // wake already delivered), so the one-shot checkpoint can be armed. #160:
+    // the controlled deadline stays armed across the production mark-clean
+    // however slow it is; the test itself releases the deadline afterwards.
+    const arm = armControlledWatch(controller, started.executionId, 1_200);
+    try {
+      // Inside the try so arm.release() always runs on failure; an early
+      // throw would otherwise leave the global timer shims installed.
+      assert.equal(arm.armed.replaced, false);
+      await writeFile(join(scenario.root, "shared.txt"), "resolved\n", "utf8");
+      const outcome = await controller.markClean({ actor: "model" });
+      assert.equal(outcome.cleared, true);
+      assert.deepEqual(outcome.paths, ["shared.txt"]);
+      assert.equal(controller.inspect(started.executionId, taskId).tasks[0]?.state, "landed");
+      assert.equal(outcome.completionAggregates?.length, 1);
+      assert.ok(outcome.completionAggregates![0]!.aggregate.includes(siblingTaskId), "the folded aggregate names the still-active sibling");
+      assert.equal(completionEvents(messages).length, 0, "no completion notification follows the suppressed validated landing");
 
-    await writeFile(join(scenario.root, "shared.txt"), "resolved\n", "utf8");
-    const outcome = await controller.markClean({ actor: "model" });
-    assert.equal(outcome.cleared, true);
-    assert.deepEqual(outcome.paths, ["shared.txt"]);
-    assert.equal(controller.inspect(started.executionId, taskId).tasks[0]?.state, "landed");
-    assert.equal(outcome.completionAggregates?.length, 1);
-    assert.ok(outcome.completionAggregates![0]!.aggregate.includes(siblingTaskId), "the folded aggregate names the still-active sibling");
-    assert.equal(completionEvents(messages).length, 0, "no completion notification follows the suppressed validated landing");
+      // The real cancelWatch retired both watch representations: the armed
+      // timer handle was cleared and the subscription plus any queued
+      // checkpoint snapshot are gone.
+      assert.equal(arm.wasCleared(), true, "production cancelWatch cleared the armed timer handle");
+      const internals = controller as unknown as {
+        watches: Map<string, unknown>;
+        pendingWatchInspections: Array<{ executionId: string }>;
+        watchDeliveryTimer?: unknown;
+      };
+      assert.equal(internals.watches.has(started.executionId), false, "the armed watch subscription was retired");
+      assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
 
-    const internals = controller as unknown as {
-      watches: Map<string, unknown>;
-      pendingWatchInspections: Array<{ executionId: string }>;
-    };
-    assert.equal(internals.watches.has(started.executionId), false, "the armed watch timer was cancelled");
-    assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
-
-    // Past the original deadline: without the cancellation a stale
-    // checkpoint would have fired here while B was still active.
-    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_500));
-    assert.equal(watchEvents(messages).length, 0, "no stale checkpoint fires after the direct-result-confirmed landing");
+      // Advance/release the would-be deadline past its original schedule.
+      // Even a firing deadline cannot deliver: the queueWatchDelivery
+      // armed-subscription guard finds nothing to inspect, so no delivery
+      // timer is scheduled and no stale checkpoint event arrives while B is
+      // still active.
+      arm.fireDeadline();
+      assert.equal(internals.watchDeliveryTimer, undefined, "no delivery timer is scheduled for a retired watch");
+      assert.equal(watchEvents(messages).length, 0, "no stale checkpoint fires after the direct-result-confirmed landing");
+    } finally {
+      arm.release();
+    }
 
     // B's own executor-driven completion is a distinct event and still wakes.
     await waitFor(() => controller.inspect(started.executionId).tasks.every((task) => task.state === "landed"));
@@ -929,6 +1095,159 @@ test("#117 a suppressed model mark-clean cancels the group's armed watch instead
     const siblingCompletion = completionEvents(messages)[0]!;
     assert.ok(siblingCompletion.content.includes(siblingTaskId), "the sibling completion names its own task");
     assert.ok(!siblingCompletion.content.includes("conflict resolution was validated and landed"), "the suppressed landing never arrives as a later notification");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#160 a checkpoint released before the suppressed landing is a legitimate pre-completion delivery, not a stale one", async () => {
+  const scenario = await setupInterruptedSiblingPair("watch-precompletion");
+  try {
+    const { controller, started, taskA, taskB, messages } = scenario;
+    // Boundary clarification from the #160 production probe: a deadline that
+    // fires while the watch is still armed — before the suppressed landing —
+    // is a legitimate checkpoint delivery, never classified as stale, and it
+    // consumes the one-shot subscription itself.
+    const arm = armControlledWatch(controller, started.executionId, 1_200);
+    try {
+      // Inside the try so arm.release() always runs on failure; an early
+      // throw would otherwise leave the global timer shims installed.
+      assert.equal(arm.armed.replaced, false);
+      arm.fireDeadline();
+      await waitFor(() => watchEvents(messages).length === 1);
+      const checkpoint = watchEvents(messages)[0]!;
+      assert.ok(checkpoint.content.includes(started.executionId), "the checkpoint names the execution");
+      assert.ok(checkpoint.content.includes(taskB), "the checkpoint reports the still-active sibling");
+      const internals = controller as unknown as { watches: Map<string, unknown> };
+      assert.equal(internals.watches.has(started.executionId), false, "the one-shot subscription was consumed by its own firing");
+      assert.equal(arm.wasCleared(), false, "the pre-completion firing was a legitimate delivery, not a cancellation");
+      // A second release is inert: the consumed subscription cannot fire
+      // again and cannot be resurrected by a later landing.
+      arm.fireDeadline();
+      assert.equal(watchEvents(messages).length, 1, "the one-shot checkpoint delivers once");
+    } finally {
+      arm.release();
+    }
+
+    // The suppressed force-merge still folds B into the direct result with no
+    // duplicate completion and no second checkpoint.
+    const landed = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId: taskA,
+      mergeAnyhow: false,
+      instructionId: "dedupe-watch-precompletion",
+      actor: "model",
+    });
+    assert.equal(landed.tasks[0]?.state, "landed");
+    assert.ok(landed.completionAggregate?.includes(taskB), "the direct result still names the outstanding sibling");
+    assert.equal(watchEvents(messages).length, 1, "the pre-completion checkpoint is the only watch delivery; the suppressed landing adds no stale one");
+    assert.equal(completionEvents(messages).length, 0, "no completion notification follows the suppressed landing");
+
+    // B's own executor-driven completion is a distinct event and still wakes.
+    await waitFor(() => controller.inspect(started.executionId).tasks.every((task) => task.state === "landed"));
+    await waitFor(() => completionEvents(messages).length === 1);
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#160 a queued checkpoint snapshot is retired by the suppressed completion instead of delivering after its window fires", async () => {
+  const scenario = await setupInterruptedSiblingPair("watch-queued-snapshot");
+  try {
+    const { controller, started, taskA, taskB, messages } = scenario;
+    // #160 non-vacuous queued-state proof: the deadline fires BEFORE the
+    // suppressed landing, so a real checkpoint snapshot is queued with its
+    // 25 ms delivery window captured; the merge's cancelWatch must retire
+    // that queued snapshot before the window runs.
+    const arm = armControlledWatch(controller, started.executionId, 1_200, { captureDeliveryTimers: true });
+    try {
+      // Inside the try so arm.release() always runs on failure; an early
+      // throw would otherwise leave the global timer shims installed.
+      assert.equal(arm.armed.replaced, false);
+      arm.fireDeadline();
+      assert.equal(arm.deliveryTimers.length, 1, "the production delivery window was captured");
+      const internals = controller as unknown as {
+        watches: Map<string, unknown>;
+        pendingWatchInspections: Array<{ executionId: string }>;
+        watchDeliveryTimer?: unknown;
+      };
+      assert.equal(internals.watches.has(started.executionId), false, "the firing consumed the one-shot subscription");
+      assert.ok(internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "a checkpoint snapshot is genuinely queued before the landing");
+      assert.equal(internals.watchDeliveryTimer, arm.deliveryTimers[0]!.handle, "the captured delivery window is the production watchDeliveryTimer");
+
+      const landed = await controller.forceMerge({
+        executionId: started.executionId,
+        taskId: taskA,
+        mergeAnyhow: false,
+        instructionId: "dedupe-watch-queued",
+        actor: "model",
+      });
+      assert.equal(landed.tasks[0]?.state, "landed");
+      assert.ok(landed.completionAggregate?.includes(taskB), "the direct result still names the outstanding sibling");
+      assert.equal(arm.wasCleared(), false, "the deadline was already consumed; cancellation retires the queued snapshot instead");
+      assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "the queued checkpoint snapshot was retired by the suppressed completion");
+      assert.equal(completionEvents(messages).length, 0, "no completion notification follows the suppressed landing");
+
+      // Release the captured delivery window after the retirement: the
+      // production delivery runs over the emptied pending list and delivers
+      // no stale checkpoint while B is still active.
+      arm.deliveryTimers[0]!.fire();
+      assert.equal(internals.watchDeliveryTimer, undefined, "the delivery window closed without scheduling anything");
+      assert.equal(watchEvents(messages).length, 0, "the retired queued checkpoint never delivers");
+    } finally {
+      arm.release();
+    }
+
+    // B's own executor-driven completion is a distinct event and still wakes.
+    await waitFor(() => controller.inspect(started.executionId).tasks.every((task) => task.state === "landed"));
+    await waitFor(() => completionEvents(messages).length === 1);
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("#160 without watch cancellation the released deadline delivers a stale checkpoint (negative control)", async () => {
+  // A long sibling window keeps B active through even a slow merge, so the
+  // stale checkpoint delivery in this test can only be suppressed by real
+  // cancellation, never by B finishing first.
+  const scenario = await setupInterruptedSiblingPair("watch-negative-control", { siblingDelayMs: 30_000 });
+  try {
+    const { controller, started, taskA, taskB, messages } = scenario;
+    const arm = armControlledWatch(controller, started.executionId, 1_200);
+    try {
+      // Inside the try so arm.release() always runs on failure; an early
+      // throw would otherwise leave the global timer shims installed.
+      assert.equal(arm.armed.replaced, false);
+      // Bounded private mutation, test-side only and never landed in
+      // production: remove the cancellation to demonstrate that the
+      // suppression tests above are genuinely sensitive to it.
+      const internals = controller as unknown as { cancelWatch: (executionId: string) => boolean };
+      const productionCancelWatch = internals.cancelWatch;
+      internals.cancelWatch = () => false;
+      try {
+        const landed = await controller.forceMerge({
+          executionId: started.executionId,
+          taskId: taskA,
+          mergeAnyhow: false,
+          instructionId: "dedupe-watch-negative",
+          actor: "model",
+        });
+        assert.equal(landed.tasks[0]?.state, "landed");
+
+        // With the cancellation removed the armed subscription survives the
+        // suppressed completion; releasing the deadline now delivers the
+        // stale checkpoint the production cancelWatch would have retired.
+        arm.fireDeadline();
+        await waitFor(() => watchEvents(messages).length === 1);
+        const stale = watchEvents(messages)[0]!;
+        assert.ok(stale.content.includes(started.executionId), "the stale checkpoint names the execution");
+        assert.ok(stale.content.includes(taskB), "the stale checkpoint fires while the sibling is still active");
+      } finally {
+        internals.cancelWatch = productionCancelWatch;
+      }
+    } finally {
+      arm.release();
+    }
   } finally {
     await scenario.cleanup();
   }

@@ -15,6 +15,34 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.65]
+
+### Changed
+
+- Extract browser diagnostics, error types and classifiers, operation/deadline
+  primitives, and URL-policy helpers into focused modules. Preserve the
+  interactive browser's existing exports, error identities, safety checks and
+  runtime behavior while reducing mixed responsibilities in its manager.
+
+## [0.1.0-dev.64]
+
+### Changed
+
+- Split background-controller tests into seven suites organized by lifecycle,
+  steering, interruption/merge, persistence, notifications, watch/widget, and
+  subtask-command behavior. Reuse shared fixture setup and update the execution
+  test command while preserving all 71 scenarios and their assertions. Runtime
+  behavior is unchanged.
+
+## [0.1.0-dev.63]
+
+### Changed
+
+- Split extension-entrypoint tests into focused readiness, deferred-discovery,
+  restoration, review-lifecycle, and uncertain-transmission suites with shared
+  fixture setup. Preserve all 55 scenarios and their production entrypoints;
+  runtime behavior is unchanged.
+
 ## [0.1.0-dev.62]
 
 ### Added

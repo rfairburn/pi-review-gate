@@ -8,6 +8,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import {
+  BINARY_SAMPLE_BYTES,
   compareSnapshots,
   createPathSnapshot,
   createWorkspaceSnapshot,
@@ -130,6 +131,174 @@ test("oversized magic-identified binaries remain binary and hash-only", async ()
     assert.equal(file?.omittedReason, "binary");
     assert.equal(file?.content, undefined);
     assert.equal(file?.sha256, createHash("sha256").update(content).digest("hex"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("valid multibyte UTF-8 crossing the sample boundary stays text through real capture", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-utf8-boundary-"));
+  try {
+    // Each fixture places one multibyte character so its byte sequence
+    // straddles the binary-sample bound at every possible split point; the
+    // rest is plain ASCII well past the bound.
+    const cases: Array<{ char: string; splits: number[] }> = [
+      { char: "\u00E9", splits: [1] },
+      { char: "\u20AC", splits: [1, 2] },
+      // U+0800 = E0 A0 80: the E0 second-byte floor (A0) is legal, so this
+      // completable tail must be trimmed like any other valid lead.
+      { char: "\u0800", splits: [1, 2] },
+      { char: "\u{1D11E}", splits: [1, 2, 3] },
+      // U+D000 = ED 80 80: the ED surrogate ceiling (9F) needs an accept-side
+      // fixture; ED 80-9F covers U+D000-D7FF (Hangul syllables).
+      { char: "\uD000", splits: [2] },
+      { char: "\uD7FF", splits: [2] }, // ED 9F BF: pins the ED accept-side ceiling
+      { char: "\u{10000}", splits: [2] }, // F0 90 80 80: pins the F0 accept-side floor
+      // U+40000 = F1 80 80 80: F1-F3 accept second bytes 80-BF, so these
+      // completable tails must be trimmed like any other valid lead.
+      { char: "\u{40000}", splits: [2, 3] },
+      // U+10FFFF = F4 8F BF BF: the F4 upper bound (8F) accept side.
+      { char: "\u{10FFFF}", splits: [2] },
+    ];
+    const expected = new Map<string, string>();
+    for (const { char, splits } of cases) {
+      const width = Buffer.byteLength(char, "utf8");
+      const codePoint = char.codePointAt(0)!.toString(16);
+      for (const split of splits) {
+        const name = `cross-${width}b-${codePoint}-split-${split}.txt`;
+        expected.set(name, "a".repeat(BINARY_SAMPLE_BYTES - split) + char + "b".repeat(120));
+      }
+    }
+    // A duplicate fixture name would silently drop a boundary case from both
+    // the on-disk fixtures and the expectations below.
+    assert.equal(
+      expected.size,
+      cases.reduce((count, entry) => count + entry.splits.length, 0),
+      "fixture names must be unique across cases",
+    );
+    for (const [name, content] of expected) await writeFile(join(dir, name), content, "utf8");
+
+    const snapshot = await createWorkspaceSnapshot(dir, snapshotOptions);
+    assert.equal(snapshot.files.size, expected.size);
+    for (const [name, content] of expected) {
+      const file = snapshot.files.get(name);
+      assert.equal(file?.isBinary, false, `${name} must stay text`);
+      assert.equal(file?.omittedReason, undefined, `${name} must not be omitted`);
+      assert.equal(file?.content, content, `${name} content must be intact past the bound`);
+      assert.equal(file?.sha256, createHash("sha256").update(content, "utf8").digest("hex"));
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ordinary text controls around the sample boundary stay text", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-utf8-controls-"));
+  try {
+    const asciiLarge = "a".repeat(BINARY_SAMPLE_BYTES + 500);
+    // Exactly the sample bound, ending on a complete multibyte character:
+    // the buffer is complete (EOF), not cut, and must decode cleanly.
+    const exactBound = "c".repeat(BINARY_SAMPLE_BYTES - 4) + "\u{1D11E}";
+    assert.equal(Buffer.byteLength(exactBound, "utf8"), BINARY_SAMPLE_BYTES);
+    const smallMultibyte = "h\u00E9llo w\u00F6rld \uD83C\uDF0D\n".repeat(200); // ~5KB with multibyte
+    const fixtures = new Map<string, string>([
+      ["ascii-large.txt", asciiLarge],
+      ["exact-bound.txt", exactBound],
+      ["small-multibyte.txt", smallMultibyte],
+    ]);
+    for (const [name, content] of fixtures) await writeFile(join(dir, name), content, "utf8");
+
+    const snapshot = await createWorkspaceSnapshot(dir, snapshotOptions);
+    for (const [name, content] of fixtures) {
+      const file = snapshot.files.get(name);
+      assert.equal(file?.isBinary, false, `${name} must stay text`);
+      assert.equal(file?.omittedReason, undefined);
+      assert.equal(file?.content, content);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("invalid UTF-8 at or below the sample boundary stays binary", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-utf8-invalid-"));
+  try {
+    // True truncated EOF below the bound: the file itself ends mid-sequence.
+    const truncatedEof = Buffer.concat([Buffer.from("abc", "ascii"), Buffer.from([0xe2, 0x82])]);
+    // Exactly the sample bound, ending mid-sequence: a complete buffer must
+    // not be treated as a harmless sample cut.
+    const exactBoundTruncated = Buffer.concat([
+      Buffer.alloc(BINARY_SAMPLE_BYTES - 2, 0x61),
+      Buffer.from([0xf0, 0x9f]),
+    ]);
+    assert.equal(exactBoundTruncated.length, BINARY_SAMPLE_BYTES);
+    // Invalid byte well inside the sample of a file that continues past it.
+    const invalidInside = Buffer.alloc(BINARY_SAMPLE_BYTES + 200, 0x61);
+    invalidInside[100] = 0xff;
+    // A malformed (overlong) lead exactly at the cut point of a continuing
+    // file: not a completable partial character, so it must not be trimmed.
+    const malformedAtCut = Buffer.alloc(BINARY_SAMPLE_BYTES + 200, 0x61);
+    malformedAtCut[BINARY_SAMPLE_BYTES - 1] = 0xc0;
+    // An orphan continuation byte just before the cut point of a continuing
+    // file: invalid content that tail trimming must not swallow.
+    const orphanBeforeCut = Buffer.alloc(BINARY_SAMPLE_BYTES + 200, 0x61);
+    orphanBeforeCut[BINARY_SAMPLE_BYTES - 1] = 0x80;
+
+    const fixtures = new Map<string, Buffer>([
+      ["truncated-eof.bin", truncatedEof],
+      ["exact-bound-truncated.bin", exactBoundTruncated],
+      ["invalid-inside.bin", invalidInside],
+      ["malformed-at-cut.bin", malformedAtCut],
+      ["orphan-before-cut.bin", orphanBeforeCut],
+    ]);
+    // A lead whose visible second byte is outside its sub-range (E0 A0-BF,
+    // ED 80-9F, F0 90-BF, F4 80-8F) can never be completed by later file
+    // bytes, so it must not be trimmed as sampling noise.
+    const subRangeSecondBytes: Array<[string, number, number]> = [
+      ["e0", 0xe0, 0x80],
+      ["ed", 0xed, 0xa0],
+      ["f0", 0xf0, 0x8f],
+      ["f4", 0xf4, 0x90],
+    ];
+    for (const [suffix, leadByte, secondByte] of subRangeSecondBytes) {
+      const buf = Buffer.alloc(BINARY_SAMPLE_BYTES + 200, 0x61);
+      buf[BINARY_SAMPLE_BYTES - 2] = leadByte;
+      buf[BINARY_SAMPLE_BYTES - 1] = secondByte;
+      fixtures.set(`subrange-${suffix}.bin`, buf);
+    }
+    for (const [name, content] of fixtures) await writeFile(join(dir, name), content);
+
+    const snapshot = await createWorkspaceSnapshot(dir, snapshotOptions);
+    for (const name of fixtures.keys()) {
+      const file = snapshot.files.get(name);
+      assert.equal(file?.isBinary, true, `${name} must stay binary`);
+      assert.equal(file?.omittedReason, "binary");
+      assert.equal(file?.content, undefined, `${name} content must not be retained`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("NUL and magic-byte detection still apply across the sample boundary", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-binary-boundary-"));
+  try {
+    const nulLarge = Buffer.alloc(BINARY_SAMPLE_BYTES + 200, 0x61);
+    nulLarge[5000] = 0;
+    const gzipLarge = Buffer.concat([
+      Buffer.from([0x1f, 0x8b, 0x08, 0x00]),
+      Buffer.alloc(BINARY_SAMPLE_BYTES + 200 - 4, 0x61),
+    ]);
+    await writeFile(join(dir, "nul-large.bin"), nulLarge);
+    await writeFile(join(dir, "gzip-large.bin"), gzipLarge);
+
+    const snapshot = await createWorkspaceSnapshot(dir, snapshotOptions);
+    for (const name of ["nul-large.bin", "gzip-large.bin"]) {
+      const file = snapshot.files.get(name);
+      assert.equal(file?.isBinary, true, `${name} must stay binary`);
+      assert.equal(file?.omittedReason, "binary");
+      assert.equal(file?.content, undefined, `${name} content must not be retained`);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -15,6 +15,31 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.70]
+
+### Fixed
+
+- Count WebSocket upgrades rejected for premature payload bytes as refusals.
+  Preserve connection-local rejection, byte accounting and sanitized diagnostics
+  without invoking the session-fatal policy callback.
+
+## [0.1.0-dev.69]
+
+### Fixed
+
+- Keep valid UTF-8 text reviewable when a multibyte character crosses the bounded
+  capture sample boundary. Distinguish a cut sample from an incomplete character
+  at end of file, preserving binary checks and existing capture limits.
+
+## [0.1.0-dev.68]
+
+### Fixed
+
+- Settle cancellation during executor retry backoff through the verified
+  cancellation path instead of reporting a recoverable executor failure. Preserve
+  prior incident evidence and retained work, and keep checkpoint-verification
+  failures critical and fail-closed.
+
 ## [0.1.0-dev.67]
 
 ### Changed

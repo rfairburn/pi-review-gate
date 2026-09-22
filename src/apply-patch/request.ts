@@ -12,8 +12,12 @@
 ///
 /// Each individual file mutation keeps the existing staged-write safety:
 /// same-directory staging, atomic no-overwrite link commits for create and
-/// move destinations, identity revalidation before overwriting or deleting an
-/// existing source, and workspace confinement. There is deliberately no
+/// move destinations, and identity revalidation before overwriting or deleting
+/// an existing source. Path access intentionally matches Pi's native
+/// edit/write tools: paths resolve against the current working directory and
+/// outside-workspace destinations (including authorized scratch paths) are
+/// supported wherever the host filesystem allows; symlinked sources are
+/// followed like native edit's write-through. There is deliberately no
 /// cross-file rollback: POSIX provides no multi-file atomicity, so this module
 /// reports the accumulated delta truthfully instead of pretending otherwise.
 
@@ -24,7 +28,7 @@ import type { ChangedFile } from "../capture";
 import { buildUnifiedPatch } from "../diff";
 import { applyDiff } from "./engine";
 import type { ApplyPatchFileOp } from "./envelope";
-import { confinePath, type ConfinedPath } from "./paths";
+import { resolveTargetPath, type ResolvedPath } from "./paths";
 
 export type ApplyPatchOperationType = "create_file" | "update_file" | "delete_file";
 
@@ -78,7 +82,24 @@ interface FileIdentity {
 }
 
 interface SourceState {
-  confined: ConfinedPath;
+  /** The operation path resolved against the cwd. */
+  resolved: ResolvedPath;
+  /**
+   * Absolute path of the final regular file the mutation applies to. Equal to
+   * `resolved.absolute` for regular sources; for a symlinked source it is the
+   * resolved target, so updates write through the link exactly like native
+   * edit's writeFile while the link itself is preserved.
+   */
+  target: string;
+  /**
+   * Identity of the symlink itself, present only when `target` differs from
+   * `resolved.absolute`. Each filesystem object carries exactly one canonical
+   * identity here: this entry for the link, `identity` for the file it
+   * resolved to. Removal operations (delete_file and moveTo source removal)
+   * unlink the named path, so they revalidate this identity in addition to
+   * the target file's before removing anything.
+   */
+  linkIdentity?: FileIdentity;
   identity: FileIdentity;
   originalBytes: Buffer;
   /** Decoded text without BOM and with LF line endings. */
@@ -91,7 +112,7 @@ interface PreparedOperation {
   op: ApplyPatchFileOp;
   index: number;
   source?: SourceState;
-  destination?: ConfinedPath;
+  destination?: ResolvedPath;
   /** Final encoded content to write (create and changed/moved updates). */
   newContent?: string;
   /** Decoded updated text without BOM/CRLF conversion (changed/moved updates). */
@@ -121,7 +142,6 @@ export async function performApplyPatchRequest(
   if (operations.length === 0) throw new Error("ApplyPatch request contains no file operations");
   ensureNotAborted(signal);
   const rootLexical = resolve(cwd);
-  const rootReal = await realpath(rootLexical);
 
   const applied: AppliedOperation[] = [];
   for (let i = 0; i < operations.length; i += 1) {
@@ -129,7 +149,7 @@ export async function performApplyPatchRequest(
     let entry: PreparedOperation | undefined;
     try {
       ensureNotAborted(signal);
-      entry = await prepareOperation(rootLexical, rootReal, op, i);
+      entry = await prepareOperation(rootLexical, op, i);
       applied.push(await commitOperation(rootLexical, entry, signal));
     } catch (error) {
       const uncertainEffects: string[] = [...(entry?.effects ?? [])];
@@ -175,14 +195,13 @@ export async function performApplyPatchRequest(
 
 async function prepareOperation(
   rootLexical: string,
-  rootReal: string,
   op: ApplyPatchFileOp,
   index: number,
 ): Promise<PreparedOperation> {
   const entry: PreparedOperation = { op, index, createdDirs: [], effects: [] };
 
   if (op.type === "create_file") {
-    const target = await confinePath(rootLexical, rootReal, op.path, `operation ${index + 1} path`);
+    const target = await resolveTargetPath(rootLexical, op.path, `operation ${index + 1} path`);
     await requireAbsent(target.absolute, op.path);
     entry.destination = target;
     // Canonical envelope adds carry the final content (each `+line`
@@ -196,7 +215,7 @@ async function prepareOperation(
   }
 
   if (op.type === "delete_file") {
-    const source = await readSource(rootLexical, rootReal, op.path, `operation ${index + 1} path`);
+    const source = await readSource(rootLexical, op.path, `operation ${index + 1} path`);
     if (source.body.includes("\0")) {
       throw new Error(`delete_file ${op.path}: refusing to delete binary content (NUL byte)`);
     }
@@ -207,7 +226,7 @@ async function prepareOperation(
   // update_file: patch the content now, at this operation's turn. A later
   // operation may legitimately target the same file again and will read the
   // state left by this one (Codex sequential semantics).
-  const source = await readSource(rootLexical, rootReal, op.path, `operation ${index + 1} path`);
+  const source = await readSource(rootLexical, op.path, `operation ${index + 1} path`);
   let updated: string;
   try {
     updated = applyDiff(source.body, op.diff ?? "");
@@ -223,8 +242,8 @@ async function prepareOperation(
   entry.changed = updated !== source.body;
 
   if (op.moveTo !== undefined) {
-    const destination = await confinePath(rootLexical, rootReal, op.moveTo, `operation ${index + 1} moveTo`);
-    if (destination.absolute === source.confined.absolute || destination.real === source.confined.real) {
+    const destination = await resolveTargetPath(rootLexical, op.moveTo, `operation ${index + 1} moveTo`);
+    if (destination.absolute === source.resolved.absolute || destination.real === source.resolved.real) {
       throw new Error(`operation ${index + 1} moveTo ${op.moveTo} resolves to the same file as operation.path ${op.path}`);
     }
     await requireAbsent(destination.absolute, op.moveTo);
@@ -233,13 +252,43 @@ async function prepareOperation(
   return entry;
 }
 
-async function readSource(rootLexical: string, rootReal: string, path: string, field: string): Promise<SourceState> {
-  const confined = await confinePath(rootLexical, rootReal, path, field);
-  const stats = await requireRegularFile(confined.absolute, path);
+async function readSource(rootLexical: string, path: string, field: string): Promise<SourceState> {
+  const resolved = await resolveTargetPath(rootLexical, path, field);
+  let stats = await lstat(resolved.absolute).catch((error: unknown) => {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new Error(`${path} does not exist; only create_file may add a new file`);
+    if (code === "ENOTDIR") throw new Error(`${path} cannot exist because an intermediate path component is not a directory`);
+    throw new Error(`${path}: ${messageOf(error)}`);
+  });
+  // Native edit/write parity: a symlinked source is followed like native
+  // edit's writeFile (write-through). The mutation is applied at the resolved
+  // regular file so the link itself is preserved; a dangling symlink is
+  // reported truthfully as a missing target.
+  let target = resolved.absolute;
+  let linkIdentity: FileIdentity | undefined;
+  if (stats.isSymbolicLink()) {
+    // Remember the link's own identity before following it: a removal
+    // operation unlinks this named entry, so it must be able to verify at
+    // commit time that it is still removing the very link that was validated.
+    linkIdentity = { ino: stats.ino, mode: stats.mode, size: stats.size, mtimeMs: stats.mtimeMs };
+    target = await realpath(resolved.absolute).catch((error: unknown) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") throw new Error(`${path} is a dangling symlink; its target does not exist`);
+      throw new Error(`${path}: ${messageOf(error)}`);
+    });
+    stats = await lstat(target).catch((error: unknown) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") throw new Error(`${path} does not exist; only create_file may add a new file`);
+      throw new Error(`${path}: ${messageOf(error)}`);
+    });
+  }
+  if (!stats.isFile()) {
+    throw new Error(`${path} is not a regular file`);
+  }
   // Validate the complete source before mutating: ApplyPatch only handles
   // UTF-8 text files, and a cancellation arriving during this read must not
   // lead to an unlink.
-  const originalBytes = await readFile(confined.absolute);
+  const originalBytes = await readFile(target);
   let decoded: string;
   try {
     decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(originalBytes);
@@ -248,7 +297,9 @@ async function readSource(rootLexical: string, rootReal: string, path: string, f
   }
   const { text: body, hadBom, hadCrlf } = splitEncoding(decoded);
   return {
-    confined,
+    resolved,
+    target,
+    ...(linkIdentity !== undefined ? { linkIdentity } : {}),
     identity: { ino: stats.ino, mode: stats.mode, size: stats.size, mtimeMs: stats.mtimeMs },
     originalBytes,
     body,
@@ -303,21 +354,30 @@ async function commitOperation(
   if (op.type === "delete_file") {
     const source = entry.source!;
     await revalidateSource(source, op.path);
+    // The unlink removes the named path itself: for a symlinked source that is
+    // the link, so verify it is still the validated link before removing it.
+    await revalidateNamedLink(source, op.path);
     ensureNotAborted(signal);
-    await unlink(source.confined.absolute);
-    // Render a bounded deletion diff for reasonably sized sources.
+    // Unlink the path the operation named: for a symlinked source this removes
+    // the link itself (rm semantics) and leaves the target file untouched.
+    await unlink(source.resolved.absolute);
+    // Render a bounded deletion diff for reasonably sized sources. A delete
+    // through a symlink removed only the link (the target file and its content
+    // still exist at the resolved path), so no content diff is fabricated.
     let finalDiff: string | undefined;
-    if (source.identity.size <= MAX_DELETE_SOURCE_BYTES) {
+    if (source.target === source.resolved.absolute && source.identity.size <= MAX_DELETE_SOURCE_BYTES) {
       finalDiff = renderFinalDiff({ path: op.path, status: "deleted", oldContent: source.body });
     }
     return {
       operation: "delete_file",
       path: op.path,
-      absolutePath: source.confined.absolute,
+      absolutePath: source.resolved.absolute,
       changed: true,
       addedLines: 0,
       removedLines: finalDiff !== undefined ? countDiffLines(finalDiff).removedLines : 0,
-      bytes: source.identity.size,
+      // Only the named link was removed for a symlinked source, so no file
+      // content bytes were deleted through it.
+      bytes: source.target === source.resolved.absolute ? source.identity.size : 0,
       requestedDiff: "",
       ...(finalDiff !== undefined ? { finalDiff } : {}),
       mutated: true,
@@ -335,7 +395,7 @@ async function commitOperation(
     return {
       operation: "update_file",
       path: op.path,
-      absolutePath: source.confined.absolute,
+      absolutePath: source.resolved.absolute,
       changed: false,
       addedLines: 0,
       removedLines: 0,
@@ -348,14 +408,16 @@ async function commitOperation(
   const content = entry.newContent!;
   if (op.moveTo === undefined) {
     const bytes = Buffer.from(content, "utf8");
-    const temp = await stageFile(dirname(source.confined.absolute), basename(source.confined.absolute), bytes, source.identity.mode, signal);
+    const temp = await stageFile(dirname(source.target), basename(source.target), bytes, source.identity.mode, signal);
     try {
       // Revalidate after staging: an external edit or replacement that lands
       // during the staging window must not be overwritten by the rename.
       await revalidateSource(source, op.path);
       ensureNotAborted(signal);
-      // rename() is atomic: a failure leaves the original file in place.
-      await rename(temp, source.confined.absolute);
+      // rename() is atomic: a failure leaves the original file in place. For a
+      // symlinked source the rename lands on the resolved target file, so the
+      // link keeps resolving to the updated content (native write-through).
+      await rename(temp, source.target);
     } catch (error) {
       await unlink(temp).catch(() => undefined);
       throw error instanceof Error ? error : new Error(String(error));
@@ -364,7 +426,7 @@ async function commitOperation(
     return {
       operation: "update_file",
       path: op.path,
-      absolutePath: source.confined.absolute,
+      absolutePath: source.target,
       changed: true,
       ...countDiffLines(diff),
       bytes: Buffer.byteLength(content, "utf8"),
@@ -394,9 +456,11 @@ async function commitOperation(
   try {
     ensureNotAborted(signal);
     // Revalidate immediately before removing the source so a concurrent edit
-    // in the staging window is not destroyed by the removal.
+    // in the staging window is not destroyed by the removal; for a symlinked
+    // source the named link itself must still be the validated one.
     await revalidateSource(source, op.path);
-    await unlink(source.confined.absolute);
+    await revalidateNamedLink(source, op.path);
+    await unlink(source.resolved.absolute);
   } catch (error) {
     entry.effects.push(`source '${op.path}' was left in place`);
     throw new Error(
@@ -427,7 +491,7 @@ async function commitOperation(
 async function revalidateSource(source: SourceState, display: string): Promise<void> {
   let stats;
   try {
-    stats = await lstat(source.confined.absolute);
+    stats = await lstat(source.target);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") throw new Error(`${display} no longer exists; refusing to continue`);
@@ -436,6 +500,44 @@ async function revalidateSource(source: SourceState, display: string): Promise<v
   const identity = source.identity;
   if (stats.ino !== identity.ino || stats.size !== identity.size || stats.mtimeMs !== identity.mtimeMs || stats.mode !== identity.mode) {
     throw new Error(`${display} changed after validation; refusing to overwrite concurrent edits`);
+  }
+}
+
+/**
+ * Revalidates the symlink itself before an operation removes the named path.
+ * revalidateSource protects the target file's content, but the unlink removes
+ * whatever currently sits at the named path: if that link was replaced during
+ * preparation — with a regular file or another link — removing the replacement
+ * would destroy state ApplyPatch never validated (including the UTF-8 text
+ * check), so the operation fails instead. Regular sources have no separate
+ * link entry; their named path is the very file revalidateSource covered.
+ */
+async function revalidateNamedLink(source: SourceState, display: string): Promise<void> {
+  if (source.linkIdentity === undefined) return;
+  let stats;
+  try {
+    stats = await lstat(source.resolved.absolute);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new Error(`${display} no longer exists; refusing to continue`);
+    throw new Error(`${display}: ${messageOf(error)}`);
+  }
+  if (!stats.isSymbolicLink()) {
+    throw new Error(`${display} was replaced with a non-symlink after validation; refusing to remove the replacement`);
+  }
+  const identity = source.linkIdentity;
+  if (stats.ino !== identity.ino || stats.size !== identity.size || stats.mtimeMs !== identity.mtimeMs || stats.mode !== identity.mode) {
+    throw new Error(`${display} was replaced after validation; refusing to remove the replacement`);
+  }
+  // Inode reuse can in principle hand a fresh link the same identity fields,
+  // so also require that the named path still resolves to the validated target.
+  const currentTarget = await realpath(source.resolved.absolute).catch((error: unknown) => {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new Error(`${display} no longer exists; refusing to continue`);
+    throw new Error(`${display}: ${messageOf(error)}`);
+  });
+  if (currentTarget !== source.target) {
+    throw new Error(`${display} now points to a different target; refusing to remove the replacement link`);
   }
 }
 
@@ -488,9 +590,10 @@ async function commitStaged(temp: string, destination: string, existsMessage: st
 }
 
 /**
- * Creates the missing directory chain for a target below the workspace root
- * and returns it (deepest first) so a failed operation can clean up or report
- * the directories it created.
+ * Creates the missing directory chain for a target and returns it (deepest
+ * first) so a failed operation can clean up or report the directories it
+ * created. Directory creation is intentionally not limited to the workspace:
+ * native write also creates parent directories wherever the host allows.
  */
 async function ensureDirectories(targetAbsolute: string, rootLexical: string): Promise<string[]> {
   const missing: string[] = [];
@@ -508,7 +611,7 @@ async function ensureDirectories(targetAbsolute: string, rootLexical: string): P
     }
   }
   // The first existing component must be a directory (symlinks are followed;
-  // confinement of the final target already happened through confinePath).
+  // the final target was already resolved through resolveTargetPath).
   const stats = await stat(dir).catch((error: unknown) => {
     throw (error as NodeJS.ErrnoException).code === "ENOENT"
       ? new Error(`cannot prepare directories for ${targetAbsolute}: missing parent`)
@@ -537,26 +640,6 @@ async function requireAbsent(absolute: string, display: string): Promise<void> {
     throw new Error(`${display} already exists and is a directory; create_file requires a non-existing file path`);
   }
   throw new Error(`${display} already exists; create_file and moveTo destinations must not exist`);
-}
-
-async function requireRegularFile(absolute: string, display: string): Promise<{ ino: number; mode: number; size: number; mtimeMs: number }> {
-  let stats;
-  try {
-    stats = await lstat(absolute);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") {
-      throw new Error(`${display} does not exist; only create_file may add a new file`);
-    }
-    throw new Error(`${display}: ${messageOf(error)}`);
-  }
-  if (stats.isSymbolicLink()) {
-    throw new Error(`${display} is a symlink; ApplyPatch refuses to follow, modify, or replace symlinks`);
-  }
-  if (!stats.isFile()) {
-    throw new Error(`${display} is not a regular file`);
-  }
-  return { ino: stats.ino, mode: stats.mode, size: stats.size, mtimeMs: stats.mtimeMs };
 }
 
 function ensureNotAborted(signal: AbortSignal | undefined): void {

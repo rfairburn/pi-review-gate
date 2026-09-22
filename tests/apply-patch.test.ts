@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, readdir, readFile, rm, symlink, writeFile, mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, symlink, unlink, writeFile, mkdtemp } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { APPLY_PATCH_TOOL_NAME, applyPatchToolSchema, registerApplyPatchTool, renderApplyPatchCall, renderApplyPatchResult, renderExpandedApplyPatchResult } from "../src/apply-patch/tool";
 import { collectEvidenceChanges, createEvidenceState, extractCandidatePaths, recordToolCallEvidence, recordToolResultEvidence, shouldRecordToolCallEvidence, shouldRecordToolResultEvidence } from "../src/evidence";
@@ -71,6 +71,12 @@ test("ApplyPatch registers with a canonical-envelope-only strict schema and sequ
   assert.ok(tool.description.includes("*** Begin Patch"));
   assert.ok(tool.description.includes("applied sequentially"));
   assert.ok(!tool.description.includes("rollback"), "the model-facing contract must not promise rollback");
+  assert.ok(!tool.description.includes("confined"), "the model-facing contract must not promise workspace confinement");
+  assert.ok(!tool.promptSnippet.includes("confined"), "the prompt snippet must not promise workspace confinement");
+  for (const guideline of tool.promptGuidelines as string[]) {
+    assert.ok(!guideline.includes("workspace-relative"), "guidelines must not claim paths are workspace-relative");
+    assert.ok(!guideline.includes("confined"), "guidelines must not promise workspace confinement");
+  }
   assert.ok(Array.isArray(tool.promptGuidelines) && tool.promptGuidelines.length > 0);
   assert.ok(typeof tool.renderCall === "function");
   assert.ok(typeof tool.renderResult === "function");
@@ -614,33 +620,41 @@ test("move commit failure leaves the source file unchanged and creates no destin
 });
 
 // ---------------------------------------------------------------------------
-// Workspace confinement
+// Path access parity with native edit/write
 // ---------------------------------------------------------------------------
 
-test("paths escaping the workspace are rejected before mutation", async () => {
+test("paths outside the workspace are supported with native edit/write parity", async () => {
   const dir = await tempWorkspace();
   const outside = await tempWorkspace();
   try {
     const { execute } = harness();
-    await writeFile(join(outside, "victim.txt"), "original\n", "utf8");
 
-    for (const path of ["../victim.txt", "sub/../../victim.txt", outside, join(outside, "victim.txt"), ".", "/etc/hosts"]) {
-      await assert.rejects(
-        execute({ patch: envelope("*** Add File: " + path, "+nope") }, { cwd: dir }),
-        (error: Error) => /outside the current workspace|workspace root/.test(error.message),
-        `expected confinement rejection for ${path}`,
-      );
-    }
-    await assert.rejects(
-      execute(updateEnvelope("../victim.txt", "-original\n+new\n"), { cwd: dir }),
-      /outside the current workspace/,
-    );
+    // Create with a nested directory chain at an absolute outside path.
+    const outsideFile = join(outside, "scratch", "created.txt");
+    await execute({ patch: envelope("*** Add File: " + outsideFile, "+created") }, { cwd: dir });
+    assert.equal(await readFile(outsideFile, "utf8"), "created\n");
+
+    // Update an existing outside file via an absolute path.
+    const existing = join(outside, "victim.txt");
+    await writeFile(existing, "original\n", "utf8");
+    await execute(updateEnvelope(existing, "-original\n+new\n"), { cwd: dir });
+    assert.equal(await readFile(existing, "utf8"), "new\n");
+
+    // Relative paths that traverse out of the cwd resolve like native edit.
     await mkdir(join(dir, "sub"), { recursive: true });
-    await assert.rejects(
-      execute(updateEnvelope("sub/../../victim.txt", "-original\n+new\n"), { cwd: dir }),
-      /outside the current workspace/,
-    );
-    assert.equal(await readFile(join(outside, "victim.txt"), "utf8"), "original\n");
+    await execute(updateEnvelope("../" + join("..", basename(outside), "victim.txt"), "-new\n+newer\n"), { cwd: join(dir, "sub") });
+    assert.equal(await readFile(existing, "utf8"), "newer\n");
+
+    // Move within the outside directory.
+    const moved = join(outside, "moved.txt");
+    const result = await execute(updateEnvelope(existing, "-newer\n+final\n", moved), { cwd: dir });
+    assert.equal(await readFile(moved, "utf8"), "final\n");
+    await assert.rejects(lstat(existing));
+    assert.equal(result.details.moveTo, moved);
+
+    // Delete the outside file.
+    await execute({ patch: envelope("*** Delete File: " + moved) }, { cwd: dir });
+    await assert.rejects(lstat(moved));
 
     // Absolute paths inside the workspace remain allowed.
     await execute({ patch: envelope("*** Add File: " + join(dir, "inside.txt"), "+ok") }, { cwd: dir });
@@ -651,31 +665,219 @@ test("paths escaping the workspace are rejected before mutation", async () => {
   }
 });
 
-test("symlink escapes and symlinked targets are rejected without following them", async () => {
+test("symlinked paths are followed like native edit write-through access", async (t) => {
+  if (process.platform === "win32") t.skip("symlink permissions vary on Windows");
   const dir = await tempWorkspace();
   const outside = await tempWorkspace();
   try {
     const { execute } = harness();
-    await writeFile(join(outside, "target.txt"), "outside\n", "utf8");
-    await symlink(join(outside, "target.txt"), join(dir, "link.txt"));
+    const target = join(outside, "target.txt");
+    await writeFile(target, "outside\n", "utf8");
+    await symlink(target, join(dir, "link.txt"));
 
-    await assert.rejects(execute(updateEnvelope("link.txt", "-outside\n+inside\n"), { cwd: dir }), /outside the current workspace|symlink/);
-    await assert.rejects(execute({ patch: envelope("*** Delete File: link.txt") }, { cwd: dir }), /outside the current workspace|symlink/);
-    await assert.rejects(
-      execute({ patch: envelope("*** Add File: link.txt", "+x") }, { cwd: dir }),
-      /outside the current workspace|already exists/,
-    );
-    assert.equal(await readFile(join(outside, "target.txt"), "utf8"), "outside\n");
+    // Update through the symlink writes the target file and preserves the link
+    // (native edit writeFile parity: write-through, no link replacement).
+    await execute(updateEnvelope("link.txt", "-outside\n+inside\n"), { cwd: dir });
+    assert.equal(await readFile(target, "utf8"), "inside\n");
+    assert.equal((await lstat(join(dir, "link.txt"))).isSymbolicLink(), true, "the symlink must survive an update");
 
-    // A symlinked directory that escapes the workspace is also confined.
+    // A symlinked directory component resolves the same way.
     await mkdir(join(outside, "docs"), { recursive: true });
     await writeFile(join(outside, "docs", "nested.txt"), "outside\n", "utf8");
     await symlink(join(outside, "docs"), join(dir, "docs-link"));
+    await execute(updateEnvelope("docs-link/nested.txt", "-outside\n+inside\n"), { cwd: dir });
+    assert.equal(await readFile(join(outside, "docs", "nested.txt"), "utf8"), "inside\n");
+
+    // Delete through the symlink removes the link itself (rm semantics); the
+    // target file remains, so no content deletion diff is fabricated.
+    const deleteResult = await execute({ patch: envelope("*** Delete File: link.txt") }, { cwd: dir });
+    await assert.rejects(lstat(join(dir, "link.txt")));
+    assert.equal(await readFile(target, "utf8"), "inside\n", "the symlink target must survive a link deletion");
+    assert.equal(deleteResult.details.finalDiff, undefined);
+    assert.equal(deleteResult.details.removedLines, 0);
+    assert.equal(deleteResult.details.bytes, 0);
+
+    // create_file still refuses an existing path, including an existing symlink.
+    await symlink(target, join(dir, "exists.txt"));
     await assert.rejects(
-      execute(updateEnvelope("docs-link/nested.txt", "-outside\n+inside\n"), { cwd: dir }),
-      (error: Error) => /outside the current workspace|symlink|not a regular file/.test(error.message),
+      execute({ patch: envelope("*** Add File: exists.txt", "+x") }, { cwd: dir }),
+      /already exists/,
     );
-    assert.equal(await readFile(join(outside, "docs", "nested.txt"), "utf8"), "outside\n");
+
+    // A dangling symlink is reported truthfully as a missing target.
+    await symlink(join(outside, "missing.txt"), join(dir, "dangling.txt"));
+    await assert.rejects(execute(updateEnvelope("dangling.txt", "-x\n+y\n"), { cwd: dir }), /dangling symlink|does not exist/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("tilde paths expand to the home directory like native edit/write without touching the real home", async () => {
+  const dir = await tempWorkspace();
+  const fakeHome = await tempWorkspace();
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  try {
+    // Synthetic home: point the platform's homedir() source at a fresh temp
+    // directory so the production entry point never touches the real home.
+    process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome; // win32's homedir source
+    // Fail closed before any mutation if the override is not in effect.
+    assert.equal(homedir(), fakeHome, "synthetic home must be in effect before any mutation");
+    const { execute } = harness();
+
+    // Add File with ~/... creates under the home directory, not a literal ~.
+    await execute({ patch: envelope("*** Add File: ~/notes/hello.txt", "+hi") }, { cwd: dir });
+    assert.equal(await readFile(join(fakeHome, "notes", "hello.txt"), "utf8"), "hi\n");
+    await assert.rejects(lstat(join(dir, "~")), "no literal ~ directory may be created in the cwd");
+
+    // Update and delete resolve ~/... against the same home.
+    await execute(updateEnvelope("~/notes/hello.txt", "-hi\n+there\n"), { cwd: dir });
+    assert.equal(await readFile(join(fakeHome, "notes", "hello.txt"), "utf8"), "there\n");
+    await execute({ patch: envelope("*** Delete File: ~/notes/hello.txt") }, { cwd: dir });
+    await assert.rejects(lstat(join(fakeHome, "notes", "hello.txt")));
+
+    // `~user` is not a home prefix (native parity): it stays relative to the cwd.
+    await execute({ patch: envelope("*** Add File: ~other/rel.txt", "+x") }, { cwd: dir });
+    assert.equal(await readFile(join(dir, "~other", "rel.txt"), "utf8"), "x\n");
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    await rm(dir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("a move through a symlinked source materializes the destination, removes the link, and keeps the target's old content", async (t) => {
+  if (process.platform === "win32") t.skip("symlink permissions vary on Windows");
+  const dir = await tempWorkspace();
+  const outside = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    const target = join(outside, "target.txt");
+    await writeFile(target, "one\ntwo\n", "utf8");
+    await symlink(target, join(dir, "link.txt"));
+
+    const result = await execute(updateEnvelope("link.txt", "-two\n+TWO\n", "moved.txt"), { cwd: dir });
+
+    // The destination materializes the patched content...
+    assert.equal(await readFile(join(dir, "moved.txt"), "utf8"), "one\nTWO\n");
+    // ...the original link is removed...
+    await assert.rejects(lstat(join(dir, "link.txt")));
+    // ...and the target file retains its old content (a move does not write through).
+    assert.equal(await readFile(target, "utf8"), "one\ntwo\n");
+
+    // Truthful result and evidence: reported as a move of the source path with
+    // the modified rename diff, pointing at the materialized destination.
+    assert.equal(result.content[0].text, ["Success. Updated the following files:", "M link.txt"].join("\n"));
+    assert.equal(result.details.moveTo, "moved.txt");
+    assert.equal(result.details.absolutePath, join(dir, "moved.txt"));
+    assert.match(result.details.finalDiff, /rename from link\.txt/);
+    assert.match(result.details.finalDiff, /rename to moved\.txt/);
+    assert.match(result.details.finalDiff, /-two/);
+    assert.match(result.details.finalDiff, /\+TWO/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("a symlink replaced after validation is not removed by delete_file", async (t) => {
+  if (process.platform === "win32") t.skip("symlink permissions vary on Windows");
+  const dir = await tempWorkspace();
+  const outside = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    const target = join(outside, "target.txt");
+    await writeFile(target, "outside\n", "utf8");
+    const link = join(dir, "link.txt");
+    await symlink(target, link);
+
+    // Deterministic replacement seam: once the source content has been read
+    // (validation is complete), replace the named link with a regular file
+    // before the deletion revalidates and unlinks. No timing involved. The
+    // production engine reads through the realpath'd target, so match that.
+    const realTarget = await realpath(target);
+    const fsp = require("node:fs/promises") as typeof import("node:fs/promises");
+    const originalReadFile = fsp.readFile;
+    fsp.readFile = (async (path: import("node:fs").PathLike) => {
+      const result = await originalReadFile(path);
+      if (String(path) === realTarget) {
+        await unlink(link);
+        await writeFile(link, "replacement\n", "utf8");
+      }
+      return result;
+    }) as unknown as typeof fsp.readFile;
+    try {
+      await assert.rejects(
+        execute({ patch: envelope("*** Delete File: link.txt") }, { cwd: dir }),
+        /was replaced with a non-symlink after validation; refusing to remove the replacement/,
+      );
+    } finally {
+      fsp.readFile = originalReadFile;
+    }
+    // The unvalidated replacement survives; the validated target is untouched.
+    assert.equal((await lstat(link)).isSymbolicLink(), false);
+    assert.equal(await readFile(link, "utf8"), "replacement\n");
+    assert.equal(await readFile(target, "utf8"), "outside\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("a symlink replaced after validation is not removed by a moveTo source removal", async (t) => {
+  if (process.platform === "win32") t.skip("symlink permissions vary on Windows");
+  const dir = await tempWorkspace();
+  const outside = await tempWorkspace();
+  try {
+    const { execute } = harness();
+    const target = join(outside, "target.txt");
+    await writeFile(target, "one\ntwo\n", "utf8");
+    const other = join(outside, "other.txt");
+    await writeFile(other, "other content\n", "utf8");
+    const link = join(dir, "link.txt");
+    await symlink(target, link);
+
+    // Deterministic replacement seam: once the source content has been read
+    // (validation is complete), replace the named link with a different
+    // symlink before the move commits its destination and removes the source.
+    // The production engine reads through the realpath'd target, so match that.
+    const realTarget = await realpath(target);
+    const fsp = require("node:fs/promises") as typeof import("node:fs/promises");
+    const originalReadFile = fsp.readFile;
+    fsp.readFile = (async (path: import("node:fs").PathLike) => {
+      const result = await originalReadFile(path);
+      if (String(path) === realTarget) {
+        await unlink(link);
+        await symlink(other, link);
+      }
+      return result;
+    }) as unknown as typeof fsp.readFile;
+    try {
+      await assert.rejects(
+        execute(updateEnvelope("link.txt", "-two\n+TWO\n", "moved.txt"), { cwd: dir }),
+        (error: Error) => {
+          assert.match(error.message, /failed at operation 1 \(update_file link\.txt \(moveTo moved\.txt\)\)/);
+          assert.match(error.message, /both files remain in place/);
+          assert.match(error.message, /refusing to remove/);
+          assert.match(error.message, /Uncertain effects of the failed operation: destination 'moved\.txt' was created; source 'link\.txt' was left in place/);
+          return true;
+        },
+      );
+    } finally {
+      fsp.readFile = originalReadFile;
+    }
+    // The destination carries the patched content; the replacement link and
+    // both files it could reach remain exactly as the external actor left them.
+    assert.equal(await readFile(join(dir, "moved.txt"), "utf8"), "one\nTWO\n");
+    assert.equal((await lstat(link)).isSymbolicLink(), true);
+    assert.equal(await realpath(link), await realpath(other));
+    assert.equal(await readFile(other, "utf8"), "other content\n");
+    assert.equal(await readFile(target, "utf8"), "one\ntwo\n", "the validated target must not be overwritten or removed");
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
@@ -843,6 +1045,42 @@ test("ApplyPatch evidence normalizes leading @ markers on envelope path and move
     assert.ok(state.candidates.has(join(dir, "src", "b.ts")), "normalized @moveTo candidate missing");
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ApplyPatch evidence resolves ~ envelope paths against the home directory", async () => {
+  const dir = await tempWorkspace();
+  const fakeHome = await tempWorkspace();
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  try {
+    // Synthetic home (same pattern as the tilde resolution test): candidate
+    // resolution must apply the tool's own home-expansion rule, so the
+    // pre-capture points at the file ApplyPatch actually mutates.
+    process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome; // win32's homedir source
+    // Fail closed before any mutation if the override is not in effect.
+    assert.equal(homedir(), fakeHome, "synthetic home must be in effect before any mutation");
+    const state = createEvidenceState();
+    await recordToolCallEvidence({
+      state,
+      cwd: dir,
+      toolName: "ApplyPatch",
+      toolInput: { patch: envelope("*** Add File: ~/notes/hello.txt", "+x") },
+      snapshotOptions: { maxFileBytes: 100_000, maxSnapshotBytes: 1_000_000 },
+      exchangeSequence: 1,
+    });
+    const candidate = state.candidates.get(join(fakeHome, "notes", "hello.txt"));
+    assert.ok(candidate, "~/... candidate must resolve against the home directory");
+    // The stored label keeps the envelope spelling; only the resolution expands.
+    assert.equal(candidate?.path, "~/notes/hello.txt");
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    await rm(dir, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
   }
 });
 

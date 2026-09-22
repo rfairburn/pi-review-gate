@@ -7,6 +7,7 @@ import {
   type SnapshotOptions,
 } from "./capture";
 import { extractEnvelopeCandidatePaths } from "./apply-patch/envelope";
+import { expandHomePath } from "./apply-patch/paths";
 import { normalizeApplyPatchPathMarker } from "./apply-patch/tool";
 import { redactBrowserToolInput, redactSensitiveText, redactSensitiveValue } from "./redaction";
 
@@ -315,7 +316,10 @@ async function addCandidate(
   snapshotOptions: SnapshotOptions,
   exchangeSequence?: number,
 ): Promise<void> {
-  const absolutePath = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+  // Resolve candidates with the tool's own home-expansion rule so a `~/...`
+  // envelope path pre-captures the file ApplyPatch actually mutates.
+  const expanded = expandHomePath(path);
+  const absolutePath = isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
   const key = absolutePath;
   const existing = state.candidates.get(key);
   if (existing) {

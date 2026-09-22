@@ -22,8 +22,7 @@
 /// - an update hunk without any change lines is rejected.
 ///
 /// Deliberate deviations (documented in docs/security-model.md):
-/// - `*** Environment ID:` lines are rejected: this tool patches the local
-///   workspace only, and silently ignoring a remote environment id would be
+/// - `*** Environment ID:` lines are rejected: this tool patches local files only, and silently ignoring a remote environment id would be
 ///   unsafe;
 /// - update-hunk bodies are handed to the existing V4A engine (engine.ts)
 ///   unmodified, so anchor/context/EOF application semantics stay identical to
@@ -33,7 +32,7 @@ import { normalizeApplyPatchPathMarker } from "./paths";
 
 export interface ApplyPatchFileOp {
   type: "create_file" | "update_file" | "delete_file";
-  /** Normalized workspace path (a single leading `@` marker is stripped). */
+  /** Normalized operation path (trimmed; a single leading `@` marker is stripped). */
   path: string;
   /** Normalized rename destination for update_file hunks (`*** Move to:`). */
   moveTo?: string;
@@ -229,7 +228,7 @@ export function parseApplyPatchEnvelope(patch: unknown): ApplyPatchFileOp[] {
 
     if (t === END_PATCH) continue; // final line; loop ends after it
     if (t.startsWith(ENVIRONMENT_ID_PREFIX)) {
-      throw new Error("apply_patch environment_id is not supported; ApplyPatch patches the current workspace only");
+      throw new Error("apply_patch environment_id is not supported; ApplyPatch patches local files only");
     }
     if (t.startsWith(ADD_FILE_PREFIX)) {
       ops.push({ type: "create_file", path: headerPath(t, ADD_FILE_PREFIX, lineNo), createContent: "" });

@@ -43,8 +43,8 @@ receipts of exactly what the model was told.
   restoration ([Recovery](docs/recovery.md)).
 - **`ApplyPatch` tool** — the canonical OpenAI/Codex apply_patch envelope as its only
   request format (multi-file create/update/rename/delete with sequential application and
-  explicit partial-failure reporting), workspace confinement, atomic staged writes, and
-  serialized mutation windows ([Security model](docs/security-model.md#applypatch-confinement-and-safety)).
+  explicit partial-failure reporting), native edit/write path access, atomic staged
+  writes, and serialized mutation windows ([Security model](docs/security-model.md#applypatch-envelope-handling-and-safety)).
 - **Background shell tools** — `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
   `ShellStop` with detached process groups and lifecycle wakes
   ([Delegated execution](docs/delegated-execution.md#background-shell-tools)).

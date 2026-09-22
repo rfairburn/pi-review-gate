@@ -206,7 +206,7 @@ preservation and path confinement are enforced by the extension's own landing an
 mutation coordination ([Delegated execution](delegated-execution.md#landing-and-source-preservation)),
 not by kernel-level containment.
 
-## ApplyPatch confinement and safety
+## ApplyPatch envelope handling and safety
 
 The `ApplyPatch` tool accepts the canonical OpenAI/Codex apply_patch envelope —
 `*** Begin Patch` ... `*** End Patch` with `*** Add File:`, `*** Update File:` (optional
@@ -243,12 +243,21 @@ The complete envelope is parsed before any filesystem mutation, so malformed req
 fail cleanly with no side effects. Update-hunk bodies are handed to the existing V4A
 engine unmodified, so anchor/context/EOF application semantics are identical to
 single-file operations. Deliberate deviations from upstream: `*** Environment ID:` lines
-are rejected (this tool patches the local workspace only), and an update hunk without any
+are rejected (this tool patches local files only, not a remote environment), and an update hunk without any
 change line is rejected with a Codex-style diagnostic.
 
-Every envelope path is a non-empty workspace-relative string (absolute paths inside the
-workspace are also accepted); a single leading `@` convention marker is stripped before
-use.
+Every envelope path is a non-empty relative or absolute string; a leading `~` or
+`~/...` expands to the process home directory (the same rule Pi's native edit/write
+tools apply), and a single leading `@` convention marker is stripped before use.
+Relative paths resolve against the current working directory, which is a path-
+resolution context, not a promised filesystem sandbox: write-enabled ApplyPatch
+access intentionally matches Pi's native edit/write tools, so destinations outside
+the workspace — including explicitly selected scratch or temporary directories —
+are supported wherever the host filesystem and the surrounding execution
+environment allow them. This grants no capability beyond the host's own tool
+authorization: read-only workers never receive ApplyPatch, review gates still capture
+and gate the resulting changes, and no external execution sandbox (such as a read-only
+reviewer sandbox) is bypassed.
 
 The tool is registered in both the top-level orchestrator and the Pi-native executor
 runtimes; it is active by default under Pi's normal registered-tool policy and is never
@@ -281,11 +290,22 @@ files listed under their source path); Pi's structured details are additive.
   [LICENSES/MIT-openai-agents-js.txt](../LICENSES/MIT-openai-agents-js.txt)). Its anchor
   parsing, context matching, first-match selection, whitespace fuzz, and
   `*** End of File` behavior are preserved.
-- Every source and destination path is confined to the current working directory. Path
-  traversal, absolute paths outside the workspace, symlink escapes, symlinked targets,
-  directories and other non-regular files, binary or non-UTF-8 content,
-  create-over-existing, update/delete-missing, and unsafe move destinations are rejected
-  with informative diagnostics. A V4A file-level header line inside an update hunk (e.g.
+- Paths resolve against the current working directory with the same core rules as
+  Pi's native edit/write tools: relative paths resolve against the cwd, a leading
+  `~`/`~/...` expands to the process home directory, and absolute paths outside the
+  workspace — including authorized scratch or temporary directories — are intentionally
+  supported wherever the host filesystem allows (parent directories are created as
+  needed). ApplyPatch mirrors those resolution rules rather than every native
+  normalization detail: Unicode-space and `file://` URL handling are not applied.
+  Symlinked sources are followed with native write-through semantics: an update through
+  a symlink lands on the resolved target file and preserves the link, a delete through
+  a symlink removes the link itself (rm semantics) while the target file remains, and a
+  move through a symlinked source materializes the patched content at the destination,
+  removes the original link, and leaves the target file with its old content.
+  Directories and other non-regular files, binary or non-UTF-8 content,
+  create-over-existing (including over an existing symlink), update/delete-missing,
+  and same-file move destinations are still rejected with informative diagnostics. A
+  V4A file-level header line inside an update hunk (e.g.
   a stray `*** End Patch`) is consumed by the envelope grammar as a hunk or operation
   terminator and never reaches the diff engine; whatever follows must therefore be a valid
   hunk header or `*** End Patch`, and any leftover body line is rejected rather than
@@ -300,7 +320,10 @@ files listed under their source path); Pi's structured details are additive.
   source-removal failure leaves both files in place and reports them as uncertain effects
   rather than hiding the state. `delete_file` validates that the full source is UTF-8
   text before removing it, and each operation revalidates its source identity immediately
-  before overwriting or deleting so concurrent external edits are not destroyed.
+  before overwriting or deleting so concurrent external edits are not destroyed; a
+  removal through a symlink additionally revalidates the link itself (not just its
+  target), so a named link replaced after validation — with a regular file or another
+  link — is refused rather than silently unlinked.
   Cancellation is honored before every mutation step (an atomic commit that already
   completed cannot be undone). The declared `executionMode: "sequential"` additionally
   prevents `ApplyPatch` from racing sibling built-in edit/write calls within one parallel
@@ -319,13 +342,16 @@ files listed under their source path); Pi's structured details are additive.
   the model can correct the envelope and resubmit only the remaining operations.
 - Review evidence pre-captures every envelope path (including move destinations) as
   mutation candidates before execution, applying the same leading-`@` normalization the
-  tool uses. Because change
+  tool uses. A write-through update via a symlink is observed through the recorded tool
+  call and result; snapshot comparison sees the link's target spelling, not the mutated
+  bytes at the resolved path. Because change
   detection compares baseline snapshots against disk state, successful changes remain in
   the review capture even when the overall call errors after a partial failure.
   Successful and failed calls both remain review evidence. Results expose
   bounded structured details including the requested diff and a unified final diff —
   with `rename from`/`rename to` headers for moves and the removed content for
-  deletions — rendered compactly by the tool's custom call/result renderers.
+  regular-file deletions (a delete through a symlink removes only the link and exposes
+  no content diff) — rendered compactly by the tool's custom call/result renderers.
 
 ## Secrets and authentication
 

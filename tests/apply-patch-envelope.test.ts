@@ -70,7 +70,7 @@ test("a shell-style heredoc wrapper is unwrapped before parsing (lenient mode)",
   assert.equal(ops[0]!.path, "a.txt");
 });
 
-test("Environment ID lines are rejected: this tool patches the local workspace only", () => {
+test("Environment ID lines are rejected: this tool patches local files only", () => {
   assert.throws(
     () => parseApplyPatchEnvelope(envelope("*** Environment ID: remote-1", "*** Add File: a.txt", "+x")),
     /environment_id is not supported/,

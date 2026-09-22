@@ -1,7 +1,19 @@
-/// Path normalization and workspace confinement shared by the ApplyPatch tool,
-/// its canonical envelope parser, and the sequential request engine.
+/// Path resolution shared by the ApplyPatch tool, its canonical envelope
+/// parser, and the sequential request engine.
+///
+/// Path access intentionally matches Pi's native edit/write tools: paths are
+/// resolved lexically against the current working directory (absolute paths,
+/// `..` components, a leading `~`/`~/...` home prefix, and a single leading
+/// `@` convention marker are honored), and destinations outside the workspace
+/// — including authorized scratch paths such as /tmp — are supported wherever
+/// the host filesystem allows. The
+/// current working directory is a path-resolution context, not a promised
+/// filesystem sandbox: host permissions, tool authorization, review gates, and
+/// any external execution-environment boundary remain authoritative (see
+/// docs/security-model.md).
 
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { realpath } from "node:fs/promises";
 
 /**
@@ -15,47 +27,50 @@ export function normalizeApplyPatchPathMarker(value: string): string {
   return candidate;
 }
 
-export interface ConfinedPath {
-  /** Lexical absolute path inside the workspace root. */
+/**
+ * Expands a leading `~` or `~/...` (plus `~\...` on Windows) against the
+ * process home directory, mirroring Pi's native edit/write path normalization
+ * (the expandTilde rule in dist/utils/paths.js). Any other spelling —
+ * including `~user` — is returned unchanged and resolves relative to the cwd.
+ */
+export function expandHomePath(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/") || (process.platform === "win32" && value.startsWith("~\\"))) {
+    return join(homedir(), value.slice(2));
+  }
+  return value;
+}
+
+export interface ResolvedPath {
+  /** Absolute path resolved lexically against the cwd; a leading `~`/`~/...` is expanded first (native edit/write semantics). */
   absolute: string;
   /** Real (symlink-resolved) path of the nearest existing ancestor plus remainder. */
   real: string;
 }
 
 /**
- * Confines a normalized path to the workspace: lexically under `rootLexical` and,
- * through the nearest-existing-ancestor realpath, under `rootReal`, so symlinked
- * components cannot escape the workspace.
+ * Resolves a normalized operation path against the tool's working directory.
+ * A leading `~`/`~/...` expands to the home directory first (native edit/write
+ * rule); relative paths then resolve against `cwd`, and absolute paths are
+ * used as given.
+ * No workspace confinement is applied: outside-workspace destinations are
+ * intentional, and refusals come only from host filesystem permissions or
+ * later per-operation correctness checks.
  */
-export async function confinePath(
-  rootLexical: string,
-  rootReal: string,
-  rawPath: string,
-  field: string,
-): Promise<ConfinedPath> {
-  const absolute = isAbsolute(rawPath) ? resolve(rawPath) : resolve(rootLexical, rawPath);
-  assertWithinRoot(rootLexical, absolute, field, rawPath);
-  let real: string;
+export async function resolveTargetPath(cwd: string, rawPath: string, field: string): Promise<ResolvedPath> {
+  // Tilde expansion runs before the absolute-path check, exactly like Pi's
+  // native normalization: `~/x` is not absolute until it expands to a home path.
+  const expanded = expandHomePath(rawPath);
+  const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
   try {
-    real = await nearestRealPath(absolute);
+    const real = await nearestRealPath(absolute);
+    return { absolute, real };
   } catch (error) {
-    throw new Error(`${field} ${rawPath} could not be resolved within the current workspace: ${messageOf(error)}`);
-  }
-  assertWithinRoot(rootReal, real, field, rawPath);
-  return { absolute, real };
-}
-
-function assertWithinRoot(root: string, candidate: string, field: string, rawPath: string): void {
-  const rel = relative(root, candidate);
-  if (rel === "") {
-    throw new Error(`${field} ${rawPath} must reference a file inside the current workspace, not the workspace root`);
-  }
-  if (rel.startsWith("..") || isAbsolute(rel)) {
-    throw new Error(`${field} ${rawPath} resolves outside the current workspace (${root}); traversal is rejected`);
+    throw new Error(`${field} ${rawPath} could not be resolved: ${messageOf(error)}`);
   }
 }
 
-/** Realpath of the nearest existing ancestor with the remainder re-joined; detects symlink escapes. */
+/** Realpath of the nearest existing ancestor with the remainder re-joined; resolves symlinked components. */
 export async function nearestRealPath(absolute: string): Promise<string> {
   let prefix = absolute;
   const suffixes: string[] = [];

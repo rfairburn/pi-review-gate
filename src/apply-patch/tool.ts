@@ -171,15 +171,15 @@ export function registerApplyPatchTool(pi: unknown, options: ApplyPatchToolOptio
     name: APPLY_PATCH_TOOL_NAME,
     label: APPLY_PATCH_TOOL_NAME,
     description:
-      "Apply a canonical OpenAI/Codex apply_patch envelope to the current workspace. One request carries '*** Begin Patch' ... '*** End Patch' and may mix " +
+      "Apply a canonical OpenAI/Codex apply_patch envelope to files on the local filesystem. One request carries '*** Begin Patch' ... '*** End Patch' and may mix " +
       "'*** Add File:' (plus-prefixed lines), '*** Update File:' (with optional '*** Move to:' rename and '@@ [anchor]' hunks of ' '/'-'/'+' lines, optionally anchored with '*** End of File'), " +
       "and '*** Delete File:' operations across multiple files; disjoint hunks per file are supported. The complete envelope is parsed before any mutation, then operations are applied sequentially in order and the request stops at the first failure: earlier operations remain applied, later ones are not attempted, and the error reports which operations applied, failed, and were skipped (including any uncertain effects of the failed operation).",
     promptSnippet:
-      "Use ApplyPatch with the canonical apply_patch envelope ('*** Begin Patch' ... '*** End Patch') for precise multi-file create/update/rename/delete mutations; the whole envelope is parsed before mutation, operations are applied sequentially and stop at the first failure (earlier successes stay applied), and every path is confined to the current workspace.",
+      "Use ApplyPatch with the canonical apply_patch envelope ('*** Begin Patch' ... '*** End Patch') for precise multi-file create/update/rename/delete mutations; the whole envelope is parsed before mutation, operations are applied sequentially and stop at the first failure (earlier successes stay applied), and path access matches native edit/write: relative paths resolve against the current working directory, a leading '~' or '~/...' expands to the home directory, and absolute paths outside it (such as authorized scratch or temp directories) are supported wherever the host filesystem allows.",
     promptGuidelines: [
       "Send one canonical patch envelope per ApplyPatch call: '*** Begin Patch', then '*** Add File: <path>' (+ lines), '*** Update File: <path>' (optional '*** Move to: <path>', '@@ [anchor]' hunks, optional '*** End of File'), or '*** Delete File: <path>', then '*** End Patch'. Mix operations for multiple files in one envelope; disjoint hunks per file are supported.",
       "ApplyPatch applies operations sequentially in envelope order and stops at the first failure: earlier operations stay applied, later ones are skipped, and the error lists the applied, failed, and not-attempted operations. Fix the diagnostic and resubmit only the remaining operations rather than working around a failed patch with shell commands.",
-      "Paths are workspace-relative (a leading '@' is stripped).",
+      "Paths resolve against the current working directory; a leading '~' or '~/...' expands to the home directory; absolute paths outside the workspace — including authorized scratch or temp directories — are supported wherever the host filesystem allows, matching native edit/write access. A single leading '@' convention marker is stripped.",
     ],
     executionMode: "sequential",
     parameters: applyPatchToolSchema(),

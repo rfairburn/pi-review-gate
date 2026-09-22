@@ -147,46 +147,8 @@ export async function runExecutorWithRecovery(input: {
     }
 
     if (input.request.signal?.aborted) {
-      attemptRecord.endedAt = new Date().toISOString();
-      attemptRecord.outcome = "cancelled";
-      try {
-        const created = await createVerifiedCheckpoint(input, attemptRecord, priorCheckpointCandidate);
-        priorCheckpointCandidate = created.candidateIdentity;
-        checkpoint = created.checkpoint;
-        input.operation.checkpoint = checkpoint;
-        input.operation.state = "cancelled";
-        await writeOperationRecord(input.operation);
-      } catch (error) {
-        input.operation.state = "failed_critical";
-        attemptRecord.outcome = "failed";
-        const message = error instanceof Error ? error.message : String(error);
-        const incident = createIncident({
-          attempt: attemptRecord.attempt,
-          generation: input.operation.generation,
-          cause: "workspace_error",
-          stage: "cancellation_checkpoint",
-          message: `Executor was cancelled, but its workspace checkpoint could not be verified: ${message}`,
-          retryable: false,
-          terminalCode: "recovery_state_corrupt_or_unverifiable",
-        });
-        incidents.push(incident);
-        input.operation.incidents.push(incident);
-        await writeOperationRecord(input.operation);
-        return {
-          status: "critical",
-          error: incident.message,
-          lastTurnNumber: turnNumber,
-          checkpoint,
-          incidents,
-        };
-      }
-      return {
-        status: "cancelled",
-        error: "Executor was cancelled.",
-        lastTurnNumber: turnNumber,
-        checkpoint,
-        incidents,
-      };
+      // #165: post-turn aborts settle through the shared cancellation path.
+      return await settleCancellation(input, attemptRecord, turnNumber, priorCheckpointCandidate, checkpoint, incidents, "Executor was cancelled.");
     }
 
     const failure = classifyFailure(turn, thrown);
@@ -285,7 +247,29 @@ export async function runExecutorWithRecovery(input: {
     );
 
     if (!compactionIncident) {
-      await retryDelay(input.retryPolicy, genericRetries, input.request.signal);
+      try {
+        await retryDelay(input.retryPolicy, genericRetries, input.request.signal);
+      } catch (error) {
+        if (input.request.signal?.aborted) {
+          // #165: an abort during retry backoff is a verified cancellation of
+          // the whole task, not another executor failure. Settle through the
+          // shared cancellation path so the prior failure incident and the
+          // verified checkpoint are retained and the operation settles
+          // cancelled instead of throwing out of the recovery loop (which the
+          // lifecycle recorded as executor_error and mapped to
+          // paused_recoverable in the durable operation record).
+          return await settleCancellation(
+            input,
+            attemptRecord,
+            turnNumber,
+            priorCheckpointCandidate,
+            checkpoint,
+            incidents,
+            "Executor was cancelled during retry backoff.",
+          );
+        }
+        throw error;
+      }
     }
     prompt = recoveryPrompt(failure.message, compactionIncident, checkpoint, originalPrompt);
     recovery = {
@@ -298,6 +282,67 @@ export async function runExecutorWithRecovery(input: {
     releaseOperationOwner(input.operation);
     await writeOperationRecord(input.operation);
   }
+}
+
+/**
+ * #165: shared cancellation settlement for every abort site in the recovery
+ * loop — after a turn and during retry backoff. Verifies a checkpoint of the
+ * retained workspace (fail-closed: an unverifiable checkpoint settles
+ * `failed_critical` with a `cancellation_checkpoint` incident, never a silent
+ * cancel), marks the operation cancelled, and returns the run with every
+ * prior incident retained. The cancellation itself records no incident.
+ */
+async function settleCancellation(
+  input: Parameters<typeof runExecutorWithRecovery>[0],
+  attemptRecord: ExecutionAttemptRecord,
+  turnNumber: number,
+  priorCheckpointCandidate: PriorCandidate | undefined,
+  checkpoint: RecoveryCheckpoint | undefined,
+  incidents: ExecutionIncident[],
+  cancelledMessage: string,
+): Promise<RecoveredExecutorRun> {
+  // A turn abort leaves the live attempt unfinished; a backoff abort lands
+  // after the attempt already ended in a retryable failure, so its end stamp
+  // is kept and only the settlement outcome is restamped.
+  attemptRecord.endedAt ??= new Date().toISOString();
+  attemptRecord.outcome = "cancelled";
+  try {
+    const created = await createVerifiedCheckpoint(input, attemptRecord, priorCheckpointCandidate);
+    checkpoint = created.checkpoint;
+    input.operation.checkpoint = checkpoint;
+    input.operation.state = "cancelled";
+    await writeOperationRecord(input.operation);
+  } catch (error) {
+    input.operation.state = "failed_critical";
+    attemptRecord.outcome = "failed";
+    const message = error instanceof Error ? error.message : String(error);
+    const incident = createIncident({
+      attempt: attemptRecord.attempt,
+      generation: input.operation.generation,
+      cause: "workspace_error",
+      stage: "cancellation_checkpoint",
+      message: `Executor was cancelled, but its workspace checkpoint could not be verified: ${message}`,
+      retryable: false,
+      terminalCode: "recovery_state_corrupt_or_unverifiable",
+    });
+    incidents.push(incident);
+    input.operation.incidents.push(incident);
+    await writeOperationRecord(input.operation);
+    return {
+      status: "critical",
+      error: incident.message,
+      lastTurnNumber: turnNumber,
+      checkpoint,
+      incidents,
+    };
+  }
+  return {
+    status: "cancelled",
+    error: cancelledMessage,
+    lastTurnNumber: turnNumber,
+    checkpoint,
+    incidents,
+  };
 }
 
 async function createVerifiedCheckpoint(

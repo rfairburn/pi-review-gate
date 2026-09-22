@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.68]
+
+### Fixed
+
+- Settle cancellation during executor retry backoff through the verified
+  cancellation path instead of reporting a recoverable executor failure. Preserve
+  prior incident evidence and retained work, and keep checkpoint-verification
+  failures critical and fail-closed.
+
 ## [0.1.0-dev.67]
 
 ### Changed

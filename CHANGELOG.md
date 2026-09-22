@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.72]
+
+### Fixed
+
+- Update real-agent-loop regression fixtures for Pi 0.87's `finishTurn` API,
+  preventing the browser native-error test from spinning on the removed hook.
+  Pin CI's agent-core runtime to 0.87.0 and refresh compatibility documentation;
+  existing production behavior and error-handling assertions remain unchanged.
+
 ## [0.1.0-dev.71]
 
 ### Changed

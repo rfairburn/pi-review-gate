@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.87.0"
+  }
+}

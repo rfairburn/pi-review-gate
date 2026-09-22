@@ -65,8 +65,8 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   tests do not need Chromium — CI's fast job runs them with provisioning skipped
   entirely.
 - **Optional: `PI_BROWSER_AGENT_RUNTIME`** pointing at an installed Pi agent-core
-  `dist/index.js` enables `tests/browser-native-error.test.ts` (CI uses
-  `@earendil-works/pi-agent-core@0.85.0`, which needs Node >=22.19; the model stream is
+  0.87.0-or-newer `dist/index.js` enables `tests/browser-native-error.test.ts` (CI uses
+  `@earendil-works/pi-agent-core@0.87.0`, which needs Node >=22.19; the model stream is
   mocked, with no live model calls). Without it the test skips itself. See
   [Web tools](web-tools.md#interactive-browser).
 - **`python3` is not needed by the test suite**: DDGS interactions are mocked. In the

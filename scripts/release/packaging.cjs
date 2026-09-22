@@ -141,10 +141,10 @@ function verifyTarball({ tarballPath, extractDir }) {
     // Native Windows launcher pair (issue 108) ships with the package.
     "scripts/pi-review-gate.cmd",
     "scripts/pi-review-gate-launcher.cjs",
-    "skills/orchestrator/SKILL.md",
-    "skills/orchestrator/references/recovery.md",
-    "skills/execution/SKILL.md",
-    "skills/research/SKILL.md",
+    "skills/pi-review-gate-orchestrator/SKILL.md",
+    "skills/pi-review-gate-orchestrator/references/recovery.md",
+    "skills/pi-review-gate-execution/SKILL.md",
+    "skills/pi-review-gate-research/SKILL.md",
   ]) {
     if (!entries.includes(required)) problems.push(`required tarball entry missing: ${required}`);
   }

@@ -172,7 +172,7 @@ worktree), and restore detachment without changing the working tree only when at
 normal continuation. Detachment alone does not create, verify, or
 revalidate any durable checkpoint, and content already destroyed by the checkout is
 reported as lost rather than guessed at. See the shipped orchestrator skill's recovery
-runbook (`skills/orchestrator/references/recovery.md`) and
+runbook (`skills/pi-review-gate-orchestrator/references/recovery.md`) and
 [Delegated execution](delegated-execution.md#landing-and-source-preservation).
 
 ## What shutdown preserves and removes

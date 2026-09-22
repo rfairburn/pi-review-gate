@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -162,12 +162,12 @@ test("persistent launcher uses the compatibility fallback config and forwards ar
   assert.equal(await readFile(join(fixture.capture, "config-env"), "utf8"), fixture.fallbackConfigPath);
   assert.equal(await readFile(join(fixture.capture, "disabled-env"), "utf8"), "unset");
   assert.equal(
-    await readFile(join(fixture.home, ".agents", "skills", "orchestrator", "SKILL.md"), "utf8"),
-    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+    await readFile(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
   );
   assert.equal(
-    await readFile(join(fixture.home, ".agents", "skills", "orchestrator", "references", "recovery.md"), "utf8"),
-    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+    await readFile(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "references", "recovery.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
   );
   // The launcher no longer bakes the orchestrator prompt in with
   // --append-system-prompt: the extension owns the operating-mode segment.
@@ -207,11 +207,11 @@ test("persistent launcher honors the PI_REVIEW_GATE_DISABLED kill switch", async
 
 test("persistent launcher refreshes a stale installed orchestrator skill", async () => {
   const fixture = await makeLauncherFixture("pi-review-launcher-skill-");
-  const installedSkill = join(fixture.home, ".agents", "skills", "orchestrator", "SKILL.md");
-  const installedRecovery = join(fixture.home, ".agents", "skills", "orchestrator", "references", "recovery.md");
+  const installedSkill = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md");
+  const installedRecovery = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "references", "recovery.md");
   await Promise.all([
     mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true }),
-    mkdir(join(fixture.home, ".agents", "skills", "orchestrator", "references"), { recursive: true }),
+    mkdir(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "references"), { recursive: true }),
   ]);
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
   await writeFile(installedSkill, "stale\n", "utf8");
@@ -221,13 +221,13 @@ test("persistent launcher refreshes a stale installed orchestrator skill", async
 
   assert.equal(
     await readFile(installedSkill, "utf8"),
-    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
   );
   assert.equal(
     await readFile(installedRecovery, "utf8"),
-    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
   );
-  for (const name of ["execution", "research"]) {
+  for (const name of ["pi-review-gate-execution", "pi-review-gate-research"]) {
     assert.equal(
       await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
       await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
@@ -257,16 +257,200 @@ test("persistent launcher preserves unrelated custom skills under ~/.agents/skil
     customContent,
     "unrelated custom skills must be preserved untouched by provisioning",
   );
-  for (const name of ["orchestrator", "execution", "research"]) {
+  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research"]) {
     assert.equal(
       await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
       await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
       `the ${name} skill must still be provisioned alongside the custom skill`,
     );
   }
+  // Issue 151: a fresh launch installs the namespaced skills only — the
+  // generic pre-#151 locations are never created by provisioning.
+  for (const generic of ["orchestrator", "execution", "research"]) {
+    assert.equal(
+      await pathExists(join(fixture.home, ".agents", "skills", generic)),
+      false,
+      `a fresh launch must not create the generic ${generic} skill location`,
+    );
+  }
   assert.match(result.stdout, /pi-review-gate orchestrator skill: /);
   assert.match(result.stdout, /pi-review-gate execution skill: /);
   assert.match(result.stdout, /pi-review-gate research skill: /);
+});
+
+test("persistent launcher migrates proven pre-#151 generic skill copies and preserves modified or unrelated files (#151)", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-skill-migration-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  // The recorded namespacing edits (exactly the canonical SKILL_MIGRATION_PLAN
+  // in scripts/pi-review-gate-launcher.cjs): reversing them on the shipped
+  // copies reconstructs the prior generic package-owned content.
+  const orchestratorRenames: Array<[string, string]> = [
+    ["name: pi-review-gate-orchestrator", "name: orchestrator"],
+    ["../pi-review-gate-execution/SKILL.md", "../execution/SKILL.md"],
+    ["../pi-review-gate-research/SKILL.md", "../research/SKILL.md"],
+  ];
+  const priorContent = async (shipped: string, renames: Array<[string, string]>): Promise<string> => {
+    let content = await readFile(resolve(shipped), "utf8");
+    for (const [to, from] of renames) content = content.split(to).join(from);
+    return content;
+  };
+
+  // Proven unmodified package-owned copies at the pre-#151 generic
+  // locations: byte-exact pre-namespacing content.
+  const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
+  const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
+  const priorExecution = join(skillsDir, "execution", "SKILL.md");
+  const modifiedResearch = join(skillsDir, "research", "SKILL.md");
+  const unrelatedFile = join(skillsDir, "execution", "user-notes.md");
+  await Promise.all([
+    mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true }),
+    mkdir(join(skillsDir, "execution"), { recursive: true }),
+    mkdir(join(skillsDir, "research"), { recursive: true }),
+  ]);
+  const researchContent = (await priorContent("skills/pi-review-gate-research/SKILL.md", [
+    ["name: pi-review-gate-research", "name: research"],
+  ])) + "\nuser customized this copy\n";
+  await Promise.all([
+    writeFile(priorOrchestrator, await priorContent("skills/pi-review-gate-orchestrator/SKILL.md", orchestratorRenames), "utf8"),
+    writeFile(priorRecovery, await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"), "utf8"),
+    writeFile(priorExecution, await priorContent("skills/pi-review-gate-execution/SKILL.md", [["name: pi-review-gate-execution", "name: execution"]]), "utf8"),
+    writeFile(modifiedResearch, researchContent, "utf8"),
+    writeFile(unrelatedFile, "user notes\n", "utf8"),
+  ]);
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  // The namespaced skills are provisioned regardless.
+  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research"]) {
+    assert.equal(
+      await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
+      await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
+      `the ${name} skill must be provisioned during the migration launch`,
+    );
+  }
+  // Proven unmodified package-owned copies are removed.
+  for (const removed of [priorOrchestrator, priorRecovery, priorExecution]) {
+    assert.equal(await pathExists(removed), false, `the proven prior copy must be migrated away: ${removed}`);
+  }
+  // A modified old copy is ambiguous or user-owned: preserved untouched.
+  assert.equal(await readFile(modifiedResearch, "utf8"), researchContent, "a modified generic copy must be preserved");
+  // Unrelated files under the old directories are preserved, and no
+  // directory is ever removed.
+  assert.equal(await readFile(unrelatedFile, "utf8"), "user notes\n", "unrelated files under old skill directories must be preserved");
+  assert.equal(await pathExists(join(skillsDir, "orchestrator")), true, "old directories are never removed");
+  assert.match(result.stderr, /removed the unmodified prior copy/);
+  assert.match(result.stdout, /pi-review-gate orchestrator skill: /);
+});
+
+test("persistent launcher preserves customized generic copies that normalize to shipped content and keeps recovery.md for a customized orchestrator (#154)", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-skill-ownership-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  // Regression cases for the ownership proof (issue 154): content that a
+  // transform-before-compare proof would wrongly classify as unmodified.
+  const fullyRenamedExecution = join(skillsDir, "execution", "SKILL.md");
+  const partiallyRenamedOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
+  const genericRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
+  await Promise.all([
+    mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true }),
+    mkdir(join(skillsDir, "execution"), { recursive: true }),
+  ]);
+  // Fully renamed: the user placed the current namespaced execution skill
+  // content at the generic path themselves. It normalizes to the shipped
+  // text under the old rename transform, but its bytes are not the
+  // historical generic copy (whose frontmatter name was `execution`), so it
+  // must be preserved.
+  const executionCopy = await readFile(resolve("skills/pi-review-gate-execution/SKILL.md"), "utf8");
+  // Partially renamed and customized: the frontmatter name already carries
+  // the namespace, one role-skill link was already namespaced, but the other
+  // link and an added note are user customization. No proof of historical
+  // identity exists, so it must be preserved.
+  const orchestratorCustom = (await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"))
+    .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
+    .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
+    + "\nuser customized this copy\n";
+  // The packaged recovery.md is byte-identical to the historical generic
+  // copy (recovery.md carried no namespacing edits), but it supports the
+  // customized generic orchestrator SKILL.md above: deleting it would break
+  // the customized skill's reference, so the pairing gate must preserve it.
+  const recoveryCopy = await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8");
+  await Promise.all([
+    writeFile(fullyRenamedExecution, executionCopy, "utf8"),
+    writeFile(partiallyRenamedOrchestrator, orchestratorCustom, "utf8"),
+    writeFile(genericRecovery, recoveryCopy, "utf8"),
+  ]);
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  assert.equal(await readFile(fullyRenamedExecution, "utf8"), executionCopy, "a fully renamed generic copy must be preserved");
+  assert.equal(await readFile(partiallyRenamedOrchestrator, "utf8"), orchestratorCustom, "a partially renamed customized generic copy must be preserved");
+  assert.equal(await readFile(genericRecovery, "utf8"), recoveryCopy, "recovery.md must be preserved while the customized generic orchestrator SKILL.md remains");
+  assert.doesNotMatch(result.stderr, /removed the unmodified prior copy/);
+});
+
+test("persistent launcher removes recovery.md together with a proven generic orchestrator SKILL.md (#154)", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-skill-paired-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  // Historical generic orchestrator pair: when the SKILL.md is proven
+  // unmodified and removed, the proven recovery.md goes with it.
+  let orchestratorHistorical = await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8");
+  orchestratorHistorical = orchestratorHistorical
+    .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
+    .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
+    .split("../pi-review-gate-research/SKILL.md").join("../research/SKILL.md");
+  const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
+  const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
+  await mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true });
+  await Promise.all([
+    writeFile(priorOrchestrator, orchestratorHistorical, "utf8"),
+    writeFile(priorRecovery, await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"), "utf8"),
+  ]);
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  assert.equal(await pathExists(priorOrchestrator), false, "the proven generic orchestrator SKILL.md must be migrated away");
+  assert.equal(await pathExists(priorRecovery), false, "the proven generic recovery.md must be removed with its paired SKILL.md");
+  assert.match(result.stderr, /removed the unmodified prior copy/);
+});
+
+test("persistent launcher never deletes through a symlinked legacy skill path (#151)", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-skill-alias-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  // User alias: the legacy orchestrator directory points at the namespaced
+  // one (a natural way to keep the old discoverable name working). The
+  // publish loop then writes the namespaced files the alias resolves to.
+  await mkdir(skillsDir, { recursive: true });
+  await symlink(join(skillsDir, "pi-review-gate-orchestrator"), join(skillsDir, "orchestrator"), "dir");
+
+  const result = await runLauncher([], launcherEnv(fixture));
+
+  // The freshly published namespaced files must survive the migration: no
+  // deletion may land on them through the alias.
+  assert.equal(
+    await readFile(join(skillsDir, "pi-review-gate-orchestrator", "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
+    "the namespaced skill must not be deleted through the aliased legacy path",
+  );
+  assert.equal(
+    await readFile(join(skillsDir, "pi-review-gate-orchestrator", "references", "recovery.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
+    "the namespaced recovery runbook must not be deleted through the aliased legacy path",
+  );
+  // The alias itself is user-owned indirection: preserved untouched.
+  assert.equal((await lstat(join(skillsDir, "orchestrator"))).isSymbolicLink(), true, "the user's alias symlink must be preserved");
+  // No migration may claim a removal in this state.
+  assert.doesNotMatch(result.stderr, /removed the unmodified prior copy/);
 });
 
 test("orchestrator prompt names the operation-specific tools and current steering contract", async () => {
@@ -294,7 +478,7 @@ test("orchestrator prompt names the operation-specific tools and current steerin
 });
 
 test("orchestrator skill explains worktree isolation and three-way landing", async () => {
-  const skill = await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8");
+  const skill = await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8");
   assert.match(skill, /separate, isolated Git worktree/);
   assert.match(skill, /Siblings do not share a working directory/);
   assert.match(skill, /guarded three-way merge\/integration/);
@@ -313,7 +497,7 @@ test("orchestrator guidance favors beneficial parallelism and bounded tasks with
   // Policy-presence check on the shipped orchestrator surfaces. These checks
   // validate wording and wiring only; they are not evidence that a model
   // consistently chooses beneficial parallelism.
-  const skill = await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8");
+  const skill = await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8");
   for (const phrase of [
     "Shape concurrency from dependencies and benefit, not from available capacity",
     "not a utilization target",
@@ -358,7 +542,7 @@ test("orchestrator guidance favors beneficial parallelism and bounded tasks with
 });
 
 test("orchestrator recovery reference covers recoverable execution states", async () => {
-  const recovery = await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8");
+  const recovery = await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8");
   for (const phrase of [
     "SubtasksInspect",
     "SubtasksContinue",
@@ -998,17 +1182,17 @@ test("persistent launcher publishes skills over a concurrently published destina
   assert.match(result.stdout, new RegExp(escapeRegExp(fixture.fallbackConfigPath)));
   assert.equal(await capturedConfigPath(fixture), fixture.fallbackConfigPath);
 
-  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
   // The atomic rename must have replaced the concurrently published (stale)
   // destination with the complete current content, at the contracted mode.
   assert.equal(
     await readFile(join(skillDir, "SKILL.md"), "utf8"),
-    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
     "the skill must be complete and current, not the stale planted content",
   );
   assert.equal(
     await readFile(join(skillDir, "references", "recovery.md"), "utf8"),
-    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
     "the recovery reference must be complete and current",
   );
   for (const file of [join(skillDir, "SKILL.md"), join(skillDir, "references", "recovery.md")]) {
@@ -1024,7 +1208,7 @@ test("persistent launcher publishes skills over a concurrently published destina
   assert.deepEqual(await readdir(join(skillDir, "references")), ["recovery.md"]);
   // Every shipped skill shares the publication seam, so every destination must
   // have been planted and atomically replaced (manifest order).
-  for (const name of ["execution", "research"]) {
+  for (const name of ["pi-review-gate-execution", "pi-review-gate-research"]) {
     const dir = join(fixture.home, ".agents", "skills", name);
     assert.equal(
       await readFile(join(dir, "SKILL.md"), "utf8"),
@@ -1042,8 +1226,8 @@ test("persistent launcher publishes skills over a concurrently published destina
   assert.deepEqual(planted, [
     join(skillDir, "SKILL.md"),
     join(skillDir, "references", "recovery.md"),
-    join(fixture.home, ".agents", "skills", "execution", "SKILL.md"),
-    join(fixture.home, ".agents", "skills", "research", "SKILL.md"),
+    join(fixture.home, ".agents", "skills", "pi-review-gate-execution", "SKILL.md"),
+    join(fixture.home, ".agents", "skills", "pi-review-gate-research", "SKILL.md"),
   ], "the seam must have planted every shipped skill destination before publication");
 });
 
@@ -1076,7 +1260,7 @@ test("persistent launcher fails closed when a directory appears at a skill path 
     },
   );
 
-  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
   assert.ok((await stat(join(skillDir, "SKILL.md"))).isDirectory(), "the racing directory must not be removed");
   assert.deepEqual(await readdir(join(skillDir, "SKILL.md")), [], "no file may be published into the directory");
   const entries = await readdir(skillDir);
@@ -1123,15 +1307,15 @@ test("concurrent first launches never clobber or expose partial JSON", async () 
   // Issue 97: every racer also publishes the orchestrator skill; all of them
   // must complete and leave the complete current skill content (the old
   // install-based publication raced into a GNU EEXIST failure on Linux).
-  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
   assert.equal(
     await readFile(join(skillDir, "SKILL.md"), "utf8"),
-    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
     "the surviving skill must be complete and current",
   );
   assert.equal(
     await readFile(join(skillDir, "references", "recovery.md"), "utf8"),
-    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
     "the surviving recovery reference must be complete and current",
   );
   for (const dir of [skillDir, join(skillDir, "references")]) {

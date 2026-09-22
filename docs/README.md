@@ -43,9 +43,9 @@ each other instead of duplicating detail.
 - Attribution and license texts: [NOTICE](../NOTICE), [LICENSE](../LICENSE),
   and [LICENSES/](../LICENSES).
 - The shipped skills provisioned with the package:
-  [skills/orchestrator/SKILL.md](../skills/orchestrator/SKILL.md),
-  [skills/execution/SKILL.md](../skills/execution/SKILL.md), and
-  [skills/research/SKILL.md](../skills/research/SKILL.md).
+  [skills/pi-review-gate-orchestrator/SKILL.md](../skills/pi-review-gate-orchestrator/SKILL.md),
+  [skills/pi-review-gate-execution/SKILL.md](../skills/pi-review-gate-execution/SKILL.md), and
+  [skills/pi-review-gate-research/SKILL.md](../skills/pi-review-gate-research/SKILL.md).
 
 ## Governance and contribution
 

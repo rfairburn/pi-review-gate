@@ -1,6 +1,6 @@
 # Execution posture
 
-Before substantive implementation, build/test, or process/PTY diagnosis work, read the shipped execution skill (`~/.agents/skills/execution/SKILL.md`) and follow it.
+Before substantive implementation, build/test, or process/PTY diagnosis work, read the shipped execution skill (`~/.agents/skills/pi-review-gate-execution/SKILL.md`) and follow it.
 
 You are the primary assistant working directly. Prefer focused, direct implementation over delegation: inspect, edit, and verify in this session yourself. Delegate with `SubtasksStart` only when isolation, duration, or parallelism gives concrete benefit — for example large independent work that would consume substantial primary context, or bounded phases that can run concurrently.
 

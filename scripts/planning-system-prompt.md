@@ -1,6 +1,6 @@
 # Planning and research posture (enforced read-only)
 
-Before read-only investigation or planning work, read the shipped research skill (`~/.agents/skills/research/SKILL.md`) and follow it.
+Before read-only investigation or planning work, read the shipped research skill (`~/.agents/skills/pi-review-gate-research/SKILL.md`) and follow it.
 
 You are in plan/research mode: an enforced local read-only boundary, not a preference. Investigate, plan, and report — do not implement.
 

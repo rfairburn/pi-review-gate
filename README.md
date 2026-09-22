@@ -174,7 +174,7 @@ A minimal config using Codex as the reviewer:
 
 The launcher builds the extension when sources are present, selects the first existing
 persistent config, refreshes the shipped skills under
-`~/.agents/skills/` (orchestrator, execution, and research), and forwards all remaining
+`~/.agents/skills/` (pi-review-gate-orchestrator, pi-review-gate-execution, and pi-review-gate-research), and forwards all remaining
 arguments to `pi`.
 For development you can load the built extension directly instead; in that path
 `PI_REVIEW_GATE_CONFIG` is honored because it reaches the extension itself rather than

@@ -1,5 +1,5 @@
 ---
-name: research
+name: pi-review-gate-research
 description: Read-only investigation and reporting — web search and fetch, indexed page reading, browser observation, codebase reading, and subtask inspection. Read before research work; shell execution, installs, PTY/process runs, and file writes are unavailable even when a task is called "research".
 ---
 

@@ -10,19 +10,45 @@ esac
 REVIEW_GATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REVIEW_GATE_EXTENSION="$REVIEW_GATE_ROOT/dist/src/index.js"
 SKILLS_DIR="$HOME/.agents/skills"
-ORCHESTRATOR_SKILL_DIR="$SKILLS_DIR/orchestrator"
-EXECUTION_SKILL_DIR="$SKILLS_DIR/execution"
-RESEARCH_SKILL_DIR="$SKILLS_DIR/research"
+# Issue 151: shipped skills are namespaced (pi-review-gate-*) so they cannot
+# collide with a user's own generically named skills; the install destinations
+# carry the same namespace.
+ORCHESTRATOR_SKILL_DIR="$SKILLS_DIR/pi-review-gate-orchestrator"
+EXECUTION_SKILL_DIR="$SKILLS_DIR/pi-review-gate-execution"
+RESEARCH_SKILL_DIR="$SKILLS_DIR/pi-review-gate-research"
 
 # Skill provisioning manifest (issue 23): packaged source path and installed
 # destination path, tab-separated, one entry per shipped skill file. Keep in
 # sync with SKILL_PUBLISH_PLAN in scripts/pi-review-gate-launcher.cjs.
 SKILL_PUBLISH_PLAN=(
-  "$REVIEW_GATE_ROOT/skills/orchestrator/SKILL.md"$'\t'"$ORCHESTRATOR_SKILL_DIR/SKILL.md"
-  "$REVIEW_GATE_ROOT/skills/orchestrator/references/recovery.md"$'\t'"$ORCHESTRATOR_SKILL_DIR/references/recovery.md"
-  "$REVIEW_GATE_ROOT/skills/execution/SKILL.md"$'\t'"$EXECUTION_SKILL_DIR/SKILL.md"
-  "$REVIEW_GATE_ROOT/skills/research/SKILL.md"$'\t'"$RESEARCH_SKILL_DIR/SKILL.md"
+  "$REVIEW_GATE_ROOT/skills/pi-review-gate-orchestrator/SKILL.md"$'\t'"$ORCHESTRATOR_SKILL_DIR/SKILL.md"
+  "$REVIEW_GATE_ROOT/skills/pi-review-gate-orchestrator/references/recovery.md"$'\t'"$ORCHESTRATOR_SKILL_DIR/references/recovery.md"
+  "$REVIEW_GATE_ROOT/skills/pi-review-gate-execution/SKILL.md"$'\t'"$EXECUTION_SKILL_DIR/SKILL.md"
+  "$REVIEW_GATE_ROOT/skills/pi-review-gate-research/SKILL.md"$'\t'"$RESEARCH_SKILL_DIR/SKILL.md"
 )
+
+# Ownership-safe migration of the pre-#151 generic install locations (issue
+# 151). There is deliberately NO migration manifest or matching algorithm
+# here: the single canonical implementation (manifest, expected-historical-
+# byte identity proof, and pairing rules) lives in
+# SKILL_MIGRATION_PLAN / migrateGenericSkillFiles in
+# scripts/pi-review-gate-launcher.cjs, which both launchers run — the POSIX
+# launcher through the --migrate-prior-skill-files mode below — so the
+# migration cannot drift between platforms and the migration identities exist
+# in exactly one shipped place.
+#
+# Run the migration only after the namespaced skills published successfully:
+# an upgrade must land the new skills even when nothing can be proven about
+# the old copies. The home directory this launcher publishes skills under is
+# passed explicitly (not left to Node's os.homedir(), which under MSYS prefers
+# USERPROFILE while $HOME may legitimately differ — see native_home_value
+# below), so the migration always inspects the same tree the SKILL_PUBLISH_PLAN
+# above just published into. Best effort and fail-safe: without a node
+# runtime, or on any helper error, nothing is removed.
+migrate_prior_skill_files() {
+  command -v node >/dev/null 2>&1 || return 0
+  node "$REVIEW_GATE_ROOT/scripts/pi-review-gate-launcher.cjs" --migrate-prior-skill-files "$HOME" || return 0
+}
 
 # Deliberate environment sanitization: the persistent config is re-resolved
 # below and re-exported, so an inherited PI_REVIEW_GATE_CONFIG (e.g. from a
@@ -443,6 +469,10 @@ while [[ "$plan_index" -lt "${#SKILL_PUBLISH_PLAN[@]}" ]]; do
   fi
   plan_index=$((plan_index + 1))
 done
+
+# Ownership-safe migration of the pre-#151 generic install locations (issue
+# 151), only after every namespaced skill published successfully.
+migrate_prior_skill_files
 
 # The exported path must be in the native Windows form: MSYS never converts
 # environment variables, and Node cannot open /c/... paths on Windows. Off

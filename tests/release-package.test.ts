@@ -440,7 +440,7 @@ test("the real staged tarball packs, verifies, installs, and exposes the dev ver
       "dist/src/index.js",
       "scripts/pi-review-gate.sh",
       "scripts/pi-review-web.sh",
-      "skills/orchestrator/SKILL.md",
+      "skills/pi-review-gate-orchestrator/SKILL.md",
       "docs/releases.md",
       "README.md",
       "LICENSE",

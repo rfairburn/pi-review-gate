@@ -1,5 +1,5 @@
 ---
-name: orchestrator
+name: pi-review-gate-orchestrator
 description: Coordinate substantive coding or research through background subtasks while retaining ownership of decisions, supervision, integration, and validation. Use for multi-step, long-running, delegated, or meaningfully parallel work.
 ---
 
@@ -15,7 +15,7 @@ You orchestrate as the primary: you keep your own registered toolset — read an
 - Check the planned operations against the actual available tools before dispatching: consult the startup inventory and `search_tools` for this session rather than assuming a capability from memory.
 - For tool discovery, the startup inventory and the `search_tools` description carry this role's discovery set: the authorized tools minus the tools the role loads automatically at baseline. The set is unchanged by later activations and is rebuilt only when the real permissions or operating mode change. Never duplicate a static tool catalog into task text or prompts.
 - Delegation never widens authority: a delegate can only use what the parent itself was authorized to use, and a plan/research operating mode cannot escalate past its own read-only boundary by delegating. If the work needs a capability this session lacks, say so instead of dispatching around it.
-- Read the relevant capability guidance before choosing or dispatching a delegate: [../execution/SKILL.md](../execution/SKILL.md) for execution tasks, [../research/SKILL.md](../research/SKILL.md) for research tasks. The execution skill details the primary-execution mode versus the delegated executor role; the research skill details the enforced read-only boundary.
+- Read the relevant capability guidance before choosing or dispatching a delegate: [../pi-review-gate-execution/SKILL.md](../pi-review-gate-execution/SKILL.md) for execution tasks, [../pi-review-gate-research/SKILL.md](../pi-review-gate-research/SKILL.md) for research tasks. The execution skill details the primary-execution mode versus the delegated executor role; the research skill details the enforced read-only boundary.
 
 ## Shape the work
 

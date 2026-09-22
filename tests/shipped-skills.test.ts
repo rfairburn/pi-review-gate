@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -26,7 +27,11 @@ const readSkillFlat = async (name: string): Promise<string> => normalize(await r
 const readRepoFileFlat = (relPath: string): Promise<string> =>
   readFile(path.join(repoRoot, relPath), "utf8").then(normalize);
 
-const SHIPPED_SKILLS = ["orchestrator", "execution", "research"] as const;
+const SHIPPED_SKILLS = [
+  "pi-review-gate-orchestrator",
+  "pi-review-gate-execution",
+  "pi-review-gate-research",
+] as const;
 
 test("every shipped skill declares valid frontmatter matching its directory", async () => {
   for (const name of SHIPPED_SKILLS) {
@@ -42,7 +47,7 @@ test("every shipped skill declares valid frontmatter matching its directory", as
 });
 
 test("execution skill distinguishes primary execution mode from the delegated executor role", async () => {
-  const skill = await readSkillFlat("execution");
+  const skill = await readSkillFlat("pi-review-gate-execution");
   for (const phrase of [
     "Primary execution mode",
     "Delegated executor role",
@@ -60,7 +65,7 @@ test("execution skill distinguishes primary execution mode from the delegated ex
 });
 
 test("execution skill teaches the discovery contract without restating the runtime catalog", async () => {
-  const skill = await readSkillFlat("execution");
+  const skill = await readSkillFlat("pi-review-gate-execution");
   for (const phrase of [
     // Startup inventory: the role's discovery set (authorized minus baseline-loaded),
     // names plus a tiny purpose, schemas deferred.
@@ -89,7 +94,7 @@ test("execution skill teaches the discovery contract without restating the runti
 });
 
 test("execution skill covers background shells, the workspace contract, and honest reporting", async () => {
-  const skill = await readSkillFlat("execution");
+  const skill = await readSkillFlat("pi-review-gate-execution");
   for (const phrase of [
     // Background-shell semantics from src/background-shell: handles, event
     // wakes, explicit stop — never polling.
@@ -122,7 +127,7 @@ test("execution skill covers background shells, the workspace contract, and hone
 });
 
 test("research skill enforces read-only work and forbids execution even when called research", async () => {
-  const skill = await readSkillFlat("research");
+  const skill = await readSkillFlat("pi-review-gate-research");
   for (const phrase of [
     "enforced read-only boundary",
     "Primary plan/research mode",
@@ -144,7 +149,7 @@ test("research skill enforces read-only work and forbids execution even when cal
 });
 
 test("research skill teaches the same discovery contract as execution", async () => {
-  const skill = await readSkillFlat("research");
+  const skill = await readSkillFlat("pi-review-gate-research");
   for (const phrase of [
     "startup inventory lists this role's discovery set",
     "`search_tools` tool description itself carries that same discovery set",
@@ -164,14 +169,14 @@ test("research skill teaches the same discovery contract as execution", async ()
 });
 
 test("orchestrator skill directs workers to the shipped role skills and keeps recovery guidance", async () => {
-  const skill = await readSkillFlat("orchestrator");
+  const skill = await readSkillFlat("pi-review-gate-orchestrator");
   assert.match(skill, /execution workers at the execution skill/);
   assert.match(skill, /research workers at the research skill/);
   assert.match(skill, /references\/recovery\.md/);
 });
 
 test("orchestrator skill teaches capability-based dispatch with role links and authority ceilings", async () => {
-  const skill = await readSkillFlat("orchestrator");
+  const skill = await readSkillFlat("pi-review-gate-orchestrator");
   // Capability-based role selection, not file-change-based: source-only
   // inspection fits research; anything that must run something fits execution
   // even when the deliverable is only a report.
@@ -189,8 +194,8 @@ test("orchestrator skill teaches capability-based dispatch with role links and a
   assert.match(skill, /Delegation never widens authority/);
   assert.match(skill, /a plan\/research operating mode cannot escalate past its own read-only boundary/);
   // Working relative links to the role skills, read before dispatching.
-  assert.match(skill, /\[\.\.\/execution\/SKILL\.md\]\(\.\.\/execution\/SKILL\.md\)/);
-  assert.match(skill, /\[\.\.\/research\/SKILL\.md\]\(\.\.\/research\/SKILL\.md\)/);
+  assert.match(skill, /\[\.\.\/pi-review-gate-execution\/SKILL\.md\]\(\.\.\/pi-review-gate-execution\/SKILL\.md\)/);
+  assert.match(skill, /\[\.\.\/pi-review-gate-research\/SKILL\.md\]\(\.\.\/pi-review-gate-research\/SKILL\.md\)/);
   assert.match(skill, /before choosing or dispatching a delegate/);
   // Preserved policies: detached worktree ownership, supervision, recovery,
   // useful concurrency.
@@ -202,7 +207,7 @@ test("orchestrator skill teaches capability-based dispatch with role links and a
 });
 
 test("execution skill sends minute-scale commands to background shells and broadens evidence beyond changed files", async () => {
-  const skill = await readSkillFlat("execution");
+  const skill = await readSkillFlat("pi-review-gate-execution");
   // Background shells, not long foreground calls, for minute-scale work even
   // without stdin interaction; foreground is for genuinely quick commands.
   assert.match(skill, /minute-scale commands such as builds, test runs, and dependency installs even when no stdin interaction is needed/);
@@ -220,7 +225,7 @@ test("execution skill sends minute-scale commands to background shells and broad
 });
 
 test("research skill distinguishes content search, path discovery, and directory listing", async () => {
-  const skill = await readSkillFlat("research");
+  const skill = await readSkillFlat("pi-review-gate-research");
   assert.match(skill, /`grep` searches file \*\*contents\*\*/);
   assert.match(skill, /`find` discovers file \*\*paths\*\* by glob pattern/);
   assert.match(skill, /`ls` lists a \*\*directory's\*\* entries/);
@@ -236,13 +241,13 @@ test("startup cue skill paths match the launcher provisioning destinations", asy
   const cjsSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate-launcher.cjs"), "utf8");
   assert.match(shSource, /SKILLS_DIR="\$HOME\/\.agents\/skills"/);
   assert.match(cjsSource, /"\.agents", "skills", skill\.name/);
-  for (const [, file, skillName] of [
-    ["execute", "execution-system-prompt.md", "execution"],
-    ["orchestrate", "orchestrator-system-prompt.md", "orchestrator"],
-    ["plan-research", "planning-system-prompt.md", "research"],
-  ] as Array<[string, string, string]>) {
+  for (const [, file, role, skillName] of [
+    ["execute", "execution-system-prompt.md", "execution", "pi-review-gate-execution"],
+    ["orchestrate", "orchestrator-system-prompt.md", "orchestrator", "pi-review-gate-orchestrator"],
+    ["plan-research", "planning-system-prompt.md", "research", "pi-review-gate-research"],
+  ] as Array<[string, string, string, string]>) {
     const segment = await readRepoFileFlat(path.join("scripts", file));
-    const cue = `read the shipped ${skillName} skill (\`~/.agents/skills/${skillName}/SKILL.md\`)`;
+    const cue = `read the shipped ${role} skill (\`~/.agents/skills/${skillName}/SKILL.md\`)`;
     assert.ok(
       segment.includes(cue),
       `${file} cue path must match the launcher provisioning destination`,
@@ -252,9 +257,9 @@ test("startup cue skill paths match the launcher provisioning destinations", asy
 
 test("each operating-mode prompt segment opens with a startup cue naming its skill", async () => {
   const cases: Array<[mode: string, file: string, skill: string, cue: RegExp]> = [
-    ["execute", "execution-system-prompt.md", "execution", /read the shipped execution skill \(`~\/\.agents\/skills\/execution\/SKILL\.md`\)/],
-    ["orchestrate", "orchestrator-system-prompt.md", "orchestrator", /read the shipped orchestrator skill \(`~\/\.agents\/skills\/orchestrator\/SKILL\.md`\)/],
-    ["plan-research", "planning-system-prompt.md", "research", /read the shipped research skill \(`~\/\.agents\/skills\/research\/SKILL\.md`\)/],
+    ["execute", "execution-system-prompt.md", "pi-review-gate-execution", /read the shipped execution skill \(`~\/\.agents\/skills\/pi-review-gate-execution\/SKILL\.md`\)/],
+    ["orchestrate", "orchestrator-system-prompt.md", "pi-review-gate-orchestrator", /read the shipped orchestrator skill \(`~\/\.agents\/skills\/pi-review-gate-orchestrator\/SKILL\.md`\)/],
+    ["plan-research", "planning-system-prompt.md", "pi-review-gate-research", /read the shipped research skill \(`~\/\.agents\/skills\/pi-review-gate-research\/SKILL\.md`\)/],
   ];
   for (const [, file, skillName, cue] of cases) {
     const segment = await readRepoFileFlat(path.join("scripts", file));
@@ -306,6 +311,91 @@ test("the two launcher skill manifests agree on every shipped skill file in orde
     assert.ok(exists, `manifest source must exist: ${source}`);
   }
 });
+
+test("the pre-#151 migration has one canonical shipped implementation (#154)", async () => {
+  // Issue 154: the migration manifest and matching algorithm must exist in
+  // exactly one shipped implementation (SKILL_MIGRATION_PLAN in
+  // scripts/pi-review-gate-launcher.cjs). Duplicating canonical migration
+  // identities or logic in the POSIX launcher would risk drift between
+  // platforms, so pi-review-gate.sh must only invoke the helper's dedicated
+  // --migrate-prior-skill-files mode.
+  const shSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate.sh"), "utf8");
+  const cjsSource = await readFile(path.join(repoRoot, "scripts", "pi-review-gate-launcher.cjs"), "utf8");
+  // Strip comment lines: the shell may document where the canonical
+  // implementation lives without carrying any of its data or code.
+  const shCode = shSource.split("\n").filter((line) => !/^\s*#/.test(line)).join("\n");
+
+  assert.doesNotMatch(shCode, /SKILL_MIGRATION_PLAN/, "pi-review-gate.sh must not carry a second migration manifest");
+  assert.doesNotMatch(shCode, /migrate_generic_skill_file/, "pi-review-gate.sh must not carry a second migration algorithm");
+  assert.match(
+    shCode,
+    /node "\$REVIEW_GATE_ROOT\/scripts\/pi-review-gate-launcher\.cjs" --migrate-prior-skill-files/,
+    "pi-review-gate.sh must delegate the migration to the canonical helper implementation",
+  );
+  assert.match(cjsSource, /--migrate-prior-skill-files/, "the helper must expose the --migrate-prior-skill-files mode");
+
+  const cjsPlan = cjsSource.match(/const SKILL_MIGRATION_PLAN = \[([\s\S]*?)\n\];/);
+  assert.ok(cjsPlan, "pi-review-gate-launcher.cjs must declare SKILL_MIGRATION_PLAN");
+  const entryBlocks = cjsPlan[1].split("  {\n").slice(1);
+  const cjsEntries = entryBlocks.map((block) => ({
+    installed: block.match(/installed: \[([^\]]+)\]/)![1]
+      .split(",").map((part) => part.trim().replace(/^"|"$/g, "")).join("/"),
+    source: block.match(/source: \[([^\]]+)\]/)![1]
+      .split(",").map((part) => part.trim().replace(/^"|"$/g, "")).join("/"),
+    // Rename entries are lines holding exactly one bracket pair, optionally
+    // prefixed by `renames:`; installed/source/pairedWith arrays carry a
+    // different key and never match.
+    renames: [...block.matchAll(/^\s*(?:renames: )?\[+\s*"([^"\]]+)", "([^"\]]+)"\]+,?$/gm)].map((m) => [m[1], m[2]] as [string, string]),
+    historicalSha256: block.match(/historicalSha256: "([0-9a-f]{64})"/)?.[1] ?? null,
+    pairedWith: /pairedWith:/.test(block),
+  }));
+
+  assert.ok(cjsEntries.length > 0, "the canonical migration manifest must list prior files");
+  // Each migration entry must point at an existing packaged copy, and its
+  // recorded namespacing edits must be exactly the namespacing diff:
+  // reversing them on the packaged copy must reconstruct the prior generic
+  // copy (here: verified via the frontmatter skill name, which must equal
+  // the prior generic directory name).
+  for (const entry of cjsEntries) {
+    const packaged = await readFile(path.join(repoRoot, entry.source), "utf8");
+    const genericName = entry.installed.slice(0, entry.installed.indexOf("/"));
+    let reconstructed = packaged;
+    for (const [from, to] of [...entry.renames].reverse()) reconstructed = reconstructed.split(to).join(from);
+    // The recorded historical digest anchors each entry to the true pre-#151
+    // bytes: if a later release edits a shipped skill file without
+    // re-deriving the edits and digest together, the reconstruction stops
+    // matching and this assertion fails instead of the entry silently
+    // degrading to never-removing at user launch time.
+    assert.ok(entry.historicalSha256, `migration entry must record a historical digest: ${entry.installed}`);
+    assert.equal(
+      createHash("sha256").update(Buffer.from(reconstructed, "utf8")).digest("hex"),
+      entry.historicalSha256,
+      `reverse namespacing edits must reproduce the recorded historical digest for ${entry.installed}`,
+    );
+    if (entry.installed.endsWith("SKILL.md")) {
+      assert.match(
+        reconstructed,
+        new RegExp(`^name: ${escapeRegExp(genericName)}$`, "m"),
+        `reverse namespacing edits must reconstruct the prior generic skill name for ${entry.installed}`,
+      );
+    }
+    const exists = await stat(path.join(repoRoot, entry.source)).then(() => true, () => false);
+    assert.ok(exists, `migration source must exist: ${entry.source}`);
+  }
+  // The orchestrator recovery.md must be paired with the sibling generic
+  // SKILL.md so a customized (preserved) generic orchestrator skill never
+  // loses the recovery runbook its links still point at, and the pairing
+  // must be evaluated after the paired file in the manifest order.
+  const recoveryIndex = cjsEntries.findIndex((entry) => entry.installed === "orchestrator/references/recovery.md");
+  assert.ok(recoveryIndex > -1, "the manifest must retain the orchestrator recovery.md entry");
+  assert.equal(cjsEntries[recoveryIndex].pairedWith, true, "the orchestrator recovery.md removal must be gated on the paired SKILL.md");
+  const pairedIndex = cjsEntries.findIndex((entry) => entry.installed === "orchestrator/SKILL.md");
+  assert.ok(pairedIndex > -1 && pairedIndex < recoveryIndex, "the paired SKILL.md entry must be processed before the recovery.md entry");
+});
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 test("every cross-skill reference in the shipped skills resolves to an existing file", async () => {
   for (const name of SHIPPED_SKILLS) {

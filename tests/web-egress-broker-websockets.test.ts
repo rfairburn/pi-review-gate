@@ -594,6 +594,130 @@ test("unauthenticated upgrades are challenged with 407 even when the owner opted
 // Opted-in plain ws: authenticated upgrade, validation, bidirectional echo.
 // ---------------------------------------------------------------------------
 
+test("premature pipelined payload on an upgrade counts exactly one refusal without a session-fatal callback", async () => {
+  const origin = await echoOrigin();
+  const { auth, credentials } = testAuth();
+  const failures: Array<{ reason: string; diagnostic: string }> = [];
+  const capacityRefusals: unknown[] = [];
+  const observer: EgressBrokerObserver = {
+    policyFailure: (reason, diagnostic) => { failures.push({ reason, diagnostic }); },
+    capacityRefusal: (context) => { capacityRefusals.push(context); },
+  };
+  const harness = await startBroker(testResolver({ "ws.test": [publicAnswer] }), {
+    auth,
+    observer,
+    websockets: { enabled: true },
+  });
+  const prematureFrame = encodeFrame(0x1, Buffer.from("PREMATURE_PAYLOAD", "utf8"));
+  try {
+    // Authenticated upgrade head with an RFC 6455 client frame pipelined in
+    // the SAME write: the broker must destroy this one socket, admit no
+    // upstream, count exactly ONE refusal, and stay fully alive for the
+    // healthy session — without ever invoking observer.policyFailure
+    // (interactive browsers treat that callback as session-fatal).
+    const outcome = await withTimeout(new Promise<{ responded: boolean; head: string }>((resolveOutcome) => {
+      const socket = net.connect({ host: "127.0.0.1", port: harness.port }, () => {
+        const head =
+          `GET http://ws.test:${origin.port}/echo HTTP/1.1\r\n`
+          + `Host: ws.test:${origin.port}\r\n`
+          + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+          + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+          + "Sec-WebSocket-Version: 13\r\n"
+          + `Proxy-Authorization: ${credentials}\r\n\r\n`;
+        socket.write(Buffer.concat([Buffer.from(head, "latin1"), prematureFrame]));
+      });
+      let received = Buffer.alloc(0);
+      socket.on("data", (chunk: Buffer) => { received = Buffer.concat([received, chunk]); });
+      socket.on("error", () => undefined);
+      socket.once("close", () => resolveOutcome({ responded: received.length > 0, head: received.toString("latin1") }));
+    }), 4_000, "premature-payload upgrade");
+    assert.equal(outcome.responded, false, "the broker must destroy the socket without relaying any 101 or response head");
+    assert.equal(harness.dials.length, 0, "no upstream may be admitted for a premature-payload upgrade");
+    assert.equal(origin.connections, 0, "the origin must receive zero connections");
+    const summary = harness.broker.summary();
+    assert.equal(summary.refusals, 1, "exactly one refusal is counted for the connection-local rejection");
+    assert.equal(summary.budgetAborts, 0, "the rejection is not a budget abort");
+    assert.ok(
+      summary.omissions.some((omission) => omission.includes("pipelined bytes before the upgrade completed")),
+      "the fixed sanitized diagnostic is retained",
+    );
+    assert.equal(failures.length, 0, "no observer.policyFailure may fire for a connection-local rejection");
+    assert.equal(capacityRefusals.length, 0);
+    // The healthy session is not torn down: the broker still listens, admits,
+    // and relays a genuine live WebSocket end to end.
+    const healthy = new TestWsClient(harness.port);
+    try {
+      const handshake = await healthy.handshake("ws.test", origin.port, credentials);
+      assert.equal(handshake.status, 101, "the broker keeps serving the healthy session after the local rejection");
+      healthy.send("still-healthy");
+      assert.equal((await healthy.receive()).payload.toString("utf8"), "still-healthy");
+      const entry = harness.broker.summary().ledger[0];
+      assert.equal(entry?.kind, "ws");
+      assert.equal(entry?.hostname, "ws.test");
+      assert.equal(harness.broker.summary().refusals, 1, "the healthy connection adds no refusal");
+      assert.equal(failures.length, 0, "the healthy session produces no fatal notification either");
+      healthy.destroy();
+      await healthy.closedWithin(2_000);
+    } finally {
+      healthy.destroy();
+    }
+  } finally {
+    await harness.stop();
+    await close(origin.server);
+  }
+
+  // Byte accounting is unchanged: the premature frame was counted against the
+  // AGGREGATE byte budget exactly as before the refusal counting existed.
+  const byteOrigin = await echoOrigin();
+  const byteFailures: string[] = [];
+  const byteHarness = await startBroker(testResolver({ "ws.test": [publicAnswer] }), {
+    auth,
+    budgets: { maxTotalBytes: prematureFrame.length },
+    observer: { policyFailure: (_reason, diagnostic) => { byteFailures.push(diagnostic); } },
+    websockets: { enabled: true },
+  });
+  const byteClient = new TestWsClient(byteHarness.port);
+  try {
+    const head =
+      `GET http://ws.test:${byteOrigin.port}/echo HTTP/1.1\r\n`
+      + `Host: ws.test:${byteOrigin.port}\r\n`
+      + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+      + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+      + "Sec-WebSocket-Version: 13\r\n"
+      + `Proxy-Authorization: ${credentials}\r\n\r\n`;
+    const socket = byteClient.socket;
+    await withTimeout(new Promise<void>((resolveWrite) => {
+      socket.on("error", () => undefined);
+      socket.once("close", () => resolveWrite());
+      socket.write(Buffer.concat([Buffer.from(head, "latin1"), prematureFrame]));
+      setTimeout(resolveWrite, 1_000).unref?.();
+    }), 2_000, "byte-accounting premature payload");
+    assert.ok(
+      byteHarness.broker.summary().omissions.some((omission) => omission.includes("pipelined bytes before the upgrade completed")),
+    );
+    // The pipelined frame consumed the whole aggregate budget, so the NEXT
+    // clean upgrade is refused by the byte budget — proof the premature bytes
+    // were counted. This genuine budget refusal legitimately notifies the
+    // observer (unlike the connection-local rejection above).
+    const next = new TestWsClient(byteHarness.port);
+    try {
+      assert.equal((await next.handshake("ws.test", byteOrigin.port, credentials)).status, 403);
+      assert.ok(byteHarness.broker.summary().omissions.some((omission) => omission.includes("aggregate byte budget")));
+      assert.equal(byteHarness.dials.length, 0, "neither the premature payload nor the budget refusal may dial");
+      assert.equal(byteOrigin.connections, 0);
+      assert.equal(byteHarness.broker.summary().refusals, 2, "one local rejection plus one budget refusal");
+      assert.equal(byteFailures.length, 1, "the genuine budget refusal still notifies the observer");
+      assert.ok(byteFailures[0]?.includes("aggregate byte budget"), "the observer diagnostic names the exhausted budget");
+    } finally {
+      next.destroy();
+    }
+  } finally {
+    byteClient.destroy();
+    await byteHarness.stop();
+    await close(byteOrigin.server);
+  }
+});
+
 test("opted-in plain ws upgrades handshake and echo bidirectionally through the broker", async () => {
   const origin = await echoOrigin();
   const { auth, credentials } = testAuth();

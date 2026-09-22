@@ -15,6 +15,14 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.70]
+
+### Fixed
+
+- Count WebSocket upgrades rejected for premature payload bytes as refusals.
+  Preserve connection-local rejection, byte accounting and sanitized diagnostics
+  without invoking the session-fatal policy callback.
+
 ## [0.1.0-dev.69]
 
 ### Fixed

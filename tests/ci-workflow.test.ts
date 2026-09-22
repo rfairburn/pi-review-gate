@@ -242,8 +242,21 @@ test("full-suite compiles the test bundle and runs the compiled suite without mu
 test("full-suite always provides the Pi agent-core runtime for the native outer-error regression", () => {
   const source = readWorkflow();
   const full = blockOf(source, "full-tests", 2);
-  assert.match(full, /@earendil-works\/pi-agent-core@\d+\.\d+\.\d+/,
-    "the runtime must be pinned to an exact published version");
+  assert.match(full, /cp scripts\/ci\/pi-agent-runtime\/package\.json scripts\/ci\/pi-agent-runtime\/package-lock\.json "\$RUNNER_TEMP\/pi-agent-runtime\/"/,
+    "the isolated runtime must install from the canonical locked manifest, not an ad-hoc package.json");
+  assert.match(full, /npm ci --no-audit --no-fund/,
+    "the runtime install must be a lockfile-exact ci; live range re-resolution breaks on upstream publish races");
+  const manifest = JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-agent-runtime", "package.json"), "utf8")) as {
+    dependencies?: Record<string, string>;
+  };
+  assert.match(manifest.dependencies?.["@earendil-works/pi-agent-core"] ?? "",
+    /^\d+\.\d+\.\d+$/, "the runtime must be pinned to an exact published version in the canonical manifest");
+  const lock = JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-agent-runtime", "package-lock.json"), "utf8")) as {
+    packages?: Record<string, { version?: string }>;
+  };
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-agent-core"]?.version,
+    manifest.dependencies?.["@earendil-works/pi-agent-core"],
+    "the lock must freeze the exact pinned runtime version, not a drifted one");
   assert.match(full, /PI_BROWSER_AGENT_RUNTIME=\$RUNNER_TEMP\/pi-agent-runtime\/node_modules\/@earendil-works\/pi-agent-core\/dist\/index\.js/,
     "the regression points at the installed agent-core entry, not a mock");
   assert.doesNotMatch(full, /continue-on-error/, "the runtime step must not be an optional skip");

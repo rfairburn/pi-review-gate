@@ -101,11 +101,15 @@ jobs:
         # extension sources (and needs Node >=22.19.0, so this job pins Node 24).
         # The test skips itself when PI_BROWSER_AGENT_RUNTIME is unset; this job
         # always sets it, so the regression genuinely runs in CI.
+        # Install the locked tree to avoid transitive range drift and registry
+        # metadata inconsistencies during upstream releases. When changing the
+        # pin, regenerate the lock in scripts/ci/pi-agent-runtime with
+        # `npm install --package-lock-only`.
         run: |
           mkdir -p "$RUNNER_TEMP/pi-agent-runtime"
+          cp scripts/ci/pi-agent-runtime/package.json scripts/ci/pi-agent-runtime/package-lock.json "$RUNNER_TEMP/pi-agent-runtime/"
           cd "$RUNNER_TEMP/pi-agent-runtime"
-          echo '{"private":true}' > package.json
-          npm install --no-audit --no-fund --no-save @earendil-works/pi-agent-core@0.87.0
+          npm ci --no-audit --no-fund
       - name: Export Pi runtime path
         run: echo "PI_BROWSER_AGENT_RUNTIME=$RUNNER_TEMP/pi-agent-runtime/node_modules/@earendil-works/pi-agent-core/dist/index.js" >> "$GITHUB_ENV"
       # PI_REVIEW_GATE_RUNTIME_ROLE must stay unset so activation tests observe

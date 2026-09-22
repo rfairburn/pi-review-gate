@@ -191,7 +191,7 @@ export interface EgressSummary {
   omissionsDropped: number;
   /** Connections destroyed at a budget (bytes or idle time). */
   budgetAborts: number;
-  /** Requests/CONNECTs refused before any dial. */
+  /** Requests/CONNECTs/upgrades refused before any dial. */
   refusals: number;
 }
 
@@ -1184,9 +1184,16 @@ export class EgressBroker {
         return;
       }
       // Bytes pipelined after the upgrade request head are protocol violations
-      // before the 101 completes; fail closed (they are counted first).
+      // before the 101 completes; fail closed (they are counted first). This
+      // is a connection-local rejection: exactly one refusal is counted (and
+      // surfaced through the summary) while the bounded omission diagnostic
+      // stays the notification channel — recordPolicyRefusal is deliberately
+      // NOT used, because its observer.policyFailure callback is session-fatal
+      // for the interactive browser and a single socket's premature payload
+      // must not tear down the healthy session.
       if (head.length > 0) {
         this.totalBytes += head.length;
+        this.refusals += 1;
         this.note("websocket upgrade refused: pipelined bytes before the upgrade completed.");
         socket.destroy();
         return;

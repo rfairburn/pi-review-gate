@@ -198,8 +198,8 @@ creates and validates the pinned `WebSearch` environment with `scripts/ensure-dd
 on macOS/Linux or the native Node helper on Windows (see
 [Prerequisites](#prerequisites)), then
 refreshes the shipped skills under
-`~/.agents/skills/` (orchestrator — including its recovery runbook — execution, and
-research), and then
+`~/.agents/skills/` (pi-review-gate-orchestrator — including its recovery runbook —
+pi-review-gate-execution, and pi-review-gate-research), and then
 executes the installed `pi` with the extension. On macOS/Linux the persistent launcher
 is a Bash script; on Windows the native entry point
 (`scripts\pi-review-gate.cmd`, or `pi-review-gate-cmd` from an npm installation) mirrors

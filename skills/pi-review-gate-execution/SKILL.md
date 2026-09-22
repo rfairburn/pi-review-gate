@@ -1,5 +1,5 @@
 ---
-name: execution
+name: pi-review-gate-execution
 description: Execute authorized implementation and runtime work directly or as a delegated worker — workspace edits, builds, targeted tests, long-running command handling, and process/PTY diagnosis. Read before substantive execution work, including before delegated execution begins.
 ---
 

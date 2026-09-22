@@ -12,7 +12,7 @@ the checkout, not shipped in the npm package).
 - `tests/` — Node test files compiled to `dist-test/`.
 - `scripts/` — launcher, web CLI wrapper, DDGS provisioning, Playwright provisioning,
   package smoke, docs validation, fake reviewer, and the operating-mode prompt segments.
-- `skills/orchestrator/`, `skills/execution/`, `skills/research/` — the shipped skills
+- `skills/pi-review-gate-orchestrator/`, `skills/pi-review-gate-execution/`, `skills/pi-review-gate-research/` — the shipped skills (issue 151 namespacing)
   refreshed by the launcher (orchestration with its recovery runbook, direct/delegated
   execution, and read-only research).
 - `examples/` — runnable JSON configs ([Getting started](getting-started.md#minimal-configuration)).
@@ -159,8 +159,8 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
   venv (creating or repairing it requires a `python3` interpreter on `PATH`; fails
   closed when the environment cannot be established).
 - Refreshes the discoverable shipped skills under
-  `~/.agents/skills/` — orchestrator (including its recovery runbook), execution, and
-  research — from the packaged
+  `~/.agents/skills/` — pi-review-gate-orchestrator (including its recovery runbook),
+  pi-review-gate-execution, and pi-review-gate-research — from the packaged
   sources, then executes the installed `pi` with the extension, forwarding all
   remaining arguments unchanged.
 

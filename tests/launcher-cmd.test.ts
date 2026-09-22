@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -398,11 +398,11 @@ test("launcher helper resolves, exports and forwards on a normal launch", async 
   assert.match(result.stdout, new RegExp(`pi-review-gate config: ${escapeRegExp(fixture.defaultConfigPath)}`));
   assert.match(result.stdout, new RegExp(`pi-review-gate extension: ${escapeRegExp(extensionPath)}`));
   assert.match(result.stdout,
-    new RegExp(`pi-review-gate orchestrator skill: ${escapeRegExp(join(fixture.home, ".agents", "skills", "orchestrator", "SKILL.md"))}`));
+    new RegExp(`pi-review-gate orchestrator skill: ${escapeRegExp(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md"))}`));
   assert.match(result.stdout,
-    new RegExp(`pi-review-gate execution skill: ${escapeRegExp(join(fixture.home, ".agents", "skills", "execution", "SKILL.md"))}`));
+    new RegExp(`pi-review-gate execution skill: ${escapeRegExp(join(fixture.home, ".agents", "skills", "pi-review-gate-execution", "SKILL.md"))}`));
   assert.match(result.stdout,
-    new RegExp(`pi-review-gate research skill: ${escapeRegExp(join(fixture.home, ".agents", "skills", "research", "SKILL.md"))}`));
+    new RegExp(`pi-review-gate research skill: ${escapeRegExp(join(fixture.home, ".agents", "skills", "pi-review-gate-research", "SKILL.md"))}`));
   assert.doesNotMatch(result.stderr, /created default zero-model config/);
   assert.doesNotMatch(result.stderr, /creating DDGS/,
     "a valid cached venv must not be provisioned again");
@@ -572,18 +572,18 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
   try {
     const stage = join(scratch, "package dir with spaces");
     await mkdir(join(stage, "scripts"), { recursive: true });
-    await mkdir(join(stage, "skills", "orchestrator", "references"), { recursive: true });
-    await mkdir(join(stage, "skills", "execution"), { recursive: true });
-    await mkdir(join(stage, "skills", "research"), { recursive: true });
+    await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
+    await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
+    await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
     await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
     if (isWindows) await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
-    await copyFile(resolve("skills/orchestrator/SKILL.md"), join(stage, "skills/orchestrator/SKILL.md"));
+    await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
     await copyFile(
-      resolve("skills/orchestrator/references/recovery.md"),
-      join(stage, "skills/orchestrator/references/recovery.md"),
+      resolve("skills/pi-review-gate-orchestrator/references/recovery.md"),
+      join(stage, "skills/pi-review-gate-orchestrator/references/recovery.md"),
     );
-    await copyFile(resolve("skills/execution/SKILL.md"), join(stage, "skills/execution/SKILL.md"));
-    await copyFile(resolve("skills/research/SKILL.md"), join(stage, "skills/research/SKILL.md"));
+    await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
+    await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
 
     const missingFixture = await makeFixture("pi-review-cmd-packmiss-");
     // The staged tree has no src and no dist: packaged failure, exit 2.
@@ -617,7 +617,7 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
 
     // Any missing manifest source must fail closed before publication and
     // before pi is launched, never with partially provisioned skills.
-    await rm(join(stage, "skills", "research", "SKILL.md"));
+    await rm(join(stage, "skills", "pi-review-gate-research", "SKILL.md"));
     const missingSkillFixture = await makeFixture("pi-review-cmd-package-skillmiss-");
     const missingSkill = await runStagedHelperExpectingFailure(
       join(stage, "scripts", "pi-review-gate-launcher.cjs"), ["--model", "example"], fixtureEnv(missingSkillFixture), scratch,
@@ -626,7 +626,7 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
     assert.match(missingSkill.stderr, /packaged skill file is missing: .*research.SKILL\.md/);
     assert.equal(await launchStarted(missingSkillFixture), false);
     assert.equal(
-      await pathExists(join(missingSkillFixture.home, ".agents", "skills", "orchestrator", "SKILL.md")),
+      await pathExists(join(missingSkillFixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md")),
       false,
       "the source check must precede publication: no skill may be provisioned",
     );
@@ -713,7 +713,7 @@ test("launcher helper refreshes a stale installed orchestrator skill", async () 
   const fixture = await makeFixture("pi-review-cmd-skill-");
   await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
-  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
   const installedSkill = join(skillDir, "SKILL.md");
   const installedRecovery = join(skillDir, "references", "recovery.md");
   await mkdir(join(skillDir, "references"), { recursive: true });
@@ -724,11 +724,11 @@ test("launcher helper refreshes a stale installed orchestrator skill", async () 
 
   assert.equal(
     await readFile(installedSkill, "utf8"),
-    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
   );
   assert.equal(
     await readFile(installedRecovery, "utf8"),
-    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
   );
   if (!isWindows) {
     assert.equal(await posixMode(installedSkill), 0o644, "published skill must keep the contracted 0644 mode");
@@ -737,7 +737,7 @@ test("launcher helper refreshes a stale installed orchestrator skill", async () 
   await assertNoTempLitter(skillDir);
   assert.deepEqual(await readdir(join(skillDir, "references")), ["recovery.md"],
     "no temporary skill files may be left behind");
-  for (const name of ["execution", "research"]) {
+  for (const name of ["pi-review-gate-execution", "pi-review-gate-research"]) {
     const dir = join(fixture.home, ".agents", "skills", name);
     assert.equal(
       await readFile(join(dir, "SKILL.md"), "utf8"),
@@ -769,16 +769,190 @@ test("launcher helper preserves unrelated custom skills under ~/.agents/skills",
     customContent,
     "unrelated custom skills must be preserved untouched by provisioning",
   );
-  for (const name of ["orchestrator", "execution", "research"]) {
+  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research"]) {
     assert.equal(
       await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
       await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
       `the ${name} skill must still be provisioned alongside the custom skill`,
     );
   }
+  // Issue 151: a fresh launch installs the namespaced skills only — the
+  // generic pre-#151 locations are never created by provisioning.
+  for (const generic of ["orchestrator", "execution", "research"]) {
+    assert.equal(
+      await pathExists(join(fixture.home, ".agents", "skills", generic)),
+      false,
+      `a fresh launch must not create the generic ${generic} skill location`,
+    );
+  }
   assert.match(result.stdout, /pi-review-gate orchestrator skill: /);
   assert.match(result.stdout, /pi-review-gate execution skill: /);
   assert.match(result.stdout, /pi-review-gate research skill: /);
+});
+
+test("launcher helper migrates proven pre-#151 generic skill copies and preserves modified or unrelated files (#151)", async () => {
+  const fixture = await makeFixture("pi-review-cmd-skill-migration-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  // The recorded namespacing edits (exactly the canonical SKILL_MIGRATION_PLAN
+  // in scripts/pi-review-gate-launcher.cjs): reversing them on the shipped
+  // copies reconstructs the prior generic package-owned content.
+  const orchestratorRenames: Array<[string, string]> = [
+    ["name: pi-review-gate-orchestrator", "name: orchestrator"],
+    ["../pi-review-gate-execution/SKILL.md", "../execution/SKILL.md"],
+    ["../pi-review-gate-research/SKILL.md", "../research/SKILL.md"],
+  ];
+  const priorContent = async (shipped: string, renames: Array<[string, string]>): Promise<string> => {
+    let content = await readFile(resolve(shipped), "utf8");
+    for (const [to, from] of renames) content = content.split(to).join(from);
+    return content;
+  };
+
+  const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
+  const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
+  const priorExecution = join(skillsDir, "execution", "SKILL.md");
+  const modifiedResearch = join(skillsDir, "research", "SKILL.md");
+  const unrelatedFile = join(skillsDir, "execution", "user-notes.md");
+  await Promise.all([
+    mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true }),
+    mkdir(join(skillsDir, "execution"), { recursive: true }),
+    mkdir(join(skillsDir, "research"), { recursive: true }),
+  ]);
+  const researchContent = (await priorContent("skills/pi-review-gate-research/SKILL.md", [
+    ["name: pi-review-gate-research", "name: research"],
+  ])) + "\nuser customized this copy\n";
+  await Promise.all([
+    writeFile(priorOrchestrator, await priorContent("skills/pi-review-gate-orchestrator/SKILL.md", orchestratorRenames), "utf8"),
+    writeFile(priorRecovery, await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"), "utf8"),
+    writeFile(priorExecution, await priorContent("skills/pi-review-gate-execution/SKILL.md", [["name: pi-review-gate-execution", "name: execution"]]), "utf8"),
+    writeFile(modifiedResearch, researchContent, "utf8"),
+    writeFile(unrelatedFile, "user notes\n", "utf8"),
+  ]);
+
+  await runHelper([], fixtureEnv(fixture));
+
+  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research"]) {
+    assert.equal(
+      await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
+      await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
+      `the ${name} skill must be provisioned during the migration launch`,
+    );
+  }
+  for (const removed of [priorOrchestrator, priorRecovery, priorExecution]) {
+    assert.equal(await pathExists(removed), false, `the proven prior copy must be migrated away: ${removed}`);
+  }
+  assert.equal(await readFile(modifiedResearch, "utf8"), researchContent, "a modified generic copy must be preserved");
+  assert.equal(await readFile(unrelatedFile, "utf8"), "user notes\n", "unrelated files under old skill directories must be preserved");
+  assert.equal(await pathExists(join(skillsDir, "orchestrator")), true, "old directories are never removed");
+});
+
+test("launcher helper preserves customized generic copies that normalize to shipped content and keeps recovery.md for a customized orchestrator (#154)", async () => {
+  const fixture = await makeFixture("pi-review-cmd-skill-ownership-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  // Regression cases for the ownership proof (issue 154): content that a
+  // transform-before-compare proof would wrongly classify as unmodified.
+  const fullyRenamedExecution = join(skillsDir, "execution", "SKILL.md");
+  const partiallyRenamedOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
+  const genericRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
+  await Promise.all([
+    mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true }),
+    mkdir(join(skillsDir, "execution"), { recursive: true }),
+  ]);
+  // Fully renamed: the user placed the current namespaced execution skill
+  // content at the generic path themselves (normalizes under the old rename
+  // transform, but is not the historical generic copy).
+  const executionCopy = await readFile(resolve("skills/pi-review-gate-execution/SKILL.md"), "utf8");
+  // Partially renamed and customized: namespaced name and one namespaced
+  // link, but the other link and an added note are user customization.
+  const orchestratorCustom = (await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"))
+    .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
+    .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
+    + "\nuser customized this copy\n";
+  // The packaged recovery.md is byte-identical to the historical generic
+  // copy, but it supports the customized generic orchestrator SKILL.md
+  // above: the pairing gate must preserve it.
+  const recoveryCopy = await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8");
+  await Promise.all([
+    writeFile(fullyRenamedExecution, executionCopy, "utf8"),
+    writeFile(partiallyRenamedOrchestrator, orchestratorCustom, "utf8"),
+    writeFile(genericRecovery, recoveryCopy, "utf8"),
+  ]);
+
+  const result = await runHelper([], fixtureEnv(fixture));
+
+  assert.equal(await readFile(fullyRenamedExecution, "utf8"), executionCopy, "a fully renamed generic copy must be preserved");
+  assert.equal(await readFile(partiallyRenamedOrchestrator, "utf8"), orchestratorCustom, "a partially renamed customized generic copy must be preserved");
+  assert.equal(await readFile(genericRecovery, "utf8"), recoveryCopy, "recovery.md must be preserved while the customized generic orchestrator SKILL.md remains");
+  assert.doesNotMatch(result.stderr, /removed the unmodified prior copy/);
+});
+
+test("launcher helper removes recovery.md together with a proven generic orchestrator SKILL.md (#154)", async () => {
+  const fixture = await makeFixture("pi-review-cmd-skill-paired-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  // Historical generic orchestrator pair: when the SKILL.md is proven
+  // unmodified and removed, the proven recovery.md goes with it.
+  let orchestratorHistorical = await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8");
+  orchestratorHistorical = orchestratorHistorical
+    .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
+    .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
+    .split("../pi-review-gate-research/SKILL.md").join("../research/SKILL.md");
+  const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
+  const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
+  await mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true });
+  await Promise.all([
+    writeFile(priorOrchestrator, orchestratorHistorical, "utf8"),
+    writeFile(priorRecovery, await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"), "utf8"),
+  ]);
+
+  const result = await runHelper([], fixtureEnv(fixture));
+
+  assert.equal(await pathExists(priorOrchestrator), false, "the proven generic orchestrator SKILL.md must be migrated away");
+  assert.equal(await pathExists(priorRecovery), false, "the proven generic recovery.md must be removed with its paired SKILL.md");
+  assert.match(result.stderr, /removed the unmodified prior copy/);
+});
+
+test("launcher helper never deletes through a symlinked legacy skill path (#151)", async () => {
+  const fixture = await makeFixture("pi-review-cmd-skill-alias-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  // User alias: the legacy orchestrator directory points at the namespaced
+  // one (a natural way to keep the old discoverable name working). The
+  // publication then writes the namespaced files the alias resolves to.
+  await mkdir(skillsDir, { recursive: true });
+  const namespacedDir = join(skillsDir, "pi-review-gate-orchestrator");
+  // A Windows junction target must be a directory; create it first so this
+  // test does not depend on junction creation with a dangling target.
+  await mkdir(namespacedDir, { recursive: true });
+  await symlink(namespacedDir, join(skillsDir, "orchestrator"), isWindows ? "junction" : "dir");
+
+  const result = await runHelper([], fixtureEnv(fixture));
+
+  // The freshly published namespaced files must survive the migration: no
+  // deletion may land on them through the alias.
+  assert.equal(
+    await readFile(join(skillsDir, "pi-review-gate-orchestrator", "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
+    "the namespaced skill must not be deleted through the aliased legacy path",
+  );
+  assert.equal(
+    await readFile(join(skillsDir, "pi-review-gate-orchestrator", "references", "recovery.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
+    "the namespaced recovery runbook must not be deleted through the aliased legacy path",
+  );
+  // The alias itself is user-owned indirection: preserved untouched.
+  assert.equal((await lstat(join(skillsDir, "orchestrator"))).isSymbolicLink(), true, "the user's alias symlink must be preserved");
+  // No migration may claim a removal in this state.
+  assert.doesNotMatch(result.stderr, /removed the unmodified prior copy/);
 });
 
 test("launcher helper fails closed when a directory appears at a skill path before publication", async () => {
@@ -788,7 +962,7 @@ test("launcher helper fails closed when a directory appears at a skill path befo
   const fixture = await makeFixture("pi-review-cmd-skill-dir-");
   await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
-  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
   await mkdir(join(skillDir, "SKILL.md"), { recursive: true });
 
   const result = await runHelperExpectingFailure([], fixtureEnv(fixture));
@@ -968,15 +1142,15 @@ test("concurrent first launches never clobber or expose partial JSON", async () 
   const generated = JSON.parse(await readFile(fixture.defaultConfigPath, "utf8")) as unknown;
   assert.deepEqual(generated, zeroModelDefaultConfig, "the surviving config must be the complete default");
   await assertNoTempLitter(fixture.agentDir);
-  const skillDir = join(fixture.home, ".agents", "skills", "orchestrator");
+  const skillDir = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator");
   assert.equal(
     await readFile(join(skillDir, "SKILL.md"), "utf8"),
-    await readFile(resolve("skills/orchestrator/SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
     "the surviving skill must be complete and current",
   );
   assert.equal(
     await readFile(join(skillDir, "references", "recovery.md"), "utf8"),
-    await readFile(resolve("skills/orchestrator/references/recovery.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
   );
   await assertNoTempLitter(skillDir);
 });
@@ -1614,18 +1788,18 @@ if (isWindows) {
     try {
       const stage = join(scratch, "package dir with spaces");
       await mkdir(join(stage, "scripts"), { recursive: true });
-      await mkdir(join(stage, "skills", "orchestrator", "references"), { recursive: true });
-      await mkdir(join(stage, "skills", "execution"), { recursive: true });
-      await mkdir(join(stage, "skills", "research"), { recursive: true });
+      await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
+      await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
+      await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
       await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
       await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
-      await copyFile(resolve("skills/orchestrator/SKILL.md"), join(stage, "skills/orchestrator/SKILL.md"));
+      await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
       await copyFile(
-        resolve("skills/orchestrator/references/recovery.md"),
-        join(stage, "skills/orchestrator/references/recovery.md"),
+        resolve("skills/pi-review-gate-orchestrator/references/recovery.md"),
+        join(stage, "skills/pi-review-gate-orchestrator/references/recovery.md"),
       );
-      await copyFile(resolve("skills/execution/SKILL.md"), join(stage, "skills/execution/SKILL.md"));
-      await copyFile(resolve("skills/research/SKILL.md"), join(stage, "skills/research/SKILL.md"));
+      await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
+      await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
 
       const missingFixture = await makeFixture("pi-review-cmd-native-packmiss-");
       const missing = runCmd(
@@ -1707,18 +1881,18 @@ if (isWindows) {
     try {
       const stage = join(scratch, "package dir with spaces");
       await mkdir(join(stage, "scripts"), { recursive: true });
-      await mkdir(join(stage, "skills", "orchestrator", "references"), { recursive: true });
-      await mkdir(join(stage, "skills", "execution"), { recursive: true });
-      await mkdir(join(stage, "skills", "research"), { recursive: true });
+      await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
+      await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
+      await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
       await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
       await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
-      await copyFile(resolve("skills/orchestrator/SKILL.md"), join(stage, "skills/orchestrator/SKILL.md"));
+      await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
       await copyFile(
-        resolve("skills/orchestrator/references/recovery.md"),
-        join(stage, "skills/orchestrator/references/recovery.md"),
+        resolve("skills/pi-review-gate-orchestrator/references/recovery.md"),
+        join(stage, "skills/pi-review-gate-orchestrator/references/recovery.md"),
       );
-      await copyFile(resolve("skills/execution/SKILL.md"), join(stage, "skills/execution/SKILL.md"));
-      await copyFile(resolve("skills/research/SKILL.md"), join(stage, "skills/research/SKILL.md"));
+      await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
+      await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
       await mkdir(join(stage, "dist", "src"), { recursive: true });
       await writeFile(join(stage, "dist", "src", "index.js"), "module.exports = { activate() {} };\n", "utf8");
 

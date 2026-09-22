@@ -190,10 +190,10 @@ Worker routes and reviewers are independent:
 The orchestrator role favors beneficial parallelism and bounded, coherent subtasks
 without making worker utilization a goal or assuming which model will be assigned to
 a task. The shipped skills carry the role detail: the orchestrator skill
-(`skills/orchestrator/SKILL.md`) holds the full orchestration policy, the execution
-skill (`skills/execution/SKILL.md`) explains the primary-execution/delegated-executor
+(`skills/pi-review-gate-orchestrator/SKILL.md`) holds the full orchestration policy, the execution
+skill (`skills/pi-review-gate-execution/SKILL.md`) explains the primary-execution/delegated-executor
 boundary and the worker workspace contract, and the research skill
-(`skills/research/SKILL.md`) explains the enforced read-only boundary; this page
+(`skills/pi-review-gate-research/SKILL.md`) explains the enforced read-only boundary; this page
 summarizes the decision points that apply to every execution
 or research group.
 
@@ -303,7 +303,7 @@ captured content that tree lacks, while conflicting local edits make the checkou
 rather than discarding them (same-commit branch creation changes only HEAD attachment);
 checkpoint validation fails closed on such a worktree. Recovery steps for an already
 damaged worktree live in the shipped orchestrator skill's recovery runbook
-(`skills/orchestrator/references/recovery.md`).
+(`skills/pi-review-gate-orchestrator/references/recovery.md`).
 
 ## Conflicts and gates
 

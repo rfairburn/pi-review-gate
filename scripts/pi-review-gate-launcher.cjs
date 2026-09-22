@@ -38,15 +38,19 @@
  *   Scripts\python.exe and a python3 -> python interpreter probe, then
  *   exports PI_REVIEW_GATE_DDGS_PYTHON for the extension.
  * - Refreshes the discoverable shipped skills under
- *   ~/.agents/skills/ (orchestrator with its recovery runbook, execution, and
- *   research) from the packaged sources, staged to temporary files and
+ *   ~/.agents/skills/ (pi-review-gate-orchestrator with its recovery runbook,
+ *   pi-review-gate-execution, and pi-review-gate-research; namespaced by
+ *   issue 151) from the packaged sources, staged to temporary files and
  *   published with atomic renames so concurrent launches replace whole files
  *   only. On
  *   Windows the rename-replace can transiently fail with EPERM/EACCES/EBUSY
  *   while an external holder (an antivirus or indexing filter scanning
  *   freshly closed files) keeps the staged file or destination open, so the
  *   rename alone is retried with a short bounded backoff; every other error
- *   and every unsafe path still fails closed.
+ *   and every unsafe path still fails closed. After publication, prior
+ *   generic install copies (pre-#151 orchestrator/execution/research) are
+ *   removed only when proven to be unmodified package-owned files; anything
+ *   else there is preserved untouched.
  * - Prints the same launch diagnostics and forwards all remaining arguments
  *   to `pi --extension <dist/src/index.js>`.
  *
@@ -655,15 +659,198 @@ function findPythonInterpreter() {
  */
 const SKILL_PUBLISH_PLAN = [
   {
-    name: "orchestrator",
+    name: "pi-review-gate-orchestrator",
+    label: "orchestrator",
     files: [
-      { source: ["skills", "orchestrator", "SKILL.md"], destination: ["SKILL.md"] },
-      { source: ["skills", "orchestrator", "references", "recovery.md"], destination: ["references", "recovery.md"] },
+      { source: ["skills", "pi-review-gate-orchestrator", "SKILL.md"], destination: ["SKILL.md"] },
+      { source: ["skills", "pi-review-gate-orchestrator", "references", "recovery.md"], destination: ["references", "recovery.md"] },
     ],
   },
-  { name: "execution", files: [{ source: ["skills", "execution", "SKILL.md"], destination: ["SKILL.md"] }] },
-  { name: "research", files: [{ source: ["skills", "research", "SKILL.md"], destination: ["SKILL.md"] }] },
+  { name: "pi-review-gate-execution", label: "execution", files: [{ source: ["skills", "pi-review-gate-execution", "SKILL.md"], destination: ["SKILL.md"] }] },
+  { name: "pi-review-gate-research", label: "research", files: [{ source: ["skills", "pi-review-gate-research", "SKILL.md"], destination: ["SKILL.md"] }] },
 ];
+
+/**
+ * One-time migration manifest for the pre-#151 generic install locations
+ * (issue 151). Each entry names the
+ * prior generic installed file (relative to ~/.agents/skills), the packaged
+ * copy that replaced it, and the recorded namespacing edits ("old -> new")
+ * that turned the prior generic copy into the packaged copy.
+ *
+ * Ownership proof: the installed file is compared byte for byte against the
+ * EXPECTED HISTORICAL BYTES, reconstructed by applying the recorded edits in
+ * reverse to the packaged copy. The installed content is never normalized or
+ * transformed: normalizing the installed copy before comparing would be
+ * non-injective and could classify customized content (for example a file
+ * that already carries the namespaced name, or a partially namespaced
+ * orchestrator) as unmodified. Exact identity against the reconstructed
+ * historical bytes positively identifies an unmodified package-owned copy
+ * from before the namespacing and nothing else; a wrong reconstruction can
+ * only ever cause false negatives (preservation), never a wrongful removal.
+ * A modified, ambiguous, or user-owned file — or a directory, dangling
+ * symlink, or anything unreadable — never matches and is preserved untouched,
+ * as is every unrelated file under the old directories: the generic name or
+ * path alone is never treated as ownership. Only whole files from this
+ * manifest are ever removed; directories are never touched.
+ *
+ * `pairedWith` (optional) names another manifest entry whose proven removal
+ * is a precondition: the orchestrator recovery.md is removed only when the
+ * sibling generic orchestrator SKILL.md was proven unmodified and actually
+ * removed in the same run, so a customized (preserved) generic SKILL.md never
+ * loses the recovery runbook its links still point at.
+ *
+ * `historicalSha256` is the digest of the true pre-#151 historical bytes and
+ * anchors the entry to an immutable identity rather than to derivations from
+ * the mutable packaged text: a removal happens only when the reconstruction
+ * hashes to the recorded digest. If a later release edits a shipped skill
+ * file, the reconstruction stops matching the digest and the entry degrades
+ * to preservation (never a wrongful removal) — re-derive the edits and the
+ * digest together, or drop the entry, when shipped skill text changes. The
+ * shipped-skills test enforces that coupling so the drift cannot pass
+ * silently. This manifest is the single canonical migration identity set;
+ * scripts/pi-review-gate.sh invokes it through the --migrate-prior-skill-files
+ * mode below (passing the home directory it published skills under) instead
+ * of carrying a second copy of the data or the algorithm.
+ */
+const SKILL_MIGRATION_PLAN = [
+  {
+    installed: ["orchestrator", "SKILL.md"],
+    source: ["skills", "pi-review-gate-orchestrator", "SKILL.md"],
+    historicalSha256: "4dadaf85c56070a4e7026d90b8ebb786968435f0d412c312eff2ef5b1898934f",
+    renames: [
+      ["name: orchestrator", "name: pi-review-gate-orchestrator"],
+      ["../execution/SKILL.md", "../pi-review-gate-execution/SKILL.md"],
+      ["../research/SKILL.md", "../pi-review-gate-research/SKILL.md"],
+    ],
+  },
+  {
+    installed: ["orchestrator", "references", "recovery.md"],
+    source: ["skills", "pi-review-gate-orchestrator", "references", "recovery.md"],
+    historicalSha256: "59ffd05775dcdbdce75d329aeee53b5d792c7c8153000ca9058c4ea19bff7400",
+    renames: [],
+    pairedWith: ["orchestrator", "SKILL.md"],
+  },
+  {
+    installed: ["execution", "SKILL.md"],
+    source: ["skills", "pi-review-gate-execution", "SKILL.md"],
+    historicalSha256: "d01c322f83c3b246d910aaa57f84ca8e5700a7e9f4dc8c8009491d304436b298",
+    renames: [["name: execution", "name: pi-review-gate-execution"]],
+  },
+  {
+    installed: ["research", "SKILL.md"],
+    source: ["skills", "pi-review-gate-research", "SKILL.md"],
+    historicalSha256: "b50bb6eaa013ba36952d5d6663cb7b278c86d18daa6117b7c0c0cb9f61eeb4d8",
+    renames: [["name: research", "name: pi-review-gate-research"]],
+  },
+];
+
+/**
+ * Delete proven unmodified package-owned copies at the prior generic
+ * locations. The installed content is never transformed: it is compared byte
+ * for byte against the expected historical bytes (the packaged replacement
+ * with the recorded namespacing edits reversed), and only an exact match — a
+ * positively identified pre-namespacing package-owned copy — is removed.
+ * Anything else — modified or user-owned content, a directory, a dangling
+ * symlink, anything unreadable — is left in place. Entries with `pairedWith`
+ * are removed only when the paired entry was proven and actually removed
+ * earlier in this same pass, so a preserved (customized) generic orchestrator
+ * SKILL.md keeps its recovery.md. Best effort and fail-safe: any read,
+ * comparison, or removal error preserves the file, because deleting user
+ * content is never the safe direction.
+ */
+function migrateGenericSkillFiles(homeDir, platform = process.platform) {
+  const provenRemovals = new Set();
+  const skillsRoot = joinForPlatform(platform, homeDir, ".agents", "skills");
+  const dirnameFor = platform === "win32" ? path.win32.dirname : path.posix.dirname;
+  for (const entry of SKILL_MIGRATION_PLAN) {
+    const installedPath = joinForPlatform(platform, homeDir, ".agents", "skills", ...entry.installed);
+    // Never delete through a symlink: a legacy path — or any directory below
+    // the skills root — that the user aliased to the namespaced location
+    // (for example ~/.agents/skills/orchestrator ->
+    // pi-review-gate-orchestrator) would make the unlink below resolve the
+    // alias and remove the freshly published namespaced file itself, and a
+    // symlinked legacy file is user-owned indirection that no content match
+    // makes ours. Walk every component between the installed path and the
+    // skills root (not just the direct parent, so a recovery.md entry
+    // reached through an aliased legacy directory is caught too) and
+    // preserve everything when any is a symlink or cannot be inspected
+    // (fail safe).
+    let probe = installedPath;
+    let aliased = false;
+    while (probe.length > skillsRoot.length) {
+      let stats;
+      try {
+        stats = fs.lstatSync(probe);
+      } catch {
+        aliased = true;
+        break;
+      }
+      if (stats.isSymbolicLink()) {
+        aliased = true;
+        break;
+      }
+      probe = dirnameFor(probe);
+    }
+    if (aliased) continue;
+    // A paired entry (the orchestrator recovery.md) is removed only when its
+    // paired file was proven unmodified and actually removed earlier in this
+    // same pass: a preserved generic orchestrator SKILL.md may still link to
+    // the generic recovery.md, and deleting that support file under a
+    // customized skill is never the safe direction.
+    if (entry.pairedWith) {
+      const pairedPath = joinForPlatform(platform, homeDir, ".agents", "skills", ...entry.pairedWith);
+      if (!provenRemovals.has(pairedPath)) continue;
+    }
+    const sourcePath = joinForPlatform(platform, path.resolve(__dirname, ".."), ...entry.source);
+    let installed;
+    try {
+      installed = fs.readFileSync(installedPath);
+    } catch {
+      continue; // missing, unreadable, or a directory: nothing proven to remove
+    }
+    let packaged;
+    try {
+      packaged = fs.readFileSync(sourcePath, "utf8");
+    } catch {
+      continue; // a broken package must never widen what may be deleted
+    }
+    // Reconstruct the expected historical bytes by applying the recorded
+    // namespacing edits in REVERSE to the packaged copy, then require exact
+    // byte identity with the installed file. The installed content itself is
+    // never transformed (a transform of the installed copy is non-injective
+    // and could classify customized content as unmodified); a mismatched
+    // reconstruction can only cause preservation, never a wrongful removal.
+    let historical = packaged;
+    for (const [from, to] of [...entry.renames].reverse()) {
+      historical = historical.split(to).join(from);
+    }
+    // The reconstruction must hash to the recorded historical digest before
+    // anything may be removed: the digest is an immutable identity anchor, so
+    // a reconstruction drifted by a later packaged edit or a manifest edit
+    // degrades this entry to preservation instead of ever matching content
+    // the release never shipped.
+    let historicalMatchesRecordedIdentity = false;
+    try {
+      historicalMatchesRecordedIdentity =
+        crypto.createHash("sha256").update(Buffer.from(historical, "utf8")).digest("hex") === entry.historicalSha256;
+    } catch {
+      historicalMatchesRecordedIdentity = false;
+    }
+    if (
+      historicalMatchesRecordedIdentity &&
+      installed.equals(Buffer.from(historical, "utf8"))
+    ) {
+      removeQuietly(installedPath);
+      // removeQuietly swallows unlink errors; the note must claim removal
+      // only when the prior copy is actually gone, and the pairing gate
+      // above must only trust removals that actually happened.
+      if (!fs.existsSync(installedPath)) {
+        provenRemovals.add(installedPath);
+        note(`pi-review-gate: removed the unmodified prior copy at ${installedPath} (the shipped skills are now provisioned under the pi-review-gate- namespace)\n`);
+      }
+    }
+  }
+}
 
 /**
  * Publish one shipped skill file atomically, mirroring
@@ -826,8 +1013,12 @@ function main(argv) {
         return 2;
       }
     }
-    out(`pi-review-gate ${skill.name} skill: ${joinForPlatform(resolution.platform, skillDir, "SKILL.md")}\n`);
+    out(`pi-review-gate ${skill.label} skill: ${joinForPlatform(resolution.platform, skillDir, "SKILL.md")}\n`);
   }
+
+  // Ownership-safe migration of the pre-#151 generic install locations
+  // (issue 151), only after every namespaced skill published successfully.
+  migrateGenericSkillFiles(resolution.homeDir);
 
   // The exported path is already the native Windows form (the helper runs on
   // native Windows); off Windows it is the platform's own form.
@@ -851,20 +1042,36 @@ function main(argv) {
 }
 
 if (require.main === module) {
-  // Direct helper invocation (the .cmd entry point forwards %* here
-  // unconditionally): management verbs are forwarded to pi untouched, with
-  // the inherited environment and no setup, mirroring the POSIX launcher's
-  // early passthrough — and, unlike a `call pi %*` batch dispatch, without
-  // any cmd re-parsing of carets or percent expansions.
   const argv = process.argv.slice(2);
-  process.exitCode = argv.length > 0 && MANAGEMENT_VERBS.has(argv[0])
-    ? launchPi(argv, null, process.env)
-    : main(argv) ?? 0;
+  if (argv[0] === "--migrate-prior-skill-files") {
+    // Dedicated migration-only invocation: scripts/pi-review-gate.sh runs
+    // this mode after publishing the namespaced skills so the pre-#151
+    // generic-location migration has exactly one canonical implementation
+    // (manifest and matching algorithm) shared by both launchers. The POSIX
+    // launcher passes the home directory it published skills under (its own
+    // $HOME, which under MSYS may legitimately differ from Node's
+    // os.homedir()/USERPROFILE); without an argument the native Windows
+    // helper semantics apply (os.homedir()). The migration is best effort
+    // and fail-safe by contract, so the exit status is always 0; nothing
+    // here may abort a launch that already published.
+    migrateGenericSkillFiles(argv[1] || os.homedir());
+    process.exitCode = 0;
+  } else if (argv.length > 0 && MANAGEMENT_VERBS.has(argv[0])) {
+    // Direct helper invocation (the .cmd entry point forwards %* here
+    // unconditionally): management verbs are forwarded to pi untouched, with
+    // the inherited environment and no setup, mirroring the POSIX launcher's
+    // early passthrough — and, unlike a `call pi %*` batch dispatch, without
+    // any cmd re-parsing of carets or percent expansions.
+    process.exitCode = launchPi(argv, null, process.env);
+  } else {
+    process.exitCode = main(argv) ?? 0;
+  }
 }
 
 module.exports = {
   DDGS_VERSION,
   MANAGEMENT_VERBS,
+  SKILL_MIGRATION_PLAN,
   SKILL_PUBLISH_RETRY_ATTEMPTS,
   SKILL_PUBLISH_RETRY_DELAY_MS,
   cmdQuote,
@@ -874,6 +1081,7 @@ module.exports = {
   normalizeWindowsShellPath,
   piAgentConfigPath,
   renameIntoPlaceWithContentionRetry,
+  migrateGenericSkillFiles,
   resolveCmdShimTarget,
   resolvePiAgentDir,
   resolvePiInvocation,

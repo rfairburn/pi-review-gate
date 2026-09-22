@@ -12,7 +12,7 @@ public docs.
 - `scripts/` — launcher, provisioning, docs validation (`check-docs.cjs`), package
   smoke, fake reviewer.
 - `docs/` — public documentation tree (shipped in the npm package).
-- `skills/orchestrator/`, `skills/execution/`, `skills/research/` — the shipped skills
+- `skills/pi-review-gate-orchestrator/`, `skills/pi-review-gate-execution/`, `skills/pi-review-gate-research/` — the shipped skills (issue 151 namespacing)
   refreshed by the launcher (orchestration with its recovery runbook, direct/delegated
   execution, and read-only research; product surface, not a private configuration).
 - `.github/` — issue/PR templates, CODEOWNERS, and external review guidance

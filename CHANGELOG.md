@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.71]
+
+### Changed
+
+- Namespace shipped orchestrator, execution and research skills with the
+  `pi-review-gate-` prefix across launchers, startup cues and documentation.
+  Preserve customized or ambiguously owned generic skills; remove only exact
+  recognized historical copies, retaining recovery references for preserved
+  generic orchestrator skills. Launcher-time atomic provisioning and role
+  permissions remain unchanged.
+
 ## [0.1.0-dev.70]
 
 ### Fixed

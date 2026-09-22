@@ -772,7 +772,8 @@ interface InspectedFile {
   content?: string;
 }
 
-const BINARY_SAMPLE_BYTES = 8192;
+/** Byte bound of the undecided prefix retained for binary classification. */
+export const BINARY_SAMPLE_BYTES = 8192;
 
 /** Hash a file exactly once while retaining content only when it is bounded text. */
 async function inspectFile(
@@ -874,13 +875,27 @@ async function inspectFileHandle(
       bytesRead += bytes.length;
       hash.update(bytes);
       if (retainTextContent && binary !== true) contentChunks.push(bytes);
-      if (binary !== undefined || sampleBytes >= BINARY_SAMPLE_BYTES) return;
+      if (sampleBytes >= BINARY_SAMPLE_BYTES) {
+        // The bound was already reached by a chunk that ended exactly on it.
+        // This event proves more file content follows, so the sample is cut
+        // and a partial trailing character is sampling noise, not invalid
+        // content.
+        if (binary === undefined) {
+          binary = looksBinary(Buffer.concat(sampleChunks, sampleBytes), true);
+          if (binary) contentChunks.length = 0;
+        }
+        return;
+      }
       const remaining = BINARY_SAMPLE_BYTES - sampleBytes;
-      const sample = bytes.length <= remaining ? bytes : bytes.subarray(0, remaining);
+      const crossesSampleBound = bytes.length > remaining;
+      const sample = crossesSampleBound ? bytes.subarray(0, remaining) : bytes;
       sampleChunks.push(sample);
       sampleBytes += sample.length;
-      if (sampleBytes >= BINARY_SAMPLE_BYTES) {
-        binary = looksBinary(Buffer.concat(sampleChunks, sampleBytes));
+      if (sampleBytes >= BINARY_SAMPLE_BYTES && crossesSampleBound) {
+        // Only a chunk extending past the bound proves the file continues.
+        // A chunk ending exactly on it defers to "end" (complete buffer) or
+        // a later "data" event (cut sample).
+        binary = looksBinary(Buffer.concat(sampleChunks, sampleBytes), true);
         if (binary) contentChunks.length = 0;
       }
     });
@@ -894,11 +909,19 @@ async function inspectFileHandle(
         reject(captureRaceError("workspace entry shrank during capture"));
         return;
       }
+      if (binary === undefined && sampleBytes >= BINARY_SAMPLE_BYTES) {
+        // The file is exactly the sample size: the buffer reached EOF, so a
+        // trailing partial character is invalid content, not a sample cut.
+        binary = looksBinary(Buffer.concat(sampleChunks, sampleBytes), false);
+        if (binary) contentChunks.length = 0;
+      }
       resolvePromise();
     });
   });
   if (binary === undefined) {
-    binary = looksBinary(Buffer.concat(sampleChunks, sampleBytes));
+    // The file is smaller than the sample bound: the whole buffer was read,
+    // so a trailing partial character is invalid content, not a sample cut.
+    binary = looksBinary(Buffer.concat(sampleChunks, sampleBytes), false);
     if (binary) contentChunks.length = 0;
   }
   return {
@@ -919,15 +942,60 @@ function abortError(signal?: AbortSignal): Error {
   return error;
 }
 
-function looksBinary(buffer: Buffer): boolean {
+function looksBinary(buffer: Buffer, sampleCut = false): boolean {
   if (hasKnownBinaryMagic(buffer)) return true;
-  const sampleLength = Math.min(buffer.length, 8192);
+  const sampleLength = Math.min(buffer.length, BINARY_SAMPLE_BYTES);
   for (let index = 0; index < sampleLength; index += 1) {
     if (buffer[index] === 0) {
       return true;
     }
   }
-  return buffer.toString("utf8", 0, sampleLength).includes("\uFFFD");
+  // A sample cut at the byte bound can end mid-character; that partial tail
+  // is sampling noise, not invalid content. Only a complete buffer may treat
+  // a trailing partial sequence as a defect.
+  const decodeEnd = sampleCut ? utf8CompleteSequenceEnd(buffer, sampleLength) : sampleLength;
+  return buffer.toString("utf8", 0, decodeEnd).includes("\uFFFD");
+}
+
+/**
+ * For a cut sample, the end of the longest prefix that ends on a complete
+ * UTF-8 sequence. Only a tail that later file bytes could still complete — a
+ * valid lead byte whose visible continuation bytes are legal for it, followed
+ * by too few continuation bytes — is sampling noise. Any other trailing shape
+ * (orphan continuation bytes, overlong or out-of-range leads, a second byte
+ * outside the lead's sub-range) is invalid content and stays in the decoded
+ * range so the replacement character flags it. Complete buffers never use
+ * this: an EOF mid-sequence is a real defect, not a sample cut.
+ */
+function utf8CompleteSequenceEnd(buffer: Buffer, length: number): number {
+  let tail = 0;
+  while (tail < 3 && length - 1 - tail >= 0 && (buffer[length - 1 - tail] & 0xc0) === 0x80) {
+    tail += 1;
+  }
+  const leadIndex = length - 1 - tail;
+  if (leadIndex < 0) return length; // all-continuation tail: let the decoder flag it
+  const lead = buffer[leadIndex];
+  let sequenceLength: number;
+  if (lead < 0x80) sequenceLength = 1;
+  else if (lead >= 0xc2 && lead <= 0xdf) sequenceLength = 2;
+  else if (lead >= 0xe0 && lead <= 0xef) sequenceLength = 3;
+  else if (lead >= 0xf0 && lead <= 0xf4) sequenceLength = 4;
+  else return length; // continuation, overlong, or out-of-range lead: malformed tail
+  if (tail >= sequenceLength - 1) return length;
+  // A visible second byte outside the lead's sub-range can never be completed
+  // into valid UTF-8 by later bytes (E0 A0-BF, ED 80-9F, F0 90-BF,
+  // F4 80-8F); keep it in the decoded range. F1-F3 have no second-byte
+  // restriction: their code-point bases (U+40000 and up) are never overlong.
+  if (tail >= 1) {
+    const second = buffer[leadIndex + 1];
+    if (
+      (lead === 0xe0 && second < 0xa0)
+      || (lead === 0xed && second > 0x9f)
+      || (lead === 0xf0 && second < 0x90)
+      || (lead === 0xf4 && second > 0x8f)
+    ) return length;
+  }
+  return leadIndex;
 }
 
 function hasKnownBinaryMagic(buffer: Buffer): boolean {

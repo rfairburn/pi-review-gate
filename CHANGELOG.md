@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.73]
+
+### Changed
+
+- Align ApplyPatch filesystem access with native write/edit: absolute paths,
+  outside-workspace relative paths, home paths and symlinked targets are supported
+  subject to host permissions and execution-environment restrictions. The working
+  directory is a path-resolution context, not a filesystem sandbox; authorized
+  scratch locations such as `/tmp` are intentional. Preserve patch correctness,
+  source-change detection, cancellation, review and read-only role protections.
+
 ## [0.1.0-dev.72]
 
 ### Fixed

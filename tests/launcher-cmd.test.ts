@@ -26,6 +26,7 @@ const isWindows = process.platform === "win32";
 const helperModule = require(helperPath) as {
   DDGS_VERSION: string;
   MANAGEMENT_VERBS: Set<string>;
+  SKILL_MIGRATION_PLAN: Array<{ installed: string[]; source: string[]; historicalSha256: string }>;
   SKILL_PUBLISH_RETRY_ATTEMPTS: number;
   SKILL_PUBLISH_RETRY_DELAY_MS: number;
   cmdQuote: (arg: string) => string;
@@ -917,6 +918,73 @@ test("launcher helper removes recovery.md together with a proven generic orchest
   assert.equal(await pathExists(priorOrchestrator), false, "the proven generic orchestrator SKILL.md must be migrated away");
   assert.equal(await pathExists(priorRecovery), false, "the proven generic recovery.md must be removed with its paired SKILL.md");
   assert.match(result.stderr, /removed the unmodified prior copy/);
+});
+
+test("launcher helper preserves generic copies whose bytes differ from the shipped historical bytes (CRLF)", async () => {
+  // The ownership proof is exact-byte identity against the reconstructed
+  // historical bytes, which are the LF bytes the package ships. Content that
+  // only normalizes to the shipped text under a line-ending transform — for
+  // example a CRLF copy, which is exactly what a Windows checkout with
+  // core.autocrlf=true produces for files not pinned in .gitattributes (the
+  // PR 169 Windows launcher CI failure) — is not the proven package-owned
+  // copy and must be preserved fail-closed. Recognizing it would require
+  // transforming the installed content before comparing, which is
+  // non-injective and could classify customized bytes as unmodified; the
+  // checkout itself is pinned LF instead (.gitattributes: skills/**/*.md).
+  const fixture = await makeFixture("pi-review-cmd-skill-crlf-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+
+  const skillsDir = join(fixture.home, ".agents", "skills");
+  const crlf = (content: string): string => content.replace(/\r\n|\n/g, "\r\n");
+  const historicalOrchestrator = (await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"))
+    .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
+    .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
+    .split("../pi-review-gate-research/SKILL.md").join("../research/SKILL.md");
+  const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
+  const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
+  const orchestratorCrlf = crlf(historicalOrchestrator);
+  const recoveryCrlf = crlf(await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"));
+  await mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true });
+  await Promise.all([
+    writeFile(priorOrchestrator, orchestratorCrlf, "utf8"),
+    writeFile(priorRecovery, recoveryCrlf, "utf8"),
+  ]);
+
+  const result = await runHelper([], fixtureEnv(fixture));
+
+  assert.equal(await readFile(priorOrchestrator, "utf8"), orchestratorCrlf,
+    "a generic copy whose bytes differ from the shipped historical bytes must be preserved byte for byte");
+  assert.equal(await readFile(priorRecovery, "utf8"), recoveryCrlf,
+    "the paired recovery.md must stay with its preserved generic orchestrator");
+  assert.doesNotMatch(result.stderr, /removed the unmodified prior copy/);
+  // The namespaced skills are still provisioned alongside the preserved
+  // generic copies.
+  assert.equal(
+    await readFile(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"),
+    "the namespaced orchestrator skill must be provisioned",
+  );
+});
+
+test("the shipped skill markdown files are pinned LF in every checkout", async () => {
+  // The pre-#151 migration identity consumes the packaged skill bytes in
+  // every checkout: without the pin, a Windows core.autocrlf=true checkout
+  // turns the packaged sources into CRLF, the LF-anchored digests stop
+  // matching, and the migration silently degrades to preservation (the PR
+  // 169 Windows launcher CI failure). Assert the pin and the actual bytes so
+  // a dropped .gitattributes rule fails fast on every platform with a clear
+  // cause instead of only surfacing in the Windows job.
+  const attrs = await readFile(resolve(".gitattributes"), "utf8");
+  assert.match(attrs, /^skills\/\*\*\/\*\.md text eol=lf$/m,
+    ".gitattributes must pin skills/**/*.md to LF: the migration digest anchor consumes these bytes verbatim");
+  for (const source of helperModule.SKILL_MIGRATION_PLAN.map((entry) => entry.source.join("/"))) {
+    const bytes = await readFile(resolve(source));
+    assert.equal(bytes.includes(0x0d), false,
+      `the identity-anchored shipped file must hold canonical LF bytes: ${source}; ` +
+      `re-clone, or force a re-checkout after a line-ending policy change ` +
+      `(git add --renormalize . only restages the index; git checkout-index -f -a rewrites the working tree)`);
+  }
 });
 
 test("launcher helper never deletes through a symlinked legacy skill path (#151)", async () => {

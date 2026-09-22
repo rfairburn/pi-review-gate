@@ -5,8 +5,11 @@ import { normalizeConfig } from "../src/config";
 import type { InteractiveBrowserManager } from "../src/web/interactive-browser";
 import { WebToolManager } from "../src/web/tools";
 
-// Point at a scratch/installed agent-core dist/index.js. Do not copy its error
-// loop into a mock: this regression must exercise the actual Pi outer result.
+// Point at a scratch/installed agent-core dist/index.js. Requires pi-agent-core
+// >= 0.87 (this fixture stops via finishTurn); older runtimes ignore finishTurn
+// and re-enter the tool batch forever in a microtask-only loop that no test
+// timer can interrupt. Do not copy its error loop into a mock: this regression
+// must exercise the actual Pi outer result.
 const runtime = process.env.PI_BROWSER_AGENT_RUNTIME;
 test("interactive Browser failures set native Pi outer isError with text only", { skip: !runtime }, async () => {
   const load = new Function("url", "return import(url)") as (url: string) => Promise<any>;
@@ -44,7 +47,7 @@ test("interactive Browser failures set native Pi outer isError with text only", 
   const results: any[] = [];
   try {
     for await (const event of agentLoop([{ role: "user", content: "fixture only", timestamp: 0 }], { systemPrompt: "fixture", messages: [], tools },
-      { model, convertToLlm: (messages: unknown[]) => messages, shouldStopAfterTurn: () => true }, undefined, streamFn)) {
+      { model, convertToLlm: (messages: unknown[]) => messages, finishTurn: () => ({ action: "end" }) }, undefined, streamFn)) {
       if (event.type === "message_end" && event.message.role === "toolResult") results.push(event.message);
     }
     assert.equal(modelCalls, 1, "only a local mock model was invoked");

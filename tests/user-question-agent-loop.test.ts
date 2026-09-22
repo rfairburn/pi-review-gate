@@ -90,7 +90,7 @@ async function runLoop(
     for await (const event of agentLoop(
       [{ role: "user", content: "fixture only", timestamp: 0 }],
       { systemPrompt: "fixture", messages: [], tools },
-      { model: makeModel(), convertToLlm: (messages: unknown[]) => messages, shouldStopAfterTurn: () => false },
+      { model: makeModel(), convertToLlm: (messages: unknown[]) => messages },
       undefined,
       streamFn,
     )) {

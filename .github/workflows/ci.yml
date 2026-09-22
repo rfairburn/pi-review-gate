@@ -97,7 +97,7 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Install pinned Pi agent-core runtime
         # tests/browser-native-error.test.ts drives the real agentLoop from an
-        # installed Pi agent-core build. 0.85.0 is verified against the current
+        # installed Pi agent-core build. 0.87.0 is verified against the current
         # extension sources (and needs Node >=22.19.0, so this job pins Node 24).
         # The test skips itself when PI_BROWSER_AGENT_RUNTIME is unset; this job
         # always sets it, so the regression genuinely runs in CI.
@@ -105,7 +105,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/pi-agent-runtime"
           cd "$RUNNER_TEMP/pi-agent-runtime"
           echo '{"private":true}' > package.json
-          npm install --no-audit --no-fund --no-save @earendil-works/pi-agent-core@0.85.0
+          npm install --no-audit --no-fund --no-save @earendil-works/pi-agent-core@0.87.0
       - name: Export Pi runtime path
         run: echo "PI_BROWSER_AGENT_RUNTIME=$RUNNER_TEMP/pi-agent-runtime/node_modules/@earendil-works/pi-agent-core/dist/index.js" >> "$GITHUB_ENV"
       # PI_REVIEW_GATE_RUNTIME_ROLE must stay unset so activation tests observe

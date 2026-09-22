@@ -12,7 +12,7 @@ Behavioral detail lives in the linked pages.
 - **Pi**, installed independently. `pi-review-gate` consumes Pi's public extension and
   CLI/RPC surfaces; it does not patch or bundle Pi, and Pi remains independently
   installed and upgradeable. Use a Node version meeting both packages' requirements:
-  for example, Pi 0.85.1 requires Node.js 22.19.0 or newer even though this extension's
+  for example, Pi 0.87.0 requires Node.js 22.19.0 or newer even though this extension's
   own declared minimum is Node.js 20.
 - **A reviewer or executor harness**, installed and authenticated by its own
   login/configuration: the Codex CLI (`codex` by default), the Claude CLI (`claude`),

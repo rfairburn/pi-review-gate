@@ -588,7 +588,7 @@ claims a proven authorization denial. `BrowserExtract` and `WebFetch` keep their
 result contract.
 The real-runtime regression in `tests/browser-native-error.test.ts` accepts
 `PI_BROWSER_AGENT_RUNTIME` pointing to an installed Pi agent-core `dist/index.js`
-(tested with 0.85.0); its model stream is entirely mocked, with no live model calls.
+(tested with 0.87.0); its model stream is entirely mocked, with no live model calls.
 Without that runtime path the optional contract test is explicitly skipped.
 
 The interactive tools are registered only through the Pi extension surface and are

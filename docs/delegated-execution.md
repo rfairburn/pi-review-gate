@@ -472,7 +472,26 @@ which never implies verification) from reviewer verdicts (`reviewer_verdict`). T
 and results are paired by real call ids; a call without an observed result stays
 `in_flight`, which is never evidence of success. Private model reasoning (Pi thinking
 blocks, Codex reasoning items) is excluded from every view, and all retained content is
-redacted before search or display. Entry previews stay compact (whitespace-collapsed
+redacted before search or display.
+
+That redaction is the shared heuristic text pass applied once at snapshot assembly,
+so find, previews, deep reads, continuations, and rendered views all serve the same
+retained bytes: sensitive-key assignments, known token formats, JWTs, and PEM private
+keys are replaced with a `[REDACTED]` marker. One narrow exception keeps the
+representative GitHub Actions permission declaration readable: a bare, unquoted
+`id-token: write` line directly under a less-indented `permissions:` mapping key in
+multiline block YAML (including realistic sibling scopes such as `contents: read`)
+is preserved because the value is a permission level, not a credential. Every other
+`id-token` assignment still redacts — `id-token: read`, quoted or inline/flow
+values, list items, and occurrences outside such a permissions mapping (including
+one that merely follows an earlier permissions block in a later, unrelated
+mapping), longer keys containing the run (`my-id-token`), and real credentials
+such as provider tokens or JWTs — as does every other sensitive key. The heuristic
+remains pattern-based, so residual limitations stay in both directions: harmless
+text that merely looks like a sensitive assignment (for example `id-token: read`,
+a list-form `id-token: [read]` value, a quoted permission declaration, or a longer
+key that contains `token`) may still be redacted, and secrets in unrecognized
+formats are not captured. Entry previews stay compact (whitespace-collapsed
 and bounded); deep reads are distinct from previews and preserve the retained text's
 own whitespace — newlines, indentation, tabs, and blank lines — so multiline YAML,
 source code, diffs, and command output arrive readable, with continued chunks

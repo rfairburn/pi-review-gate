@@ -39,6 +39,7 @@ import {
 import { pinCommit } from "./wave-worktrees";
 import {
   configWithReviewers,
+  effectiveReviewSettings,
   frozenReviewerSelection,
   resolveReviewers,
   reviewerDisplayLabel,
@@ -174,11 +175,7 @@ function reportProgress(
 
 // ── reviewer validation ──────────────────────────────────────────────────────
 
-/**
- * Freeze and validate reviewer selection for this worker.
- * Returns a frozen canonical config with the exact selection and the
- * external agent definitions it needs, or throws on blockage.
- */
+/** Progress label for one reviewer: model metadata first, then stable id. */
 export function reviewerProgressLabel(reviewer: DeciderConfig): string {
   if (reviewer.adapter === "pi-model") {
     return reviewerDisplayLabel(reviewer);
@@ -189,11 +186,34 @@ export function reviewerProgressLabel(reviewer: DeciderConfig): string {
   return reviewerDisplayLabel(reviewer);
 }
 
+/**
+ * Freeze and validate reviewer selection for this worker (issue #175).
+ *
+ * The lifecycle reviews subtask results, so it consults the subtask review
+ * layer: `effectiveReviewSettings` supplies the stored `subtaskEnabled`
+ * toggle, and `resolveReviewers`/`frozenReviewerSelection` use the subtask
+ * reviewer set (the legacy imported set for pre-split records, the stored
+ * `subtaskReviewers` for split ones). Primary selections never leak into
+ * subtask review after a split, and the primary toggle never influences this
+ * decision.
+ *
+ * Returns a frozen canonical config with the exact selection and the
+ * external agent definitions it needs, or throws on blockage. With subtask
+ * review off, no selection is resolved or validated and no reviewer runs:
+ * a changed task takes the explicit `completed_unreviewed` path.
+ */
 function freezeReviewers(
   config: ReviewGateConfig,
   scopedModels: string[] = [],
 ): { frozenConfig: ReviewGateConfig; enabled: boolean } {
-  const resolution = resolveReviewers(config, scopedModels);
+  // The automatic subtask-review toggle is authoritative here: Off disables
+  // this worker's review entirely, independently of primary review or the
+  // reviewer sets. Skip resolution so an unused or invalid subtask selection
+  // cannot block an unreviewed completion.
+  if (!effectiveReviewSettings(config).subtaskEnabled) {
+    return { frozenConfig: config, enabled: false };
+  }
+  const resolution = resolveReviewers(config, scopedModels, "subtask");
   if (resolution.unknownIds.length > 0) {
     throw new Error(
       `Blocked reviewer selection: unknown enabled reviewer ids: ${resolution.unknownIds.join(", ")}`,
@@ -206,8 +226,12 @@ function freezeReviewers(
   }
   const enabled = config.enabled && resolution.reviewers.length > 0;
   // Materialize a frozen canonical config so runReview uses the exact
-  // selected reviewers and their agent definitions.
-  const frozenConfig = configWithReviewers(config, frozenReviewerSelection(config, resolution), enabled);
+  // selected subtask reviewers and their agent definitions.
+  const frozenConfig = configWithReviewers(
+    config,
+    frozenReviewerSelection(config, resolution, "subtask"),
+    enabled,
+  );
   return { frozenConfig, enabled };
 }
 
@@ -597,7 +621,8 @@ function executionMetadata(result: WaveWorkerResult): Pick<
  * Run one complete isolated worker review/correction lifecycle.
  *
  * This function:
- * 1. Freezes/validates reviewer selection.
+ * 1. Freezes/validates the subtask reviewer selection (no-op, unreviewed,
+ *    when the automatic subtask-review toggle is off — issue #175).
  * 2. Snapshots the worker worktree at the wave base.
  * 3. Runs the initial executor turn via runWaveWorker.
  * 4. For a changed candidate with review enabled, builds its exact patch and calls runReview.
@@ -607,7 +632,8 @@ function executionMetadata(result: WaveWorkerResult): Pick<
  *    unchanged from the passed candidate tree, pins the exact passed commit under the immutable
  *    workers/<task-id> ref and accepts it. If the tree changed, the old pass is invalid and the
  *    new candidate must be reviewed.
- * 8. If review is explicitly disabled/no reviewers, pins the changed candidate and returns
+ * 8. If subtask review is off, the gate is disabled, or no subtask reviewers
+ *    resolve, pins the changed candidate and returns
  *    completed_unreviewed.
  * 9. Writes result.json in the worker artifact root.
  *
@@ -653,9 +679,10 @@ export async function runWaveWorkerLifecycle(
     return result;
   }
 
-  // Fail fast on an invalid initial selection, but do not retain it. The
-  // current /review-settings selection is resolved again when each review
-  // cycle actually begins.
+  // Fail fast on an invalid initial subtask selection, but do not retain it.
+  // The current /review-settings selection is resolved again when each review
+  // cycle actually begins. With subtask review off this does not resolve or
+  // block: the unreviewed path never consults the selection.
   try {
     freezeReviewers(config, scopedModels);
   } catch (error) {

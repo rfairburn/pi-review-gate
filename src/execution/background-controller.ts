@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { mkdtemp, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExecutorSelection, ReviewGateConfig } from "../config";
-import { resolvedWorkerResources, resolvedWorkerRoute } from "../config";
+import { effectiveReviewSettings, resolvedWorkerResources, resolvedWorkerRoute } from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
@@ -228,6 +229,77 @@ function describeSalvageSource(source: ForceMergeLandingSource): string {
     return `the retained worker worktree (${where})`;
   }
   return `retained ref ${candidate.refName ?? "unknown"}`;
+}
+
+/**
+ * #175: subtask-review status established from a landing's settled outcome.
+ * `reviewed` is true only when the outcome provably carries a successful
+ * subtask review (an accepted/accepted_with_warnings result whose final
+ * recorded review cycle passed). `uncertain` marks outcomes whose review
+ * status cannot be established from the evidence: callers fail closed by
+ * keeping the landed diff in the primary review window and reporting the
+ * uncertainty, never by guessing a review status or fabricating a PASS.
+ */
+interface LandedReviewStatus {
+  reviewed: boolean;
+  uncertain?: boolean;
+  detail?: string;
+}
+
+/**
+ * #175: establish the subtask-review status of a landing outcome from the
+ * settled subtask result (status, explicit unreviewed flag, review cycles)
+ * and, for explicit force-merges, the landing source: a forced checkpoint or
+ * salvage carries no review success by construction, while an ordinary
+ * verified-checkpoint force-merge inherits the settled result's review
+ * status. Unknown evidence fails closed (unreviewed + uncertain).
+ */
+function landedReviewStatusOf(
+  result:
+    | { status?: string; unreviewed?: boolean; reviewCycles?: ReadonlyArray<{ verdict?: string }> }
+    | undefined,
+  forceMergeSource?: ForceMergeLandingSource,
+): LandedReviewStatus {
+  if (forceMergeSource && forceMergeSource.kind !== "checkpoint") {
+    return {
+      reviewed: false,
+      detail: forceMergeSource.kind === "forced_checkpoint"
+        ? "explicitly forced checkpoint landing; no review success is asserted"
+        : "salvage landing; no ordinary checkpoint or review behind it",
+    };
+  }
+  if (!result) {
+    return { reviewed: false, uncertain: true, detail: "no settled subtask result evidence" };
+  }
+  if (result.status === "completed_unreviewed" || result.unreviewed === true) {
+    return { reviewed: false, detail: "subtask completed unreviewed" };
+  }
+  if (result.status === "accepted" || result.status === "accepted_with_warnings") {
+    const finalCycle = result.reviewCycles?.at(-1);
+    if (finalCycle?.verdict === "pass") return { reviewed: true };
+    return {
+      reviewed: false,
+      uncertain: true,
+      detail: "accepted result without a passing final review cycle",
+    };
+  }
+  return {
+    reviewed: false,
+    uncertain: true,
+    detail: `unrecognized subtask outcome status ${typeof result.status === "string" ? result.status : "missing"}`,
+  };
+}
+
+/** #175: synchronous same-workspace identity test for conflict-gate review
+ *  readiness (the sync twin of checkpointParent's realpath guard). An
+ *  identity-resolution error fails closed by treating the gate as
+ *  same-workspace, keeping the review blocker. */
+function sameWorkspaceGate(sourceRoot: string, cwd: string): boolean {
+  try {
+    return realpathSync(sourceRoot) === realpathSync(cwd);
+  } catch {
+    return true;
+  }
 }
 
 /** Durable forced-salvage provenance for a force-merge whose source is not the
@@ -1102,7 +1174,7 @@ export class BackgroundExecutionController {
     // read the controller-wide active-task index instead of traversing every
     // settled window in every attached group. The active-state filter stays
     // defensive so an unsynchronized transition can never surface.
-    return [...this.activeTasks.values()]
+    const readiness: BackgroundReviewReadinessTask[] = [...this.activeTasks.values()]
       .filter(({ task }) => isActiveTaskState(task.state))
       .map(({ group, task }) => ({
         executionId: group.executionId,
@@ -1111,6 +1183,30 @@ export class BackgroundExecutionController {
         title: task.definition.title,
         state: task.state,
       }));
+    // #175: with the landed-change review policy on, a same-workspace conflict
+    // gate keeps its task a review-readiness blocker until SubtasksMarkClean
+    // resolves it: the materialized conflict markers sit in the primary review
+    // window, so the model's idle review must not run against unresolved
+    // markers. Only the final resolved diff becomes landed evidence, at the
+    // ordinary next idle review. The policy off keeps the exact prior
+    // behavior (conflicted tasks were not readiness blockers); foreign-target
+    // gates never put markers in the parent window, and identity-resolution
+    // errors fail closed to blocking.
+    if (!this.reviewLandedChangesEnabled()) return readiness;
+    for (const { gate } of this.conflictGates.entries()) {
+      if (!sameWorkspaceGate(gate.sourceRoot, this.input.cwd())) continue;
+      const group = this.groups.get(gate.executionId);
+      const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
+      if (!group || !task || task.state !== "conflicted") continue;
+      readiness.push({
+        executionId: group.executionId,
+        kind: group.kind,
+        taskId: task.taskId,
+        title: task.definition.title,
+        state: task.state,
+      });
+    }
+    return readiness;
   }
 
   async continueTask(input: {
@@ -1810,7 +1906,7 @@ export class BackgroundExecutionController {
           binarySidecars: true,
           preserveUnrepresentable: true,
         });
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
+        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task, source));
         // #126 approved: conflicts that cannot carry markers are preserved
         // instead of represented, so the preserved target and any worker
         // version saved alongside (or a recorded deletion) must both be named.
@@ -1892,7 +1988,7 @@ export class BackgroundExecutionController {
       // transition to landed unconditionally; save/publish/wake stay tolerated
       // so the landed outcome survives any of them failing.
       await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId });
+        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task, source));
       });
       if (command.salvage) {
         const salvageProvenance = command.salvage;
@@ -2163,7 +2259,13 @@ export class BackgroundExecutionController {
       // #25: same-directory identity guard as checkpointParent — a conflict
       // gate on a foreign target must not merge that repository's files into
       // the parent review baseline.
-      if (baseline && gate.paths.length > 0 && await realpath(gate.sourceRoot) === await realpath(this.input.cwd())) {
+      // #175: with the landed-change review policy on (and automatic primary
+      // review on), the resolved landed diff also remains in the primary
+      // review window here (no selective checkpoint after clearance): the
+      // resolution is unreviewed evidence, while the gate plus the #175
+      // review-readiness blocker kept the unresolved markers out of review
+      // until clearance. Only the post-resolution landed state is exposed.
+      if (!this.reviewLandedChangesEnabled() && baseline && gate.paths.length > 0 && await realpath(gate.sourceRoot) === await realpath(this.input.cwd())) {
         const resolved = await createWorkspaceSnapshot(gate.sourceRoot, {
           maxFileBytes: this.input.config.maxFileBytes,
           maxSnapshotBytes: this.input.config.maxSnapshotBytes,
@@ -2866,7 +2968,7 @@ export class BackgroundExecutionController {
         // conflicts reach here and are materialized as diff3 markers in the
         // source workspace.
         const materialized = await materializeLandingConflicts(capture, plan, `subtask ${task.taskId}`);
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
+        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
         const conflictGate: BackgroundConflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
@@ -2910,7 +3012,7 @@ export class BackgroundExecutionController {
       // then transition to landed unconditionally — a checkpoint/save/publish/wake
       // failure can neither prevent nor reclassify the landing.
       await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId });
+        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
       });
       transitionTaskState(task, "landed");
       const completionSnapshot = transitionEventSnapshot(group, task);
@@ -3044,7 +3146,7 @@ export class BackgroundExecutionController {
           // unrepresentable conflicts refuse the whole transfer before any
           // mutation; only text conflicts are materialized here.
           const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
-          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId });
+          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
           const conflictGate = this.activateConflictGate(
             group, task, materialized.paths, materialized.manifestPath,
             `Continued task ${task.taskId} requires immediate conflict resolution.`,
@@ -3073,7 +3175,7 @@ export class BackgroundExecutionController {
         // ordering where the checkpoint completes before the landed state becomes
         // visible), then transition to landed unconditionally.
         await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
-          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId });
+          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
         });
         transitionTaskState(task, "landed");
         const completionSnapshot = transitionEventSnapshot(group, task);
@@ -3285,6 +3387,27 @@ export class BackgroundExecutionController {
     this.updateIndicator();
   }
 
+  /**
+   * #175: the human-selected landed-change review policy. Landed diffs stay
+   * in the primary review window only when the master gate, automatic primary
+   * review and the landed option are all on; any off keeps selective-checkpoint
+   * behavior (the primary window persists for later manual own-edit review).
+   */
+  private reviewLandedChangesEnabled(): boolean {
+    const review = effectiveReviewSettings(this.input.config);
+    return this.input.config.enabled && review.primaryEnabled && review.reviewLandedChanges;
+  }
+
+  /** #175: establish the subtask-review status of this task's landing
+   *  outcome from its settled result, optionally qualified by an explicit
+   *  force-merge landing source. */
+  private landedReviewStatus(
+    task: BackgroundTaskRecord,
+    forceMergeSource?: ForceMergeLandingSource,
+  ): LandedReviewStatus {
+    return landedReviewStatusOf(task.result?.taskResults[0], forceMergeSource);
+  }
+
   private async checkpointParent(
     reviewWindowId: number | undefined,
     taskBaseline: WorkspaceSnapshot | undefined,
@@ -3292,6 +3415,7 @@ export class BackgroundExecutionController {
     sourceRoot: string,
     landedPaths: string[],
     faultContext: BackgroundFaultContext = {},
+    landedReview?: LandedReviewStatus,
   ): Promise<void> {
     await this.input.faults?.checkpointParent?.(faultContext);
     if (!taskBaseline || !before || reviewWindowId === undefined || this.input.state.reviewWindow?.id !== reviewWindowId || landedPaths.length === 0) return;
@@ -3302,6 +3426,38 @@ export class BackgroundExecutionController {
     // A landing into an explicitly selected foreign target therefore never
     // checkpoints the parent; same-directory targets keep current behavior.
     if (await realpath(sourceRoot) !== await realpath(this.input.cwd())) return;
+    // #175: with the landed-change review policy on (and automatic primary
+    // review on), an UNREVIEWED same-workspace landing keeps its diff in the
+    // primary review window's ordinary evidence for the model's normal idle
+    // settlement (never an immediate or separate review); a landing whose
+    // content already carries a successful subtask review is not
+    // double-reviewed and keeps the exact existing selective checkpoint. An
+    // outcome whose review status cannot be established fails closed: the
+    // diff stays in the review window and the uncertainty is reported rather
+    // than guessed or treated as reviewed. The foreign-target identity guard
+    // above still keeps unrelated target landings out of the parent window,
+    // and the policy off (or primary review off) keeps the exact prior
+    // checkpointing behavior.
+    if (this.reviewLandedChangesEnabled()) {
+      const status = landedReview
+        ?? { reviewed: false, uncertain: true, detail: "no review-status evidence supplied for this landing path" };
+      if (!status.reviewed) {
+        if (status.uncertain) {
+          const group = faultContext.executionId ? this.groups.get(faultContext.executionId) : undefined;
+          const task = faultContext.taskId
+            ? group?.tasks.find((candidate) => candidate.taskId === faultContext.taskId)
+            : undefined;
+          if (task) {
+            this.addActivity(
+              task,
+              "bookkeeping",
+              `Task ${task.taskId} landed with subtask-review status that could not be established from its outcome (${status.detail}); the landed diff stays in the primary review window for the next model-idle review instead of being treated as reviewed.`,
+            );
+          }
+        }
+        return;
+      }
+    }
     const after = await createWorkspaceSnapshot(sourceRoot, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,

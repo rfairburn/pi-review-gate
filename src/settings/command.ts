@@ -16,6 +16,7 @@ import {
   externalAgentSupportsReview,
   executorEntryId,
   executorSelectionKey,
+  effectiveReviewSettings,
   normalizeModeCycleShortcut,
   resolvedExternalAgent,
   resolvedWorkerCatalog,
@@ -95,7 +96,15 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let workerResources = withoutResourceThinkingCatalog(resolvedWorkerCatalog(input.config));
   let executeRoute = initialWorkerRoute(input.config, "execute");
   let researchRoute = initialWorkerRoute(input.config, "research");
-  let activeReviewers = materializeReviewerThinking(initialReviewerSelections(input.config), input.scoped);
+  // Issue #175: the review draft is the layer-split state. A legacy
+  // `review.activeReviewers` record is imported into both sets here (menu
+  // display is immediate), and the stored file is untouched until a save.
+  const effectiveReview = effectiveReviewSettings(input.config);
+  let primaryReviewers = materializeReviewerThinking(effectiveReview.primaryReviewers, input.scoped);
+  let subtaskReviewers = materializeReviewerThinking(effectiveReview.subtaskReviewers, input.scoped);
+  let primaryEnabled = effectiveReview.primaryEnabled;
+  let subtaskEnabled = effectiveReview.subtaskEnabled;
+  let reviewLandedChanges = effectiveReview.reviewLandedChanges;
   let reviewerTimeoutMs = input.config.reviewerTimeoutMs;
   let executorTimeoutMs = input.config.executorTimeoutMs;
   let maxCorrectionCycles = input.config.maxCorrectionCycles;
@@ -122,16 +131,24 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   let rootLastKey: string | undefined;
   while (true) {
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
-    const reviewStatus = input.config.enabled
-      ? activeReviewers.length === 0 ? " — review disabled" : ""
-      : " — review disabled by master setting";
+    const layerSummary = (enabled: boolean, reviewers: ActiveReviewerSelection[]): string =>
+      enabled
+        ? reviewers.length === 0
+          ? `0/${totalReviewerChoices} selected · auto off (no reviewers)`
+          : `${reviewers.length}/${totalReviewerChoices} selected · auto`
+        : "off";
+    const reviewStatus = !input.config.enabled
+      ? " — review disabled by master setting"
+      : !primaryEnabled && !subtaskEnabled
+        ? " — automatic review off"
+        : "";
     const [modeRow, modeCycleRow, resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, deferredToolsRow, subtasksViewRow, webRow] = alignedSettingsRows([
       ["Operating mode", OPERATING_MODE_LABELS[operatingMode]],
       ["Mode cycle hotkey", modeCycleShortcut],
       ["Worker resources", executorPoolSummary(workerResources)],
       ["Execution priority", workerRouteSummary(executeRoute, workerResources, input.config, input.scoped)],
       ["Research priority", workerRouteSummary(researchRoute, workerResources, input.config, input.scoped)],
-      ["Reviewers", `${activeReviewers.length}/${totalReviewerChoices} selected${reviewStatus}`],
+      ["Reviewers", `primary ${layerSummary(primaryEnabled, primaryReviewers)} · subtask ${layerSummary(subtaskEnabled, subtaskReviewers)}${reviewStatus}`],
       ["Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`],
       ["Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`],
       ["Bundle retention", retentionLabel(retainBundles)],
@@ -258,7 +275,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       continue;
     }
     if (choice === "reviewers") {
-      activeReviewers = await selectReviewers(input.ui, activeReviewers, agents, input.scoped);
+      ({ primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges } =
+        await selectReviewSection(input.ui, { primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges }, agents, input.scoped));
       continue;
     }
     if (choice === "timeouts") {
@@ -307,7 +325,8 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ));
       continue;
     }
-    const error = await validateSelection(workerResources, activeReviewers, input.config, input.scoped, executeRoute, researchRoute);
+    const error = (await validateSelection(workerResources, primaryReviewers, input.config, input.scoped, executeRoute, researchRoute))
+      ?? (await validateSelection(workerResources, subtaskReviewers, input.config, input.scoped, executeRoute, researchRoute));
     if (error) {
       await notify(input.ui, error, "error");
       continue;
@@ -318,7 +337,11 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       workerResources,
       executeRoute,
       researchRoute,
-      activeReviewers,
+      primaryReviewers,
+      subtaskReviewers,
+      primaryEnabled,
+      subtaskEnabled,
+      reviewLandedChanges,
       reviewerTimeoutMs,
       executorTimeoutMs,
       maxCorrectionCycles,
@@ -1099,6 +1122,101 @@ async function selectExecutorCapacity(ui: UiContext, current: number): Promise<n
   return values.find((_value, index) => selected === rows[index]) ?? current;
 }
 
+/** Staged state of the Review submenu (issue #175); draft-only until Save. */
+interface ReviewSectionState {
+  primaryReviewers: ActiveReviewerSelection[];
+  subtaskReviewers: ActiveReviewerSelection[];
+  primaryEnabled: boolean;
+  subtaskEnabled: boolean;
+  reviewLandedChanges: boolean;
+}
+
+/**
+ * The Review submenu (issue #175): the automatic-review toggles plus one
+ * reviewer set per layer, picked from the existing reviewer catalog. Saved
+ * choices take effect for automatic reviews after Save; both layers may be
+ * Off, and with both Off there is no automatic review. The toggles control
+ * automatic review only: manual `/review-now` and `/ask-reviewer` stay usable
+ * while reviewers remain selected, and no model-controlled path reaches this
+ * menu. Review timing stays model idle — the landed-changes toggle governs
+ * which subtask landings are included in the primary review window, never
+ * instant review: On adds only unreviewed subtask landings to the primary
+ * window, while a subtask landing that passed its own review keeps today's
+ * checkpoint/bypass and is not redundantly re-reviewed — and nothing is ever
+ * fabricated as a pass.
+ */
+async function selectReviewSection(
+  ui: UiContext,
+  initial: ReviewSectionState,
+  agents: ExternalAgentConfig[],
+  scoped: ScopedModelChoice[],
+): Promise<ReviewSectionState> {
+  const state: ReviewSectionState = {
+    primaryReviewers: initial.primaryReviewers.map(cloneReviewerSelection),
+    subtaskReviewers: initial.subtaskReviewers.map(cloneReviewerSelection),
+    primaryEnabled: initial.primaryEnabled,
+    subtaskEnabled: initial.subtaskEnabled,
+    reviewLandedChanges: initial.reviewLandedChanges,
+  };
+  const totalChoices = scoped.length + agents.filter(externalAgentSupportsReview).length;
+  await notify(
+    ui,
+    "Automatic primary review covers the primary assistant's own changes (one policy shared by Execute and Orchestrate); automatic subtask review covers subtask results before ordinary accepted landing. The toggles control automatic review only — /review-now and /ask-reviewer stay available while reviewers remain selected, and a saved Off stops automatic review for that layer once saved; with both layers Off there is no automatic review. Reviewing landed changes adds only unreviewed subtask landings to the primary review window instead of checkpointing them out; a subtask landing that passed its own review keeps today's checkpoint/bypass and is not redundantly re-reviewed by the primary review. It is inactive while automatic primary review is off. Review timing stays model idle — the landed toggle governs inclusion in the review window, never instant review. Each layer has its own reviewer set from the same reviewer catalog.",
+    "info",
+  );
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
+  while (true) {
+    const [primaryRow, subtaskRow, landedRow, primaryReviewersRow, subtaskReviewersRow] = alignedSettingsRows([
+      ["Automatic primary review", state.primaryEnabled ? "On" : "Off"],
+      ["Automatic subtask review", state.subtaskEnabled ? "On" : "Off"],
+      ["Review landed changes", state.reviewLandedChanges
+        ? state.primaryEnabled ? "On" : "On · inactive (automatic primary review is off)"
+        : "Off"],
+      ["Primary reviewers", `${state.primaryReviewers.length}/${totalChoices} selected`],
+      ["Subtask reviewers", `${state.subtaskReviewers.length}/${totalChoices} selected`],
+    ]);
+    const choice = await retainedSelect(ui, {
+      title: "Review",
+      rows: [
+        { key: "primaryToggle", label: primaryRow },
+        { key: "subtaskToggle", label: subtaskRow },
+        { key: "landed", label: landedRow },
+        { key: "primaryReviewers", label: primaryReviewersRow },
+        { key: "subtaskReviewers", label: subtaskReviewersRow },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return state;
+    lastKey = choice;
+    if (choice === "primaryToggle") {
+      state.primaryEnabled = !state.primaryEnabled;
+      continue;
+    }
+    if (choice === "subtaskToggle") {
+      state.subtaskEnabled = !state.subtaskEnabled;
+      continue;
+    }
+    if (choice === "landed") {
+      if (!state.primaryEnabled) {
+        await notify(ui, "Reviewing landed changes is inactive while automatic primary review is off; turn on automatic primary review first.", "info");
+        continue;
+      }
+      state.reviewLandedChanges = !state.reviewLandedChanges;
+      continue;
+    }
+    if (choice === "primaryReviewers") {
+      state.primaryReviewers = await selectReviewers(ui, state.primaryReviewers, agents, scoped);
+      continue;
+    }
+    if (choice === "subtaskReviewers") {
+      state.subtaskReviewers = await selectReviewers(ui, state.subtaskReviewers, agents, scoped);
+      continue;
+    }
+  }
+}
+
 async function selectReviewers(
   ui: UiContext,
   initial: ActiveReviewerSelection[],
@@ -1381,10 +1499,6 @@ async function validateSelection(
     if (config.enabled && !await commandAvailable(agent.command!)) return `Reviewer executable is unavailable: ${agent.command} (${agent.id})`;
   }
   return undefined;
-}
-
-function initialReviewerSelections(config: ReviewGateConfig): ActiveReviewerSelection[] {
-  return (config.review?.activeReviewers ?? []).map(cloneReviewerSelection);
 }
 
 function executorPoolSummary(catalog: WorkerResourceCatalog): string {

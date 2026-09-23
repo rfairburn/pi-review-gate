@@ -280,6 +280,17 @@ completed landing immediately frees capacity, and `SubtasksAdd` can top the exec
 group back up. The landed changes remain uncommitted; source HEAD, index, staging
 state, and stash are preserved.
 
+**Automatic review layers**: the review around landing is configured per layer in
+`/review-settings` (see
+[Review layers](configuration.md#review-layers-and-the-legacy-activereviewers-import)).
+`review.subtaskEnabled` controls the pre-landing subtask review. With
+`review.reviewLandedChanges` on, a landing into the parent session's own workspace
+that did **not** already complete a successful subtask review keeps its diff in the
+parent's review window as ordinary evidence instead of being checkpointed out,
+reviewed at the primary model's normal idle settlement; a landing that already
+completed a successful subtask review keeps the existing checkpoint/bypass handling.
+Landings into a foreign workspace target never enter the parent review window.
+
 **Source preservation**: Landing never changes source HEAD, index, staging state, or
 stash. Final filesystem mutations are serialized and rollback-protected. Absolute
 source-workspace paths in task and correction text are remapped to the worker worktree,

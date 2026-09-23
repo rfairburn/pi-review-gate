@@ -51,21 +51,21 @@ const CANONICAL_EXECUTION = {
 test("old-only decider field is rejected with an actionable diagnostic", () => {
   assert.throws(
     () => normalizeConfig({ ...CANONICAL_REVIEW, review: undefined, decider: { id: "d", adapter: "generic-cli", command: "node" } }),
-    (error: Error) => /unsupported legacy reviewer configuration.*decider.*no longer accepted.*review\.activeReviewers/.test(error.message),
+    (error: Error) => /unsupported legacy reviewer configuration.*decider.*no longer accepted.*review\.primaryReviewers/.test(error.message),
   );
 });
 
 test("old-only reviewers field is rejected with an actionable diagnostic", () => {
   assert.throws(
     () => normalizeConfig({ ...CANONICAL_REVIEW, review: undefined, reviewers: [{ id: "d", adapter: "generic-cli", command: "node" }] }),
-    (error: Error) => /unsupported legacy reviewer configuration.*reviewers.*no longer accepted.*review\.activeReviewers/.test(error.message),
+    (error: Error) => /unsupported legacy reviewer configuration.*reviewers.*no longer accepted.*review\.primaryReviewers/.test(error.message),
   );
 });
 
 test("old-only enabledReviewerIds field is rejected with an actionable diagnostic", () => {
   assert.throws(
     () => normalizeConfig({ ...CANONICAL_REVIEW, review: undefined, enabledReviewerIds: ["d"] }),
-    (error: Error) => /unsupported legacy reviewer configuration.*enabledReviewerIds.*no longer accepted.*review\.activeReviewers/.test(error.message),
+    (error: Error) => /unsupported legacy reviewer configuration.*enabledReviewerIds.*no longer accepted.*review\.primaryReviewers/.test(error.message),
   );
 });
 

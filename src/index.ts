@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { deferredPiToolsEnabled, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode } from "./config";
+import { deferredPiToolsEnabled, effectiveReviewSettings, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode } from "./config";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
@@ -692,11 +692,19 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     currentCwd = extractCwd(args, currentCwd);
     const noticeTarget = extractContext(args) ?? pi;
     const prospectiveWindow = state.reviewWindow;
+    // Issue #175: automatic primary review is a stored per-layer toggle. It
+    // suppresses the settlement-time automatic review only; manual
+    // /review-now and /ask-reviewer stay gated by the selected reviewers and
+    // the master setting. The hold must track whether an automatic review
+    // will actually run, so queued user input is never stranded behind a
+    // review that was switched off.
+    const primaryEnabled = effectiveReviewSettings(config).primaryEnabled;
     agentSettlementInputHold = Boolean(
       prospectiveWindow?.baseline
       && !runAborted
       && !pausedForReviewerQuestion
       && !state.reviewsPaused
+      && primaryEnabled
       && (prospectiveWindow.reviewConfig?.enabled ?? config.enabled),
     );
     // Reviews settle model work, not the live browser. Page scripts and
@@ -724,6 +732,47 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     }
     const window = state.reviewWindow;
     if (!window) {
+      return;
+    }
+    if (!primaryEnabled) {
+      // Automatic primary review is off (issue #175): no reviewer runs at
+      // settlement. Nothing is deferred on background readiness — there is no
+      // automatic review for active background work to block — and the window
+      // stays open so the baseline, exchanges, evidence, and history keep
+      // accumulating across quick turns for a manual /review-now. The turn's
+      // exchange is settled without any verdict, so no synthetic PASS ever
+      // enters the persisted review history.
+      // A background-completion wake armed by an earlier deferral while
+      // automatic review was on may still resume the model after the toggle:
+      // it finishes the original request, and this same off path settles that
+      // resumed turn without running reviewers.
+      backgroundReviewDeferred = false;
+      pendingNativeCompletionRevision = undefined;
+      if (!window.baseline) {
+        closeReviewWindow(state);
+        return;
+      }
+      if (!config.enabled) {
+        // Master setting off keeps its existing settlement semantics: the
+        // window is preserved for reviewer questions but not kept open.
+        closeReviewWindow(state, true);
+        return;
+      }
+      if (runAborted) {
+        // A user abort of the run supersedes automatic review; the window and
+        // its baseline survive for the next turn, exactly as before.
+        state.reviewInProgress = false;
+        state.queuedUserInputsDuringReview = [];
+        return;
+      }
+      await collectPausedReviewExchange({
+        cwd: currentCwd,
+        config: window.reviewConfig ?? freezeReviewWindowConfig(state, config, currentScopedModels),
+        evidence: window.evidence,
+        actingUsage,
+        window,
+      });
+      await persistSessionState();
       return;
     }
     const backgroundReadiness = currentBackgroundReadiness();

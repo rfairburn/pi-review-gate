@@ -1830,3 +1830,315 @@ test("lifecycle: when both record and marker publication fail, currentness is ne
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// ── #175 subtask review layer selection ─────────────────────────────────────
+
+/** A passing CLI reviewer that leaves a marker file behind when invoked. */
+function markerPassReviewer(id: string, marker: string): ExternalAgentConfig {
+  return {
+    id,
+    adapter: "generic-cli",
+    command: process.execPath,
+    args: [],
+    review: {
+      args: [
+        "-e",
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)},'used');` +
+          "process.stdin.resume();process.stdin.on('end',()=>" +
+          "process.stdout.write(JSON.stringify({verdict:'pass',summary:'ok',findings:[]})))",
+      ],
+      timeoutMs: 15_000,
+    },
+  };
+}
+
+test("lifecycle: subtask review off returns completed_unreviewed without invoking reviewers", async () => {
+  const root = await mkTmp("pi-wwl-subtask-off-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-subtask-off");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-subtask-off");
+    await mkdir(artifactDir, { recursive: true });
+    const reviewerMarker = join(root, "reviewer-ran.txt");
+
+    const { command } = await createFakeExecutor(root);
+    const config = buildConfig(command, "fake-exec", [markerPassReviewer("subtask-rev", reviewerMarker)]);
+    // Subtask review is explicitly off even though its own reviewer set is
+    // populated and primary review remains on: neither may pull the subtask
+    // layer back on.
+    config.review = {
+      primaryReviewers: [{ source: "external", id: "subtask-rev" }],
+      subtaskReviewers: [{ source: "external", id: "subtask-rev" }],
+      subtaskEnabled: false,
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-subtask-off",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "completed_unreviewed", `expected completed_unreviewed, got ${result.status}`);
+    assert.equal(result.unreviewed, true, "the change must be explicitly unreviewed");
+    assert.ok(result.acceptedRef, "the changed candidate is still pinned on the unreviewed path");
+    assert.equal(result.reviewCycles.length, 0, "no review cycles may be fabricated");
+    assert.equal(result.reviewReport ?? undefined, undefined, "no review report may be fabricated");
+    await assert.rejects(
+      () => access(reviewerMarker),
+      "the subtask reviewer must never be invoked while subtask review is off",
+    );
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: subtask review off ignores an invalid subtask selection", async () => {
+  const root = await mkTmp("pi-wwl-subtask-off-invalid-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-subtask-off-invalid");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-subtask-off-invalid");
+    await mkdir(artifactDir, { recursive: true });
+
+    const { command } = await createFakeExecutor(root);
+    const config = buildConfig(command);
+    // The unreviewed path never resolves or validates the subtask selection,
+    // so an unknown subtask reviewer id must not block completion.
+    config.review = {
+      subtaskReviewers: [{ source: "external", id: "missing-reviewer" }],
+      subtaskEnabled: false,
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-subtask-off-invalid",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "completed_unreviewed", `expected completed_unreviewed, got ${result.status}`);
+    assert.equal(result.unreviewed, true);
+    assert.equal(result.reviewCycles.length, 0);
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: subtask review on uses the subtask reviewer set, not the primary set", async () => {
+  const root = await mkTmp("pi-wwl-subtask-set-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-subtask-set");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-subtask-set");
+    await mkdir(artifactDir, { recursive: true });
+    const primaryMarker = join(root, "primary-reviewer-ran.txt");
+    const subtaskMarker = join(root, "subtask-reviewer-ran.txt");
+
+    const { command } = await createFakeExecutor(root);
+    const config = buildConfig(command, "fake-exec", [
+      markerPassReviewer("primary-rev", primaryMarker),
+      markerPassReviewer("subtask-rev", subtaskMarker),
+    ]);
+    // A split configuration: the primary set and the subtask set are stored
+    // separately, and subtask review must run only the subtask reviewers.
+    config.review = {
+      primaryReviewers: [{ source: "external", id: "primary-rev" }],
+      subtaskReviewers: [{ source: "external", id: "subtask-rev" }],
+    };
+    const updates: Array<{ phase: string; message: string }> = [];
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-subtask-set",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+      onUpdate: (update) => updates.push(update),
+    });
+
+    assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
+    assert.equal(result.reviewCycles.length, 1, "should have one review cycle");
+    assert.equal(result.reviewCycles[0].verdict, "pass");
+    await access(subtaskMarker);
+    await assert.rejects(
+      () => access(primaryMarker),
+      "the primary reviewer set must never be invoked for subtask review",
+    );
+    assert.ok(
+      updates.some((update) => update.phase === "reviewing" && update.message === "subtask-rev started"),
+      "progress must name the subtask reviewer",
+    );
+    assert.ok(
+      !updates.some((update) => update.phase === "reviewing" && update.message === "primary-rev started"),
+      "progress must never name the primary reviewer for subtask review",
+    );
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: empty subtask reviewer set returns completed_unreviewed without using the primary set", async () => {
+  const root = await mkTmp("pi-wwl-subtask-empty-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-subtask-empty");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-subtask-empty");
+    await mkdir(artifactDir, { recursive: true });
+    const primaryMarker = join(root, "primary-reviewer-ran.txt");
+
+    const { command } = await createFakeExecutor(root);
+    const config = buildConfig(command, "fake-exec", [markerPassReviewer("primary-rev", primaryMarker)]);
+    // Subtask review stays on but its separate set is empty: the pre-split
+    // no-reviewer semantics hold for the subtask layer, and the populated
+    // primary set must not silently become the subtask reviewers.
+    config.review = {
+      primaryReviewers: [{ source: "external", id: "primary-rev" }],
+      subtaskReviewers: [],
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-subtask-empty",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "completed_unreviewed", `expected completed_unreviewed, got ${result.status}`);
+    assert.equal(result.unreviewed, true);
+    assert.equal(result.reviewCycles.length, 0);
+    await assert.rejects(
+      () => access(primaryMarker),
+      "the primary reviewer set must not be invoked as a subtask fallback",
+    );
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: primary toggle off leaves subtask review independent", async () => {
+  const root = await mkTmp("pi-wwl-subtask-independent-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-subtask-independent");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-subtask-independent");
+    await mkdir(artifactDir, { recursive: true });
+    const subtaskMarker = join(root, "subtask-reviewer-ran.txt");
+
+    const { command } = await createFakeExecutor(root);
+    const config = buildConfig(command, "fake-exec", [markerPassReviewer("subtask-rev", subtaskMarker)]);
+    // Primary automatic review is off; the subtask layer must still review.
+    config.review = {
+      primaryEnabled: false,
+      subtaskReviewers: [{ source: "external", id: "subtask-rev" }],
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-subtask-independent",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
+    assert.equal(result.reviewCycles[0].verdict, "pass");
+    await access(subtaskMarker);
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: unknown subtask reviewer id still blocks review", async () => {
+  const root = await mkTmp("pi-wwl-subtask-unknown-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-subtask-unknown");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-subtask-unknown");
+    await mkdir(artifactDir, { recursive: true });
+
+    const { command } = await createFakeExecutor(root);
+    const config = buildConfig(command);
+    config.review = {
+      subtaskReviewers: [{ source: "external", id: "missing-reviewer" }],
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-subtask-unknown",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "reviewer_blocked", `expected reviewer_blocked, got ${result.status}`);
+    assert.match(result.error ?? "", /unknown enabled reviewer ids/);
+    assert.ok(!result.acceptedRef, "fail-closed blocking must not pin a candidate");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: duplicate subtask reviewer ids still block review", async () => {
+  const root = await mkTmp("pi-wwl-subtask-dup-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-subtask-dup");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-subtask-dup");
+    await mkdir(artifactDir, { recursive: true });
+
+    const { command } = await createFakeExecutor(root);
+    const reviewer = markerPassReviewer("subtask-rev", join(root, "marker.txt"));
+    const config = buildConfig(command, "fake-exec", [reviewer]);
+    config.review = {
+      subtaskReviewers: [
+        { source: "external", id: "subtask-rev" },
+        { source: "external", id: "subtask-rev" },
+      ],
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-subtask-dup",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "reviewer_blocked", `expected reviewer_blocked, got ${result.status}`);
+    assert.match(result.error ?? "", /duplicate enabled reviewer ids/);
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

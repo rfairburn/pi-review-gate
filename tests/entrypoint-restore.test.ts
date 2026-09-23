@@ -272,6 +272,7 @@ review: { activeReviewers: [
     // In-session settings change: swap the selection from alpha to beta via
     // the /review-settings UI. No reload happens.
     let rootMenu = 0;
+    let reviewMenu = 0;
     let reviewerMenu = 0;
     await reviewSettings!("", {
       ui: {
@@ -280,6 +281,12 @@ review: { activeReviewers: [
             return rootMenu++ === 0
               ? options.find((option) => option.startsWith("Reviewers"))!
               : "Save changes";
+          }
+          if (title === "Review") {
+            // The Review submenu: open the primary reviewer picker, then Back.
+            return reviewMenu++ === 0
+              ? options.find((option) => option.startsWith("Primary reviewers"))!
+              : "Back";
           }
           if (title.startsWith("Reviewers —")) {
             const step = reviewerMenu++;
@@ -371,9 +378,12 @@ review: { activeReviewers: [
     await assert.rejects(access(alphaInvocations), /ENOENT/, "nothing may run while no reviewer is usable");
 
     // Fix the selection in-session: drop the unresolvable selection and
-    // enable alpha via /review-settings. The unavailable selection stays
-    // visible (and save is rejected) until it is explicitly removed.
+    // enable alpha via /review-settings — in BOTH imported sets, because the
+    // legacy import copied the unresolvable selection into the subtask set
+    // too. The unavailable selection stays visible (and save is rejected)
+    // until it is explicitly removed.
     let rootMenu = 0;
+    let reviewMenu = 0;
     let reviewerMenu = 0;
     await reviewSettings!("", {
       ui: {
@@ -383,10 +393,20 @@ review: { activeReviewers: [
               ? options.find((option) => option.startsWith("Reviewers"))!
               : "Save changes";
           }
+          if (title === "Review") {
+            // The Review submenu: primary picker, then subtask picker, then Back.
+            const step = reviewMenu++;
+            if (step === 0) return options.find((option) => option.startsWith("Primary reviewers"))!;
+            if (step === 1) return options.find((option) => option.startsWith("Subtask reviewers"))!;
+            return "Back";
+          }
           if (title.startsWith("Reviewers —")) {
+            // Flat step sequence across both picker visits: primary set first
+            // (remove the unresolvable selection, enable alpha), then the
+            // subtask set in the same order.
             const step = reviewerMenu++;
-            if (step === 0) return options.find((option) => option.includes("[unavailable]"))!;
-            if (step === 1) return options.find((option) => option.startsWith("alpha [generic-cli]"))!;
+            if (step === 0 || step === 3) return options.find((option) => option.includes("[unavailable]"))!;
+            if (step === 1 || step === 4) return options.find((option) => option.startsWith("alpha [generic-cli]"))!;
             return "Back";
           }
           return undefined;
@@ -484,6 +504,7 @@ review: { activeReviewers: [
 
     // Swap the selection to beta while alpha is still running.
     let rootMenu = 0;
+    let reviewMenu = 0;
     let reviewerMenu = 0;
     await reviewSettings!("", {
       ui: {
@@ -492,6 +513,12 @@ review: { activeReviewers: [
             return rootMenu++ === 0
               ? options.find((option) => option.startsWith("Reviewers"))!
               : "Save changes";
+          }
+          if (title === "Review") {
+            // The Review submenu: open the primary reviewer picker, then Back.
+            return reviewMenu++ === 0
+              ? options.find((option) => option.startsWith("Primary reviewers"))!
+              : "Back";
           }
           if (title.startsWith("Reviewers —")) {
             const step = reviewerMenu++;

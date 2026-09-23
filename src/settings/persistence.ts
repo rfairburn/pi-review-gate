@@ -24,7 +24,16 @@ export interface ReviewSettingsSelection {
   workerResources: WorkerResourceCatalog;
   executeRoute?: WorkerRouteEntry[];
   researchRoute?: WorkerRouteEntry[];
-  activeReviewers: ActiveReviewerSelection[];
+  /** Automatic review of the primary assistant's own changes (Execute + Orchestrate). */
+  primaryReviewers: ActiveReviewerSelection[];
+  /** Automatic review of subtask results before ordinary accepted landing. */
+  subtaskReviewers: ActiveReviewerSelection[];
+  /** Automatic primary review on; manual review commands are unaffected. */
+  primaryEnabled: boolean;
+  /** Automatic subtask review on. */
+  subtaskEnabled: boolean;
+  /** Landed-change re-review choice; inactive while automatic primary review is off. */
+  reviewLandedChanges: boolean;
   reviewerTimeoutMs: number;
   executorTimeoutMs: number;
   maxCorrectionCycles: number;
@@ -72,7 +81,16 @@ export async function persistReviewSettings(
     // externalAgents is intentionally untouched: agents are not editable in
     // this UI, and the save boundary canonicalizes the latest on-disk form.
     const review = isRecord(parsed.review) ? { ...parsed.review } : {};
-    review.activeReviewers = selection.activeReviewers.map((reviewer) => ({ ...reviewer }));
+    // The split reviewer fields are the only canonical reviewer state (issue
+    // #175): every save persists them and removes the legacy single-set key,
+    // even when no manual reviewer edit was staged, so the stored record
+    // never keeps a second reviewer set after the first save.
+    review.primaryReviewers = selection.primaryReviewers.map((reviewer) => ({ ...reviewer }));
+    review.subtaskReviewers = selection.subtaskReviewers.map((reviewer) => ({ ...reviewer }));
+    review.primaryEnabled = selection.primaryEnabled;
+    review.subtaskEnabled = selection.subtaskEnabled;
+    review.reviewLandedChanges = selection.reviewLandedChanges;
+    delete review.activeReviewers;
     parsed.review = review;
     parsed.operatingMode = selection.operatingMode;
     parsed.modeCycleShortcut = selection.modeCycleShortcut;

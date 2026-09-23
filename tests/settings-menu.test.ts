@@ -374,32 +374,42 @@ test("reviewers menu keeps the toggled reviewer highlighted", async () => {
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const harness = createTuiSettingsContext([
-    [...downs(ROOT.reviewers), KEY_ENTER],      // root → Reviewers
+    [...downs(ROOT.reviewers), KEY_ENTER],      // root → Reviewers submenu
+    [...downs(3), KEY_ENTER],                   // submenu: Primary reviewers
     [KEY_DOWN, KEY_ENTER],                      // toggle "two" on (row 1)
-    [KEY_ESCAPE],                               // re-show: two retained; back to root
+    [KEY_ESCAPE],                               // re-show: two retained; back to submenu
+    [KEY_ESCAPE],                               // back to root
     [...downs(10), KEY_ENTER],                  // save (reviewers row + 10)
   ]);
   setMenuTuiHost(harness.host);
   await registered.handler("", harness.context);
 
-  const [, reviewers1, reviewers2] = harness.lists;
-  const [rootFirst, reviewersFirst, reviewersSecond, rootSecond] = harness.initialIndexes;
+  const [, reviewSubmenu, reviewers1, reviewers2, reviewSubmenu2] = harness.lists;
+  const [rootFirst, submenuFirst, reviewersFirst, reviewersSecond, submenuSecond, rootSecond] = harness.initialIndexes;
   assert.equal(rootFirst, 0);
-  // First visit opens at the first reviewer; the toggle targets row 1.
+  // The submenu opens at the first row (the automatic primary review toggle).
+  assert.equal(submenuFirst, 0);
+  assert.ok(reviewSubmenu!.items[3]!.label.includes("Primary reviewers"));
+  // First picker visit opens at the first reviewer; the toggle targets row 1.
   assert.equal(reviewersFirst, 0);
   assert.equal(reviewers1!.items[1]!.label, "two [generic-cli] ✗");
   // Re-shown after the toggle: same reviewer row preselected with the flipped ✓.
   assert.equal(reviewersSecond, 1);
   assert.equal(reviewers2!.items[1]!.value, "external:two");
   assert.equal(reviewers2!.items[1]!.label, "two [generic-cli] ✓");
+  // The submenu re-show retains the Primary reviewers row; the root re-show
+  // retains the Reviewers row.
+  assert.equal(submenuSecond, 3);
   assert.equal(rootSecond, ROOT.reviewers);
   assert.equal(harness.selectCalls.length, 0);
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.review.activeReviewers, [
+  assert.deepEqual(saved.review.primaryReviewers, [
     { source: "external", id: "one" },
     { source: "external", id: "two" },
   ]);
+  assert.deepEqual(saved.review.subtaskReviewers, [{ source: "external", id: "one" }]);
+  assert.equal(saved.review.activeReviewers, undefined);
 });
 
 test("worker resources keep the edited resource highlighted after a model switch re-sorts the list", async () => {

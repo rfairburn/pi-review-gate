@@ -259,8 +259,105 @@ export type ActiveReviewerSelection =
   | { source: "pi"; model: string; thinkingLevel?: ThinkingLevel }
   | { source: "external"; id: string };
 
+/** Which review layer a selection, resolution, or enablement flag applies to. */
+export type ReviewLayer = "primary" | "subtask";
+
+/** Default automatic-review enablement for the primary layer (issue #175). */
+export const REVIEW_PRIMARY_ENABLED_DEFAULT = true;
+/** Default automatic-review enablement for the subtask layer (issue #175). */
+export const REVIEW_SUBTASK_ENABLED_DEFAULT = true;
+/** Default landed-change re-review posture: landed changes stay checkpointed out of the primary window. */
+export const REVIEW_LANDED_CHANGES_DEFAULT = false;
+
 export interface ReviewSelectionConfig {
+  /**
+   * Legacy single reviewer set (pre-#175 records). It is never the effective
+   * state by itself: `effectiveReviewSettings` imports it into both split
+   * sets in memory on load. Save removes the key; loading never rewrites it.
+   */
   activeReviewers?: ActiveReviewerSelection[];
+  /** Automatic review of the primary assistant's own changes (shared by Execute and Orchestrate). */
+  primaryReviewers?: ActiveReviewerSelection[];
+  /** Automatic review of subtask results before ordinary accepted landing. */
+  subtaskReviewers?: ActiveReviewerSelection[];
+  /**
+   * Automatic primary review is on. Controls automatic review only: manual
+   * `/review-now` and `/ask-reviewer` stay usable while reviewers remain
+   * selected. Defaults on (preserves pre-split behavior).
+   */
+  primaryEnabled?: boolean;
+  /** Automatic subtask review is on. Defaults on (preserves pre-split behavior). */
+  subtaskEnabled?: boolean;
+  /**
+   * Changes landed into the primary review window stay pending in that
+   * window's diff instead of being checkpointed out. Inactive while
+   * `primaryEnabled` is off. Defaults off (preserves current behavior).
+   */
+  reviewLandedChanges?: boolean;
+}
+
+/**
+ * Effective, layer-resolved review settings derived from one configuration
+ * (issue #175). Field names match the canonical stored `review.*` fields
+ * one-for-one; this is the shared seam later runtime integration consumes.
+ */
+export interface EffectiveReviewSettings {
+  /** Reviewer set for the primary assistant's own changes (Execute + Orchestrate). */
+  primaryReviewers: ActiveReviewerSelection[];
+  /** Reviewer set for subtask review before ordinary accepted landing. */
+  subtaskReviewers: ActiveReviewerSelection[];
+  /** Automatic primary review on (manual review commands are unaffected). */
+  primaryEnabled: boolean;
+  /** Automatic subtask review on. */
+  subtaskEnabled: boolean;
+  /** Landed-change re-review choice; inactive while `primaryEnabled` is off. */
+  reviewLandedChanges: boolean;
+}
+
+function cloneReviewerSelections(values: readonly ActiveReviewerSelection[] | undefined): ActiveReviewerSelection[] {
+  return (values ?? []).map((selection) => ({ ...selection }));
+}
+
+/**
+ * The single derivation seam for the #175 reviewer split.
+ *
+ * - A configuration that stores either split set (`primaryReviewers` or
+ *   `subtaskReviewers`) is a split configuration: its saved choices are
+ *   authoritative, a coexisting legacy `activeReviewers` copy is ignored
+ *   without a rewrite (the same doubled-record precedence as the
+ *   pre-cutover fields), and it is never re-imported over saved choices.
+ * - A legacy configuration that stores only `activeReviewers` is imported
+ *   in memory on every load: the same selections become both effective
+ *   sets, so menus and resolution see them immediately while the stored
+ *   record stays byte-identical until the next save. The import is
+ *   stateless and idempotent, so Cancel keeps the file (and the session
+ *   keeps the effective sets) and re-loading the unchanged file re-imports
+ *   identically.
+ *
+ * Returned arrays are fresh clones; callers may mutate them freely.
+ */
+export function effectiveReviewSettings(config: ReviewGateConfig): EffectiveReviewSettings {
+  const review = config.review ?? {};
+  const primaryEnabled = review.primaryEnabled ?? REVIEW_PRIMARY_ENABLED_DEFAULT;
+  const subtaskEnabled = review.subtaskEnabled ?? REVIEW_SUBTASK_ENABLED_DEFAULT;
+  const reviewLandedChanges = review.reviewLandedChanges ?? REVIEW_LANDED_CHANGES_DEFAULT;
+  if (review.primaryReviewers !== undefined || review.subtaskReviewers !== undefined) {
+    return {
+      primaryReviewers: cloneReviewerSelections(review.primaryReviewers),
+      subtaskReviewers: cloneReviewerSelections(review.subtaskReviewers),
+      primaryEnabled,
+      subtaskEnabled,
+      reviewLandedChanges,
+    };
+  }
+  const legacy = cloneReviewerSelections(review.activeReviewers);
+  return {
+    primaryReviewers: cloneReviewerSelections(legacy),
+    subtaskReviewers: cloneReviewerSelections(legacy),
+    primaryEnabled,
+    subtaskEnabled,
+    reviewLandedChanges,
+  };
 }
 
 export interface ExecutionRetryPolicy {
@@ -556,11 +653,14 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
 function rejectLegacyReviewFields(value: Record<string, unknown>): void {
   const legacy = ["decider", "reviewers", "enabledReviewerIds"].filter((field) => value[field] !== undefined);
   if (legacy.length === 0) return;
-  const canonical = isRecord(value.review) && Array.isArray(value.review.activeReviewers);
+  const canonical = isRecord(value.review)
+    && (Array.isArray(value.review.activeReviewers)
+      || Array.isArray(value.review.primaryReviewers)
+      || Array.isArray(value.review.subtaskReviewers));
   if (canonical) return; // doubled record: the canonical selection wins
   throw new Error(
     `unsupported legacy reviewer configuration: ${legacy.join(", ")} is no longer accepted; ` +
-    "select reviewers with review.activeReviewers and define external harnesses in externalAgents",
+    "select reviewers with review.primaryReviewers/review.subtaskReviewers and define external harnesses in externalAgents",
   );
 }
 
@@ -691,7 +791,12 @@ export interface ReviewerResolution {
 }
 
 /**
- * Resolve the canonical `review.activeReviewers` selection.
+ * Resolve one review layer's reviewer selection (issue #175).
+ *
+ * The selections come from `effectiveReviewSettings`: the layer's stored set
+ * for a split configuration, or the legacy `review.activeReviewers` import
+ * for a pre-split one. Omitting the layer resolves the primary set, which
+ * preserves pre-split runtime behavior until dedicated runtime integration.
  *
  * `scopedModels` distinguishes the two resolution domains:
  * - a live configuration is resolved against the currently scoped Pi models
@@ -703,8 +808,13 @@ export interface ReviewerResolution {
  *   external references resolve against the agent definitions frozen beside
  *   them. Later settings or scope changes never re-resolve a frozen config.
  */
-export function resolveReviewers(config: ReviewGateConfig, scopedModels?: string[]): ReviewerResolution {
-  const selections = config.review?.activeReviewers ?? [];
+export function resolveReviewers(
+  config: ReviewGateConfig,
+  scopedModels?: string[],
+  layer: ReviewLayer = "primary",
+): ReviewerResolution {
+  const settings = effectiveReviewSettings(config);
+  const selections = layer === "primary" ? settings.primaryReviewers : settings.subtaskReviewers;
   const scoped = new Set(scopedModels ?? []);
   const reviewers: DeciderConfig[] = [];
   const unknownIds: string[] = [];
@@ -758,9 +868,12 @@ export function reviewerSelectionKey(selection: ActiveReviewerSelection): string
 export function frozenReviewerSelection(
   config: ReviewGateConfig,
   resolution: ReviewerResolution,
+  layer: ReviewLayer = "primary",
 ): { activeReviewers: ActiveReviewerSelection[]; externalAgents: ExternalAgentCatalog } {
   const unknown = new Set(resolution.unknownIds);
-  const activeReviewers = (config.review?.activeReviewers ?? [])
+  const settings = effectiveReviewSettings(config);
+  const selections = layer === "primary" ? settings.primaryReviewers : settings.subtaskReviewers;
+  const activeReviewers = selections
     .filter((selection) => !unknown.has(reviewerSelectionKey(selection)))
     .map((selection) => ({ ...selection }));
   const needed = new Set(
@@ -777,13 +890,25 @@ export function frozenReviewerSelection(
 }
 
 /**
- * Automatic review is enabled when the gate is on and at least one reviewer
- * resolves. Unresolvable or duplicated selections no longer disable the whole
- * gate: they produce explicit bounded outcomes at run time while every
- * resolvable reviewer still runs (issue 15 reconciliation semantics).
+ * Automatic review is enabled for a layer when the gate is on and at least
+ * one of the layer's reviewers resolves. Unresolvable or duplicated
+ * selections no longer disable the whole gate: they produce explicit bounded
+ * outcomes at run time while every resolvable reviewer still runs (issue 15
+ * reconciliation semantics).
+ *
+ * This predicate describes reviewer availability, not the human-controlled
+ * automatic-review policy switch. Manual `/review-now` and `/ask-reviewer`
+ * share it with review-window materialization, so they remain usable with
+ * selected primary reviewers even when `primaryEnabled` is off. Automatic
+ * primary settlement and subtask lifecycles apply their respective switches
+ * from `effectiveReviewSettings` at their own review boundaries.
  */
-export function automaticReviewEnabled(config: ReviewGateConfig, scopedModels?: string[]): boolean {
-  const resolved = resolveReviewers(config, scopedModels);
+export function automaticReviewEnabled(
+  config: ReviewGateConfig,
+  scopedModels?: string[],
+  layer: ReviewLayer = "primary",
+): boolean {
+  const resolved = resolveReviewers(config, scopedModels, layer);
   return config.enabled && resolved.reviewers.length > 0;
 }
 
@@ -1073,20 +1198,35 @@ function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {
   if (!isRecord(value)) {
     throw new Error("review must be an object");
   }
+  for (const field of ["primaryEnabled", "subtaskEnabled", "reviewLandedChanges"] as const) {
+    const flag = value[field];
+    if (flag !== undefined && typeof flag !== "boolean") {
+      throw new Error(`review.${field} must be a boolean`);
+    }
+  }
   return {
     activeReviewers: value.activeReviewers === undefined
       ? undefined
       : normalizeActiveReviewers(value.activeReviewers),
+    primaryReviewers: value.primaryReviewers === undefined
+      ? undefined
+      : normalizeActiveReviewers(value.primaryReviewers, "review.primaryReviewers"),
+    subtaskReviewers: value.subtaskReviewers === undefined
+      ? undefined
+      : normalizeActiveReviewers(value.subtaskReviewers, "review.subtaskReviewers"),
+    ...(value.primaryEnabled !== undefined ? { primaryEnabled: value.primaryEnabled as boolean } : {}),
+    ...(value.subtaskEnabled !== undefined ? { subtaskEnabled: value.subtaskEnabled as boolean } : {}),
+    ...(value.reviewLandedChanges !== undefined ? { reviewLandedChanges: value.reviewLandedChanges as boolean } : {}),
   };
 }
 
-function normalizeActiveReviewers(value: unknown): ActiveReviewerSelection[] {
+function normalizeActiveReviewers(value: unknown, field = "review.activeReviewers"): ActiveReviewerSelection[] {
   if (!Array.isArray(value)) {
-    throw new Error("review.activeReviewers must be an array");
+    throw new Error(`${field} must be an array`);
   }
   return value.map((selection) => {
     if (!isRecord(selection)) {
-      throw new Error("review.activeReviewers entries must be objects");
+      throw new Error(`${field} entries must be objects`);
     }
     if (selection.source === "pi") {
       if (typeof selection.model !== "string" || !selection.model.trim()) {
@@ -1106,7 +1246,7 @@ function normalizeActiveReviewers(value: unknown): ActiveReviewerSelection[] {
       validateConfiguredId(selection.id, "external reviewer");
       return { source: "external", id: selection.id };
     }
-    throw new Error("unsupported review.activeReviewers source");
+    throw new Error(`unsupported ${field} source`);
   });
 }
 

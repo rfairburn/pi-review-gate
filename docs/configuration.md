@@ -38,10 +38,13 @@ described only briefly here is owned by the linked page.
   warns loudly when it is set instead of silently swallowing it.
 - Top-level `enabled: false` is the automatic-review master switch only. It does **not**
   disable configured worker routes.
-- Clearing every reviewer in `/review-settings` disables automatic review without
-  disabling delegated execution. The preserved review window stays open (deferring
-  each review with a notice) until reviewers are configured again or the window is
-  cleared explicitly; it never turns into a pass.
+- Clearing every reviewer for a review layer in `/review-settings` disables that layer's
+  automatic review without disabling delegated execution. The preserved review window
+  stays open (deferring each review with a notice) until reviewers are configured again
+  or the window is cleared explicitly; it never turns into a pass. Manual primary
+  review commands remain available while primary reviewers stay selected (see
+  [Review layers](#review-layers-and-the-legacy-activereviewers-import)); the stored
+  automatic-review toggles never gate them.
 
 ## Top-level fields
 
@@ -182,6 +185,67 @@ through `/review-settings` materializes an explicit model-supported level.
 }
 ```
 
+### Review layers and the legacy `activeReviewers` import
+
+Issue #175 splits automatic review into two independently controlled layers, both
+configured from the **Review** submenu in `/review-settings` and stored under the
+existing `review` object:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `review.primaryReviewers` | — | Reviewer set for automatic review of the primary assistant's own changes (one policy shared by `execute` and `orchestrate`). |
+| `review.subtaskReviewers` | — | Reviewer set for automatic review of subtask results before ordinary accepted landing. |
+| `review.primaryEnabled` | `true` | Automatic review of the primary assistant's own changes is on (one policy shared by `execute` and `orchestrate`). Controls automatic review only: manual `/review-now` and `/ask-reviewer` remain usable while reviewers stay selected, and `/review-pause` is unchanged as a temporary control. |
+| `review.subtaskEnabled` | `true` | Automatic subtask review is on: ordinary accepted subtask landings go through the subtask reviewer set before landing. Off lets subtasks land without their own review; their changes still follow `review.reviewLandedChanges`. |
+| `review.reviewLandedChanges` | `false` | Landings into the primary review window that did **not** already complete a successful subtask review stay pending in that window's diff as ordinary primary review evidence instead of being checkpointed out. Inactive while automatic primary review is off (landed changes are checkpointed out as before). |
+
+Both layers may be saved Off, including a configuration that performs no automatic
+review at all. The selected primary reviewer set remains available to manual
+`/review-now` and `/ask-reviewer`: the toggles control automatic review only
+and never gate those commands. While automatic primary review is off, the primary review
+window/baseline stays tracked across quick iterations so a later manual review can
+inspect those changes; suppressing the automatic run never records a synthetic PASS.
+There are no model-controlled paths to these settings: the submenu is staged by a
+human like every other settings section, and the reviewer sets are drawn from the
+existing reviewer catalog above (no second definition catalog and no model controls).
+
+**Landed changes.** With `review.reviewLandedChanges` on, a landing into the parent
+session's own workspace that did **not** already complete a successful subtask review
+— an unreviewed subtask merge, or an unreviewed exceptional-path landing such as
+explicit force-merge/salvage or `SubtasksMarkClean` resolved-conflict handling where
+the landing path supports it — keeps its diff in the primary review window as ordinary
+evidence instead of being checkpointed out. A landing that already completed a
+successful subtask review keeps the existing checkpoint/bypass handling and is not
+re-reviewed in the primary window. The review itself always settles at the primary
+model's normal idle point, exactly like any other primary exchange; a landing never
+triggers an immediate review. The existing conflict and salvage recovery warnings and
+fail-closed gates are unchanged: a forced merge is still a mechanical landing attempt,
+not verification. Landings into a target other than the parent session's workspace
+never enter the parent review window
+(see [Delegated execution](delegated-execution.md#conflicts-and-gates)). With the
+option off — or while automatic primary review is off — landed changes are
+checkpointed out of the window as before.
+
+**Legacy import.** A config that stores only the legacy `review.activeReviewers`
+single set is imported in memory on every load: the same selections become both
+effective sets (primary and subtask) and both menus display them immediately, while
+the stored file stays byte-identical — loading never rewrites it. The lifecycle:
+
+- **Save (even with no manual edit)** persists the effective split fields and removes
+  the `review.activeReviewers` key, so a saved record never keeps a second canonical
+  reviewer set. Manual edits win over the imported values.
+- **Cancel or Esc** leaves the file untouched, but the imported sets remain effective
+  for the running session; re-loading the unchanged file re-imports identically.
+- A config that already stores the split fields honors its saved choices and never
+  re-imports the legacy copy. A record that carries both uses the split fields and
+  ignores the obsolete copy without a rewrite (the same doubled-record precedence as
+  the pre-cutover fields below).
+
+The split state is derived through one shared accessor, `effectiveReviewSettings(config)`,
+whose fields match the stored `review.*` fields one-for-one (`primaryReviewers`,
+`subtaskReviewers`, `primaryEnabled`, `subtaskEnabled`, `reviewLandedChanges`), so
+automatic review consumes layer-specific values from a single canonical source.
+
 Pi and the selected provider own reasoning effort and token-budget behavior;
 review-gate does not impose a second output-side thinking cap. Reviewer and executor
 selections remain separate from the orchestrator. External harness reasoning is
@@ -216,10 +280,10 @@ The pre-cutover fields `decider`, `reviewers`, `enabledReviewerIds`,
 `execution.externalExecutors` are no longer accepted. A config that carries
 only one of them fails strict validation. Startup warns and omits unsupported fields;
 it does not convert them into reviewer or worker selections. Use `externalAgents`
-plus `review.activeReviewers`, or `execution.workerResources`. There is no migration: a record
+plus `review.primaryReviewers`/`review.subtaskReviewers`, or `execution.workerResources`. There is no migration: a record
 that carries both the old and the new shape uses the canonical fields and ignores the
 old copies, and `/review-settings` saves never rewrite stored records into either
-shape. Reviewer and executor selections that cannot be resolved against the current
+pre-cutover shape. Reviewer and executor selections that cannot be resolved against the current
 catalog remain reported (as unavailable selections) instead of being dropped or
 silently disabling review.
 
@@ -489,10 +553,22 @@ boundaries are owned by [Web tools](web-tools.md) and
   those resources, referenced by key. Either route can exclude a resource; a missing or
   empty route means no models for that role. Per-route reasoning lets the same local
   model use different effort without creating a second capacity bucket.
-- **Reviewers** is a multi-selection, `/scoped-models`-style picker over the same
-  Pi-scoped models plus review-capable entries from `externalAgents`. Clearing every
-  reviewer is valid and disables automatic review without disabling delegated execution.
-  Each selected internal reviewer has its own **Reasoning** row.
+- **Reviewers** opens the **Review** submenu: **Automatic primary review**,
+  **Automatic subtask review**, and **Review landed changes** toggles, plus one
+  multi-selection, `/scoped-models`-style reviewer picker per layer (**Primary
+  reviewers** and **Subtask reviewers**) over the same Pi-scoped models plus
+  review-capable entries from `externalAgents`. Each layer may be off. Saving a layer
+  Off stops that layer's automatic review from that point on (already-running reviewer
+  and executor processes finish with their launch values), while manual `/review-now`
+  and `/ask-reviewer` stay usable with selected primary reviewers either way, and
+  `/review-pause` remains unchanged. The landed-changes choice is inactive while
+  automatic primary review is off. Clearing every reviewer for a layer is valid and
+  disables that layer's automatic review without disabling delegated execution (a
+  layer with no reviewers cannot run
+  one). Each selected internal reviewer has its own **Reasoning** row per set. A legacy
+  `review.activeReviewers` record displays in both
+  sets immediately; see
+  [Review layers](#review-layers-and-the-legacy-activereviewers-import).
 - **Timeouts** edits the default reviewer and executor timeouts in minutes. Explicit
   `review.timeoutMs` and `execution.timeoutMs` values on an `externalAgents` entry
   override these defaults for that external harness role.

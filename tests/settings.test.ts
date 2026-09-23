@@ -35,8 +35,10 @@ test("/review-settings stages executor and reviewer changes and saves them toget
     "fake [run-as-binary]",
     "1  current",
     "Back",
-    rootSettingsRow("Reviewers", "1/2 selected"),
+    rootSettingsRow("Reviewers", "primary 1/2 selected · auto · subtask 1/2 selected · auto"),
+    reviewSettingsRow("Primary reviewers", "1/2 selected"),
     "two [generic-cli] ✗",
+    "Back",
     "Back",
     rootSettingsRow("Global concurrency", "4"),
     "2",
@@ -58,10 +60,17 @@ test("/review-settings stages executor and reviewer changes and saves them toget
   });
   assert.equal(saved.execution.activeExecutor, undefined);
   assert.equal(saved.execution.maxWorkers, 2);
-  assert.deepEqual(saved.review.activeReviewers, [
+  // The manual primary edit persists in the split form; the subtask set keeps
+  // the imported legacy selections, and the legacy key is gone.
+  assert.deepEqual(saved.review.primaryReviewers, [
     { source: "external", id: "one" },
     { source: "external", id: "two" },
   ]);
+  assert.deepEqual(saved.review.subtaskReviewers, [{ source: "external", id: "one" }]);
+  assert.equal(saved.review.primaryEnabled, true);
+  assert.equal(saved.review.subtaskEnabled, true);
+  assert.equal(saved.review.reviewLandedChanges, false);
+  assert.equal(saved.review.activeReviewers, undefined);
   // The canonical catalog keeps the configured agent order; settings saves
   // never reorder or migrate the shared external agent list.
   assert.deepEqual(Object.keys(saved.externalAgents), ["one", "two", "fake"]);
@@ -218,14 +227,19 @@ review: { activeReviewers: [
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Reviewers", "1/1 selected"),
+    rootSettingsRow("Reviewers", "primary 1/1 selected · auto · subtask 1/1 selected · auto"),
+    reviewSettingsRow("Primary reviewers", "1/1 selected"),
     "Clear all",
+    "Back",
     "Back",
     "Save changes",
   ]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.review.activeReviewers, []);
+  assert.deepEqual(saved.review.primaryReviewers, []);
+  // The untouched subtask set keeps the imported legacy selection.
+  assert.deepEqual(saved.review.subtaskReviewers, [{ source: "external", id: "one" }]);
+  assert.equal(saved.review.activeReviewers, undefined);
 });
 
 test("root Escape leaves the settings file unchanged", async () => {
@@ -324,7 +338,11 @@ review: { activeReviewers: [
   await registered.handler("", contextWithSelections(["Save changes"]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.review.activeReviewers, [{ source: "external", id: "legacy" }]);
+  // Save without any manual edit persists the effective split fields (the
+  // legacy import copied into both sets) and removes the legacy key.
+  assert.deepEqual(saved.review.primaryReviewers, [{ source: "external", id: "legacy" }]);
+  assert.deepEqual(saved.review.subtaskReviewers, [{ source: "external", id: "legacy" }]);
+  assert.equal(saved.review.activeReviewers, undefined);
   // The canonical config is persisted as configured; review defaults are
   // applied at resolution time, never rewritten into the stored record.
   assert.deepEqual(saved.externalAgents, {
@@ -359,19 +377,24 @@ test("reviewer picker includes scoped models and shared review-capable external 
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Reviewers", "0/2 selected — review disabled by master setting"),
+    rootSettingsRow("Reviewers", "primary 0/2 selected · auto off (no reviewers) · subtask 0/2 selected · auto off (no reviewers) — review disabled by master setting"),
+    reviewSettingsRow("Primary reviewers", "0/2 selected"),
     "gpt-5.6-sol [openai-codex] ✗",
     "High  current",
     "codex [codex-cli] ✗",
+    "Back",
     "Back",
     "Save changes",
   ], [{ model: reasoningModel("openai-codex", "gpt-5.6-sol") }]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.deepEqual(saved.review.activeReviewers, [
+  assert.deepEqual(saved.review.primaryReviewers, [
     { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
     { source: "external", id: "codex" },
   ]);
+  // The unedited subtask set keeps the (empty) imported legacy selection.
+  assert.deepEqual(saved.review.subtaskReviewers, []);
+  assert.equal(saved.review.activeReviewers, undefined);
 });
 
 test("review policy values are staged and saved atomically", async () => {
@@ -677,9 +700,11 @@ test("internal executor and reviewers persist independent per-model reasoning le
     "Max",
     "Back",
     "Back",
-    rootSettingsRow("Reviewers", "2/2 selected — review disabled by master setting"),
+    rootSettingsRow("Reviewers", "primary 2/2 selected · auto · subtask 2/2 selected · auto — review disabled by master setting"),
+    reviewSettingsRow("Primary reviewers", "2/2 selected"),
     "Reasoning · gpt-5.6-luna [openai-codex]  High",
     "Max",
+    "Back",
     "Back",
     "Save changes",
   ], scoped));
@@ -703,10 +728,17 @@ test("internal executor and reviewers persist independent per-model reasoning le
       resourceId: "pi-b3BlbmFpLWNvZGV4L2dwdC01LjYtbHVuYQ",
     }],
   });
-  assert.deepEqual(saved.review.activeReviewers, [
+  assert.deepEqual(saved.review.primaryReviewers, [
     { source: "pi", model: "openai-codex/gpt-5.6-luna", thinkingLevel: "max" },
     { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
   ]);
+  // The unedited subtask set keeps the imported legacy selections with their
+  // own materialized reasoning levels.
+  assert.deepEqual(saved.review.subtaskReviewers, [
+    { source: "pi", model: "openai-codex/gpt-5.6-luna", thinkingLevel: "high" },
+    { source: "pi", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "high" },
+  ]);
+  assert.equal(saved.review.activeReviewers, undefined);
 });
 
 test("scoped model reasoning choices omit unsupported extended levels", () => {
@@ -1844,6 +1876,18 @@ function assertEffectiveReasoningSupported(savedConfig: unknown, scopedModels: u
       `effective ${kind} reasoning ${String(selection.thinkingLevel)} is supported by ${selection.model}`,
     );
   }
+}
+
+const REVIEW_SETTING_LABELS = [
+  "Automatic primary review",
+  "Automatic subtask review",
+  "Review landed changes",
+  "Primary reviewers",
+  "Subtask reviewers",
+] as const;
+
+function reviewSettingsRow(label: typeof REVIEW_SETTING_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, REVIEW_SETTING_LABELS);
 }
 
 const ROOT_SETTING_LABELS = [

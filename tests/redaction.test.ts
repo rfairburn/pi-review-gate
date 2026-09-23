@@ -129,6 +129,151 @@ test("redactSensitiveText leaves near-miss non-secrets intact", () => {
   assert.equal(redactSensitiveText(text), text);
 });
 
+test("redactSensitiveText preserves GitHub Actions id-token permission declarations (#55)", () => {
+  const workflow = [
+    "on:",
+    "  push:",
+    "    branches: [main]",
+    "jobs:",
+    "  deploy:",
+    "    runs-on: ubuntu-latest",
+    "    permissions:",
+    "      contents: read",
+    "      id-token: write",
+    "    steps:",
+    "      - uses: actions/checkout@v4",
+  ].join("\n");
+
+  assert.equal(redactSensitiveText(workflow), workflow);
+});
+
+test("redactSensitiveText preserves only the bare id-token write under a permissions mapping (#55)", () => {
+  for (const text of [
+    "permissions:\n  id-token: write",
+    "permissions:\r\n  id-token: write\r\n",
+    "permissions:\n  contents: read\n  id-token: write\n  checks: none",
+  ]) {
+    assert.equal(redactSensitiveText(text), text, `expected preserved: ${JSON.stringify(text)}`);
+  }
+});
+
+test("redactSensitiveText redacts id-token write outside a permissions mapping (#55)", () => {
+  // Top-level, and under unrelated mappings (a weak credential value).
+  assert.equal(redactSensitiveText("id-token: write"), "id-token: [REDACTED]");
+  assert.equal(
+    redactSensitiveText("env:\n  id-token: write"),
+    "env:\n  id-token: [REDACTED]",
+  );
+  // Same indentation as the permissions key is a sibling, not a child.
+  assert.equal(
+    redactSensitiveText("permissions:\nid-token: write"),
+    "permissions:\nid-token: [REDACTED]",
+  );
+  // A stale earlier permissions block must not extend over a later mapping.
+  const stale = "permissions:\n  contents: read\nenv:\n  id-token: write";
+  assert.equal(
+    redactSensitiveText(stale),
+    "permissions:\n  contents: read\nenv:\n  id-token: [REDACTED]",
+  );
+  // Under a nested key of the permissions mapping, not directly under it.
+  const nested = "permissions:\n  nested:\n    id-token: write";
+  assert.equal(
+    redactSensitiveText(nested),
+    "permissions:\n  nested:\n    id-token: [REDACTED]",
+  );
+});
+
+test("redactSensitiveText redacts non-bare id-token permission forms (#55)", () => {
+  // `read` was never approved for preservation.
+  assert.equal(
+    redactSensitiveText("permissions:\n  id-token: read"),
+    "permissions:\n  id-token: [REDACTED]",
+  );
+  // Quoted values are not bare.
+  assert.equal(
+    redactSensitiveText('permissions:\n  id-token: "write"'),
+    'permissions:\n  id-token: "[REDACTED]"',
+  );
+  assert.equal(
+    redactSensitiveText("permissions:\n  id-token: 'write'"),
+    "permissions:\n  id-token: '[REDACTED]'",
+  );
+  // Inline/flow mappings and list items are not bare block-YAML lines.
+  assert.equal(
+    redactSensitiveText("permissions: { id-token: write }"),
+    "permissions: { id-token: [REDACTED] }",
+  );
+  assert.equal(
+    redactSensitiveText("permissions:\n  - id-token: write"),
+    "permissions:\n  - id-token: [REDACTED]",
+  );
+  // Case is exact: only lowercase `write` is the permission level.
+  assert.equal(
+    redactSensitiveText("permissions:\n  id-token: Write"),
+    "permissions:\n  id-token: [REDACTED]",
+  );
+  // A same-line scalar continuation is not the bare permission level.
+  assert.equal(
+    redactSensitiveText("permissions:\n  id-token: write extra"),
+    "permissions:\n  id-token: [REDACTED] extra",
+  );
+  // Key case is exact too: only lowercase `id-token` is the documented form.
+  assert.equal(
+    redactSensitiveText("permissions:\n  ID-TOKEN: write"),
+    "permissions:\n  ID-TOKEN: [REDACTED]",
+  );
+});
+
+test("redactSensitiveText still redacts credential-bearing id-token and token assignments (#55 controls)", () => {
+  // A real provider token assigned to id-token.
+  assert.equal(
+    redactSensitiveText("id-token: ghp_abcdefghijklmnopqrstuvwxyz1234567890"),
+    "id-token: [REDACTED]",
+  );
+  // An opaque non-permission-level value under id-token (e.g. a raw credential).
+  assert.equal(
+    redactSensitiveText("id-token: 4f8a2b9c1d3e5f7a8b0c2d4e6f8a0b1c"),
+    "id-token: [REDACTED]",
+  );
+  // A JWT assigned to id-token.
+  const jwt = [
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+    "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ",
+    "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+  ].join(".");
+  assert.equal(redactSensitiveText(`id-token: ${jwt}`), "id-token: [REDACTED]");
+  // No general `write` bypass for other sensitive keys.
+  assert.equal(redactSensitiveText("token: write"), "token: [REDACTED]");
+  assert.equal(redactSensitiveText("password=write"), "password=[REDACTED]");
+  assert.equal(redactSensitiveText("access_token=write"), "access_token=[REDACTED]");
+  // No broad id-token exemption: longer keys containing the run still redact.
+  assert.equal(redactSensitiveText("my-id-token: write"), "my-id-token: [REDACTED]");
+  // Value suffixes are not bare permission levels.
+  assert.equal(redactSensitiveText("id-token: write-secret"), "id-token: [REDACTED]");
+  // List-form values are not bare permission levels and remain redacted
+  // (residual false positive; the trailing bracket is pre-existing value-shape behavior).
+  assert.equal(redactSensitiveText("id-token: [read]"), "id-token: [REDACTED]]");
+});
+
+test("redactSensitiveText keeps the id-token context scan bounded on large text (#55)", () => {
+  // Hundreds of sibling lines above a candidate: no enclosing permissions
+  // mapping, so the value still redacts (and the scan stays bounded).
+  const decoyLines = ["env:"];
+  for (let i = 0; i < 400; i++) decoyLines.push(`    filler${i}: value-${i}`);
+  decoyLines.push("    id-token: write");
+  assert.equal(
+    redactSensitiveText(decoyLines.join("\n")),
+    decoyLines.map((line) => (line === "    id-token: write" ? "    id-token: [REDACTED]" : line)).join("\n"),
+  );
+});
+
+test("redactSensitiveText idempotence holds across the id-token exception (#55)", () => {
+  const preserved = "permissions:\n  id-token: write";
+  assert.equal(redactSensitiveText(redactSensitiveText(preserved)), preserved);
+  const redacted = redactSensitiveText("id-token: 4f8a2b9c1d3e5f7a8b0c2d4e6f8a0b1c");
+  assert.equal(redactSensitiveText(redacted), redacted);
+});
+
 test("browser form values are structurally redacted regardless of content", () => {
   for (const [tool, field, value] of [
     ["BrowserFill", "value", "ordinary prose"],

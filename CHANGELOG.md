@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.76]
+
+### Fixed
+
+- Keep the bare `id-token: write` permission readable under a GitHub Actions-style
+  multiline `permissions:` mapping in redacted evidence, including search,
+  previews, deep reads, continuations and rendered results. Token-bearing
+  assignments and occurrences outside that mapping remain redacted.
+
 ## [0.1.0-dev.75]
 
 ### Added

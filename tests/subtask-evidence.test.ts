@@ -45,6 +45,22 @@ function retainedText(bundle: SubtaskEvidenceBundle): string {
   return [...bundle.snapshot.contentByEntryId.values()].join("\n");
 }
 
+// #55 representative surfaces: the GitHub Actions `permissions:` block whose
+// `id-token: write` declaration must survive redaction, and one synthetic
+// credential-bearing control in the same content that must never appear.
+const ID_TOKEN_WORKFLOW = [
+  "on: push",
+  "jobs:",
+  "  deploy:",
+  "    runs-on: ubuntu-latest",
+  "    permissions:",
+  "      contents: read",
+  "      id-token: write",
+  "    steps:",
+  "      - uses: actions/checkout@v4",
+].join("\n");
+const SYNTHETIC_PROVIDER_CREDENTIAL = "ghp_SYNTHETIC_PROVIDER_CRED_0123456789abcdef";
+
 const SESSION_ID = "11111111-2222-3333-4444-555555555555";
 
 function piSessionEntries(): unknown[] {
@@ -119,6 +135,116 @@ test("pi session: paired call/result, privacy exclusion, redaction, find, range"
   const filtered = readSubtaskEvidence(bundle, { filter: "tool_result", limit: 10 });
   assert.equal(filtered.entries?.length, 1);
   assert.equal(filtered.cursor, undefined);
+});
+
+test("github actions id-token permission survives find/preview/deep views while credentials redact (#55)", async () => {
+  const workflow = [
+    "on: push",
+    "jobs:",
+    "  deploy:",
+    "    runs-on: ubuntu-latest",
+    "    permissions:",
+    "      contents: read",
+    "      id-token: write",
+    "    steps:",
+    "      - uses: actions/checkout@v4",
+  ].join("\n");
+
+  const { artifactDir } = await makeTaskArtifacts("pi-idtoken");
+  await writeFile(join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`), jsonlLines(
+    { type: "session", version: 3, id: SESSION_ID, timestamp: "2025-06-01T10:00:00.000Z", cwd: "/tmp/wt" },
+    {
+      type: "message", id: "m-user-1", parentId: null, timestamp: "2025-06-01T10:00:01.000Z",
+      message: { role: "user", content: [{ type: "text", text: "show me the workflow" }] },
+    },
+    {
+      type: "message", id: "m-asst-1", parentId: "m-user-1", timestamp: "2025-06-01T10:00:02.000Z",
+      message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: ".github/workflows/deploy.yml" } }] },
+    },
+    {
+      type: "message", id: "m-res-1", parentId: "m-asst-1", timestamp: "2025-06-01T10:00:03.000Z",
+      message: {
+        role: "toolResult", toolCallId: "call-1", toolName: "read", isError: false, details: {}, usage: null,
+        timestamp: "2025-06-01T10:00:03.000Z",
+        content: [{ type: "text", text: `${workflow}\n\nid-token: ghp_ABCDEFGHIJKLMNOPQRSTUVWX` }],
+      },
+    },
+  ));
+
+  const bundle = await buildSubtaskEvidence({ taskId: "task-1", waveRoot: join(root, "pi-idtoken"), artifactDir });
+  const result = bundle.snapshot.entries.find((entry) => entry.kind === "tool_result")!;
+  assert.ok(result);
+  const retained = bundle.snapshot.contentByEntryId.get(result.entryId)!;
+
+  // Redaction happens once at snapshot assembly: the harmless permission
+  // declaration is preserved in the retained content, and the credential-bearing
+  // assignment never reaches any view.
+  assert.ok(retained.includes("id-token: write"), "permission declaration must be preserved");
+  assert.ok(!retained.includes("ghp_ABCDEFGHIJKLMNOPQRSTUVWX"), "credential must not be retained");
+  assert.ok(retained.includes("[REDACTED]"));
+
+  // Previews stay understandable.
+  assert.match(result.preview, /id-token: write/);
+
+  // Find matches the preserved declaration over redacted content.
+  const found = readSubtaskEvidence(bundle, { find: "id-token: write" });
+  assert.equal(found.mode, "find");
+  assert.ok((found.matchSummary?.totalMatches ?? 0) >= 1);
+  assert.ok(found.matches?.some((match) => match.snippet.includes("id-token: write")));
+
+  // Deep reads serve the same retained text in bounded chunks.
+  const deep = readSubtaskEvidence(bundle, { entryId: result.entryId, chunkIndex: 0 });
+  assert.equal(deep.mode, "entry");
+  assert.ok(deep.deepContent?.content.includes("id-token: write"));
+  assert.ok(!deep.deepContent?.content.includes("ghp_ABCDEFGHIJKLMNOPQRSTUVWX"));
+});
+
+test("#55: cursor continuation after appending the result preserves the id-token: write declaration and never exposes the synthetic credential", async () => {
+  const { waveRoot, artifactDir } = await makeTaskArtifacts("pi-idtoken-cursor");
+  const sessionPath = join(artifactDir, "executor-sessions", `${SESSION_ID}.jsonl`);
+  await writeFile(sessionPath, jsonlLines(...piSessionEntries()));
+
+  const bundle1 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
+  const first = readSubtaskEvidence(bundle1, { index: 0, limit: 2 });
+  assert.ok(first.cursor, "unfiltered ranged reads must issue a cursor");
+  const firstIds = new Set((first.entries ?? []).map((entry) => entry.entryId));
+
+  // The executor appends a workflow read result carrying the representative
+  // permission declaration plus one credential-bearing control while the
+  // cursor is live.
+  await writeFile(sessionPath, jsonlLines(
+    ...piSessionEntries(),
+    {
+      type: "message", id: "m-asst-it", parentId: "c-1", timestamp: "2025-06-01T10:00:05.000Z",
+      message: { role: "assistant", content: [{ type: "toolCall", id: "call-idtoken", name: "read", arguments: { path: ".github/workflows/deploy.yml" } }] },
+    },
+    {
+      type: "message", id: "m-res-idt", parentId: "m-asst-it", timestamp: "2025-06-01T10:00:06.000Z",
+      message: {
+        role: "toolResult", toolCallId: "call-idtoken", toolName: "read", isError: false, details: {}, usage: null,
+        timestamp: "2025-06-01T10:00:06.000Z",
+        content: [{ type: "text", text: `${ID_TOKEN_WORKFLOW}\n\nid-token: ${SYNTHETIC_PROVIDER_CREDENTIAL}` }],
+      },
+    },
+  ));
+  const bundle2 = await buildSubtaskEvidence({ taskId: "task-1", waveRoot, artifactDir });
+  const continued = readSubtaskEvidence(bundle2, { cursor: first.cursor! });
+  assert.equal(continued.mode, "cursor");
+  const continuedEntries = continued.entries ?? [];
+  // The appended result is identified by its own record, not by kind (earlier
+  // results share the kind but stay covered by the cursor's prefix).
+  const resultEntry = continuedEntries.find((entry) => entry.entryId.endsWith("/m-res-idt"));
+  assert.ok(resultEntry, "the appended workflow result must be returned by continuation");
+  assert.deepEqual(continuedEntries.filter((entry) => firstIds.has(entry.entryId)), [], "no duplicates across cursor continuation");
+
+  // The harmless permission declaration survives in the continuation preview…
+  assert.match(resultEntry.preview, /id-token: write/);
+  // …while the synthetic credential is never exposed there or in retained content.
+  assert.ok(!resultEntry.preview.includes(SYNTHETIC_PROVIDER_CREDENTIAL), "credential must never reach the continuation preview");
+  const deep = readSubtaskEvidence(bundle2, { entryId: resultEntry.entryId, chunkIndex: 0 });
+  assert.ok(deep.deepContent?.content.includes("id-token: write"));
+  assert.ok(!deep.deepContent?.content.includes(SYNTHETIC_PROVIDER_CREDENTIAL));
+  assert.ok(deep.deepContent?.content.includes("[REDACTED]"), "the credential-bearing control must be redacted");
 });
 
 test("cursor: incremental continuation across appends without duplicates", async () => {
@@ -632,7 +758,9 @@ test("end-to-end: registered SubtasksInspect serves bounded evidence navigation"
       message: {
         role: "toolResult", toolCallId: "e2e-call-1", toolName: "bash", isError: true, details: {}, usage: null,
         timestamp: "2025-06-02T09:00:05.000Z",
-        content: [{ type: "text", text: "E2E-FAILURE-MARKER: 3 of 10 tests failed" }],
+        // #55: the fixture content carries the representative GitHub Actions
+        // permission declaration plus one credential-bearing control.
+        content: [{ type: "text", text: `${ID_TOKEN_WORKFLOW}\n\nid-token: ${SYNTHETIC_PROVIDER_CREDENTIAL}\n\nE2E-FAILURE-MARKER: 3 of 10 tests failed` }],
       },
     },
   ));
@@ -717,7 +845,9 @@ workerResources: { "default": { selection: { source: "pi", model: "model-x" }, m
     assert.match(String(bad.content[0].text), /mutually exclusive/);
 
     // Ranged read issues a cursor; continuation returns only newer entries.
-    const page = await execute("e2e-page", { executionId: "exec-e2e", taskId: "task-e2e", evidence: { index: 0, limit: 2 } });
+    // limit 4 (not 2) so the page's rendered human text also carries the
+    // executor's tool-result entries (#55 renders their previews verbatim).
+    const page = await execute("e2e-page", { executionId: "exec-e2e", taskId: "task-e2e", evidence: { index: 0, limit: 4 } });
     assert.equal(page.isError, false);
     const pageEvidence = page.details.evidence;
     assert.ok(pageEvidence.cursor, "unfiltered ranged reads must issue a cursor");
@@ -739,6 +869,17 @@ workerResources: { "default": { selection: { source: "pi", model: "model-x" }, m
     assert.ok(!reviewers[0]!.summary.includes("supersecretvalue123"), "raw secret must not reach the context payload");
     assert.match(reviewers[0]!.summary, /\[REDACTED\]/);
     assert.ok(!text.includes("supersecretvalue123"), "raw secret must not reach the rendered text");
+
+    // #55: the human-rendered SubtasksInspect text must preserve the
+    // representative `id-token: write` declaration while the synthetic
+    // credential never reaches it.
+    assert.match(text, /id-token: write/, "the permission declaration must appear in the rendered text");
+    assert.ok(!text.includes(SYNTHETIC_PROVIDER_CREDENTIAL), "the synthetic credential must never reach the rendered text");
+    // Attributed to the control's own entry, not the whole page: other redacted
+    // records (e.g. the reviewer summary) can appear in the same render.
+    const idTokenResultEntry = (pageEvidence.entries ?? []).find((entry: { kind: string }) => entry.kind === "tool_result");
+    assert.ok(idTokenResultEntry, "the tool-result entry must be on the rendered page");
+    assert.match(String(idTokenResultEntry!.preview), /\[REDACTED\]/, "the credential-bearing control must be redacted in its entry preview");
 
     // Legacy activity inspection remains byte-compatible (no evidence field requested).
     const legacy = await execute("e2e-legacy", { executionId: "exec-e2e", taskId: "task-e2e", offset: 0, lines: 5 });

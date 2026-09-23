@@ -8,9 +8,11 @@ import { normalizeConfig } from "../src/config";
 import { ExecutionToolManager } from "../src/execution/tool";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
+  createExecutorToolCatalog,
   createPiWorkerToolCatalog,
   type ExecutorToolCatalog,
 } from "../src/execution/tool-catalog";
+import { GIT_READ_TOOL_NAME } from "../src/git-read/tool";
 import { createState } from "../src/state";
 import { InteractiveBrowserManager } from "../src/web/interactive-browser";
 
@@ -155,6 +157,9 @@ test("executor role registers web tools and background shell without orchestrati
     for (const tool of backgroundShellToolNames) {
       assert.ok(captured.tools.has(tool), `expected executor child to register ${tool}`);
     }
+    // #73: GitRead registers in the executor runtime too; its visibility is
+    // owned by the durable catalog boundary, not by registration.
+    assert.ok(captured.tools.has(GIT_READ_TOOL_NAME), "expected executor child to register GitRead");
     for (const tool of executionToolNames) {
       assert.equal(captured.tools.has(tool), false, `executor child must not register ${tool}`);
     }
@@ -354,6 +359,100 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     await manager.shutdown();
   }
 }
+
+test("parent ceilings give research children GitRead and never execute children (#73)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gitread-children-"));
+  try {
+    process.env.PI_REVIEW_GATE_CONFIG = await writeConfig(dir);
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    // The parent's authoritative active snapshot carries GitRead, as the
+    // plan/research top-level mode or a research worker would.
+    const tools: Array<{ name: string; execute?: (...args: any[]) => Promise<Record<string, any>> }> = [];
+    const activeNames = ["read", "edit", GIT_READ_TOOL_NAME, ...webToolNames, "ShellList", ...executionToolNames];
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: {
+        "fake": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: {
+            protocol: "pi-review-executor-jsonl-v1",
+            args: ["-e", "process.stdin.resume();setInterval(()=>{},1000)"],
+          }
+        },
+        // codex-cli is research-eligible (workerResourceSupportsResearch);
+        // the idle command never answers, which is fine — start only spawns.
+        "fake-research": {
+          adapter: "codex-cli",
+          command: process.execPath,
+          args: ["-e", "process.stdin.resume();setInterval(()=>{},1000)"],
+          execution: {},
+        }
+      },
+      execution: {
+workerResources: {
+  "default": { selection: { source: "external", id: "fake" }, maxConcurrent: 1 },
+  "researcher": { selection: { source: "external", id: "fake-research" }, maxConcurrent: 1 },
+},
+  routes: { execute: [{ resourceId: "default" }], research: [{ resourceId: "researcher" }] },
+    },
+    });
+    const manager = new ExecutionToolManager({
+      pi: {
+        registerTool(tool: { name: string; execute?: (...args: any[]) => Promise<Record<string, any>> }) { tools.push(tool); },
+        registerCommand() {},
+        setToolActive() {},
+        getActiveTools: () => activeNames,
+      },
+      config,
+      state: createState(),
+      cwd: () => process.cwd(),
+    });
+    manager.sync();
+    try {
+      const start = tools.find((tool) => tool.name === "SubtasksStart");
+      assert.ok(start?.execute);
+      const task = { title: "Catalog", instructions: "Wait", acceptanceCriteria: ["Catalog captured"] };
+
+      const research = await start.execute("research-catalog", { kind: "research", tasks: [task] }, undefined, undefined, {});
+      assert.equal(research.isError, false);
+      const researchCatalog = (research.details as any).tasks[0].definition.executorToolCatalog as ExecutorToolCatalog;
+      assert.ok(researchCatalog.allowedToolCatalog.includes(GIT_READ_TOOL_NAME), "research ceiling carries GitRead");
+      assert.ok(researchCatalog.initialActiveTools.includes(GIT_READ_TOOL_NAME), "research children start with it active, no search_tools step");
+
+      const execute = await start.execute("execute-catalog", { kind: "execute", tasks: [task] }, undefined, undefined, {});
+      assert.equal(execute.isError, false);
+      const executeCatalog = (execute.details as any).tasks[0].definition.executorToolCatalog as ExecutorToolCatalog;
+      assert.equal(executeCatalog.allowedToolCatalog.includes(GIT_READ_TOOL_NAME), false, "execute ceiling never carries GitRead");
+      assert.equal(executeCatalog.initialActiveTools.includes(GIT_READ_TOOL_NAME), false);
+
+      // A model-supplied task catalog is rejected at request normalization
+      // (tasks carry only title/instructions/acceptanceCriteria/relevantContext),
+      // so no child can widen or reshape its durable ceiling; the parent
+      // snapshot stays authoritative.
+      const rejected = await start.execute("explicit-gitread", {
+        kind: "execute",
+        tasks: [{
+          ...task,
+          executorToolCatalog: { allowedToolCatalog: ["read", GIT_READ_TOOL_NAME], initialActiveTools: [GIT_READ_TOOL_NAME] },
+        }],
+      }, undefined, undefined, {});
+      assert.equal(rejected.isError, true);
+      // The subset invariant itself fails closed for any internal caller: an
+      // initial set naming GitRead is only valid where the allowed ceiling admits it.
+      assert.throws(
+        () => createExecutorToolCatalog(["read"], [GIT_READ_TOOL_NAME]),
+        /initial active tools must be a subset/,
+      );
+    } finally {
+      await manager.shutdown();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("PI_REVIEW_GATE_DISABLED still short-circuits activation before executor-role registration", async () => {
   // Documents the kill-switch behavior that previously broke Pi executor

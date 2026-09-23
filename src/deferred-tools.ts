@@ -6,6 +6,7 @@ import {
   type ExecutorToolCatalog,
 } from "./execution/tool-catalog";
 import { RESEARCH_ALLOWED_TOOLS } from "./execution/tool";
+import { GIT_READ_TOOL_NAME } from "./git-read/tool";
 import { DEFAULT_OPERATING_MODE, type OperatingMode } from "./config";
 import { renderAuthorizedToolInventory } from "./tool-inventory";
 import { deferredToolSearchRenderResult } from "./deferred-tools-result-renderer";
@@ -47,7 +48,12 @@ const PLANNING_OBSERVATION_TOOLS = new Set(["SubtasksInspect", "SubtasksWatch"])
 function planningToolVisible(name: string): boolean {
   return name === DEFERRED_TOOL_SEARCH_NAME
     || RESEARCH_ALLOWED_TOOLS.has(name)
-    || PLANNING_OBSERVATION_TOOLS.has(name);
+    || PLANNING_OBSERVATION_TOOLS.has(name)
+    // #73: GitRead is the structured read-only Git-history tool of the
+    // plan/research role. It passes the planning visibility filter so a
+    // mode switch can never unload it while the mode is applied; its
+    // always-active (never deferred) behavior is owned by gitReadVisible.
+    || name === GIT_READ_TOOL_NAME;
 }
 
 // Pi recreates ExtensionAPI wrappers when extension modules reload, while the
@@ -136,6 +142,31 @@ export class DeferredToolManager {
     return renderAuthorizedToolInventory(entries, { deferred: this.sessionDeferred });
   }
 
+  /**
+   * #73 GitRead visibility, reasserted on every active-set write:
+   *
+   * - Top level: visible exactly while the operating mode is plan/research.
+   *   It is never a baseline or deferred tool there — it is active from the
+   *   first request in that mode (even with deferred tools enabled) and is
+   *   neither active, inventoried, listed, nor searchable in any other mode.
+   * - Worker runtimes: visible when the durable catalog admits it as
+   *   initially active (Pi research workers). The worker's default role never
+   *   hides it; execute-kind catalogs simply do not contain it. Catalogs that
+   *   admit GitRead in the allowed ceiling without the initial subset are
+   *   rejected fail-closed at capture, so an authorized GitRead can never be
+   *   silently unusable.
+   *
+   * In neither case is GitRead a deferred discovery target: while visible it
+   * is already active, and while invisible it must not be disclosed or
+   * activatable at all (no stale name leakage across mode switches).
+   */
+  private gitReadVisible(): boolean {
+    if (!this.boundary) return false;
+    if (!this.boundary.authorizedNames.has(GIT_READ_TOOL_NAME)) return false;
+    return this.getOperatingMode() === "plan-research"
+      || this.boundary.initialActiveNames.includes(GIT_READ_TOOL_NAME);
+  }
+
   /** Apply a local settings change immediately within the captured boundary. */
   setDeferredEnabled(enabled: boolean): boolean {
     if (!this.boundary || !isDeferredToolHost(this.pi)) return false;
@@ -160,17 +191,37 @@ export class DeferredToolManager {
   reapply(): void {
     if (!this.activeSetEstablished || !isDeferredToolHost(this.pi)) return;
     this.syncSearchToolDescription();
-    this.pi.setActiveTools(this.getOperatingMode() === "plan-research"
+    const planning = this.getOperatingMode() === "plan-research";
+    let names = planning
       ? this.desiredActiveNames.filter(planningToolVisible)
-      : [...this.desiredActiveNames]);
+      : [...this.desiredActiveNames];
+    // #73: GitRead is mode/catalog-pinned, not baseline. Add it while visible
+    // (so deferred-on plan/research and catalog-initial research workers keep
+    // it active from the first request) and remove it everywhere else so a
+    // prior activation or full-active desired set can never leak it into a
+    // mode that does not expose it.
+    if (this.gitReadVisible()) {
+      if (!names.includes(GIT_READ_TOOL_NAME)) names.push(GIT_READ_TOOL_NAME);
+    } else {
+      names = names.filter((name) => name !== GIT_READ_TOOL_NAME);
+    }
+    this.pi.setActiveTools(names);
   }
 
   /** Names visible at the live mode ceiling (authority boundary, not activation). */
   private modeVisibleAuthorizedNames(): ReadonlySet<string> {
     if (!this.boundary) return new Set<string>();
-    return this.getOperatingMode() === "plan-research"
-      ? new Set([...this.boundary.authorizedNames].filter((name) => planningToolVisible(name)))
-      : new Set(this.boundary.authorizedNames);
+    const planning = this.getOperatingMode() === "plan-research";
+    const visible = planning
+      ? [...this.boundary.authorizedNames].filter((name) => planningToolVisible(name))
+      : [...this.boundary.authorizedNames];
+    // #73: an invisible GitRead is not part of the live ceiling at all — it
+    // must not reach the startup inventory, the search_tools description,
+    // or any match result outside the modes/roles that expose it.
+    if (!this.gitReadVisible()) {
+      return new Set(visible.filter((name) => name !== GIT_READ_TOOL_NAME));
+    }
+    return new Set(visible);
   }
 
   /**
@@ -185,6 +236,11 @@ export class DeferredToolManager {
   private deferredDiscoveryNames(): ReadonlySet<string> {
     if (!this.boundary || !this.sessionDeferred) return new Set<string>();
     const baseline = new Set(this.boundary.initialActiveNames);
+    // #73: a visible GitRead is active from the first request, so it is
+    // excluded from the deferred discovery set exactly like baseline tools —
+    // the inventory and search description never promise an activation step
+    // that cannot happen.
+    if (this.gitReadVisible()) baseline.add(GIT_READ_TOOL_NAME);
     return new Set([...this.modeVisibleAuthorizedNames()].filter((name) => !baseline.has(name)));
   }
 
@@ -301,9 +357,14 @@ export class DeferredToolManager {
 
     // Planning mode makes forbidden tools absent from discovery as well: they
     // cannot be matched, reported, or activated while the mode is applied.
-    const catalog = this.getOperatingMode() === "plan-research"
-      ? this.boundary.catalog.filter((tool) => planningToolVisible(tool.name))
-      : this.boundary.catalog;
+    // #73: GitRead follows its own visibility rule in every mode — searchable
+    // (and already active) where visible, and unmatchable everywhere else so
+    // search can never activate it outside plan/research or a research catalog.
+    const planning = this.getOperatingMode() === "plan-research";
+    const catalog = this.boundary.catalog.filter((tool) => {
+      if (tool.name === GIT_READ_TOOL_NAME) return this.gitReadVisible();
+      return planning ? planningToolVisible(tool.name) : true;
+    });
     const matches = catalog
       .map((tool) => matchTool(tool, query, terms))
       .filter((match): match is SearchMatch => match !== undefined)
@@ -331,6 +392,10 @@ export class DeferredToolManager {
     }
 
     const active = new Set(this.desiredActiveNames);
+    // #73: a visible GitRead is host-active by the mode/catalog pin, not by
+    // search activation; report it as already active instead of mutating the
+    // desired set with a no-op "activation".
+    if (this.gitReadVisible()) active.add(GIT_READ_TOOL_NAME);
     const activated: string[] = [];
     const alreadyActive: string[] = [];
     for (const match of selected) {
@@ -406,10 +471,21 @@ function captureAuthorizationBoundary(pi: DeferredToolHost): AuthorizationBounda
   for (const name of NATIVE_DISCOVERY_TOOLS) {
     if (metadataByName.has(name)) authorizedNames.add(name);
   }
+  // #73: GitRead is an extension-registered tool. Whenever the host registry
+  // carries it (an explicit --tools exclusion removes it from the registry
+  // and stays authoritative), the top-level boundary authorizes it; its
+  // activity is then pinned to plan/research by gitReadVisible, never to the
+  // baseline below.
+  if (metadataByName.has(GIT_READ_TOOL_NAME)) authorizedNames.add(GIT_READ_TOOL_NAME);
   const catalog = [...authorizedNames]
     .map((name) => metadataByName.get(name) ?? { name, description: "" })
     .sort((left, right) => compareNames(left.name, right.name));
-  const initialActiveNames = DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER.filter((name) => authorizedNames.has(name));
+  // #73: top-level baseline excludes GitRead on purpose — it is mode-pinned
+  // (active in plan/research only), while the same ORDER entry still makes it
+  // part of durable research-worker initial-active catalogs.
+  const initialActiveNames = DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER
+    .filter((name) => name !== GIT_READ_TOOL_NAME)
+    .filter((name) => authorizedNames.has(name));
   return createAuthorizationBoundary(catalog, authorizedNames, initialActiveNames);
 }
 
@@ -430,6 +506,15 @@ function captureConfiguredAuthorizationBoundary(
     normalized.allowedToolCatalog.includes(DEFERRED_TOOL_SEARCH_NAME)
     || normalized.initialActiveTools.includes(DEFERRED_TOOL_SEARCH_NAME)
   ) return undefined;
+  // #73: a durable catalog that admits GitRead in the allowed ceiling must also
+  // place it in the initial subset. Worker visibility keys on the initial set,
+  // so a contradictory shape would make an authorized tool neither active nor
+  // discoverable — machine-generated catalogs always satisfy this, and anything
+  // else is rejected fail-closed rather than silently hiding authority.
+  if (normalized.allowedToolCatalog.includes(GIT_READ_TOOL_NAME)
+    && !normalized.initialActiveTools.includes(GIT_READ_TOOL_NAME)) {
+    return undefined;
+  }
 
   const launchActive = new Set(normalizedActiveNames(pi.getActiveTools()));
   if (!launchActive.has(DEFERRED_TOOL_SEARCH_NAME)) return undefined;

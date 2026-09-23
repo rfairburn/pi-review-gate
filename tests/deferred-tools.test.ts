@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { DeferredToolManager } from "../src/deferred-tools";
+import { GIT_READ_TOOL_NAME } from "../src/git-read/tool";
+import { createExecutorToolCatalog } from "../src/execution/tool-catalog";
 import type { OperatingMode } from "../src/config";
 import { measureToolSchemaBaseline } from "./tool-schema-baseline-helper";
 
@@ -956,6 +958,199 @@ test("deferred-disabled sessions render no redundant inventory and the descripti
   assert.equal(manager.startupGuidance(), undefined);
   assert.doesNotMatch(searchDescription(fixture), /Authorized tool names:/);
   assert.equal(searchSnippet(fixture), offSnippet);
+});
+
+// --- #73 GitRead role visibility (top-level mode pin and durable worker catalogs)
+
+const GIT_READ_DESCRIPTION = "Structured read-only Git history research on the current repository.";
+
+function gitReadSearchFixture() {
+  const fixture = hostFixture();
+  fixture.pi.registerTool(tool(GIT_READ_TOOL_NAME, GIT_READ_DESCRIPTION));
+  return fixture;
+}
+
+test("GitRead is active from the first plan/research request and never a deferred target (#73)", async () => {
+  const fixture = gitReadSearchFixture();
+  const manager = new DeferredToolManager(fixture.pi, () => "plan-research");
+  assert.equal(manager.register(), true);
+  assert.equal(manager.sessionStart({}), true);
+
+  // Active immediately even though deferred tools are enabled: the mode pin,
+  // not search activation, owns it.
+  assert.deepEqual(fixture.active(), ["read", "search_tools", GIT_READ_TOOL_NAME]);
+
+  // Never disclosed as a deferred discovery target in either surface.
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /GitRead/);
+  assert.doesNotMatch(searchDescription(fixture), /GitRead/);
+  assert.doesNotMatch(searchSnippet(fixture), /GitRead/);
+
+  // Exact and capability searches find it only as already active.
+  const exact = await fixture.search()("id", { query: GIT_READ_TOOL_NAME });
+  assert.equal(exact.isError, false);
+  assert.deepEqual((exact.details as { activated: string[] }).activated, []);
+  assert.match(JSON.stringify(exact), /already active/);
+  const capability = await fixture.search()("id", { query: "git history" });
+  assert.equal(capability.isError, false);
+  assert.deepEqual((capability.details as { activated: string[] }).activated, []);
+  assert.match(JSON.stringify(capability), /already active/);
+});
+
+test("GitRead is absent from the active set, inventory, and search outside plan/research (#73)", async () => {
+  const fixture = gitReadSearchFixture();
+  const manager = new DeferredToolManager(fixture.pi, () => "execute");
+  assert.equal(manager.register(), true);
+  assert.equal(manager.sessionStart({}), true);
+
+  assert.deepEqual(
+    fixture.active(),
+    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"],
+  );
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /GitRead/);
+  assert.doesNotMatch(searchDescription(fixture), /GitRead/);
+
+  // Neither exact names nor capability terms may match or activate it.
+  const exact = await fixture.search()("id", { query: GIT_READ_TOOL_NAME });
+  assert.deepEqual((exact.details as { activated: string[] }).activated, []);
+  assert.match(JSON.stringify(exact), /No authorized tools matched/);
+  const capability = await fixture.search()("id", { query: "git history" });
+  assert.deepEqual((capability.details as { activated: string[] }).activated, []);
+
+  // A stale host-side activation is stripped on the next reassertion.
+  fixture.pi.setActiveTools([...fixture.active(), GIT_READ_TOOL_NAME]);
+  manager.reapply();
+  assert.equal(fixture.active().includes(GIT_READ_TOOL_NAME), false);
+});
+
+test("GitRead visibility reasserts across plan/research and execute mode switches (#73)", async () => {
+  const fixture = gitReadSearchFixture();
+  let mode: OperatingMode = "plan-research";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  assert.equal(manager.register(), true);
+  assert.equal(manager.sessionStart({}), true);
+  assert.ok(fixture.active().includes(GIT_READ_TOOL_NAME));
+  const planDescription = searchDescription(fixture);
+
+  mode = "execute";
+  manager.reapply();
+  assert.equal(fixture.active().includes(GIT_READ_TOOL_NAME), false, "switching to execute removes it");
+  const executeDescription = searchDescription(fixture);
+  assert.doesNotMatch(executeDescription, /GitRead/);
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /GitRead/);
+
+  mode = "plan-research";
+  manager.reapply();
+  assert.ok(fixture.active().includes(GIT_READ_TOOL_NAME), "switching back restores it");
+  assert.equal(
+    searchDescription(fixture),
+    planDescription,
+    "search description round-trips byte-for-byte",
+  );
+});
+
+test("GitRead follows the operating mode with deferred tools off (#73)", async () => {
+  const fixture = gitReadSearchFixture();
+  let mode: OperatingMode = "execute";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  assert.equal(manager.register(), true);
+  assert.equal(manager.sessionStart({}, undefined, false, false), true);
+  // Full authorized set active outside plan/research — but the mode ceiling
+  // still strips GitRead from the full-active desired set.
+  assert.deepEqual(
+    fixture.active(),
+    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "SubtasksAdd",
+      "SubtasksInspect", "WebSearch", "search_tools"],
+  );
+
+  mode = "plan-research";
+  manager.reapply();
+  // The planning ceiling keeps only read-only names, and the mode pin adds
+  // GitRead back in.
+  assert.deepEqual(
+    fixture.active(),
+    ["read", "SubtasksInspect", "WebSearch", GIT_READ_TOOL_NAME, "search_tools"],
+  );
+});
+
+test("a durable research catalog keeps GitRead active from the first request under the default role (#73)", async () => {
+  const fixture = gitReadSearchFixture();
+  // Conservative initial subset: read + GitRead are active up front; the rest
+  // of the allowed ceiling stays deferred-discoverable.
+  const catalog = createExecutorToolCatalog(
+    ["read", "bash", "edit", "write", "ApplyPatch", GIT_READ_TOOL_NAME],
+    ["read", GIT_READ_TOOL_NAME],
+  );
+  // The worker's default role is orchestrate, never plan/research; the durable
+  // catalog alone must keep GitRead visible.
+  const manager = new DeferredToolManager(fixture.pi);
+  assert.equal(manager.register(), true);
+  assert.equal(manager.sessionStart({}, catalog), true);
+
+  assert.deepEqual(fixture.active(), ["read", GIT_READ_TOOL_NAME, "search_tools"]);
+  // The deferred discovery set is the allowed ceiling minus the baseline;
+  // GitRead is never listed as a discovery target.
+  const guidance = manager.startupGuidance() ?? "";
+  for (const name of ["ApplyPatch", "bash", "edit", "write"]) {
+    assert.match(guidance, new RegExp(`\\"${name}\\"`));
+  }
+  assert.doesNotMatch(guidance, /GitRead/);
+  assert.doesNotMatch(searchDescription(fixture), /GitRead/);
+  const exact = await fixture.search()("id", { query: GIT_READ_TOOL_NAME });
+  assert.equal(exact.isError, false);
+  assert.deepEqual((exact.details as { activated: string[] }).activated, []);
+  assert.match(JSON.stringify(exact), /already active/);
+
+  manager.reapply();
+  assert.ok(fixture.active().includes(GIT_READ_TOOL_NAME), "the default role never hides it");
+});
+
+test("an execute-kind durable catalog removes a registered GitRead from the worker active set (#73)", async () => {
+  const fixture = gitReadSearchFixture();
+  const catalog = createExecutorToolCatalog(
+    ["read", "bash", "edit", "write", "ApplyPatch"],
+    ["read", "bash", "edit", "write", "ApplyPatch"],
+  );
+  const manager = new DeferredToolManager(fixture.pi);
+  assert.equal(manager.register(), true);
+  assert.equal(manager.sessionStart({}, catalog), true);
+
+  assert.deepEqual(
+    fixture.active(),
+    ["read", "bash", "edit", "write", "ApplyPatch", "search_tools"],
+    "stripped at session_start despite registration",
+  );
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /GitRead/);
+  assert.doesNotMatch(searchDescription(fixture), /GitRead/);
+  const exact = await fixture.search()("id", { query: GIT_READ_TOOL_NAME });
+  assert.deepEqual((exact.details as { activated: string[] }).activated, []);
+});
+
+test("a worker catalog admitting GitRead only in the allowed ceiling fails closed (#73)", async () => {
+  // The visibility rule keys on the initial subset, so a contradictory shape
+  // (allowed without initial) is rejected at capture instead of making an
+  // authorized tool silently unusable.
+  const fixture = gitReadSearchFixture();
+  const catalog = createExecutorToolCatalog(
+    ["read", "bash", GIT_READ_TOOL_NAME],
+    ["read"],
+  );
+  const manager = new DeferredToolManager(fixture.pi);
+  assert.equal(manager.register(), true);
+  assert.equal(manager.sessionStart({}, catalog), false, "contradictory catalog is rejected fail-closed");
+  assert.equal(fixture.active().includes(GIT_READ_TOOL_NAME), false);
+});
+
+test("an explicit Pi launch allowlist excluding GitRead stays authoritative (#73)", async () => {
+  // No GitRead registration at all models --tools/--exclude-tools removal.
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi, () => "plan-research");
+  assert.equal(manager.register(), true);
+  assert.equal(manager.sessionStart({}), true);
+
+  assert.equal(fixture.active().includes(GIT_READ_TOOL_NAME), false);
+  assert.doesNotMatch(searchDescription(fixture), /GitRead/);
+  const exact = await fixture.search()("id", { query: GIT_READ_TOOL_NAME });
+  assert.deepEqual((exact.details as { activated: string[] }).activated, []);
 });
 
 function searchDescription(fixture: ReturnType<typeof hostFixture>): string {

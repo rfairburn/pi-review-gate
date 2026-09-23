@@ -217,14 +217,14 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
 
     await activate(pi);
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools", "AskUserQuestion",
+      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "search_tools", "AskUserQuestion",
     ]);
 
     runtimeInitialized = true;
     const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
     await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", ...backgroundShellToolNames, "search_tools", "AskUserQuestion", ...executionToolNames,
+      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "search_tools", "AskUserQuestion", ...executionToolNames,
     ]);
     const deferredActive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"];
     assert.deepEqual(activeTools, deferredActive);
@@ -282,7 +282,9 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     for (const name of discoveryNames) {
       assert.match(inventory, new RegExp(escapeRegExp(`\\"${name}\\"`)));
     }
-    for (const baselineName of ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"]) {
+    // GitRead is mode-pinned (absent outside plan/research), never a deferred
+    // discovery target in either state.
+    for (const baselineName of ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools", "GitRead"]) {
       assert.doesNotMatch(inventory, new RegExp(escapeRegExp(`\\"${baselineName}\\"`)));
     }
     assert.match(inventory, /exact name/);
@@ -336,6 +338,11 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.match(researchSegment, new RegExp(escapeRegExp(`\\"SubtasksInspect\\" (`)));
     assert.match(researchSegment, new RegExp(escapeRegExp(`\\"WebSearch\\" (`)));
     assert.doesNotMatch(researchSegment, /SubtasksAdd|ShellStart|BrowserClick|SubtasksSteer/);
+    // #73: GitRead is active in plan/research but never listed as a deferred
+    // discovery target; the search loader agrees.
+    assert.ok(activeTools.includes("GitRead"), "GitRead is active in plan/research without search activation");
+    assert.doesNotMatch(researchSegment, /GitRead/);
+    assert.doesNotMatch(registeredTools.find((tool) => tool.name === "search_tools")?.description ?? "", /GitRead/);
     const researchSearch = registeredTools.find((tool) => tool.name === "search_tools");
     assert.doesNotMatch(researchSearch?.description ?? "", /SubtasksAdd|ShellStart|BrowserClick/);
     assert.match(researchSearch?.description ?? "", /SubtasksInspect, SubtasksWatch, WebFetch, WebSearch\.$/);
@@ -432,6 +439,122 @@ test("deferred authorization survives API recreation and remains isolated per Pi
     assert.equal(backingB.active.includes("SessionAOnly"), false);
   } finally {
     reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GitRead registers in the top-level runtime and follows the operating mode end to end (#73)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gitread-entrypoint-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      operatingMode: "plan-research",
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    let reviewSettingsHandler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    let activeTools = ["read", "bash", "edit"];
+    let runtimeInitialized = false;
+    const assertRuntime = () => {
+      if (!runtimeInitialized) throw new Error("Extension runtime not initialized");
+    };
+    const registeredTools: Array<{ name: string; description?: string }> = [];
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+        if (name === "review-settings") reviewSettingsHandler = options.handler;
+      },
+      registerTool(tool: { name: string; description?: string }) {
+        const existing = registeredTools.findIndex((candidate) => candidate.name === tool.name);
+        if (existing >= 0) registeredTools.splice(existing, 1, tool);
+        else registeredTools.push(tool);
+        if (!activeTools.includes(tool.name)) activeTools.push(tool.name);
+      },
+      getActiveTools() {
+        assertRuntime();
+        return activeTools;
+      },
+      getAllTools() {
+        assertRuntime();
+        return [
+          { name: "read", description: "Read files." },
+          { name: "bash", description: "Run shell commands." },
+          { name: "edit", description: "Edit files." },
+          ...registeredTools,
+        ];
+      },
+      setActiveTools(next: string[]) {
+        assertRuntime();
+        activeTools = next;
+      },
+      notify() {},
+    };
+
+    await activate(pi);
+    // #73: GitRead registers in the top-level runtime before authorization capture.
+    assert.ok(registeredTools.some((tool) => tool.name === "GitRead"), "GitRead registered at activation");
+
+    runtimeInitialized = true;
+    const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
+    await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
+
+    // plan/research (from config): active from the first request even with
+    // deferred tools enabled, and never disclosed as a deferred target.
+    assert.deepEqual(activeTools, ["read", "search_tools", "GitRead"]);
+    const beforePlan = await triggerResults(hooks, "before_agent_start", { cwd: dir });
+    const planInventory = JSON.stringify(beforePlan);
+    assert.doesNotMatch(planInventory, /\\\"GitRead\\\"/);
+
+    const searchTools = () => registeredTools.find((tool) => tool.name === "search_tools") as {
+      execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
+      description?: string;
+    };
+    assert.ok(searchTools().execute);
+    const planDescription = searchTools().description ?? "";
+    assert.doesNotMatch(planDescription, /GitRead/);
+    const exactPlan = await searchTools().execute!("gitread-plan", { query: "GitRead" });
+    assert.equal(exactPlan.isError, false);
+    assert.deepEqual((exactPlan.details as { activated: string[] }).activated, []);
+    assert.match(JSON.stringify(exactPlan), /already active/);
+
+    const selectOperatingMode = async (label: string) => {
+      assert.ok(reviewSettingsHandler);
+      let rootVisits = 0;
+      await reviewSettingsHandler("", {
+        ui: {
+          select: async (title: string, options: string[]) => {
+            if (title === "Review settings") return rootVisits++ === 0
+              ? options.find((option) => option.startsWith("Operating mode"))
+              : "Save changes";
+            if (title === "Operating mode") return options.find((option) => option.startsWith(label));
+            throw new Error(`Unexpected menu: ${title}`);
+          },
+          notify() {},
+        },
+      });
+    };
+
+    // Switching to orchestration removes GitRead from the active set, the
+    // inventory, and search; it cannot be matched or activated there.
+    await selectOperatingMode("Prefer orchestration");
+    assert.equal(activeTools.includes("GitRead"), false, "mode switch strips GitRead");
+    const executeDescription = searchTools().description ?? "";
+    assert.doesNotMatch(executeDescription, /GitRead/);
+    const exactExecute = await searchTools().execute!("gitread-execute", { query: "GitRead" });
+    assert.deepEqual((exactExecute.details as { activated: string[] }).activated, []);
+    assert.match(JSON.stringify(exactExecute), /No authorized tools matched/);
+
+    // Switching back restores activity and the byte-for-byte plan description.
+    await selectOperatingMode("Plan/research");
+    assert.ok(activeTools.includes("GitRead"), "mode switch back restores GitRead");
+    assert.equal(searchTools().description, planDescription);
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

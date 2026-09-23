@@ -49,6 +49,7 @@ import {
   type BackgroundShellLifecycleEvent,
 } from "./background-shell";
 import { registerApplyPatchTool } from "./apply-patch/tool";
+import { registerGitReadTool, type GitReadHost } from "./git-read/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
 import { DeferredToolManager } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
@@ -84,6 +85,9 @@ interface ActivationDependencies {
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
+  // Live session working directory. The top-level branch keeps it updated from
+  // hook context; a Pi executor worker's cwd is its stable worktree root.
+  let currentCwd = process.cwd();
   const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
   let executorSettlementBootstrap: PiSettlementBootstrap | undefined;
   let executorSettlementBootstrapError: Error | undefined;
@@ -116,6 +120,18 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // this never force-enables the tool through setActiveTools.
   if (canRegisterApplyPatchTool(pi)) {
     registerApplyPatchTool(pi);
+  }
+
+  // Register GitRead (#73) in both the top-level orchestrator and Pi-native
+  // executor runtimes, before any deferred-tool authorization capture. Role
+  // visibility is applied downstream, never here: the captured boundary pins
+  // it to the plan/research operating mode at the top level, while durable
+  // child catalogs admit it for research workers and exclude it from
+  // execute-kind workers. Like ApplyPatch it is active by default under Pi's
+  // registered-tool policy; an explicit Pi launch --tools allowlist remains
+  // authoritative, so this never force-enables the tool through setActiveTools.
+  if (canRegisterGitReadTool(pi)) {
+    registerGitReadTool(pi, () => currentCwd);
   }
 
   if (executorRole) {
@@ -220,7 +236,6 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   const userQuestions = registerUserQuestions(pi);
 
   const state = createState();
-  let currentCwd = process.cwd();
   let currentScopedModels: string[] = [];
   let sessionActive = true;
   let activeReviewAbort: ReviewAbortHandle | undefined;
@@ -1200,6 +1215,10 @@ function canRegisterWebTools(value: unknown): value is PiWebHost {
 }
 
 function canRegisterApplyPatchTool(value: unknown): boolean {
+  return typeof (value as { registerTool?: unknown } | undefined)?.registerTool === "function";
+}
+
+function canRegisterGitReadTool(value: unknown): value is GitReadHost {
   return typeof (value as { registerTool?: unknown } | undefined)?.registerTool === "function";
 }
 

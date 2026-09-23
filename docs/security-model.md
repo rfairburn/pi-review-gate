@@ -193,6 +193,24 @@ For delegated workers and research subtasks:
 - Generic binary adapters are ineligible for research because their protocol does not
   acknowledge the restriction.
 
+The structured read-only Git history tool `GitRead` is registered in both the
+top-level and Pi executor runtimes, and its visibility is pinned to role rather than
+left to activation state: at the top level it is active only while the operating mode
+is plan/research (removed from the active set, inventory, and `search_tools` results
+in every other mode), Pi research workers receive it through the durable initial-active
+subset, and execute-kind worker catalogs never contain it. It reads stored repository
+objects only — history, trees, and blobs at pinned revisions — through structured
+actions (`log`, `show`, two-revision `diff`, `blame`, `refs`, `mergeBase`,
+`listFiles`, `readFile`, `search`). There is no shell and no raw Git argument path: it
+operates on the repository at the runtime working directory (it cannot target another
+workspace) and never touches the work tree, index, refs, or network. `status` and
+worktree diff are unsupported by design; use two explicit revisions instead. Results
+are bounded and paged, with every revision pinned to a full commit id at acquisition.
+Two current limits fail closed: repositories using Git's SHA-256 object format are
+unsupported (revision pinning accepts only 40-hex-digit SHA-1 ids) pending a dedicated
+improvement, and the `log` action's `author` filter is passed to git's `--author`,
+which uses regex semantics rather than literal substring matching.
+
 Tool restriction uses each harness's native allowlist. There is no review-gate
 configuration gate for `ApplyPatch` and no `setActiveTools` re-enabling: availability
 follows Pi's normal registered-tool policy, and an explicit Pi launch `--tools`

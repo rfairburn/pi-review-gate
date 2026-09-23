@@ -70,9 +70,11 @@ Choose **Operating mode** in `/review-settings`, then **Save changes**:
 - **Plan/research**: local read-only investigation and planning. Write-capable tools,
   arbitrary shell, and execution-subtask controls are removed from the active tool
   schemas, authorized inventory, and `search_tools` results. Launch-authorized native
-  read-only discovery (`grep`, `find`, `ls`) stays active in every mode. When changes
-  are needed, the assistant asks you to switch modes; there is no GitHub-writing
-  exception.
+  read-only discovery (`grep`, `find`, `ls`) stays active in every mode. The structured
+  read-only Git history tool `GitRead` is active only in this mode: available from the
+  first request (no `search_tools` step) and removed from the active set, inventory,
+  and search results in every other mode. When changes are needed, the assistant asks
+  you to switch modes; there is no GitHub-writing exception.
 
 The next normal run in the same conversation receives the replacement mode prompt:
 no `/new`, reload, or restart is needed. Shared safety and review instructions and user
@@ -87,7 +89,9 @@ The extension selects the mode segment rather than the launcher permanently appe
 orchestration instructions. Native `grep`, `find`, and `ls` stay active in all modes
 whenever Pi's tool registry permits them. `--no-builtin-tools` only changes initial
 activity, so it does not keep this trio inactive; use `--exclude-tools` or an explicit
-`--tools` allowlist to exclude them. Planning gains no shell or Git-history tools.
+`--tools` allowlist to exclude them. Planning gains no arbitrary shell, but it does
+activate the structured read-only `GitRead` history tool; outside plan/research,
+`GitRead` is neither active nor discoverable (see [Security model](security-model.md#read-only-enforcement)).
 
 ### Direct mode-cycle hotkey
 

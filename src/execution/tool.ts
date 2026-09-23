@@ -34,6 +34,7 @@ import {
   defaultExecutorInitialActiveTools,
   resolveExecutorToolCatalog,
 } from "./tool-catalog";
+import { GIT_READ_TOOL_NAME } from "../git-read/tool";
 
 const ACTIONS = ["start", "add", "inspect", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean"] as const;
 type Action = typeof ACTIONS[number];
@@ -816,7 +817,15 @@ export class ExecutionToolManager {
     if (!allowedTools) {
       throw new Error(`${kind === "research" ? "Research" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
     }
-    const childTools = kind === "research" ? researchToolIntersection(allowedTools) : allowedTools;
+    // #73: GitRead is a research-role capability. Research children inherit it
+    // through the read-only intersection (and its conservative initial-active
+    // subset) whenever the parent authorization carries it; execute children
+    // never carry it in the durable allowed ceiling or initial set, and an
+    // explicit child catalog naming it for an execute task fails closed at
+    // subset validation below.
+    const childTools = kind === "research"
+      ? researchToolIntersection(allowedTools)
+      : allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME);
     return tasks.map((task) => {
       // Validate any supplied contract, but preserve only an explicitly named
       // initial set. The authoritative parent snapshot always determines the
@@ -851,9 +860,14 @@ export class ExecutionToolManager {
  * The research role allow policy. Also the planning-mode visibility policy at
  * the top level (plus read-only subtask observation controls): anything not on
  * this list is write-capable or execution control and stays out of plan/research.
+ *
+ * #73: GitRead is the structured read-only Git-history tool. It enters the
+ * research intersection (and, through DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER, the
+ * conservative initial-active subset) so Pi research workers have it active
+ * from the first request; execute-kind catalogs exclude it in withParentTools.
  */
 export const RESEARCH_ALLOWED_TOOLS = new Set([
-  "read", "grep", "glob", "find", "ls", "WebFetch", "WebSearch", "BrowserExtract",
+  "read", "grep", "glob", "find", "ls", GIT_READ_TOOL_NAME, "WebFetch", "WebSearch", "BrowserExtract",
   // Research may use bounded diagnostics and observational hover, but
   // consequential click/form authority never enters the read-only role policy.
   "BrowserOpen", "BrowserNavigate", "BrowserSnapshot", "BrowserConsole", "BrowserNetwork", "BrowserInspect", "BrowserScreenshot",

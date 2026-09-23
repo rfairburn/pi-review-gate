@@ -225,8 +225,12 @@ extension registers no competing key handler, mirrors no expansion state, and ex
 never reruns a tool, performs a network request, polls, or reads logs, artifacts, or
 history — it renders only data the tool already returned.
 
-All 37 registered extension-owned tools are covered by one shared mechanism in
-`src/tool-result-expansion.ts` — there is no rendererless remainder:
+Every extension-owned registration with a custom result renderer is covered by one
+shared mechanism in `src/tool-result-expansion.ts` — 40 of the 42 tools registered
+in the top-level runtime (24 web/browser, `ApplyPatch`, `GitRead`, 5 background-shell,
+`search_tools`, `AskUserQuestion`, and 9 subtask tools). `GitRead` and
+`AskUserQuestion` deliberately register no custom renderer; their results are
+self-describing text rendered through Pi's default text display:
 
 - `expandableResult(collapsedRenderer, expandedRenderer?)` returns a Pi-compatible
   `renderResult` callback. Collapsed state (or any state before an expanded callback is
@@ -336,8 +340,8 @@ All 37 registered extension-owned tools are covered by one shared mechanism in
 
 `isExpandableResult()` provides a wiring-audit marker used by
 `tests/tool-result-expansion.test.ts` and
-`tests/browser-render-registration.test.ts` to prove that every one of the 37
-registrations routes through the shared helper, that expand and re-collapse render
+`tests/browser-render-registration.test.ts` to prove that every expandable
+registration routes through the shared helper, that expand and re-collapse render
 through it, that the interactive browser family shares one wrapper instance, and that
 expanded views carry the actual recorded inputs (including content beyond the legacy
 preview caps and synthetic secret-shaped model-visible input shown unfiltered). The

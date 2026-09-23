@@ -13,6 +13,7 @@ import {
   rejectPreCutoverRequestFields,
   resolveExecutorToolCatalog,
 } from "../src/execution/tool-catalog";
+import { GIT_READ_TOOL_NAME } from "../src/git-read/tool";
 import { newTask } from "../src/execution/task-state";
 import { createOperationRecord, operationRecordPath, readOperationRecord } from "../src/execution/operation-record";
 import { synchronizeTaskAndOperationToolCatalog, type WaveWorkerTask } from "../src/execution/wave-worker";
@@ -65,6 +66,20 @@ test("new Pi worker defaults activate authorized write without widening research
   const worker = createPiWorkerToolCatalog(createExecutorToolCatalog(allowed, defaultExecutorInitialActiveTools(allowed)));
   assert.deepEqual(worker.initialActiveTools, ["read", "edit", "write", "ApplyPatch"]);
   assert.deepEqual(defaultExecutorInitialActiveTools(["read", "grep", "find", "ls"]), ["read", "grep", "find", "ls"]);
+});
+
+test("GitRead enters the conservative initial subset wherever the durable catalog admits it (#73)", () => {
+  // Admitted: positioned after native discovery, before shell/write tools.
+  assert.deepEqual(
+    defaultExecutorInitialActiveTools(["read", "grep", "find", "ls", GIT_READ_TOOL_NAME, "bash", "edit", "write"]),
+    ["read", "grep", "find", "ls", GIT_READ_TOOL_NAME, "bash", "edit", "write"],
+  );
+  // Not admitted (execute-kind catalogs and explicit parent exclusions):
+  // the subset never widens on its own.
+  assert.deepEqual(
+    defaultExecutorInitialActiveTools(["read", "bash", "edit", "write", "ApplyPatch"]),
+    ["read", "bash", "edit", "write", "ApplyPatch"],
+  );
 });
 
 test("Pi worker catalogs remove orchestrator-only delegation controls without mutating the durable catalog", () => {

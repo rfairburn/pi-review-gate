@@ -730,11 +730,19 @@ login/configuration; see [Security model](security-model.md#secrets-and-authenti
 Pi enforces the read-only tool intersection through `--tools`. Launch-authorized native
 read-only discovery (`grep`, `find`, `ls`) is part of the durable initial-active
 subset, so Pi research workers can enumerate paths, search contents, and read matches
-from the first request without a `search_tools` activation step. Codex uses its
-read-only sandbox and rejects configuration that could weaken the research profile.
-Claude maps the same authorized capability names onto its native `Grep`/`Glob` inside
-an explicit read-only tool allowlist and permission callback while disabling user
-settings, skills, plugins, and MCP. Every adapter also receives a private worktree
+from the first request without a `search_tools` activation step. The structured
+read-only Git history tool `GitRead` belongs to that same subset: whenever the parent's
+authorization carries it, Pi research workers have it active from the first request,
+with no `search_tools` step. Execute-kind tasks never receive `GitRead` — the durable
+catalog excludes it even when the parent's active set includes it — and an explicit
+child catalog naming it for an execute task fails closed at subset validation.
+Codex uses its
+read-only sandbox and rejects configuration that could weaken the research profile;
+it may run native Git reads under that sandbox but does not receive this structured
+tool. Claude maps the same authorized capability names onto its native `Grep`/`Glob`
+inside an explicit read-only tool allowlist and permission callback while disabling
+user settings, skills, plugins, and MCP; it has no equivalent structured Git-history
+tool. Every adapter also receives a private worktree
 check that quarantines any detected write. Generic binary adapters are ineligible for
 research because their protocol does not acknowledge the restriction. Research
 subtasks never receive `ApplyPatch`, and they never receive an arbitrary shell in

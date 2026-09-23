@@ -6,6 +6,7 @@
  * workers. Keeping the two values in one validated contract prevents a
  * restored or retried task from widening authorization.
  */
+import { GIT_READ_TOOL_NAME } from "../git-read/tool";
 export const EXECUTOR_TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
 export const DEFERRED_TOOL_SEARCH_NAME = "search_tools";
 /**
@@ -33,9 +34,16 @@ const EXECUTOR_SHELL_TOOLS = ["bash", "powershell"] as const;
  * (the planning visibility policy keeps it). Every entry is still filtered
  * through the captured authorized catalog. Registry removal via --tools,
  * --exclude-tools, or --no-tools keeps those capabilities excluded.
+ *
+ * `GitRead` (#73) belongs to the subset wherever the durable catalog admits
+ * it: Pi research workers carry it in their parent intersection and start
+ * with it active, no `search_tools` step. Top-level capture deliberately does
+ * not treat it as baseline there — its top-level activity is pinned to the
+ * plan/research operating mode by the deferred-tool manager instead — and
+ * execute-kind child catalogs never contain it at all.
  */
 export const DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER = [
-  "read", ...NATIVE_DISCOVERY_TOOLS, ...EXECUTOR_SHELL_TOOLS, "edit", "write", "ApplyPatch", "SubtasksStart",
+  "read", ...NATIVE_DISCOVERY_TOOLS, GIT_READ_TOOL_NAME, ...EXECUTOR_SHELL_TOOLS, "edit", "write", "ApplyPatch", "SubtasksStart",
 ] as const;
 
 export interface ExecutorToolCatalog {

@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.74]
+
+### Added
+
+- Add `GitRead` for bounded, structured Git-history research: commit logs and inspection,
+  two-revision diffs with indexed file/patch navigation, blame, refs, merge-base,
+  historical tree/file reads and tracked-content search. The tool is immediately
+  available in primary Plan/research and Pi-backed research subtasks, but hidden
+  from other primary modes and execution subtasks. It accepts no shell or raw Git
+  arguments, and leaves Claude research unchanged; Codex research retains its
+  own read-only-sandboxed Git access without this structured tool. Worktree
+  status/diff and SHA-256 object-format repositories are not supported.
+
 ## [0.1.0-dev.73]
 
 ### Changed

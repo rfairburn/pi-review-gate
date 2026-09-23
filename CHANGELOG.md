@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.75]
+
+### Added
+
+- Add a Review submenu with independent automatic primary and subtask review switches
+  and reviewer sets. Legacy shared reviewer selections appear in both sets on load;
+  Save writes the split format, while Cancel leaves the old file untouched. Both
+  automatic layers may be Off without disabling manual primary review.
+- Optionally keep unreviewed subtask landings in the primary review window for its
+  normal model-idle review, including resolved conflicts and force/salvage paths;
+  already-reviewed landings retain their existing checkpoint behavior. No landing
+  triggers immediate review, and disabled automatic review records no synthetic PASS.
+
 ## [0.1.0-dev.74]
 
 ### Added

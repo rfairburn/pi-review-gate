@@ -22,80 +22,33 @@
  * the UI then renders with naive width handling and only the live keybinding
  * manager drives input. The host chat editor (`Editor`) is exposed for the
  * free-text answer row (issue #182); without it the component keeps its
- * built-in fallback editor. No installed path is hard-coded.
+ * built-in fallback editor. Editor creation, theming, and live-keybinding
+ * wiring live in the shared host-agnostic adapter (src/host-editor.ts,
+ * issue #185). No installed path is hard-coded.
  */
 
-import { createRequire } from "node:module";
-import { readFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { loadHostPeerModule } from "../host-peer-loader";
+import type { HostEditor, HostEditorProvider, HostEditorTheme } from "../host-editor";
 
-const PI_AGENT_PACKAGE_NAMES = new Set(["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"]);
 const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
-/** How far up from the host entry to look for its package.json. */
-const MAX_HOST_ROOT_DEPTH = 16;
-
-// tsc rewrites `await import(x)` in CommonJS output to require(x), which
-// cannot load ESM on Node 20 and would defeat the explicit file resolution
-// done here. Compile a native dynamic import the transpiler leaves untouched.
-const nativeDynamicImport = new Function("specifier", "return import(specifier)") as (
-  specifier: string,
-) => Promise<unknown>;
 
 /**
  * The host chat-editor surface the free-text answer row drives (issue #182).
- * Mirrors the pi-tui Editor contract the component relies on; the editor is
- * the single source of truth for the draft text and cursor — the component
+ * The shared host-agnostic contract from the adapter (issue #185): the editor
+ * is the single source of truth for the draft text and cursor — the component
  * never stores a copy.
  */
-export interface QuestionAnswerEditor {
-  /** Focus flag consumed by the TUI for IME cursor placement; the component propagates it. */
-  focused: boolean;
-  /** Fired by the editor's own submit action with expanded, trimmed text. */
-  onSubmit?: (text: string) => void;
-  /** Fired after every content change (raw stored text, paste markers included). */
-  onChange?: (text: string) => void;
-  render(width: number): string[];
-  handleInput(data: string): void;
-  invalidate(): void;
-  setText(text: string): void;
-  /** Stored text with paste markers expanded to their actual content. */
-  getExpandedText(): string;
-}
+export type QuestionAnswerEditor = HostEditor;
 
-/** Select-list styling the host editor theme requires (never visible here: no autocomplete provider is set). */
-export interface QuestionAnswerEditorSelectListTheme {
-  selectedPrefix(text: string): string;
-  selectedText(text: string): string;
-  description(text: string): string;
-  scrollInfo(text: string): string;
-  noMatch(text: string): string;
-}
-
-/** Theme for the host editor component (border + select-list styling). */
-export interface QuestionAnswerEditorTheme {
-  borderColor(text: string): string;
-  selectList: QuestionAnswerEditorSelectListTheme;
-}
+/** Theme for the host editor component (border + select-list styling), shared adapter contract. */
+export type QuestionAnswerEditorTheme = HostEditorTheme;
 
 /** The pi-tui surface the question UI uses; every member is optional. */
-export interface QuestionTuiHost {
+export interface QuestionTuiHost extends HostEditorProvider {
   matchesKey?(data: string, keyId: string): boolean;
   visibleWidth?(text: string): number;
   truncateToWidth?(text: string, width: number, ellipsis?: string): string;
   wrapTextWithAnsi?(text: string, width: number): string[];
-  /** The module-global KeybindingsManager (default resolution). */
-  getKeybindings?(): { matches?(data: string, keybinding: string): boolean } | undefined;
-  /** The pi-tui Editor class (host chat editor), when the module exposes it. */
-  Editor?: new (tui: unknown, theme: QuestionAnswerEditorTheme) => QuestionAnswerEditor;
-  /**
-   * The loaded module's public setKeybindings(). Since pi >= 0.86 the
-   * standalone module's global keybinding state is a fresh default-only copy
-   * (the app sets its own inlined chunk), so components built from this
-   * module must be pointed at the live manager — same strategy as
-   * src/settings/menu.ts.
-   */
-  setKeybindings?(keybindings: unknown): void;
 }
 
 let hostOverride: QuestionTuiHost | undefined;
@@ -124,7 +77,7 @@ export function loadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
 }
 
 async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
-  const mod = await loadPeerModule(PI_TUI_PACKAGE_NAME);
+  const mod = await loadHostPeerModule(PI_TUI_PACKAGE_NAME, { entryProvider: hostEntryProvider });
   if (!mod) return undefined;
   const matchesKey = mod.matchesKey as ((data: string, keyId: string) => boolean) | undefined;
   const visibleWidth = mod.visibleWidth as ((text: string) => number) | undefined;
@@ -133,9 +86,7 @@ async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
     | undefined;
   const wrapTextWithAnsi = mod.wrapTextWithAnsi as ((text: string, width: number) => string[]) | undefined;
   const getKeybindings = mod.getKeybindings as (() => unknown) | undefined;
-  const EditorCtor = mod.Editor as
-    | (new (tui: unknown, theme: QuestionAnswerEditorTheme) => QuestionAnswerEditor)
-    | undefined;
+  const EditorCtor = mod.Editor as HostEditorProvider["Editor"];
   const setKeybindings = mod.setKeybindings as ((keybindings: unknown) => void) | undefined;
   const host: QuestionTuiHost = {};
   if (typeof matchesKey === "function") {
@@ -167,86 +118,6 @@ async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
     };
   }
   return Object.keys(host).length > 0 ? host : undefined;
-}
-
-/** Loads one host peer module. Never a hard dependency: any failure yields undefined. */
-async function loadPeerModule(name: string): Promise<Record<string, unknown> | undefined> {
-  try {
-    const mod = require(name) as unknown;
-    if (isRecord(mod)) return mod;
-  } catch {
-    // MODULE_NOT_FOUND for compiled CJS entries under pi >= 0.86: the native
-    // import bypasses the jiti aliases. Try host-relative resolution.
-  }
-  const piRoot = findRunningPiRoot();
-  if (!piRoot) return undefined;
-  let entry: string | undefined;
-  try {
-    const hostRequire = createRequire(piRoot.entry);
-    entry = hostRequire.resolve(name);
-  } catch {
-    return undefined;
-  }
-  try {
-    const mod = require(entry) as unknown;
-    if (isRecord(mod)) return mod;
-  } catch {
-    // ESM-only package on a Node without require(esm): fall through.
-  }
-  try {
-    const mod = await nativeDynamicImport(pathToFileURL(entry).href);
-    if (isRecord(mod)) return mod;
-  } catch {
-    return undefined;
-  }
-  return undefined;
-}
-
-interface RunningPiRoot {
-  root: string;
-  entry: string;
-}
-
-/**
- * Locates the running Pi install from the process entry, mirroring
- * src/settings/menu.ts. Returns undefined when the process was not started
- * from a Pi install (unit tests, other hosts).
- */
-function findRunningPiRoot(): RunningPiRoot | undefined {
-  const candidate = (hostEntryProvider ?? defaultHostEntry)();
-  if (!candidate) return undefined;
-  let real: string;
-  try {
-    real = realpathSync(candidate);
-  } catch {
-    return undefined;
-  }
-  let dir = dirname(real);
-  for (let depth = 0; depth < MAX_HOST_ROOT_DEPTH; depth += 1) {
-    const pkg = readPackageJson(dir);
-    if (pkg && typeof pkg.name === "string" && PI_AGENT_PACKAGE_NAMES.has(pkg.name)) {
-      return { root: dir, entry: real };
-    }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return undefined;
-}
-
-function defaultHostEntry(): string | undefined {
-  const candidate = process.argv[1];
-  if (!candidate || typeof candidate !== "string") return undefined;
-  return isAbsolute(candidate) ? candidate : resolve(process.cwd(), candidate);
-}
-
-function readPackageJson(dir: string): Record<string, unknown> | undefined {
-  try {
-    const parsed = JSON.parse(readFileSync(resolve(dir, "package.json"), "utf8")) as unknown;
-    return isRecord(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

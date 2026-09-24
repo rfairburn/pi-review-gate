@@ -25,15 +25,17 @@
  * Free-text editing (issue #182): when the host chat editor is available
  * (the loader exposes pi-tui's `Editor`), the free-text row embeds a host
  * Editor created per answer-view session (lazily, on first entry into
- * editing). The editor is the single source of truth
+ * editing) through the shared host-agnostic adapter (src/host-editor.ts,
+ * issue #185). The editor is the single source of truth
  * for the draft text and cursor — movement, word/line edits, deletion,
  * kill-ring yank, undo, page scrolling, character jumps, bracketed paste,
  * and Shift+Enter/Ctrl+J newlines all resolve through the host's live
  * KeybindingsManager exactly as in the main chat editor, including user
  * keybindings.json overrides. Enter submits (ends trimmed, embedded newlines
- * preserved); Escape returns to the option rows with the draft kept; the
- * 4000-character bound is enforced by reverting over-limit changes to the
- * last compliant draft. Without a loadable host editor (unit tests, SEA/
+ * preserved); Escape returns to the option rows with the draft kept. There
+ * is no length cap on answers — a long paste or typed draft is kept in full
+ * and can be submitted as-is (the controller applies no answer bound).
+ * Without a loadable host editor (unit tests, SEA/
  * binary hosts) the built-in fallback editor keeps the original key set:
  * arrows, backspace, Enter, Esc, printable text, and bracketed paste — the
  * approved chord collapses it like every other mode (the question stays
@@ -87,7 +89,6 @@ export interface QuestionListComponent {
 
 const TYPE_ROW = "__type__";
 const DECLINE_ROW = "__decline__";
-const MAX_FREE_TEXT_CHARS = 4000;
 
 export function createQuestionListComponent(options: QuestionListComponentOptions): QuestionListComponent {
   const { controller, keybindings, theme, tuiHost, shortcutLabel } = options;
@@ -101,9 +102,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   // when no host editor exists.
   let answerEditor: QuestionAnswerEditor | undefined;
   let answerEditorAttempted = false;
-  /** Last expanded draft within the character bound (the revert target). */
-  let lastCompliantDraft = "";
-  let limitReverting = false;
   let buffer = "";
   let cursor = 0;
   let closed = false;
@@ -171,8 +169,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   function wireAnswerEditor(): void {
     const editor = answerEditor;
     if (!editor) return;
+    // Only the editor's own submit action is consumed; the draft text and
+    // cursor stay wholly inside the editor (no length cap, no copies).
     editor.onSubmit = (text) => handleEditorSubmit(text);
-    editor.onChange = () => enforceDraftLimit();
   }
 
   /** Create the host editor for this answer-view session, on first edit entry. */
@@ -202,25 +201,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     setEditing(false);
     submitFromAnswer(controller.submitAnswer(id, text, sourceProbe()));
-  }
-
-  /** Keep the stored draft within MAX_FREE_TEXT_CHARS (expanded content). */
-  function enforceDraftLimit(): void {
-    const editor = answerEditor;
-    if (!editor || limitReverting) return;
-    const expanded = editor.getExpandedText();
-    if (expanded.length <= MAX_FREE_TEXT_CHARS) {
-      lastCompliantDraft = expanded;
-      return;
-    }
-    // Over the bound: revert to the last compliant draft. The revert's own
-    // onChange is suppressed by limitReverting so it cannot retrigger.
-    limitReverting = true;
-    try {
-      editor.setText(lastCompliantDraft);
-    } finally {
-      limitReverting = false;
-    }
   }
 
   function handleListInput(data: string): void {
@@ -253,7 +233,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       // same reset the fallback path applies to its buffer).
       answerEditor = undefined;
       answerEditorAttempted = false;
-      lastCompliantDraft = "";
       setEditing(false);
       buffer = "";
       cursor = 0;
@@ -382,7 +361,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     const printable = printableText(data);
     if (printable.length === 0) return;
-    if (buffer.length >= MAX_FREE_TEXT_CHARS) return;
     buffer = buffer.slice(0, cursor) + printable + buffer.slice(cursor);
     cursor += printable.length;
     invalidate();

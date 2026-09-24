@@ -208,6 +208,26 @@ test("bracketed paste inserts its payload without escape-marker residue", async 
   assert.ok(!/200~|201~/.test(fixture.sent[0]!.message), "no paste markers reach the model");
 });
 
+test("the fallback editor keeps and submits drafts beyond 4000 characters without data loss", async () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
+  fixture.component.handleInput(ENTER); // open answer view
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // start editing
+  // A large bracketed paste (5000 chars) is inserted in full — no UI-side cap.
+  fixture.component.handleInput(`\x1b[200~${"p".repeat(5000)}\x1b[201~`);
+  fixture.component.handleInput(BACKSPACE); // remains editable: drop the last char
+  fixture.component.handleInput("z");
+  fixture.component.handleInput(ENTER); // submit
+  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(fixture.sent.length, 1);
+  assert.ok(
+    fixture.sent[0]!.message.endsWith("p".repeat(4999) + "z"),
+    "every character beyond 4000 reached the model",
+  );
+});
+
 test("unrecognized terminal sequences never insert printable tails into the draft", async () => {
   const fixture = makeFixture();
   register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });

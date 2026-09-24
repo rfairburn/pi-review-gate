@@ -878,7 +878,12 @@ test("dispatch failure events name the entry, due time, and exact error", () => 
   assert.ok(text.includes("No execute worker route is configured."));
 });
 
-test("repeated fall-back local minutes show their different offsets", () => {
+test("repeated fall-back local minutes show their different offsets", (t) => {
+  // Windows does not reliably apply process.env.TZ to Date local getters.
+  if (process.platform === "win32") {
+    t.skip("runtime TZ switching is not portable to Windows");
+    return;
+  }
   const previous = process.env.TZ;
   process.env.TZ = "America/New_York";
   try {

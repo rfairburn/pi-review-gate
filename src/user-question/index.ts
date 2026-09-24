@@ -28,8 +28,17 @@
 import { findOccupiedHostBindings } from "../host-keybindings";
 import { sendNotice } from "../pi";
 import { UserQuestionController, type QuestionSubmitSource } from "./controller";
-import { createQuestionListComponent, QUESTION_LIST_SHORTCUT_KEY, type QuestionUiTheme } from "./components";
-import { loadQuestionTuiHost } from "./pi-tui-host";
+import {
+  createQuestionListComponent,
+  QUESTION_LIST_SHORTCUT_KEY,
+  type QuestionUiTheme,
+} from "./components";
+import {
+  loadQuestionTuiHost,
+  type QuestionAnswerEditor,
+  type QuestionAnswerEditorTheme,
+  type QuestionTuiHost,
+} from "./pi-tui-host";
 import { createUserQuestionTool } from "./tool";
 
 /** Widget key for the persistent collapsed pending-question panel (above the editor). */
@@ -239,13 +248,26 @@ async function openQuestionList(pi: unknown, controller: UserQuestionController,
   // failure degrades rendering/input matching but never blocks the list.
   const tuiHost = await loadQuestionTuiHost().catch(() => undefined);
   try {
-    await ui.custom((_tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
+    await ui.custom((tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
+      // Point the standalone pi-tui module's global keybinding state at the
+      // app's live manager. Since pi >= 0.86 the bundled chunk keeps its own
+      // inlined copy, so a loaded standalone module is a fresh default-only
+      // state; without this the embedded chat editor would not see the user's
+      // keybindings.json overrides (same strategy as src/settings/menu.ts).
+      if (typeof tuiHost?.setKeybindings === "function" && isLiveKeybindingsManager(keybindings)) {
+        try {
+          tuiHost.setKeybindings(keybindings);
+        } catch {
+          // Best-effort; the injected manager still drives this component.
+        }
+      }
       const component = createQuestionListComponent({
         controller,
         keybindings: resolveUiKeybindings(keybindings, tuiHost),
         theme: toUiTheme(theme),
         tuiHost,
         shortcutLabel: questionShortcutLabel(),
+        createAnswerEditor: () => createAnswerEditor(tuiHost, tui, theme),
         onDone: () => done(undefined),
       });
       component.setSourceProbe(sourceProbeOf(ctx));
@@ -255,6 +277,67 @@ async function openQuestionList(pi: unknown, controller: UserQuestionController,
     // The host surfaced the failure itself (error banner); the questions
     // remain pending and the panel stays visible.
   }
+}
+
+/** True only for a real KeybindingsManager instance (live defaults + overrides). */
+function isLiveKeybindingsManager(value: unknown): boolean {
+  return isRecord(value) && typeof value.matches === "function";
+}
+
+/**
+ * Builds the host chat editor for the free-text answer row (issue #182), or
+ * undefined so the component keeps its built-in fallback editor.
+ */
+function createAnswerEditor(
+  tuiHost: QuestionTuiHost | undefined,
+  tui: unknown,
+  theme: unknown,
+): QuestionAnswerEditor | undefined {
+  const EditorCtor = tuiHost?.Editor;
+  if (!EditorCtor || !isUsableTui(tui)) return undefined;
+  try {
+    return new EditorCtor(tui, buildAnswerEditorTheme(theme));
+  } catch {
+    // A failing constructor degrades to the fallback editor.
+    return undefined;
+  }
+}
+
+/** The host editor renders against the TUI's terminal geometry. */
+function isUsableTui(tui: unknown): boolean {
+  if (!isRecord(tui)) return false;
+  const terminal = (tui as Record<string, unknown>).terminal;
+  return isRecord(terminal) && typeof (terminal as Record<string, unknown>).rows === "number";
+}
+
+/**
+ * EditorTheme for the embedded answer editor: the app's muted border color
+ * (its autocomplete list never opens — no provider is set — so only the
+ * border styling is ever visible).
+ */
+function buildAnswerEditorTheme(theme: unknown): QuestionAnswerEditorTheme {
+  const identity = (text: string): string => text;
+  return {
+    borderColor: (text) => safeThemeFg(theme, "borderMuted", text),
+    selectList: {
+      selectedPrefix: identity,
+      selectedText: identity,
+      description: identity,
+      scrollInfo: identity,
+      noMatch: identity,
+    },
+  };
+}
+
+function safeThemeFg(theme: unknown, color: string, text: string): string {
+  if (isRecord(theme) && typeof theme.fg === "function") {
+    try {
+      return String((theme.fg as (color: string, text: string) => unknown)(color, text));
+    } catch {
+      // Unknown color in a non-standard theme; plain text keeps the border.
+    }
+  }
+  return text;
 }
 
 function resolveUiKeybindings(

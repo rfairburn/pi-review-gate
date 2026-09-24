@@ -22,13 +22,26 @@
  * chord (Ctrl+Alt+Up) is matched with the host pi-tui's matchesKey when
  * loadable; without it, Escape still closes the list.
  *
- * The free-text editor inserts only ordinary printable text: the approved
- * chord collapses it like every other mode (the question stays pending), and
- * unrecognized terminal escape sequences are rejected rather than leaking
- * their printable tails into the draft.
+ * Free-text editing (issue #182): when the host chat editor is available
+ * (the loader exposes pi-tui's `Editor`), the free-text row embeds a host
+ * Editor created per answer-view session (lazily, on first entry into
+ * editing). The editor is the single source of truth
+ * for the draft text and cursor — movement, word/line edits, deletion,
+ * kill-ring yank, undo, page scrolling, character jumps, bracketed paste,
+ * and Shift+Enter/Ctrl+J newlines all resolve through the host's live
+ * KeybindingsManager exactly as in the main chat editor, including user
+ * keybindings.json overrides. Enter submits (ends trimmed, embedded newlines
+ * preserved); Escape returns to the option rows with the draft kept; the
+ * 4000-character bound is enforced by reverting over-limit changes to the
+ * last compliant draft. Without a loadable host editor (unit tests, SEA/
+ * binary hosts) the built-in fallback editor keeps the original key set:
+ * arrows, backspace, Enter, Esc, printable text, and bracketed paste — the
+ * approved chord collapses it like every other mode (the question stays
+ * pending), and unrecognized terminal escape sequences are rejected rather
+ * than leaking their printable tails into the draft.
  */
 
-import type { QuestionTuiHost } from "./pi-tui-host";
+import type { QuestionAnswerEditor, QuestionTuiHost } from "./pi-tui-host";
 import type { SubmitResult, UserQuestionController } from "./controller";
 
 /** The approved chord; the label shown to users is platform-specific. */
@@ -55,6 +68,12 @@ export interface QuestionListComponentOptions {
   tuiHost?: QuestionTuiHost;
   /** Platform label for the shortcut, e.g. "Ctrl+Alt+Up" or "Ctrl+Option+Up". */
   shortcutLabel: string;
+  /**
+   * Lazily creates the host chat editor for the free-text row (issue #182).
+   * Called once per answer-view session, on the first entry into editing;
+   * undefined — or a returned undefined — keeps the built-in fallback editor.
+   */
+  createAnswerEditor?: () => QuestionAnswerEditor | undefined;
   onDone: (result: QuestionListDone) => void;
 }
 
@@ -76,6 +95,15 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let selectedId: string | undefined;
   let answerIndex = 0;
   let editing = false;
+  // Host chat editor for the free-text row (issue #182): one instance per
+  // answer-view session, created lazily on first entry into editing. It owns
+  // the draft text and cursor; the fallback buffer/cursor below is only used
+  // when no host editor exists.
+  let answerEditor: QuestionAnswerEditor | undefined;
+  let answerEditorAttempted = false;
+  /** Last expanded draft within the character bound (the revert target). */
+  let lastCompliantDraft = "";
+  let limitReverting = false;
   let buffer = "";
   let cursor = 0;
   let closed = false;
@@ -126,8 +154,73 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return;
     }
     mode = "list";
-    editing = false;
+    setEditing(false);
+  }
+
+  /** Enter/leave editing, keeping the host editor's focus flag in step. */
+  function setEditing(value: boolean): void {
+    editing = value;
+    if (answerEditor) answerEditor.focused = value;
     invalidate();
+  }
+
+  // ------------------------------------------------------------------
+  // Host chat editor for the free-text row (issue #182)
+  // ------------------------------------------------------------------
+
+  function wireAnswerEditor(): void {
+    const editor = answerEditor;
+    if (!editor) return;
+    editor.onSubmit = (text) => handleEditorSubmit(text);
+    editor.onChange = () => enforceDraftLimit();
+  }
+
+  /** Create the host editor for this answer-view session, on first edit entry. */
+  function ensureAnswerEditor(): void {
+    if (answerEditorAttempted) return;
+    answerEditorAttempted = true;
+    try {
+      answerEditor = options.createAnswerEditor?.() ?? undefined;
+    } catch {
+      // A failing constructor degrades to the fallback editor.
+      answerEditor = undefined;
+    }
+    if (answerEditor) wireAnswerEditor();
+  }
+
+  /** The editor's own submit action (Enter): expanded, already trimmed. */
+  function handleEditorSubmit(text: string): void {
+    const id = selectedId;
+    if (!id || !controller.get(id)) {
+      // Stale state (session changed or question vanished): leave the UI.
+      close();
+      return;
+    }
+    if (text.length === 0) {
+      // Empty or whitespace-only: nothing to send; stay in editing.
+      return;
+    }
+    setEditing(false);
+    submitFromAnswer(controller.submitAnswer(id, text, sourceProbe()));
+  }
+
+  /** Keep the stored draft within MAX_FREE_TEXT_CHARS (expanded content). */
+  function enforceDraftLimit(): void {
+    const editor = answerEditor;
+    if (!editor || limitReverting) return;
+    const expanded = editor.getExpandedText();
+    if (expanded.length <= MAX_FREE_TEXT_CHARS) {
+      lastCompliantDraft = expanded;
+      return;
+    }
+    // Over the bound: revert to the last compliant draft. The revert's own
+    // onChange is suppressed by limitReverting so it cannot retrigger.
+    limitReverting = true;
+    try {
+      editor.setText(lastCompliantDraft);
+    } finally {
+      limitReverting = false;
+    }
   }
 
   function handleListInput(data: string): void {
@@ -152,7 +245,16 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       mode = "answer";
       selectedId = id;
       answerIndex = 0;
-      editing = false;
+      // A new answer-view session starts fresh — text, cursor and undo
+      // history all empty. The host Editor exposes no public undo-stack
+      // clear, so the previous session's instance is discarded here and a
+      // new one is created on first entry into editing; the draft only
+      // survives between editing and the option rows of this session (the
+      // same reset the fallback path applies to its buffer).
+      answerEditor = undefined;
+      answerEditorAttempted = false;
+      lastCompliantDraft = "";
+      setEditing(false);
       buffer = "";
       cursor = 0;
       invalidate();
@@ -191,8 +293,8 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       const row = rows[answerIndex];
       if (row === undefined) return;
       if (row === TYPE_ROW) {
-        editing = true;
-        invalidate();
+        ensureAnswerEditor();
+        setEditing(true);
         return;
       }
       if (row === DECLINE_ROW) {
@@ -213,6 +315,34 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   }
 
   function handleEditingInput(data: string, id: string): void {
+    const editor = answerEditor;
+    if (editor) {
+      // Escape (and whatever tui.select.cancel is bound to) returns to the
+      // option rows with the draft kept — handled before the editor sees it.
+      if (keybindings.matches(data, "tui.select.cancel")) {
+        setEditing(false);
+        return;
+      }
+      // The approved collapse chord works in editing mode just like in list
+      // and answer modes: it closes the UI without submitting; the question
+      // stays pending.
+      if (matchesShortcut(data)) {
+        close();
+        return;
+      }
+      // Submitting an empty or whitespace-only draft is a no-op that keeps
+      // the draft (the host editor would clear it on submit).
+      if (keybindings.matches(data, "tui.input.submit") && editor.getExpandedText().trim() === "") {
+        return;
+      }
+      // Everything else is the host chat editor's own business: movement,
+      // word/line edits, deletion, yank, undo, newlines, paste — all through
+      // the live KeybindingsManager.
+      editor.focused = true;
+      editor.handleInput(data);
+      invalidate();
+      return;
+    }
     if (keybindings.matches(data, "tui.select.confirm")) {
       const text = buffer.trim();
       if (text.length === 0) return;
@@ -322,9 +452,20 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     lines.push("");
     rows.forEach((row, index) => {
       const selected = index === answerIndex;
+      if (row === TYPE_ROW && editing && answerEditor) {
+        // The host editor renders its own bordered box (top/bottom rules and
+        // word-wrapped lines with the hardware-cursor marker); indent it like
+        // the other rows. Every line is padded to the box width, so each
+        // total line stays within `width`.
+        const box = answerEditor.render(Math.max(1, width - 2));
+        lines.push(`  ${box[0] ?? ""}`);
+        for (const rest of box.slice(1)) lines.push(`  ${rest}`);
+        return;
+      }
       const prefix = selected ? theme.fg("accent", "> ") : "  ";
       let text: string;
       if (row === TYPE_ROW) {
+        // Fallback editor (no host pi-tui): single inverted-cursor line.
         text = editing
           ? renderEditorLine()
           : theme.fg("muted", "Type something…");

@@ -78,6 +78,18 @@ arrows select · Enter confirm · Esc back
 ```
 
 - Selecting a choice or submitting typed text delivers your answer.
+- The free-text row is Pi's own chat editor, so its standard text-entry
+  keybindings work there: arrows (up/down move between the lines of a
+  multiline draft), word movement (Alt/Option+←/→, Ctrl+←/→), line start/end
+  (Home/End, Ctrl+A/Ctrl+E), PageUp/PageDown, Backspace/Delete, word deletion
+  (Ctrl+W, Alt+Backspace, Alt+D), delete to line start/end (Ctrl+U/Ctrl+K),
+  yank and yank-pop (Ctrl+Y, Alt+Y), undo (Ctrl+-), newlines (Shift+Enter or
+  Ctrl+J), and bracketed paste. Your `keybindings.json` overrides apply exactly
+  as in the main editor. Enter submits the answer (ends trimmed, embedded
+  newlines preserved); Escape goes back to the choices with the draft kept.
+  Answers are bounded at 4000 characters — an over-limit change is reverted to
+  the last compliant draft. Tab does nothing in the answer field (there is no
+  autocomplete there), and transcript/session shortcuts do not apply inside it.
 - **Decline** is one deliberate action: select the Decline row and press
   Enter. There is no second confirmation, but Escape only goes back — it
   never declines.
@@ -123,6 +135,9 @@ is cleared when the session ends or is replaced.
   terminals negotiate it automatically). On terminals without that support
   the chord does not fire — questions remain pending and visible in the panel
   until you answer them from a supported environment.
+- **Editor fallback.** The free-text row reuses Pi's chat editor component.
+  On the rare host where Pi's TUI module cannot be loaded at all, it degrades
+  to a basic field (arrows, Backspace, Enter, Esc) rather than failing.
 - **Operating modes.** Like other non-read-only tools, `AskUserQuestion`
   follows the standard tool visibility policy: it is hidden in plan/research
   mode and appears again in write-capable modes.

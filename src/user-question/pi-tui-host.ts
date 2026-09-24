@@ -20,7 +20,9 @@
  *
  * Anything that cannot be resolved (unit tests, SEA/binary hosts) degrades:
  * the UI then renders with naive width handling and only the live keybinding
- * manager drives input. No installed path is hard-coded.
+ * manager drives input. The host chat editor (`Editor`) is exposed for the
+ * free-text answer row (issue #182); without it the component keeps its
+ * built-in fallback editor. No installed path is hard-coded.
  */
 
 import { createRequire } from "node:module";
@@ -40,6 +42,42 @@ const nativeDynamicImport = new Function("specifier", "return import(specifier)"
   specifier: string,
 ) => Promise<unknown>;
 
+/**
+ * The host chat-editor surface the free-text answer row drives (issue #182).
+ * Mirrors the pi-tui Editor contract the component relies on; the editor is
+ * the single source of truth for the draft text and cursor — the component
+ * never stores a copy.
+ */
+export interface QuestionAnswerEditor {
+  /** Focus flag consumed by the TUI for IME cursor placement; the component propagates it. */
+  focused: boolean;
+  /** Fired by the editor's own submit action with expanded, trimmed text. */
+  onSubmit?: (text: string) => void;
+  /** Fired after every content change (raw stored text, paste markers included). */
+  onChange?: (text: string) => void;
+  render(width: number): string[];
+  handleInput(data: string): void;
+  invalidate(): void;
+  setText(text: string): void;
+  /** Stored text with paste markers expanded to their actual content. */
+  getExpandedText(): string;
+}
+
+/** Select-list styling the host editor theme requires (never visible here: no autocomplete provider is set). */
+export interface QuestionAnswerEditorSelectListTheme {
+  selectedPrefix(text: string): string;
+  selectedText(text: string): string;
+  description(text: string): string;
+  scrollInfo(text: string): string;
+  noMatch(text: string): string;
+}
+
+/** Theme for the host editor component (border + select-list styling). */
+export interface QuestionAnswerEditorTheme {
+  borderColor(text: string): string;
+  selectList: QuestionAnswerEditorSelectListTheme;
+}
+
 /** The pi-tui surface the question UI uses; every member is optional. */
 export interface QuestionTuiHost {
   matchesKey?(data: string, keyId: string): boolean;
@@ -48,6 +86,16 @@ export interface QuestionTuiHost {
   wrapTextWithAnsi?(text: string, width: number): string[];
   /** The module-global KeybindingsManager (default resolution). */
   getKeybindings?(): { matches?(data: string, keybinding: string): boolean } | undefined;
+  /** The pi-tui Editor class (host chat editor), when the module exposes it. */
+  Editor?: new (tui: unknown, theme: QuestionAnswerEditorTheme) => QuestionAnswerEditor;
+  /**
+   * The loaded module's public setKeybindings(). Since pi >= 0.86 the
+   * standalone module's global keybinding state is a fresh default-only copy
+   * (the app sets its own inlined chunk), so components built from this
+   * module must be pointed at the live manager — same strategy as
+   * src/settings/menu.ts.
+   */
+  setKeybindings?(keybindings: unknown): void;
 }
 
 let hostOverride: QuestionTuiHost | undefined;
@@ -85,6 +133,10 @@ async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
     | undefined;
   const wrapTextWithAnsi = mod.wrapTextWithAnsi as ((text: string, width: number) => string[]) | undefined;
   const getKeybindings = mod.getKeybindings as (() => unknown) | undefined;
+  const EditorCtor = mod.Editor as
+    | (new (tui: unknown, theme: QuestionAnswerEditorTheme) => QuestionAnswerEditor)
+    | undefined;
+  const setKeybindings = mod.setKeybindings as ((keybindings: unknown) => void) | undefined;
   const host: QuestionTuiHost = {};
   if (typeof matchesKey === "function") {
     host.matchesKey = (data, keyId) => Boolean(matchesKey(data, keyId));
@@ -104,6 +156,14 @@ async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
       return isRecord(manager) && typeof manager.matches === "function"
         ? manager as unknown as { matches(data: string, keybinding: string): boolean }
         : undefined;
+    };
+  }
+  if (typeof EditorCtor === "function") {
+    host.Editor = EditorCtor;
+  }
+  if (typeof setKeybindings === "function") {
+    host.setKeybindings = (keybindings) => {
+      setKeybindings(keybindings);
     };
   }
   return Object.keys(host).length > 0 ? host : undefined;

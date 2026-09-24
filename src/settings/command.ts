@@ -52,6 +52,8 @@ import { findOccupiedHostBindings } from "../host-keybindings";
 import { retainedSelect, type MenuCustomFactory } from "./menu";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
+import { editSettingText } from "./text-input";
+import { editWorkspaceDirectory } from "./workspace-editor";
 
 interface RegisterSettingsInput {
   pi: unknown;
@@ -76,6 +78,8 @@ interface RegisterSettingsInput {
 interface UiContext {
   select(title: string, options: string[]): Promise<string | undefined>;
   input?(title: string, placeholder?: string): Promise<string | undefined>;
+  /** Pi's public multi-line editor with editable prefill (issue #26). */
+  editor?(title: string, prefill?: string): Promise<string | undefined>;
   confirm?(title: string, message: string): Promise<boolean>;
   notify?(message: string, type?: "info" | "warning" | "error"): void;
   /** Host custom TUI component (Pi hosts only); guarded by `mode === "tui"`. */
@@ -481,12 +485,13 @@ async function selectWebSettings(
       if (entry) browserInteractionApproval = entry[0] as BrowserInteractionApproval;
       continue;
     }
-    if (!ui.input) {
-      await notify(ui, "This UI does not support numeric input.", "error");
-      continue;
-    }
     if (choice === "idleExpiry") {
-      const entered = await ui.input("Browser idle expiry in minutes (0 disables idle close)", String(browserIdleExpiryMinutes));
+      const entered = await editSettingText(
+        ui,
+        "Browser idle expiry in minutes (0 disables idle close)",
+        String(browserIdleExpiryMinutes),
+        "This UI does not support numeric input.",
+      );
       if (entered === undefined) continue;
       // Empty input must stay rejected: Number("") would otherwise stage 0.
       const trimmed = entered.trim();
@@ -500,7 +505,12 @@ async function selectWebSettings(
     }
     if (choice === "retention") {
       await notify(ui, "Maximum retained unsaved downloads per browser session. While the cap is reached, a new download cancels and releases the oldest retained one (after a live lowering, the next arrival may release more than one); saved files are never counted or affected. 0 disables count-based eviction entirely (normal save/close/revocation cleanup still applies). A lowered value takes effect when the next download arrives; editing this setting never deletes pending downloads.", "info");
-      const entered = await ui.input("Maximum retained unsaved downloads per browser session (0 = unlimited)", String(browserDownloadRetention));
+      const entered = await editSettingText(
+        ui,
+        "Maximum retained unsaved downloads per browser session (0 = unlimited)",
+        String(browserDownloadRetention),
+        "This UI does not support numeric input.",
+      );
       if (entered === undefined) continue;
       // Empty input must stay rejected: Number("") would otherwise stage 0.
       const trimmed = entered.trim();
@@ -512,7 +522,12 @@ async function selectWebSettings(
       browserDownloadRetention = retention;
       continue;
     }
-    const entered = await ui.input("Maximum download size in MiB", String(maxDownloadBytes / (1024 * 1024)));
+    const entered = await editSettingText(
+      ui,
+      "Maximum download size in MiB",
+      String(maxDownloadBytes / (1024 * 1024)),
+      "This UI does not support numeric input.",
+    );
     if (entered === undefined) continue;
     const mebibytes = Number(entered.trim());
     if (!Number.isSafeInteger(mebibytes) || mebibytes < 1 || mebibytes > 2_048) {
@@ -756,6 +771,17 @@ function generateScheduledTaskId(catalog: ScheduledTaskCatalog): string {
 }
 
 /**
+ * Cron editor title (issue #26): a compact heading rendered above the
+ * editable prefilled cron text that maps all five fields in order, states
+ * the machine-local time basis, and explains the canonical wildcard line.
+ */
+const CRON_EXPRESSION_TITLE = [
+  "Cron expression — 5 fields, machine-local time",
+  "minute  hour  day-of-month  month  day-of-week",
+  "* * * * * = every minute",
+].join("\n");
+
+/**
  * The Scheduled tasks submenu (issue #26): one staged entry per independent
  * scheduled task, keyed by its stable generated identity. Entries are always
  * visible and editable here regardless of the process-local scheduler runtime
@@ -789,11 +815,12 @@ async function selectScheduledTasks(
     if (!choice || choice === "action:back") return catalog;
     lastKey = choice;
     if (choice === "action:add") {
-      if (!ui.input) {
-        await notify(ui, "This UI does not support text input; scheduled tasks cannot be added here.", "error");
-        continue;
-      }
-      const entered = await ui.input("Scheduled task name", "");
+      const entered = await editSettingText(
+        ui,
+        "Scheduled task name",
+        "",
+        "This UI does not support text input; scheduled tasks cannot be added here.",
+      );
       if (entered === undefined) continue;
       const name = entered.trim();
       if (!name) {
@@ -864,11 +891,7 @@ async function editScheduledTaskEntry(
     if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "name") {
-      if (!ui.input) {
-        await notify(ui, "This UI does not support text input.", "error");
-        continue;
-      }
-      const entered = await ui.input("Scheduled task name", entry.name);
+      const entered = await editSettingText(ui, "Scheduled task name", entry.name);
       if (entered === undefined) continue;
       const name = entered.trim();
       if (!name) {
@@ -879,11 +902,10 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "cron") {
-      if (!ui.input) {
-        await notify(ui, "This UI does not support text input.", "error");
-        continue;
-      }
-      const entered = await ui.input("Cron expression (5 fields, machine-local time)", entry.cron);
+      // The heading renders above the editable prefilled cron text: all five
+      // fields in order, the machine-local time basis, and the canonical
+      // wildcard line (issue #26).
+      const entered = await editSettingText(ui, CRON_EXPRESSION_TITLE, entry.cron);
       if (entered === undefined) continue;
       try {
         setCatalogKey(catalog, id, { ...entry, cron: parseCronExpression(entered, "cron expression").expression });
@@ -901,11 +923,9 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "instructions") {
-      if (!ui.input) {
-        await notify(ui, "This UI does not support text input.", "error");
-        continue;
-      }
-      const entered = await ui.input("Instructions for the scheduled subtask", entry.instructions);
+      // Ordinary field: the public Pi editor seam (native controls including
+      // Ctrl+G external editing), never a bespoke surface (issue #26).
+      const entered = await editSettingText(ui, "Instructions for the scheduled subtask", entry.instructions);
       if (entered === undefined) continue;
       if (!entered.trim()) {
         await notify(ui, "Instructions must be a non-empty string.", "error");
@@ -915,11 +935,10 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "workspace") {
-      if (!ui.input) {
-        await notify(ui, "This UI does not support text input.", "error");
-        continue;
-      }
-      const entered = await ui.input("Authorized target workspace directory", entry.workspace);
+      // The one field with a bespoke surface: an embedded host editor with
+      // directory Tab completion when the interactive TUI offers it, then the
+      // public editor prefill, then the legacy input (issue #26).
+      const entered = await editWorkspaceDirectory(ui, entry.workspace);
       if (entered === undefined) continue;
       if (!entered.trim()) {
         await notify(ui, "Workspace must be a non-empty string.", "error");
@@ -1128,12 +1147,13 @@ async function selectOperatingMode(ui: UiContext, current: OperatingMode): Promi
 }
 
 async function selectModeCycleShortcut(ui: UiContext, current: string): Promise<string> {
-  if (!ui.input) {
-    await notify(ui, "This UI does not support text input; the mode cycle hotkey cannot be edited here.", "error");
-    return current;
-  }
   while (true) {
-    const entered = await ui.input("Mode cycle hotkey (modifiers + key, e.g. alt+m)", current);
+    const entered = await editSettingText(
+      ui,
+      "Mode cycle hotkey (modifiers + key, e.g. alt+m)",
+      current,
+      "This UI does not support text input; the mode cycle hotkey cannot be edited here.",
+    );
     if (entered === undefined) return current;
     const trimmed = entered.trim();
     if (trimmed.length === 0) {
@@ -1213,10 +1233,6 @@ async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): 
       policy.jitter = !policy.jitter;
       continue;
     }
-    if (!ui.input) {
-      await notify(ui, "This UI does not support numeric input.", "error");
-      continue;
-    }
     const isDelay = choice === "base" || choice === "max";
     const current = choice === "retries"
       ? policy.maxRetries
@@ -1225,7 +1241,12 @@ async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): 
         : choice === "max"
           ? policy.maxDelayMs
           : policy.maxSameIncidentRepeats;
-    const entered = await ui.input(isDelay ? "Delay in milliseconds" : "Retry limit", String(current));
+    const entered = await editSettingText(
+      ui,
+      isDelay ? "Delay in milliseconds" : "Retry limit",
+      String(current),
+      "This UI does not support numeric input.",
+    );
     if (entered === undefined) continue;
     const parsed = Number(entered.trim());
     if (!Number.isSafeInteger(parsed) || parsed < 0) {
@@ -1802,14 +1823,12 @@ async function selectReviewPolicy(
     });
     if (!choice || choice === "back") return { maxCorrectionCycles, guidanceThreshold };
     lastKey = choice;
-    if (!ui.input) {
-      await notify(ui, "This UI does not support numeric input.", "error");
-      continue;
-    }
     const current = choice === "cycles" ? maxCorrectionCycles : guidanceThreshold;
-    const entered = await ui.input(
+    const entered = await editSettingText(
+      ui,
       choice === "cycles" ? "Automatic correction attempts" : "Concrete guidance after correction attempts",
       String(current),
+      "This UI does not support numeric input.",
     );
     if (entered === undefined) continue;
     const parsed = Number(entered.trim());
@@ -1847,14 +1866,12 @@ async function selectTimeouts(
     });
     if (!choice || choice === "back") return { reviewerTimeoutMs, executorTimeoutMs };
     lastKey = choice;
-    if (!ui.input) {
-      await notify(ui, "This UI does not support numeric input.", "error");
-      continue;
-    }
     const currentMs = choice === "reviewer" ? reviewerTimeoutMs : executorTimeoutMs;
-    const entered = await ui.input(
+    const entered = await editSettingText(
+      ui,
       choice === "reviewer" ? "Reviewer timeout in minutes" : "Executor timeout in minutes",
       String(currentMs / 60_000),
+      "This UI does not support numeric input.",
     );
     if (entered === undefined) continue;
     const minutes = Number(entered.trim());

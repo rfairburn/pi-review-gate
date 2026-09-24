@@ -38,6 +38,29 @@ dates.
   path of that name exists; relative workspaces keep resolving against the
   parent session's working directory.
 
+### Fixed
+
+- Make every `/review-settings` text field truly editable: each field now opens
+  in Pi's public editor surface with its current value as an editable prefill —
+  native editing controls, including Ctrl+G external editing for long values
+  such as scheduled-task instructions — and cancel still leaves the staged value
+  unchanged. Hosts without an editor keep the previous input fallback with its
+  old title/placeholder semantics, and a host offering neither seam fails closed
+  with an error notice instead of silently staging nothing. The scheduled-task
+  workspace field additionally embeds the host's own editor in the interactive
+  TUI (host-provided pi-tui through the shared peer loader; no private Pi
+  member) with a minimal directory-only Tab completion: only `/...` and `~`/
+  `~/...` tokens complete, suggestions are existing directories only (symlinks
+  to directories count), `~/...` spellings stay displayed while expansion
+  happens only for filesystem lookup, and the editor remains the single draft.
+  Completion is a convenience — Save-time validation still rejects nonexistent
+  or non-directory workspaces. The cron field shows a compact heading above the
+  editable prefilled text mapping all five fields in order (minute, hour,
+  day-of-month, month, day-of-week), stating machine-local time and
+  `* * * * * = every minute`. No scheduler policy change: grammar, dispatch,
+  no-catch-up, overlap handling, choices and toggles, and validation are
+  unchanged.
+
 ## [0.1.0-dev.79]
 
 ### Changed

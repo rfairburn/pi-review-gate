@@ -828,6 +828,23 @@ installation when ordinary package-name loading is unavailable. Hosts without a 
 keep the plain selector that opens at the first row; retention is TUI-only, with no GUI
 planned.
 
+Text fields open in Pi's public editor surface with their current value as an
+editable prefill, so an existing value can be read, selected, and rewritten in
+place; native editing controls apply, including Ctrl+G external editing for long
+values such as scheduled-task instructions. Cancel leaves the staged value
+unchanged. Hosts without an editor keep the previous single-line input with its
+placeholder semantics, and a host offering neither seam reports an error instead
+of staging anything. In the interactive Pi TUI, the scheduled-task **workspace**
+field additionally embeds the host's own editor with directory-only Tab
+completion: only `/...` and `~`/`~/...` tokens complete, suggestions are existing
+directories only (symlinks to directories count), `~/...` spellings stay
+displayed while expansion happens only for filesystem lookup, and Enter submits
+the editor's own text. Completion is a convenience — Save still validates the
+workspace and rejects nonexistent or non-directory targets. The cron field shows
+a compact heading above its editable prefilled text mapping all five fields in
+order (minute, hour, day-of-month, month, day-of-week), stating machine-local
+time and `* * * * * = every minute`.
+
 Escape from a submenu returns to the settings root. Escape or **Cancel** at the root
 discards all staged changes; **Save changes** atomically persists every section while
 preserving unrelated JSON keys.

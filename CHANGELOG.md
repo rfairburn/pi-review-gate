@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.80]
+## [0.1.0-dev.81]
 
 ### Added
 
@@ -60,6 +60,15 @@ dates.
   `* * * * * = every minute`. No scheduler policy change: grammar, dispatch,
   no-catch-up, overlap handling, choices and toggles, and validation are
   unchanged.
+
+## [0.1.0-dev.80]
+
+### Fixed
+
+- Show `Closes #N` and `Refs #N` as plain text in the pull request template's
+  fill-in lines so a completed PR body can close a fully resolved issue on
+  merge or link a related issue without closing it. This source-only guidance
+  change does not alter runtime behavior or review policy.
 
 ## [0.1.0-dev.79]
 

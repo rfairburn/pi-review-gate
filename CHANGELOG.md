@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.78]
+
+### Changed
+
+- Use Pi's chat editor in `AskUserQuestion` free-text answers, including configured
+  text-entry bindings, multiline editing, movement, deletion, yank, and undo. Keep
+  Enter submission, Escape/back with the draft preserved, choices and Decline,
+  and the 4000-character answer bound; fall back to the basic field if the host
+  editor is unavailable.
+
 ## [0.1.0-dev.77]
 
 ### Added

@@ -5,14 +5,16 @@
 Every PR must accompany or link an issue to be considered; PRs without one are not
 reviewed or merged. State the relationship with accurate semantics:
 
-- `Closes #N` — fully resolves issue N. Provide evidence of the full resolution below.
-- `Refs #N` — partially addresses or is related to issue N. State the remaining scope
+- Closes #N — fully resolves issue N. Provide evidence of the full resolution below.
+- Refs #N — partially addresses or is related to issue N. State the remaining scope
   explicitly so the issue can stay open honestly.
 
-Tick the form that applies (replace N with the issue number):
+Tick the form that applies, replace N with the issue number, and leave the chosen
+line as ordinary Markdown text. Do not wrap it in backticks or a code block:
+GitHub only recognizes unformatted issue references and closing keywords.
 
-- [ ] `Closes #N`
-- [ ] `Refs #N` — remaining scope:
+- [ ] Closes #N
+- [ ] Refs #N — remaining scope:
 
 ## Description
 

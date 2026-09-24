@@ -116,7 +116,7 @@ test("operation-specific execution tools expose exact durable schemas", () => {
     SubtasksAdd: ["executionId", "tasks"],
     SubtasksInspect: ["executionId", "taskId", "offset", "lines", "evidence"],
     SubtasksWatch: ["executionId", "after"],
-    SubtasksContinue: ["executionId", "taskId", "bundle", "instructions", "instructionId"],
+    SubtasksContinue: ["executionId", "taskId", "bundle", "instructions", "instructionId", "inPlace"],
     SubtasksSteer: ["executionId", "taskId", "instructions", "instructionId", "interrupt"],
     SubtasksInterrupt: ["executionId", "taskId", "interruptMode", "instructionId"],
     SubtasksForceMerge: ["executionId", "taskId", "mergeAnyhow", "instructionId"],
@@ -135,6 +135,11 @@ test("operation-specific execution tools expose exact durable schemas", () => {
   assert.equal(start.properties.tasks.maxItems, 16);
   assert.equal(start.properties.tasks.items.properties.wakeOn, undefined);
   assert.equal(start.properties.instructions, undefined);
+  // #179: one explicit boolean opt-in; strict continuation stays the default.
+  const continueParams = executionTool(tools, "SubtasksContinue").parameters;
+  assert.equal(continueParams.properties.inPlace.type, "boolean");
+  assert.deepEqual(continueParams.required, ["instructions"]);
+  assert.match(continueParams.properties.inPlace.description, /Omitted or false keeps strict checkpoint-verified continuation/);
   const steer = executionTool(tools, "SubtasksSteer").parameters;
   assert.equal(steer.properties.interrupt.type, "boolean");
   assert.deepEqual(steer.required, ["instructions"]);
@@ -156,6 +161,34 @@ test("operation-specific execution tools expose exact durable schemas", () => {
     assert.ok(!required.includes("taskId"), name);
     assert.match(String(params.properties.taskId.description), /may be omitted only when the execution contains exactly one task/i, name);
   }
+});
+
+test("SubtasksContinue carries one explicit boolean inPlace opt-in to the controller and validates it", async () => {
+  const { tools, manager } = harness();
+  const continueTool = executionTool(tools, "SubtasksContinue").execute as ExecuteTool;
+  const received: Array<Record<string, unknown>> = [];
+  (manager as unknown as { controller: { continueTask: (input: Record<string, unknown>) => Promise<never> } }).controller.continueTask =
+    async (input) => {
+      received.push(input);
+      throw new Error("stub controller");
+    };
+  const invalid = await continueTool("in-place-invalid", { instructions: "go", inPlace: "yes" });
+  assert.equal(invalid.isError, true);
+  assert.match(String(invalid.content?.[0]?.text), /inPlace must be boolean/);
+  const steerWithFlag = await (executionTool(tools, "SubtasksSteer").execute as ExecuteTool)("steer-in-place", {
+    executionId: "exec", taskId: "task", instructions: "go", inPlace: true,
+  });
+  assert.equal(steerWithFlag.isError, true);
+  assert.match(String(steerWithFlag.content?.[0]?.text), /inPlace is not valid for action steer/);
+  assert.equal(received.length, 0, "invalid requests never reach the controller");
+  await continueTool("in-place-true", { executionId: "exec", taskId: "task", instructions: "go", inPlace: true });
+  await continueTool("in-place-false", { executionId: "exec", taskId: "task", instructions: "go", inPlace: false });
+  await continueTool("in-place-omitted", { executionId: "exec", taskId: "task", instructions: "go" });
+  assert.equal(received.length, 3);
+  assert.equal(received[0]!.inPlace, true);
+  assert.equal("inPlace" in received[1]!, false, "false is the strict default, not a second representation");
+  assert.equal("inPlace" in received[2]!, false);
+  await manager.shutdown();
 });
 
 test("dispatch guidance carries the beneficial-parallelism and bounded-task policy", () => {

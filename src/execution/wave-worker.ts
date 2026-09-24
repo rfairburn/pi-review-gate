@@ -328,6 +328,31 @@ export interface WaveWorkerContinuationInput {
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
   acquireFailover?: (current: ExecutorPoolAssignment) => Promise<ExecutorPoolAssignment | undefined>;
+  /**
+   * #179: explicit same-worktree continuation (execute only). The prior result
+   * may lack a candidate (no verified checkpoint); the turn runs in exactly the
+   * supplied retained worktree and carries a truthful state disclosure.
+   */
+  inPlace?: boolean;
+}
+
+/**
+ * #179: truthful disclosure for an explicit in-place continuation. It states
+ * only what the harness knows: the folder was reused untouched, its current
+ * state is neither checkpoint-verified nor reviewed, a failed staging attempt may have staged
+ * index entries, and — for a fresh session — prior conversation/hidden state
+ * is unavailable. The continuation instruction stays authoritative.
+ */
+export function buildInPlaceContinuationDisclosure(resumedSession: boolean): string {
+  return [
+    "In-place continuation (explicitly requested):",
+    "This turn runs in exactly the same retained worktree the previous executor turn used. The harness did not recreate, copy, reset, check out, or clean it: tracked, untracked, and staged files are as the previous turn left them.",
+    "The harness has not checkpoint-verified or reviewed the retained worktree state as it stands. A failed checkpoint staging attempt may have staged changes in the Git index; inspect the working tree and index state yourself rather than assuming either is unchanged.",
+    resumedSession
+      ? "Your previous executor session is being resumed."
+      : "This is a fresh executor session: the previous executor's conversation, reasoning, and any other hidden session state are not available. Rely on the task text, the continuation instruction, and the current worktree contents.",
+    "The continuation instruction below is authoritative. A changed successful result still needs a verified candidate, configured subtask review if enabled, and ordinary landing gates; no outcome is pre-approved.",
+  ].join("\n");
 }
 
 // ── validation ───────────────────────────────────────────────────────────────
@@ -1155,7 +1180,11 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
 
   // ── Validate prior result ──
   const research = task.backgroundKind === "research";
-  if (!priorResult.candidate && !research) {
+  const inPlace = input.inPlace === true;
+  if (inPlace && research) {
+    throw new Error("In-place continuation applies only to execute tasks.");
+  }
+  if (!priorResult.candidate && !research && !inPlace) {
     throw new Error("Continuation requires a prior result with a candidate.");
   }
   if (turn < 2) {
@@ -1223,7 +1252,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       }
     }
   }
-  if (!continuationCandidate) {
+  if (!continuationCandidate && !inPlace) {
     throw new Error("Continuation requires a prior result with a candidate.");
   }
 
@@ -1256,8 +1285,11 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   });
 
   // ── Resume the exact executor session ──
+  // #179: in place, the resumed-session prompt and the fresh-session handoff
+  // each carry their own truthful disclosure (a failed resume falls back to
+  // the handoff, which must not claim the old session survived).
   const rewrittenFeedback = buildWaveWorkerContinuationPrompt(
-    feedback,
+    inPlace ? `${buildInPlaceContinuationDisclosure(true)}\n\n${feedback}` : feedback,
     [sourceRoot, ...(sourceRootAliases ?? [])],
     worktree.worktreeRoot,
   );
@@ -1266,8 +1298,15 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     buildWaveWorkerPrompt(task, [sourceRoot, ...(sourceRootAliases ?? [])], worktree.worktreeRoot),
     "",
     "Current continuation instructions:",
-    rewrittenFeedback,
+    inPlace
+      ? buildWaveWorkerContinuationPrompt(
+        `${buildInPlaceContinuationDisclosure(false)}\n\n${feedback}`,
+        [sourceRoot, ...(sourceRootAliases ?? [])],
+        worktree.worktreeRoot,
+      )
+      : rewrittenFeedback,
   ].join("\n");
+  const newSessionOrigin = inPlace ? "in the same retained worktree" : "from the durable checkpoint";
   // Session compatibility is proven by the durable record: a persisted
   // session may only be resumed when the recorded executor selection matches
   // the effective assignment, and — for external agents, whose id is a
@@ -1286,7 +1325,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   if (priorResult.session && selectionChanged) {
     reportProgress(input, {
       phase: "correcting",
-      message: `current /review-settings changed the executor assignment; starting a new ${assignment.entry.entryId} session from the durable checkpoint`,
+      message: `current /review-settings changed the executor assignment; starting a new ${assignment.entry.entryId} session ${newSessionOrigin}`,
       artifactDir: resolvedArtifactDir,
       executorEntryId: assignment.entry.entryId,
       executorSelection: { ...assignment.entry.selection },
@@ -1294,7 +1333,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   } else if (priorResult.session && selectionUnrecorded) {
     reportProgress(input, {
       phase: "correcting",
-      message: `the prior executor assignment is not durably recorded, so the previous session cannot be verified against ${assignment.entry.entryId}; starting a new session from the durable checkpoint`,
+      message: `the prior executor assignment is not durably recorded, so the previous session cannot be verified against ${assignment.entry.entryId}; starting a new session ${newSessionOrigin}`,
       artifactDir: resolvedArtifactDir,
       executorEntryId: assignment.entry.entryId,
       executorSelection: { ...assignment.entry.selection },
@@ -1302,7 +1341,7 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   } else if (priorResult.session && resolutionDrifted) {
     reportProgress(input, {
       phase: "correcting",
-      message: `the recorded executor agent no longer resolves to the adapter and model that created the previous session; starting a new ${assignment.entry.entryId} session from the durable checkpoint`,
+      message: `the recorded executor agent no longer resolves to the adapter and model that created the previous session; starting a new ${assignment.entry.entryId} session ${newSessionOrigin}`,
       artifactDir: resolvedArtifactDir,
       executorEntryId: assignment.entry.entryId,
       executorSelection: { ...assignment.entry.selection },
@@ -1377,11 +1416,11 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
       worktree.worktreeRoot,
       taskId,
       task.title,
-      {
+      continuationCandidate ? {
         commitSha: continuationCandidate.commitSha,
         treeSha: continuationCandidate.treeSha,
         ref: continuationCandidate.candidateRef,
-      },
+      } : undefined,
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Candidate normalization failed.";
@@ -1420,6 +1459,17 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
   operation.checkpoint = await checkpointCandidate(capture, taskId, candidate);
   operation.session = turnResult.session;
   operation.state = "completed";
+  if (inPlace) {
+    // #179: the retained worktree now has a verified checkpoint; the earlier
+    // checkpoint staging/verification incidents are resolved by it.
+    const resolvedAt = new Date().toISOString();
+    for (const incident of operation.incidents) {
+      if (incident.terminalCode === "recovery_state_corrupt_or_unverifiable" && !incident.resolvedAt) {
+        incident.resolvedAt = resolvedAt;
+        incident.resolution = "in_place_continuation_checkpoint_verified";
+      }
+    }
+  }
   await writeOperationRecord(operation);
 
   // ── Determine status based on candidate vs base ──

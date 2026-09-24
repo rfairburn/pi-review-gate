@@ -98,6 +98,13 @@ export interface BackgroundCommandRecord {
   actor: "model" | "user" | "system";
   /** Steer only: request turn interruption before delivery (issue #63). Canonical flag for the whole producer/consumer path. */
   interrupt?: boolean;
+  /**
+   * #179 continue only: explicit same-worktree continuation of a stopped
+   * execute task without a verified checkpoint. The canonical controller-side
+   * record of the opt-in; `pendingContinuation` points at this command by
+   * instructionId and never duplicates the flag.
+   */
+  inPlace?: true;
 
   text?: string;
   mode?: string;

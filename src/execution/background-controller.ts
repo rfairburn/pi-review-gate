@@ -24,7 +24,7 @@ import {
   type PriorArchiveRecord,
 } from "./background-group-store";
 import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
-import { continueOperation, inspectOperation, readVerifiedAcceptedResult, verifyRecoveryCheckpoint } from "./operation-actions";
+import { continueOperation, inspectOperation, readVerifiedAcceptedResult, verifyInPlaceContinuation, verifyRecoveryCheckpoint } from "./operation-actions";
 import type { OperationRecord, ReattachmentBundle } from "./operation-record";
 import { createIncident, createReattachmentBundle, operationOwnershipStatus, readOperationRecord, writeOperationRecord } from "./operation-record";
 import { resolveArtifactRoot } from "./evidence/sources";
@@ -653,6 +653,13 @@ export class BackgroundExecutionController {
           if (task.state === "stopped_for_application_exit" && task.result?.taskResults[0]?.acceptedCommitSha) {
             transitionTaskState(task, "paused_recoverable");
             task.summary = "Accepted checkpoint retained after restart; inspect and force-merge without rerunning the executor.";
+          } else if (task.state === "stopped_for_application_exit" && task.bundle && await this.restoreAdmittedInPlaceContinuation(group, task)) {
+            // #179 audit finding: an admitted-but-undispatched explicit
+            // in-place continuation is authoritative. The helper either
+            // re-verified it and re-queued the original instruction/flag, or
+            // failed closed to paused_recoverable with the original command
+            // preserved; in neither case is a strict system auto-resume
+            // substituted for it.
           } else if (task.state === "stopped_for_application_exit" && task.bundle) {
             const instructionId = `application-resume-${randomUUID()}`;
             task.pendingContinuation = {
@@ -1216,6 +1223,12 @@ export class BackgroundExecutionController {
     instructions: string;
     instructionId: string;
     actor: "model" | "user";
+    /**
+     * #179: explicit same-worktree continuation of a stopped execute task
+     * without a verified checkpoint. Omitted/false keeps the strict
+     * checkpoint-verified default unchanged.
+     */
+    inPlace?: boolean;
   }): Promise<BackgroundInspection> {
     const taskId = input.taskId ?? input.bundle?.taskId ?? this.resolveTask(input.executionId).task.taskId;
     if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
@@ -1234,6 +1247,7 @@ export class BackgroundExecutionController {
     input: Parameters<BackgroundExecutionController["continueTask"]>[0],
     epoch: number,
   ): Promise<BackgroundInspection> {
+    if (input.inPlace === true) return this.admitInPlaceContinuation(input, epoch);
     const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle);
     const { group, task } = target;
     const archiveOnly = target.archiveOnly === true;
@@ -1249,6 +1263,9 @@ export class BackgroundExecutionController {
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) {
+      if (duplicate.inPlace === true) {
+        throw new Error(`Instruction ${input.instructionId} was already admitted as an explicit in-place continuation; retry with inPlace: true or use a new instructionId.`);
+      }
       return archiveOnly
         ? this.buildInspection(group, [task])
         : this.inspect(group.executionId, task.taskId);
@@ -1282,6 +1299,114 @@ export class BackgroundExecutionController {
     return this.inspect(group.executionId, task.taskId);
   }
 
+  /**
+   * #179: explicit in-place admission. Only an inline, stopped, unlanded
+   * execute task owned by this controller qualifies; archived/adopted work
+   * never does. Idempotency is decided before any verification so a replayed
+   * instruction never re-runs gates against a folder the first run consumed.
+   * Verification is read-only: nothing is created, copied, reset, checked
+   * out, cleaned, or staged during admission.
+   */
+  private async admitInPlaceContinuation(
+    input: Parameters<BackgroundExecutionController["continueTask"]>[0],
+    epoch: number,
+  ): Promise<BackgroundInspection> {
+    const { group, task } = this.resolveTask(input.executionId, input.taskId ?? input.bundle?.taskId);
+    if (group.kind !== "execute") {
+      throw new Error(`In-place continuation applies only to execute tasks; ${task.taskId} is a ${group.kind} task.`);
+    }
+    this.assertContinuationAdmission(task, epoch);
+    const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
+    if (duplicate) {
+      if (duplicate.action !== "continue" || duplicate.inPlace !== true) {
+        throw new Error(`Instruction ${input.instructionId} was already used for a ${duplicate.action} command without the in-place opt-in; use a new instructionId.`);
+      }
+      return this.inspect(group.executionId, task.taskId);
+    }
+    this.assertInPlaceTaskGates(group, task);
+    await this.recoverTaskAssociation(group, task, input.bundle, { inPlace: true });
+    // No await between this recheck and command/queue mutation.
+    this.assertContinuationAdmission(task, epoch);
+    this.assertInPlaceTaskGates(group, task);
+    const bundle = task.bundle;
+    if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
+    task.bundle = { ...bundle };
+    task.pendingContinuation = { instructions: input.instructions, instructionId: input.instructionId };
+    task.commands.push({
+      instructionId: input.instructionId,
+      action: "continue",
+      actor: input.actor,
+      inPlace: true,
+      text: input.instructions,
+      status: "queued",
+      createdAt: new Date().toISOString(),
+    });
+    transitionTaskState(task, "queued");
+    this.addActivity(task, "continue", `Explicit in-place continuation admitted (${input.instructionId}); the retained worktree is reused without a verified checkpoint.`);
+    await this.save(group);
+    void this.pump();
+    return this.inspect(group.executionId, task.taskId);
+  }
+
+  /** #179 controller-side landing/conflict gates for in-place admission. */
+  private assertInPlaceTaskGates(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): void {
+    if (isArchivableTaskState(task.state)) {
+      throw new Error(`In-place continuation refused: task ${task.taskId} is ${task.state}; settled work has no retained worktree to reuse. Use SubtasksContinue without inPlace.`);
+    }
+    if (task.state === "conflicted" || this.gateForTask(group.executionId, task.taskId)) {
+      throw new Error(`In-place continuation refused: task ${task.taskId} has an outstanding landing conflict gate. Resolve the conflict and call SubtasksMarkClean first.`);
+    }
+    if (!task.waveRoot) {
+      throw new Error(`In-place continuation refused: task ${task.taskId} never captured a managed worktree.`);
+    }
+  }
+
+  /**
+   * #179 audit finding: an admitted-but-undispatched explicit in-place
+   * continuation must survive an application restart as the authoritative
+   * instruction. Restores the original pending instruction and in-place flag
+   * by re-verifying the full read-only admission/dispatch guards (worktree
+   * identity, detached HEAD, writer quiescence, landing gates, checkpoint
+   * posture) and re-queuing on success; on any refusal the task fails closed
+   * to paused_recoverable with the original command preserved and the
+   * orchestrator notified — never a substituted strict auto-resume.
+   *
+   * Returns whether an admitted in-place continuation was found and handled.
+   * When true, the caller must not run the ordinary auto-resume branch.
+   */
+  private async restoreAdmittedInPlaceContinuation(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+  ): Promise<boolean> {
+    const pending = task.pendingContinuation;
+    if (!pending) return false;
+    const admitted = task.commands.find((command) => command.instructionId === pending.instructionId
+      && command.action === "continue" && command.status === "queued");
+    if (admitted?.inPlace !== true) return false;
+    try {
+      this.assertInPlaceTaskGates(group, task);
+      // Read-only re-verification of the exact retained worktree, its
+      // detached HEAD, writer quiescence, and landing gates — the same
+      // admission guards the original explicit admission ran.
+      await this.recoverTaskAssociation(group, task, undefined, { inPlace: true });
+      this.assertInPlaceTaskGates(group, task);
+    } catch (error) {
+      transitionTaskState(task, "paused_recoverable");
+      task.summary = "Admitted in-place continuation could not be re-verified after restart; the original instruction is preserved. Inspect before any resume.";
+      this.addActivity(task, "recovery", `In-place continuation re-verification refused after restart: ${messageOf(error)}`);
+      task.updatedAt = new Date().toISOString();
+      await this.input.notify?.(
+        `review gate: task ${task.taskId}: admitted in-place continuation was not resumed after restart (${messageOf(error)}); its original instruction is preserved for inspection.`,
+      );
+      return true;
+    }
+    transitionTaskState(task, "queued");
+    task.summary = "Exact parent conversation restored; admitted in-place continuation re-verified and re-queued.";
+    task.updatedAt = new Date().toISOString();
+    this.addActivity(task, "recovery", `Admitted in-place continuation ${pending.instructionId} re-verified after restart and re-queued unchanged.`);
+    return true;
+  }
+
   private assertContinuationAdmission(task: BackgroundTaskRecord, epoch: number): void {
     if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== epoch) {
       throw new Error("Application shutdown or controller detach began during continuation admission.");
@@ -1303,9 +1428,12 @@ export class BackgroundExecutionController {
     group: BackgroundExecutionGroup,
     task: BackgroundTaskRecord,
     explicit?: ReattachmentBundle,
-    options?: { tolerateUnverifiedCheckpoint?: boolean },
+    options?: { tolerateUnverifiedCheckpoint?: boolean; inPlace?: boolean },
   ): Promise<void> {
-    if (group.kind === "research") return this.recoverResearchTaskAssociation(group, task, explicit);
+    if (group.kind === "research") {
+      if (options?.inPlace === true) throw new Error("In-place continuation applies only to execute tasks.");
+      return this.recoverResearchTaskAssociation(group, task, explicit);
+    }
     if (!task.waveRoot) {
       if (explicit) throw new Error("Recovery task has no durable wave ownership anchor.");
       return;
@@ -1339,7 +1467,12 @@ export class BackgroundExecutionController {
     }
     if (inspection.live) throw new Error("Recovery operation still has a live writer.");
     const verifiedCheckpoint = inspection.checkpointVerification.status === "verified";
-    if ((!task.bundle || explicit) && !verifiedCheckpoint
+    if (options?.inPlace === true) {
+      // #179: the verified checkpoint is not required, but the retained
+      // folder, HEAD, writer, failed_critical cause, and landing gates are
+      // (read-only). The dispatch path re-verifies before any executor runs.
+      await verifyInPlaceContinuation({ waveRoot: ownedRoot, record: inspection.record, capture, manifest: inspection.manifest });
+    } else if ((!task.bundle || explicit) && !verifiedCheckpoint
       && options?.tolerateUnverifiedCheckpoint !== true) {
       throw new Error(`Recovery checkpoint is not verified: ${inspection.checkpointVerification.error ?? inspection.checkpointVerification.status}`);
     }
@@ -1347,7 +1480,9 @@ export class BackgroundExecutionController {
       ? await readVerifiedAcceptedResult(inspection) : undefined;
     if (this.detachEpoch !== epoch || this.detaching > 0) throw new Error("Controller detached during recovery verification.");
     // A tolerated, unverified checkpoint is inspected for salvage but never
-    // published as a durable continuation bundle.
+    // published as a durable continuation bundle. An in-place admission
+    // publishes the identity-verified current bundle; the operation layer
+    // still refuses any later default Continue without a verified checkpoint.
     if (verifiedCheckpoint || options?.tolerateUnverifiedCheckpoint !== true) {
       task.bundle = { ...inspection.bundle };
     }
@@ -3095,7 +3230,10 @@ export class BackgroundExecutionController {
     const priorState = transitionTaskState(task, "running");
     command.status = "delivered";
     command.deliveredAt = new Date().toISOString();
-    this.addActivity(task, "running", `Continuing from durable checkpoint (${pending.instructionId}).`);
+    const inPlace = command.inPlace === true;
+    this.addActivity(task, "running", inPlace
+      ? `Continuing in place in the retained worktree (${pending.instructionId}).`
+      : `Continuing from durable checkpoint (${pending.instructionId}).`);
     await this.save(group);
     const activation = stateTransitionNotice(task, priorState, task.state);
     if (activation) await this.wake(task, "state", activation);
@@ -3104,6 +3242,7 @@ export class BackgroundExecutionController {
         bundle: task.bundle!,
         instructions: pending.instructions,
         instructionId: pending.instructionId,
+        ...(inPlace ? { inPlace: true } : {}),
         config: this.input.config,
         scopedModels: this.scopedModels,
         signal: abort.signal,

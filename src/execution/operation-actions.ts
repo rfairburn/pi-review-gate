@@ -30,8 +30,10 @@ import {
   readOperationRecord,
   releaseOperationOwner,
   writeOperationRecord,
+  type ExecutionIncident,
   type OperationRecord,
   type OperationInstruction,
+  type RecoveryCheckpoint,
   type ReattachmentBundle,
 } from "./operation-record";
 import type { WaveManifest, WaveManifestTask, WaveTaskResult } from "./wave-controller";
@@ -279,6 +281,17 @@ export async function continueOperation(input: {
   bundle: ReattachmentBundle;
   instructions: string;
   instructionId: string;
+  /**
+   * #179: explicit same-worktree continuation. When true, a stopped operation
+   * without a verified checkpoint continues in exactly its retained managed
+   * worktree after the read-only {@link verifyInPlaceContinuation} preflight.
+   * The opt-in is deliberately constrained to the no-verified-checkpoint case:
+   * when the durable checkpoint still verifies, in-place continuation is
+   * refused (the retained folder may sit behind the checkpoint, and the
+   * normalized candidate could silently omit checkpointed work). Omitted/false
+   * keeps the strict checkpoint-verified default.
+   */
+  inPlace?: boolean;
   config: ReviewGateConfig;
   scopedModels?: string[];
   signal?: AbortSignal;
@@ -309,8 +322,15 @@ export async function continueOperation(input: {
       `Stale reattachment bundle revision ${input.bundle.expectedRevision}; current operation revision is ${record.revision}. Inspect and retry with the returned bundle.`,
     );
   }
+  const inPlace = input.inPlace === true;
   const priorInstruction = record.instructions.find((item) => item.instructionId === input.instructionId);
   if (priorInstruction) {
+    if ((priorInstruction.inPlace === true) !== inPlace) {
+      throw new Error(
+        `Instruction ${input.instructionId} was already recorded ${priorInstruction.inPlace === true ? "as an explicit in-place continuation" : "without the in-place opt-in"}; `
+          + "retry with the same inPlace value or use a new instructionId.",
+      );
+    }
     return {
       inspection: await inspectOperation(createReattachmentBundle(record, waveRoot)),
       duplicateInstruction: true,
@@ -339,6 +359,43 @@ export async function continueOperation(input: {
     await releaseWaveOwner(waveRoot, continuationOwner);
   };
   try {
+  let capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>;
+  // The prior candidate identity the continuation adopts/normalizes against.
+  // The strict default always has one; the in-place path never does
+  // (verifyInPlaceContinuation refuses any wave whose durable checkpoint still
+  // verifies, so the retained folder is never normalized against checkpoint
+  // identity its tree may not contain).
+  let priorCheckpoint: RecoveryCheckpoint | undefined;
+  let inPlacePreflight: InPlaceContinuationPreflight | undefined;
+  if (inPlace) {
+    // #179: explicit in-place continuation. The preflight is strictly
+    // read-only and refuses outstanding landing recovery rather than running
+    // it; no reconciliation stages the retained worktree here.
+    capture = await readWaveCaptureRecord(waveRoot);
+    inPlacePreflight = await verifyInPlaceContinuation({ waveRoot, record, capture, manifest });
+    if (record.state === "running" || record.state === "compacting" || record.state === "retrying") {
+      // The owner is recorded and proven dead/released by the preflight.
+      // Release it as bookkeeping only; the retained worktree stays as-is.
+      releaseOperationOwner(record);
+      record.incidents.push(createIncident({
+        attempt: Math.max(1, record.attempts.length),
+        generation: record.generation,
+        cause: "interruption",
+        stage: "application_restart",
+        message: "The prior writer ended without releasing the operation; its retained worktree is kept exactly as-is for an explicit in-place continuation (no checkpoint was staged).",
+        retryable: true,
+      }));
+      record.state = "paused_recoverable";
+      await writeOperationRecord(record);
+    }
+    // #179 audit finding: a verified checkpoint is never carried into an
+    // in-place continuation. verifyInPlaceContinuation refuses any wave whose
+    // durable checkpoint still verifies, so the retained folder is never
+    // silently normalized against checkpoint identity that its tree may not
+    // contain (checkpointed work must not be omitted without explicit
+    // inspection).
+    priorCheckpoint = undefined;
+  } else {
   const landingRecoveryManifests = await inspectLandingRecoveryManifests(waveRoot);
   for (const recovery of landingRecoveryManifests) {
     if (recovery.state !== "in_progress" && recovery.state !== "recovery_required") continue;
@@ -362,7 +419,7 @@ export async function continueOperation(input: {
     }
     record = await reconcileAbandonedOperation(record, waveRoot);
   }
-  const capture = await readWaveCaptureRecord(waveRoot);
+  capture = await readWaveCaptureRecord(waveRoot);
   if (!record.checkpoint?.verified) {
     throw new Error("Operation cannot continue because its verified recovery checkpoint is missing.");
   }
@@ -383,8 +440,13 @@ export async function continueOperation(input: {
     await writeOperationRecord(record);
     throw new Error(`Recovery checkpoint verification failed; automatic continuation is blocked: ${message}`);
   }
+  priorCheckpoint = record.checkpoint;
+  }
   const previouslyLanded = record.state === "landed" || manifest.landingStatus === "landed";
-  const continuationLandingBase = previouslyLanded ? record.checkpoint.commitSha : undefined;
+  if (previouslyLanded && !priorCheckpoint) {
+    throw new Error(`${IN_PLACE_REFUSED} this wave previously landed, but no verified checkpoint identifies the landed base: ${inPlacePreflight?.checkpointError ?? "checkpoint missing"}.`);
+  }
+  const continuationLandingBase = previouslyLanded ? priorCheckpoint!.commitSha : undefined;
 
   const task = await readTask(record.artifactDir);
   synchronizeTaskAndOperationToolCatalog(task, record);
@@ -394,7 +456,12 @@ export async function continueOperation(input: {
   const publishLiveControl = (control: ExecutorLiveControl | undefined): void => {
     input.onLiveControl?.(steeringEvidence.wrap(control));
   };
-  const recoveryWorktree = await ensureRecoveryWorktree(capture, record, input.signal);
+  // In place: exactly the retained, preflight-verified folder — never
+  // recreated or reset. The default path may recreate a missing worktree
+  // from its verified checkpoint.
+  const recoveryWorktree: WorkerWorktree = inPlacePreflight
+    ? { worktreeRoot: inPlacePreflight.worktreeRoot, effectiveCwd: inPlacePreflight.effectiveCwd }
+    : await ensureRecoveryWorktree(capture, record, input.signal);
   record.generation += 1;
   // Continuation candidates keep their own immutable snapshot namespace per
   // generation; the durable checkpoint's actual ref is carried verbatim as
@@ -417,6 +484,7 @@ export async function continueOperation(input: {
     sequence: record.nextInstructionSequence++,
     action: "continue",
     text: input.instructions,
+    ...(inPlace ? { inPlace: true as const } : {}),
     status: "queued",
     createdAt: new Date().toISOString(),
   };
@@ -431,28 +499,39 @@ export async function continueOperation(input: {
     adapter: record.adapter ?? record.session?.adapter ?? "unknown",
     model: record.model,
     session: record.session,
-    candidate: {
-      commitSha: record.checkpoint.commitSha,
-      treeSha: record.checkpoint.treeSha,
+    // In place without a verified checkpoint there is deliberately no prior
+    // candidate: nothing unverified is laundered into candidate identity.
+    candidate: priorCheckpoint ? {
+      commitSha: priorCheckpoint.commitSha,
+      treeSha: priorCheckpoint.treeSha,
       // Carry the durable checkpoint's actual ref so continuation verifies
       // and adopts exactly that identity instead of mixing the original-wave
       // and -gN candidate namespaces.
-      candidateRef: record.checkpoint.ref,
-      differsFromBase: record.checkpoint.differsFromBase,
-    },
+      candidateRef: priorCheckpoint.ref,
+      differsFromBase: priorCheckpoint.differsFromBase,
+    } : undefined,
     operationRecord: operationRecordPath(record.artifactDir),
     bundle: createReattachmentBundle(record, waveRoot),
-    checkpoint: record.checkpoint,
+    checkpoint: priorCheckpoint,
     incidents: record.incidents,
     attempts: record.attempts.length,
     lastExecutorTurn: Math.max(0, ...record.attempts.map((attempt) => attempt.turn)),
   };
   const nextTurn = (prior.lastExecutorTurn ?? 0) + 1;
-  const instruction = [
-    `Continuation instruction ${input.instructionId}:`,
-    input.instructions,
-    "Continue from the preserved workspace and session state; do not restart completed work.",
-  ].join("\n\n");
+  const instruction = inPlacePreflight
+    ? [
+      `Continuation instruction ${input.instructionId} (explicit in-place continuation):`,
+      input.instructions,
+      inPlacePreflight.checkpointIncident
+        ? `Last recorded checkpoint failure: ${inPlacePreflight.checkpointIncident.message}`
+        : "No verified recovery checkpoint exists for this task.",
+      "Continue from the retained worktree exactly as it is; do not restart completed work.",
+    ].join("\n\n")
+    : [
+      `Continuation instruction ${input.instructionId}:`,
+      input.instructions,
+      "Continue from the preserved workspace and session state; do not restart completed work.",
+    ].join("\n\n");
   instructionRecord.status = "delivered";
   instructionRecord.deliveredAt = new Date().toISOString();
   await writeOperationRecord(record);
@@ -492,6 +571,7 @@ export async function continueOperation(input: {
     acquireFailover,
     onLiveControl: publishLiveControl,
     onUpdate: (update) => input.onUpdate?.(update),
+    ...(inPlace ? { inPlace: true } : {}),
     });
     if (continued.status === "completed") {
       await steeringEvidence.record(input.instructions, input.instructionId, "continue");
@@ -547,6 +627,9 @@ export async function continueOperation(input: {
   await input.onWorkerSettled?.(lifecycle);
 
   if (!isEligible(lifecycle) || !lifecycle.acceptedCommitSha) {
+    // #179: a repeated in-place staging failure leaves no new checkpoint, a
+    // fresh checkpoint incident, and the retained folder for another explicit
+    // attempt; the strict default Continue still requires a verified checkpoint.
     record.state = lifecycle.status === "cancelled" ? "cancelled" : "paused_recoverable";
     await writeOperationRecord(record);
     await publishContinuationManifest(join(waveRoot, "wave-manifest.json"), manifest, lifecycle);
@@ -841,6 +924,191 @@ export async function verifyRecoveryCheckpoint(
   if (checkpoint.differsFromBase !== (changedPaths.length > 0)) {
     throw new Error("Recovery checkpoint differs-from-base flag does not match its content.");
   }
+}
+
+/** #179: the only terminal code an explicit in-place continuation may bypass.
+ * Every producer of this code is a checkpoint staging or verification failure
+ * (candidate normalization, checkpoint verification, cancellation/retry/
+ * adapter-initialization checkpoint creation); landing rollback uses its own
+ * `landing_rollback_incomplete` code, which is never bypassed. */
+const IN_PLACE_BYPASSABLE_TERMINAL_CODE = "recovery_state_corrupt_or_unverifiable";
+
+const IN_PLACE_REFUSED = "In-place continuation refused:";
+
+/** Result of the read-only #179 in-place continuation preflight. */
+export interface InPlaceContinuationPreflight {
+  worktreeRoot: string;
+  effectiveCwd: string;
+  /** Current detached HEAD of the retained worktree (base or a verified candidate of this task). */
+  headCommit: string;
+  /** Whether the record's durable checkpoint (if any) still verifies. Always
+   * false in a returned preflight: a verified checkpoint refuses in-place
+   * continuation outright (fail-closed against silently omitting checkpointed
+   * work); the field remains for the diagnostic distinction between "no
+   * checkpoint" and "checkpoint present but unverifiable". */
+  checkpointVerified: boolean;
+  checkpointError?: string;
+  /** Latest unresolved checkpoint staging/verification incident, if any. */
+  checkpointIncident?: ExecutionIncident;
+}
+
+/** Latest unresolved incident that carries a terminal safety code. */
+function latestUnresolvedTerminalIncident(record: OperationRecord): ExecutionIncident | undefined {
+  for (let index = record.incidents.length - 1; index >= 0; index -= 1) {
+    const incident = record.incidents[index]!;
+    if (incident.terminalCode && !incident.resolvedAt) return incident;
+  }
+  return undefined;
+}
+
+function latestUnresolvedCheckpointIncident(record: OperationRecord): ExecutionIncident | undefined {
+  for (let index = record.incidents.length - 1; index >= 0; index -= 1) {
+    const incident = record.incidents[index]!;
+    if (incident.terminalCode === IN_PLACE_BYPASSABLE_TERMINAL_CODE && !incident.resolvedAt) return incident;
+  }
+  return undefined;
+}
+
+/**
+ * #179: verify, strictly read-only, that an explicit in-place continuation may
+ * reuse exactly the operation's retained managed worktree without a verified
+ * checkpoint. Nothing is created, copied, reset, checked out, cleaned, or
+ * staged: every Git probe is a read with optional locks disabled.
+ *
+ * Refuses (fail closed, with actionable diagnostics) when:
+ * - any landing recovery is outstanding or unverified, or a landing rollback
+ *   incident is unresolved (landing recovery is never bypassed);
+ * - the writer is live/uncertain, or an active state has no durable owner;
+ * - the operation is landed/reviewing, or failed_critical for any reason other
+ *   than a checkpoint staging/verification failure with its durable incident;
+ * - the retained folder is missing, not a real directory, not the task's
+ *   managed worktree path, not a Git top-level of the private wave repository,
+ *   on an attached HEAD, or at a HEAD that is neither the captured base nor a
+ *   verified candidate of this task's continuation lineage.
+ */
+export async function verifyInPlaceContinuation(input: {
+  waveRoot: string;
+  record: OperationRecord;
+  capture: Awaited<ReturnType<typeof readWaveCaptureRecord>>;
+  manifest: { landingStatus?: string };
+}): Promise<InPlaceContinuationPreflight> {
+  const { waveRoot, record, capture, manifest } = input;
+  // ── Landing / source-mutation gates ──
+  if (manifest.landingStatus === "recovery_required") {
+    throw new Error(`${IN_PLACE_REFUSED} the wave's landing rollback was incomplete (landingStatus recovery_required). Resolve the authenticated landing recovery manifest before any continuation; in-place continuation never bypasses landing-rollback recovery.`);
+  }
+  const landingRecoveryManifests = await inspectLandingRecoveryManifests(waveRoot);
+  const outstandingRecovery = landingRecoveryManifests.find((recovery) =>
+    recovery.state === "in_progress" || recovery.state === "recovery_required" || !recovery.verified);
+  if (outstandingRecovery) {
+    throw new Error(`${IN_PLACE_REFUSED} landing recovery manifest ${outstandingRecovery.manifestPath} is ${outstandingRecovery.verified ? outstandingRecovery.state : "unverified"}. Resolve landing recovery first; in-place continuation never bypasses landing-rollback recovery.`);
+  }
+  if (record.incidents.some((incident) => incident.terminalCode === "landing_rollback_incomplete" && !incident.resolvedAt)) {
+    throw new Error(`${IN_PLACE_REFUSED} the operation has an unresolved landing_rollback_incomplete incident. Resolve landing recovery first; in-place continuation never bypasses landing-rollback recovery.`);
+  }
+  // ── Writer quiescence ──
+  const ownership = operationOwnershipStatus(record);
+  if (ownership.processAlive) {
+    throw new Error(`${IN_PLACE_REFUSED} the operation still has a live or uncertain writer. ${ownership.message} Wait for the writer to stop (or interrupt it) and inspect again.`);
+  }
+  if ((record.state === "running" || record.state === "compacting" || record.state === "retrying") && !record.owner) {
+    throw new Error(`${IN_PLACE_REFUSED} operation state ${record.state} predates durable writer ownership, so an unrecorded writer may still own the worktree.`);
+  }
+  // ── Operation state gate ──
+  if (record.state === "landed") {
+    throw new Error(`${IN_PLACE_REFUSED} operation ${record.operationId} already landed; its verified checkpoint supports an ordinary SubtasksContinue without inPlace.`);
+  }
+  if (record.state === "reviewing") {
+    throw new Error(`${IN_PLACE_REFUSED} operation ${record.operationId} is in state reviewing; in-place continuation only applies to a stopped executor.`);
+  }
+  const checkpointIncident = latestUnresolvedCheckpointIncident(record);
+  if (record.state === "failed_critical") {
+    const terminal = latestUnresolvedTerminalIncident(record);
+    if (!terminal || terminal.terminalCode !== IN_PLACE_BYPASSABLE_TERMINAL_CODE) {
+      throw new Error(`${IN_PLACE_REFUSED} operation state failed_critical is not explained by a durable checkpoint staging/verification incident${terminal ? ` (latest terminal incident: ${terminal.stage}/${terminal.terminalCode})` : ""}. Only a checkpoint staging or verification failure may be continued in place; inspect the operation diagnostics.`);
+    }
+  }
+  // ── Exact retained managed worktree ──
+  const worktreeRoot = record.worktreeRoot;
+  const entry = await fs.lstat(worktreeRoot).catch(() => undefined);
+  if (!entry) {
+    throw new Error(`${IN_PLACE_REFUSED} the retained worktree ${worktreeRoot} no longer exists. In-place continuation never recreates, copies, resets, checks out, or cleans a worktree. Restore the folder at that exact path, retire this task and start a replacement with SubtasksAdd, or use SubtasksForceMerge only if a surviving verified checkpoint or snapshot ref still exists.`);
+  }
+  if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    throw new Error(`${IN_PLACE_REFUSED} the retained worktree path ${worktreeRoot} is not a real directory (symlink or other file type).`);
+  }
+  const expectedRoot = join(waveRoot, "workers", record.taskId);
+  const [realWorktree, realExpected, realWaveRoot, realRepository] = await Promise.all([
+    fs.realpath(worktreeRoot),
+    fs.realpath(expectedRoot).catch(() => undefined),
+    fs.realpath(waveRoot),
+    fs.realpath(capture.repositoryPath),
+  ]);
+  if (realExpected !== realWorktree || relative(realWaveRoot, realWorktree).startsWith("..")) {
+    throw new Error(`${IN_PLACE_REFUSED} the recorded worktree ${worktreeRoot} is not this task's managed worktree ${expectedRoot}.`);
+  }
+  const realCwd = await fs.realpath(record.effectiveCwd).catch(() => undefined);
+  const cwdRelative = realCwd === undefined ? undefined : relative(realWorktree, realCwd);
+  if (cwdRelative === undefined || isAbsolute(cwdRelative) || cwdRelative === ".." || cwdRelative.startsWith(`..${sep}`)) {
+    throw new Error(`${IN_PLACE_REFUSED} the recorded effective directory ${record.effectiveCwd} is missing or outside the retained worktree.`);
+  }
+  const topLevel = await gitRead(["rev-parse", "--show-toplevel"], worktreeRoot).catch(() => "");
+  if (!topLevel || await fs.realpath(resolve(worktreeRoot, topLevel)).catch(() => "") !== realWorktree) {
+    throw new Error(`${IN_PLACE_REFUSED} ${worktreeRoot} is not a Git worktree top-level.`);
+  }
+  const commonDir = await gitRead(["rev-parse", "--git-common-dir"], worktreeRoot).catch(() => "");
+  if (!commonDir || await fs.realpath(resolve(worktreeRoot, commonDir)).catch(() => "") !== realRepository) {
+    throw new Error(`${IN_PLACE_REFUSED} ${worktreeRoot} does not belong to the wave's private repository ${capture.repositoryPath}.`);
+  }
+  const attached = await gitRead(["symbolic-ref", "-q", "HEAD"], worktreeRoot).catch(() => "");
+  if (attached !== "") {
+    throw new Error(`${IN_PLACE_REFUSED} the retained worktree HEAD is attached to ${attached}; managed worktrees must stay on a detached HEAD. The harness never checks out or detaches a HEAD for you.`);
+  }
+  const headCommit = await gitRead(["rev-parse", "--verify", "HEAD^{commit}"], worktreeRoot).catch(() => "");
+  if (!headCommit) throw new Error(`${IN_PLACE_REFUSED} the retained worktree HEAD cannot be resolved.`);
+  if (headCommit !== capture.baseCommit) {
+    const captureLineage = waveLineageOf(capture);
+    try {
+      await verifyCandidateCommitIdentity(capture.repositoryPath, {
+        commitSha: headCommit,
+        baseCommit: capture.baseCommit,
+        lineage: { rootWaveId: captureLineage.rootWaveId, generation: Math.max(captureLineage.generation, record.generation) },
+        taskId: record.taskId,
+      });
+    } catch (error) {
+      throw new Error(`${IN_PLACE_REFUSED} the retained worktree HEAD ${headCommit} is neither the captured base ${capture.baseCommit} nor a verified candidate of this task: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  // ── Optional prior checkpoint (never required in place) ──
+  let checkpointVerified = false;
+  let checkpointError: string | undefined;
+  if (record.checkpoint) {
+    try {
+      await verifyRecoveryCheckpoint(waveRoot, record, capture);
+      checkpointVerified = true;
+    } catch (error) {
+      checkpointError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  // #179 audit finding: the opt-in exists only for waves without a verified
+  // checkpoint. When the durable checkpoint still verifies, a retained folder
+  // that is behind or divergent from it would let the normalized candidate
+  // silently omit checkpointed work. Refuse read-only: direct inspection of
+  // the retained changes and the ordinary strict Continue instead; never
+  // auto-reset, copy, or reconcile the retained folder here.
+  if (checkpointVerified) {
+    throw new Error(
+      `${IN_PLACE_REFUSED} this operation already has a verified recovery checkpoint (${record.checkpoint!.commitSha.slice(0, 12)}), so in-place continuation is refused: a retained folder behind or divergent from that checkpoint could silently omit checkpointed work. Inspect the retained changes in ${worktreeRoot} against the verified checkpoint first, then use ordinary SubtasksContinue without inPlace (strict, checkpoint-gated). In-place continuation never resets, copies, or reconciles the retained folder.`,
+    );
+  }
+  return {
+    worktreeRoot,
+    effectiveCwd: record.effectiveCwd,
+    headCommit,
+    checkpointVerified,
+    checkpointError,
+    checkpointIncident,
+  };
 }
 
 async function gitRead(args: string[], cwd: string): Promise<string> {

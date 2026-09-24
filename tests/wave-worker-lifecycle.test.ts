@@ -6,6 +6,7 @@ import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
 import { createWorkerWorktree, removeWorktree, workerRefName } from "../src/execution/wave-worktrees";
 import { reviewerProgressLabel, runWaveWorkerLifecycle, type WaveWorkerLifecycleResult } from "../src/execution/wave-worker-lifecycle";
+import { buildWaveWorkerPrompt } from "../src/execution/wave-worker";
 import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
 import { buildSubtaskEvidence, readSubtaskEvidence } from "../src/execution/subtask-evidence";
 import { normalizeConfig, type ActiveReviewerSelection, type ExternalAgentConfig, type ReviewGateConfig } from "../src/config";
@@ -2141,4 +2142,142 @@ test("lifecycle: duplicate subtask reviewer ids still block review", async () =>
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// ── Subtask review workspace-validity criterion (#179) ───────────────────────
+
+test("lifecycle: subtask review request carries the hard candidate workspace-validity criterion", async () => {
+  const root = await mkTmp("pi-wwl-validity-prompt-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-validity-prompt");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-validity-prompt");
+    await mkdir(artifactDir, { recursive: true });
+
+    const { command } = await createFakeExecutor(root);
+    // Deterministic reviewer: passes only when the subtask review request
+    // carries the workspace-validity criterion; otherwise blocks. This tests
+    // prompt delivery, not that an LLM would follow the instruction.
+    const reviewerScript = [
+      "process.stdin.resume();let s='';",
+      "process.stdin.on('data',c=>s+=c);",
+      "process.stdin.on('end',()=>{",
+      "const ok=s.includes('Candidate workspace validity (hard criterion)')",
+      "&& s.includes('needs_changes with a path-specific actionable reason')",
+      "&& s.includes('Gitlinks (submodule entries)')",
+      "&& s.includes('harmless temp-like name')",
+      "&& s.includes('pre-existing untracked files outside the candidate')",
+      "&& s.includes('full test-suite run alone')",
+      "&& s.includes('a task without a verified candidate cannot be reviewed');",
+      "process.stdout.write(JSON.stringify(ok",
+      "?{verdict:'pass',summary:'criterion delivered',findings:[]}",
+      ":{verdict:'needs_changes',summary:'criterion missing',findings:[{severity:'blocking',file:'prompt',line:null,issue:'workspace-validity criterion missing',recommendation:'deliver the criterion in the subtask review request'}]}));",
+      "});",
+    ].join("");
+    const reviewer = cliReviewerAgent("validity-prompt-checker", reviewerScript);
+    const baseConfig = buildConfig(command, "fake-exec", [reviewer]);
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      enabled: true,
+      review: { subtaskReviewers: [{ source: "external", id: "validity-prompt-checker" }] },
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-validity-prompt",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
+    assert.equal(result.reviewCycles[0].verdict, "pass");
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle: workspace-validity defect blocks acceptance until the candidate is corrected", async () => {
+  const root = await mkTmp("pi-wwl-validity-defect-");
+  try {
+    const { capture } = await setupCapture(root);
+    const worker = await createWorkerWorktree(capture, "task-validity-defect");
+    const artifactDir = join(capture.waveRoot, "artifacts", "task-validity-defect");
+    await mkdir(artifactDir, { recursive: true });
+
+    const unwantedFile = "scratch-diagnostic.txt";
+    // Synthetic executor: initial turn leaves a task-generated diagnostic file
+    // in the candidate; the correction turn removes it.
+    const executor = join(root, "validity-defect-executor.cjs");
+    await writeFile(executor, [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const resumed = process.env.PI_REVIEW_EXECUTOR_OPERATION === 'resume';",
+      "fs.writeFileSync(path.join(process.cwd(), 'worker-output.txt'), 'worker done\\n');",
+      "if (resumed) { fs.rmSync(path.join(process.cwd(), 'scratch-diagnostic.txt'), { force: true }); }",
+      "else { fs.writeFileSync(path.join(process.cwd(), 'scratch-diagnostic.txt'), 'internal diagnostic noise\\n'); }",
+      "console.log(JSON.stringify({ type: 'session', sessionId: 'validity-defect-session' }));",
+      "console.log(JSON.stringify({ type: 'assistant', text: resumed ? 'Removed the unwanted diagnostic file.' : 'Implemented the change.' }));",
+    ].join("\n"), "utf8");
+    await chmod(executor, 0o755);
+
+    // Deterministic reviewer: when the candidate patch contains the unwanted
+    // generated file, it must be needs_changes with a path-specific finding;
+    // once the candidate is clean (and the criterion is present), it passes.
+    const reviewerScript = [
+      "process.stdin.resume();",
+      "let s='';",
+      "process.stdin.on('data',c=>s+=c);",
+      "process.stdin.on('end',()=>{",
+      "if (!s.includes('Candidate workspace validity (hard criterion)')) {",
+      "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'criterion missing',findings:[{severity:'blocking',file:'prompt',line:null,issue:'criterion missing',recommendation:'deliver the criterion'}]})); return; }",
+      `if (s.includes(${JSON.stringify(unwantedFile)})) {`,
+      "process.stdout.write(JSON.stringify({verdict:'needs_changes',summary:'unwanted generated file inside the candidate',findings:[{severity:'blocking',file:'scratch-diagnostic.txt',line:null,issue:'task-generated diagnostic file inside the candidate',recommendation:'remove scratch-diagnostic.txt from the workspace'}]})); return; }",
+      "process.stdout.write(JSON.stringify({verdict:'pass',summary:'candidate workspace valid',findings:[]}));",
+      "});",
+    ].join("");
+    const reviewer = cliReviewerAgent("validity-defect-checker", reviewerScript);
+    const baseConfig = buildConfig(executor, "fake-exec", [reviewer]);
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      enabled: true,
+      maxCorrectionCycles: 2,
+      review: { subtaskReviewers: [{ source: "external", id: "validity-defect-checker" }] },
+    };
+
+    const result = await runWaveWorkerLifecycle({
+      sourceRoot: capture.discovery.captureRoot,
+      taskId: "task-validity-defect",
+      task: testTask(),
+      capture,
+      worktree: worker,
+      artifactDir,
+      config,
+    });
+
+    // A verified candidate workspace defect must block acceptance/landing
+    // until the path-specific correction lands; the clean replacement passes.
+    assert.equal(result.status, "accepted", `expected accepted, got ${result.status}`);
+    assert.deepEqual(result.reviewCycles.map((cycle) => cycle.verdict), ["needs_changes", "pass"]);
+    assert.equal(result.reviewCycles[0].reviewOutput.result?.findings?.[0]?.file, unwantedFile);
+
+    await removeWorktree(worker.worktreeRoot, capture.repositoryPath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("generic built-in worker prompt does not carry the subtask review validity criterion", () => {
+  const prompt = buildWaveWorkerPrompt(
+    testTask(),
+    "/source-root-placeholder",
+    "/worker-root-placeholder",
+  );
+  assert.ok(!prompt.includes("Candidate workspace validity (hard criterion)"));
+  assert.ok(!prompt.includes("needs_changes with a path-specific actionable reason"));
+  assert.ok(prompt.includes("Workspace snapshot disclosure:"));
 });

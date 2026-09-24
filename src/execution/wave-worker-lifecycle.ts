@@ -291,7 +291,8 @@ async function buildReviewTransmission(
 
 /**
  * Build a comprehensive review request containing the full bounded task
- * definition and workspace disclosure for the reviewer.
+ * definition, workspace disclosure, and the hard candidate workspace-validity
+ * criterion for the reviewer (subtask review only).
  */
 function buildReviewRequest(task: WaveWorkerTask): string {
   const lines = [
@@ -321,6 +322,16 @@ function buildReviewRequest(task: WaveWorkerTask): string {
     "Workspace snapshot disclosure:",
     "The isolated snapshot contains tracked files and non-ignored untracked files.",
     "Git-ignored files are not present in this snapshot.",
+    "",
+    "Candidate workspace validity (hard criterion):",
+    "Read-only inspect the exact candidate patch supplied with this request, plus any worktree evidence available to you, for concrete merge/readiness defects in the candidate itself, including:",
+    "- Unwanted task-generated files inside the candidate (build output, logs, scratch or diagnostic files, session/auth fixtures, editor droppings).",
+    "- Gitlinks (submodule entries), which the landing process does not support.",
+    "- Secrets, credentials, or unrelated files introduced by the task.",
+    "- Any other task-created residue that makes the candidate unsafe or unlandable.",
+    "A verified concrete defect of this kind MUST be returned as needs_changes with a path-specific actionable reason for each affected path; such a candidate must never pass or be reduced to a non-blocking note.",
+    "Do not reject the candidate for a harmless temp-like name that is part of the requested deliverable, for pre-existing untracked files outside the candidate, or for the absence of a full test-suite run alone.",
+    "This review always operates on a verified candidate commit and its exact patch; a task without a verified candidate cannot be reviewed, so never promise or request otherwise.",
   );
   return lines.join("\n");
 }

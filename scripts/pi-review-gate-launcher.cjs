@@ -677,21 +677,33 @@ const SKILL_PUBLISH_PLAN = [
  * copy that replaced it, and the recorded namespacing edits ("old -> new")
  * that turned the prior generic copy into the packaged copy.
  *
- * Ownership proof: the installed file is compared byte for byte against the
- * EXPECTED HISTORICAL BYTES, reconstructed by applying the recorded edits in
- * reverse to the packaged copy. The installed content is never normalized or
- * transformed: normalizing the installed copy before comparing would be
- * non-injective and could classify customized content (for example a file
- * that already carries the namespaced name, or a partially namespaced
- * orchestrator) as unmodified. Exact identity against the reconstructed
- * historical bytes positively identifies an unmodified package-owned copy
- * from before the namespacing and nothing else; a wrong reconstruction can
- * only ever cause false negatives (preservation), never a wrongful removal.
- * A modified, ambiguous, or user-owned file — or a directory, dangling
- * symlink, or anything unreadable — never matches and is preserved untouched,
- * as is every unrelated file under the old directories: the generic name or
- * path alone is never treated as ownership. Only whole files from this
- * manifest are ever removed; directories are never touched.
+ * Ownership proof: the installed file is compared against the EXPECTED
+ * HISTORICAL BYTES by digest — its own SHA-256 must equal `historicalSha256`,
+ * the digest of the true pre-#151 package-owned bytes, which are preserved as
+ * immutable fixtures under tests/fixtures/skill-migration/ (mirroring the
+ * generic install layout). The installed content is never normalized or
+ * transformed: a transform before comparing would be non-injective and could
+ * classify customized content (for example a file that already carries the
+ * namespaced name, or a partially namespaced orchestrator) as unmodified. An
+ * exact digest match positively identifies an unmodified package-owned copy
+ * from before the namespacing and nothing else; any deviation — modified,
+ * ambiguous, or user-owned content, a directory, a dangling symlink, anything
+ * unreadable — fails to match and is preserved untouched, as is every
+ * unrelated file under the old directories: the generic name or path alone is
+ * never treated as ownership. Only whole files from this manifest are ever
+ * removed; directories are never touched.
+ *
+ * Matching deliberately does NOT reconstruct historical bytes from the current
+ * packaged text: that derivation silently stops matching once any later
+ * release edits a shipped skill file (as issue 179 did), degrading genuine old
+ * installs to preservation forever. Anchoring on the immutable digest keeps
+ * old-install migration working across future shipped-skill edits; the
+ * fixtures and their digests are the identity, and the shipped-skills test
+ * enforces that coupling so drift cannot pass silently.
+ *
+ * `renames` is documentary only: it records the namespacing diff between the
+ * historical copy and the first namespaced release for human readers. The
+ * matching algorithm never applies it.
  *
  * `pairedWith` (optional) names another manifest entry whose proven removal
  * is a precondition: the orchestrator recovery.md is removed only when the
@@ -699,15 +711,7 @@ const SKILL_PUBLISH_PLAN = [
  * removed in the same run, so a customized (preserved) generic SKILL.md never
  * loses the recovery runbook its links still point at.
  *
- * `historicalSha256` is the digest of the true pre-#151 historical bytes and
- * anchors the entry to an immutable identity rather than to derivations from
- * the mutable packaged text: a removal happens only when the reconstruction
- * hashes to the recorded digest. If a later release edits a shipped skill
- * file, the reconstruction stops matching the digest and the entry degrades
- * to preservation (never a wrongful removal) — re-derive the edits and the
- * digest together, or drop the entry, when shipped skill text changes. The
- * shipped-skills test enforces that coupling so the drift cannot pass
- * silently. This manifest is the single canonical migration identity set;
+ * This manifest is the single canonical migration identity set;
  * scripts/pi-review-gate.sh invokes it through the --migrate-prior-skill-files
  * mode below (passing the home directory it published skills under) instead
  * of carrying a second copy of the data or the algorithm.
@@ -746,10 +750,10 @@ const SKILL_MIGRATION_PLAN = [
 
 /**
  * Delete proven unmodified package-owned copies at the prior generic
- * locations. The installed content is never transformed: it is compared byte
- * for byte against the expected historical bytes (the packaged replacement
- * with the recorded namespacing edits reversed), and only an exact match — a
- * positively identified pre-namespacing package-owned copy — is removed.
+ * locations. The installed content is never transformed: its own SHA-256 must
+ * equal the entry's recorded historical digest — the immutable identity of
+ * the true pre-#151 package-owned bytes — and only that exact match, a
+ * positively identified pre-namespacing package-owned copy, is removed.
  * Anything else — modified or user-owned content, a directory, a dangling
  * symlink, anything unreadable — is left in place. Entries with `pairedWith`
  * are removed only when the paired entry was proven and actually removed
@@ -801,45 +805,29 @@ function migrateGenericSkillFiles(homeDir, platform = process.platform) {
       const pairedPath = joinForPlatform(platform, homeDir, ".agents", "skills", ...entry.pairedWith);
       if (!provenRemovals.has(pairedPath)) continue;
     }
-    const sourcePath = joinForPlatform(platform, path.resolve(__dirname, ".."), ...entry.source);
     let installed;
     try {
       installed = fs.readFileSync(installedPath);
     } catch {
       continue; // missing, unreadable, or a directory: nothing proven to remove
     }
-    let packaged;
+    // The installed bytes must hash to the entry's recorded historical digest.
+    // That digest is the immutable identity of the true pre-#151 package-owned
+    // bytes (preserved under tests/fixtures/skill-migration/), so an exact
+    // match positively identifies an unmodified prior copy and nothing else.
+    // The check never depends on the current packaged text — later releases
+    // may edit shipped skill files without changing what a genuine old install
+    // looks like — and no transform of the installed content is ever applied,
+    // so customized, ambiguous, or user-owned bytes can only ever fail to
+    // match (preservation), never match wrongly.
+    let matchesRecordedIdentity = false;
     try {
-      packaged = fs.readFileSync(sourcePath, "utf8");
+      matchesRecordedIdentity =
+        crypto.createHash("sha256").update(installed).digest("hex") === entry.historicalSha256;
     } catch {
-      continue; // a broken package must never widen what may be deleted
+      matchesRecordedIdentity = false;
     }
-    // Reconstruct the expected historical bytes by applying the recorded
-    // namespacing edits in REVERSE to the packaged copy, then require exact
-    // byte identity with the installed file. The installed content itself is
-    // never transformed (a transform of the installed copy is non-injective
-    // and could classify customized content as unmodified); a mismatched
-    // reconstruction can only cause preservation, never a wrongful removal.
-    let historical = packaged;
-    for (const [from, to] of [...entry.renames].reverse()) {
-      historical = historical.split(to).join(from);
-    }
-    // The reconstruction must hash to the recorded historical digest before
-    // anything may be removed: the digest is an immutable identity anchor, so
-    // a reconstruction drifted by a later packaged edit or a manifest edit
-    // degrades this entry to preservation instead of ever matching content
-    // the release never shipped.
-    let historicalMatchesRecordedIdentity = false;
-    try {
-      historicalMatchesRecordedIdentity =
-        crypto.createHash("sha256").update(Buffer.from(historical, "utf8")).digest("hex") === entry.historicalSha256;
-    } catch {
-      historicalMatchesRecordedIdentity = false;
-    }
-    if (
-      historicalMatchesRecordedIdentity &&
-      installed.equals(Buffer.from(historical, "utf8"))
-    ) {
+    if (matchesRecordedIdentity) {
       removeQuietly(installedPath);
       // removeQuietly swallows unlink errors; the note must claim removal
       // only when the prior copy is actually gone, and the pairing gate

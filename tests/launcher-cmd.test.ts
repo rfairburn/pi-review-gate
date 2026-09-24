@@ -288,6 +288,15 @@ async function pathExists(path: string): Promise<boolean> {
   return stat(path).then(() => true, () => false);
 }
 
+/**
+ * Immutable pre-#151 historical fixture bytes (digest-anchored in
+ * tests/shipped-skills.test.ts): the true prior generic package-owned content,
+ * independent of later shipped-skill edits such as issue 179's.
+ */
+async function historicalFixture(installedPath: string): Promise<string> {
+  return readFile(join(resolve("tests", "fixtures", "skill-migration"), ...installedPath.split("/")), "utf8");
+}
+
 async function posixMode(path: string): Promise<number> {
   return (await stat(path)).mode & 0o777;
 }
@@ -797,20 +806,10 @@ test("launcher helper migrates proven pre-#151 generic skill copies and preserve
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
 
   const skillsDir = join(fixture.home, ".agents", "skills");
-  // The recorded namespacing edits (exactly the canonical SKILL_MIGRATION_PLAN
-  // in scripts/pi-review-gate-launcher.cjs): reversing them on the shipped
-  // copies reconstructs the prior generic package-owned content.
-  const orchestratorRenames: Array<[string, string]> = [
-    ["name: pi-review-gate-orchestrator", "name: orchestrator"],
-    ["../pi-review-gate-execution/SKILL.md", "../execution/SKILL.md"],
-    ["../pi-review-gate-research/SKILL.md", "../research/SKILL.md"],
-  ];
-  const priorContent = async (shipped: string, renames: Array<[string, string]>): Promise<string> => {
-    let content = await readFile(resolve(shipped), "utf8");
-    for (const [to, from] of renames) content = content.split(to).join(from);
-    return content;
-  };
-
+  // Proven unmodified package-owned copies at the pre-#151 generic
+  // locations: the immutable historical fixtures hold the byte-exact
+  // pre-namespacing content (digest-anchored), so this test establishes old
+  // installation behavior even after shipped skill edits.
   const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
   const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
   const priorExecution = join(skillsDir, "execution", "SKILL.md");
@@ -821,13 +820,11 @@ test("launcher helper migrates proven pre-#151 generic skill copies and preserve
     mkdir(join(skillsDir, "execution"), { recursive: true }),
     mkdir(join(skillsDir, "research"), { recursive: true }),
   ]);
-  const researchContent = (await priorContent("skills/pi-review-gate-research/SKILL.md", [
-    ["name: pi-review-gate-research", "name: research"],
-  ])) + "\nuser customized this copy\n";
+  const researchContent = (await historicalFixture("research/SKILL.md")) + "\nuser customized this copy\n";
   await Promise.all([
-    writeFile(priorOrchestrator, await priorContent("skills/pi-review-gate-orchestrator/SKILL.md", orchestratorRenames), "utf8"),
-    writeFile(priorRecovery, await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"), "utf8"),
-    writeFile(priorExecution, await priorContent("skills/pi-review-gate-execution/SKILL.md", [["name: pi-review-gate-execution", "name: execution"]]), "utf8"),
+    writeFile(priorOrchestrator, await historicalFixture("orchestrator/SKILL.md"), "utf8"),
+    writeFile(priorRecovery, await historicalFixture("orchestrator/references/recovery.md"), "utf8"),
+    writeFile(priorExecution, await historicalFixture("execution/SKILL.md"), "utf8"),
     writeFile(modifiedResearch, researchContent, "utf8"),
     writeFile(unrelatedFile, "user notes\n", "utf8"),
   ]);
@@ -874,10 +871,11 @@ test("launcher helper preserves customized generic copies that normalize to ship
     .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
     .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
     + "\nuser customized this copy\n";
-  // The packaged recovery.md is byte-identical to the historical generic
-  // copy, but it supports the customized generic orchestrator SKILL.md
-  // above: the pairing gate must preserve it.
-  const recoveryCopy = await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8");
+  // The true historical recovery bytes (recovery.md carried no namespacing
+  // edits, so the fixture is byte-exact) support the customized generic
+  // orchestrator SKILL.md above: deleting them would break the customized
+  // skill's reference, so the pairing gate must preserve them.
+  const recoveryCopy = await historicalFixture("orchestrator/references/recovery.md");
   await Promise.all([
     writeFile(fullyRenamedExecution, executionCopy, "utf8"),
     writeFile(partiallyRenamedOrchestrator, orchestratorCustom, "utf8"),
@@ -898,19 +896,15 @@ test("launcher helper removes recovery.md together with a proven generic orchest
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
 
   const skillsDir = join(fixture.home, ".agents", "skills");
-  // Historical generic orchestrator pair: when the SKILL.md is proven
-  // unmodified and removed, the proven recovery.md goes with it.
-  let orchestratorHistorical = await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8");
-  orchestratorHistorical = orchestratorHistorical
-    .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
-    .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
-    .split("../pi-review-gate-research/SKILL.md").join("../research/SKILL.md");
+  // Historical generic orchestrator pair (immutable fixtures): when the
+  // SKILL.md is proven unmodified and removed, the proven recovery.md goes
+  // with it.
   const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
   const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
   await mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true });
   await Promise.all([
-    writeFile(priorOrchestrator, orchestratorHistorical, "utf8"),
-    writeFile(priorRecovery, await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"), "utf8"),
+    writeFile(priorOrchestrator, await historicalFixture("orchestrator/SKILL.md"), "utf8"),
+    writeFile(priorRecovery, await historicalFixture("orchestrator/references/recovery.md"), "utf8"),
   ]);
 
   const result = await runHelper([], fixtureEnv(fixture));
@@ -921,30 +915,31 @@ test("launcher helper removes recovery.md together with a proven generic orchest
 });
 
 test("launcher helper preserves generic copies whose bytes differ from the shipped historical bytes (CRLF)", async () => {
-  // The ownership proof is exact-byte identity against the reconstructed
-  // historical bytes, which are the LF bytes the package ships. Content that
-  // only normalizes to the shipped text under a line-ending transform — for
+  // The ownership proof is an exact match between the installed bytes and the
+  // recorded historical digest — the immutable LF bytes the package shipped
+  // (preserved under tests/fixtures/skill-migration/). Content that only
+  // normalizes to the historical text under a line-ending transform — for
   // example a CRLF copy, which is exactly what a Windows checkout with
   // core.autocrlf=true produces for files not pinned in .gitattributes (the
   // PR 169 Windows launcher CI failure) — is not the proven package-owned
   // copy and must be preserved fail-closed. Recognizing it would require
   // transforming the installed content before comparing, which is
   // non-injective and could classify customized bytes as unmodified; the
-  // checkout itself is pinned LF instead (.gitattributes: skills/**/*.md).
+  // checkout itself is pinned LF instead (.gitattributes: skills/**/*.md and
+  // the fixture pin).
   const fixture = await makeFixture("pi-review-cmd-skill-crlf-");
   await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
 
   const skillsDir = join(fixture.home, ".agents", "skills");
   const crlf = (content: string): string => content.replace(/\r\n|\n/g, "\r\n");
-  const historicalOrchestrator = (await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8"))
-    .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
-    .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
-    .split("../pi-review-gate-research/SKILL.md").join("../research/SKILL.md");
+  // CRLF versions of the true historical bytes (immutable fixtures): a
+  // line-ending transform is not the proven package-owned copy and must be
+  // preserved fail-closed.
   const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
   const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
-  const orchestratorCrlf = crlf(historicalOrchestrator);
-  const recoveryCrlf = crlf(await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"));
+  const orchestratorCrlf = crlf(await historicalFixture("orchestrator/SKILL.md"));
+  const recoveryCrlf = crlf(await historicalFixture("orchestrator/references/recovery.md"));
   await mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true });
   await Promise.all([
     writeFile(priorOrchestrator, orchestratorCrlf, "utf8"),
@@ -967,21 +962,34 @@ test("launcher helper preserves generic copies whose bytes differ from the shipp
   );
 });
 
-test("the shipped skill markdown files are pinned LF in every checkout", async () => {
-  // The pre-#151 migration identity consumes the packaged skill bytes in
-  // every checkout: without the pin, a Windows core.autocrlf=true checkout
-  // turns the packaged sources into CRLF, the LF-anchored digests stop
+test("shipped skill and migration-fixture markdown are pinned LF in every checkout", async () => {
+  // The pre-#151 migration identity is anchored to the immutable historical
+  // fixtures (tests/fixtures/skill-migration/), not to the packaged skill
+  // bytes: without the fixture pin, a Windows core.autocrlf=true checkout
+  // would turn the fixture bytes into CRLF, the recorded digests would stop
   // matching, and the migration silently degrades to preservation (the PR
-  // 169 Windows launcher CI failure). Assert the pin and the actual bytes so
-  // a dropped .gitattributes rule fails fast on every platform with a clear
-  // cause instead of only surfacing in the Windows job.
+  // 169 Windows launcher CI failure). The skills pin keeps the shipped and
+  // provisioned bytes canonical LF for the same class of reason. Assert both
+  // pins and the actual bytes so a dropped .gitattributes rule fails fast on
+  // every platform with a clear cause instead of only surfacing in the
+  // Windows job.
   const attrs = await readFile(resolve(".gitattributes"), "utf8");
   assert.match(attrs, /^skills\/\*\*\/\*\.md text eol=lf$/m,
-    ".gitattributes must pin skills/**/*.md to LF: the migration digest anchor consumes these bytes verbatim");
+    ".gitattributes must pin skills/**/*.md to LF: the shipped skill bytes are provisioned verbatim from the checkout");
+  assert.match(attrs, /^tests\/fixtures\/skill-migration\/\*\*\/\*\.md text eol=lf$/m,
+    ".gitattributes must pin the historical fixtures to LF: the migration digest anchor consumes their bytes verbatim");
+  for (const entry of helperModule.SKILL_MIGRATION_PLAN) {
+    const fixturePath = join("tests", "fixtures", "skill-migration", ...entry.installed);
+    const bytes = await readFile(resolve(fixturePath));
+    assert.equal(bytes.includes(0x0d), false,
+      `the historical fixture must hold canonical LF bytes: ${fixturePath}; ` +
+      `re-clone, or force a re-checkout after a line-ending policy change ` +
+      `(git add --renormalize . only restages the index; git checkout-index -f -a rewrites the working tree)`);
+  }
   for (const source of helperModule.SKILL_MIGRATION_PLAN.map((entry) => entry.source.join("/"))) {
     const bytes = await readFile(resolve(source));
     assert.equal(bytes.includes(0x0d), false,
-      `the identity-anchored shipped file must hold canonical LF bytes: ${source}; ` +
+      `the shipped skill file must hold canonical LF bytes: ${source}; ` +
       `re-clone, or force a re-checkout after a line-ending policy change ` +
       `(git add --renormalize . only restages the index; git checkout-index -f -a rewrites the working tree)`);
   }

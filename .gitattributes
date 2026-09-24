@@ -1,12 +1,16 @@
 # Batch launchers must keep CRLF line endings in every checkout (cmd.exe).
 *.cmd text eol=crlf
 
-# Shipped skill files are byte-identity-anchored: the pre-#151 migration
-# (SKILL_MIGRATION_PLAN in scripts/pi-review-gate-launcher.cjs) proves a
-# prior generic copy is package-owned only by exact-byte identity against
-# the recorded LF historical digests, and the npm tarball ships these files
-# as LF. Windows checkouts default to core.autocrlf=true, which would turn
-# the packaged sources into CRLF and fail the digest anchor (fail-closed
-# preservation, PR 169 Windows launcher CI); pinning LF keeps the packaged
-# bytes canonical in every checkout on every platform.
+# Shipped skill files ship as canonical LF bytes: the npm tarball carries
+# them as LF and the launcher provisions them verbatim, so Windows checkouts
+# (core.autocrlf=true by default) must not rewrite them to CRLF. The pre-#151
+# migration digest anchor itself is protected by the immutable historical
+# fixtures pinned below, not by these shipped bytes.
 skills/**/*.md text eol=lf
+
+# Immutable pre-#151 skill-migration fixtures are byte-identity-anchored by
+# SHA-256 (tests/shipped-skills.test.ts): they hold the true historical bytes
+# the launcher migration compares installed copies against. Pin LF so Windows
+# checkouts cannot alter the anchored bytes (same rationale as the skills pin
+# above).
+tests/fixtures/skill-migration/**/*.md text eol=lf

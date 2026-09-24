@@ -15,6 +15,42 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.77]
+
+### Added
+
+- Add an explicit `inPlace: true` `SubtasksContinue` for a stopped execute task without
+  a verified recovery checkpoint (including checkpoint staging/verification failure): the task
+  continues in exactly its retained managed worktree — never recreated, copied, reset,
+  checked out, or cleaned — after a strictly read-only preflight that verifies writer
+  quiescence, worktree identity, detached HEAD against the task's candidate lineage, and
+  landing-recovery safety. The continuation is told the truth about the reused folder:
+  its state is neither checkpoint-verified nor reviewed, a failed staging attempt may
+  have staged Git index entries, and a fresh executor session does not restore prior
+  hidden state. The later candidate is still checkpoint-verified and passes the normal
+  configured review and landing gates.
+
+### Changed
+
+- Extend the shipped orchestrator recovery runbook and the public recovery and
+  delegated-execution documentation for retained-worktree reuse after a checkpoint
+  staging failure, keeping checkpoint staging failures (pre-review, reported back to the
+  orchestrator) distinct from normal landing refusals and conflicts, and keeping
+  `SubtasksForceMerge` an all-identified-work mechanical salvage rather than a
+  continuation or review.
+- Require configured subtask reviewers to treat concrete candidate-workspace defects
+  as blocking, path-specific `needs_changes` findings. Primary review and the
+  review-Off contract stay unchanged; a pre-review checkpoint failure cannot be
+  fixed by a reviewer prompt.
+- Preserve the launcher's historical generic-skill migration as shipped skill text
+  evolves: immutable pre-namespacing identities still remove only proven unmodified
+  old copies, while customized or uncertain files remain untouched.
+- Preserve the strict defaults: ordinary `SubtasksContinue` still requires a verified
+  checkpoint, a repeated in-place staging failure leaves no new checkpoint and the
+  retained folder for another explicit attempt, landing recovery is never bypassed,
+  no cache exclusion or disposable worktree is added, and with review off judgment
+  stays with the orchestrator.
+
 ## [0.1.0-dev.76]
 
 ### Fixed

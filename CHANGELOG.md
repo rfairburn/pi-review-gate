@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.79]
+## [0.1.0-dev.80]
 
 ### Added
 
@@ -32,11 +32,25 @@ dates.
 - Accept a leading `~` or `~/...` as a scheduled-task workspace and as the
   `SubtasksStart` workspace: settings Save and run-time dispatch both expand it
   against the user's home through the shared Pi-native path rule, and Save
-  persists the expanded absolute spelling (runtime target realpath is separate). Nonexistent or non-directory targets
-  fail closed; unsupported tilde spellings (such as `~user`) are never
-  reinterpreted and fail closed unless a literal path of that name exists;
-  relative workspaces keep resolving against the parent session's working
-  directory.
+  persists the expanded absolute spelling (runtime target realpath is separate).
+  Nonexistent or non-directory targets fail closed; unsupported tilde spellings
+  (such as `~user`) are never reinterpreted and fail closed unless a literal
+  path of that name exists; relative workspaces keep resolving against the
+  parent session's working directory.
+
+## [0.1.0-dev.79]
+
+### Changed
+
+- Remove the UI-only 4000-character answer bound from `AskUserQuestion` free-text
+  answers: drafts and pastes beyond 4000 characters are kept in full and submit
+  without data loss in both the hosted editor and the fallback field (the
+  controller never applied an answer cap). Extract the host chat-editor creation,
+  theme, and live-keybinding wiring into a shared host-agnostic adapter
+  (`src/host-editor.ts`) that the question UI now consumes, and deduplicate the
+  identical peer-module discovery/loading of `src/settings/menu.ts` and the
+  question loader into one shared host peer-loader (`src/host-peer-loader.ts`)
+  with unchanged resolution behavior and test seams.
 
 ## [0.1.0-dev.78]
 

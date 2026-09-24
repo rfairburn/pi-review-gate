@@ -27,44 +27,29 @@
  *   first match — byte-identical to the previous label-based dispatch. RPC
  *   hosts keep today's behavior; `custom()` is never required of them.
  *
- * The pi packages are host-provided peers, never hard dependencies, loaded
- * in two steps and degrading to the plain selector on any failure:
- *
- * 1. Soft `require` of the package name — inside a jiti-transformed Pi
- *    extension the loader aliases both names to the running host's modules.
- * 2. Host-relative resolution for compiled entries: since pi 0.86 (jiti 2.7,
- *    Node >= 24) a pre-compiled CommonJS entry is loaded by native import and
- *    its `require()` calls bypass the jiti aliases, so step 1 throws
- *    MODULE_NOT_FOUND. The loader then locates the running Pi install from
- *    `process.argv[1]` (realpath, nearest package.json named
- *    @earendil-works/pi-coding-agent), resolves pi-tui with
- *    `createRequire(piEntry).resolve()` and loads it with `require()` (CJS,
- *    or ESM via require(esm) on Node >= 22.12) falling back to a native
- *    dynamic `import()` for ESM on Node 20. The agent package's import-only
- *    exports fall back to its own package.json main field. Both load paths
- *    hit Node's module cache, so repeated loads share one instance — the same
- *    files the host's jiti aliases target (each package's dist/index.js).
- *    pi >= 0.86 runs its bundled chunk with pi-tui inlined, so that
- *    standalone module's global keybinding state is a fresh default-only
- *    copy rather than the app's live manager: user tui.select.* overrides
- *    would not reach an extension-built SelectList on their own. The adapter
- *    therefore points the loaded module at the live KeybindingsManager the
- *    host injects into every custom component (the public setKeybindings()
- *    export), so navigation, confirm, and cancel — and the agent package's
- *    keyHint() hint text — resolve exactly as they do in the app. No
- *    installed path is hard-coded: the entry is discovered from the running
- *    process itself, and anything that cannot be resolved (outside Pi,
- *    SEA/binary hosts) degrades to the plain selector.
+ * The pi packages are host-provided peers, never hard dependencies: they are
+ * loaded with the shared two-step peer loader (src/host-peer-loader.ts, issue
+ * #185 — soft require first, then host-relative resolution from the running
+ * Pi install, with the agent package's import-only exports resolved through
+ * its own package.json main field) and degrade to the plain selector on any
+ * failure. pi >= 0.86 runs its bundled chunk with pi-tui inlined, so that
+ * standalone module's global keybinding state is a fresh default-only copy
+ * rather than the app's live manager: user tui.select.* overrides would not
+ * reach an extension-built SelectList on their own. The adapter therefore
+ * points the loaded module at the live KeybindingsManager the host injects
+ * into every custom component (the public setKeybindings() export), so
+ * navigation, confirm, and cancel — and the agent package's keyHint() hint
+ * text — resolve exactly as they do in the app. No installed path is
+ * hard-coded: the entry is discovered from the running process itself, and
+ * anything that cannot be resolved (outside Pi, SEA/binary hosts) degrades to
+ * the plain selector.
  *
  * A key that no longer exists in the current rows keeps the default first
  * row: safe, with no invented reorder. Selection position is UI-only state;
  * it is never persisted as a product setting.
  */
 
-import { createRequire } from "node:module";
-import { readFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { loadHostPeerModule } from "../host-peer-loader";
 
 /** One selectable row: a stable logical key plus its rendered label. */
 export interface RetainedRow {
@@ -159,20 +144,10 @@ export interface MenuTuiHost {
   keyHint?: (keybinding: string, description: string) => string;
 }
 
-/** Package names of the running host (current plus legacy scope). */
-const PI_AGENT_PACKAGE_NAMES = new Set(["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"]);
+
+/** Host peer package names: pi-tui plus the running agent package. */
 const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
 const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
-/** How far up from the host entry to look for its package.json. */
-const MAX_HOST_ROOT_DEPTH = 16;
-
-// tsc rewrites `await import(x)` in CommonJS output to require(x), which
-// cannot load ESM on Node 20 and would defeat the explicit file resolution
-// done here. Compile a native dynamic import the transpiler leaves untouched
-// (same technique as ./execution/adapters/claude-cli).
-const nativeDynamicImport = new Function("specifier", "return import(specifier)") as (
-  specifier: string,
-) => Promise<unknown>;
 
 let hostOverride: MenuTuiHost | undefined;
 let hostLoadPromise: Promise<MenuTuiHost | undefined> | undefined;
@@ -199,7 +174,7 @@ function resolveMenuTuiHost(): Promise<MenuTuiHost | undefined> {
 }
 
 async function loadMenuTuiHost(): Promise<MenuTuiHost | undefined> {
-  const tui = await loadPeerModule(PI_TUI_PACKAGE_NAME);
+  const tui = await loadHostPeerModule(PI_TUI_PACKAGE_NAME, { entryProvider: hostEntryProvider, packageMainFallback: true });
   if (!isSelectListProvider(tui)) {
     // Outside Pi (unit tests, tooling) or an unloadable peer: the menu
     // simply degrades to the plain selector.
@@ -213,7 +188,7 @@ async function loadMenuTuiHost(): Promise<MenuTuiHost | undefined> {
   if (typeof tui.setKeybindings === "function") {
     host.setKeybindings = tui.setKeybindings as MenuTuiHost["setKeybindings"];
   }
-  const agent = await loadPeerModule(PI_AGENT_PACKAGE_NAME);
+  const agent = await loadHostPeerModule(PI_AGENT_PACKAGE_NAME, { entryProvider: hostEntryProvider, packageMainFallback: true });
   if (agent) {
     if (typeof agent.DynamicBorder === "function") host.DynamicBorder = agent.DynamicBorder as MenuTuiHost["DynamicBorder"];
     if (typeof agent.getSelectListTheme === "function") host.getSelectListTheme = agent.getSelectListTheme as MenuTuiHost["getSelectListTheme"];
@@ -221,121 +196,6 @@ async function loadMenuTuiHost(): Promise<MenuTuiHost | undefined> {
     if (typeof agent.keyHint === "function") host.keyHint = agent.keyHint as MenuTuiHost["keyHint"];
   }
   return host;
-}
-
-/**
- * Loads one host peer module. Never a hard dependency: any failure yields
- * undefined and the caller degrades.
- */
-async function loadPeerModule(name: string): Promise<Record<string, unknown> | undefined> {
-  try {
-    // Step 1: inside a jiti-transformed Pi extension the loader aliases the
-    // pi package names to the running host's modules (verified in pi 0.85.1,
-    // dist/core/extensions/loader.js); a local node_modules copy works too.
-    const mod = require(name) as unknown;
-    if (isRecord(mod)) return mod;
-  } catch {
-    // MODULE_NOT_FOUND for compiled CJS entries under pi >= 0.86: the native
-    // import bypasses the jiti aliases. Try host-relative resolution.
-  }
-  const piRoot = findRunningPiRoot();
-  if (!piRoot) return undefined;
-  const entry = resolvePeerEntry(piRoot, name);
-  if (!entry) return undefined;
-  return loadPeerFile(entry);
-}
-
-/** The running Pi install: package root plus the resolved entry file. */
-interface RunningPiRoot {
-  /** Directory containing the host's own package.json. */
-  root: string;
-  /** Realpath of the process entry (the pi CLI script). */
-  entry: string;
-}
-
-/**
- * Locates the running Pi install from the process entry. `process.argv[1]`
- * is the public, documented pointer to the launched script; a bin symlink
- * (npm global, nvm, homebrew) is resolved with realpath before walking up
- * for the nearest package.json, which must name the pi agent package.
- * Returns undefined when the process was not started from a Pi install
- * (unit tests, other hosts, SEA/binary entries without a discoverable root).
- */
-function findRunningPiRoot(): RunningPiRoot | undefined {
-  const candidate = (hostEntryProvider ?? defaultHostEntry)();
-  if (!candidate) return undefined;
-  let real: string;
-  try {
-    real = realpathSync(candidate);
-  } catch {
-    return undefined;
-  }
-  let dir = dirname(real);
-  for (let depth = 0; depth < MAX_HOST_ROOT_DEPTH; depth += 1) {
-    const pkg = readPackageJson(dir);
-    if (pkg && typeof pkg.name === "string" && PI_AGENT_PACKAGE_NAMES.has(pkg.name)) {
-      return { root: dir, entry: real };
-    }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return undefined;
-}
-
-function defaultHostEntry(): string | undefined {
-  const candidate = process.argv[1];
-  if (!candidate || typeof candidate !== "string") return undefined;
-  return isAbsolute(candidate) ? candidate : resolve(process.cwd(), candidate);
-}
-
-/**
- * Resolves one peer package to a loadable file from the running host's tree
- * using Node's own resolution (createRequire rooted at the host entry).
- * A package that only exposes ESM "import" exports (the agent package) is
- * resolved through its own package.json main field when it is the running
- * host itself.
- */
-function resolvePeerEntry(piRoot: RunningPiRoot, name: string): string | undefined {
-  try {
-    return createRequire(piRoot.entry).resolve(name);
-  } catch {
-    // Not resolvable under CJS conditions; fall through to the main field.
-  }
-  const pkg = readPackageJson(piRoot.root);
-  if (!pkg || pkg.name !== name) return undefined;
-  const main = typeof pkg.main === "string" && pkg.main.length > 0 ? pkg.main : "index.js";
-  return resolve(piRoot.root, main);
-}
-
-/**
- * Loads a resolved peer file. `require()` covers CJS and, on Node >= 22.12,
- * ESM via require(esm); older Node throws ERR_REQUIRE_ESM, in which case a
- * native dynamic import loads the ESM module. Both hit Node's module cache,
- * so repeated loads share one instance inside the extension process.
- */
-async function loadPeerFile(filePath: string): Promise<Record<string, unknown> | undefined> {
-  try {
-    const mod = require(filePath) as unknown;
-    if (isRecord(mod)) return mod;
-  } catch {
-    // ERR_REQUIRE_ESM on Node < 22.12 (or any load failure): use import().
-  }
-  try {
-    const mod = await nativeDynamicImport(pathToFileURL(filePath).href);
-    return isRecord(mod) ? mod : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function readPackageJson(dir: string): Record<string, unknown> | undefined {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-    return isRecord(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

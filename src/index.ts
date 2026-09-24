@@ -1,5 +1,8 @@
 import { join } from "node:path";
-import { deferredPiToolsEnabled, effectiveReviewSettings, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode } from "./config";
+import { deferredPiToolsEnabled, effectiveReviewSettings, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode, type ScheduledTaskEntryConfig } from "./config";
+import { ScheduledTaskRuntime } from "./scheduling/dispatcher";
+import { deliverScheduledEvent, formatScheduledDispatchFailure, formatScheduledOverdueDrop, formatScheduledSkipEvent, scheduledTaskDefinition } from "./scheduling/events";
+import { getSchedulerRuntime } from "./scheduling/runtime";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
 import { registerCommands } from "./commands";
@@ -279,6 +282,79 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     },
   });
 
+  // Issue #26: process-local scheduled-execution runtime. The live On/Off
+  // switch lives in a process-global holder that survives /reload; this
+  // per-activation timer loop attaches to each session and detaches with
+  // it, so timers never outlive their orchestrator while the switch keeps
+  // its state across reloads. Dispatch goes straight through the ordinary
+  // subtask start path — no model or orchestrator launch turn — and every
+  // outcome flows through the existing owner-scoped notification policy.
+  const schedulerSwitch = getSchedulerRuntime();
+  const scheduledRuntime = new ScheduledTaskRuntime({
+    switchState: schedulerSwitch,
+    catalog: () => config.scheduledTasks,
+    onDue: (entryId, entry, dueAt, overdue) => dispatchScheduledEntry(entryId, entry, dueAt, overdue),
+    onError: (message) => sendNotice(pi, `review gate: ${message}`),
+  });
+
+  /**
+   * Issue #26: one due occurrence of one scheduled entry. `dueAt` is the
+   * exact absolute minute the runtime sampled, so every skip and failure
+   * wake reports the scheduled due time — never the (possibly late)
+   * dispatch instant. Overlap is checked against the controller's live
+   * (and restored) groups: while any prior run of this entry still has
+   * unsettled tasks, EVERY due occurrence is skipped and reported with
+   * actionable identity/handle data — never queued, interrupted, or implied
+   * complete — including one whose admission was delayed past its due minute
+   * within the same On/Save epoch. An overdue occurrence with no active run
+   * is reported as not-run instead of launching a catch-up run. Otherwise the
+   * entry dispatches through the ordinary subtask start path with its
+   * independent per-entry worker/review overrides; a failed dispatch fails
+   * closed with an actionable wake instead of retrying silently.
+   */
+  const dispatchScheduledEntry = async (
+    entryId: string,
+    entry: ScheduledTaskEntryConfig,
+    dueAt: Date,
+    overdue: boolean,
+  ): Promise<void> => {
+    const activeRuns = executionTools.scheduledRuns(entryId);
+    if (activeRuns.length > 0) {
+      await wakeSchedulerOwner(formatScheduledSkipEvent(entryId, entry, dueAt, activeRuns));
+      return;
+    }
+    if (overdue) {
+      // No catch-up: the due minute passed before this entry's previous
+      // dispatch settled and no run is active — report the drop instead of
+      // launching a late run. The next due occurrence is evaluated independently.
+      await wakeSchedulerOwner(formatScheduledOverdueDrop(entryId, entry, dueAt));
+      return;
+    }
+    try {
+      const inspection = await executionTools.startScheduled(
+        scheduledTaskDefinition(entryId, entry),
+        entry.kind,
+        entry.workspace,
+        {
+          scheduledTaskId: entryId,
+          ...(entry.workerResourceId !== undefined ? { workerResourceId: entry.workerResourceId } : {}),
+          ...(entry.review !== undefined ? { reviewOverride: entry.review } : {}),
+        },
+      );
+      await sendNotice(pi, `review gate: scheduled task ${entryId} (${entry.name}) dispatched as ${inspection.executionId} (${entry.kind}); ordinary subtask notifications will report its outcome`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await wakeSchedulerOwner(formatScheduledDispatchFailure(entryId, entry, dueAt, message));
+    }
+  };
+
+  /** Issue #26: owner wake for scheduler-only events (skip/overdue drop/dispatch failure). */
+  const wakeSchedulerOwner = async (content: string): Promise<void> => {
+    if (!deliverScheduledEvent(pi, content)) {
+      await sendNotice(pi, content);
+    }
+  };
+
   const effectiveReviewConfig = () => {
     if (state.reviewWindow && !state.reviewWindow.reviewConfig) {
       freezeReviewWindowConfig(state, config, currentScopedModels);
@@ -424,6 +500,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     unsubscribeBackgroundLifecycle?.();
     unsubscribeBackgroundLifecycle = undefined;
     releaseReviewerQuestionPauseWaiters();
+    // Issue #26: stop future dispatches for the dying session first; active
+    // scheduled subtasks are NOT interrupted — they settle through the
+    // controller's own shutdown/recovery semantics below.
+    scheduledRuntime.detach();
     await executionTools.shutdown();
     await webTools?.cleanup();
     await cleanupReviewBundles(state);
@@ -531,6 +611,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       });
       await sendNotice(context ?? pi, `review gate: restored conversation state revision ${restoredRevision}`);
     }
+    // Issue #26: arm the scheduler only after restore completes, so overlap
+    // detection sees restored groups before any due occurrence can fire.
+    scheduledRuntime.attach();
     await persistSessionState();
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
   });
@@ -1145,8 +1228,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     pi,
     config,
     configPath: loaded.path,
+    // Issue #26: the live process-local switch; the menu flips it through
+    // setEnabled, which stops or starts the timers immediately.
+    schedulerRuntime: schedulerSwitch,
     onSaved: async (_saved, previousMode, context) => {
       executionTools.sync();
+      // Issue #26: Save replans same-process timers immediately — future-only
+      // sampling restarts from the next minute boundary against the saved
+      // catalog; no missed occurrence is replayed.
+      scheduledRuntime.replan();
       deferredTools.setDeferredEnabled(deferredPiToolsEnabled(config));
       // The saved web visibility applies to a live interactive browser
       // immediately (controlled replacement); the callback awaits it so the

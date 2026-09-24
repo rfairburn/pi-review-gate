@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import type { ConfigPathResolution } from "./config-path";
 import { reviewGateConfigCandidates, resolveConfigPathResolution } from "./config-path";
+import { parseCronExpression } from "./scheduling/cron";
 
 export type RetainBundles = "never" | "on-failure" | "always";
 /**
@@ -404,6 +405,51 @@ export interface ExecutionConfig {
   deferredPiTools?: boolean;
 }
 
+/** What a scheduled task runs: a write-capable subtask or a read-only research one. */
+export type ScheduledTaskKind = "execute" | "research";
+
+/**
+ * A task-local review override (issue #26). `off` runs the task's subtasks
+ * without any review — including write-capable tasks — and never fabricates a
+ * verdict; `selected` reviews the task's runs with exactly the listed set.
+ * An absent override inherits the live global subtask review settings.
+ */
+export type ScheduledTaskReviewOverride =
+  | { mode: "off" }
+  | { mode: "selected"; reviewers: ActiveReviewerSelection[] };
+
+/**
+ * One independently scheduled task entry (issue #26). Stored once, keyed by
+ * its stable identity; every field is self-contained and no inherited global
+ * value is ever copied into the entry — omitted optional fields inherit the
+ * current global subtask settings at each future run.
+ */
+export interface ScheduledTaskEntryConfig {
+  /** Human label, editable without changing the entry's stable identity. */
+  name: string;
+  /** Standard 5-field Unix cron expression, interpreted in machine-local time. */
+  cron: string;
+  /** Disabled entries stay configured but are never dispatched. */
+  enabled: boolean;
+  kind: ScheduledTaskKind;
+  /** Instructions carried verbatim to the scheduled subtask. */
+  instructions: string;
+  /** Explicit authorized target workspace directory for the scheduled run. */
+  workspace: string;
+  /**
+   * Explicit worker resource id override from `execution.workerResources`.
+   * Never requires a global-route membership: the independent catalog is the
+   * source, though research capability is still enforced for research tasks.
+   * Omitted, the kind's live global route applies at each future run.
+   */
+  workerResourceId?: string;
+  /** Task-local review choice; omitted inherits live global subtask review settings. */
+  review?: ScheduledTaskReviewOverride;
+}
+
+/** Unordered scheduled-task catalog keyed by stable task identity. */
+export type ScheduledTaskCatalog = Record<string, ScheduledTaskEntryConfig>;
+
 export interface ReviewGateUiConfig {
   subtasksViewExpanded?: boolean;
 }
@@ -427,6 +473,8 @@ export interface ReviewGateConfig {
   review?: ReviewSelectionConfig;
   externalAgents?: ExternalAgentCatalog;
   execution?: ExecutionConfig;
+  /** Independently scheduled task entries (issue #26); the only canonical copy. */
+  scheduledTasks?: ScheduledTaskCatalog;
   ui?: ReviewGateUiConfig;
   web?: WebConfig;
 }
@@ -530,7 +578,7 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
   // a model, reasoning pair, command or authorization reference to repair one.
   const containers = new Set(["web", "web.search", "web.fetch", "web.browserPermissions", "ui", "review",
     "execution", "execution.retryPolicy", "execution.routes",
-    "execution.workerResources", "externalAgents"]);
+    "execution.workerResources", "externalAgents", "scheduledTasks"]);
   const recover = (parent: Record<string, unknown>, key: string, input: unknown, path: string): void => {
     const attempt = (replacement: unknown): boolean => {
       const previous = Object.getOwnPropertyDescriptor(parent, key);
@@ -569,9 +617,11 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
     warnings.push(`${path} is invalid or unsupported; using its default.`);
   };
   const recoverObject = (target: Record<string, unknown>, input: Record<string, unknown>, prefix: string): void => {
-    // Resources must precede routes; canonical fields must precede obsolete
-    // copies so a malformed unrelated field does not change their precedence.
-    const last = new Set(["routes", "decider", "reviewers", "enabledReviewerIds", "activeExecutor", "executorPool", "externalExecutors"]);
+    // Resources must precede routes; the scheduled-task catalog must follow
+    // execution and externalAgents, so its worker-resource cross-references
+    // validate against the recovered catalog instead of the key order deciding
+    // whether valid worker-pinned entries survive recovery.
+    const last = new Set(["routes", "decider", "reviewers", "enabledReviewerIds", "activeExecutor", "executorPool", "externalExecutors", "scheduledTasks"]);
     const entries = Object.entries(input).sort(([a], [b]) => Number(last.has(a)) - Number(last.has(b)));
     if (prefix === "execution.retryPolicy") {
       // Delay bounds are coupled; testing either against the other's default
@@ -634,11 +684,101 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     review: value.review === undefined ? undefined : normalizeReviewSelection(value.review),
     externalAgents: value.externalAgents === undefined ? undefined : normalizeExternalAgents(value.externalAgents),
     execution: value.execution === undefined ? undefined : normalizeExecution(value.execution),
+    scheduledTasks: value.scheduledTasks === undefined ? undefined : normalizeScheduledTasks(value.scheduledTasks),
     ui: value.ui === undefined ? undefined : normalizeUi(value.ui),
     web: normalizeWeb(value.web),
   };
 
+  validateScheduledTaskReferences(config);
   return config;
+}
+
+/**
+ * Cross-checks of the scheduled-task catalog against the worker resources it
+ * may name. An explicit worker override is independent of the global role
+ * routes by design (issue #26): catalog membership, not route membership, is
+ * what authorizes the selection — route membership would defeat the entry's
+ * independence from later route edits. Research capability is still enforced,
+ * because a scheduled research task must not dispatch to an executor resource
+ * that cannot perform research.
+ */
+function validateScheduledTaskReferences(config: ReviewGateConfig): void {
+  const scheduledTasks = config.scheduledTasks;
+  if (!scheduledTasks) return;
+  for (const [id, entry] of Object.entries(scheduledTasks)) {
+    if (entry.workerResourceId === undefined) continue;
+    const resource = resolvedWorkerResource(config, entry.workerResourceId);
+    if (!resource) {
+      throw new Error(`scheduledTasks.${id} references unknown worker resource ${entry.workerResourceId}`);
+    }
+    if (entry.kind === "research" && !workerResourceSupportsResearch(config, resource.selection)) {
+      throw new Error(`scheduledTasks.${id} worker resource is not research-capable: ${entry.workerResourceId}`);
+    }
+  }
+}
+
+/**
+ * Canonical form is an object keyed by stable task identity. Required fields
+ * stay required, `enabled` defaults to true, `kind` defaults to execute, and
+ * the cron expression is validated by the shared grammar parser. Optional
+ * override fields stay absent when not provided: absence is the single
+ * discriminator for inheritance, so no inherited global value is ever copied
+ * into the entry (issue #26: exactly one durable copy of every setting).
+ */
+function normalizeScheduledTasks(value: unknown): ScheduledTaskCatalog {
+  if (!isRecord(value)) throw new Error("scheduledTasks must be an object");
+  const catalog: ScheduledTaskCatalog = {};
+  for (const [id, entry] of Object.entries(value)) {
+    validateConfiguredId(id, "scheduled task");
+    if (!isRecord(entry)) throw new Error(`scheduledTasks.${id} must be an object`);
+    const name = requireNonEmptyString(entry.name, `scheduledTasks.${id}.name`);
+    const cron = parseCronExpression(entry.cron, `scheduledTasks.${id}.cron`).expression;
+    if (entry.enabled !== undefined && typeof entry.enabled !== "boolean") {
+      throw new Error(`scheduledTasks.${id}.enabled must be a boolean`);
+    }
+    const kind = entry.kind === undefined ? "execute" : entry.kind;
+    if (kind !== "execute" && kind !== "research") {
+      throw new Error(`scheduledTasks.${id}.kind must be execute or research`);
+    }
+    const instructions = requireNonEmptyString(entry.instructions, `scheduledTasks.${id}.instructions`);
+    const workspace = requireNonEmptyString(entry.workspace, `scheduledTasks.${id}.workspace`);
+    let workerResourceId: string | undefined;
+    if (entry.workerResourceId !== undefined) {
+      workerResourceId = normalizeOptionalNonEmptyString(entry.workerResourceId, `scheduledTasks.${id}.workerResourceId`);
+      validateConfiguredId(workerResourceId!, "scheduled task worker resource");
+    }
+    const review = entry.review === undefined
+      ? undefined
+      : normalizeScheduledTaskReviewOverride(entry.review, `scheduledTasks.${id}`);
+    defineOwnKey(catalog, id, {
+      name,
+      cron,
+      enabled: entry.enabled ?? true,
+      kind,
+      instructions,
+      workspace,
+      ...(workerResourceId !== undefined ? { workerResourceId } : {}),
+      ...(review !== undefined ? { review } : {}),
+    });
+  }
+  return catalog;
+}
+
+function normalizeScheduledTaskReviewOverride(value: unknown, field: string): ScheduledTaskReviewOverride {
+  if (!isRecord(value)) throw new Error(`${field}.review must be an object`);
+  if (value.mode === "off") return { mode: "off" };
+  if (value.mode === "selected") {
+    return { mode: "selected", reviewers: normalizeActiveReviewers(value.reviewers, `${field}.review.reviewers`) };
+  }
+  throw new Error(`${field}.review.mode must be "off" or "selected"`);
+}
+
+/** Required, non-empty-after-trim string value. */
+function requireNonEmptyString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return value.trim();
 }
 
 /**
@@ -1618,6 +1758,24 @@ export function cloneWorkerCatalog(catalog: WorkerResourceCatalog): WorkerResour
     });
   }
   return out;
+}
+
+/** Deep clone of the scheduled-task catalog; no inherited global values are ever synthesized. */
+export function cloneScheduledTaskCatalog(catalog: ScheduledTaskCatalog): ScheduledTaskCatalog {
+  const out: ScheduledTaskCatalog = {};
+  for (const [id, entry] of Object.entries(catalog)) {
+    defineOwnKey(out, id, {
+      ...entry,
+      ...(entry.review !== undefined ? { review: cloneScheduledTaskReviewOverride(entry.review) } : {}),
+    });
+  }
+  return out;
+}
+
+function cloneScheduledTaskReviewOverride(override: ScheduledTaskReviewOverride): ScheduledTaskReviewOverride {
+  return override.mode === "off"
+    ? { mode: "off" }
+    : { mode: "selected", reviewers: override.reviewers.map((reviewer) => ({ ...reviewer })) };
 }
 
 /** Define an own data property even for keys like "__proto__" or "constructor". */

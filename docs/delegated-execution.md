@@ -716,6 +716,19 @@ failure, meaningful state changes, and workspace conflicts are delivered proacti
 polling loops are neither required nor recommended, but purposeful `SubtasksInspect`
 calls are always supported.
 
+**Scheduled runs:** when the process-local scheduler switch is On, a due schedule
+entry starts through this same background subtask path — no model or orchestrator
+launch turn begins the run. Scheduled executions appear in the widget and receive
+the ordinary owner-scoped notifications described above, so their outcomes are
+delivered exactly like any other execution's. An overlap skip (a due occurrence
+while an earlier run of the same entry is still active) wakes the owning
+orchestrator with the schedule identity, the exact due time, and the active task
+handles. A due occurrence whose minute passed before its own dispatch could be
+admitted (a previous occurrence of the same entry had not yet settled) and no
+run is active is reported as not-run; it is never caught up. Configuration,
+per-entry inheritance, and daylight-saving semantics live in [Scheduled task
+fields](configuration.md#scheduled-task-fields).
+
 ## Review-readiness deferral
 
 The same top-level review-readiness gate covers background shell jobs and execution and

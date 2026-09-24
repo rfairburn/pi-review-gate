@@ -699,6 +699,55 @@ test("launcher helper forwards the kill switch and warns loudly", async () => {
     "persistent config resolution still applies while disabled");
 });
 
+test("launcher helper clears an inherited scheduler flag and honors --scheduler", async () => {
+  const fixture = await makeFixture("pi-review-cmd-scheduler-");
+  await mkdir(fixture.agentDir, { recursive: true });
+  await writeFile(fixture.defaultConfigPath, "{}\n", "utf8");
+
+  // Capture the scheduler env seam exactly as pi's child would see it.
+  const fakePiEntry = join(fixture.bin, "fake-pi-entry.cjs");
+  await writeFile(fakePiEntry, [
+    "const fs = require('node:fs');",
+    "fs.writeFileSync(process.env.CAPTURE_FILE, JSON.stringify({",
+    "  args: process.argv.slice(2),",
+    "  schedulerEnv: process.env.PI_REVIEW_GATE_SCHEDULER ?? null,",
+    "}));",
+  ].join("\n"), "utf8");
+
+  // Hermetic base: the host environment never contributes the flag.
+  const envFor = (overrides: NodeJS.ProcessEnv = {}) => {
+    const base = fixtureEnv(fixture);
+    delete base.PI_REVIEW_GATE_SCHEDULER;
+    return { ...base, ...overrides };
+  };
+  const capturedScheduler = async (): Promise<{ args: string[]; schedulerEnv: string | null }> =>
+    JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8")) as { args: string[]; schedulerEnv: string | null };
+
+  // Inherited from a parent launched with --scheduler: an unflagged launch
+  // must start Off — the inherited value is cleared, never forwarded.
+  await runHelper(["--model", "example"], envFor({ PI_REVIEW_GATE_SCHEDULER: "1" }));
+  assert.equal(
+    (await capturedScheduler()).schedulerEnv,
+    null,
+    "an inherited scheduler flag must not leak into an unflagged launch",
+  );
+
+  // The explicit flag opts in for exactly this launch, with or without an
+  // inherited value, and is never forwarded to pi.
+  await runHelper(["--scheduler", "--model", "example"], envFor({ PI_REVIEW_GATE_SCHEDULER: "1" }));
+  let capture = await capturedScheduler();
+  assert.equal(capture.schedulerEnv, "1", "--scheduler exports the flag for this launch (inherited value present)");
+  assert.deepEqual(
+    capture.args,
+    ["--extension", resolve("dist/src/index.js"), "--model", "example"],
+    "--scheduler is consumed by the helper and never forwarded to pi",
+  );
+
+  await runHelper(["--scheduler", "--model", "example"], envFor());
+  capture = await capturedScheduler();
+  assert.equal(capture.schedulerEnv, "1", "--scheduler exports the flag for this launch (no inherited value)");
+});
+
 test("launcher helper management verbs pass straight through to pi without setup", async () => {
   for (const verb of helperModule.MANAGEMENT_VERBS) {
     const fixture = await makeFixture(`pi-review-cmd-verb-${verb}-`);

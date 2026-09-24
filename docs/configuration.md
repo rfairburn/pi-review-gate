@@ -312,6 +312,179 @@ defaults to `true`. The default retry policy is
 `maxRetries: 2`, `baseDelayMs: 1000`, `maxDelayMs: 15000`, `jitter: true`,
 `maxSameIncidentRepeats: 2`.
 
+## Scheduled task fields
+
+`scheduledTasks` is an unordered catalog keyed by each task's stable identity.
+Every schedule entry is stored exactly once, in this catalog — there is no
+second copy, no parallel mirror, and no copied global setting inside an entry.
+The cron timer and dispatch that run these entries are part of the scheduled-run
+runtime; this section defines, validates, and persists the entries that runtime
+consumes.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `name` | (required) | Human label, editable without changing the entry's stable key. |
+| `cron` | (required) | Standard five-field Unix cron expression (minute, hour, day-of-month, month, day-of-week), interpreted in the machine's local timezone. Ranges, lists, steps, and `jan`–`dec` / `sun`–`sat` names are accepted; `7` means Sunday. No seconds field and no `@` shorthands. |
+| `enabled` | `true` | Disabled entries stay configured but are never dispatched. |
+| `kind` | `"execute"` | `execute` (write-capable subtask) or `research` (read-only subtask). |
+| `instructions` | (required) | Instructions carried verbatim to the scheduled subtask. |
+| `workspace` | (required) | Explicit authorized target workspace directory for the scheduled run. |
+| `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. |
+| `review` | absent | Task-local review choice. See below. |
+
+Example:
+
+```json
+{
+  "scheduledTasks": {
+    "task-nightly": {
+      "name": "Nightly docs check",
+      "cron": "30 2 * * *",
+      "enabled": true,
+      "kind": "execute",
+      "instructions": "Check the docs for staleness and report any findings",
+      "workspace": "/work/pi-review-gate"
+    },
+    "task-research": {
+      "name": "Morning research digest",
+      "cron": "0 9 * * mon-fri",
+      "enabled": true,
+      "kind": "research",
+      "instructions": "Summarize upstream releases",
+      "workspace": "/work/pi-review-gate",
+      "workerResourceId": "local-research",
+      "review": { "mode": "off" }
+    }
+  }
+}
+```
+
+### Inheritance and overrides
+
+Inheritance is per-field and resolved live at each future run; absence is the
+only marker, so a global change flows into every still-inheriting entry without
+any stored copy going stale:
+
+- **Worker:** an entry with no `workerResourceId` uses the current global route
+  for its kind when it runs. An entry with `workerResourceId` uses exactly that
+  worker resource, selected from the independent `execution.workerResources`
+  catalog — it does not have to appear on the kind's global route, because
+  route membership would defeat the entry's independence from later route
+  edits. Research capability is still enforced: a `research` entry may only
+  name a research-capable resource.
+- **Review:** an entry with no `review` inherits the current global subtask
+  review settings at run time. An explicit choice is task-local and frozen per
+  run: `{ "mode": "off" }` runs the task's subtasks without review — allowed
+  for write-capable tasks too — and `{ "mode": "selected", "reviewers": [...] }`
+  reviews that task's runs with exactly the listed set. An explicit choice
+  never mutates the global or parent review state, and an unreviewed run is
+  recorded as an ordinary unreviewed outcome; no pass verdict is ever
+  fabricated. Review overrides apply to `execute` entries: research runs have
+  no review stage, so a `selected` override on a `research` entry fails closed
+  at dispatch time instead of being silently ignored (`off` is a consistent
+  no-op there).
+
+The two inheritances are independent: an entry may pin a worker while
+inheriting review policy, or the reverse.
+
+### Local time and daylight saving
+
+The cron expression is stored and interpreted only in the machine's local
+timezone. No UTC representation is stored or displayed alongside it.
+
+The runtime samples the host's actual local wall clock once per distinct
+absolute minute and dispatches every enabled entry whose expression matches
+the sampled minute. Daylight-saving behavior falls out of that sampling rather
+than from any fire-time computation:
+
+- **Spring-forward gap:** local minutes that do not exist on the transition
+  day (for example 02:00–02:59 when the clock jumps forward) are never
+  observed by the host clock, so an entry due in that window is missed for
+  that day. It runs again on its next ordinary due time.
+- **Fall-back repeat:** a local minute that occurs twice (for example 01:00–
+  01:59 when the clock repeats) fires once per distinct absolute due minute —
+  an entry due at 01:30 runs twice on the transition day, once per pass.
+- **No catch-up:** time that passes while the process is not running, while
+  the switch is Off, or while a host sleeps is never replayed. Starting,
+  re-enabling, or replanning makes the next full minute the first possible
+  dispatch. The same rule applies inside one enabled session: a due occurrence
+  whose minute passes before its own dispatch could be admitted (a previous
+  occurrence of the same entry had not yet settled) is never run late — it is
+  reported (an overlap skip when a run of the entry is active, otherwise as
+  not-run) and the next due occurrence is evaluated independently.
+
+### Settings behavior and process visibility
+
+Entries are created and edited under **Scheduled tasks** in `/review-settings`,
+staged like every other section behind **Save changes** / **Cancel**. Save
+validates every entry (a real cron expression, non-empty instructions, an
+existing workspace directory, a resolvable worker override, and a task-local
+reviewer set that resolves like any global one) and persists the catalog while
+preserving unrelated JSON keys. Entries remain visible and editable regardless
+of the runtime switch described below, and a Save applies to the task
+definitions only: an already-running subtask is never stopped or reconfigured
+by a Save, and stopping one is an explicit action.
+
+Save also preserves schedule entries that another Pi process appended to the
+config after this instance's menu opened; entries this instance explicitly
+removed are still removed. A Pi process reads schedule definitions from its own
+loaded configuration: it sees another process's saved edits only on its own
+`/reload` or restart.
+
+Scheduled execution has a live, current-process-only On/Off switch in
+`/review-settings`. It is never stored in the config file and is never a shared
+default: a launcher process starts with scheduled execution **On only when that
+launch passed the `--scheduler` flag** — the launchers export
+`PI_REVIEW_GATE_SCHEDULER=1` for exactly that launch and clear any inherited
+value, so a nested or fresh launch without the flag starts **Off** even under a
+flagged parent. A directly loaded Pi process (no launcher) instead seeds its
+initial state from `PI_REVIEW_GATE_SCHEDULER=1` in its own environment. Either
+way, a live toggle survives `/reload` in the same process exactly as it was set.
+Because several enabled Pi processes may share one config file, two enabled
+instances can independently run the same due task — treat accidental concurrent
+runs as a real possibility and enable more than one instance only deliberately.
+If independently differing schedule sets are wanted, point the instances at
+separate config files: launcher launches follow Pi's `PI_CODING_AGENT_DIR`
+agent-directory override (the launchers deliberately ignore an inherited
+`PI_REVIEW_GATE_CONFIG`, see [Config discovery](#config-discovery)), while
+direct loads honor `PI_REVIEW_GATE_CONFIG`; there is no per-instance, per-task
+filtering.
+
+### Runtime dispatch
+
+When the switch is On, a due entry dispatches directly through the ordinary
+background subtask start path — no model turn and no orchestrator launch turn
+are involved in starting the run. The launching orchestrator then receives the
+same ordinary owner-scoped completion, failure, and recovery notifications it
+receives for any subtask; a successful dispatch itself is reported with a
+lightweight notice.
+
+**Overlap:** while any earlier run of an entry still has unsettled tasks (the
+entry's stable id is persisted on each run's execution group, so overlap
+detection survives restarts), **every** due occurrence is skipped and the
+owning orchestrator is woken with actionable data: the schedule identity,
+the exact due time, and the active executions with their task handles. A skip
+never implies completion or cancellation, never queues a later run, and never
+interrupts the active run. Editing an entry does not proactively wake its
+orchestrator; a later due occurrence that overlaps the still-active run does.
+
+**Stopping:** turning the switch Off (or ending the session) stops future
+dispatch only — active scheduled subtasks keep running under the controller's
+own recovery semantics and are never interrupted by the scheduler. Occurrences
+that were sampled but not yet admitted when the switch went Off or the session
+ended are dropped: they can never start after a re-enable, and no catch-up run
+is started for them. Process exit stops the timers the same way; a run in
+flight settles through the existing subtask recovery rather than any
+notification to an exited process.
+
+**Save replan:** saving `/review-settings` replans the current process's
+timers immediately: future-only sampling restarts from the next full minute
+against the saved catalog, so edits apply at the very next due occurrence
+without replaying anything. A Save likewise drops occurrences that were
+sampled but not yet admitted: none of them starts afterwards with the old or
+the edited definition. Entries that fail validation at dispatch time are
+skipped with an actionable report instead of taking down the timer loop.
+
 ## Web fields
 
 ```json
@@ -543,7 +716,7 @@ boundaries are owned by [Web tools](web-tools.md) and
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with thirteen sections:
+`/review-settings` opens one staged settings transaction with fourteen sections:
 
 - **Worker resources** defines Pi-scoped models and execution-capable entries from
   `externalAgents`, each with one physical maximum concurrency shared by every
@@ -593,6 +766,24 @@ boundaries are owned by [Web tools](web-tools.md) and
   Newly launched Pi subtasks use the saved value, while already-running subtask
   sessions keep their launch behavior.
 - **Subtasks view** stores the expanded/collapsed live-panel preference globally.
+- **Scheduled tasks** opens the scheduled-task submenu (issue #26): one staged entry
+  per independent scheduled task, keyed by its stable identity, with name,
+  five-field Unix cron schedule in machine-local time, execute/research kind,
+  instructions, explicit authorized workspace directory, an optional worker
+  override picked from the worker-resource catalog (never from the global role
+  routes; research-capable only for research tasks), an optional task-local
+  review choice (**Inherit global subtask review settings**, **Off — run this
+  task's subtasks without review**, or a selected reviewer set), and an
+  enabled/disabled toggle. Adding prompts for a name and generates a stable
+  identity; required-but-unset fields block Save with a named validation error.
+  Entries stay visible and editable regardless of the **Scheduler runtime**
+  switch, and saving never clears entries. See
+  [Scheduled task fields](#scheduled-task-fields).
+- **Scheduler runtime** (shown when the host runtime provides the switch) is a
+  live, current-process-only On/Off toggle for scheduled execution: it applies
+  immediately, is never persisted in the config file, and stays outside the
+  staged Save/Cancel transaction. See
+  [Scheduled task fields](#settings-behavior-and-process-visibility).
 - **Web** includes maximum acquisition size and **Browser interaction approval**:
   **Ask**, **Automatically Accept**, or **Automatically Deny**. Ask prompts when
   approval is required and rejects without UI; Accept supplies automatic approval

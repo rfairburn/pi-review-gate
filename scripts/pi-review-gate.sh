@@ -495,7 +495,31 @@ echo "pi-review-gate orchestrator skill: $ORCHESTRATOR_SKILL_DIR/SKILL.md"
 echo "pi-review-gate execution skill: $EXECUTION_SKILL_DIR/SKILL.md"
 echo "pi-review-gate research skill: $RESEARCH_SKILL_DIR/SKILL.md"
 
+# Issue #26: --scheduler enables the process-local scheduled-execution runtime
+# for this launch only. The flag is consumed here and handed to the extension
+# through PI_REVIEW_GATE_SCHEDULER; it is never forwarded to pi, which would
+# reject the unknown option. Processes started without the flag start Off (the
+# live /review-settings toggle can still turn them on). An inherited
+# PI_REVIEW_GATE_SCHEDULER (e.g. from a parent launched with --scheduler) is
+# cleared before parsing so the explicit opt-in contract holds for nested and
+# fresh launches: the variable reaches pi only when THIS launch passed the
+# flag. Keep in sync with scripts/pi-review-gate-launcher.cjs and
+# schedulerLaunchFlagEnabled() in src/scheduling/runtime.ts.
+unset PI_REVIEW_GATE_SCHEDULER
+SCHEDULER_ENABLED=""
+REMAINING_ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--scheduler" ]]; then
+    SCHEDULER_ENABLED="1"
+  else
+    REMAINING_ARGS+=("$arg")
+  fi
+done
+if [[ -n "$SCHEDULER_ENABLED" ]]; then
+  export PI_REVIEW_GATE_SCHEDULER="$SCHEDULER_ENABLED"
+fi
+
 # The extension owns the operating-mode system prompt segment (issue 19); the
 # launcher no longer passes a permanent --append-system-prompt, so mode
 # switches hot-replace it on the next run without string surgery.
-exec pi --extension "$REVIEW_GATE_EXTENSION" "$@"
+exec pi --extension "$REVIEW_GATE_EXTENSION" ${REMAINING_ARGS[@]+"${REMAINING_ARGS[@]}"}

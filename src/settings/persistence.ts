@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  cloneScheduledTaskCatalog,
   cloneWorkerCatalog,
   normalizeConfig,
   type ActiveReviewerSelection,
   type BrowserInteractionApproval,
+  type ScheduledTaskCatalog,
   type WebBrowserPermissions,
   type WorkerResourceCatalog,
   type WorkerRouteEntry,
@@ -44,6 +46,17 @@ export interface ReviewSettingsSelection {
   subtaskNotifications: SubtaskNotificationMode;
   deferredPiTools?: boolean;
   subtasksViewExpanded: boolean;
+  /** Complete scheduled-task catalog (issue #26); persisted as a whole. */
+  scheduledTasks?: ScheduledTaskCatalog;
+  /**
+   * Entry ids the caller staged the catalog from (the ids visible when the
+   * settings menu opened). Save uses it to tell the caller's own deletions
+   * apart from entries another process appended after the staging point: ids
+   * staged-then-removed are deleted, while ids present on disk but never seen
+   * by the caller survive the save (issue #26: an off instance's Save must
+   * never erase schedule entries it never knew about).
+   */
+  scheduledTasksStagedFrom?: string[];
   webMaxDownloadBytes?: number;
   browserInteractionApproval?: BrowserInteractionApproval;
   browserIdleExpiryMinutes?: number;
@@ -57,10 +70,22 @@ export interface ReviewSettingsSelection {
 
 const configUpdateTails = new Map<string, Promise<void>>();
 
+/** Post-validation finalization hook for one config update. */
+export interface UpdateReviewGateConfigOptions {
+  /**
+   * Invoked after the strict validation gate and catalog canonicalization but
+   * before the atomic write, for saves that must persist raw content the gate
+   * must not re-validate (issue #26: foreign schedule entries this save does
+   * not own are preserved verbatim rather than validated).
+   */
+  afterValidate?: (parsed: Record<string, unknown>, normalized: ReviewGateConfig) => void;
+}
+
 export async function persistReviewSettings(
   configPath: string,
   selection: ReviewSettingsSelection,
 ): Promise<ReviewGateConfig> {
+  let scheduledTasksResult: Record<string, unknown> | undefined;
   return updateReviewGateConfig(configPath, (parsed) => {
     const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
     // Both catalogs persist in canonical keyed-object form; routes persist
@@ -102,6 +127,30 @@ export async function persistReviewSettings(
     const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
     ui.subtasksViewExpanded = selection.subtasksViewExpanded;
     parsed.ui = ui;
+    if (selection.scheduledTasks !== undefined) {
+      // Entries are the single canonical copy of each schedule (issue #26), so
+      // omitted fields stay absent and no inherited global setting is copied
+      // into any entry. The merge is write-granularity, not a second copy:
+      // staged entries win per id, entries the caller staged and then removed
+      // are deleted, and on-disk entries the caller never staged are kept so
+      // an off or stale instance cannot erase another process's schedules.
+      const staged = cloneScheduledTaskCatalog(selection.scheduledTasks);
+      const stagedIds = new Set(Object.keys(staged));
+      const deletions = new Set(
+        (selection.scheduledTasksStagedFrom ?? []).filter((id) => !stagedIds.has(id)),
+      );
+      const stored = isRecord(parsed.scheduledTasks) ? parsed.scheduledTasks : {};
+      scheduledTasksResult = mergeScheduledTaskEntries(stored, staged, deletions);
+      // The validation gate below runs on exactly the entries this save owns:
+      // a preserved on-disk entry this snapshot cannot resolve (hand-edited, or
+      // pinned to a worker resource another process created) must never abort
+      // an unrelated Save — it is attached back after validation, verbatim and
+      // unvalidated, and stays on disk for the process that can resolve it.
+      // The returned normalized config (and the in-memory replacement) carries
+      // the staged catalog: this process sees another process's saved edits
+      // only on its own reload, which matches the documented visibility rule.
+      parsed.scheduledTasks = staged;
+    }
     if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined || selection.browserDownloadRetention !== undefined || selection.browserVisible !== undefined || selection.webBrowserPermissions !== undefined) {
       const web = isRecord(parsed.web) ? { ...parsed.web } : {};
       if (selection.webMaxDownloadBytes !== undefined) {
@@ -129,6 +178,10 @@ export async function persistReviewSettings(
       }
       parsed.web = web;
     }
+  }, {
+    afterValidate: (finalParsed) => {
+      if (scheduledTasksResult !== undefined) finalParsed.scheduledTasks = scheduledTasksResult;
+    },
   });
 }
 
@@ -146,6 +199,7 @@ export async function persistSubtasksViewPreference(
 export async function updateReviewGateConfig(
   configPath: string,
   mutate: (config: Record<string, unknown>) => void,
+  options: UpdateReviewGateConfigOptions = {},
 ): Promise<ReviewGateConfig> {
   const key = resolve(configPath);
   const prior = configUpdateTails.get(key) ?? Promise.resolve();
@@ -158,6 +212,7 @@ export async function updateReviewGateConfig(
     mutate(parsed);
     normalized = normalizeConfig(parsed);
     canonicalizeCatalogs(parsed, normalized);
+    options.afterValidate?.(parsed, normalized);
     await writeConfigAtomically(configPath, parsed);
   });
   const tail = operation.catch(() => undefined);
@@ -189,6 +244,29 @@ function canonicalizeCatalogs(parsed: Record<string, unknown>, normalized: Revie
   if (isRecord(execution) && execution.workerResources !== undefined && workerResources !== undefined) {
     execution.workerResources = workerResources;
   }
+}
+
+/**
+ * Merge the staged scheduled-task entries over the on-disk catalog for one
+ * save. This is write granularity, not a second canonical copy: staged entries
+ * win per id, entries the caller staged and then removed are deleted, and
+ * on-disk entries the caller never staged are kept verbatim (even if this
+ * snapshot could not validate them) so an off or stale instance can never
+ * erase another process's schedules. Prototype-safe for exotic ids.
+ */
+function mergeScheduledTaskEntries(
+  stored: Record<string, unknown>,
+  staged: Record<string, unknown>,
+  deletions: ReadonlySet<string>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...stored };
+  for (const id of deletions) delete merged[id];
+  for (const [id, entry] of Object.entries(staged)) {
+    // Own data property even for a key like "__proto__": the definition keeps
+    // the merge prototype-safe for validated staged ids.
+    Object.defineProperty(merged, id, { value: entry, enumerable: true, writable: true, configurable: true });
+  }
+  return merged;
 }
 
 async function writeConfigAtomically(configPath: string, parsed: Record<string, unknown>): Promise<void> {

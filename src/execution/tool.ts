@@ -1,4 +1,4 @@
-import { deferredPiToolsEnabled, externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
+import { deferredPiToolsEnabled, externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig, type ScheduledTaskReviewOverride } from "../config";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
 import type { ExecutionAssociationsSnapshot } from "../session-state";
@@ -229,6 +229,33 @@ export class ExecutionToolManager {
 
   reviewReadiness(): BackgroundReviewReadinessTask[] {
     return this.controller.reviewReadiness();
+  }
+
+  /**
+   * Issue #26: dispatch one scheduled entry through the ordinary subtask
+   * start path. Reuses the same parent-authorization capture as
+   * /subtask-add so a scheduled run gets exactly the same tool ceiling as
+   * an interactive one — no model or orchestrator launch turn is involved.
+   * Throws with actionable diagnostics when dispatch is impossible; the
+   * scheduler runtime reports those instead of retrying silently.
+   */
+  async startScheduled(
+    definition: BackgroundTaskDefinition,
+    kind: BackgroundTaskKind,
+    workspace: string | undefined,
+    options: { scheduledTaskId: string; workerResourceId?: string; reviewOverride?: ScheduledTaskReviewOverride },
+  ): Promise<BackgroundInspection> {
+    return this.controller.start(
+      this.withParentTools([definition], kind),
+      kind,
+      workspace,
+      options,
+    );
+  }
+
+  /** Issue #26: unsettled scheduled runs of one entry (overlap detection). */
+  scheduledRuns(scheduledTaskId: string): ReturnType<BackgroundExecutionController["scheduledRuns"]> {
+    return this.controller.scheduledRuns(scheduledTaskId);
   }
 
   async shutdown(): Promise<void> {

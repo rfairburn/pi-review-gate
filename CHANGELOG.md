@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.79]
+
+### Added
+
+- Add opt-in process-local scheduled subtasks. Define independently enabled
+  local-time cron entries in `/review-settings`, with per-entry instructions,
+  workspaces, worker routes, and task-local review choices. A Pi process starts
+  scheduling only with `--scheduler`, or after its own live settings toggle;
+  definitions stay editable while scheduling is off. Future due occurrences
+  dispatch through existing subtasks, with owner notifications and actionable
+  overlap skips rather than catch-up or cross-process deduplication.
+
 ## [0.1.0-dev.78]
 
 ### Changed

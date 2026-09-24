@@ -3,8 +3,14 @@ import { realpathSync } from "node:fs";
 import { mkdtemp, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ExecutorSelection, ReviewGateConfig } from "../config";
-import { effectiveReviewSettings, resolvedWorkerResources, resolvedWorkerRoute } from "../config";
+import type { ExecutorPoolEntry, ExecutorSelection, ReviewGateConfig, ScheduledTaskReviewOverride } from "../config";
+import {
+  effectiveReviewSettings,
+  resolvedWorkerResource,
+  resolvedWorkerResources,
+  resolvedWorkerRoute,
+  workerResourceSupportsResearch,
+} from "../config";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
@@ -338,6 +344,25 @@ interface PersistedGroupRevision {
   integritySha256: string;
 }
 
+/**
+ * Issue #26 overlap semantics: a scheduled run blocks its entry's next
+ * occurrence while any task is unsettled. Terminal outcomes are landed,
+ * reported (research success), failed, and interrupted; every other state
+ * — including conflicted, paused_recoverable, and
+ * stopped_for_application_exit — keeps the entry occupied until it is
+ * resolved or terminalized through the ordinary recovery paths.
+ */
+const SCHEDULED_SETTLED_STATES: ReadonlySet<BackgroundTaskState> = new Set([
+  "landed",
+  "reported",
+  "failed",
+  "interrupted",
+]);
+
+function isSettledScheduledState(state: BackgroundTaskState): boolean {
+  return SCHEDULED_SETTLED_STATES.has(state);
+}
+
 interface BackgroundControllerInput {
   pi: unknown;
   config: ReviewGateConfig;
@@ -451,6 +476,23 @@ export interface BackgroundReviewReadinessTask {
   taskId: string;
   title: string;
   state: BackgroundTaskState;
+}
+
+/**
+ * Issue #26: scheduled-dispatch options. The controller only records and
+ * validates them; the process-local scheduler runtime owns when they are
+ * used. A pinned worker resource resolves against the CURRENT catalog at
+ * dispatch time (live inheritance), and a review override is task-local:
+ * `off` disables the subtask review stage without fabricating a PASS,
+ * `selected` uses exactly the listed set, omitted inherits global settings.
+ */
+export interface ScheduledStartOptions {
+  /** Stable scheduled-task entry id; persisted on the group for overlap detection across restarts. */
+  scheduledTaskId?: string;
+  /** Explicit worker resource id pinned for this run's tasks. */
+  workerResourceId?: string;
+  /** Task-local review choice frozen per run (execute groups only). */
+  reviewOverride?: ScheduledTaskReviewOverride;
 }
 
 export class BackgroundExecutionController {
@@ -725,14 +767,33 @@ export class BackgroundExecutionController {
     tasks: BackgroundTaskDefinition[],
     kind: BackgroundTaskKind = "execute",
     workspace?: string,
+    options?: ScheduledStartOptions,
   ): Promise<BackgroundInspection> {
     const detachEpoch = this.detachEpoch;
     if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
     // #25: resolve the execution target exactly once, before any durable
     // group state exists; a rejected workspace never leaves a group behind.
     const cwd = await this.resolveExecutionTarget(workspace);
-    if (resolvedWorkerRoute(this.input.config, kind).length === 0) {
+    if (options?.workerResourceId !== undefined) {
+      // Issue #26: an explicit scheduled worker pin fails closed at creation
+      // when it does not resolve against the CURRENT catalog — a group that
+      // could never run must never be created silently.
+      const pinned = resolvedWorkerResource(this.input.config, options.workerResourceId);
+      if (!pinned) {
+        throw new Error(`Scheduled worker resource ${options.workerResourceId} no longer exists in /review-settings; update the entry or its worker choice.`);
+      }
+      if (kind === "research" && !workerResourceSupportsResearch(this.input.config, pinned.selection)) {
+        throw new Error(`Scheduled worker resource ${options.workerResourceId} cannot run research tasks; choose a research-capable resource for this entry.`);
+      }
+    } else if (resolvedWorkerRoute(this.input.config, kind).length === 0) {
       throw new Error(`No ${kind} worker route is configured. Add at least one eligible resource in /review-settings.`);
+    }
+    if (kind === "research" && options?.reviewOverride?.mode === "selected") {
+      // Issue #26: research runs have no review stage, so a selected-reviewer
+      // override could never take effect. Failing closed here keeps an
+      // explicit user choice from being silently discarded; mode "off" is a
+      // consistent no-op for research and stays allowed.
+      throw new Error("Research tasks have no review stage; remove the selected-reviewer override from this research entry (mode off is fine).");
     }
     // Finding 15: fail closed at the unsettled admission cap before any
     // filesystem resources are created.
@@ -761,6 +822,9 @@ export class BackgroundExecutionController {
       root,
       cwd,
       sessionCwd: resolve(this.input.cwd()),
+      ...(options?.scheduledTaskId !== undefined ? { scheduledTaskId: options.scheduledTaskId } : {}),
+      ...(options?.workerResourceId !== undefined ? { scheduledWorkerResourceId: options.workerResourceId } : {}),
+      ...(options?.reviewOverride !== undefined ? { scheduledReviewOverride: options.reviewOverride } : {}),
       createdAt: now,
       updatedAt: now,
       peakConcurrency: 0,
@@ -2635,6 +2699,110 @@ export class BackgroundExecutionController {
     }
   }
 
+  /**
+   * Issue #26: the dispatch route for one group. A scheduled group with a
+   * pinned worker resource resolves that single resource against the
+   * CURRENT catalog (research capability enforced for research groups);
+   * every other group keeps the existing global-role route, so ordinary
+   * subtask behavior is byte-for-byte unchanged.
+   */
+  private routeForGroup(group: BackgroundExecutionGroup): ExecutorPoolEntry[] {
+    if (group.scheduledWorkerResourceId === undefined) {
+      return resolvedWorkerRoute(this.input.config, group.kind);
+    }
+    const pinned = resolvedWorkerResource(this.input.config, group.scheduledWorkerResourceId);
+    if (!pinned) return [];
+    if (group.kind === "research" && !workerResourceSupportsResearch(this.input.config, pinned.selection)) return [];
+    return [pinned];
+  }
+
+  /**
+   * Issue #26: fail closed when a scheduled group's pinned worker resource
+   * no longer resolves (removed or research-ineligible after dispatch).
+   * Each queued task is terminalized exactly once with an actionable
+   * failure wake; the skip never implies completion of skipped work.
+   */
+  private async failScheduledRoute(queued: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord }): Promise<void> {
+    const resource = queued.group.scheduledWorkerResourceId!;
+    const message = `Scheduled task ${queued.group.scheduledTaskId ?? queued.group.executionId} cannot run: pinned worker resource ${resource} no longer resolves in /review-settings. The due occurrence was skipped; fix the entry or its worker choice, and inspect the active tasks before re-dispatching.`;
+    for (const task of queued.group.tasks) {
+      if (task.state !== "queued") continue;
+      transitionTaskState(task, "failed");
+      task.error = message;
+      task.summary = message;
+      this.addActivity(task, "scheduled_route_failure", message);
+      await this.save(queued.group);
+      await this.wake(task, "failure", message);
+    }
+  }
+
+  /**
+   * Issue #26: the effective configuration for one group's worker launch.
+   * A scheduled execute group with a review override derives a
+   * task-local config: `off` disables automatic subtask review (no PASS is
+   * ever fabricated), `selected` replaces exactly the subtask reviewer set
+   * while preserving the primary layer. The derivation is pure — the
+   * controller's shared global config is never mutated, so concurrent
+   * ordinary subtasks keep their own settings.
+   */
+  private groupConfig(group: BackgroundExecutionGroup): ReviewGateConfig {
+    const override = group.scheduledReviewOverride;
+    const pinned = group.scheduledWorkerResourceId;
+    if (pinned === undefined && (!override || group.kind !== "execute")) return this.input.config;
+    const base = this.input.config;
+    // Issue #26: a pinned entry resolves exactly its pinned resource in every
+    // downstream route derivation too — the wave's executor-pool guard and
+    // failover both read the derived role route, so the pin holds for the
+    // whole run even when the kind's global route is empty, and failover can
+    // never silently switch a pinned task onto a global-route worker (a
+    // single-entry route fails closed instead). The base config is cloned,
+    // never mutated.
+    const execution = pinned === undefined || base.execution === undefined
+      ? base.execution
+      : { ...base.execution, routes: { ...base.execution.routes, [group.kind]: [{ resourceId: pinned }] } };
+    if (override === undefined || group.kind !== "execute") {
+      return execution === base.execution ? this.input.config : { ...base, execution };
+    }
+    // Materialize both layers explicitly: a legacy (activeReviewers-only)
+    // base config must not lose its primary set when the derived config
+    // becomes split-shaped for this run.
+    const effective = effectiveReviewSettings(base);
+    return {
+      ...base,
+      ...(execution !== base.execution ? { execution } : {}),
+      review: {
+        ...base.review,
+        primaryReviewers: effective.primaryReviewers.map((selection) => ({ ...selection })),
+        subtaskEnabled: override.mode === "off" ? false : true,
+        subtaskReviewers: (override.mode === "selected" ? override.reviewers : effective.subtaskReviewers).map((selection) => ({ ...selection })),
+      },
+    };
+  }
+
+  /**
+   * Issue #26: scheduled runs of one entry that still have unsettled
+   * tasks (queued through landing, conflicted, paused, or exit-stopped —
+   * everything except the terminal landed/reported/failed/interrupted).
+   * The scheduler uses this for overlap detection: while any of these
+   * exist, every due occurrence of the entry is skipped and reported.
+   */
+  scheduledRuns(scheduledTaskId: string): Array<{
+    executionId: string;
+    kind: BackgroundTaskKind;
+    tasks: Array<{ taskId: string; title: string; state: BackgroundTaskState }>;
+  }> {
+    return [...this.groups.values()]
+      .filter((group) => group.scheduledTaskId === scheduledTaskId)
+      .map((group) => ({
+        executionId: group.executionId,
+        kind: group.kind,
+        tasks: group.tasks
+          .filter((task) => !isSettledScheduledState(task.state))
+          .map((task) => ({ taskId: task.taskId, title: task.definition.title, state: task.state })),
+      }))
+      .filter((run) => run.tasks.length > 0);
+  }
+
   private async pump(): Promise<void> {
     if (this.shuttingDown) return;
     if (this.pumping) {
@@ -2647,8 +2815,17 @@ export class BackgroundExecutionController {
       while (this.active < maxWorkers) {
         let launched = false;
         for (const queued of this.queuedTasks()) {
-          const route = resolvedWorkerRoute(this.input.config, queued.group.kind);
-          if (route.length === 0) continue;
+          const route = this.routeForGroup(queued.group);
+          if (route.length === 0) {
+            // Issue #26: an ordinary group with no global route keeps the
+            // existing silent-skip behavior; a scheduled group with a PINNED
+            // resource that no longer resolves fails closed instead of
+            // queueing forever — each queued task gets one actionable failure.
+            if (queued.group.scheduledWorkerResourceId !== undefined) {
+              await this.failScheduledRoute(queued);
+            }
+            continue;
+          }
           const pendingContinuation = queued.task.pendingContinuation;
           const requiredEntry = pendingContinuation
             ? await continuationEntryId(queued.task).catch(() => undefined)
@@ -2888,7 +3065,7 @@ export class BackgroundExecutionController {
         currentLease.release();
         const next = await this.pool.acquireAfterRoute(
           currentAssignment,
-          () => resolvedWorkerRoute(this.input.config, "research"),
+          () => this.routeForGroup(group),
           abort.signal,
         );
         if (next) currentLease = next;
@@ -3065,7 +3242,7 @@ export class BackgroundExecutionController {
       cwd: group.cwd,
       tasks: [task.definition],
       taskIds: [task.taskId],
-      config: this.input.config,
+      config: this.groupConfig(group),
       scopedModels: this.scopedModels,
       maxWorkers: 1,
       independentLanding: true,
@@ -3243,7 +3420,7 @@ export class BackgroundExecutionController {
         instructions: pending.instructions,
         instructionId: pending.instructionId,
         ...(inPlace ? { inPlace: true } : {}),
-        config: this.input.config,
+        config: this.groupConfig(group),
         scopedModels: this.scopedModels,
         signal: abort.signal,
         executorAssignment: lease,

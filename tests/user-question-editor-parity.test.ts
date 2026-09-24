@@ -8,7 +8,8 @@
  *    expanded trimmed text, onChange fires after every content change). They
  *    pin the wrapper coordination that must hold regardless of which editor
  *    backend answers: draft preservation across Escape, empty-submit no-op,
- *    the 4000-character bound revert, per-question draft ownership, focus
+ *    answers beyond 4000 characters kept and submitted in full (no UI-side
+ *    cap, issue #185), per-question draft ownership, focus
  *    propagation, width-correct multiline rendering, and the unchanged
  *    choice/decline lifecycle.
  *
@@ -169,6 +170,16 @@ class FakeAnswerEditor implements QuestionAnswerEditor {
         this.col -= 1;
         this.onChange?.(this.getExpandedText());
       }
+      return;
+    }
+    if (data.includes("\x1b[200~")) {
+      // Bracketed paste: the real Editor strips the markers and inserts the
+      // payload at the cursor.
+      const payload = data.replace(/\x1b\[20[01]~/g, "");
+      const current = this.lines[this.line]!;
+      this.lines[this.line] = current.slice(0, this.col) + payload + current.slice(this.col);
+      this.col += payload.length;
+      this.onChange?.(this.getExpandedText());
       return;
     }
     if (data.length === 1 && data.charCodeAt(0) >= 32) {
@@ -369,21 +380,44 @@ test("Enter submits through the host editor with embedded newlines preserved", a
   assert.match(fixture.sent[0]!.message, /Answer to pending question "Which database\?": alpha\nbeta/);
 });
 
-test("the 4000-character bound reverts over-limit changes to the last compliant draft", () => {
+test("answers beyond 4000 characters are kept and submit in full (no UI cap)", async () => {
   const fixture = makeEditorFixture();
   register(fixture, "Which database?", { choices: ["SQLite"] });
   enterEditing(fixture);
-  fixture.editor.setText("a".repeat(4000)); // a prior compliant state (e.g. typed or pasted)
-  fixture.component.handleInput("b"); // one character over the bound
+  // A large pre-set draft (equivalent to a big paste) is never trimmed or
+  // reverted — the component applies no length cap and neither does the
+  // controller.
+  const long = "a".repeat(4500);
+  fixture.editor.setText(long);
+  assert.equal(fixture.editor.getExpandedText(), long, "the over-4000 draft is kept in full");
+  // Typing beyond 4000 keeps appending; nothing is reverted.
+  fixture.component.handleInput("b");
+  assert.equal(fixture.editor.getExpandedText(), `${long}b`, "typing past 4000 keeps appending");
+  // The full draft survives backing out to the rows and re-entering.
+  fixture.component.handleInput(ESCAPE);
+  fixture.component.handleInput(ENTER);
+  assert.equal(fixture.editor.getExpandedText(), `${long}b`);
+  fixture.component.handleInput(ENTER); // submit
+  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
+  await flush();
+  assert.equal(fixture.sent.length, 1);
+  assert.ok(
+    fixture.sent[0]!.message.endsWith(`${long}b`),
+    "the submitted answer carries every character",
+  );
+});
 
-  assert.equal(fixture.editor.getExpandedText(), "a".repeat(4000), "the over-limit change is reverted");
-
-  // From an empty draft, typing past the bound stops at exactly 4000.
-  const second = makeEditorFixture();
-  register(second, "Which database?", { choices: ["SQLite"] });
-  enterEditing(second);
-  for (let i = 0; i < 5000; i += 1) second.component.handleInput("x");
-  assert.equal(second.editor.getExpandedText().length, 4000);
+test("a large bracketed paste is kept and submitted without data loss (host editor)", async () => {
+  const fixture = makeEditorFixture();
+  register(fixture, "Which database?", { choices: ["SQLite"] });
+  enterEditing(fixture);
+  fixture.component.handleInput(`\x1b[200~${"c".repeat(5000)}\x1b[201~`);
+  assert.equal(fixture.editor.getExpandedText(), "c".repeat(5000), "the pasted draft is kept in full");
+  fixture.component.handleInput(ENTER); // submit
+  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
+  await flush();
+  assert.equal(fixture.sent.length, 1);
+  assert.ok(fixture.sent[0]!.message.endsWith("c".repeat(5000)));
 });
 
 test("the draft survives editing↔rows but a new answer view starts fresh (text and undo)", () => {
@@ -770,7 +804,7 @@ test("host integration: unsupported escape input never leaks printable tails int
   assert.match(fixture.sent[0]!.message, /": yes and no$/);
 });
 
-test("host integration: the 4000-character bound holds for typing and pastes", async (t) => {
+test("host integration: answers beyond 4000 characters are kept and submit in full", async (t) => {
   const host = await loadRealHost();
   if (!host) {
     t.skip("pi-tui is not resolvable in this environment");
@@ -781,18 +815,29 @@ test("host integration: the 4000-character bound holds for typing and pastes", a
   hostEnterEditing(fixture);
   const editor = fixture.editor as any;
 
-  // Typing one character over the bound reverts to the compliant draft.
-  editor.setText("a".repeat(4000));
+  // A large draft (paste or typed) is never clamped: the full content is
+  // stored, stays editable, and submits without data loss.
+  editor.setText("a".repeat(4500));
+  assert.equal(editor.getExpandedText(), "a".repeat(4500), "the over-4000 draft is kept in full");
   fixture.component.handleInput("b");
-  assert.equal(editor.getExpandedText(), "a".repeat(4000), "the over-limit keystroke is reverted");
+  assert.equal(editor.getExpandedText(), "a".repeat(4500) + "b", "typing past 4000 keeps appending");
+  fixture.component.handleInput(ENTER);
+  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
+  await flush();
+  assert.equal(fixture.sent.length, 1);
+  assert.ok(fixture.sent[0]!.message.endsWith("a".repeat(4500) + "b"));
 
-  // A large bracketed paste from an empty draft cannot exceed the bound.
+  // A large bracketed paste from an empty draft is kept in full too.
   const second = makeHostFixture(host);
   hostRegister(second, "Which database?", ["SQLite"]);
   hostEnterEditing(second);
   second.component.handleInput(`\x1b[200~${"c".repeat(5000)}\x1b[201~`);
   const expanded = (second.editor as any).getExpandedText();
-  assert.ok(expanded.length <= 4000, `paste is clamped to the bound (got ${expanded.length})`);
+  assert.equal(expanded, "c".repeat(5000), "the pasted draft is kept in full");
+  second.component.handleInput(ENTER);
+  await flush();
+  assert.equal(second.sent.length, 1);
+  assert.ok(second.sent[0]!.message.endsWith("c".repeat(5000)));
 });
 
 test("host integration: choice and decline lifecycle is unchanged with the real editor", async (t) => {

@@ -18,6 +18,10 @@
  *   unavailable and AskUserQuestion fails closed with an explicit result —
  *   questions are never silently dropped or answered for the user.
  *
+ * Host editor creation, theming, and live-keybinding wiring for the free-text
+ * row are shared with other extension surfaces through the host-agnostic
+ * adapter in src/host-editor.ts (issue #185).
+ *
  * Session isolation: the controller is bound to the session identity
  * (SessionManager object) at session_start; every registration, presentation,
  * and submission rechecks it, so a question can never be presented in, or
@@ -26,6 +30,11 @@
  */
 
 import { findOccupiedHostBindings } from "../host-keybindings";
+import {
+  createHostEditor,
+  pointHostEditorModuleAtLiveKeybindings,
+  resolveLiveKeybindings,
+} from "../host-editor";
 import { sendNotice } from "../pi";
 import { UserQuestionController, type QuestionSubmitSource } from "./controller";
 import {
@@ -35,9 +44,6 @@ import {
 } from "./components";
 import {
   loadQuestionTuiHost,
-  type QuestionAnswerEditor,
-  type QuestionAnswerEditorTheme,
-  type QuestionTuiHost,
 } from "./pi-tui-host";
 import { createUserQuestionTool } from "./tool";
 
@@ -250,24 +256,20 @@ async function openQuestionList(pi: unknown, controller: UserQuestionController,
   try {
     await ui.custom((tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
       // Point the standalone pi-tui module's global keybinding state at the
-      // app's live manager. Since pi >= 0.86 the bundled chunk keeps its own
-      // inlined copy, so a loaded standalone module is a fresh default-only
-      // state; without this the embedded chat editor would not see the user's
-      // keybindings.json overrides (same strategy as src/settings/menu.ts).
-      if (typeof tuiHost?.setKeybindings === "function" && isLiveKeybindingsManager(keybindings)) {
-        try {
-          tuiHost.setKeybindings(keybindings);
-        } catch {
-          // Best-effort; the injected manager still drives this component.
-        }
-      }
+      // app's live manager and resolve the effective manager through the
+      // shared host-agnostic adapter (src/host-editor.ts, issue #185). Since
+      // pi >= 0.86 the bundled chunk keeps its own inlined copy, so a loaded
+      // standalone module is a fresh default-only state; without this the
+      // embedded chat editor would not see the user's keybindings.json
+      // overrides (same strategy as src/settings/menu.ts).
+      pointHostEditorModuleAtLiveKeybindings(tuiHost, keybindings);
       const component = createQuestionListComponent({
         controller,
-        keybindings: resolveUiKeybindings(keybindings, tuiHost),
+        keybindings: resolveLiveKeybindings(keybindings, tuiHost),
         theme: toUiTheme(theme),
         tuiHost,
         shortcutLabel: questionShortcutLabel(),
-        createAnswerEditor: () => createAnswerEditor(tuiHost, tui, theme),
+        createAnswerEditor: () => createHostEditor(tuiHost, tui, theme),
         onDone: () => done(undefined),
       });
       component.setSourceProbe(sourceProbeOf(ctx));
@@ -277,92 +279,6 @@ async function openQuestionList(pi: unknown, controller: UserQuestionController,
     // The host surfaced the failure itself (error banner); the questions
     // remain pending and the panel stays visible.
   }
-}
-
-/** True only for a real KeybindingsManager instance (live defaults + overrides). */
-function isLiveKeybindingsManager(value: unknown): boolean {
-  return isRecord(value) && typeof value.matches === "function";
-}
-
-/**
- * Builds the host chat editor for the free-text answer row (issue #182), or
- * undefined so the component keeps its built-in fallback editor.
- */
-function createAnswerEditor(
-  tuiHost: QuestionTuiHost | undefined,
-  tui: unknown,
-  theme: unknown,
-): QuestionAnswerEditor | undefined {
-  const EditorCtor = tuiHost?.Editor;
-  if (!EditorCtor || !isUsableTui(tui)) return undefined;
-  try {
-    return new EditorCtor(tui, buildAnswerEditorTheme(theme));
-  } catch {
-    // A failing constructor degrades to the fallback editor.
-    return undefined;
-  }
-}
-
-/** The host editor renders against the TUI's terminal geometry. */
-function isUsableTui(tui: unknown): boolean {
-  if (!isRecord(tui)) return false;
-  const terminal = (tui as Record<string, unknown>).terminal;
-  return isRecord(terminal) && typeof (terminal as Record<string, unknown>).rows === "number";
-}
-
-/**
- * EditorTheme for the embedded answer editor: the app's muted border color
- * (its autocomplete list never opens — no provider is set — so only the
- * border styling is ever visible).
- */
-function buildAnswerEditorTheme(theme: unknown): QuestionAnswerEditorTheme {
-  const identity = (text: string): string => text;
-  return {
-    borderColor: (text) => safeThemeFg(theme, "borderMuted", text),
-    selectList: {
-      selectedPrefix: identity,
-      selectedText: identity,
-      description: identity,
-      scrollInfo: identity,
-      noMatch: identity,
-    },
-  };
-}
-
-function safeThemeFg(theme: unknown, color: string, text: string): string {
-  if (isRecord(theme) && typeof theme.fg === "function") {
-    try {
-      return String((theme.fg as (color: string, text: string) => unknown)(color, text));
-    } catch {
-      // Unknown color in a non-standard theme; plain text keeps the border.
-    }
-  }
-  return text;
-}
-
-function resolveUiKeybindings(
-  injected: unknown,
-  tuiHost: { getKeybindings?(): { matches?(data: string, keybinding: string): boolean } | undefined } | undefined,
-): { matches(data: string, keybinding: string): boolean } {
-  // Prefer the host's live manager (built-in defaults plus the user's
-  // keybindings.json); fall back to pi-tui's module-global default
-  // resolution; without either, no key can be interpreted and every press is
-  // ignored (the raw chord match in the component still closes the list).
-  const candidates: unknown[] = [injected];
-  if (typeof tuiHost?.getKeybindings === "function") {
-    try {
-      candidates.push(tuiHost.getKeybindings());
-    } catch {
-      // Keep the chain moving; the fallback is best-effort.
-    }
-  }
-  for (const candidate of candidates) {
-    if (isRecord(candidate) && typeof candidate.matches === "function") {
-      const matches = candidate.matches.bind(candidate);
-      return { matches: (data, keybinding) => Boolean(matches(data, keybinding)) };
-    }
-  }
-  return { matches: () => false };
 }
 
 function toUiTheme(theme: unknown): QuestionUiTheme {

@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.79]
+
+### Changed
+
+- Remove the UI-only 4000-character answer bound from `AskUserQuestion` free-text
+  answers: drafts and pastes beyond 4000 characters are kept in full and submit
+  without data loss in both the hosted editor and the fallback field (the
+  controller never applied an answer cap). Extract the host chat-editor creation,
+  theme, and live-keybinding wiring into a shared host-agnostic adapter
+  (`src/host-editor.ts`) that the question UI now consumes, and deduplicate the
+  identical peer-module discovery/loading of `src/settings/menu.ts` and the
+  question loader into one shared host peer-loader (`src/host-peer-loader.ts`)
+  with unchanged resolution behavior and test seams.
+
 ## [0.1.0-dev.78]
 
 ### Changed

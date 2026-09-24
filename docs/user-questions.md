@@ -87,9 +87,10 @@ arrows select · Enter confirm · Esc back
   Ctrl+J), and bracketed paste. Your `keybindings.json` overrides apply exactly
   as in the main editor. Enter submits the answer (ends trimmed, embedded
   newlines preserved); Escape goes back to the choices with the draft kept.
-  Answers are bounded at 4000 characters — an over-limit change is reverted to
-  the last compliant draft. Tab does nothing in the answer field (there is no
-  autocomplete there), and transcript/session shortcuts do not apply inside it.
+  There is no length cap on answers — a long paste or typed draft is kept in
+  full and can be submitted as-is. Tab does nothing in the answer field (there
+  is no autocomplete there), and transcript/session shortcuts do not apply
+  inside it.
 - **Decline** is one deliberate action: select the Decline row and press
   Enter. There is no second confirmation, but Escape only goes back — it
   never declines.

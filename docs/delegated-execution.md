@@ -44,7 +44,12 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
 - Research tasks skip review and landing, validate that their private worktree stayed
   unchanged, and finish as `reported` with a durable report path.
 - `SubtasksContinue` accepts either an associated task handle or a verified reattachment
-  bundle.
+  bundle. By default continuation strictly requires a verified recovery checkpoint: a
+  missing, invalid, or unverifiable checkpoint blocks continuation, and the checkpoint is
+  re-verified before the executor runs. An explicit `inPlace: true` on a stopped execute
+  task is the one exception — it continues the task in exactly its retained managed
+  worktree without a verified checkpoint (see
+  [Steering, continuation, and failure handling](#steering-continuation-and-failure-handling)).
 - `SubtasksInspect` requires an explicit `taskId`, even for single-task executions; it
   is never inferred from group size, and an omitted ID fails immediately with a concise
   actionable diagnostic in both activity and evidence modes. The execution-wide overview
@@ -312,8 +317,14 @@ contract authoritatively. Checking out a branch whose commit differs from the cu
 inside a managed worktree resets its tree to that branch's committed state and can drop
 captured content that tree lacks, while conflicting local edits make the checkout refuse
 rather than discarding them (same-commit branch creation changes only HEAD attachment);
-checkpoint validation fails closed on such a worktree. Recovery steps for an already
-damaged worktree live in the shipped orchestrator skill's recovery runbook
+checkpoint validation fails closed on such a worktree. An explicit in-place continuation
+(see [Steering, continuation, and failure handling](#steering-continuation-and-failure-handling))
+reuses exactly the task's retained managed worktree while it still satisfies that
+contract, and refuses one that no longer does — a missing, moved, or symlinked folder, an
+attached HEAD, or a worktree that does not belong to the wave's private repository — and
+it never recreates, copies,
+resets, checks out, or cleans the folder. Recovery steps for an already damaged worktree
+live in the shipped orchestrator skill's recovery runbook
 (`skills/pi-review-gate-orchestrator/references/recovery.md`).
 
 ## Conflicts and gates
@@ -334,7 +345,10 @@ parent session's own workspace), clears the gates, and wakes queued landings.
 disposition. A normal cancellation uses `interrupt_as_failure`; `interrupt_with_merge`
 must be requested explicitly. `SubtasksForceMerge` operates only on a stopped task; it
 lands the task's verified checkpoint when one exists, and otherwise salvages an
-identified snapshot of the worker's actual work (explicit salvage below).
+identified snapshot of the worker's actual work (explicit salvage below). Force merge is
+mechanical salvage of all identified work, not a `SubtasksContinue` substitute: it never
+resumes the stopped executor, requires no verified checkpoint, and asserts no review
+status.
 An explicit force-merge always merges all identified work in one call: clean paths
 apply and ordinary text conflicts install diff3 markers in main (`mergeAnyhow` is
 accepted for caller compatibility only and controls nothing). A conflict that cannot
@@ -401,6 +415,30 @@ queued delivery as an interruption.
 Stopped tasks retain verified checkpoints and reattachment bundles for
 `SubtasksContinue`; stopped tasks without a usable checkpoint remain salvageable
 through explicit `SubtasksForceMerge` from their retained worktree or surviving refs.
+
+**Explicit in-place continuation**: A checkpoint staging or verification failure happens
+before review of that turn, and its failure and recovery diagnostics return to the orchestrator
+like any other failed operation — this is distinct from a normal landing refusal or
+conflict, which is only reachable after a candidate has been accepted for landing (and,
+when the subtask review layer is enabled, reviewed). When
+a stopped execute task has no verified recovery checkpoint (for example after such a
+failure), an explicit `SubtasksContinue` with
+`inPlace: true` reuses the task's exact retained managed worktree — never recreated,
+copied, reset, checked out, or cleaned — after a strictly read-only preflight that
+verifies writer quiescence, that the folder is the task's own managed worktree, its
+detached HEAD against the task's candidate lineage, and that no landing recovery is
+outstanding (landing rollback recovery is never bypassed). The strict default is
+unchanged: ordinary `SubtasksContinue` still requires a verified checkpoint, and a
+repeated in-place staging failure leaves no new checkpoint, a fresh checkpoint incident,
+and the retained folder for another explicit attempt. The continuation turn is told the
+truth about the reused folder: its current state is neither checkpoint-verified nor
+reviewed, a failed staging attempt may have staged entries in the Git index (inspect
+rather than assume either is unchanged), and a fresh executor session does not restore
+the previous session's conversation or hidden state. The later candidate is treated like
+any other: it must be checkpoint-verified and pass the normal configured review and
+landing gates before it lands; with `review.subtaskEnabled` off, no synthetic review is
+added and judgment about the result stays with the orchestrator as for any unreviewed
+landing.
 
 **Failures, retry, and recovery**: Executor failures are checkpointed to a protected
 recovery ref before bounded retry. If same-executor recovery is exhausted, a verified

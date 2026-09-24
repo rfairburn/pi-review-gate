@@ -1,5 +1,5 @@
 ---
-name: pi-review-gate-execution
+name: execution
 description: Execute authorized implementation and runtime work directly or as a delegated worker — workspace edits, builds, targeted tests, long-running command handling, and process/PTY diagnosis. Read before substantive execution work, including before delegated execution begins.
 ---
 
@@ -97,37 +97,6 @@ commit; they are not the source/target checkout.
   `no_changes` is a legitimate deliverable when the authorized scope required
   none — report the observations that establish it — but it does not prove
   task acceptance or review; the parent evaluates the returned evidence.
-
-## After a checkpoint staging failure
-
-This section is shared by both execution roles — apply it whenever you read it and
-your work must continue after a checkpoint staging failure, whether you are a
-delegated worker whose finished turn the harness could not stage into a reviewable
-candidate or a top-level session asked to finish or recover work in a workspace
-that failed one. Not every adapter loads this skill automatically, so nothing here
-assumes it was read ahead of time; it is guidance you follow when you have it.
-
-A staging failure happens before review of that turn: no new candidate is verified,
-and nothing from that turn has been reviewed or landed. Earlier checkpoints do not
-certify its later retained work. The retained folder (worktree), its index, and its
-HEAD are preserved for inspection. When continuing after one:
-
-- Inspect before mutating: read the retained folder, `git status` (index and
-  untracked entries), and HEAD first, and report what you find.
-- Distinguish pre-existing or untracked work from artifacts this task created.
-  Everything you did not create is unknown: do not modify or delete it.
-- Finish only the remaining requested work; do not redo completed parts, and run
-  the validation that actually covers your change before reporting it.
-- Remove a disposable artifact only when you can positively identify it as one
-  this task created and it is no longer needed; recheck ownership before each
-  removal and report uncertain ownership instead of deleting. No folder convention
-  or path pattern classifies a file as disposable — ownership comes only from
-  positive identification.
-- Never use blanket `git clean`, `git reset --hard`, or branch checkout to make the
-  workspace "clean," and never delete unknown or user-owned files.
-- Do not claim recovered hidden model state, a verified candidate, review success,
-  or a landing. Those exist only when the harness gates report them; your report
-  states what you did, what you validated, and what remains uncertain.
 
 ## Verify and report
 

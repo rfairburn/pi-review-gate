@@ -224,6 +224,35 @@ test("execution skill sends minute-scale commands to background shells and broad
   assert.match(skill, /the summary is the deliverable/);
 });
 
+test("execution skill shares checkpoint-staging-failure recovery guidance with both roles (#179)", async () => {
+  const skill = await readSkillFlat("pi-review-gate-execution");
+  for (const phrase of [
+    // Shared by both execution roles, usable when read — without claiming
+    // every adapter loads the skill automatically.
+    "This section is shared by both execution roles",
+    "delegated worker whose finished turn the harness could not stage into a reviewable candidate",
+    "top-level session asked to finish or recover work in a workspace that failed one",
+    "Not every adapter loads this skill automatically",
+    // Pre-review failure semantics and inspect-before-mutating.
+    "A staging failure happens before review",
+    "Inspect before mutating",
+    // Ownership, remaining work, validation, and safe cleanup boundaries.
+    "Distinguish pre-existing or untracked work from artifacts this task created",
+    "Finish only the remaining requested work",
+    "positively identify it as one this task created and it is no longer needed",
+    "recheck ownership before each removal",
+    "report uncertain ownership instead of deleting",
+    // No special disposable folder convention or automatic classification.
+    "No folder convention or path pattern classifies a file as disposable",
+    // Explicit prohibitions and honest reporting.
+    "blanket `git clean`, `git reset --hard`, or branch checkout",
+    "never delete unknown or user-owned files",
+    "Do not claim recovered hidden model state, a verified candidate, review success, or a landing",
+  ]) {
+    assert.ok(skill.includes(phrase), `execution skill missing: ${phrase}`);
+  }
+});
+
 test("research skill distinguishes content search, path discovery, and directory listing", async () => {
   const skill = await readSkillFlat("pi-review-gate-research");
   assert.match(skill, /`grep` searches file \*\*contents\*\*/);
@@ -342,41 +371,42 @@ test("the pre-#151 migration has one canonical shipped implementation (#154)", a
       .split(",").map((part) => part.trim().replace(/^"|"$/g, "")).join("/"),
     source: block.match(/source: \[([^\]]+)\]/)![1]
       .split(",").map((part) => part.trim().replace(/^"|"$/g, "")).join("/"),
-    // Rename entries are lines holding exactly one bracket pair, optionally
-    // prefixed by `renames:`; installed/source/pairedWith arrays carry a
-    // different key and never match.
-    renames: [...block.matchAll(/^\s*(?:renames: )?\[+\s*"([^"\]]+)", "([^"\]]+)"\]+,?$/gm)].map((m) => [m[1], m[2]] as [string, string]),
+    // `renames` is documentary only (the namespacing diff for human readers);
+    // the matching algorithm compares installed bytes against the digest.
     historicalSha256: block.match(/historicalSha256: "([0-9a-f]{64})"/)?.[1] ?? null,
     pairedWith: /pairedWith:/.test(block),
   }));
 
   assert.ok(cjsEntries.length > 0, "the canonical migration manifest must list prior files");
-  // Each migration entry must point at an existing packaged copy, and its
-  // recorded namespacing edits must be exactly the namespacing diff:
-  // reversing them on the packaged copy must reconstruct the prior generic
-  // copy (here: verified via the frontmatter skill name, which must equal
-  // the prior generic directory name).
+  // Each entry's recorded digest must be the SHA-256 of the immutable
+  // historical fixture — the true pre-#151 package-owned bytes, preserved
+  // under tests/fixtures/skill-migration/ mirroring the generic install
+  // layout. The identity is anchored to those bytes, not to derivations from
+  // the mutable packaged text: later releases may edit shipped skill files (as
+  // issue 179 did) without changing what a genuine old install looks like,
+  // and the launcher compares installed copies against this digest directly.
+  // A drifted fixture or digest fails here instead of silently degrading
+  // removal at user launch time.
   for (const entry of cjsEntries) {
-    const packaged = await readFile(path.join(repoRoot, entry.source), "utf8");
-    const genericName = entry.installed.slice(0, entry.installed.indexOf("/"));
-    let reconstructed = packaged;
-    for (const [from, to] of [...entry.renames].reverse()) reconstructed = reconstructed.split(to).join(from);
-    // The recorded historical digest anchors each entry to the true pre-#151
-    // bytes: if a later release edits a shipped skill file without
-    // re-deriving the edits and digest together, the reconstruction stops
-    // matching and this assertion fails instead of the entry silently
-    // degrading to never-removing at user launch time.
     assert.ok(entry.historicalSha256, `migration entry must record a historical digest: ${entry.installed}`);
+    const fixturePath = path.join(repoRoot, "tests", "fixtures", "skill-migration", ...entry.installed.split("/"));
+    let fixtureBytes: Buffer;
+    try {
+      fixtureBytes = await readFile(fixturePath);
+    } catch {
+      throw new Error(`historical fixture is missing for migration entry ${entry.installed}: ${fixturePath}`);
+    }
     assert.equal(
-      createHash("sha256").update(Buffer.from(reconstructed, "utf8")).digest("hex"),
+      createHash("sha256").update(fixtureBytes).digest("hex"),
       entry.historicalSha256,
-      `reverse namespacing edits must reproduce the recorded historical digest for ${entry.installed}`,
+      `the historical fixture must hold exactly the recorded pre-#151 bytes for ${entry.installed}`,
     );
     if (entry.installed.endsWith("SKILL.md")) {
+      const genericName = entry.installed.slice(0, entry.installed.indexOf("/"));
       assert.match(
-        reconstructed,
+        fixtureBytes.toString("utf8"),
         new RegExp(`^name: ${escapeRegExp(genericName)}$`, "m"),
-        `reverse namespacing edits must reconstruct the prior generic skill name for ${entry.installed}`,
+        `the historical fixture must carry the prior generic skill name for ${entry.installed}`,
       );
     }
     const exists = await stat(path.join(repoRoot, entry.source)).then(() => true, () => false);

@@ -22,7 +22,10 @@ and conflict gates. A live or uncertain owner blocks another writer; a confirmed
 writer can be reconciled into a freshly reverified checkpoint before an explicit
 continuation. A stopped task with a durable bundle is then queued for continuation, and
 that continuation reconciles verified in-progress or recovery-required landing manifests
-before allowing further source mutation.
+before allowing further source mutation. Continuation itself stays checkpoint-verified
+by default; the explicit `inPlace: true` exception for a checkpoint staging or
+verification failure is owned by
+[Delegated execution](delegated-execution.md#steering-continuation-and-failure-handling).
 
 Restored review windows reconcile to the current reviewer configuration. The persisted
 sidecar records which review settings produced it; when those settings changed before
@@ -187,8 +190,14 @@ diagnosis ([Delegated execution](delegated-execution.md#landing-and-source-prese
 
 Some failed tasks never produce an ordinary verified checkpoint: the executor left the
 worktree on an attached branch, was interrupted before normalization, or the operation
-ended in a failed critical state. `SubtasksContinue` cannot resume those tasks, but an
-explicit `SubtasksForceMerge` can still salvage an identified snapshot of the worker's
+ended in a failed critical state. A stopped execute task with no verified checkpoint,
+such as after checkpoint staging or verification failure, can instead be resumed through an explicit
+`SubtasksContinue` with `inPlace: true`, but only while its retained managed worktree is
+intact, on a detached HEAD, and passes the read-only in-place preflight (writer, task,
+wave, HEAD, and landing-recovery safety — see
+[Delegated execution](delegated-execution.md#steering-continuation-and-failure-handling));
+an ordinary `SubtasksContinue` still cannot resume an unverified task, but an explicit
+`SubtasksForceMerge` can still salvage an identified snapshot of the worker's
 actual work — retained commits, staged and unstaged edits, and task-created files —
 without requiring any ordinary lifecycle eligibility.
 

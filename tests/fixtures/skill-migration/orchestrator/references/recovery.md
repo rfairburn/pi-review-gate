@@ -21,7 +21,7 @@ Read the packet for:
 
 1. **Current state and latest command.** Distinguish an active task from a stopped task, and distinguish a queued steer from an acknowledged or failed one.
 2. **Writer ownership.** A live controller, process, or uncertain owner blocks continuation and force-merge. Wait for an event or interrupt the known live task; do not create a competing writer.
-3. **Checkpoint status.** Ordinary `SubtasksContinue` requires a verified recovery checkpoint or an accepted commit. When none verifies, a stopped execute task may qualify for explicit `inPlace: true` only with its original, safely owned retained worktree and all guards below; otherwise use a replacement task or explicit manual recovery, never optimistic reuse. `SubtasksForceMerge` lands an accepted commit or verified checkpoint when one is present and otherwise salvages the identified work from retained state — it never asserts review success.
+3. **Checkpoint status.** `SubtasksContinue` requires a verified recovery checkpoint or an accepted commit; missing, invalid, or unverifiable checkpoints require a replacement task or explicit manual recovery, not optimistic reuse. `SubtasksForceMerge` lands an accepted commit or verified checkpoint when one is present and otherwise salvages the identified work from retained state — it never asserts review success.
 4. **Source-workspace disposition.** `unchanged` means this task did not land; `landed` means it mechanically reached main; `recovery_required` means source state may be uncertain.
 5. **Conflict status.** Determine whether main already contains diff3 markers (or preserved unrepresentable conflicts — an intact target with a worker version saved alongside, or a recorded worker-side deletion) and an active conflict gate, or whether the attempted landing refused before touching main. Ordinary reviewed landing refuses any conflict it cannot represent; an explicit force-merge preserves them instead.
 6. **Recovery manifests and safe actions.** Follow the packet's safe/blocked actions. A verified landing-recovery manifest may be reconciled during continuation; an unverified manifest blocks source mutation.
@@ -34,11 +34,11 @@ Do not poll for ordinary progress. Inspect once for a decision, take the selecte
 | Observed state or disposition | Meaning | Normal next action |
 | --- | --- | --- |
 | `queued`, `capturing`, `running`, `reviewing`, `accepted`, `waiting_to_land`, `landing` | The task still owns or may soon own active execution/landing work. | Steer or interrupt if direction must change; otherwise wait for events. Do not continue or force-merge. |
-| `paused_recoverable` | Execution stopped but a durable bundle/checkpoint may be reusable. | Inspect ownership and checkpoint. Use ordinary `SubtasksContinue` with a verified checkpoint; without one, consider explicit `inPlace: true` only under the retained-worktree checks below. |
-| `interrupted` | A user or model intentionally stopped the task. It may or may not have a reusable checkpoint. | Inspect. Use ordinary Continue if the checkpoint verifies; without one, consider explicit `inPlace: true` only for a stopped execute task with a safely owned retained worktree. Otherwise replace or leave explicitly incomplete. |
+| `paused_recoverable` | Execution stopped but a durable bundle/checkpoint may be reusable. | Inspect ownership and checkpoint, then use `SubtasksContinue` when listed as safe. |
+| `interrupted` | A user or model intentionally stopped the task. It may or may not have a reusable checkpoint. | Inspect. Continue if the checkpoint is verified and the work should resume; otherwise replace or leave explicitly incomplete. |
 | `stopped_for_application_exit` | The owning application shut down and retained task state. | Resume the exact parent conversation and cwd; allow automatic restart recovery, then inspect only if it does not become active or reports a problem. |
-| `failed` | The task stopped without a usable automatic recovery path, often without a bundle. | Inspect diagnostics (failed checkpoint staging has its own runbook below). If an original bundle and safely owned worktree remain, explicit `inPlace: true` may finish the task; otherwise start a replacement or use `SubtasksForceMerge` to salvage identified work when mechanical landing is desired. Retain the failed task as history. |
-| `failed_critical` or source `recovery_required` | Recovery state or source rollback is unsafe or unverifiable. | Stop source mutations and inspect recovery manifests. Only a durable checkpoint staging/verification incident may qualify for explicit in-place continuation after its safety checks; never bypass source rollback recovery or continue automatically. |
+| `failed` | The task stopped without a usable automatic recovery path, often without a bundle. | Inspect diagnostics. If no verified checkpoint exists, either start a replacement task for the remaining outcome or use `SubtasksForceMerge` to salvage the retained work when landing that identified work is the desired outcome; retain the failed task as history. |
+| `failed_critical` or source `recovery_required` | Recovery state or source rollback is unsafe or unverifiable. | Stop source mutations. Inspect recovery manifests and blocked actions; do not continue automatically. Report the exact source-state risk if the tool cannot establish a safe action. |
 | `conflicted` with an active conflict gate | Main contains materialized diff3 markers and automatic landings are paused. | Resolve all gated paths in main, verify the combined result, then call `SubtasksMarkClean`. |
 | Landing refused before any mutation | An ordinary reviewed landing met a conflict it cannot represent (binary, symlink/type change, oversized side, or worker-side deletion), so nothing was transferred and the limits were reported; or a force-merge met a genuinely unsafe path (escaping destination or unsafe symlinked ancestor). | For a normal landing, rework the task or resolve the overlap directly in main if authorized, then retry. An explicit force-merge does not refuse these representability limits — it preserves them — so do not expect another mode; only unsafe paths refuse. |
 | `landed` | The task's mechanical landing completed. | Inspect affected paths and run combined validation; do not continue recovery unless new incremental work is explicitly desired. |
@@ -68,7 +68,7 @@ After `interrupt_with_merge`, inspect the main workspace regardless of status. `
 
 ## Continue a stopped worker
 
-Use ordinary, checkpoint-verified `SubtasksContinue` when inspection shows all of the following:
+Use `SubtasksContinue` when inspection shows all of the following:
 
 - no live or uncertain writer remains;
 - the task has a current durable continuation bundle;
@@ -78,93 +78,9 @@ Use ordinary, checkpoint-verified `SubtasksContinue` when inspection shows all o
 
 Give continuation instructions that state what remains, what changed since the prior turn, and what must not be redone. The worker resumes from the preserved session/worktree when its adapter supports that; otherwise the verified checkpoint and durable task contract preserve the work across a new session.
 
-If continuation rejects a stale bundle, inspect again and retry with the returned current bundle. If checkpoint verification fails, do not recreate or patch that checkpoint. Explicit `inPlace: true` may be available for a stopped execute task with no verified checkpoint and an intact, safely owned retained worktree (below); otherwise start a replacement task for the remaining outcome or choose explicit mechanical salvage. Neither path fabricates a verified checkpoint.
+If continuation rejects a stale bundle, inspect again and retry with the returned current bundle. If checkpoint verification fails, do not recreate or patch that checkpoint. Start a replacement task from the current main workspace for the remaining outcome, and report that the original work could not be safely resumed.
 
 Continuation uses the current `/review-settings`; a changed model or configuration is expected outside the happy path and should be treated as a warning, not as proof the checkpoint is invalid.
-
-## Recover a failed checkpoint staging
-
-Checkpoint staging is where the harness turns a finished executor turn into a
-reviewable candidate: it stages the worktree's changes into a single candidate
-commit pinned in the wave's private repository.
-Staging happens **before review of that turn**, so when it fails (an attached HEAD,
-a worktree no longer based on the captured base, an unstageable or unsafe path,
-or a dirty-worktree verification failure):
-the task stops at the checkpointing stage with no newly verified candidate — nothing
-from that turn can be reviewed or landed yet. An earlier verified checkpoint, if
-one exists, does not certify the later retained work. The failure event and
-the `SubtasksInspect` packet carry the incident, the checkpoint/bundle state,
-artifact paths, and safe actions to you — recover from that packet, not from a
-single error string in isolation.
-
-A failed staging does not destroy the work: the worker's folder (worktree), its
-index, and its HEAD are retained for inspection.
-No recovery step may claim to have read or restored hidden model state; the
-session context belongs to the executor, and only the harness gates establish
-what is verified. Once inspection settles ownership, two outcomes are available:
-
-- **In-place continuation.** `SubtasksContinue` with explicit `inPlace: true`
-  attempts to finish a stopped execute task in its exact retained worktree
-  **only when no recovery checkpoint verifies**. Inspect first: a durable
-  bundle and original managed folder must exist, no writer may be live or
-  uncertain, HEAD must still satisfy the managed detached-worktree identity,
-  and landing recovery must not be outstanding. A `failed_critical` state is
-  eligible only when its durable terminal incident is a checkpoint
-  staging/verification failure; source rollback is never bypassed. The tool
-  re-verifies these guards and refuses on uncertainty, without resetting or
-  cleaning the folder. It resumes the prior executor session only when that
-  session is genuinely available; otherwise a fresh turn sees the retained
-  files and instructions, **not** the interrupted session's hidden state.
-  If a verified checkpoint exists, inspect any later retained changes before
-  using ordinary Continue; explicit in-place mode refuses rather than risk
-  silently omitting checkpointed work.
-- **Mechanical salvage.** `SubtasksForceMerge`
-  transfers the identified retained work into main for manual inspection:
-  clean paths apply and conflicts are materialized or preserved.
-  It never asserts review success,
-  and it never replaces inspecting main afterward; use it when landing that
-  identified work is the desired outcome and continuation is unavailable or
-  not wanted.
-
-An attached HEAD is the common staging failure; its dedicated salvage runbook
-is the attached-HEAD section below this one. Whichever path you choose, the
-worker's task or continuation instructions must follow the sample contract
-below — they are what keep a second failure from turning retained work into
-destroyed work.
-
-### Sample task instructions for checkpoint-sensitive work
-
-When dispatching an execution task into a workspace that already carries
-untracked or in-progress content, make ownership explicit in the task text so
-the worker never guesses what is its own. State (adapted to the task):
-
-> The worktree may contain pre-existing untracked files and edits that are not
-> part of this task. Treat everything you did not create as unknown: do not
-> modify, delete, or "clean up" anything you cannot
-> positively identify as a disposable artifact this task created (scratch
-> output, temporary build or test trees, diagnostic captures). Keep
-> deliverables as ordinary working-tree files.
-> Do not run blanket `git clean`, `git reset --hard`, or any branch checkout in
-> this worktree; if a step seems to require one, stop and report it instead.
-
-After a checkpoint staging failure, the continuation instruction must be just as
-specific about what remains and what is safe:
-
-> Your previous turn's checkpoint staging failed before its review; no new
-> candidate was verified and nothing from that turn has been reviewed or landed.
-> First inspect the retained
-> state — the worktree folder, `git status` (index and untracked entries), and
-> HEAD — and report what you find before changing anything.
-> Then finish only the remaining requested work; do not redo completed parts.
-> Run the validation that actually covers your change before reporting it.
-> Remove a disposable artifact only when you can positively identify it as one
-> this task created and it is no longer needed;
-> recheck ownership before each removal and report any file whose ownership is
-> uncertain instead of deleting it. Never use blanket `git clean`, hard reset,
-> or branch checkout to make the workspace "clean,"
-> and never delete unknown or user-owned files.
-> Do not claim recovered hidden model state, a verified candidate, review
-> success, or a landing: those exist only when the harness gates say so.
 
 ## Recover a worker worktree whose detached HEAD was replaced by a branch checkout
 

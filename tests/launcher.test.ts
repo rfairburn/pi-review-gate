@@ -124,6 +124,15 @@ async function pathExists(path: string): Promise<boolean> {
   return stat(path).then(() => true, () => false);
 }
 
+/**
+ * Immutable pre-#151 historical fixture bytes (digest-anchored in
+ * tests/shipped-skills.test.ts): the true prior generic package-owned content,
+ * independent of later shipped-skill edits such as issue 179's.
+ */
+async function historicalFixture(installedPath: string): Promise<string> {
+  return readFile(join(resolve("tests", "fixtures", "skill-migration"), ...installedPath.split("/")), "utf8");
+}
+
 async function assertNoTempLitter(dir: string): Promise<void> {
   const entries = await readdir(dir);
   assert.ok(
@@ -284,22 +293,10 @@ test("persistent launcher migrates proven pre-#151 generic skill copies and pres
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
 
   const skillsDir = join(fixture.home, ".agents", "skills");
-  // The recorded namespacing edits (exactly the canonical SKILL_MIGRATION_PLAN
-  // in scripts/pi-review-gate-launcher.cjs): reversing them on the shipped
-  // copies reconstructs the prior generic package-owned content.
-  const orchestratorRenames: Array<[string, string]> = [
-    ["name: pi-review-gate-orchestrator", "name: orchestrator"],
-    ["../pi-review-gate-execution/SKILL.md", "../execution/SKILL.md"],
-    ["../pi-review-gate-research/SKILL.md", "../research/SKILL.md"],
-  ];
-  const priorContent = async (shipped: string, renames: Array<[string, string]>): Promise<string> => {
-    let content = await readFile(resolve(shipped), "utf8");
-    for (const [to, from] of renames) content = content.split(to).join(from);
-    return content;
-  };
-
   // Proven unmodified package-owned copies at the pre-#151 generic
-  // locations: byte-exact pre-namespacing content.
+  // locations: the immutable historical fixtures hold the byte-exact
+  // pre-namespacing content (digest-anchored), so this test establishes old
+  // installation behavior even after shipped skill edits.
   const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
   const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
   const priorExecution = join(skillsDir, "execution", "SKILL.md");
@@ -310,13 +307,11 @@ test("persistent launcher migrates proven pre-#151 generic skill copies and pres
     mkdir(join(skillsDir, "execution"), { recursive: true }),
     mkdir(join(skillsDir, "research"), { recursive: true }),
   ]);
-  const researchContent = (await priorContent("skills/pi-review-gate-research/SKILL.md", [
-    ["name: pi-review-gate-research", "name: research"],
-  ])) + "\nuser customized this copy\n";
+  const researchContent = (await historicalFixture("research/SKILL.md")) + "\nuser customized this copy\n";
   await Promise.all([
-    writeFile(priorOrchestrator, await priorContent("skills/pi-review-gate-orchestrator/SKILL.md", orchestratorRenames), "utf8"),
-    writeFile(priorRecovery, await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"), "utf8"),
-    writeFile(priorExecution, await priorContent("skills/pi-review-gate-execution/SKILL.md", [["name: pi-review-gate-execution", "name: execution"]]), "utf8"),
+    writeFile(priorOrchestrator, await historicalFixture("orchestrator/SKILL.md"), "utf8"),
+    writeFile(priorRecovery, await historicalFixture("orchestrator/references/recovery.md"), "utf8"),
+    writeFile(priorExecution, await historicalFixture("execution/SKILL.md"), "utf8"),
     writeFile(modifiedResearch, researchContent, "utf8"),
     writeFile(unrelatedFile, "user notes\n", "utf8"),
   ]);
@@ -374,11 +369,11 @@ test("persistent launcher preserves customized generic copies that normalize to 
     .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
     .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
     + "\nuser customized this copy\n";
-  // The packaged recovery.md is byte-identical to the historical generic
-  // copy (recovery.md carried no namespacing edits), but it supports the
-  // customized generic orchestrator SKILL.md above: deleting it would break
-  // the customized skill's reference, so the pairing gate must preserve it.
-  const recoveryCopy = await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8");
+  // The true historical recovery bytes (recovery.md carried no namespacing
+  // edits, so the fixture is byte-exact) support the customized generic
+  // orchestrator SKILL.md above: deleting them would break the customized
+  // skill's reference, so the pairing gate must preserve them.
+  const recoveryCopy = await historicalFixture("orchestrator/references/recovery.md");
   await Promise.all([
     writeFile(fullyRenamedExecution, executionCopy, "utf8"),
     writeFile(partiallyRenamedOrchestrator, orchestratorCustom, "utf8"),
@@ -399,19 +394,15 @@ test("persistent launcher removes recovery.md together with a proven generic orc
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
 
   const skillsDir = join(fixture.home, ".agents", "skills");
-  // Historical generic orchestrator pair: when the SKILL.md is proven
-  // unmodified and removed, the proven recovery.md goes with it.
-  let orchestratorHistorical = await readFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), "utf8");
-  orchestratorHistorical = orchestratorHistorical
-    .split("name: pi-review-gate-orchestrator").join("name: orchestrator")
-    .split("../pi-review-gate-execution/SKILL.md").join("../execution/SKILL.md")
-    .split("../pi-review-gate-research/SKILL.md").join("../research/SKILL.md");
+  // Historical generic orchestrator pair (immutable fixtures): when the
+  // SKILL.md is proven unmodified and removed, the proven recovery.md goes
+  // with it.
   const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
   const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
   await mkdir(join(skillsDir, "orchestrator", "references"), { recursive: true });
   await Promise.all([
-    writeFile(priorOrchestrator, orchestratorHistorical, "utf8"),
-    writeFile(priorRecovery, await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"), "utf8"),
+    writeFile(priorOrchestrator, await historicalFixture("orchestrator/SKILL.md"), "utf8"),
+    writeFile(priorRecovery, await historicalFixture("orchestrator/references/recovery.md"), "utf8"),
   ]);
 
   const result = await runLauncher([], launcherEnv(fixture));
@@ -582,6 +573,30 @@ test("orchestrator recovery reference covers recoverable execution states", asyn
     "user-authorized manual recovery",
     "git merge-base HEAD <baseCommit>",
     "Never run `git reset --hard`",
+    // Failed checkpoint staging (#179): pre-review failure class, in-place
+    // continuation versus mechanical salvage, and the sample instruction
+    // contract with its explicit prohibitions.
+    "## Recover a failed checkpoint staging",
+    "Staging happens \\*\\*before review of that turn\\*\\*",
+    "the task stops at the checkpointing stage with no newly verified candidate",
+    "No recovery step may claim to have read or restored hidden model state",
+    "`SubtasksContinue` with explicit `inPlace: true`",
+    "attempts to finish a stopped execute task in its exact retained worktree",
+    "A `failed_critical` state is",
+    "session is genuinely available; otherwise a fresh turn sees the retained",
+    "transfers the identified retained work into main for manual inspection",
+    "It never asserts review success,",
+    "it never replaces inspecting main afterward",
+    "### Sample task instructions for checkpoint-sensitive work",
+    "Treat everything you did not create as unknown",
+    "positively identify as a disposable artifact this task created",
+    "Do not run blanket `git clean`, `git reset --hard`, or any branch checkout in",
+    "Then finish only the remaining requested work; do not redo completed parts.",
+    "Run the validation that actually covers your change before reporting it.",
+    "recheck ownership before each removal and report any file whose ownership is",
+    "and never delete unknown or user-owned files.",
+    "Do not claim recovered hidden model state",
+    "failed checkpoint staging has its own runbook below",
   ]) assert.match(recovery, new RegExp(phrase));
 });
 

@@ -120,7 +120,7 @@ function toolDescription(action: Action): string {
     case "watch":
       return "Request one future one-shot checkpoint if an execution is still active after a specified duration.";
     case "continue":
-      return "Continue a stopped background subtask from its verified checkpoint, optionally using an explicit reattachment bundle.";
+      return "Continue a stopped background subtask from its verified checkpoint, optionally using an explicit reattachment bundle. Explicit inPlace: true instead continues a stopped execute task without a verified checkpoint in its exact retained worktree.";
     case "steer":
       return "Give new authoritative instructions to a queued, running, or reviewing background subtask.";
     case "interrupt":
@@ -182,6 +182,8 @@ interface NormalizedInput {
   interruptMode?: "interrupt_as_failure" | "interrupt_with_merge";
   /** Steer only: interrupt the active executor turn before delivery (issue #63). */
   interrupt?: boolean;
+  /** Continue only (#179): explicit same-worktree continuation without a verified checkpoint. */
+  inPlace?: boolean;
   mergeAnyhow?: boolean;
   offset?: number;
   lines?: number;
@@ -710,6 +712,7 @@ export class ExecutionToolManager {
             instructions: normalized.instructions!,
             instructionId,
             actor: "model",
+            ...(normalized.inPlace === true ? { inPlace: true } : {}),
           });
           return backgroundResult("continue", inspection, false);
         }
@@ -960,6 +963,10 @@ function toolSchema(action: Action): Record<string, unknown> {
       properties.bundle = reattachmentSchema();
       properties.instructions = instructions;
       properties.instructionId = instructionId;
+      properties.inPlace = {
+        type: "boolean",
+        description: "Optional, execute tasks only. When true, continue a stopped task that has no verified checkpoint (for example after checkpoint staging failed) in exactly its retained managed worktree, without recreating, resetting, or cleaning it. Refused when the folder is missing or unsafe, a writer may be live, landing recovery or a conflict gate is outstanding, or the task failed critically for a reason other than checkpointing. A changed successful result still needs a verified candidate, configured subtask review if enabled, and ordinary landing gates. Omitted or false keeps strict checkpoint-verified continuation.",
+      };
       required.push("instructions");
       break;
     case "steer":
@@ -1061,6 +1068,10 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     if (typeof value.interrupt !== "boolean") throw new Error("interrupt must be boolean");
     normalized.interrupt = value.interrupt;
   }
+  if (value.inPlace !== undefined) {
+    if (typeof value.inPlace !== "boolean") throw new Error("inPlace must be boolean");
+    normalized.inPlace = value.inPlace;
+  }
   if (value.evidence !== undefined) {
     normalized.evidence = normalizeEvidenceSelector(value.evidence);
     if (normalized.offset !== undefined || normalized.lines !== undefined) {
@@ -1088,7 +1099,7 @@ function allowedKeys(action: Action): Set<string> {
     case "add": return new Set(["executionId", "tasks"]);
     case "inspect": return new Set(["executionId", "taskId", "offset", "lines", "evidence"]);
     case "watch": return new Set(["executionId", "after"]);
-    case "continue": return new Set(["executionId", "taskId", "bundle", "instructions", "instructionId"]);
+    case "continue": return new Set(["executionId", "taskId", "bundle", "instructions", "instructionId", "inPlace"]);
     case "steer": return new Set(["executionId", "taskId", "instructions", "instructionId", "interrupt"]);
     case "interrupt": return new Set(["executionId", "taskId", "interruptMode", "instructionId"]);
     case "force_merge": return new Set(["executionId", "taskId", "mergeAnyhow", "instructionId"]);

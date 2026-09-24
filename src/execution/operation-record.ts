@@ -93,6 +93,12 @@ export interface OperationInstruction {
   sequence: number;
   action: "continue" | "steer";
   text: string;
+  /**
+   * #179: continue only. The one durable operation-level record that this
+   * instruction explicitly opted into same-worktree continuation without a
+   * verified checkpoint. Absent means the strict checkpoint-verified default.
+   */
+  inPlace?: true;
   status: "queued" | "delivered" | "acknowledged" | "failed";
   createdAt: string;
   deliveredAt?: string;

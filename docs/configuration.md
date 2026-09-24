@@ -420,8 +420,9 @@ than from any fire-time computation:
 Entries are created and edited under **Scheduled tasks** in `/review-settings`,
 staged like every other section behind **Save changes** / **Cancel**. Save
 validates every entry (a real cron expression, non-empty instructions, an
-existing workspace directory — a leading `~`/`~/...` is expanded against the
-user's home before that check — a resolvable worker override, and a task-local
+existing workspace directory — relative paths are checked against the session
+working directory and a leading `~`/`~/...` is expanded against the user's
+home before that check — a resolvable worker override, and a task-local
 reviewer set that resolves like any global one) and persists the catalog while
 preserving unrelated JSON keys. A tilde workspace entered in the editor or
 hand-edited into the config file is persisted in its expanded absolute form on
@@ -835,12 +836,23 @@ values such as scheduled-task instructions. Cancel leaves the staged value
 unchanged. Hosts without an editor keep the previous single-line input with its
 placeholder semantics, and a host offering neither seam reports an error instead
 of staging anything. In the interactive Pi TUI, the scheduled-task **workspace**
-field additionally embeds the host's own editor with directory-only Tab
-completion: only `/...` and `~`/`~/...` tokens complete, suggestions are existing
-directories only (symlinks to directories count), `~/...` spellings stay
-displayed while expansion happens only for filesystem lookup, and Enter submits
-the editor's own text. Completion is a convenience — Save still validates the
-workspace and rejects nonexistent or non-directory targets. The cron field shows
+field additionally embeds the host's own editor with Pi's native path
+completion: typing a relative or `~/...` path and pressing Tab opens the
+host's own selectable list (a single match is applied directly, exactly as in
+the chat editor) — for example, `docs/` + first Tab lists the
+folders *and* files under it — navigated with the host's standard selection
+keys. Token recognition, relative/`~`/absolute handling, platform behavior,
+the list UI, and selection keys are inherited from the host as-is, so no
+universal absolute-path or Windows support is claimed: a line starting with
+`/` remains the host editor's slash-command context, and completion there
+follows the host chat editor's own behavior. Enter submits the editor's own
+text; Esc first dismisses a visible completion list, then cancels the field.
+Hosts without the host editor or its native provider (or without working
+public completion seams) keep the public editor prefill above, then the legacy
+single-line input. Completion is a convenience — Save validates the workspace
+against the same session working directory used for relative completion and
+dispatch, and rejects nonexistent or non-directory targets, including a file
+selected from the list. The cron field shows
 a compact heading above its editable prefilled text mapping all five fields in
 order (minute, hour, day-of-month, month, day-of-week), stating machine-local
 time and `* * * * * = every minute`.

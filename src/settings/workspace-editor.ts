@@ -8,38 +8,37 @@
  * — created through the shared host-agnostic adapter (src/host-editor.ts,
  * issue #185) and loaded with the shared peer loader
  * (src/host-peer-loader.ts, issue #185) — prefilled with the currently staged
- * workspace, plus a minimal directory-only Tab autocomplete provider attached
- * through the editor's public `setAutocompleteProvider` seam:
+ * workspace, plus Pi's own native path completion:
  *
- * - Only `/...`, bare `~`, and `~/...` tokens complete; anything else —
- *   including `~user` and relative spellings — leaves Tab alone and is never
- *   anchored against an arbitrary cwd.
- * - Suggestions are existing directories only (symlinks to directories
- *   count); the `~/...` spelling the user typed is preserved in the displayed
- *   suggestions at every depth, root-parented listings stay absolute, and
- *   expansion happens only for filesystem lookup.
- * - Completion replaces exactly the token before the cursor and leaves the
- *   cursor after the inserted path; a directory carries a trailing `/` so a
- *   following Tab descends into it (the host's file-completion convention).
+ * - The host module's `CombinedAutocompleteProvider` is constructed with no
+ *   slash commands and the actual host session cwd carried on the command
+ *   context (`ctx.cwd`) as its base path, then attached through the editor's
+ *   public `setAutocompleteProvider` seam. This extension carries no
+ *   completion algorithm of its own: token recognition, relative/`~`/absolute
+ *   handling, platform behavior, the selectable list UI, and selection keys
+ *   are all inherited from Pi as-is — including its limitations (a line that
+ *   starts with `/` is the host editor's slash-command context, so absolute
+ *   paths complete only where the host's own chat editor does; files appear
+ *   in the list alongside directories).
  * - The editor is the single source of truth for the draft: this component
  *   never stores or copies text, and submit resolves with the editor's own
- *   expanded, trimmed output. Esc cancels (`undefined` — the staged value is
- *   unchanged); Enter submits.
+ *   expanded, trimmed output. Esc first lets the host editor dismiss a
+ *   visible native completion list (its public `isShowingAutocomplete`
+ *   seam); only with no list visible does it cancel (`undefined` — the
+ *   staged value is unchanged). Enter submits.
+ * - Save-time validation is unchanged: an entered path that is not an
+ *   existing directory is rejected at Save, so selecting a file from the
+ *   completion list cannot bypass the workspace-directory boundary.
  *
- * Everywhere else — no `custom` (RPC/print), host module unloadable, no
- * Editor class, no terminal geometry — the field degrades to the shared text
+ * Everywhere else — no `custom` (RPC/print), host module unloadable, missing
+ * Editor or CombinedAutocompleteProvider class, no terminal geometry, or no
+ * session cwd on the command context — the field degrades to the shared text
  * seam (src/settings/text-input.ts): public `ui.editor` prefill first, then
  * the legacy `ui.input`. Host loading failures fail closed into that chain;
- * they never surface as a broken menu or a second draft. Validation and the
- * Save path are unchanged: an entered directory that does not exist is still
- * rejected at Save, so completion can never silently accept an invalid
- * directory. No private Pi member (e.g. ExtensionEditorComponent's internal
- * editor) is touched; the provider attaches through public surface only.
+ * they never surface as a broken menu or a second draft. No private Pi member
+ * is touched; both surfaces attach through public seams only.
  */
 
-import { readdir, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
 import {
   createHostEditor,
   pointHostEditorModuleAtLiveKeybindings,
@@ -51,13 +50,11 @@ import type { MenuCustomFactory } from "./menu";
 import { editSettingText, type SettingTextInputUi } from "./text-input";
 
 const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
-/** Bound on one suggestion list; keeps huge directories responsive. */
-const MAX_SUGGESTIONS = 50;
 
 /** Title shared by every surface of this field (custom, editor, input). */
 export const WORKSPACE_EDITOR_TITLE = "Authorized target workspace directory";
 /** Static key hint line under the embedded editor box. */
-export const WORKSPACE_EDITOR_HINT = "Tab completes directories · Enter submits · Esc cancels";
+export const WORKSPACE_EDITOR_HINT = "Tab completes paths · Enter submits · Esc dismisses the list, then cancels";
 
 /** The UI surface this seam needs (host ctx.ui or a structural mock). */
 export interface WorkspaceEditorUi extends SettingTextInputUi {
@@ -65,167 +62,8 @@ export interface WorkspaceEditorUi extends SettingTextInputUi {
   custom?(factory: MenuCustomFactory): Promise<string | undefined>;
   /** Host run mode ("tui" | "rpc" | ...); carried from the command context. */
   mode?: string;
-}
-
-// ---------------------------------------------------------------------------
-// Directory-only Tab autocomplete provider (structural pi-tui contract)
-// ---------------------------------------------------------------------------
-
-export interface DirectoryAutocompleteItem {
-  value: string;
-  label: string;
-  description?: string;
-}
-
-export interface DirectoryAutocompleteSuggestions {
-  items: DirectoryAutocompleteItem[];
-  prefix: string;
-}
-
-/** The structural pi-tui AutocompleteProvider surface this field drives. */
-export interface DirectoryAutocompleteProvider {
-  getSuggestions(
-    lines: string[],
-    cursorLine: number,
-    cursorCol: number,
-    options: { signal: AbortSignal; force?: boolean },
-  ): Promise<DirectoryAutocompleteSuggestions | null>;
-  applyCompletion(
-    lines: string[],
-    cursorLine: number,
-    cursorCol: number,
-    item: DirectoryAutocompleteItem,
-    prefix: string,
-  ): { lines: string[]; cursorLine: number; cursorCol: number };
-  shouldTriggerFileCompletion?(lines: string[], cursorLine: number, cursorCol: number): boolean;
-}
-
-export interface DirectoryAutocompleteProviderOptions {
-  /** Test seam: the home directory used for `~` expansion (default: os.homedir()). */
-  homeDir?: () => string;
-}
-
-/** The path token ending at the cursor on its line, plus where it starts. */
-function pathTokenAt(lines: string[], cursorLine: number, cursorCol: number): { token: string; start: number } {
-  const line = lines[cursorLine] ?? "";
-  const end = Math.min(cursorCol, line.length);
-  let start = end;
-  while (start > 0 && !/\s/.test(line[start - 1]!)) start -= 1;
-  return { token: line.slice(start, end), start };
-}
-
-/**
- * True for the only spellings this field completes: `/...`, bare `~`, and
- * `~/...`. Anything else — including `~user` (which the shared path rule
- * leaves literal) and relative spellings — never completes, so no suggestion
- * can ever be anchored against the process cwd.
- */
-function isCompletableToken(token: string): boolean {
-  return token.startsWith("/") || token === "~" || token.startsWith("~/");
-}
-
-/**
- * Builds the directory-only Tab autocomplete provider. Suggestions are
- * existing directories under the token's parent (or the token itself when it
- * ends in `/`); `~/...` tokens display `~/...` suggestions at every depth,
- * root-parented listings stay absolute, and filesystem lookup uses the
- * expanded spelling only. Any read failure yields no suggestions rather than
- * an error — completion is a convenience, and the Save-time validation remains
- * the authority on what is accepted.
- */
-/**
- * Expands a leading `~`/`~/...` against the provider's own home seam (not
- * os.homedir() directly, so tests can point `~` at a fixture directory).
- */
-function expandTilde(token: string, home: string): string {
-  if (token === "~") return home;
-  if (token.startsWith("~/")) return join(home, token.slice(2));
-  return token;
-}
-
-export function createDirectoryAutocompleteProvider(
-  options: DirectoryAutocompleteProviderOptions = {},
-): DirectoryAutocompleteProvider {
-  const home = (): string => options.homeDir?.() ?? homedir();
-
-  return {
-    async getSuggestions(lines, cursorLine, cursorCol, { signal }) {
-      const { token } = pathTokenAt(lines, cursorLine, cursorCol);
-      if (!isCompletableToken(token)) return null;
-      const expanded = expandTilde(token, home());
-      let base: string;
-      let namePrefix: string;
-      if (expanded === home()) {
-        // `~` or `~/`: list the home directory itself.
-        base = home();
-        namePrefix = "";
-      } else if (expanded === "/" || expanded.endsWith("/")) {
-        // `~/` expands to `${home}/`; normalize so displays never double-slash.
-        base = expanded === "/" ? "/" : expanded.replace(/\/+$/, "");
-        namePrefix = "";
-      } else {
-        base = dirname(expanded);
-        namePrefix = basename(expanded);
-        if (!namePrefix) return null;
-      }
-      let entries;
-      try {
-        entries = await readdir(base, { withFileTypes: true });
-      } catch {
-        // Missing/unreadable parent (including a not-yet-existing final
-        // component): no suggestions, nothing to report.
-        return null;
-      }
-      if (signal.aborted) return null;
-      const items: DirectoryAutocompleteItem[] = [];
-      for (const entry of [...entries].sort((a, b) => a.name.localeCompare(b.name))) {
-        let isDirectory = entry.isDirectory();
-        if (!isDirectory && entry.isSymbolicLink()) {
-          try {
-            isDirectory = (await stat(join(base, entry.name))).isDirectory();
-          } catch {
-            // Broken symlink: not a directory.
-          }
-        }
-        if (!isDirectory) continue;
-        if (namePrefix.length > 0 && !entry.name.startsWith(namePrefix)) continue;
-        // Display on the spelling the user typed: `~`/`~/...` tokens keep the
-        // tilde at every depth (expansion was lookup-only), and root-parented
-        // listings stay absolute — a suggestion must never rewrite an entered
-        // `/...` token into a relative one.
-        const homePath = home();
-        let displayBase: string;
-        if (base === homePath) {
-          displayBase = "~";
-        } else if (token.startsWith("~/") && base.startsWith(`${homePath}/`)) {
-          displayBase = `~${base.slice(homePath.length)}`;
-        } else {
-          displayBase = base;
-        }
-        const display = `${displayBase.endsWith("/") ? displayBase : `${displayBase}/`}${entry.name}/`;
-        items.push({ value: display, label: display });
-        if (items.length >= MAX_SUGGESTIONS) break;
-      }
-      return { items, prefix: token };
-    },
-
-    applyCompletion(lines, cursorLine, cursorCol, item, _prefix) {
-      // Recompute the token from live line state rather than trusting the
-      // passed prefix: the replacement is exactly what precedes the cursor on
-      // that line, whatever the host recorded.
-      const { start } = pathTokenAt(lines, cursorLine, cursorCol);
-      const end = Math.min(cursorCol, (lines[cursorLine] ?? "").length);
-      const line = lines[cursorLine] ?? "";
-      const newLines = [...lines];
-      newLines[cursorLine] = line.slice(0, start) + item.value + line.slice(end);
-      return { lines: newLines, cursorLine, cursorCol: start + item.value.length };
-    },
-
-    shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
-      const { token } = pathTokenAt(lines, cursorLine, cursorCol);
-      return isCompletableToken(token);
-    },
-  };
+  /** The host session's working directory, carried from the command context. */
+  cwd?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -259,9 +97,12 @@ function resolveWorkspaceTuiHost(): Promise<HostEditorProvider | undefined> {
 
 async function loadWorkspaceTuiHost(): Promise<HostEditorProvider | undefined> {
   const mod = await loadHostPeerModule(PI_TUI_PACKAGE_NAME, { entryProvider: hostEntryProvider, packageMainFallback: true });
-  if (!mod || typeof mod.Editor !== "function") return undefined;
+  // Feature-detect both public surfaces on the same host module; without
+  // either one the field degrades to the shared text seam.
+  if (!mod || typeof mod.Editor !== "function" || typeof mod.CombinedAutocompleteProvider !== "function") return undefined;
   const provider: HostEditorProvider = {};
   provider.Editor = mod.Editor as HostEditorProvider["Editor"];
+  provider.CombinedAutocompleteProvider = mod.CombinedAutocompleteProvider as HostEditorProvider["CombinedAutocompleteProvider"];
   if (typeof mod.setKeybindings === "function") {
     provider.setKeybindings = (keybindings) => {
       (mod.setKeybindings as (keybindings: unknown) => void)(keybindings);
@@ -279,11 +120,11 @@ async function loadWorkspaceTuiHost(): Promise<HostEditorProvider | undefined> {
 }
 
 // ---------------------------------------------------------------------------
-// The embedded-editor component (host Editor + directory Tab completion)
+// The embedded-editor component (host Editor + native path completion)
 // ---------------------------------------------------------------------------
 
 export interface WorkspaceEditorComponentOptions {
-  /** The loaded pi-tui host surface (Editor constructor + keybinding wiring). */
+  /** The loaded pi-tui host surface (Editor + CombinedAutocompleteProvider + keybinding wiring). */
   host: HostEditorProvider;
   /** The TUI the host injected into the custom component factory. */
   tui: unknown;
@@ -293,8 +134,8 @@ export interface WorkspaceEditorComponentOptions {
   keybindings: unknown;
   /** The currently staged workspace, prefilled and editable. */
   current: string;
-  /** Directory provider override (tests); a default one is built otherwise. */
-  provider?: DirectoryAutocompleteProvider;
+  /** The host session's working directory anchoring native path completion. */
+  cwd: string;
   done: (value: string | undefined) => void;
 }
 
@@ -315,23 +156,36 @@ export interface WorkspaceEditorComponent {
 export function createWorkspaceEditorComponent(
   options: WorkspaceEditorComponentOptions,
 ): WorkspaceEditorComponent | undefined {
+  // Pi's own native path completion: no slash commands, anchored to the host
+  // session cwd. Relative/~/absolute handling, list UI, and selection keys
+  // are all inherited from the host as-is. The provider class is part of the
+  // feature-detect contract (see loadWorkspaceTuiHost): without it — or a
+  // failing construction — the field degrades like any other missing surface.
+  const ProviderCtor = options.host.CombinedAutocompleteProvider;
+  if (typeof ProviderCtor !== "function") return undefined;
+  let provider: unknown;
+  try {
+    provider = new ProviderCtor([], options.cwd);
+  } catch {
+    return undefined;
+  }
   const editor = createHostEditor(options.host, options.tui, options.theme);
-  if (!editor) return undefined;
+  if (!editor || typeof editor.setAutocompleteProvider !== "function" || typeof editor.isShowingAutocomplete !== "function") {
+    return undefined;
+  }
+  try {
+    editor.setAutocompleteProvider(provider);
+  } catch {
+    // Without an attached native provider, use the public editor fallback
+    // rather than presenting a custom field that silently lacks completion.
+    return undefined;
+  }
   // Point the standalone pi-tui module's global keybinding state at the live
   // manager (same strategy as src/settings/menu.ts and the question UI), then
   // resolve the effective manager for this component's own cancel handling.
   pointHostEditorModuleAtLiveKeybindings(options.host, options.keybindings);
   const keybindings = resolveLiveKeybindings(options.keybindings, options.host);
   if (options.current) editor.setText(options.current);
-  const provider = options.provider ?? createDirectoryAutocompleteProvider();
-  if (typeof editor.setAutocompleteProvider === "function") {
-    try {
-      editor.setAutocompleteProvider(provider);
-    } catch {
-      // A failing attach leaves the editor without completion — still a fully
-      // editable field; nothing is invented to paper over it.
-    }
-  }
   let focused = false;
   let settled = false;
   const finish = (value: string | undefined): void => {
@@ -355,9 +209,13 @@ export function createWorkspaceEditorComponent(
     },
     handleInput(data: string): void {
       if (settled) return;
-      // Esc / Ctrl+C cancel before the editor sees them (the host app would
-      // otherwise treat Escape as abort); everything else is the editor's.
+      // Esc / Ctrl+C: let the host editor dismiss a visible native completion
+      // list first; only with no list visible does it cancel this field.
       if (keybindings.matches(data, "tui.select.cancel")) {
+        if (typeof editor.isShowingAutocomplete === "function" && editor.isShowingAutocomplete()) {
+          editor.handleInput(data);
+          return;
+        }
         finish(undefined);
         return;
       }
@@ -375,8 +233,9 @@ export function createWorkspaceEditorComponent(
 
 /**
  * Edits the staged workspace directory for one scheduled task. In an
- * interactive TUI with a loadable host Editor, embeds that editor with
- * directory Tab completion; otherwise degrades through the shared text seam
+ * interactive TUI with a loadable host Editor and CombinedAutocompleteProvider
+ * (and a session cwd on the command context), embeds that editor with Pi's
+ * native path completion; otherwise degrades through the shared text seam
  * (public `ui.editor` prefill, then legacy `ui.input`). Resolves `undefined`
  * on cancel — the staged value is left unchanged.
  */
@@ -384,14 +243,15 @@ export async function editWorkspaceDirectory(
   ui: WorkspaceEditorUi,
   current: string,
 ): Promise<string | undefined> {
-  if (ui.mode === "tui" && typeof ui.custom === "function") {
+  const cwd = typeof ui.cwd === "string" && ui.cwd.length > 0 ? ui.cwd : undefined;
+  if (ui.mode === "tui" && typeof ui.custom === "function" && cwd !== undefined) {
     // Resolution must stay fail-safe at the call site: any loader failure
     // degrades to the shared text seam instead of breaking the menu.
     const host = await resolveWorkspaceTuiHost().catch(() => undefined);
     if (host) {
       try {
         return await ui.custom((tui, theme, keybindings, done) => {
-          const component = createWorkspaceEditorComponent({ host, tui, theme, keybindings, current, done });
+          const component = createWorkspaceEditorComponent({ host, tui, theme, keybindings, current, cwd, done });
           // No usable editor surface: throw so the host closes the custom
           // slot and we degrade to the public path below.
           if (!component) throw new Error("host editor unavailable");
@@ -430,6 +290,7 @@ function toStyledTheme(theme: unknown): StyledTheme {
       try {
         return String((theme.bold as (text: string) => unknown)(text));
       } catch {
+        // Unknown color in a non-standard theme; plain text keeps the line.
         return text;
       }
     }

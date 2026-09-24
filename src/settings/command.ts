@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { delimiter, isAbsolute, join } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import {
   BROWSER_PERMISSION_FIELDS,
   DEFAULT_BROWSER_PERMISSIONS,
@@ -86,6 +86,8 @@ interface UiContext {
   custom?(factory: MenuCustomFactory): Promise<string | undefined>;
   /** Host run mode ("tui" | "rpc" | ...); carried from the command context. */
   mode?: string;
+  /** The host session's working directory, carried from the command context. */
+  cwd?: string;
 }
 
 export function registerReviewSettings(input: RegisterSettingsInput): void {
@@ -370,7 +372,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
     scheduledTasks = expandScheduledTaskWorkspaces(scheduledTasks);
     const error = (await validateSelection(workerResources, primaryReviewers, input.config, input.scoped, executeRoute, researchRoute))
       ?? (await validateSelection(workerResources, subtaskReviewers, input.config, input.scoped, executeRoute, researchRoute))
-      ?? (await validateScheduledTasks(scheduledTasks, workerResources, input.config, input.scoped));
+      ?? (await validateScheduledTasks(scheduledTasks, workerResources, input.config, input.scoped, input.ui.cwd));
     if (error) {
       await notify(input.ui, error, "error");
       continue;
@@ -936,8 +938,9 @@ async function editScheduledTaskEntry(
     }
     if (choice === "workspace") {
       // The one field with a bespoke surface: an embedded host editor with
-      // directory Tab completion when the interactive TUI offers it, then the
-      // public editor prefill, then the legacy input (issue #26).
+      // Pi's native path completion anchored to the session cwd when the
+      // interactive TUI offers it, then the public editor prefill, then the
+      // legacy input (issue #26).
       const entered = await editWorkspaceDirectory(ui, entry.workspace);
       if (entered === undefined) continue;
       if (!entered.trim()) {
@@ -1086,6 +1089,7 @@ async function validateScheduledTasks(
   workerResources: WorkerResourceCatalog,
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
+  sessionCwd?: string,
 ): Promise<string | undefined> {
   for (const [id, entry] of Object.entries(catalog)) {
     if (!entry.name.trim()) return `Scheduled task ${id} has no name`;
@@ -1095,8 +1099,12 @@ async function validateScheduledTasks(
       return error instanceof Error ? error.message : String(error);
     }
     if (!entry.instructions.trim()) return `Scheduled task ${id} has no instructions`;
-    if (!entry.workspace.trim()) return `Scheduled task ${id} has no workspace`;
-    if (!await directoryExists(entry.workspace.trim())) {
+    const workspace = entry.workspace.trim();
+    if (!workspace) return `Scheduled task ${id} has no workspace`;
+    // Pi's native completion and the eventual subtask start both anchor
+    // relative paths to this session cwd, not the extension process cwd.
+    const candidate = sessionCwd && !isAbsolute(workspace) ? resolve(sessionCwd, workspace) : workspace;
+    if (!await directoryExists(candidate)) {
       return `Scheduled task ${id} workspace is not an existing directory: ${entry.workspace}`;
     }
     if (entry.workerResourceId !== undefined) {
@@ -2101,6 +2109,9 @@ function extractUi(ctx: unknown): UiContext | undefined {
   // components (issue #140).
   const ui = Object.create(ctx.ui) as UiContext;
   if (typeof ctx.mode === "string") ui.mode = ctx.mode;
+  // The session cwd anchors the workspace field's native path completion
+  // against the host's own working directory, never process.cwd (issue #26).
+  if (typeof ctx.cwd === "string") ui.cwd = ctx.cwd;
   return ui;
 }
 

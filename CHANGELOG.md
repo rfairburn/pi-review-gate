@@ -49,17 +49,28 @@ dates.
   with an error notice instead of silently staging nothing. The scheduled-task
   workspace field additionally embeds the host's own editor in the interactive
   TUI (host-provided pi-tui through the shared peer loader; no private Pi
-  member) with a minimal directory-only Tab completion: only `/...` and `~`/
-  `~/...` tokens complete, suggestions are existing directories only (symlinks
-  to directories count), `~/...` spellings stay displayed while expansion
-  happens only for filesystem lookup, and the editor remains the single draft.
-  Completion is a convenience — Save-time validation still rejects nonexistent
-  or non-directory workspaces. The cron field shows a compact heading above the
+  member) with Pi's native path completion instead of a bespoke one: the host
+  module's own `CombinedAutocompleteProvider` is attached through the public
+  editor seam, anchored to the session working directory, so typing a relative
+  or `~/...` path and pressing Tab opens the host's own selectable list (a
+  single match is applied directly, exactly as in the chat editor) — `docs/`
+  + first Tab lists the folders *and* files under it — navigated with
+  the host's standard selection keys. Token recognition, relative/`~`/absolute
+  handling, platform behavior, the list UI, and selection keys are inherited
+  from the host as-is (a line starting with `/` remains the host editor's
+  slash-command context, so no universal absolute-path or Windows support is
+  claimed), and the editor remains the single draft. Esc first dismisses a
+  visible completion list, then cancels the field; hosts without the host
+  editor or its native provider (or without working public completion seams)
+  fall back to the public editor prefill above, then the legacy input.
+  Completion is a convenience — Save checks relative workspaces against the
+  session working directory, matching completion and dispatch, and still
+  rejects nonexistent or non-directory targets, including a file selected
+  from the list. The cron field shows a compact heading above the
   editable prefilled text mapping all five fields in order (minute, hour,
   day-of-month, month, day-of-week), stating machine-local time and
   `* * * * * = every minute`. No scheduler policy change: grammar, dispatch,
-  no-catch-up, overlap handling, choices and toggles, and validation are
-  unchanged.
+  no-catch-up, overlap handling, choices and toggles are unchanged.
 
 ## [0.1.0-dev.80]
 

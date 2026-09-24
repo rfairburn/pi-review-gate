@@ -74,6 +74,12 @@ export interface HostEditor {
    * completion, and the embedding field stays fully editable.
    */
   setAutocompleteProvider?(provider: unknown): void;
+  /**
+   * Public pi-tui Editor seam reporting whether the native completion list is
+   * currently visible. Embedding components use it to let the editor dismiss
+   * a visible list on Esc before treating the same key as cancel.
+   */
+  isShowingAutocomplete?(): boolean;
 }
 
 /**
@@ -84,6 +90,12 @@ export interface HostEditor {
 export interface HostEditorProvider {
   /** The pi-tui Editor class (host chat editor), when the module exposes it. */
   Editor?: new (tui: unknown, theme: HostEditorTheme) => HostEditor;
+  /**
+   * The pi-tui CombinedAutocompleteProvider class (native path completion),
+   * when the module exposes it. Consumers only ever construct it with an
+   * empty slash-command list and a base path; the host class may accept more.
+   */
+  CombinedAutocompleteProvider?: new (commands: never[], basePath: string) => unknown;
   /** The loaded module's public setKeybindings(); see pointHostEditorModuleAtLiveKeybindings. */
   setKeybindings?(keybindings: unknown): void;
   /** The module-global KeybindingsManager (default resolution). */

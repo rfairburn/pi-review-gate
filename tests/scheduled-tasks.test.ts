@@ -489,11 +489,13 @@ function commandHarness(): {
 function contextWithSelections(
   values: Array<string | undefined>,
   inputs: Array<string | undefined> = [],
+  cwd?: string,
 ): unknown {
   let index = 0;
   let inputIndex = 0;
   return {
     scopedModels: [],
+    ...(cwd !== undefined ? { cwd } : {}),
     ui: {
       async select(title: string, options: string[]) {
         const value = values[index++];
@@ -606,6 +608,41 @@ test("/review-settings creates a scheduled task entry and saves it with staged s
     review: { mode: "off" },
   });
   assert.deepEqual(saved.customFutureKey, { keep: true });
+});
+
+test("/review-settings validates a relative completed workspace against the session cwd", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-session-cwd-"));
+  const relativeWorkspace = "only-under-this-session";
+  const configPath = join(dir, "review-gate.json");
+  await mkdir(join(dir, relativeWorkspace));
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { primaryReviewers: [], subtaskReviewers: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  try {
+    await registered.handler("", contextWithSelections([
+      rootSettingsRow("Scheduled tasks", "None"),
+      "Add scheduled task",
+      scheduledEditorRow("Schedule (cron)", "(not set)"),
+      scheduledEditorRow("Instructions", "(not set)"),
+      scheduledEditorRow("Workspace", "(not set)"),
+      "Back",
+      "Back",
+      "Save changes",
+    ], [
+      "Session-local docs check", "30 2 * * *", "Check docs", relativeWorkspace,
+    ], dir));
+
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    const ids = Object.keys(saved.scheduledTasks);
+    assert.equal(ids.length, 1, "Save accepts a directory in the session cwd even when the process cwd differs");
+    assert.equal(saved.scheduledTasks[ids[0]!].workspace, relativeWorkspace, "the relative spelling is retained for runtime resolution");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("/review-settings stages edits to an existing scheduled task and preserves its identity", async () => {

@@ -1,34 +1,41 @@
 /**
- * Issue #26: the scheduled-task workspace directory field.
+ * Issue #26: the scheduled-task workspace directory field (native Pi path
+ * completion).
  *
  * Pins the one bespoke settings surface: in an interactive TUI where the host
- * pi-tui `Editor` is embeddable, the field shows that editor — created via the
- * shared host-agnostic adapter and peer loader — prefilled with the staged
- * workspace, with a minimal directory-only Tab autocomplete provider attached
- * through the public `setAutocompleteProvider` seam:
+ * pi-tui `Editor` can be embedded, the field shows that editor — created via
+ * the shared host-agnostic adapter and peer loader — prefilled with the staged
+ * workspace, with the host module's own
+ * `CombinedAutocompleteProvider([], sessionCwd)` attached through the public
+ * `setAutocompleteProvider` seam. The extension carries no completion algorithm
+ * of its own: token recognition, relative/`~`/absolute handling, platform
+ * behavior, the selectable list UI, and selection keys are all inherited from
+ * Pi as-is — including its limitations (a line starting with `/` is the host
+ * editor's slash-command context, so absolute paths complete only where the
+ * host's own chat editor does; files appear in the list alongside directories).
  *
- * - Only `/...` and `~`/`~/...` tokens complete; directories only (symlinks
- *   to directories count, files and broken links never); `~/` stays displayed
- *   while expansion happens only for filesystem lookup.
  * - The editor is the single draft: prefill via setText, submit resolves with
- *   the editor's own text, Esc cancels, exactly one settle.
- * - No usable custom surface (no Editor class, no terminal geometry, no
- *   `custom` at all) degrades to the public `ui.editor` prefill, then the
- *   legacy `ui.input`; host-load failures fail closed into that chain.
+ *   the editor's own text, Esc first dismisses a visible native completion
+ *   list (the public `isShowingAutocomplete` seam) and only then cancels,
+ *   exactly one settle.
+ * - No usable custom surface (no Editor or CombinedAutocompleteProvider
+ *   class, no terminal geometry, no session cwd, no `custom` at all) degrades
+ *   to the public `ui.editor` prefill, then the legacy `ui.input`; host-load
+ *   failures fail closed into that chain. No process.cwd anchor is invented.
  * - Invalid directories are not silently accepted: completion is a
- *   convenience and Save-time validation remains the authority.
+ *   convenience and Save-time validation remains the authority — selecting a
+ *   file from the list cannot bypass the workspace-directory boundary.
  *
- * Real-host tests drive the installed Pi's actual pi-tui Editor (skipped when
- * the peer is unresolvable in this environment). They verify Tab completion
- * of real directories, including `~/` display preservation. What they cannot
- * verify headlessly: a human watching the box render, and Ctrl+G external
- * editing — that control belongs to the host's own editor surface (the public
- * `ui.editor` path for ordinary fields), asserted at the seam level in
- * settings-text-fields.test.ts.
+ * Real-host tests drive the installed Pi's actual pi-tui Editor and
+ * CombinedAutocompleteProvider (skipped when the peer is unresolvable in this
+ * environment). What they cannot verify headlessly: a human watching the box
+ * render, and Ctrl+G external editing — that control belongs to the host's own
+ * editor surface (the public `ui.editor` path for ordinary fields), asserted
+ * at the seam level in settings-text-fields.test.ts.
  */
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -36,121 +43,35 @@ import type { HostEditorProvider } from "../src/host-editor";
 import { registerReviewSettings } from "../src/settings/command";
 import { setMenuTuiHost } from "../src/settings/menu";
 import {
-  createDirectoryAutocompleteProvider,
   createWorkspaceEditorComponent,
   editWorkspaceDirectory,
   setWorkspaceEditorTuiHost,
   WORKSPACE_EDITOR_HINT,
   WORKSPACE_EDITOR_TITLE,
 } from "../src/settings/workspace-editor";
-import { createFakeMenuTuiHost, IDENTITY_THEME, KEY_DOWN, KEY_ENTER, loadRealPiTuiModule } from "./menu-tui-fakes";
+import {
+  createFakeMenuTuiHost,
+  IDENTITY_THEME,
+  KEY_DOWN,
+  KEY_ENTER,
+  loadRealPiTuiModule,
+} from "./menu-tui-fakes";
 
 const GEOMETRY_TUI = { terminal: { rows: 40 }, requestRender(): void {} };
-const signal = (): AbortSignal => new AbortController().signal;
+
 async function settle(ms = 25): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---------------------------------------------------------------------------
-// Provider unit tests (real temp directories; `~` via the homeDir seam)
-// ---------------------------------------------------------------------------
-
-test("directory provider completes only existing directories for / and ~ tokens", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-ws-prov-"));
-  const home = join(root, "home");
-  await mkdir(join(home, "beta", "inner"), { recursive: true });
-  await mkdir(join(home, "berlin"), { recursive: true });
-  await mkdir(join(root, "alpha"), { recursive: true });
-  await mkdir(join(root, "gamma", "inner"), { recursive: true });
-  await writeFile(join(root, "file.txt"), "");
-  await symlink(join(root, "alpha"), join(root, "link-to-alpha"));
-  await symlink("no-such-target-anywhere", join(root, "broken"));
-
-  const provider = createDirectoryAutocompleteProvider({ homeDir: () => home });
-  const values = (result: Awaited<ReturnType<typeof provider.getSuggestions>>): string[] | null =>
-    result ? result.items.map((item) => item.value) : null;
-
-  // Absolute token: prefix-filtered, directories only, trailing slash.
-  assert.deepEqual(values(await provider.getSuggestions([`${root}/a`], 0, `${root}/a`.length, { signal: signal() })), [`${root}/alpha/`]);
-
-  // Directory listing at the token's parent: symlinks to directories count;
-  // files and broken links never do.
-  assert.deepEqual(values(await provider.getSuggestions([`${root}/`], 0, `${root}/`.length, { signal: signal() })), [
-    `${root}/alpha/`,
-    `${root}/gamma/`,
-    `${root}/home/`,
-    `${root}/link-to-alpha/`,
-  ]);
-
-  // `~/...` keeps the user's spelling in the suggestions; lookup expands.
-  assert.deepEqual(values(await provider.getSuggestions(["~/be"], 0, 4, { signal: signal() })), ["~/berlin/", "~/beta/"]);
-  assert.equal((await provider.getSuggestions(["~/be"], 0, 4, { signal: signal() }))?.prefix, "~/be");
-
-  // Bare `~` and `~/` list the home directory; no doubled slashes.
-  assert.deepEqual(values(await provider.getSuggestions(["~"], 0, 1, { signal: signal() })), ["~/berlin/", "~/beta/"]);
-  assert.deepEqual(values(await provider.getSuggestions(["~/"], 0, 2, { signal: signal() })), ["~/berlin/", "~/beta/"]);
-
-  // Nested `~/...` keeps the tilde spelling at every depth, not just level 1.
-  assert.deepEqual(values(await provider.getSuggestions(["~/beta/i"], 0, 8, { signal: signal() })), ["~/beta/inner/"]);
-
-  // Root-parented tokens stay absolute: a suggestion must never rewrite an
-  // entered `/...` token into a relative one (e.g. /Users + Tab → Users/).
-  const rootItems = await provider.getSuggestions(["/"], 0, 1, { signal: signal() });
-  assert.ok(rootItems && rootItems.items.length > 0, "the filesystem root yields directory suggestions");
-  assert.ok(
-    rootItems!.items.every((item) => item.value.startsWith("/")),
-    `root-parented suggestions stay absolute: ${JSON.stringify(rootItems!.items.slice(0, 3))}`,
-  );
-
-  // A prefixed root token (first letter of a real root-level directory) filters
-  // but still yields only absolute spellings.
-  const realRootDirs = (await readdir("/", { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
-  assert.ok(realRootDirs.length > 0, "the filesystem root has directories");
-  const prefix = realRootDirs[0]!.charAt(0);
-  const prefixedRoot = await provider.getSuggestions([`/${prefix}`], 0, `${prefix}`.length + 1, { signal: signal() });
-  assert.ok(prefixedRoot, `prefixed root token yields suggestions: /${prefix}`);
-  assert.ok(
-    prefixedRoot!.items.every((item) => item.value.startsWith("/")),
-    `prefixed root-parented suggestions stay absolute: ${JSON.stringify(prefixedRoot!.items.slice(0, 3))}`,
-  );
-
-  // Non-path tokens are never completed (no cwd anchoring for relatives).
-  assert.equal(await provider.getSuggestions(["hello world"], 0, 11, { signal: signal() }), null);
-  assert.equal(await provider.getSuggestions(["relative/dir"], 0, 14, { signal: signal() }), null);
-  assert.equal(await provider.getSuggestions([""], 0, 0, { signal: signal() }), null);
-
-  // `~user`-style spellings are not completable: the shared path rule leaves
-  // them literal, so they must never anchor a readdir at the process cwd.
-  assert.equal(await provider.getSuggestions(["~user"], 0, 5, { signal: signal() }), null);
-  assert.equal(provider.shouldTriggerFileCompletion?.(["~user"], 0, 5), false);
-
-  // A missing parent yields no suggestions; nothing is invented.
-  assert.equal(await provider.getSuggestions([`${root}/missing/sub`], 0, `${root}/missing/sub`.length, { signal: signal() }), null);
-
-  // The editor's file-completion trigger flag follows the same token rule.
-  assert.equal(provider.shouldTriggerFileCompletion?.(["/x"], 0, 2), true);
-  assert.equal(provider.shouldTriggerFileCompletion?.(["~/x"], 0, 3), true);
-  assert.equal(provider.shouldTriggerFileCompletion?.(["plain"], 0, 5), false);
-});
-
-test("directory provider applyCompletion replaces exactly the token before the cursor", () => {
-  const provider = createDirectoryAutocompleteProvider();
-  const item = { value: "/opt/tools/", label: "/opt/tools/" };
-  const line = "/opt/to rest";
-  const col = "/opt/to".length;
-
-  const out = provider.applyCompletion([line], 0, col, item, "/opt/to");
-  assert.deepEqual(out.lines, ["/opt/tools/ rest"]);
-  assert.equal(out.cursorCol, "/opt/tools/".length);
-  assert.equal(out.cursorLine, 0);
-
-  // Other lines are untouched.
-  const out2 = provider.applyCompletion(["keep", line], 1, col, item, "/opt/to");
-  assert.deepEqual(out2.lines, ["keep", "/opt/tools/ rest"]);
-});
+/** A minimal live-manager stand-in whose cancel binding matches Esc/Ctrl+C. */
+const CANCEL_MANAGER = {
+  matches(data: string, keybinding: string): boolean {
+    return keybinding === "tui.select.cancel" && (data === "\x1b" || data === "\x03");
+  },
+};
 
 // ---------------------------------------------------------------------------
-// Component tests with a fake host editor (deterministic settle semantics)
+// Fake host (wiring only — never a reimplementation of Pi completion)
 // ---------------------------------------------------------------------------
 
 interface FakeWorkspaceEditor {
@@ -158,21 +79,33 @@ interface FakeWorkspaceEditor {
   onSubmit?: (text: string) => void;
   text: string;
   provider?: unknown;
-  setText(text: string): void;
-  getExpandedText(): string;
-  handleInput(data: string): void;
-  render(width: number): string[];
-  invalidate(): void;
-  setAutocompleteProvider(provider: unknown): void;
+  /** Test-controlled visibility of the native completion list (Esc seam). */
+  showingAutocomplete: boolean;
+  received: string[];
 }
 
-function fakeHostWithEditor(): { host: HostEditorProvider; instances: FakeWorkspaceEditor[] } {
+interface FakeNativeProvider {
+  commands: unknown[];
+  basePath: string;
+}
+
+/**
+ * Structural stand-ins for the host module's two public classes. They record
+ * construction arguments and the attached provider so the wiring (public
+ * seams, session-cwd anchor) is verifiable without a loadable peer; they do
+ * not reimplement Pi completion behavior — that is exercised against the real
+ * host in the integration tests below.
+ */
+function fakeHostWithEditor(): { host: HostEditorProvider; instances: FakeWorkspaceEditor[]; providers: FakeNativeProvider[] } {
   const instances: FakeWorkspaceEditor[] = [];
+  const providers: FakeNativeProvider[] = [];
   class Editor implements FakeWorkspaceEditor {
     focused = false;
     onSubmit?: (text: string) => void;
     text = "";
     provider?: unknown;
+    showingAutocomplete = false;
+    received: string[] = [];
     constructor(_tui: unknown, _theme: unknown) {
       instances.push(this);
     }
@@ -183,6 +116,7 @@ function fakeHostWithEditor(): { host: HostEditorProvider; instances: FakeWorksp
       return this.text;
     }
     handleInput(data: string): void {
+      this.received.push(data);
       if (data === "\x15") {
         this.text = ""; // ctrl+u: delete to line start (single-line editor)
       } else if (data === "\r") {
@@ -200,19 +134,24 @@ function fakeHostWithEditor(): { host: HostEditorProvider; instances: FakeWorksp
     setAutocompleteProvider(provider: unknown): void {
       this.provider = provider;
     }
+    isShowingAutocomplete(): boolean {
+      return this.showingAutocomplete;
+    }
   }
-  return { host: { Editor }, instances };
+  class NativeProvider implements FakeNativeProvider {
+    readonly commands: unknown[];
+    readonly basePath: string;
+    constructor(commands: unknown[], basePath: string) {
+      this.commands = commands;
+      this.basePath = basePath;
+      providers.push(this);
+    }
+  }
+  return { host: { Editor, CombinedAutocompleteProvider: NativeProvider }, instances, providers };
 }
 
-/** A minimal live-manager stand-in whose cancel binding matches Esc/Ctrl+C. */
-const CANCEL_MANAGER = {
-  matches(data: string, keybinding: string): boolean {
-    return keybinding === "tui.select.cancel" && (data === "\x1b" || data === "\x03");
-  },
-};
-
-test("workspace editor component prefills the staged value and settles exactly once on submit", () => {
-  const { host, instances } = fakeHostWithEditor();
+test("workspace editor component prefills the staged value, attaches native completion anchored to the session cwd, and settles exactly once on submit", () => {
+  const { host, instances, providers } = fakeHostWithEditor();
   let doneValue: string | undefined = "sentinel";
   let doneCount = 0;
   const component = createWorkspaceEditorComponent({
@@ -221,6 +160,7 @@ test("workspace editor component prefills the staged value and settles exactly o
     theme: IDENTITY_THEME,
     keybindings: CANCEL_MANAGER,
     current: "/staged/dir",
+    cwd: "/session/cwd",
     done: (value) => {
       doneValue = value;
       doneCount += 1;
@@ -230,7 +170,9 @@ test("workspace editor component prefills the staged value and settles exactly o
 
   const editor = instances[0]!;
   assert.equal(editor.text, "/staged/dir", "the staged workspace is the editor's prefill (single draft)");
-  assert.equal(typeof (editor.provider as { getSuggestions?: unknown } | undefined)?.getSuggestions, "function", "provider attached through the public seam");
+  assert.ok(editor.provider, "provider attached through the public seam");
+  assert.deepEqual(providers[0]?.commands, [], "constructed with no slash commands");
+  assert.equal(providers[0]?.basePath, "/session/cwd", "anchored to the host session cwd, not process.cwd");
 
   const frame = component.render(80).join("\n");
   assert.ok(frame.includes(WORKSPACE_EDITOR_TITLE), `title renders: ${frame}`);
@@ -243,10 +185,8 @@ test("workspace editor component prefills the staged value and settles exactly o
   assert.equal(doneCount, 1);
   assert.equal(doneValue, "/staged/dir", "submit resolves with the editor's own text");
 
-  // Late input after settle is ignored; no second draft, no second settle.
-  component.handleInput("x");
   component.handleInput("\r");
-  assert.equal(doneCount, 1);
+  assert.equal(doneCount, 1, "exactly one settle");
 });
 
 test("workspace editor component: typed edits submit; Esc cancels with undefined", () => {
@@ -259,6 +199,7 @@ test("workspace editor component: typed edits submit; Esc cancels with undefined
     theme: IDENTITY_THEME,
     keybindings: CANCEL_MANAGER,
     current: "/base",
+    cwd: "/session/cwd",
     done: (value) => {
       doneValue = value;
       doneCount += 1;
@@ -276,11 +217,13 @@ test("workspace editor component: typed edits submit; Esc cancels with undefined
     theme: IDENTITY_THEME,
     keybindings: CANCEL_MANAGER,
     current: "/base",
+    cwd: "/session/cwd",
     done: (value) => {
       doneValue = value;
       doneCount += 1;
     },
   })!;
+
   second.handleInput("\x1b");
   assert.equal(doneCount, 2);
   assert.equal(doneValue, undefined, "Esc cancels with undefined (staged value unchanged)");
@@ -289,24 +232,54 @@ test("workspace editor component: typed edits submit; Esc cancels with undefined
   assert.equal(doneCount, 2, "no settle after cancel");
 });
 
+test("workspace editor component: Esc dismisses a visible completion list first, then cancels", () => {
+  const { host, instances } = fakeHostWithEditor();
+  let doneValue: string | undefined = "sentinel";
+  let doneCount = 0;
+  const component = createWorkspaceEditorComponent({
+    host,
+    tui: GEOMETRY_TUI,
+    theme: IDENTITY_THEME,
+    keybindings: CANCEL_MANAGER,
+    current: "",
+    cwd: "/session/cwd",
+    done: (value) => {
+      doneValue = value;
+      doneCount += 1;
+    },
+  })!;
+
+  const editor = instances[0]!;
+  editor.showingAutocomplete = true; // a native list is visible
+  component.handleInput("\x1b");
+  assert.equal(doneCount, 0, "first Esc does not cancel while the list is visible");
+  assert.ok(editor.received.includes("\x1b"), "the first Esc is forwarded to the host editor (it dismisses its own list)");
+
+  editor.showingAutocomplete = false; // the host editor dismissed it
+  component.handleInput("\x1b");
+  assert.equal(doneCount, 1, "second Esc cancels");
+  assert.equal(doneValue, undefined, "cancel leaves the staged value unchanged");
+});
+
 // ---------------------------------------------------------------------------
-// Degradation chain: custom host editor → public editor → legacy input
+// Degradation chain: custom host editor -> public editor -> legacy input
 // ---------------------------------------------------------------------------
 
-interface DegradeHarness {
+function degradeUi(options: { mode?: string; customTui?: unknown; withEditor?: boolean; withInput?: boolean; cwd?: string }): {
   ui: unknown;
   editorCalls: Array<{ title: string; prefill?: string }>;
   inputCalls: Array<{ title: string; placeholder?: string }>;
-}
-
-function degradeUi(options: { mode?: string; customTui?: unknown; withEditor?: boolean; withInput?: boolean }): DegradeHarness & { run: () => Promise<string | undefined> } {
-  const harness: DegradeHarness = { ui: undefined, editorCalls: [], inputCalls: [] };
+  run: () => Promise<string | undefined>;
+} {
+  const editorCalls: Array<{ title: string; prefill?: string }> = [];
+  const inputCalls: Array<{ title: string; placeholder?: string }> = [];
   let editorIndex = 0;
   let inputIndex = 0;
   const ui: Record<string, unknown> = {
     mode: options.mode ?? "tui",
     notify(): void {},
   };
+  if (options.cwd !== undefined) ui.cwd = options.cwd;
   if (options.customTui !== undefined) {
     ui.custom = (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: string | undefined) => void) => unknown): Promise<string | undefined> =>
       new Promise((resolve) => {
@@ -316,45 +289,92 @@ function degradeUi(options: { mode?: string; customTui?: unknown; withEditor?: b
   }
   if (options.withEditor ?? true) {
     ui.editor = async (title: string, prefill?: string) => {
-      harness.editorCalls.push({ title, prefill });
+      editorCalls.push({ title, prefill });
       return ["public-editor-value"][editorIndex++];
     };
   }
   if (options.withInput ?? false) {
     ui.input = async (title: string, placeholder?: string) => {
-      harness.inputCalls.push({ title, placeholder });
+      inputCalls.push({ title, placeholder });
       return ["legacy-input-value"][inputIndex++];
     };
   }
-  harness.ui = ui;
-  return { ...harness, run: () => editWorkspaceDirectory(ui as never, "/current/dir") };
+  return {
+    ui,
+    editorCalls,
+    inputCalls,
+    run: () => editWorkspaceDirectory(ui as never, "/current/dir"),
+  };
 }
 
 test("a host without an Editor class degrades to the public editor prefill", async (t) => {
   setWorkspaceEditorTuiHost({}); // truthy provider, no Editor class
   t.after(() => setWorkspaceEditorTuiHost(undefined));
 
-  const harness = degradeUi({ customTui: GEOMETRY_TUI });
+  const harness = degradeUi({ customTui: GEOMETRY_TUI, cwd: "/session/cwd" });
   const value = await harness.run();
 
   assert.equal(value, "public-editor-value");
   assert.deepEqual(harness.editorCalls, [{ title: WORKSPACE_EDITOR_TITLE, prefill: "/current/dir" }]);
-  assert.equal(harness.inputCalls.length, 0);
 });
+
+test("a host without a CombinedAutocompleteProvider class degrades to the public editor prefill", async (t) => {
+  const { host } = fakeHostWithEditor();
+  setWorkspaceEditorTuiHost({ Editor: host.Editor }); // Editor only, no provider class
+  t.after(() => setWorkspaceEditorTuiHost(undefined));
+
+  const harness = degradeUi({ customTui: GEOMETRY_TUI, cwd: "/session/cwd" });
+  const value = await harness.run();
+
+  assert.equal(value, "public-editor-value");
+  assert.deepEqual(harness.editorCalls, [{ title: WORKSPACE_EDITOR_TITLE, prefill: "/current/dir" }]);
+});
+
+for (const [missingSeam, changeHost] of [
+  ["setAutocompleteProvider", (prototype: Record<string, unknown>) => { delete prototype.setAutocompleteProvider; }],
+  ["isShowingAutocomplete", (prototype: Record<string, unknown>) => { delete prototype.isShowingAutocomplete; }],
+  ["working provider attachment", (prototype: Record<string, unknown>) => {
+    prototype.setAutocompleteProvider = () => { throw new Error("host provider attach failed"); };
+  }],
+] as const) {
+  test(`a host Editor without ${missingSeam} degrades to the public editor prefill`, async (t) => {
+    const { host } = fakeHostWithEditor();
+    changeHost((host.Editor as unknown as { prototype: Record<string, unknown> }).prototype);
+    setWorkspaceEditorTuiHost(host);
+    t.after(() => setWorkspaceEditorTuiHost(undefined));
+
+    const harness = degradeUi({ customTui: GEOMETRY_TUI, cwd: "/session/cwd" });
+    assert.equal(await harness.run(), "public-editor-value");
+    assert.deepEqual(harness.editorCalls, [{ title: WORKSPACE_EDITOR_TITLE, prefill: "/current/dir" }]);
+  });
+}
 
 test("a host Editor without terminal geometry degrades to the public editor prefill", async (t) => {
   setWorkspaceEditorTuiHost(fakeHostWithEditor().host);
   t.after(() => setWorkspaceEditorTuiHost(undefined));
 
-  const harness = degradeUi({ customTui: { requestRender(): void {} } }); // no terminal.rows
+  const harness = degradeUi({ customTui: { requestRender(): void {} }, cwd: "/session/cwd" }); // no terminal.rows
   const value = await harness.run();
 
   assert.equal(value, "public-editor-value");
   assert.deepEqual(harness.editorCalls, [{ title: WORKSPACE_EDITOR_TITLE, prefill: "/current/dir" }]);
 });
 
+test("a TUI without a session cwd degrades to the public editor prefill (no process.cwd anchor)", async (t) => {
+  const { host, providers } = fakeHostWithEditor();
+  setWorkspaceEditorTuiHost(host);
+  t.after(() => setWorkspaceEditorTuiHost(undefined));
+
+  const harness = degradeUi({ customTui: GEOMETRY_TUI }); // no cwd on the command context
+  const value = await harness.run();
+
+  assert.equal(value, "public-editor-value");
+  assert.deepEqual(harness.editorCalls, [{ title: WORKSPACE_EDITOR_TITLE, prefill: "/current/dir" }]);
+  assert.equal(providers.length, 0, "no completion provider is constructed without a session cwd");
+});
+
 test("without custom (RPC) the field uses the public editor; without that too, legacy input", async () => {
-  const withEditor = degradeUi({ mode: "rpc", withInput: true });
+  const withEditor = degradeUi({ mode: "rpc" });
   assert.equal(await withEditor.run(), "public-editor-value");
   assert.deepEqual(withEditor.editorCalls, [{ title: WORKSPACE_EDITOR_TITLE, prefill: "/current/dir" }]);
 
@@ -364,132 +384,268 @@ test("without custom (RPC) the field uses the public editor; without that too, l
 });
 
 // ---------------------------------------------------------------------------
-// Real-host integration (installed Pi's pi-tui Editor; skipped when absent)
+// Real-host integration (installed Pi's pi-tui Editor + native provider;
+// skipped when the peer is unresolvable in this environment)
 // ---------------------------------------------------------------------------
 
-test("real host editor: Tab completes existing directories and submits the completed path", async (t) => {
+function realHost(mod: Record<string, unknown>): HostEditorProvider {
+  return {
+    Editor: mod.Editor as HostEditorProvider["Editor"],
+    CombinedAutocompleteProvider: mod.CombinedAutocompleteProvider as HostEditorProvider["CombinedAutocompleteProvider"],
+  };
+}
+
+function realKeybindingsManager(mod: Record<string, unknown>): { matches(data: string, kb: string): boolean } {
+  const manager = new (mod.KeybindingsManager as new (a: unknown, b: unknown) => { matches(data: string, kb: string): boolean })(mod.TUI_KEYBINDINGS, {});
+  (mod.setKeybindings as (keybindings: unknown) => void)(manager);
+  return manager;
+}
+
+async function makeDocsFixture(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "pi-ws-real-"));
+  await mkdir(join(root, "docs", "assets"), { recursive: true });
+  await writeFile(join(root, "docs", "guide.md"), "");
+  await writeFile(join(root, "docs", "intro.md"), "");
+  await mkdir(join(root, "other"), { recursive: true });
+  return root;
+}
+
+function realComponent(mod: Record<string, unknown>, cwd: string, current: string, onDone: (value: string | undefined) => void) {
+  const component = createWorkspaceEditorComponent({
+    host: realHost(mod),
+    tui: GEOMETRY_TUI,
+    theme: IDENTITY_THEME,
+    keybindings: realKeybindingsManager(mod),
+    current,
+    cwd,
+    done: onDone,
+  });
+  assert.ok(component, "the real host editor embeds in the component");
+  component.focused = true;
+  return component as { render(width: number): string[]; handleInput(data: string): void };
+}
+
+const typeText = (component: { handleInput(data: string): void }, text: string): void => {
+  for (const ch of text) component.handleInput(ch);
+};
+
+test("real host editor: docs/ + first Tab opens a native selectable list of folders and files", async (t) => {
   const mod = await loadRealPiTuiModule();
   if (!mod) {
     t.skip("pi-tui is not resolvable in this environment");
     return;
   }
-  const root = await mkdtemp(join(tmpdir(), "pi-ws-real-"));
-  await mkdir(join(root, "alpha"), { recursive: true });
-  await mkdir(join(root, "beta"), { recursive: true });
-  await writeFile(join(root, "file.txt"), "");
-
-  const host: HostEditorProvider = { Editor: mod.Editor as HostEditorProvider["Editor"] };
-  setWorkspaceEditorTuiHost(host);
+  const root = await makeDocsFixture();
+  setWorkspaceEditorTuiHost(realHost(mod));
   t.after(() => setWorkspaceEditorTuiHost(undefined));
 
-  const manager = new (mod.KeybindingsManager as new (a: unknown, b: unknown) => { matches(data: string, kb: string): boolean })(mod.TUI_KEYBINDINGS, {});
-  (mod.setKeybindings as ((keybindings: unknown) => void))(manager);
+  let doneCount = 0;
+  const component = realComponent(mod, root, "", () => {
+    doneCount += 1;
+  });
+
+  typeText(component, "docs/");
+  await settle();
+  // The first Tab opens the native selectable list (the user's screenshot case).
+  component.handleInput("\t");
+  await settle();
+  const frame = component.render(200).join("\n"); // wide enough to avoid list truncation
+  assert.ok(frame.includes("assets/"), `folder listed: ${frame}`);
+  assert.ok(frame.includes("guide.md"), `file listed (the native provider lists files too): ${frame}`);
+  assert.ok(frame.includes("intro.md"), `second file listed: ${frame}`);
+  assert.ok(!frame.includes("other"), "anchored to the passed session cwd, not process.cwd");
+  assert.equal(doneCount, 0, "opening the list does not submit");
+});
+
+test("real host editor: native keys select a folder from the list and Enter submits it", async (t) => {
+  const mod = await loadRealPiTuiModule();
+  if (!mod) {
+    t.skip("pi-tui is not resolvable in this environment");
+    return;
+  }
+
+
+  const root = await makeDocsFixture();
+  setWorkspaceEditorTuiHost(realHost(mod));
+  t.after(() => setWorkspaceEditorTuiHost(undefined));
 
   let doneValue: string | undefined = "sentinel";
   let doneCount = 0;
-  const component = createWorkspaceEditorComponent({
-    host,
-    tui: GEOMETRY_TUI,
-    theme: IDENTITY_THEME,
-    keybindings: manager,
-    current: "",
-    done: (value) => {
-      doneValue = value;
-      doneCount += 1;
-    },
+  const component = realComponent(mod, root, "", (value) => {
+    doneValue = value;
+    doneCount += 1;
   });
-  assert.ok(component, "the real host editor embeds in the component");
-  component.focused = true;
 
-  const type = (text: string): void => {
-    for (const ch of text) component.handleInput(ch);
-  };
-  type(`${root}/a`);
+  typeText(component, "docs/");
   await settle();
-  let frame = component.render(200).join("\n"); // wide enough to avoid list truncation
-  assert.ok(frame.includes("alpha/"), `directory suggestion rendered: ${frame}`);
-  assert.ok(!frame.includes("file.txt"), "files are never suggested");
+  component.handleInput("\t"); // open the list (assets/ highlighted first: directories sort first)
+  await settle();
+  const frame = component.render(200).join("\n");
+  assert.ok(frame.includes("assets/"), `list is open: ${frame}`);
 
-  // Tab applies the highlighted completion (the only prefix match).
-  component.handleInput("\t");
+  component.handleInput("\t"); // apply the highlighted folder with the native key
   await settle();
   component.handleInput(KEY_ENTER);
   assert.equal(doneCount, 1);
-  assert.equal(doneValue, `${root}/alpha/`, "submit carries the completed directory");
+  assert.equal(doneValue, "docs/assets/", "submit carries the natively selected folder (relative to the session cwd)");
 });
 
-test("real host editor: ~/ suggestions keep the tilde spelling", async (t) => {
+test("real host editor: arrow keys move the native selection to a file; Esc then cancels unchanged", async (t) => {
+  const mod = await loadRealPiTuiModule();
+  if (!mod) {
+    t.skip("pi-tui is not resolvable in this environment");
+    return;
+  }
+  const root = await makeDocsFixture();
+  setWorkspaceEditorTuiHost(realHost(mod));
+  t.after(() => setWorkspaceEditorTuiHost(undefined));
+
+  let doneValue: string | undefined = "sentinel";
+  let doneCount = 0;
+  const component = realComponent(mod, root, "", (value) => {
+    doneValue = value;
+    doneCount += 1;
+  });
+
+  typeText(component, "docs/");
+  await settle();
+  component.handleInput("\t"); // open the list
+  await settle();
+  component.handleInput(KEY_DOWN); // move the native selection to the next item (guide.md)
+  await settle();
+  component.handleInput("\t"); // apply it
+  await settle();
+  const frame = component.render(200).join("\n");
+  assert.ok(frame.includes("docs/guide.md"), `the natively selected file is in the draft: ${frame}`);
+
+  // The list closed with the applied completion, so a single Esc cancels.
+  component.handleInput("\x1b");
+  assert.equal(doneCount, 1);
+  assert.equal(doneValue, undefined, "Esc after an applied completion cancels (staged value unchanged)");
+});
+
+test("real host editor: Esc dismisses a visible completion list first, then cancels", async (t) => {
+  const mod = await loadRealPiTuiModule();
+  if (!mod) {
+    t.skip("pi-tui is not resolvable in this environment");
+    return;
+  }
+  const root = await makeDocsFixture();
+  setWorkspaceEditorTuiHost(realHost(mod));
+  t.after(() => setWorkspaceEditorTuiHost(undefined));
+
+  let doneValue: string | undefined = "sentinel";
+  let doneCount = 0;
+  const component = realComponent(mod, root, "", (value) => {
+    doneValue = value;
+    doneCount += 1;
+  });
+
+  typeText(component, "docs/");
+  await settle();
+  component.handleInput("\t"); // open the list
+  await settle();
+  assert.ok(component.render(200).join("\n").includes("assets/"), "the list is visible");
+
+  component.handleInput("\x1b"); // first Esc: the host editor dismisses its own list
+  await settle();
+  const frame = component.render(200).join("\n");
+  assert.equal(doneCount, 0, "first Esc does not cancel while the list is visible");
+  assert.ok(!frame.includes("assets/"), `the list was dismissed: ${frame}`);
+  assert.ok(frame.includes("docs/"), "the draft text survives the dismissal");
+
+  component.handleInput("\x1b"); // second Esc: cancel the field
+  assert.equal(doneCount, 1);
+  assert.equal(doneValue, undefined, "cancel leaves the staged value unchanged");
+});
+
+/** Points the native provider's `~` expansion at a fixture home (os.homedir reads $HOME). */
+function withFixtureHome(home: string, t: { after(callback: () => void): void }): void {
+  const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  if (process.platform === "win32") process.env.USERPROFILE = home;
+  t.after(() => {
+    if (previous.HOME === undefined) delete process.env.HOME;
+    else process.env.HOME = previous.HOME;
+    if (previous.USERPROFILE === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previous.USERPROFILE;
+  });
+}
+
+test("real host provider: ~/ completions keep the native tilde spelling", async (t) => {
   const mod = await loadRealPiTuiModule();
   if (!mod) {
     t.skip("pi-tui is not resolvable in this environment");
     return;
   }
   const home = await mkdtemp(join(tmpdir(), "pi-ws-realhome-"));
-  await mkdir(join(home, "beta"), { recursive: true });
   await mkdir(join(home, "berlin"), { recursive: true });
+  await mkdir(join(home, "beta"), { recursive: true });
+  withFixtureHome(home, t);
 
-  const host: HostEditorProvider = { Editor: mod.Editor as HostEditorProvider["Editor"] };
-  setWorkspaceEditorTuiHost(host);
+  setWorkspaceEditorTuiHost(realHost(mod));
   t.after(() => setWorkspaceEditorTuiHost(undefined));
 
-  const manager = new (mod.KeybindingsManager as new (a: unknown, b: unknown) => { matches(data: string, kb: string): boolean })(mod.TUI_KEYBINDINGS, {});
-  (mod.setKeybindings as ((keybindings: unknown) => void))(manager);
-
   let doneValue: string | undefined = "sentinel";
-  const component = createWorkspaceEditorComponent({
-    host,
-    tui: GEOMETRY_TUI,
-    theme: IDENTITY_THEME,
-    keybindings: manager,
-    current: "",
-    provider: createDirectoryAutocompleteProvider({ homeDir: () => home }),
-    done: (value) => {
-      doneValue = value;
-    },
+  const component = realComponent(mod, home, "", (value) => {
+    doneValue = value;
   });
-  assert.ok(component);
-  component.focused = true;
 
-  for (const ch of "~/be") component.handleInput(ch);
-  component.handleInput("\t"); // Tab: force directory completion
+  typeText(component, "~/be");
+  component.handleInput("\t"); // Tab: native path completion
   await settle();
   const frame = component.render(200).join("\n");
-  assert.ok(frame.includes("~/berlin/"), `~/ spelling preserved in suggestions: ${frame}`);
-  assert.ok(frame.includes("~/beta/"), `~/ spelling preserved in suggestions: ${frame}`);
+  assert.ok(frame.includes("berlin/"), `suggestion listed: ${frame}`);
+  assert.ok(frame.includes("beta/"), `suggestion listed: ${frame}`);
 
-  // Tab applies the highlighted ~/... completion; Enter submits it verbatim.
+  // Tab applies the highlighted ~/... completion; the tilde spelling survives.
   component.handleInput("\t");
   await settle();
+  const draft = component.render(200).join("\n");
+  assert.ok(draft.includes("~/berlin/"), `~/ spelling preserved in the applied draft: ${draft}`);
   component.handleInput(KEY_ENTER);
   assert.equal(doneValue, "~/berlin/", "the tilde spelling is what the field submits (Save expands it)");
 });
 
-// ---------------------------------------------------------------------------
-// Full /review-settings flow: invalid directories are not silently accepted
-// ---------------------------------------------------------------------------
+test("real host provider: an absolute home prefix completes as-is, never rewritten to ~/", async (t) => {
+  const mod = await loadRealPiTuiModule();
+  if (!mod) {
+    t.skip("pi-tui is not resolvable in this environment");
+    return;
+  }
+  const home = await mkdtemp(join(tmpdir(), "pi-ws-realabs-"));
+  await mkdir(join(home, "berlin"), { recursive: true });
+  await mkdir(join(home, "beta"), { recursive: true });
+  withFixtureHome(home, t);
 
-const ROOT_SETTING_LABELS = [
-  "Operating mode",
-  "Mode cycle hotkey",
-  "Worker resources",
-  "Execution priority",
-  "Research priority",
-  "Reviewers",
-  "Timeouts",
-  "Review policy",
-  "Bundle retention",
-  "Global concurrency",
-  "Retry policy",
-  "Subtask notifications",
-  "Deferred Pi tools",
-  "Subtasks view",
-  "Scheduled tasks",
-  "Web",
-] as const;
+  // Drive the host's own provider directly (the same class the editor gets):
+  // an exact-home absolute prefix keeps its absolute spelling at completion.
+  const ProviderCtor = mod.CombinedAutocompleteProvider as new (commands: never[], basePath: string) => {
+    getSuggestions(lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal; force?: boolean }): Promise<{ items: Array<{ value: string }>; prefix: string } | null>;
+  };
+  const provider = new ProviderCtor([], process.cwd());
+  const token = `${home}/b`;
+  const result = await provider.getSuggestions([token], 0, token.length, { signal: new AbortController().signal, force: true });
+  assert.ok(result, "forced file completion yields suggestions for an absolute home prefix");
+  assert.deepEqual(
+    result.items.map((item) => item.value),
+    [`${home}/berlin/`, `${home}/beta/`],
+    "an exact-home absolute prefix stays absolute when Pi completes it",
+  );
+
+  // Inherited host limitation, pinned as-is: a line starting with `/` is the
+  // editor's slash-command context (no commands are registered here), so the
+  // natural trigger yields nothing — no leading-slash shim is added.
+  assert.equal(await provider.getSuggestions([token], 0, token.length, { signal: new AbortController().signal }), null);
+});
+
+// ---------------------------------------------------------------------------
+// Full /review-settings flow: Save validation stays the authority
+// ---------------------------------------------------------------------------
 
 type FlowStep = (component: { render?(width: number): string[]; handleInput?(data: string): void }) => void | Promise<void>;
 
-function flowHarness(steps: FlowStep[]): {
+function flowHarness(steps: FlowStep[], options: { cwd?: string; keybindings?: unknown } = {}): {
   ctx: unknown;
   notifyCalls: Array<{ message: string; type?: string }>;
   editorCalls: Array<{ title: string; prefill?: string }>;
@@ -497,24 +653,23 @@ function flowHarness(steps: FlowStep[]): {
 } {
   let stepIndex = 0;
   let customCount = 0;
-  const frames: string[][] = [];
   const notifyCalls: Array<{ message: string; type?: string }> = [];
   const editorCalls: Array<{ title: string; prefill?: string }> = [];
+  const keybindings = options.keybindings ?? CANCEL_MANAGER;
   const ctx = {
     mode: "tui",
     scopedModels: [],
+    ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
     ui: {
       custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: string | undefined) => void) => unknown): Promise<string | undefined> {
         customCount += 1;
         return new Promise((resolve) => {
-          const component = factory(GEOMETRY_TUI, IDENTITY_THEME, CANCEL_MANAGER, resolve) as {
+          const component = factory(GEOMETRY_TUI, IDENTITY_THEME, keybindings, resolve) as {
             render?(width: number): string[];
             handleInput?(data: string): void;
             focused?: boolean;
           };
           component.focused = true;
-          const frame = component.render?.(80);
-          if (Array.isArray(frame)) frames.push(frame);
           void (async () => {
             await steps[stepIndex++]?.(component);
           })();
@@ -542,33 +697,11 @@ const keys = (...sequence: string[]): FlowStep => (component) => {
 async function writeFlowConfig(): Promise<{ dir: string; configPath: string }> {
   const dir = await mkdtemp(join(tmpdir(), "pi-ws-flow-"));
   const configPath = join(dir, "review-gate.json");
-  await writeFile(configPath, JSON.stringify({
-    enabled: false,
-    review: { primaryReviewers: [], subtaskReviewers: [] },
-    scheduledTasks: {
-      "task-abcdef12": {
-        name: "Nightly check",
-        cron: "30 2 * * *",
-        enabled: true,
-        kind: "execute",
-        instructions: "Check the docs for staleness",
-        workspace: dir,
-      },
-    },
-  }), "utf8");
+  await writeFile(configPath, JSON.stringify({ scheduledTasks: { "task-abcdef12": { name: "Nightly check", cron: "30 2 * * *", enabled: true, kind: "execute", instructions: "Check the docs for staleness", workspace: dir } } }, null, 2));
   return { dir, configPath };
 }
 
-test("full flow: a typed non-existent directory is rejected at Save, never silently accepted", async (t) => {
-  const menuHost = createFakeMenuTuiHost();
-  setMenuTuiHost(menuHost);
-  setWorkspaceEditorTuiHost(fakeHostWithEditor().host);
-  t.after(() => {
-    setMenuTuiHost(undefined);
-    setWorkspaceEditorTuiHost(undefined);
-  });
-
-  const { dir, configPath } = await writeFlowConfig();
+async function registerFlowHandler(configPath: string): Promise<(ctx: unknown) => Promise<void>> {
   const config = (await import("../src/config")).normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   registerReviewSettings({
@@ -580,6 +713,23 @@ test("full flow: a typed non-existent directory is rejected at Save, never silen
     config,
     configPath,
   });
+  assert.ok(handler, "the /review-settings command registered");
+  return (ctx) => handler!("", ctx);
+}
+
+test("full flow: a typed non-existent directory is rejected at Save, never silently accepted", async (t) => {
+  const fake = fakeHostWithEditor();
+  const menuHost = createFakeMenuTuiHost();
+  setMenuTuiHost(menuHost);
+  setWorkspaceEditorTuiHost(fake.host);
+  t.after(() => {
+    setMenuTuiHost(undefined);
+    setWorkspaceEditorTuiHost(undefined);
+  });
+
+  const { dir, configPath } = await writeFlowConfig();
+  const before = await readFile(configPath, "utf8");
+  const run = await registerFlowHandler(configPath);
 
   const invalid = "/nonexistent-xyz-123";
   const harness = flowHarness([
@@ -595,24 +745,20 @@ test("full flow: a typed non-existent directory is rejected at Save, never silen
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (row 14) → Save changes (row 16)
     keys("\x1b"), // failed save re-shows the root menu; Esc leaves without saving
-  ]);
+  ], { cwd: dir });
 
-  assert.ok(handler, "the /review-settings command registered");
-  await handler("", harness.ctx);
+  await run(harness.ctx);
 
   assert.ok(
     harness.notifyCalls.some((call) => call.type === "error" && /not an existing directory/.test(call.message)),
     `Save validation rejected the invalid directory: ${JSON.stringify(harness.notifyCalls)}`,
   );
-  const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.equal(saved.scheduledTasks["task-abcdef12"].workspace, dir, "the staged workspace is unchanged");
-  // Six menus plus the workspace editor surface and the post-failure root
-  // re-show; the field used the custom host editor, not a second draft.
-  assert.equal(harness.customCount(), 8);
-  assert.equal(harness.editorCalls.length, 0);
+  assert.equal(await readFile(configPath, "utf8"), before, "the config file is byte-unchanged after a failed save");
+  assert.equal(harness.editorCalls.length, 0, "the field used the embedded host editor, not a second draft");
+  assert.equal(harness.customCount(), 8, "seven menus plus the workspace editor surface");
 });
 
-test("full flow: Tab completion in the embedded editor stages an existing directory through Save", async (t) => {
+test("full flow: a file selected from the native completion list cannot pass Save", async (t) => {
   const mod = await loadRealPiTuiModule();
   if (!mod) {
     t.skip("pi-tui is not resolvable in this environment");
@@ -620,55 +766,99 @@ test("full flow: Tab completion in the embedded editor stages an existing direct
   }
   const menuHost = createFakeMenuTuiHost();
   setMenuTuiHost(menuHost);
-  const host: HostEditorProvider = { Editor: mod.Editor as HostEditorProvider["Editor"] };
-  setWorkspaceEditorTuiHost(host);
+  setWorkspaceEditorTuiHost(realHost(mod));
   t.after(() => {
     setMenuTuiHost(undefined);
     setWorkspaceEditorTuiHost(undefined);
   });
 
-  const root = await mkdtemp(join(tmpdir(), "pi-ws-flowreal-"));
-  await mkdir(join(root, "alpha"), { recursive: true });
-  await mkdir(join(root, "beta"), { recursive: true });
-  const manager = new (mod.KeybindingsManager as new (a: unknown, b: unknown) => { matches(data: string, kb: string): boolean })(mod.TUI_KEYBINDINGS, {});
-  (mod.setKeybindings as ((keybindings: unknown) => void))(manager);
+  // Fixture home: the native list under ~/docs/ holds a folder and a file.
+  const home = await mkdtemp(join(tmpdir(), "pi-ws-flowfile-"));
+  await mkdir(join(home, "docs", "assets"), { recursive: true });
+  await writeFile(join(home, "docs", "guide.md"), "");
+  withFixtureHome(home, t);
 
-  const { dir, configPath } = await writeFlowConfig();
-  const config = (await import("../src/config")).normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
-  let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
-  registerReviewSettings({
-    pi: {
-      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
-        if (name === "review-settings") handler = options.handler;
-      },
-    },
-    config,
-    configPath,
-  });
+  const { configPath } = await writeFlowConfig();
+  const before = await readFile(configPath, "utf8");
+  const run = await registerFlowHandler(configPath);
 
   const harness = flowHarness([
-    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks
-    keys(KEY_ENTER), // list → task entry
+    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
+    keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 4)
     async (component) => {
       component.handleInput?.("\x15"); // Ctrl+U: clear the prefilled staged value
-      for (const ch of `${root}/a`) component.handleInput?.(ch);
-      component.handleInput?.("\t"); // Tab: directory completion
+      for (const ch of "~/docs/") component.handleInput?.(ch);
+      component.handleInput?.("\t"); // Tab: open the native list (assets/ highlighted first)
       await settle();
-      const frame = component.render!(200).join("\n"); // wide enough to avoid list truncation
-      assert.ok(frame.includes("alpha/"), `Tab rendered the directory suggestion: ${frame}`);
-      component.handleInput?.("\t"); // apply the highlighted completion
+      const frame = component.render!(200).join("\n");
+      assert.ok(frame.includes("guide.md"), `the file is in the native list: ${frame}`);
+      component.handleInput?.(KEY_DOWN); // move the native selection to the file
       await settle();
+      component.handleInput?.("\t"); // apply it
+      await settle();
+      assert.ok(component.render!(200).join("\n").includes("docs/guide.md"), "the selected file is in the draft");
+      component.handleInput?.(KEY_ENTER); // submit the completed file path
+    },
+    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 4) → Back (row 9)
+    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
+    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (row 14) → Save changes (row 16)
+    keys("\x1b"), // failed save re-shows the root menu; Esc leaves without saving
+  ], { cwd: home, keybindings: realKeybindingsManager(mod) });
+
+  await run(harness.ctx);
+
+  assert.ok(
+    harness.notifyCalls.some((call) => call.type === "error" && /not an existing directory/.test(call.message)),
+    `Save validation rejected the completed file: ${JSON.stringify(harness.notifyCalls)}`,
+  );
+  assert.equal(await readFile(configPath, "utf8"), before, "selecting a file cannot bypass the directory boundary");
+});
+
+test("full flow: native Tab completion stages an existing directory through Save", async (t) => {
+  const mod = await loadRealPiTuiModule();
+  if (!mod) {
+    t.skip("pi-tui is not resolvable in this environment");
+    return;
+  }
+  const menuHost = createFakeMenuTuiHost();
+  setMenuTuiHost(menuHost);
+  setWorkspaceEditorTuiHost(realHost(mod));
+  t.after(() => {
+    setMenuTuiHost(undefined);
+    setWorkspaceEditorTuiHost(undefined);
+  });
+
+  // Fixture home: the native provider completes ~/a to ~/alpha/.
+  const home = await mkdtemp(join(tmpdir(), "pi-ws-flowreal-"));
+  await mkdir(join(home, "alpha"), { recursive: true });
+  await mkdir(join(home, "beta"), { recursive: true });
+  withFixtureHome(home, t);
+
+  const { configPath } = await writeFlowConfig();
+  const run = await registerFlowHandler(configPath);
+
+  const harness = flowHarness([
+    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
+    keys(KEY_ENTER), // list → task entry (row 0)
+    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 4)
+    async (component) => {
+      component.handleInput?.("\x15"); // Ctrl+U: clear the prefilled staged value
+      for (const ch of "~/a") component.handleInput?.(ch);
+      component.handleInput?.("\t"); // Tab: the single native match (~/alpha/) applies directly
+      await settle();
+      assert.ok(component.render!(200).join("\n").includes("~/alpha/"), "the folder completion is in the draft");
       component.handleInput?.(KEY_ENTER); // submit
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show → Back
-    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back
-    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show → Save changes
-  ]);
+    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 4) → Back (row 9)
+    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
+    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (row 14) → Save changes (row 16)
+  ], { cwd: home, keybindings: realKeybindingsManager(mod) });
 
-  assert.ok(handler, "the /review-settings command registered");
-  await handler("", harness.ctx);
+  await run(harness.ctx);
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
-  assert.equal(saved.scheduledTasks["task-abcdef12"].workspace, `${root}/alpha/`, "the completed directory is staged and saved");
+  // expandHomePath joins the home prefix with the remainder verbatim, so the
+  // native directory completion's trailing slash is preserved in the save.
+  assert.equal(saved.scheduledTasks["task-abcdef12"].workspace, join(home, "alpha/"), "the completed directory is staged (expanded) and saved");
 });

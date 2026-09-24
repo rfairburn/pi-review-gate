@@ -26,7 +26,15 @@ export interface ScheduledRunView {
 }
 
 function dueTimeLabel(dueAt: Date): string {
-  return dueAt.toISOString();
+  // Display the exact occurrence in the host's local timezone, as the cron
+  // expression is interpreted. Include the offset so the two passes through
+  // a repeated fall-back hour remain distinguishable without showing UTC.
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  const offsetMinutes = -dueAt.getTimezoneOffset();
+  const sign = offsetMinutes < 0 ? "-" : "+";
+  const offset = `${sign}${pad(Math.floor(Math.abs(offsetMinutes) / 60))}:${pad(Math.abs(offsetMinutes) % 60)}`;
+  return `${dueAt.getFullYear()}-${pad(dueAt.getMonth() + 1)}-${pad(dueAt.getDate())} `
+    + `${pad(dueAt.getHours())}:${pad(dueAt.getMinutes())} ${offset} (local)`;
 }
 
 /**

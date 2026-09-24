@@ -330,8 +330,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       await wakeSchedulerOwner(formatScheduledOverdueDrop(entryId, entry, dueAt));
       return;
     }
+    let inspection: Awaited<ReturnType<typeof executionTools.startScheduled>>;
     try {
-      const inspection = await executionTools.startScheduled(
+      inspection = await executionTools.startScheduled(
         scheduledTaskDefinition(entryId, entry),
         entry.kind,
         entry.workspace,
@@ -341,10 +342,18 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
           ...(entry.review !== undefined ? { reviewOverride: entry.review } : {}),
         },
       );
-      await sendNotice(pi, `review gate: scheduled task ${entryId} (${entry.name}) dispatched as ${inspection.executionId} (${entry.kind}); ordinary subtask notifications will report its outcome`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await wakeSchedulerOwner(formatScheduledDispatchFailure(entryId, entry, dueAt, message));
+      return;
+    }
+    // A notice failure after start() returned cannot turn a real execution
+    // into a dispatch failure. Its ordinary outcome still uses the controller's
+    // owner notification path; report the missing start notice best-effort.
+    try {
+      await sendNotice(pi, `review gate: scheduled task ${entryId} (${entry.name}) dispatched as ${inspection.executionId} (${entry.kind}); ordinary subtask notifications will report its outcome`);
+    } catch {
+      console.warn(`review gate: scheduled task ${entryId} dispatched as ${inspection.executionId}, but its start notice could not be delivered; inspect that execution for its outcome`);
     }
   };
 

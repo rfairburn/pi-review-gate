@@ -828,6 +828,13 @@ test("settled chains are removed from inFlight without losing same-entry seriali
 // Scheduler owner-event wording and delivery.
 // ---------------------------------------------------------------------------
 
+function localDueLabel(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const minutes = -date.getTimezoneOffset();
+  const offset = `${minutes < 0 ? "-" : "+"}${pad(Math.floor(Math.abs(minutes) / 60))}:${pad(Math.abs(minutes) % 60)}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())} ${offset} (local)`;
+}
+
 test("overlap skip events carry identity, due time, and handles without implying completion", () => {
   const entry = { name: "Nightly build", cron: "0 9 * * *", enabled: true, kind: "execute" as const, instructions: "build", workspace: "/tmp/ws" };
   const text = formatScheduledSkipEvent(
@@ -845,7 +852,8 @@ test("overlap skip events carry identity, due time, and handles without implying
   assert.ok(text.includes("nightly"), "schedule identity");
   assert.ok(text.includes("Nightly build"));
   assert.ok(text.includes("0 9 * * *"));
-  assert.ok(text.includes("2025-05-05T09:00:00.000Z"), "exact due time");
+  assert.ok(text.includes(localDueLabel(new Date(Date.UTC(2025, 4, 5, 9, 0)))), "exact machine-local due minute and offset");
+  assert.ok(!text.includes("2025-05-05T09:00:00.000Z"), "do not display UTC as the local cron time");
   assert.ok(text.includes("exec-1") && text.includes("task-7") && text.includes("running"), "active execution and task handles");
   assert.ok(/SKIPPED/.test(text), "the skip is explicit");
   assert.ok(!/completed/i.test(text.replace(/SKIPPED[^\n]*/i, "")), "no implied completion");
@@ -855,7 +863,7 @@ test("overdue drop events name the entry, due time, and state no run happened", 
   const entry = { name: "Nightly build", cron: "0 9 * * *", enabled: true, kind: "execute" as const, instructions: "build", workspace: "/tmp/ws" };
   const text = formatScheduledOverdueDrop("nightly", entry, new Date(Date.UTC(2025, 4, 5, 9, 0)));
   assert.ok(text.includes("nightly") && text.includes("Nightly build") && text.includes("0 9 * * *"));
-  assert.ok(text.includes("2025-05-05T09:00:00.000Z"), "exact due time");
+  assert.ok(text.includes(localDueLabel(new Date(Date.UTC(2025, 4, 5, 9, 0)))), "exact local due time");
   assert.ok(/NOT RUN/.test(text), "the drop is explicit");
   assert.ok(/no catch-up run is started/i.test(text), "no catch-up is promised");
   const withoutDropLine = text.replace(/nothing was dispatched[^\n]*/i, "");
@@ -866,8 +874,23 @@ test("dispatch failure events name the entry, due time, and exact error", () => 
   const entry = { name: "Nightly build", cron: "0 9 * * *", enabled: true, kind: "execute" as const, instructions: "build", workspace: "/tmp/ws" };
   const text = formatScheduledDispatchFailure("nightly", entry, new Date(Date.UTC(2025, 4, 5, 9, 0)), "No execute worker route is configured.");
   assert.ok(text.includes("nightly") && text.includes("0 9 * * *"));
-  assert.ok(text.includes("2025-05-05T09:00:00.000Z"));
+  assert.ok(text.includes(localDueLabel(new Date(Date.UTC(2025, 4, 5, 9, 0)))));
   assert.ok(text.includes("No execute worker route is configured."));
+});
+
+test("repeated fall-back local minutes show their different offsets", () => {
+  const previous = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    const entry = { name: "DST", cron: "30 1 * * *", enabled: true, kind: "execute" as const, instructions: "check", workspace: "/tmp/ws" };
+    const first = formatScheduledOverdueDrop("dst", entry, new Date("2025-11-02T05:30:00Z"));
+    const second = formatScheduledOverdueDrop("dst", entry, new Date("2025-11-02T06:30:00Z"));
+    assert.match(first, /2025-11-02 01:30 -04:00 \(local\)/);
+    assert.match(second, /2025-11-02 01:30 -05:00 \(local\)/);
+  } finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
 });
 
 test("deliverScheduledEvent uses the steer-now lane and reports unavailable hosts", () => {

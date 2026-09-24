@@ -402,8 +402,10 @@ than from any fire-time computation:
   observed by the host clock, so an entry due in that window is missed for
   that day. It runs again on its next ordinary due time.
 - **Fall-back repeat:** a local minute that occurs twice (for example 01:00–
-  01:59 when the clock repeats) fires once per distinct absolute due minute —
-  an entry due at 01:30 runs twice on the transition day, once per pass.
+  01:59 when the clock repeats) is evaluated once per distinct absolute due
+  minute. An entry due at 01:30 can run on both passes; if its first run is
+  still active on the second pass, that occurrence is skipped with an
+  actionable overlap wake instead.
 - **No catch-up:** time that passes while the process is not running, while
   the switch is Off, or while a host sleeps is never replayed. Starting,
   re-enabling, or replanning makes the next full minute the first possible
